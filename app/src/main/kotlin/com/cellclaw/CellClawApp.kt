@@ -32,7 +32,7 @@ class CellClawApp : Application(), Configuration.Provider {
             getString(R.string.notification_channel_service),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "CellClaw background service status"
+            description = "ZeroClaw background service status"
             setShowBadge(false)
         }
 

@@ -18,7 +18,7 @@ fun GuideScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("CellClaw Guide") },
+                title = { Text("ZeroClaw Guide") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
@@ -56,7 +56,7 @@ fun GuideScreen(onBack: () -> Unit) {
 
             GuideSection(
                 title = "\uD83D\uDD35 Logo",
-                body = "The floating bubble uses the CellClaw target icon. " +
+                body = "The floating bubble uses the ZeroClaw target icon. " +
                     "Its background color changes in real-time to reflect the current agent state."
             )
 
@@ -75,8 +75,8 @@ fun GuideScreen(onBack: () -> Unit) {
                 title = "\uD83D\uDD27 Overlay Panel Icons",
                 body = null,
                 items = listOf(
-                    "\u2139 Info" to "Open the CellClaw guide",
-                    "\u2605 Star" to "Open the full CellClaw app",
+                    "\u2139 Info" to "Open the ZeroClaw guide",
+                    "\u2605 Star" to "Open the full ZeroClaw app",
                     "\u2699 Gear" to "Open app settings"
                 )
             )
@@ -86,7 +86,7 @@ fun GuideScreen(onBack: () -> Unit) {
                 body = null,
                 items = listOf(
                     "Single Tap" to "Open quick-reply text panel",
-                    "Double Tap" to "Open the full CellClaw app",
+                    "Double Tap" to "Open the full ZeroClaw app",
                     "Long Press" to "Show stop / hide buttons",
                     "Drag" to "Move the bubble anywhere on screen"
                 )

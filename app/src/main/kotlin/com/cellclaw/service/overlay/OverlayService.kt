@@ -321,7 +321,7 @@ class OverlayService : Service() {
         }
 
         val label = TextView(this).apply {
-            text = "CellClaw"
+            text = "ZeroClaw"
             setTextColor(Color.parseColor("#BB86FC"))
             textSize = 11f
         }
@@ -696,7 +696,7 @@ class OverlayService : Service() {
 
         // Title
         content.addView(TextView(this).apply {
-            text = "CellClaw Guide"
+            text = "ZeroClaw Guide"
             setTextColor(Color.parseColor("#BB86FC"))
             textSize = 16f
             gravity = Gravity.CENTER
@@ -731,19 +731,19 @@ class OverlayService : Service() {
 
         // -- Logo section --
         addGuideSection(content, "\uD83D\uDD35 Logo",
-            "The floating bubble uses the CellClaw target icon. " +
+            "The floating bubble uses the ZeroClaw target icon. " +
             "Its background color changes in real-time to reflect the current agent state shown above.")
 
         // -- Panel icons section --
         addGuideSection(content, "\uD83D\uDD27 Panel Icons", null)
         addActionRow(content, "\u2139 Info", "Open this guide")
-        addActionRow(content, "\u2605 Star", "Open the full CellClaw app")
+        addActionRow(content, "\u2605 Star", "Open the full ZeroClaw app")
         addActionRow(content, "\u2699 Gear", "Open app settings")
 
         // -- Overlay actions section --
         addGuideSection(content, "\uD83D\uDC46 Overlay Actions", null)
         addActionRow(content, "Single Tap", "Open quick-reply text panel")
-        addActionRow(content, "Double Tap", "Open the full CellClaw app")
+        addActionRow(content, "Double Tap", "Open the full ZeroClaw app")
         addActionRow(content, "Long Press", "Show stop / hide buttons")
         addActionRow(content, "Drag", "Move the bubble anywhere on screen")
 
@@ -1089,7 +1089,7 @@ class OverlayService : Service() {
 
     private fun buildOverlayNotification(): Notification {
         return NotificationCompat.Builder(this, CellClawApp.CHANNEL_SERVICE)
-            .setContentTitle("CellClaw")
+            .setContentTitle("ZeroClaw")
             .setContentText("Overlay active")
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)

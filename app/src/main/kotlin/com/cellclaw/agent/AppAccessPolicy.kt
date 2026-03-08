@@ -15,9 +15,9 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class AccessMode(val key: String, val displayName: String, val description: String) {
-    ALL_ON("all_on", "All Apps On", "CellClaw can interact with every app"),
+    ALL_ON("all_on", "All Apps On", "ZeroClaw can interact with every app"),
     SMART("smart", "Smart", "All apps except banking, finance & investment apps"),
-    ALL_OFF("all_off", "All Apps Off", "CellClaw cannot interact with any app unless you allow it");
+    ALL_OFF("all_off", "All Apps Off", "ZeroClaw cannot interact with any app unless you allow it");
 
     companion object {
         fun fromKey(key: String): AccessMode =

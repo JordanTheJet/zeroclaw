@@ -423,7 +423,7 @@ class AgentLoop @Inject constructor(
 
         if (!appAccessPolicy.isAppAllowed(targetPackage)) {
             return "Access to $targetPackage is blocked by app access policy. " +
-                "The user has restricted CellClaw from interacting with this app."
+                "The user has restricted ZeroClaw from interacting with this app."
         }
         return null
     }

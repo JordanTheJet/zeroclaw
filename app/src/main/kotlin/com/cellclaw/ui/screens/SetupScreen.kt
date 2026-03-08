@@ -52,7 +52,7 @@ fun SetupScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("Welcome to CellClaw") })
+            TopAppBar(title = { Text("Welcome to ZeroClaw") })
         }
     ) { padding ->
         Column(
@@ -75,7 +75,7 @@ fun SetupScreen(
                         style = MaterialTheme.typography.headlineMedium
                     )
                     Text(
-                        "CellClaw supports multiple AI providers. Pick one and enter your API key.",
+                        "ZeroClaw supports multiple AI providers. Pick one and enter your API key.",
                         style = MaterialTheme.typography.bodyLarge
                     )
 
@@ -193,11 +193,11 @@ fun SetupScreen(
 
                 1 -> {
                     Text(
-                        "Tell CellClaw about you",
+                        "Tell ZeroClaw about you",
                         style = MaterialTheme.typography.headlineMedium
                     )
                     Text(
-                        "This helps CellClaw personalize its responses.",
+                        "This helps ZeroClaw personalize its responses.",
                         style = MaterialTheme.typography.bodyLarge
                     )
 
@@ -234,7 +234,7 @@ fun SetupScreen(
                         style = MaterialTheme.typography.headlineMedium
                     )
                     Text(
-                        "How much freedom should CellClaw have? You can change this anytime in Settings.",
+                        "How much freedom should ZeroClaw have? You can change this anytime in Settings.",
                         style = MaterialTheme.typography.bodyLarge
                     )
 
@@ -330,7 +330,7 @@ fun SetupScreen(
                         style = MaterialTheme.typography.headlineMedium
                     )
                     Text(
-                        "CellClaw needs these permissions to work. Tap each one to open settings.",
+                        "ZeroClaw needs these permissions to work. Tap each one to open settings.",
                         style = MaterialTheme.typography.bodyLarge
                     )
 
@@ -384,7 +384,7 @@ fun SetupScreen(
                         modifier = Modifier.fillMaxWidth(),
                         enabled = allGranted
                     ) {
-                        Text("Start CellClaw")
+                        Text("Start ZeroClaw")
                     }
 
                     if (!allGranted) {

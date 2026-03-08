@@ -42,11 +42,11 @@ android {
     buildTypes {
         debug {
             applicationIdSuffix = ".dev"
-            resValue("string", "app_name", "CellClaw Dev")
+            resValue("string", "app_name", "ZeroClaw Dev")
         }
         release {
             signingConfig = signingConfigs.getByName("release")
-            resValue("string", "app_name", "CellClaw")
+            resValue("string", "app_name", "ZeroClaw")
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

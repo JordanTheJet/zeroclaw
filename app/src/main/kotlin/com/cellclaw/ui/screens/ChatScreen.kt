@@ -81,7 +81,7 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("CellClaw") },
+                title = { Text("ZeroClaw") },
                 actions = {
                     if (pendingApprovals.isNotEmpty()) {
                         BadgedBox(badge = {
@@ -419,7 +419,7 @@ fun ChatScreen(
                     onValueChange = { inputText = it },
                     modifier = Modifier.weight(1f),
                     placeholder = {
-                        Text(if (isAgentRunning) "Send instructions..." else "Message CellClaw...")
+                        Text(if (isAgentRunning) "Send instructions..." else "Message ZeroClaw...")
                     },
                     shape = RoundedCornerShape(24.dp),
                     maxLines = 4

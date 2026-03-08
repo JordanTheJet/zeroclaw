@@ -311,7 +311,7 @@ fun SettingsScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Allow app installation", style = MaterialTheme.typography.bodyMedium)
                             Text(
-                                "Let CellClaw install apps from the Play Store when needed",
+                                "Let ZeroClaw install apps from the Play Store when needed",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -523,7 +523,7 @@ fun SettingsScreen(
                                 style = MaterialTheme.typography.bodyLarge
                             )
                             Text(
-                                "Control which apps CellClaw can interact with",
+                                "Control which apps ZeroClaw can interact with",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

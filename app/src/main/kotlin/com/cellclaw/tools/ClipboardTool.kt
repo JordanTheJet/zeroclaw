@@ -50,7 +50,7 @@ class ClipboardWriteTool @Inject constructor(
 
         return try {
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("CellClaw", text))
+            clipboard.setPrimaryClip(ClipData.newPlainText("ZeroClaw", text))
 
             ToolResult.success(buildJsonObject {
                 put("copied", true)

@@ -80,7 +80,7 @@ fun AppAccessScreen(
             // Header
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    "Control which apps CellClaw can interact with.",
+                    "Control which apps ZeroClaw can interact with.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
