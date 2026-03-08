@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="CellClaw_1.png" alt="CellClaw" width="300"/>
+  <img src="zeroclaw_compressed.jpg" alt="ZeroClaw" width="300"/>
 </p>
 
-<h1 align="center">CellClaw</h1>
+<h1 align="center">ZeroClaw</h1>
 
 <p align="center">
   <strong>Autonomous AI agent for Android. No other hardware required.</strong>
@@ -10,26 +10,26 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
-  <a href="https://github.com/jordanthejet/cellclaw/releases"><img src="https://img.shields.io/github/v/release/jordanthejet/cellclaw?include_prereleases" alt="GitHub release" /></a>
+  <a href="https://github.com/jordanthejet/zeroclaw/releases"><img src="https://img.shields.io/github/v/release/jordanthejet/zeroclaw?include_prereleases" alt="GitHub release" /></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/jordanthejet/cellclaw/releases">Releases</a> ·
-  <a href="https://github.com/jordanthejet/cellclaw/issues">Issues</a> ·
+  <a href="https://github.com/jordanthejet/zeroclaw/releases">Releases</a> ·
+  <a href="https://github.com/jordanthejet/zeroclaw/issues">Issues</a> ·
   <a href="LICENSE">License</a>
 </p>
 
 Built at [Sundai Club](https://sundai.club).
 
-CellClaw runs natively on your phone and can read your screen, send messages, make calls, control apps, take photos, and more — all orchestrated by an LLM through a tool-use loop with a heartbeat.
+ZeroClaw runs natively on your phone and can read your screen, send messages, make calls, control apps, take photos, and more — all orchestrated by an LLM through a tool-use loop with a heartbeat.
 
 ```
 33 tools · 12 categories · 4 providers · Android 8.0+ · No middleman server
 ```
 
-### Why CellClaw?
+### Why ZeroClaw?
 
-- **No middleman** — no CellClaw server, your phone talks directly to your AI provider
+- **No middleman** — no ZeroClaw server, your phone talks directly to your AI provider
 - **Bring your own model** — Claude, GPT, Gemini, or any OpenRouter model
 - **33 tools, zero scripts** — the AI figures out what to do from plain language
 - **Real Android control** — not just chat; it taps, swipes, types, launches apps, reads your screen
@@ -37,7 +37,7 @@ CellClaw runs natively on your phone and can read your screen, send messages, ma
 
 ## What Can It Do?
 
-CellClaw has **33 tools** across 12 categories that give the AI deep access to your phone:
+ZeroClaw has **33 tools** across 12 categories that give the AI deep access to your phone:
 
 | Category | Tools | Examples |
 |----------|-------|---------|
@@ -65,13 +65,13 @@ The AI decides which tools to use. You just describe what you want in plain lang
 
 ### Install
 
-1. Download the latest APK from [Releases](https://github.com/jordanthejet/cellclaw/releases)
+1. Download the latest APK from [Releases](https://github.com/jordanthejet/zeroclaw/releases)
 2. Enable "Install from unknown sources" if prompted
-3. Open CellClaw
+3. Open ZeroClaw
 
 ### First Launch
 
-CellClaw walks you through a 4-step setup:
+ZeroClaw walks you through a 4-step setup:
 
 1. **Choose your AI provider** — Pick Anthropic, OpenAI, Gemini, or OpenRouter and enter your API key. Keys are encrypted on-device using Android Keystore.
 
@@ -82,18 +82,18 @@ CellClaw walks you through a 4-step setup:
    - **Balanced** — Reads are automatic, sends/writes ask first. *(Recommended)*
    - **Cautious** — Almost everything requires approval.
 
-4. **Grant permissions** — CellClaw needs three system permissions:
+4. **Grant permissions** — ZeroClaw needs three system permissions:
    - **Display over other apps** — For the floating overlay bubble
    - **Accessibility service** — For reading screens and controlling apps
    - **Notification access** — For reading and acting on notifications
 
    Each links directly to the Android settings page where you enable it.
 
-After setup, CellClaw starts a foreground service and you're ready to go.
+After setup, ZeroClaw starts a foreground service and you're ready to go.
 
 ## How It Works
 
-CellClaw runs an **agent loop** — a cycle where the AI thinks, calls tools, observes results, and repeats until the task is done:
+ZeroClaw runs an **agent loop** — a cycle where the AI thinks, calls tools, observes results, and repeats until the task is done:
 
 ```
 You: "Open Tinder and swipe right on people over 30"
@@ -113,7 +113,7 @@ The AI decides the strategy. You don't write rules or scripts — it figures out
 
 ### Screen Reading
 
-CellClaw reads your screen in two ways:
+ZeroClaw reads your screen in two ways:
 
 - **Accessibility tree** (`screen.read`) — Fast and free. Returns text, buttons, and UI elements as structured data. Works great for most apps.
 - **Screenshots** (`screen.capture` + `vision.analyze`) — Uses the AI's vision capability to understand images, game boards, charts, and canvas-rendered content that isn't in the accessibility tree.
@@ -122,7 +122,7 @@ The AI picks the right approach based on the task.
 
 ### Heartbeat System
 
-For long-running tasks (playing a chess game, monitoring an app, waiting for a response), CellClaw uses a **heartbeat** — a periodic check-in that wakes the AI to look at the screen and act if needed.
+For long-running tasks (playing a chess game, monitoring an app, waiting for a response), ZeroClaw uses a **heartbeat** — a periodic check-in that wakes the AI to look at the screen and act if needed.
 
 - Starts at 5-second intervals, backs off to 60 seconds when nothing is happening
 - Resets to fast polling when the AI takes action
@@ -131,7 +131,7 @@ For long-running tasks (playing a chess game, monitoring an app, waiting for a r
 
 ### Approval System
 
-When the AI wants to do something sensitive (send a message, make a call, execute a script), CellClaw can ask for your approval first. This depends on your autonomy level:
+When the AI wants to do something sensitive (send a message, make a call, execute a script), ZeroClaw can ask for your approval first. This depends on your autonomy level:
 
 | Action Type | Full Auto | Balanced | Cautious |
 |------------|-----------|----------|----------|
@@ -147,7 +147,7 @@ Approvals show up in the chat and in the notification. You can tap **Approve**, 
 - **Chat screen** — Full conversation interface with tool execution status
 - **Floating overlay** — Tap the bubble for quick questions without leaving your current app
 - **Notification reply** — Reply directly from the persistent notification
-- **Quick Settings tile** — Toggle CellClaw from the notification shade
+- **Quick Settings tile** — Toggle ZeroClaw from the notification shade
 - **Wake word** — Hands-free activation (requires microphone permission)
 
 ## Supported AI Models
@@ -165,16 +165,16 @@ Switch providers and models anytime in Settings.
 
 - **API keys are encrypted** on-device using Android Keystore (AES-256-GCM). Never stored in plaintext.
 - **You control what the AI can do** via the autonomy level. Sensitive actions can require explicit approval.
-- **No CellClaw backend** — there is no CellClaw server. Your data goes directly from your phone to your chosen AI provider.
+- **No ZeroClaw backend** — there is no ZeroClaw server. Your data goes directly from your phone to your chosen AI provider.
 - **Cloud inference** — screen content, messages, and prompts are sent to the AI provider's API for processing. Review your provider's privacy policy ([Anthropic](https://www.anthropic.com/privacy), [OpenAI](https://openai.com/privacy), [Google](https://ai.google.dev/terms)).
 - **Biometric gate** available for sensitive operations (fingerprint/face unlock).
-- **No telemetry, no analytics, no tracking** from CellClaw itself.
+- **No telemetry, no analytics, no tracking** from ZeroClaw itself.
 
 ## Build from Source
 
 ```bash
-git clone https://github.com/jordanthejet/cellclaw.git
-cd cellclaw
+git clone https://github.com/jordanthejet/zeroclaw.git
+cd zeroclaw
 
 # Build debug APK
 ./gradlew assembleDebug
@@ -252,10 +252,6 @@ class YourTool @Inject constructor() : Tool {
 - [ ] iOS app
 - [ ] Skill sharing and community skill packs
 
-## See Also
-
-- [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) — lightweight Rust-based AI assistant infrastructure
-
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE)
@@ -263,7 +259,7 @@ Apache 2.0 — see [LICENSE](LICENSE)
 ## Star History
 
 <p align="center">
-  <a href="https://www.star-history.com/#JordanTheJet/cellclaw&Date">
-    <img src="https://api.star-history.com/svg?repos=JordanTheJet/cellclaw&type=Date" alt="Star History Chart" />
+  <a href="https://www.star-history.com/#JordanTheJet/zeroclaw&Date">
+    <img src="https://api.star-history.com/svg?repos=JordanTheJet/zeroclaw&type=Date" alt="Star History Chart" />
   </a>
 </p>
