@@ -79,6 +79,43 @@ pub async fn handle_command(
                     }
                 }
             }
+
+            // Surface skill directories present on disk but skipped by the
+            // security audit (e.g. bundling shell scripts) so a blocked skill
+            // is visible rather than silently absent. This re-scans the
+            // workspace skills dir on purpose: `load_skills_with_config` above
+            // aggregates several sources and returns only loaded skills, and
+            // this path passes `warn_on_skip = false` so it renders the skips
+            // here instead of re-emitting the runtime stderr warning. `list`
+            // is a one-shot command, so the extra scan is negligible.
+            let (_loaded, skipped) = load_skills_from_directory_with_skips(
+                &skills_dir(workspace_dir),
+                config.skills.allow_scripts,
+            );
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                for s in &skipped {
+                    println!(
+                        "  {} {} — {}",
+                        console::style("⚠").yellow().bold(),
+                        console::style(&s.name).white().bold(),
+                        s.reason,
+                    );
+                    if s.scripts_blocked {
+                        println!(
+                            "    {}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
+                        );
+                    }
+                }
+            }
             println!();
             Ok(())
         }

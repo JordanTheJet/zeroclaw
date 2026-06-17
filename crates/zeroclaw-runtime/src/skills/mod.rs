@@ -519,21 +519,65 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
     load_skills_from_directory(&skills_dir, allow_scripts)
 }
 
+/// A skill directory that was present on disk but skipped by the security
+/// audit (most commonly: it bundles shell scripts while
+/// `skills.allow_scripts = false`). Surfaced to operators (e.g. by
+/// `zeroclaw skills list`) so a blocked skill is visible rather than silently
+/// absent.
+#[derive(Debug, Clone)]
+pub struct SkippedSkill {
+    /// The skill directory name.
+    pub name: String,
+    /// Path to the skipped skill directory.
+    pub path: PathBuf,
+    /// Human-readable audit reason (the audit summary, or the audit error).
+    pub reason: String,
+    /// True when the skip is the script-policy case specifically — i.e.
+    /// enabling `skills.allow_scripts = true` would let the skill load.
+    pub scripts_blocked: bool,
+}
+
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     cache::cached_load(skills_dir, allow_scripts, "workspace", || {
-        load_skills_from_directory_uncached(skills_dir, allow_scripts)
+        scan_skills_directory(skills_dir, allow_scripts, true).0
     })
 }
 
-fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+/// Like [`load_skills_from_directory`] but also returns the skill directories
+/// the security audit skipped, for user-facing surfacing (e.g.
+/// `zeroclaw skills list`). Uncached, and it does not emit the per-skill
+/// stderr warning — the caller is expected to render the returned skips.
+pub fn load_skills_from_directory_with_skips(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<SkippedSkill>) {
+    scan_skills_directory(skills_dir, allow_scripts, false)
+}
+
+fn skipped_skill_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Scan a skills directory, returning the loaded skills and the directories
+/// skipped by the security audit. When `warn_on_skip` is true the legacy
+/// per-skill stderr/log warning is emitted (the runtime load path); the CLI
+/// surfacing path passes false and renders the returned skips itself.
+fn scan_skills_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+    warn_on_skip: bool,
+) -> (Vec<Skill>, Vec<SkippedSkill>) {
+    let mut skills = Vec::new();
+    let mut skipped = Vec::new();
+
     if !skills_dir.exists() {
-        return Vec::new();
+        return (skills, skipped);
     }
 
-    let mut skills = Vec::new();
-
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
+        return (skills, skipped);
     };
 
     for entry in entries.flatten() {
@@ -549,10 +593,24 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                if warn_on_skip {
+                    warn_skipped_skill(&path, &summary, allow_scripts);
+                }
+                let scripts_blocked =
+                    !allow_scripts && summary.contains("script-like files are blocked");
+                skipped.push(SkippedSkill {
+                    name: skipped_skill_name(&path),
+                    path: path.clone(),
+                    reason: summary,
+                    scripts_blocked,
+                });
                 continue;
             }
             Err(err) => {
+                // Defensive: entries are pre-filtered by `is_dir`, so the
+                // audit's own exists/is-dir bails are unreachable here and this
+                // is effectively a canonicalize/race failure. Surface it as a
+                // skip rather than dropping it silently.
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -562,6 +620,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
                         path.display().to_string()
                     )
                 );
+                skipped.push(SkippedSkill {
+                    name: skipped_skill_name(&path),
+                    path: path.clone(),
+                    reason: format!("could not audit skill directory: {err}"),
+                    scripts_blocked: false,
+                });
                 continue;
             }
         }
@@ -605,7 +669,7 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
         }
     }
 
-    skills
+    (skills, skipped)
 }
 
 fn finalize_open_skill(mut skill: Skill) -> Skill {
@@ -2999,6 +3063,100 @@ version = "0.1.0"
         assert!(
             !data_dir_skill_names.contains(&skill_name),
             "skill in agent workspace must NOT be loaded when passing data_dir (this was the bug); got: {data_dir_skill_names:?}"
+        );
+    }
+
+    fn write_clean_skill(skills_dir: &Path, name: &str) {
+        let d = skills_dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A clean skill.\n---\n\n# Body\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_shell_script_skill(skills_dir: &Path, name: &str) {
+        let d = skills_dir.join(name);
+        std::fs::create_dir_all(d.join("scripts")).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Ships a bash helper.\n---\n\n# Body\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("scripts").join("run.sh"), "#!/bin/bash\necho hi\n").unwrap();
+    }
+
+    #[test]
+    fn with_skips_reports_shell_script_skill_and_loads_clean() {
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_clean_skill(&skills, "clean-skill");
+        write_shell_script_skill(&skills, "scripted-skill");
+
+        let (loaded, skipped) = load_skills_from_directory_with_skips(&skills, false);
+        let loaded_names: Vec<&str> = loaded.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            loaded_names.contains(&"clean-skill"),
+            "clean skill must load; got {loaded_names:?}"
+        );
+        assert!(
+            !loaded_names.contains(&"scripted-skill"),
+            "scripted skill must not load with allow_scripts=false; got {loaded_names:?}"
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "exactly one skipped skill; got {skipped:?}"
+        );
+        let sk = &skipped[0];
+        assert_eq!(sk.name, "scripted-skill");
+        assert!(
+            sk.scripts_blocked,
+            "must flag scripts_blocked; reason={:?}",
+            sk.reason
+        );
+        assert!(
+            sk.reason.contains("script-like files are blocked"),
+            "reason should explain the block; got {:?}",
+            sk.reason
+        );
+    }
+
+    #[test]
+    fn with_skips_empty_when_scripts_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_shell_script_skill(&skills, "scripted-skill");
+
+        let (loaded, skipped) = load_skills_from_directory_with_skips(&skills, true);
+        let loaded_names: Vec<&str> = loaded.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            loaded_names.contains(&"scripted-skill"),
+            "scripted skill loads with allow_scripts=true; got {loaded_names:?}"
+        );
+        assert!(
+            skipped.is_empty(),
+            "no skips when scripts allowed; got {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn load_skills_from_directory_drops_skips_unchanged() {
+        // Regression: the cached Vec<Skill> API still returns only loaded skills.
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_clean_skill(&skills, "clean-skill");
+        write_shell_script_skill(&skills, "scripted-skill");
+
+        let loaded = load_skills_from_directory(&skills, false);
+        let names: Vec<&str> = loaded.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"clean-skill") && !names.contains(&"scripted-skill"),
+            "Vec<Skill> API must load clean and drop the script skill; got {names:?}"
         );
     }
 

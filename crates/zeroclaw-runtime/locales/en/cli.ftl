@@ -433,6 +433,8 @@ cli-skills-create-hint = {"  "}Create one: mkdir -p ~/.zeroclaw/workspace/skills
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
 cli-skills-tags = Tags:  {$tags}
+cli-skills-skipped-header = Skipped skills ({$count}) — present but blocked by the security audit:
+cli-skills-skipped-scripts-hint = Set skills.allow_scripts = true (or run zeroclaw skills audit <name>) to enable.
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.

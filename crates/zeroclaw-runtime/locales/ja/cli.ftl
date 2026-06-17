@@ -380,6 +380,8 @@ cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
 cli-skills-tags = タグ:  {$tags}
+cli-skills-skipped-header = スキップされたスキル ({$count}) — 存在しますがセキュリティ監査によりブロックされています:
+cli-skills-skipped-scripts-hint = 有効にするには skills.allow_scripts = true を設定する（または zeroclaw skills audit <name> を実行する）。
 cli-sop-none = SOP が見つかりません。
 cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します

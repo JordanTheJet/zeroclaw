@@ -379,6 +379,8 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过的技能 ({$count}) — 存在但被安全审计阻止：
+cli-skills-skipped-scripts-hint = 设置 skills.allow_scripts = true（或运行 zeroclaw skills audit <name>）以启用。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
