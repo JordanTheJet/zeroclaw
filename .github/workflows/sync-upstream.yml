@@ -1,0 +1,35 @@
+name: sync fork with upstream
+
+# Keeps this fork's `master` current with zeroclaw-labs/zeroclaw by merging upstream
+# in daily. Fork-only files (the clawpatch CI) have no upstream counterpart, so the
+# merge is clean; if a real conflict ever appears the run fails so you can resolve it.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream/master into master
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git
+          git fetch upstream master
+          BEFORE=$(git rev-parse HEAD)
+          git merge --no-edit upstream/master
+          if [ "$(git rev-parse HEAD)" != "$BEFORE" ]; then
+            git push origin HEAD:master
+            echo "synced: merged upstream/master into master"
+          else
+            echo "already up to date with upstream/master"
+          fi

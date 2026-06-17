@@ -1,0 +1,85 @@
+name: clawpatch (zeroclaw self-review)
+
+# Reviews the code changed in each PR using ZeroClaw's OWN coding agent as the brain:
+#   clawpatch (provider=acpx) -> acpx -> `zeroclaw acp` (stdio JSON-RPC) -> ZeroClaw agent -> Claude
+#
+# Requirements:
+#   - Repo secret ANTHROPIC_OAUTH_TOKEN: a Claude subscription OAuth token (sk-ant-oat01-...,
+#     minted with `claude setup-token`). ZeroClaw's Anthropic provider auto-detects the prefix.
+#
+# Behavior: non-blocking. Findings are posted to the job summary and uploaded as an artifact.
+# This is a best-effort first cut — validate on a real PR run and tune timeouts/model as needed.
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clawpatch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install zeroclaw (prebuilt) + acpx + clawpatch
+        run: |
+          set -euo pipefail
+          ZC_VERSION="v0.8.0"
+          curl -fsSL "https://github.com/zeroclaw-labs/zeroclaw/releases/download/${ZC_VERSION}/zeroclaw-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
+          sudo install -m 0755 zeroclaw /usr/local/bin/zeroclaw
+          zeroclaw --version
+          # acpx pinned to clawpatch's tested range; clawpatch from npm (swap for your fork if desired)
+          npm install -g 'acpx@^0.8.0' clawpatch
+          acpx --version
+          clawpatch --version
+
+      - name: Configure the zeroclaw ACP brain
+        env:
+          ZC_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ZC_TOKEN:-}" ]; then
+            echo "::warning::ANTHROPIC_OAUTH_TOKEN secret is not set — the review step will be skipped."
+          fi
+          ZC_DIR="$RUNNER_TEMP/factory-zc"
+          mkdir -p "$ZC_DIR"
+          umask 077
+          sed "s|__ZC_TOKEN__|${ZC_TOKEN:-}|" .github/clawpatch/factory-zc.config.toml > "$ZC_DIR/config.toml"
+          mkdir -p "$HOME/.acpx"
+          printf '{"defaultAgent":"zeroclaw","agents":{"zeroclaw":{"command":"zeroclaw","args":["acp","--config-dir","%s"]}}}\n' "$ZC_DIR" > "$HOME/.acpx/config.json"
+          echo "ZC_DIR=$ZC_DIR" >> "$GITHUB_ENV"
+
+      - name: Review changed code via zeroclaw
+        continue-on-error: true
+        env:
+          CLAWPATCH_PROVIDER: acpx
+          CLAWPATCH_MODEL: zeroclaw
+          CLAWPATCH_ACPX_TIMEOUT_MS: '600000'
+        run: |
+          set -uo pipefail
+          clawpatch init || true
+          clawpatch ci --since "origin/${{ github.base_ref }}" --output clawpatch-report.md || true
+          if [ -s clawpatch-report.md ]; then
+            { echo '## 🦞 clawpatch — zeroclaw self-review'; echo; cat clawpatch-report.md; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'clawpatch produced no report (no changed features, or the brain was unavailable).' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clawpatch-report
+          path: clawpatch-report.md
+          if-no-files-found: ignore

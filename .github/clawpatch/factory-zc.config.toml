@@ -1,0 +1,26 @@
+# Isolated ZeroClaw config for the clawpatch CI "brain" (the agent that reviews PRs).
+# __ZC_TOKEN__ is replaced at CI time from the ANTHROPIC_OAUTH_TOKEN repo secret.
+# The Anthropic provider auto-detects the sk-ant-oat01- prefix and uses the OAuth path.
+schema_version = 3
+
+[providers.models.anthropic.factory]
+model = "claude-sonnet-4-6"
+api_key = "__ZC_TOKEN__"
+
+[agents.factory]
+model_provider = "anthropic.factory"
+enabled = true
+risk_profile = "default"
+runtime_profile = "default"
+
+# Review is read-only; a default (supervised) risk profile is sufficient for CI.
+[risk_profiles.default]
+
+[runtime_profiles.default]
+agentic = true
+max_tool_iterations = 50
+
+[acp]
+default_agent = "factory"
+max_sessions = 5
+session_timeout_secs = 3600

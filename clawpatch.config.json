@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "stateDir": ".clawpatch",
+  "include": ["**/*"],
+  "exclude": [
+    "node_modules/**",
+    "dist/**",
+    "build/**",
+    "target/**",
+    ".build/**",
+    ".git/**",
+    ".clawpatch/**",
+    ".context/**"
+  ],
+  "provider": {
+    "name": "acpx",
+    "model": "zeroclaw",
+    "reasoningEffort": null,
+    "codexConfig": {}
+  },
+  "commands": { "typecheck": null, "lint": null, "format": null, "test": null },
+  "review": {
+    "maxContextFiles": 24,
+    "maxOwnedFiles": 12,
+    "maxFindingsPerFeature": 10,
+    "minConfidenceToFix": "medium"
+  },
+  "git": { "requireCleanWorktreeForFix": true, "commit": false, "openPr": false },
+  "registryVerifier": { "enabled": false }
+}
