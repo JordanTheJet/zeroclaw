@@ -346,6 +346,8 @@ zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
+zc-chat-agent-switched = Switched to agent { $alias }.
+zc-chat-agent-switched-cleared = Switched to agent { $alias }. Your draft and queued messages were discarded.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -376,6 +378,7 @@ zc-chat-help-navigate = Navigate
 zc-chat-help-select-agent = Select agent
 zc-chat-help-quit = Quit
 zc-chat-help-switch-session = Switch session
+zc-chat-help-switch-agent = Switch agent
 zc-chat-help-close = Close
 zc-chat-help-cancel = Cancel
 zc-chat-help-approve = Approve
