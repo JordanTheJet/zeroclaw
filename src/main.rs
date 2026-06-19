@@ -280,6 +280,8 @@ mod multimodal;
 #[cfg(feature = "agent-runtime")]
 mod observability;
 #[cfg(feature = "agent-runtime")]
+mod onboard;
+#[cfg(feature = "agent-runtime")]
 mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
@@ -441,61 +443,24 @@ enum Commands {
         agent: Option<String>,
     },
 
-    /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
+    /// Chat-based setup assistant. Talk to ZeroClaw in plain language to
+    /// inspect your install, configure providers and agents, run guided
+    /// setup, and get pointed at the next step. Bare `zeroclaw onboard`
+    /// opens the interactive assistant; a terminal is required.
     Onboard {
-        /// Configure a specific section only. Omit to run the full flow.
-        #[command(subcommand)]
-        section: Option<zeroclaw_config::sections::Section>,
+        /// Run a single request non-interactively and exit (skips the chat
+        /// loop). Example: `zeroclaw onboard --message "set me up"`.
+        #[arg(long, value_name = "TEXT")]
+        message: Option<String>,
 
-        /// Skip interactive prompts; read from --api-key/--model-provider/--model/--memory.
-        #[arg(long, hide = true)]
-        quick: bool,
+        /// Print the current configuration overview as JSON and exit.
+        #[arg(long)]
+        json: bool,
 
-        /// Force the dialoguer CLI backend instead of the default ratatui TUI.
-        #[arg(long, hide = true)]
-        cli: bool,
-
-        /// Deprecated: TUI is now the default. Accepted as a no-op for one release.
-        #[arg(long, hide = true)]
-        tui: bool,
-
-        /// Don't ask "keep stored secret?" — always re-prompt.
-        #[arg(long, hide = true)]
-        force: bool,
-
-        /// Back up existing config and start from defaults.
-        #[arg(long, hide = true)]
-        reinit: bool,
-
-        /// API key for model_provider configuration.
-        #[arg(long, hide = true)]
-        api_key: Option<String>,
-
-        /// ModelProvider name. Used as the type key for the synthesized
-        /// `[providers.models.<type>.default]` entry.
-        #[arg(long, hide = true)]
-        model_provider: Option<String>,
-
-        /// Model ID override.
-        #[arg(long, hide = true)]
-        model: Option<String>,
-
-        /// Memory backend (sqlite, lucid, markdown, none).
-        #[arg(long, hide = true)]
-        memory: Option<String>,
-
-        // Deprecated legacy flags — parsed for one release, each maps to a
-        // subcommand with a stderr warning pointing at the new form.
-        #[arg(long, hide = true)]
-        channels_only: bool,
-        #[arg(long, hide = true)]
-        providers_only: bool,
-        #[arg(long, hide = true)]
-        memory_only: bool,
-        #[arg(long, hide = true)]
-        hardware_only: bool,
-        #[arg(long, hide = true)]
-        tunnel_only: bool,
+        /// Auto-approve config-changing actions. Use with --message for
+        /// scripted/non-interactive runs.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Start the AI agent loop
@@ -3213,62 +3178,6 @@ async fn main() -> Result<()> {
         cli.verbose,
     );
 
-    // `zeroclaw onboard` is deprecated. The legacy section-by-section
-    // wizard is gone; new installs run `zeroclaw quickstart`. Any old
-    // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
-    // positional section subcommands) error so scripted callers fail
-    // loudly rather than silently doing the wrong thing.
-    #[cfg(feature = "agent-runtime")]
-    if let Commands::Onboard {
-        section,
-        quick,
-        cli: use_cli,
-        tui: _,
-        force,
-        reinit,
-        api_key,
-        model_provider,
-        model,
-        memory,
-        channels_only,
-        providers_only,
-        memory_only,
-        hardware_only,
-        tunnel_only,
-    } = &cli.command
-    {
-        let any_legacy_flag = section.is_some()
-            || *quick
-            || *use_cli
-            || *force
-            || *reinit
-            || api_key.is_some()
-            || model_provider.is_some()
-            || model.is_some()
-            || memory.is_some()
-            || *channels_only
-            || *providers_only
-            || *memory_only
-            || *hardware_only
-            || *tunnel_only;
-        if any_legacy_flag {
-            eprintln!(
-                "error: `zeroclaw onboard` is deprecated and its flags no longer apply. \
-                 Use `zeroclaw quickstart` to create a new agent, or `zeroclaw config set <path>=<value>` \
-                 for headless updates."
-            );
-            std::process::exit(2);
-        }
-        eprintln!(
-            "{}",
-            t(
-                "cli-onboard-deprecated",
-                "`zeroclaw onboard` is deprecated — use `zeroclaw quickstart`."
-            )
-        );
-        return Ok(());
-    }
-
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     #[cfg(feature = "agent-runtime")]
@@ -3430,10 +3339,14 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     match cli.command {
-        Commands::Onboard { .. }
-        | Commands::Completions { .. }
-        | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
+            unreachable!()
+        }
+
+        Commands::Onboard { message, json, yes } => {
+            Box::pin(onboard::run(&mut config, message, json, yes)).await?;
+            return Ok(());
+        }
 
         Commands::Quickstart {
             model_provider,
@@ -7002,20 +6915,29 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_help_includes_model_flag() {
+    fn onboard_help_exposes_chat_flags() {
         let cmd = Cli::command();
         let onboard = cmd
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "onboard")
             .expect("onboard subcommand must exist");
 
-        let has_model_flag = onboard
+        let longs: Vec<&str> = onboard
             .get_arguments()
-            .any(|arg| arg.get_id().as_str() == "model" && arg.get_long() == Some("model"));
+            .filter_map(clap::Arg::get_long)
+            .collect();
 
+        // The chat assistant takes only these flags; the legacy quick-setup
+        // flags (--model/--model-provider/--api-key) were removed.
+        for expected in ["message", "json", "yes"] {
+            assert!(
+                longs.contains(&expected),
+                "onboard should expose --{expected}; got {longs:?}"
+            );
+        }
         assert!(
-            has_model_flag,
-            "onboard help should include --model for quick setup overrides"
+            !longs.contains(&"model"),
+            "onboard should no longer expose --model"
         );
     }
 
@@ -7039,33 +6961,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "onboard",
-            "--model-provider",
-            "openrouter",
-            "--model",
-            "custom-model-946",
-            "--api-key",
-            "sk-issue946",
-        ])
-        .expect("quick onboard invocation should parse");
+    fn onboard_cli_accepts_message_json_and_yes_flags() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--message", "set me up", "--yes"])
+            .expect("onboard --message --yes should parse");
 
         match cli.command {
-            Commands::Onboard {
-                force,
-                channels_only,
-                api_key,
-                model_provider,
-                model,
-                ..
-            } => {
-                assert!(!force);
-                assert!(!channels_only);
-                assert_eq!(model_provider.as_deref(), Some("openrouter"));
-                assert_eq!(model.as_deref(), Some("custom-model-946"));
-                assert_eq!(api_key.as_deref(), Some("sk-issue946"));
+            Commands::Onboard { message, json, yes } => {
+                assert_eq!(message.as_deref(), Some("set me up"));
+                assert!(!json);
+                assert!(yes);
+            }
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--json"])
+            .expect("onboard --json should parse");
+        match cli.command {
+            Commands::Onboard { json, message, yes } => {
+                assert!(json);
+                assert!(message.is_none());
+                assert!(!yes);
             }
             other => panic!("expected onboard command, got {other:?}"),
         }
@@ -7119,32 +7034,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_accepts_force_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
-            .expect("onboard --force should parse");
-
-        match cli.command {
-            Commands::Onboard { force, .. } => assert!(force),
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_parses_quick_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
-            .expect("onboard --quick should parse");
-
-        match cli.command {
-            Commands::Onboard { quick, .. } => assert!(quick),
-            other => panic!("expected onboard command, got {other:?}"),
+    fn onboard_cli_rejects_removed_legacy_flags() {
+        // The deprecated onboarding flags are gone; the chat assistant
+        // auto-detects a TTY and takes only --message/--json/--yes.
+        for flag in ["--interactive", "--quick", "--force", "--channels-only"] {
+            assert!(
+                Cli::try_parse_from(["zeroclaw", "onboard", flag]).is_err(),
+                "removed flag {flag} should no longer parse"
+            );
         }
     }
 
@@ -7493,42 +7390,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_quick_and_channels_only_conflict() {
-        // --quick and --channels-only should both parse at the CLI level
-        // (the conflict is checked at runtime), but we verify both flags parse.
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--channels-only"]);
-        assert!(
-            cli.is_ok(),
-            "--quick --channels-only should parse at CLI level"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_bare_parses() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
 
         match cli.command {
-            Commands::Onboard { section, .. } => assert!(section.is_none()),
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_positional_sections_parse() {
-        // Drive from the canonical const so adding a section forces
-        // parser coverage here. clap subcommand names are the
-        // section's `as_str()` keys (snake_case) verbatim, set via
-        // `#[command(name = $key)]` inside the `sections!` macro that
-        // also defines the enum.
-        for w in zeroclaw_config::sections::QUICKSTART_SECTIONS {
-            let cli = Cli::try_parse_from(["zeroclaw", "onboard", w.as_str()])
-                .unwrap_or_else(|_| panic!("onboard {} should parse", w.as_str()));
-            match cli.command {
-                Commands::Onboard { section, .. } => assert_eq!(section, Some(*w)),
-                other => panic!("expected onboard command, got {other:?}"),
+            Commands::Onboard { message, json, yes } => {
+                assert!(message.is_none());
+                assert!(!json);
+                assert!(!yes);
             }
+            other => panic!("expected onboard command, got {other:?}"),
         }
     }
 
