@@ -911,6 +911,22 @@ cli-onboard-setup-action-key = Change API key
 cli-onboard-setup-action-model = Change model
 cli-onboard-setup-action-rename = Rename agent
 cli-onboard-setup-action-cancel = Cancel
+cli-onboard-setup-action-username = Change your name
+cli-onboard-setup-action-style = Change style
+cli-onboard-setup-action-risk = Change autonomy
+cli-onboard-setup-review-you = you       {$v}
+cli-onboard-setup-review-style = style     {$v}
+cli-onboard-setup-review-risk = autonomy  {$v}
+cli-onboard-setup-username-prompt = What's your name?
+cli-onboard-setup-style-prompt = How should it talk to you?
+cli-onboard-setup-risk-prompt = How much autonomy should it have?
+cli-onboard-style-warm = Warm & friendly
+cli-onboard-style-concise = Concise & direct
+cli-onboard-style-formal = Formal & precise
+cli-onboard-style-playful = Playful & witty
+cli-onboard-risk-balanced = Balanced — supervised, stays in its workspace (recommended)
+cli-onboard-risk-locked = Locked down — most restrictive
+cli-onboard-risk-open = Open — full autonomy, can leave the workspace (advanced)
 
 # --- onboard: greeting + agent handoff ---
 cli-onboard-greeting = Hi! I help you set up and run ZeroClaw. Try `setup` to create an agent, `status` to see what's configured, or `help` for everything I can do.
