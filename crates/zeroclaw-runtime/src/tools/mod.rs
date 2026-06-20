@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod attribution;
+pub mod create_agent;
 pub mod cron_add;
 pub(crate) mod cron_common;
 pub mod cron_list;
@@ -604,6 +605,11 @@ pub fn all_tools_with_runtime(
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
+        )),
+        Arc::new(crate::tools::create_agent::CreateAgentTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias.to_string(),
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
