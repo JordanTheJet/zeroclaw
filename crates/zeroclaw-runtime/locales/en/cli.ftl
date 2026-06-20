@@ -916,3 +916,7 @@ cli-onboard-setup-action-cancel = Cancel
 cli-onboard-greeting = Hi! I help you set up and run ZeroClaw. Try `setup` to create an agent, `status` to see what's configured, or `help` for everything I can do.
 cli-onboard-talk-confirm = Start agent {$alias} now?
 cli-onboard-talk-launching = Starting {$alias} — exit the agent to come back here.
+
+# --- onboard: setup assistant handoff ---
+cli-onboard-assistant-launching = Handing you to the setup assistant — she'll help build your agent. Type /quit to leave.
+cli-onboard-assistant-failed = Could not start the setup assistant: {$err}

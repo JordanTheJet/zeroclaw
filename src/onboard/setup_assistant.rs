@@ -1,0 +1,193 @@
+//! The bundled **setup assistant** — a small onboarding agent that takes over
+//! once `setup` has a working model, and conversationally builds the user's
+//! real agent.
+//!
+//! `setup` stays minimal (provider → key → model). It then instantiates a
+//! locked-down `setup_assistant` agent bound to that provider and launches her
+//! interactive session. She greets the user, asks what they want, *suggests*
+//! a name / model / autonomy / personality, and creates the agent with the
+//! `create_agent` tool. Her risk profile allows only `create_agent` + `ask_user`,
+//! so she can build agents but nothing else.
+
+use anyhow::Result;
+
+use zeroclaw_config::presets::{
+    AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, QuickstartPersonalityFile,
+    SelectorChoice,
+};
+use zeroclaw_config::schema::Config;
+use zeroclaw_runtime::quickstart::{Surface, apply_with_surface};
+
+use super::execute::Outcome;
+
+/// Agent alias + dedicated risk-profile name.
+const ALIAS: &str = "setup_assistant";
+
+/// Her identity — who she is and her single job.
+const IDENTITY_MD: &str = "\
+# Identity
+
+You are the **ZeroClaw Setup Assistant**. You run inside `zeroclaw onboard`.
+The person you're talking to just picked a model provider, so a working model
+is already configured.
+
+Your one job: figure out what kind of agent the person wants, then create it
+for them with the `create_agent` tool. You configure agents; you do not run
+them yourself.
+";
+
+/// Her voice and manner.
+const SOUL_MD: &str = "\
+# Soul
+
+Be warm, brief, and genuinely helpful — a sharp onboarding buddy, not a form.
+Ask one thing at a time. Make concrete suggestions instead of open menus
+(\"I'd call it `scout` and use the model you just set up — sound good?\") and let
+the person confirm or tweak. Default to sensible choices; never ask for things
+you can reasonably default. When the agent is created, celebrate briefly and
+tell them how to talk to it.
+";
+
+/// How she operates — the behavioral spec the model follows.
+const AGENTS_MD: &str = "\
+# How you work
+
+Tools you have:
+- `create_agent` — creates a new agent: name, provider, model, autonomy/risk,
+  and a personality woven from the person's name and preferred style. It writes
+  config only. This is how you actually build their agent.
+- `ask_user` — ask a question and get the answer. You can also just ask in your
+  reply; both work.
+
+Flow (keep it to a few turns):
+1. Greet the person and ask, in one sentence, what they want the agent to help
+   with.
+2. From their answer, SUGGEST a short lowercase name, a model (reuse the one
+   already configured unless they ask otherwise), an autonomy level (default
+   `balanced` — supervised, workspace-only), and a communication style. Offer
+   your picks; let them confirm or adjust.
+3. Call `create_agent` with: name, provider (reuse the existing provider
+   reference such as `anthropic.default`), model (omit to reuse), risk,
+   user_name (their name), and communication_style.
+4. On success, tell them the agent is ready and that they can run it with
+   `zeroclaw agent --agent <name>`.
+
+Do not create an agent named `setup_assistant`, and do not try to modify
+yourself. If they want several agents, create them one at a time.
+";
+
+/// What she knows about the user at the start (she learns the rest).
+const USER_MD: &str = "\
+# About the user
+
+They're setting up ZeroClaw and want a working agent fast. Learn what they need
+as you talk — suggest, don't interrogate.
+";
+
+/// Instantiate the setup assistant (if needed) and launch her session.
+pub async fn run(
+    config: &mut Config,
+    model_provider: SelectorChoice<ModelProviderChoice>,
+) -> Result<Outcome> {
+    if !config.agents.contains_key(ALIAS) {
+        if let Err(err) = instantiate(config, model_provider).await {
+            println!(
+                "{}",
+                crate::ta(
+                    "cli-onboard-assistant-failed",
+                    &[("err", &err.to_string())],
+                    "Could not start the setup assistant: {$err}",
+                )
+            );
+            return Ok(plain());
+        }
+    }
+
+    println!(
+        "{}",
+        crate::t(
+            "cli-onboard-assistant-launching",
+            "Handing you to the setup assistant — she'll help build your agent. Type /quit to leave.",
+        )
+    );
+    launch().await?;
+    Ok(plain())
+}
+
+/// Create the provider + the locked-down `setup_assistant` agent + her persona.
+async fn instantiate(
+    config: &mut Config,
+    model_provider: SelectorChoice<ModelProviderChoice>,
+) -> Result<()> {
+    let submission = BuilderSubmission {
+        model_provider,
+        risk_profile: SelectorChoice::Fresh("balanced".to_string()),
+        runtime_profile: SelectorChoice::Fresh("unbounded".to_string()),
+        memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+        channels: vec![],
+        peer_groups: vec![],
+        agent: AgentIdentity {
+            name: ALIAS.to_string(),
+            system_prompt: String::new(),
+            personality_file: None,
+            personality_files: persona(),
+        },
+    };
+    Box::pin(apply_with_surface(submission, config, Surface::Cli))
+        .await
+        .map_err(|errors| {
+            anyhow::Error::msg(
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+
+    // Lock her down: a dedicated risk profile that allows only the two tools she
+    // needs (default profile is Supervised), then rebind her to it.
+    let _ = config.create_map_key("risk_profiles", ALIAS);
+    config.set_prop_persistent(
+        &format!("risk_profiles.{ALIAS}.allowed_tools"),
+        r#"["create_agent","ask_user"]"#,
+    )?;
+    config.set_prop_persistent(&format!("agents.{ALIAS}.risk_profile"), ALIAS)?;
+    Box::pin(config.save_dirty()).await?;
+    Ok(())
+}
+
+/// Her bundled personality files.
+fn persona() -> Vec<QuickstartPersonalityFile> {
+    [
+        ("IDENTITY.md", IDENTITY_MD),
+        ("SOUL.md", SOUL_MD),
+        ("AGENTS.md", AGENTS_MD),
+        ("USER.md", USER_MD),
+    ]
+    .into_iter()
+    .map(|(filename, content)| QuickstartPersonalityFile {
+        filename: filename.to_string(),
+        content: content.to_string(),
+    })
+    .collect()
+}
+
+/// Launch `zeroclaw agent --agent setup_assistant`, inheriting this terminal.
+async fn launch() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    tokio::process::Command::new(exe)
+        .arg("agent")
+        .arg("--agent")
+        .arg(ALIAS)
+        .status()
+        .await?;
+    Ok(())
+}
+
+fn plain() -> Outcome {
+    Outcome {
+        applied: false,
+        exit_loop: false,
+    }
+}
