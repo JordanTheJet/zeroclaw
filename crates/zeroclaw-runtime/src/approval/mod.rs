@@ -111,6 +111,10 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Name shown in the CLI approval prompt ("<label> wants to execute: …").
+    /// `None` falls back to the generic "Agent"; set to the agent's alias so
+    /// the operator sees which agent is asking.
+    agent_label: Option<String>,
 }
 
 impl ApprovalManager {
@@ -124,7 +128,20 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            agent_label: None,
         }
+    }
+
+    /// Attach the calling agent's name to this manager so CLI approval prompts
+    /// read "<alias> wants to execute" instead of a generic "Agent". A blank
+    /// label is ignored (keeps the generic fallback).
+    #[must_use]
+    pub fn with_agent_label(mut self, label: impl Into<String>) -> Self {
+        let label = label.into();
+        if !label.trim().is_empty() {
+            self.agent_label = Some(label);
+        }
+        self
     }
 
     /// Create a non-interactive approval manager for channel-driven runs.
@@ -141,6 +158,7 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            agent_label: None,
         }
     }
 
@@ -159,6 +177,7 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            agent_label: None,
         }
     }
 
@@ -260,17 +279,22 @@ impl ApprovalManager {
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
-        prompt_cli_interactive(request)
+        prompt_cli_interactive(request, self.agent_label.as_deref())
     }
 }
 
 // ── CLI prompt ───────────────────────────────────────────────────
 
-/// Display the approval prompt and read user input from stdin.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+/// Display the approval prompt and read user input from stdin. `agent_label`
+/// names the requesting agent (its alias); `None` falls back to "Agent".
+fn prompt_cli_interactive(
+    request: &ApprovalRequest,
+    agent_label: Option<&str>,
+) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
+    let who = agent_label.unwrap_or("Agent");
     eprintln!();
-    eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
+    eprintln!("🔧 {who} wants to execute: {}", request.tool_name);
     eprintln!("   {summary}");
     eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
     let _ = io::stderr().flush();
@@ -446,6 +470,20 @@ mod tests {
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
+    }
+
+    #[test]
+    fn agent_label_set_and_blank_ignored() {
+        let base = ApprovalManager::from_risk_profile(&supervised_config());
+        assert_eq!(base.agent_label, None, "defaults to the generic prompt");
+
+        let named = ApprovalManager::from_risk_profile(&supervised_config())
+            .with_agent_label("social_scout");
+        assert_eq!(named.agent_label.as_deref(), Some("social_scout"));
+
+        let blank =
+            ApprovalManager::from_risk_profile(&supervised_config()).with_agent_label("   ");
+        assert_eq!(blank.agent_label, None, "blank label keeps the fallback");
     }
 
     #[test]

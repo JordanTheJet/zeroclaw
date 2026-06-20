@@ -1529,7 +1529,7 @@ pub async fn run(
 
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager = if interactive {
-            Some(ApprovalManager::from_risk_profile(&risk_profile))
+            Some(ApprovalManager::from_risk_profile(&risk_profile).with_agent_label(agent_alias))
         } else {
             None
         };
