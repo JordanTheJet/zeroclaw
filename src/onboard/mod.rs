@@ -18,6 +18,7 @@ mod execute;
 mod operation;
 mod overview;
 mod planner;
+mod setup;
 
 use std::io::IsTerminal;
 

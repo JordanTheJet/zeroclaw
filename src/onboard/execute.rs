@@ -288,16 +288,10 @@ pub async fn execute(config: &mut Config, op: Operation, approved: bool) -> Resu
         }
 
         Operation::Setup => {
-            if !approved {
-                print_plan(&Operation::Setup);
-                return Ok(Outcome::plain());
-            }
-            // Reuse the canonical guided wizard. It loads, mutates, and
-            // persists its own config through the quickstart apply path.
-            Box::pin(crate::run_quickstart_cli(None, None, None, None)).await?;
-            // Our in-memory copy is now stale; reload from disk.
-            *config = Box::pin(Config::load_or_init()).await?;
-            Ok(Outcome::applied())
+            // Setup self-gates (TTY check) and asks for its own approval after
+            // collecting the (minimal) choices, so it is invoked directly
+            // rather than through the generic persistent-op approval.
+            Box::pin(super::setup::run(config)).await
         }
 
         Operation::SetDefaultModel { reference } => {

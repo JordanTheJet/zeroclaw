@@ -59,11 +59,12 @@ pub enum Operation {
 
 impl Operation {
     /// Whether applying this operation changes persisted state and therefore
-    /// requires explicit approval before it runs.
+    /// requires explicit approval *before* it runs. `Setup` is excluded: it is
+    /// interactive and asks for its own approval after collecting choices.
     pub fn is_persistent(&self) -> bool {
         matches!(
             self,
-            Operation::Setup | Operation::SetDefaultModel { .. } | Operation::ConfigSet { .. }
+            Operation::SetDefaultModel { .. } | Operation::ConfigSet { .. }
         )
     }
 

@@ -883,3 +883,17 @@ cli-onboard-help-inspect = Inspect:  status · overview · doctor · models · a
 cli-onboard-help-change = Change:   setup · set default model <family>/<model> · config set <path> <value>
 cli-onboard-help-go = Go:       talk to agent · help · quit
 cli-onboard-help-note = Changes are previewed and need your approval before they apply.
+
+# --- onboard: conversational setup ---
+cli-onboard-setup-needs-tty = Setup is interactive — run `zeroclaw onboard` in a terminal (or `zeroclaw quickstart`).
+cli-onboard-setup-existing = Using your configured provider {$provider} (model {$model}).
+cli-onboard-setup-provider-prompt = Choose a model provider
+cli-onboard-setup-provider-local = {$name} (local — no key)
+cli-onboard-setup-key-prompt = API key for {$provider}
+cli-onboard-setup-model-prompt = Choose a model
+cli-onboard-setup-model-input = Model id
+cli-onboard-setup-name-prompt = Name your agent
+cli-onboard-setup-name-default = assistant
+cli-onboard-setup-plan = {$glyph} Plan: create agent {$name} using {$provider}/{$model}.
+cli-onboard-setup-done = {$glyph} Created agent {$name}. Run `talk to agent` to start it.
+cli-onboard-setup-failed = {$glyph} Setup could not finish:
