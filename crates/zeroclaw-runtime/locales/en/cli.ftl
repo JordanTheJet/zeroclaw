@@ -897,3 +897,22 @@ cli-onboard-setup-name-default = assistant
 cli-onboard-setup-plan = {$glyph} Plan: create agent {$name} using {$provider}/{$model}.
 cli-onboard-setup-done = {$glyph} Created agent {$name}. Run `talk to agent` to start it.
 cli-onboard-setup-failed = {$glyph} Setup could not finish:
+cli-onboard-setup-review-header = Review:
+cli-onboard-setup-review-provider = provider  {$v}
+cli-onboard-setup-review-key = key       {$v}
+cli-onboard-setup-review-model = model     {$v}
+cli-onboard-setup-review-agent = agent     {$v}
+cli-onboard-setup-key-set = (set)
+cli-onboard-setup-key-unset = (not set)
+cli-onboard-setup-action-prompt = What next?
+cli-onboard-setup-action-apply = Apply — create the agent
+cli-onboard-setup-action-provider = Change provider
+cli-onboard-setup-action-key = Change API key
+cli-onboard-setup-action-model = Change model
+cli-onboard-setup-action-rename = Rename agent
+cli-onboard-setup-action-cancel = Cancel
+
+# --- onboard: greeting + agent handoff ---
+cli-onboard-greeting = Hi! I help you set up and run ZeroClaw. Try `setup` to create an agent, `status` to see what's configured, or `help` for everything I can do.
+cli-onboard-talk-confirm = Start agent {$alias} now?
+cli-onboard-talk-launching = Starting {$alias} — exit the agent to come back here.

@@ -31,6 +31,8 @@ impl GatewayAction {
 pub enum Operation {
     /// Print the system overview snapshot.
     Overview,
+    /// Friendly reply to a greeting / small talk.
+    Greeting,
     /// List the allowed commands.
     Help,
     /// Run full diagnostics (`zeroclaw doctor`).
@@ -109,13 +111,16 @@ pub fn parse(input: &str) -> Operation {
             "Tell me what to set up — try `setup`, `status`, `doctor`, `models`, or `agents`.",
         );
     }
-    if matches!(lower.as_str(), "quit" | "exit" | "bye" | "q") {
+    if matches!(lower.as_str(), "quit" | "exit" | "bye" | "goodbye" | "q") {
         return Operation::None {
             message: "Bye.".to_string(),
             exit: true,
         };
     }
-    if matches!(lower.as_str(), "help" | "?" | "commands") {
+    if is_greeting(&lower) {
+        return Operation::Greeting;
+    }
+    if is_help_request(&lower) {
         return Operation::Help;
     }
     if matches!(lower.as_str(), "overview" | "status" | "system") {
@@ -188,8 +193,51 @@ pub fn parse(input: &str) -> Operation {
     }
 
     none(
-        "I can run `status`, `doctor`, `models`, `agents`, `gateway status`, `validate config`, set config values, or `setup`. Try `help`.",
+        "I didn't quite catch that. I can `setup` an agent, check things with `status`/`doctor`, list `agents`/`models`, or `talk to agent`. Say `help` to see everything.",
     )
+}
+
+/// Whether the input is a greeting or light small talk (handled warmly, no LLM).
+fn is_greeting(lower: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "hi",
+        "hii",
+        "hiya",
+        "hey",
+        "heya",
+        "hello",
+        "helo",
+        "yo",
+        "sup",
+        "howdy",
+        "hola",
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
+        "cheers",
+        "ok",
+        "okay",
+        "cool",
+        "nice",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    ];
+    let t = lower.trim_end_matches(['!', '.', ' ']);
+    EXACT.contains(&t) || t.starts_with("hi ") || t.starts_with("hey ") || t.starts_with("hello ")
+}
+
+/// Whether the input is asking for help / what the assistant can do.
+fn is_help_request(lower: &str) -> bool {
+    matches!(lower, "help" | "?" | "commands" | "menu")
+        || lower.contains("help me")
+        || lower.contains("can you help")
+        || lower.contains("what can you do")
+        || lower.contains("what can i do")
+        || lower.contains("what do you do")
+        || lower.contains("how do i use")
+        || lower.contains("how does this work")
 }
 
 fn none(message: &str) -> Operation {
@@ -368,5 +416,40 @@ mod tests {
     fn quit_marks_exit() {
         assert!(matches!(parse("quit"), Operation::None { exit: true, .. }));
         assert!(matches!(parse("exit"), Operation::None { exit: true, .. }));
+        assert!(matches!(
+            parse("goodbye"),
+            Operation::None { exit: true, .. }
+        ));
+    }
+
+    #[test]
+    fn greetings_get_a_friendly_reply() {
+        for g in ["hi", "hello", "hey", "thanks", "hi there", "Good morning!"] {
+            assert!(
+                matches!(parse(g), Operation::Greeting),
+                "{g:?} should greet"
+            );
+        }
+    }
+
+    #[test]
+    fn help_phrasings_route_to_help() {
+        for h in [
+            "help",
+            "?",
+            "can you help",
+            "what can you do",
+            "help me",
+            "what do you do",
+        ] {
+            assert!(matches!(parse(h), Operation::Help), "{h:?} should be Help");
+        }
+    }
+
+    #[test]
+    fn commands_are_not_mistaken_for_greetings() {
+        assert!(matches!(parse("setup"), Operation::Setup));
+        assert!(matches!(parse("status"), Operation::Overview));
+        assert!(matches!(parse("agents"), Operation::Agents));
     }
 }

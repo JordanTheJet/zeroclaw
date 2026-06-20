@@ -11,13 +11,30 @@
 //! keys); leading indentation stays in the `println!` format string so the
 //! localized prose lives entirely in the catalogue.
 
-use anyhow::Result;
+use std::io::IsTerminal;
+
+use anyhow::{Context, Result};
 use console::style;
 
 use zeroclaw_config::schema::Config;
 
 use super::operation::{GatewayAction, Operation};
 use super::overview::Overview;
+
+/// Hand off to the agent loop by running `zeroclaw agent --agent <alias>` as a
+/// child that inherits this terminal (and `ZEROCLAW_CONFIG_DIR`). Control
+/// returns to the onboard loop when the agent session ends.
+async fn launch_agent(alias: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("could not locate the zeroclaw binary")?;
+    tokio::process::Command::new(exe)
+        .arg("agent")
+        .arg("--agent")
+        .arg(alias)
+        .status()
+        .await
+        .context("could not launch the agent")?;
+    Ok(())
+}
 
 /// Result of executing one operation.
 pub struct Outcome {
@@ -55,6 +72,17 @@ pub async fn execute(config: &mut Config, op: Operation, approved: bool) -> Resu
 
         Operation::Help => {
             print_help();
+            Ok(Outcome::plain())
+        }
+
+        Operation::Greeting => {
+            println!(
+                "{}",
+                crate::t(
+                    "cli-onboard-greeting",
+                    "Hi! I help you set up and run ZeroClaw. Try `setup` to create an agent, `status` to see what's configured, or `help` for everything I can do.",
+                )
+            );
             Ok(Outcome::plain())
         }
 
@@ -245,17 +273,41 @@ pub async fn execute(config: &mut Config, op: Operation, approved: bool) -> Resu
                 });
             match target {
                 Some(alias) => {
-                    let cmd = style(format!("zeroclaw agent --agent {alias}"))
-                        .cyan()
-                        .to_string();
-                    println!(
-                        "{}",
-                        crate::ta(
-                            "cli-onboard-talk-start",
-                            &[("cmd", &cmd)],
-                            "Start your agent with: {$cmd}",
-                        )
-                    );
+                    let interactive =
+                        std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+                    let launch = interactive
+                        && dialoguer::Confirm::new()
+                            .with_prompt(crate::ta(
+                                "cli-onboard-talk-confirm",
+                                &[("alias", &alias)],
+                                "Start agent {$alias} now?",
+                            ))
+                            .default(true)
+                            .interact()
+                            .unwrap_or(false);
+                    if launch {
+                        println!(
+                            "{}",
+                            crate::ta(
+                                "cli-onboard-talk-launching",
+                                &[("alias", &alias)],
+                                "Starting {$alias} — exit the agent to come back here.",
+                            )
+                        );
+                        launch_agent(&alias).await?;
+                    } else {
+                        let cmd = style(format!("zeroclaw agent --agent {alias}"))
+                            .cyan()
+                            .to_string();
+                        println!(
+                            "{}",
+                            crate::ta(
+                                "cli-onboard-talk-start",
+                                &[("cmd", &cmd)],
+                                "Start your agent with: {$cmd}",
+                            )
+                        );
+                    }
                 }
                 None if overview.agents.is_empty() => {
                     println!(

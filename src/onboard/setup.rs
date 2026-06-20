@@ -1,20 +1,19 @@
 //! Conversational `setup` — the intuitive path to a working agent.
 //!
-//! Ported in spirit from OpenClaw's `onboard --modern` setup, which detects
-//! what's usable and asks for as little as possible. Instead of the full
-//! quickstart checklist, this asks only the questions that have no sensible
-//! default:
+//! Ported in spirit from OpenClaw's `onboard --modern` setup. Instead of the
+//! full quickstart checklist, it asks only the questions that have no sensible
+//! default, then shows an **editable review** so nothing is a one-way march:
 //!
-//! * Already-usable install (a provider with a model exists) → ask only the
-//!   **agent name**, bind a new agent to that provider.
-//! * Fresh install → **pick provider → enter key** (skipped for local/keyless
-//!   providers) → **pick model** (catalog default = newest/strongest, or
-//!   free-text) → **agent name**.
+//! * Already-usable install (a provider with a model exists) → ask the agent
+//!   name, review, apply.
+//! * Fresh install → pick provider (key prompt skipped for local/keyless) →
+//!   API key → model (catalog default = newest, or free-text) → agent name →
+//!   review (change any field) → apply.
 //!
-//! Everything else is defaulted: `balanced` risk, `sqlite` memory, no
-//! channels, empty system prompt. The collected choices are landed through the
+//! Every prompt is Esc-to-back-out, and nothing is written until you choose
+//! *Apply* on the review screen. The collected choices are landed through the
 //! canonical [`apply_with_surface`] path — the same sanctioned write path the
-//! quickstart wizard uses — after an explicit approval.
+//! quickstart wizard uses.
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -22,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use console::style;
-use dialoguer::{Confirm, FuzzySelect, Input, Password};
+use dialoguer::{FuzzySelect, Input, Password, Select};
 
 use zeroclaw_config::presets::{
     AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
@@ -36,8 +35,7 @@ use super::execute::Outcome;
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Run the conversational setup flow. Self-gates on a TTY and asks for its own
-/// approval before writing, so the caller invokes it directly (it is not a
-/// generic approval-gated operation).
+/// approval (via the review screen) before writing.
 pub async fn run(config: &mut Config) -> Result<Outcome> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         println!(
@@ -51,7 +49,7 @@ pub async fn run(config: &mut Config) -> Result<Outcome> {
     }
 
     // Branch on whether the install already has a provider that can run.
-    let submission = if let Some((provider_ref, model)) = first_usable_provider(config) {
+    let collected = if let Some((provider_ref, model)) = first_usable_provider(config) {
         println!(
             "{}",
             crate::ta(
@@ -60,51 +58,15 @@ pub async fn run(config: &mut Config) -> Result<Outcome> {
                 "Using your configured provider {$provider} (model {$model}).",
             )
         );
-        let Some(name) = prompt_agent_name(config)? else {
-            return Ok(skipped());
-        };
-        if !confirm_plan(&name, &provider_ref, &model)? {
-            return Ok(skipped());
-        }
-        build_submission(SelectorChoice::Existing(provider_ref), name)
+        collect_existing(config, &provider_ref, &model)?
     } else {
-        let Some((provider_type, local)) = pick_provider()? else {
-            return Ok(skipped());
-        };
-        let key = if local {
-            None
-        } else {
-            prompt_key(&provider_type)?
-        };
-        // Aborting the key prompt (Ctrl+C) bails out of setup entirely.
-        if !local && key.is_none() {
-            return Ok(skipped());
-        }
-        let Some(model) = pick_model(&provider_type).await? else {
-            return Ok(skipped());
-        };
-        let Some(name) = prompt_agent_name(config)? else {
-            return Ok(skipped());
-        };
-        if !confirm_plan(&name, &provider_type, &model)? {
-            return Ok(skipped());
-        }
-        let mut fields = HashMap::new();
-        if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
-            // snake_case key — the apply path round-trips it verbatim into
-            // set_prop_persistent, which rejects the kebab spelling.
-            fields.insert("api_key".to_string(), k);
-        }
-        build_submission(
-            SelectorChoice::Fresh(ModelProviderChoice {
-                provider_type,
-                alias: "default".to_string(),
-                model,
-                fields,
-            }),
-            name,
-        )
+        collect_fresh(config).await?
     };
+
+    let Some((model_provider, name)) = collected else {
+        return Ok(skipped());
+    };
+    let submission = build_submission(model_provider, name);
 
     match Box::pin(apply_with_surface(submission, config, Surface::Cli)).await {
         Ok(applied) => {
@@ -135,6 +97,200 @@ pub async fn run(config: &mut Config) -> Result<Outcome> {
             Ok(plain())
         }
     }
+}
+
+/// Fresh-install collection: pick everything, then loop on an editable review
+/// until the user applies or cancels. Returns the provider choice + agent name.
+async fn collect_fresh(
+    config: &Config,
+) -> Result<Option<(SelectorChoice<ModelProviderChoice>, String)>> {
+    let Some((mut provider_type, mut local)) = pick_provider()? else {
+        return Ok(None);
+    };
+    let mut key = if local {
+        None
+    } else {
+        match prompt_key(&provider_type)? {
+            Some(k) => Some(k),
+            None => return Ok(None),
+        }
+    };
+    let Some(mut model) = pick_model(&provider_type).await? else {
+        return Ok(None);
+    };
+    let Some(mut name) = prompt_agent_name(config, None)? else {
+        return Ok(None);
+    };
+
+    loop {
+        print_review(&provider_type, local, key.as_deref(), &model, &name);
+        match review_action(local)? {
+            ReviewAction::Apply => {
+                let mut fields = HashMap::new();
+                if let Some(k) = key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    // snake_case key — the apply path round-trips it verbatim into
+                    // set_prop_persistent, which rejects the kebab spelling.
+                    fields.insert("api_key".to_string(), k.clone());
+                }
+                return Ok(Some((
+                    SelectorChoice::Fresh(ModelProviderChoice {
+                        provider_type: provider_type.clone(),
+                        alias: "default".to_string(),
+                        model: model.clone(),
+                        fields,
+                    }),
+                    name.clone(),
+                )));
+            }
+            ReviewAction::Cancel => return Ok(None),
+            ReviewAction::Provider => {
+                // Provider drives the key requirement and the model list, so
+                // re-collect those when it changes.
+                if let Some((pt, lo)) = pick_provider()? {
+                    provider_type = pt;
+                    local = lo;
+                    key = if local {
+                        None
+                    } else {
+                        prompt_key(&provider_type)?.or(key)
+                    };
+                    if let Some(m) = pick_model(&provider_type).await? {
+                        model = m;
+                    }
+                }
+            }
+            ReviewAction::Key => {
+                if let Some(k) = prompt_key(&provider_type)? {
+                    key = Some(k);
+                }
+            }
+            ReviewAction::Model => {
+                if let Some(m) = pick_model(&provider_type).await? {
+                    model = m;
+                }
+            }
+            ReviewAction::Rename => {
+                if let Some(n) = prompt_agent_name(config, Some(&name))? {
+                    name = n;
+                }
+            }
+        }
+    }
+}
+
+/// Already-usable collection: bind a new agent to the existing provider. Only
+/// the agent name is editable here.
+fn collect_existing(
+    config: &Config,
+    provider_ref: &str,
+    model: &str,
+) -> Result<Option<(SelectorChoice<ModelProviderChoice>, String)>> {
+    let Some(mut name) = prompt_agent_name(config, None)? else {
+        return Ok(None);
+    };
+    loop {
+        println!("{}", crate::t("cli-onboard-setup-review-header", "Review:"));
+        review_line(
+            "cli-onboard-setup-review-provider",
+            "provider  {$v}",
+            provider_ref,
+        );
+        review_line("cli-onboard-setup-review-model", "model     {$v}", model);
+        review_line("cli-onboard-setup-review-agent", "agent     {$v}", &name);
+        let labels = [
+            crate::t("cli-onboard-setup-action-apply", "Apply — create the agent"),
+            crate::t("cli-onboard-setup-action-rename", "Rename agent"),
+            crate::t("cli-onboard-setup-action-cancel", "Cancel"),
+        ];
+        match Select::new()
+            .with_prompt(crate::t("cli-onboard-setup-action-prompt", "What next?"))
+            .items(&labels)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(0) => {
+                return Ok(Some((
+                    SelectorChoice::Existing(provider_ref.to_string()),
+                    name,
+                )));
+            }
+            Some(1) => {
+                if let Some(n) = prompt_agent_name(config, Some(&name))? {
+                    name = n;
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// One review action chosen from the menu.
+enum ReviewAction {
+    Apply,
+    Provider,
+    Key,
+    Model,
+    Rename,
+    Cancel,
+}
+
+/// Render the editable summary for the fresh flow.
+fn print_review(provider: &str, local: bool, key: Option<&str>, model: &str, name: &str) {
+    println!("{}", crate::t("cli-onboard-setup-review-header", "Review:"));
+    review_line(
+        "cli-onboard-setup-review-provider",
+        "provider  {$v}",
+        provider,
+    );
+    if !local {
+        let status = if key.is_some_and(|k| !k.trim().is_empty()) {
+            crate::t("cli-onboard-setup-key-set", "(set)")
+        } else {
+            crate::t("cli-onboard-setup-key-unset", "(not set)")
+        };
+        review_line("cli-onboard-setup-review-key", "key       {$v}", &status);
+    }
+    review_line("cli-onboard-setup-review-model", "model     {$v}", model);
+    review_line("cli-onboard-setup-review-agent", "agent     {$v}", name);
+}
+
+/// Print one indented `label  value` review row.
+fn review_line(key: &str, fallback: &str, value: &str) {
+    println!("  {}", crate::ta(key, &[("v", value)], fallback));
+}
+
+/// The review menu for the fresh flow. Esc → [`ReviewAction::Cancel`].
+fn review_action(local: bool) -> Result<ReviewAction> {
+    let mut actions = vec![ReviewAction::Apply];
+    let mut labels = vec![crate::t(
+        "cli-onboard-setup-action-apply",
+        "Apply — create the agent",
+    )];
+    actions.push(ReviewAction::Provider);
+    labels.push(crate::t(
+        "cli-onboard-setup-action-provider",
+        "Change provider",
+    ));
+    if !local {
+        actions.push(ReviewAction::Key);
+        labels.push(crate::t("cli-onboard-setup-action-key", "Change API key"));
+    }
+    actions.push(ReviewAction::Model);
+    labels.push(crate::t("cli-onboard-setup-action-model", "Change model"));
+    actions.push(ReviewAction::Rename);
+    labels.push(crate::t("cli-onboard-setup-action-rename", "Rename agent"));
+    actions.push(ReviewAction::Cancel);
+    labels.push(crate::t("cli-onboard-setup-action-cancel", "Cancel"));
+
+    let pick = Select::new()
+        .with_prompt(crate::t("cli-onboard-setup-action-prompt", "What next?"))
+        .items(&labels)
+        .default(0)
+        .interact_opt()?;
+    Ok(match pick {
+        Some(i) => actions.into_iter().nth(i).unwrap_or(ReviewAction::Cancel),
+        None => ReviewAction::Cancel,
+    })
 }
 
 /// First configured provider that could actually run (has a model and either a
@@ -254,43 +410,24 @@ async fn pick_model(provider: &str) -> Result<Option<String>> {
     Ok(Some(ids[i].clone()))
 }
 
-/// Agent-name prompt, validated as an alias. Defaults to `assistant` unless
-/// that alias is taken. Returns `None` if aborted.
-fn prompt_agent_name(config: &Config) -> Result<Option<String>> {
-    let suggested = crate::t("cli-onboard-setup-name-default", "assistant");
+/// Agent-name prompt, validated as an alias. Defaults to `current` when editing,
+/// else `assistant` (unless taken). Returns `None` if aborted.
+fn prompt_agent_name(config: &Config, current: Option<&str>) -> Result<Option<String>> {
+    let default = match current {
+        Some(name) => name.to_string(),
+        None => crate::t("cli-onboard-setup-name-default", "assistant"),
+    };
     let mut input = Input::<String>::new()
         .with_prompt(crate::t("cli-onboard-setup-name-prompt", "Name your agent"))
         .allow_empty(false)
         .validate_with(|s: &String| zeroclaw_config::helpers::validate_alias_key(s));
-    if !config.agents.contains_key(&suggested) {
-        input = input.default(suggested);
+    if !default.is_empty() && (current.is_some() || !config.agents.contains_key(&default)) {
+        input = input.default(default);
     }
     match input.interact_text() {
         Ok(name) => Ok(Some(name)),
         Err(_) => Ok(None),
     }
-}
-
-/// Print the plan and ask for approval before any write.
-fn confirm_plan(name: &str, provider: &str, model: &str) -> Result<bool> {
-    let glyph = style("?").yellow().to_string();
-    println!(
-        "{}",
-        crate::ta(
-            "cli-onboard-setup-plan",
-            &[
-                ("glyph", &glyph),
-                ("name", name),
-                ("provider", provider),
-                ("model", model)
-            ],
-            "{$glyph} Plan: create agent {$name} using {$provider}/{$model}.",
-        )
-    );
-    Ok(Confirm::new()
-        .with_prompt(crate::t("cli-onboard-apply-prompt", "Apply this change?"))
-        .default(false)
-        .interact()?)
 }
 
 /// Build a minimal one-agent submission. Risk `balanced`, sqlite memory, no
