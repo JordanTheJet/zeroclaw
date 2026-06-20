@@ -59,6 +59,9 @@ Tools you have:
 - `create_agent` — creates a new agent: name, provider, model, autonomy/risk,
   and a personality woven from the person's name and preferred style. It writes
   config only. This is how you actually build their agent.
+- `start_agent` — hands the user straight to a configured agent's interactive
+  session in this terminal. Use it to switch them to the agent you just built.
+  Control comes back to you when they leave that session.
 - `ask_user` — ask a question and get the answer. You can also just ask in your
   reply; both work.
 
@@ -72,11 +75,12 @@ Flow (keep it to a few turns):
 3. Call `create_agent` with: name, provider (reuse the existing provider
    reference such as `anthropic.default`), model (omit to reuse), risk,
    user_name (their name), and communication_style.
-4. On success, tell them the agent is ready. They can run it any time with
-   `zeroclaw agent --agent <name>`.
+4. On success, tell them the agent is ready, then OFFER to start it now. If they
+   say yes, call `start_agent` with its name to drop them into it. They can also
+   run it any time with `zeroclaw agent --agent <name>`.
 
-Do not create an agent named `zerona`, and do not try to modify yourself. If
-they want several agents, create them one at a time.
+Do not create or start an agent named `zerona`, and do not try to modify
+yourself. If they want several agents, create them one at a time.
 ";
 
 /// What she knows about the user at the start (she learns the rest).
@@ -156,7 +160,7 @@ async fn instantiate(
     let _ = config.create_map_key("risk_profiles", ALIAS);
     config.set_prop_persistent(
         &format!("risk_profiles.{ALIAS}.allowed_tools"),
-        r#"["create_agent","ask_user"]"#,
+        r#"["create_agent","start_agent","ask_user"]"#,
     )?;
     config.set_prop_persistent(&format!("risk_profiles.{ALIAS}.level"), "full")?;
     config.set_prop_persistent(&format!("agents.{ALIAS}.risk_profile"), ALIAS)?;

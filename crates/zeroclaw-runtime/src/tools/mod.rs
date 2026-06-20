@@ -41,6 +41,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod spawn_subagent;
+pub mod start_agent;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -607,6 +608,11 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(crate::tools::create_agent::CreateAgentTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias.to_string(),
+        )),
+        Arc::new(crate::tools::start_agent::StartAgentTool::new(
             config.clone(),
             security.clone(),
             agent_alias.to_string(),
