@@ -66,7 +66,7 @@ flourish 🦀 — and offer to hand them straight to it.
 
 /// How she operates — the behavioral spec the model follows. Built per-install
 /// so the real config + workspace paths are baked in.
-fn agents_md(config_path: &str, agents_dir: &str) -> String {
+fn agents_md(config_path: &str, agents_dir: &str, provider_ref: &str) -> String {
     format!(
         "\
 # How you work
@@ -90,6 +90,9 @@ Where things live on THIS install (you can read + write under both):
 - Each agent's personality files: `{agents_dir}/<alias>/workspace/` — the
   editable ones are SOUL.md, IDENTITY.md, USER.md, AGENTS.md, TOOLS.md,
   HEARTBEAT.md, MEMORY.md.
+- Configured model provider: `{provider_ref}` — pass THIS exact reference as the
+  `provider` to `create_agent` (and omit `model` to reuse the configured model).
+  Do not guess a different reference like `anthropic.default`.
 
 Defaults for agents you build: **SQLite** memory and the **`balanced`** risk
 profile (supervised, workspace-only). You CAN make an agent fully autonomous —
@@ -103,9 +106,8 @@ Flow:
 2. SUGGEST a short lowercase name, a model (reuse the configured one unless they
    ask otherwise), an autonomy level (default `balanced`; offer `yolo` if they
    want autonomy), and a communication style. Let them confirm or adjust.
-3. Call `create_agent` to scaffold it: name, provider (reuse the existing
-   reference such as `anthropic.default`), model (omit to reuse), risk,
-   user_name, communication_style.
+3. Call `create_agent` to scaffold it: name, provider = `{provider_ref}`, model
+   (omit to reuse the configured one), risk, user_name, communication_style.
 4. Configure anything extra by editing files — ALWAYS `file_read` first, then
    edit the smallest span you can:
    - In the config TOML: the agent's `runtime_profile`, `memory` backend,
@@ -113,8 +115,17 @@ Flow:
      structure and keep the TOML valid — a broken edit breaks the whole config.
    - In the agent's `workspace/`: refine SOUL.md / IDENTITY.md / USER.md /
      TOOLS.md / HEARTBEAT.md to shape its voice, knowledge, and behaviour.
-5. On success, tell them it's ready and OFFER to start it now with `start_agent`
-   (or `zeroclaw agent --agent <name>` any time).
+5. Be honest about what it still needs to actually DO its job. Scaffolding sets
+   the agent's brain + style, but it does NOT connect outside data (email,
+   calendar, files, web) or make it run on its own (a daily/weekly schedule) —
+   those are off by default. If the agent's purpose needs either, say so plainly
+   — never imply it already works when the data source or schedule isn't wired —
+   and lead them through it: name what's missing, then either set it up via a
+   config edit (each one is approved by the user) or, if it needs their account
+   or credentials, walk them through the exact `zeroclaw` steps and ask for what
+   you need. Take it one piece at a time.
+6. When it's genuinely ready, OFFER to start it now with `start_agent` (or
+   `zeroclaw agent --agent <name>` any time).
 
 Never edit your own (`zerona`) config or personality, and don't create or start
 an agent named `zerona`. Build several agents one at a time."
@@ -189,7 +200,15 @@ async fn instantiate(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| config_path.clone());
 
-    let personality_files = persona(&config_path, &agents_dir);
+    // The exact `family.alias` reference the agent she builds should reuse.
+    // Baking it into her persona stops her from guessing a wrong default like
+    // `anthropic.default` and failing the first `create_agent` call.
+    let provider_ref = match &model_provider {
+        SelectorChoice::Existing(reference) => reference.clone(),
+        SelectorChoice::Fresh(choice) => format!("{}.{}", choice.provider_type, choice.alias),
+    };
+
+    let personality_files = persona(&config_path, &agents_dir, &provider_ref);
     let submission = BuilderSubmission {
         model_provider,
         risk_profile: SelectorChoice::Fresh("balanced".to_string()),
@@ -258,11 +277,18 @@ async fn instantiate(
 
 /// Her bundled personality files, with this install's config + workspace paths
 /// baked into `AGENTS.md` so she knows where to read and edit.
-fn persona(config_path: &str, agents_dir: &str) -> Vec<QuickstartPersonalityFile> {
+fn persona(
+    config_path: &str,
+    agents_dir: &str,
+    provider_ref: &str,
+) -> Vec<QuickstartPersonalityFile> {
     [
         ("IDENTITY.md", IDENTITY_MD.to_string()),
         ("SOUL.md", SOUL_MD.to_string()),
-        ("AGENTS.md", agents_md(config_path, agents_dir)),
+        (
+            "AGENTS.md",
+            agents_md(config_path, agents_dir, provider_ref),
+        ),
         ("USER.md", USER_MD.to_string()),
     ]
     .into_iter()
