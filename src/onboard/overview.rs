@@ -131,102 +131,177 @@ impl Overview {
     }
 
     /// The single recommended next command, mirroring the install's state.
-    pub fn next_step(&self) -> &'static str {
+    /// Returns a localized string (display-only; the planner reads the struct
+    /// fields, not this text).
+    pub fn next_step(&self) -> String {
         if !self.config_exists || self.default_model.is_none() {
-            "run `setup` to create your first working agent"
+            crate::t(
+                "cli-onboard-next-setup-first",
+                "run `setup` to create your first working agent",
+            )
         } else if !self.config_issues.is_empty() {
-            "run `validate config` or `doctor` to inspect the issues above"
+            crate::t(
+                "cli-onboard-next-validate",
+                "run `validate config` or `doctor` to inspect the issues above",
+            )
         } else if self.agents.iter().all(|a| !a.enabled) {
-            "run `setup` to add an agent"
+            crate::t("cli-onboard-next-add-agent", "run `setup` to add an agent")
         } else if !self.gateway_reachable && !self.service_running {
-            "run `gateway status` to check the gateway/daemon"
+            crate::t(
+                "cli-onboard-next-gateway",
+                "run `gateway status` to check the gateway/daemon",
+            )
         } else {
-            "run `talk to agent` to start your configured agent"
+            crate::t(
+                "cli-onboard-next-talk",
+                "run `talk to agent` to start your configured agent",
+            )
         }
     }
 
     /// Human-readable banner shown on entry and on `overview`/`status`.
+    /// Every surface string routes through the locale bundle; only data
+    /// (paths, aliases, model ids, urls) and the structured field keys are
+    /// substituted verbatim. Display-only — `--json` serializes the struct,
+    /// and the planner reads the struct fields, not this text.
     pub fn format(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!(
-            "Config: {}",
-            if self.config_exists {
-                "present"
-            } else {
-                "missing (first run)"
-            }
+
+        let config_state = if self.config_exists {
+            crate::t("cli-onboard-ov-present", "present")
+        } else {
+            crate::t("cli-onboard-ov-missing", "missing (first run)")
+        };
+        lines.push(crate::ta(
+            "cli-onboard-ov-config",
+            &[("state", &config_state)],
+            "Config: {$state}",
         ));
-        lines.push(format!("Path: {}", self.config_path));
-        lines.push(format!(
-            "Default model: {}",
-            self.default_model.as_deref().unwrap_or("not configured")
+        lines.push(crate::ta(
+            "cli-onboard-ov-path",
+            &[("path", &self.config_path)],
+            "Path: {$path}",
+        ));
+        let default_model = self
+            .default_model
+            .clone()
+            .unwrap_or_else(|| crate::t("cli-onboard-ov-not-configured", "not configured"));
+        lines.push(crate::ta(
+            "cli-onboard-ov-default-model",
+            &[("model", &default_model)],
+            "Default model: {$model}",
         ));
 
-        lines.push("Agents:".to_string());
+        lines.push(crate::t("cli-onboard-ov-agents", "Agents:"));
         if self.agents.is_empty() {
-            lines.push("  - none".to_string());
+            lines.push(format!("  - {}", crate::t("cli-onboard-ov-none", "none")));
         } else {
             for a in &self.agents {
-                let mut parts = vec![a.alias.clone(), format!("provider={}", a.model_provider)];
-                if let Some(m) = &a.model {
-                    parts.push(format!("model={m}"));
-                }
-                if !a.enabled {
-                    parts.push("disabled".to_string());
-                }
-                lines.push(format!("  - {}", parts.join(" | ")));
-            }
-        }
-
-        lines.push("Providers:".to_string());
-        if self.providers.is_empty() {
-            lines.push("  - none".to_string());
-        } else {
-            for p in &self.providers {
+                let model = a
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| crate::t("cli-onboard-agent-inherited", "(inherited)"));
+                let state = if a.enabled {
+                    String::new()
+                } else {
+                    format!(" {}", crate::t("cli-onboard-agent-disabled", "[disabled]"))
+                };
                 lines.push(format!(
-                    "  - {}.{} | model={} | key={}",
-                    p.family,
-                    p.alias,
-                    p.model.as_deref().unwrap_or("(none)"),
-                    if p.has_key { "yes" } else { "no" }
+                    "  - {}",
+                    crate::ta(
+                        "cli-onboard-agent-row",
+                        &[
+                            ("alias", &a.alias),
+                            ("provider", &a.model_provider),
+                            ("model", &model),
+                            ("state", &state),
+                        ],
+                        "{$alias} | provider={$provider} | model={$model}{$state}",
+                    )
                 ));
             }
         }
 
-        lines.push(format!(
-            "Gateway: {} ({})",
-            if self.gateway_reachable {
-                "reachable"
-            } else {
-                "not reachable"
-            },
-            self.gateway_url
-        ));
-        lines.push(format!(
-            "Service: {}",
-            if self.service_running {
-                "running"
-            } else {
-                "not running"
+        lines.push(crate::t("cli-onboard-ov-providers", "Providers:"));
+        if self.providers.is_empty() {
+            lines.push(format!("  - {}", crate::t("cli-onboard-ov-none", "none")));
+        } else {
+            for p in &self.providers {
+                let model = p
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| crate::t("cli-onboard-ov-model-none", "(none)"));
+                let key = if p.has_key {
+                    crate::t("cli-onboard-ov-key-yes", "yes")
+                } else {
+                    crate::t("cli-onboard-ov-key-no", "no")
+                };
+                lines.push(format!(
+                    "  - {}",
+                    crate::ta(
+                        "cli-onboard-ov-provider-row",
+                        &[
+                            ("family", &p.family),
+                            ("alias", &p.alias),
+                            ("model", &model),
+                            ("key", &key),
+                        ],
+                        "{$family}.{$alias} | model={$model} | key={$key}",
+                    )
+                ));
             }
+        }
+
+        let gw_state = if self.gateway_reachable {
+            crate::t("cli-onboard-reachable", "reachable")
+        } else {
+            crate::t("cli-onboard-not-reachable", "not reachable")
+        };
+        lines.push(crate::ta(
+            "cli-onboard-ov-gateway",
+            &[("state", &gw_state), ("url", &self.gateway_url)],
+            "Gateway: {$state} ({$url})",
         ));
-        lines.push(format!(
-            "Planner: {}",
-            if self.default_model.is_some() {
-                "model-assisted for free-form requests"
-            } else {
-                "deterministic only until a model is configured"
-            }
+        let svc_state = if self.service_running {
+            crate::t("cli-onboard-running", "running")
+        } else {
+            crate::t("cli-onboard-not-running", "not running")
+        };
+        lines.push(crate::ta(
+            "cli-onboard-ov-service",
+            &[("state", &svc_state)],
+            "Service: {$state}",
+        ));
+        let planner_state = if self.default_model.is_some() {
+            crate::t(
+                "cli-onboard-ov-planner-on",
+                "model-assisted for free-form requests",
+            )
+        } else {
+            crate::t(
+                "cli-onboard-ov-planner-off",
+                "deterministic only until a model is configured",
+            )
+        };
+        lines.push(crate::ta(
+            "cli-onboard-ov-planner",
+            &[("state", &planner_state)],
+            "Planner: {$state}",
         ));
 
         if !self.config_issues.is_empty() {
-            lines.push("Config issues:".to_string());
+            lines.push(crate::t("cli-onboard-ov-config-issues", "Config issues:"));
             for issue in &self.config_issues {
                 lines.push(format!("  - {issue}"));
             }
         }
 
-        lines.push(format!("Next: {}", self.next_step()));
+        let step = self.next_step();
+        lines.push(crate::ta(
+            "cli-onboard-ov-next",
+            &[("step", &step)],
+            "Next: {$step}",
+        ));
         lines.join("\n")
     }
 }

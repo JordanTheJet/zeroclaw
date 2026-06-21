@@ -884,6 +884,38 @@ cli-onboard-help-change = Change:   setup · set default model <family>/<model> 
 cli-onboard-help-go = Go:       talk to agent · help · quit
 cli-onboard-help-note = Changes are previewed and need your approval before they apply.
 
+# --- onboard: parser hints (Operation::None messages) ---
+cli-onboard-empty-input = Tell me what to set up — try `setup`, `status`, `doctor`, `models`, or `agents`.
+cli-onboard-bye = Bye.
+cli-onboard-unknown-input = I didn't quite catch that. I can `setup` an agent, check things with `status`/`doctor`, list `agents`/`models`, or `talk to agent`. Say `help` to see everything.
+
+# --- onboard: overview snapshot (Overview::format / next_step) ---
+cli-onboard-ov-config = Config: {$state}
+cli-onboard-ov-present = present
+cli-onboard-ov-missing = missing (first run)
+cli-onboard-ov-path = Path: {$path}
+cli-onboard-ov-default-model = Default model: {$model}
+cli-onboard-ov-not-configured = not configured
+cli-onboard-ov-agents = Agents:
+cli-onboard-ov-none = none
+cli-onboard-ov-providers = Providers:
+cli-onboard-ov-provider-row = {$family}.{$alias} | model={$model} | key={$key}
+cli-onboard-ov-model-none = (none)
+cli-onboard-ov-key-yes = yes
+cli-onboard-ov-key-no = no
+cli-onboard-ov-gateway = Gateway: {$state} ({$url})
+cli-onboard-ov-service = Service: {$state}
+cli-onboard-ov-planner = Planner: {$state}
+cli-onboard-ov-planner-on = model-assisted for free-form requests
+cli-onboard-ov-planner-off = deterministic only until a model is configured
+cli-onboard-ov-config-issues = Config issues:
+cli-onboard-ov-next = Next: {$step}
+cli-onboard-next-setup-first = run `setup` to create your first working agent
+cli-onboard-next-validate = run `validate config` or `doctor` to inspect the issues above
+cli-onboard-next-add-agent = run `setup` to add an agent
+cli-onboard-next-gateway = run `gateway status` to check the gateway/daemon
+cli-onboard-next-talk = run `talk to agent` to start your configured agent
+
 # --- onboard: conversational setup ---
 cli-onboard-setup-needs-tty = Setup is interactive — run `zeroclaw onboard` in a terminal (or `zeroclaw quickstart`).
 cli-onboard-setup-existing = Using your configured provider {$provider} (model {$model}).

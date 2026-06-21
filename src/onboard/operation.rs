@@ -107,13 +107,14 @@ pub fn parse(input: &str) -> Operation {
     let lower = trimmed.to_ascii_lowercase();
 
     if trimmed.is_empty() {
-        return none(
+        return none(crate::t(
+            "cli-onboard-empty-input",
             "Tell me what to set up — try `setup`, `status`, `doctor`, `models`, or `agents`.",
-        );
+        ));
     }
     if matches!(lower.as_str(), "quit" | "exit" | "bye" | "goodbye" | "q") {
         return Operation::None {
-            message: "Bye.".to_string(),
+            message: crate::t("cli-onboard-bye", "Bye."),
             exit: true,
         };
     }
@@ -192,9 +193,10 @@ pub fn parse(input: &str) -> Operation {
         return Operation::Models;
     }
 
-    none(
+    none(crate::t(
+        "cli-onboard-unknown-input",
         "I didn't quite catch that. I can `setup` an agent, check things with `status`/`doctor`, list `agents`/`models`, or `talk to agent`. Say `help` to see everything.",
-    )
+    ))
 }
 
 /// Whether the input is a greeting or light small talk (handled warmly, no LLM).
@@ -240,9 +242,14 @@ fn is_help_request(lower: &str) -> bool {
         || lower.contains("how does this work")
 }
 
-fn none(message: &str) -> Operation {
+/// Build a non-exit [`Operation::None`] carrying an already-localized hint.
+/// Callers pass the resolved Fluent string (via [`crate::t`]) so the message
+/// stored in the enum — and later printed verbatim — never bypasses the
+/// locale bundle, even though the `cli_fluent_coverage` source scan can't see
+/// strings held in enum fields.
+fn none(message: String) -> Operation {
     Operation::None {
-        message: message.to_string(),
+        message,
         exit: false,
     }
 }
@@ -451,5 +458,42 @@ mod tests {
         assert!(matches!(parse("setup"), Operation::Setup));
         assert!(matches!(parse("status"), Operation::Overview));
         assert!(matches!(parse("agents"), Operation::Agents));
+    }
+
+    /// The hints carried in `Operation::None::message` are stored in an enum
+    /// field, so the `cli_fluent_coverage` source scan can't see them. This
+    /// closes that blind spot: every `None` message must resolve through the
+    /// locale bundle, i.e. equal `crate::t(<key>, _)` for its key. (`crate::t`
+    /// looks the key up in the embedded catalogue and ignores the fallback, so
+    /// a non-empty result also proves the key exists.)
+    #[test]
+    fn none_messages_route_through_fluent() {
+        // (input, expected key, expected exit)
+        let cases = [
+            ("", "cli-onboard-empty-input", false),
+            (
+                "\u{fffd}\u{fffd} not a command \u{fffd}",
+                "cli-onboard-unknown-input",
+                false,
+            ),
+            ("quit", "cli-onboard-bye", true),
+        ];
+        for (input, key, exit) in cases {
+            match parse(input) {
+                Operation::None {
+                    message,
+                    exit: got_exit,
+                } => {
+                    assert_eq!(got_exit, exit, "{input:?} exit flag");
+                    let resolved = crate::t(key, "");
+                    assert!(
+                        !resolved.is_empty(),
+                        "`{key}` missing from the locale bundle"
+                    );
+                    assert_eq!(message, resolved, "{input:?} must resolve via `{key}`");
+                }
+                other => panic!("{input:?} expected None, got {other:?}"),
+            }
+        }
     }
 }
