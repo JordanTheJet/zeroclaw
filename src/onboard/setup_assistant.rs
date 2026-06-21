@@ -66,8 +66,10 @@ Tools you have:
   reply; both work.
 
 Flow (keep it to a few turns):
-1. Greet the person and ask, in one sentence, what they want the agent to help
-   with.
+1. The user has ALREADY been greeted and asked, in one sentence, what they want
+   their agent to do — so don't re-introduce yourself. Treat their first message
+   as that answer and respond to it directly. If it's vague, ask one quick
+   clarifying question; otherwise go straight to suggesting.
 2. From their answer, SUGGEST a short lowercase name, a model (reuse the one
    already configured unless they ask otherwise), an autonomy level (default
    `balanced` — supervised, workspace-only), and a communication style. Offer
@@ -115,6 +117,17 @@ pub async fn run(
         crate::t(
             "cli-onboard-assistant-launching",
             "Handing you to the agent builder, Zerona — she'll help build your agent. Type /quit to leave.",
+        )
+    );
+    // Open with Zerona's question so the user has something concrete to answer
+    // instead of an empty prompt. She picks up from this answer (her persona
+    // tells her not to re-greet), so it reads as one continuous conversation.
+    println!();
+    println!(
+        "{}",
+        crate::t(
+            "cli-onboard-assistant-opening",
+            "I'm Zerona, your agent builder. In one sentence, what do you want your agent to help with? For example: \"triage my GitHub notifications,\" \"draft replies to support emails,\" or \"summarize articles I save to read later.\"",
         )
     );
     launch().await?;
