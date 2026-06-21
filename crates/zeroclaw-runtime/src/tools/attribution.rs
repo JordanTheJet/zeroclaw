@@ -6,6 +6,7 @@ use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 use zeroclaw_api::tool_attribution;
 
 use crate::tools::ArcToolRef;
+use crate::tools::config_help::ConfigHelpTool;
 use crate::tools::create_agent::CreateAgentTool;
 use crate::tools::cron_add::CronAddTool;
 use crate::tools::cron_list::CronListTool;
@@ -39,6 +40,7 @@ tool_attribution!(CronRemoveTool, ToolKind::Plugin);
 tool_attribution!(CronRunTool, ToolKind::Plugin);
 tool_attribution!(CronRunsTool, ToolKind::Plugin);
 tool_attribution!(CronUpdateTool, ToolKind::Plugin);
+tool_attribution!(ConfigHelpTool, ToolKind::Plugin);
 tool_attribution!(CreateAgentTool, ToolKind::Plugin);
 tool_attribution!(DelegateTool, ToolKind::Plugin);
 tool_attribution!(FileReadTool, ToolKind::Plugin);

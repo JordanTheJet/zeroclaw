@@ -2,6 +2,23 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
+/// The full `Config` JSON Schema as a `Value` — the `root` the rest of this
+/// module's renderers (e.g. [`field_table_for_path`]) consume. Returns `None`
+/// when the crate is built without the `schema-export` feature (no `schemars`
+/// derives). This lets a downstream crate get the schema without depending on
+/// `schemars` itself, only on this crate's `schema-export`.
+#[must_use]
+pub fn config_schema_root() -> Option<Value> {
+    #[cfg(feature = "schema-export")]
+    {
+        Some(schemars::schema_for!(crate::schema::Config).to_value())
+    }
+    #[cfg(not(feature = "schema-export"))]
+    {
+        None
+    }
+}
+
 /// Build the channel streaming-capability table by walking the `channels`
 /// section of the `Config` schema. Capability is derived from each channel
 /// struct's fields, never hand-listed:

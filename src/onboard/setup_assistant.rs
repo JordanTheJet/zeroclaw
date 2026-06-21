@@ -83,6 +83,10 @@ you should: scaffolding alone rarely finishes the job. Your tools:
   the agents' personality files directly, for anything `create_agent` doesn't
   cover. (Edits surface an approval prompt to the user — that's expected; make
   the change clear and minimal so they can approve at a glance.)
+- `config_help` — look up the authoritative schema for a config section (its
+  exact keys, types, and defaults) BEFORE you edit that part of the config. It's
+  generated from the live ZeroClaw schema, so it's always correct and never
+  stale. Use it for any section whose keys you aren't 100% sure of.
 - `start_agent` — hands the user straight to a configured agent's interactive
   session. Control returns to you when they leave.
 - `ask_user` — ask a question and get the answer (you can also just ask in your
@@ -117,10 +121,11 @@ Flow:
    etc.), channels, and whether it should run on a schedule. Default-built agents
    have none of that. Handle the gaps yourself, one at a time, over as many turns
    as it takes:
-   - If you already have what you need, WIRE IT by editing the config: `file_read`
-     the relevant section first so you match its exact structure, then `file_edit`
-     the smallest valid change (the user approves each edit), then re-read to
-     confirm it took.
+   - If you already have what you need, WIRE IT by editing the config. First, if
+     you're not certain of a section's keys, call `config_help` with that section
+     (e.g. `config_help cron_jobs`) to get the exact schema. Then `file_read` the
+     live config to match its structure, `file_edit` the smallest valid change
+     (the user approves each edit), and re-read to confirm it took.
    - If a step needs something only the person can give — an account, a key, a
      schedule time, which channel to deliver to — `ask_user` for it, then make the
      edit yourself. Don't just hand them a list of manual commands; do the config
@@ -263,9 +268,8 @@ async fn instantiate(
     //    with `Always` to allow-list for the session. So a permission-changing
     //    config edit can never happen silently.
     let _ = config.create_map_key("risk_profiles", ALIAS);
-    let allowed_tools =
-        r#"["create_agent","start_agent","ask_user","file_read","file_edit","file_write"]"#;
-    let auto_approve = r#"["create_agent","start_agent","ask_user","file_read"]"#;
+    let allowed_tools = r#"["create_agent","start_agent","ask_user","file_read","file_edit","file_write","config_help"]"#;
+    let auto_approve = r#"["create_agent","start_agent","ask_user","file_read","config_help"]"#;
     let mut roots = vec![config_dir.clone()];
     if agents_dir != config_dir {
         roots.push(agents_dir.clone());
@@ -345,9 +349,8 @@ mod tests {
         let mut config = Config::default();
         let config_dir = "/zc/install";
         let agents_dir = "/zc/install/agents";
-        let allowed_tools =
-            r#"["create_agent","start_agent","ask_user","file_read","file_edit","file_write"]"#;
-        let auto_approve = r#"["create_agent","start_agent","ask_user","file_read"]"#;
+        let allowed_tools = r#"["create_agent","start_agent","ask_user","file_read","file_edit","file_write","config_help"]"#;
+        let auto_approve = r#"["create_agent","start_agent","ask_user","file_read","config_help"]"#;
 
         let _ = config.create_map_key("risk_profiles", ALIAS);
         config
