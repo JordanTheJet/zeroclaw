@@ -163,7 +163,7 @@ pub async fn run(
         "{}",
         crate::t(
             "cli-onboard-assistant-opening",
-            "I'm Zerona, your agent builder. In one sentence, what do you want your agent to help with? For example: \"triage my GitHub notifications,\" \"draft replies to support emails,\" or \"summarize articles I save to read later.\"",
+            "I'm Zerona, your agent builder 🦀. What would you like your agent to help you with? Tell me as much or as little as you like, and we'll shape it together.",
         )
     );
     launch().await?;

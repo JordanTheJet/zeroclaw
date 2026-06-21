@@ -932,7 +932,7 @@ cli-onboard-setup-review-model = model     {$v}
 cli-onboard-setup-key-set = (set)
 cli-onboard-setup-key-unset = (not set)
 cli-onboard-setup-action-prompt = What next?
-cli-onboard-setup-action-apply = Apply — set up the model & start the agent builder
+cli-onboard-setup-action-apply = Apply — start the agent builder
 cli-onboard-setup-action-provider = Change provider
 cli-onboard-setup-action-key = Change API key
 cli-onboard-setup-action-model = Change model
@@ -945,5 +945,5 @@ cli-onboard-talk-launching = Starting {$alias} — exit the agent to come back h
 
 # --- onboard: setup assistant handoff ---
 cli-onboard-assistant-launching = Handing you to the agent builder, Zerona — she'll help build your agent. Type /quit to leave.
-cli-onboard-assistant-opening = I'm Zerona, your agent builder. In one sentence, what do you want your agent to help with? For example: "triage my GitHub notifications," "draft replies to support emails," or "summarize articles I save to read later."
+cli-onboard-assistant-opening = I'm Zerona, your agent builder 🦀. What would you like your agent to help you with? Tell me as much or as little as you like, and we'll shape it together.
 cli-onboard-assistant-failed = Could not start Zerona: {$err}
