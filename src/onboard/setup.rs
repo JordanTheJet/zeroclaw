@@ -158,7 +158,7 @@ fn review_action(local: bool) -> Result<ReviewAction> {
     let mut actions = vec![ReviewAction::Apply];
     let mut labels = vec![crate::t(
         "cli-onboard-setup-action-apply",
-        "Apply — set up the model",
+        "Apply — set up the model & start the agent builder",
     )];
     actions.push(ReviewAction::Provider);
     labels.push(crate::t(
