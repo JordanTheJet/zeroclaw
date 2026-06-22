@@ -5295,6 +5295,44 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
+/// An external, user-configured skill registry ZeroClaw can install from.
+///
+/// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
+/// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ExternalRegistry {
+    /// Short alias used in `registry:<name>/<skill>` install specs.
+    pub name: String,
+    /// Git repository URL of the registry (must expose a top-level `skills/` dir).
+    pub url: String,
+    /// Registry protocol. Only `"git"` is supported today; other protocols
+    /// are reserved for a future additive release.
+    #[serde(default = "default_extra_registry_kind")]
+    pub kind: String,
+    /// Whether this registry is eligible for installs. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl ExternalRegistry {
+    /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
+    ///
+    /// Keep this as the single registry-alias rule used by both config
+    /// validation and runtime install-spec parsing. Lowercase aliases also
+    /// avoid clone-directory collisions on case-insensitive filesystems.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+}
+
+fn default_extra_registry_kind() -> String {
+    "git".to_string()
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5316,6 +5354,11 @@ pub struct SkillsConfig {
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
     pub registry_url: Option<String>,
+    /// Additional user-configured skill registries, installed via
+    /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
+    /// is cloned to its own `extra-registry-<name>/` workspace directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -9558,6 +9601,12 @@ pub struct MemoryConfig {
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_api_key: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -9756,6 +9805,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -17415,6 +17465,50 @@ impl Config {
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
+        // Skills — extra registries
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (i, reg) in self.skills.extra_registries.iter().enumerate() {
+                if reg.name.trim().is_empty() {
+                    anyhow::bail!("skills.extra_registries[{i}].name must not be empty");
+                }
+                if !ExternalRegistry::is_valid_name(&reg.name) {
+                    anyhow::bail!(
+                        "skills.extra_registries[{i}].name '{}' is invalid; use only lowercase ASCII letters, numbers, '-' or '_' so it can be addressed as registry:<name>/<skill>",
+                        reg.name
+                    );
+                }
+                if !seen.insert(reg.name.as_str()) {
+                    anyhow::bail!("skills.extra_registries has duplicate name '{}'", reg.name);
+                }
+                if reg.url.trim().is_empty() {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].url must not be empty",
+                        reg.name
+                    );
+                }
+                if reg.kind != "git" {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
+                        reg.name,
+                        reg.kind
+                    );
+                }
+                match reqwest::Url::parse(&reg.url) {
+                    Ok(u) if matches!(u.scheme(), "http" | "https" | "file") => {}
+                    Ok(u) => anyhow::bail!(
+                        "skills.extra_registries[{}].url scheme '{}' is unsupported (use http, https, or file)",
+                        reg.name,
+                        u.scheme()
+                    ),
+                    Err(e) => anyhow::bail!(
+                        "skills.extra_registries[{}].url is not a valid URL: {e}",
+                        reg.name
+                    ),
+                }
+            }
+        }
+
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
@@ -19559,6 +19653,96 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    fn ext_reg(name: &str, url: &str, kind: &str) -> ExternalRegistry {
+        ExternalRegistry {
+            name: name.to_string(),
+            url: url.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_git_extra_registry() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "git")];
+        assert!(config.validate().is_ok(), "valid git registry must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_non_git_kind() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "zip-api")];
+        let err = config
+            .validate()
+            .expect_err("non-git kind must be rejected");
+        assert!(err.to_string().contains("kind must be 'git'"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_duplicate_names() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![
+            ext_reg("team", "https://github.com/acme/a", "git"),
+            ext_reg("team", "https://github.com/acme/b", "git"),
+        ];
+        let err = config
+            .validate()
+            .expect_err("duplicate names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate name 'team'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_unaddressable_names() {
+        for name in [
+            "team.prod",
+            "team prod",
+            "team/prod",
+            "..",
+            " team",
+            "team ",
+            "Team",
+            "teamProd",
+        ] {
+            let mut config = Config::default();
+            config.skills.extra_registries =
+                vec![ext_reg(name, "https://github.com/acme/skills", "git")];
+            let err = config
+                .validate()
+                .expect_err("unaddressable extra-registry name must be rejected");
+            assert!(
+                err.to_string().contains("registry:<name>/<skill>"),
+                "name {name:?} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_empty_name_or_url() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("", "https://github.com/acme/a", "git")];
+        assert!(config.validate().is_err(), "empty name must be rejected");
+
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "   ", "git")];
+        assert!(config.validate().is_err(), "empty url must be rejected");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_bad_url_scheme() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "ftp://example.com/x", "git")];
+        let err = config
+            .validate()
+            .expect_err("non-http(s)/file scheme must be rejected");
+        assert!(err.to_string().contains("scheme"), "got: {err}");
     }
 
     #[test]
