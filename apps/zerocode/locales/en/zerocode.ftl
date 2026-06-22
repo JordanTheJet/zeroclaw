@@ -8,7 +8,11 @@ zc-pane-quickstart = Quickstart
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon
+zc-app-help-selection-mode = Selection mode (mouse copy/paste)
+zc-app-help-native-select = Select text natively (most terminals)
 zc-app-help-quit = Quit
+zc-app-selection-mode = ▣ SELECTION MODE · drag to copy, paste with your terminal · { $key } to exit
+zc-app-selection-mode-compact = ▣ { $key } = exit selection mode
 
 zc-app-press-any-key-to-close = Press any key to close
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every

@@ -55,6 +55,23 @@ pub(crate) fn init_terminal() -> Result<Term> {
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
+/// Toggle terminal mouse-event reporting at runtime.
+///
+/// With capture on (the default), the TUI receives mouse events and the
+/// terminal's own click-drag text selection is suppressed — so a user cannot
+/// select/copy with the mouse the usual way. Turning capture off hands the
+/// mouse back to the terminal for native selection, copy, and paste; the app
+/// stops seeing mouse events until it is turned back on. Best-effort: a
+/// terminal that ignores the sequence simply keeps its current behavior.
+pub(crate) fn set_mouse_capture(term: &mut Term, on: bool) -> Result<()> {
+    if on {
+        execute!(term.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(term.backend_mut(), DisableMouseCapture)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
     // Pop the enhancement flags best-effort — if they were never pushed (or the

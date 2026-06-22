@@ -951,7 +951,7 @@ impl InputBarState {
 
         match action {
             Some(IbWidgetAction::Paste) => {
-                return self.handle_clipboard_image();
+                return self.handle_paste_action();
             }
             Some(IbWidgetAction::AutocompleteCancel) if self.autocomplete_active => {
                 self.dismiss_autocomplete();
@@ -1286,6 +1286,34 @@ impl InputBarState {
         } else {
             InputBarAction::Consumed
         }
+    }
+
+    /// Ctrl+V paste — text first.
+    ///
+    /// A Ctrl+V almost always means "paste text", so read the clipboard's
+    /// text and insert it directly; only when the clipboard holds no text
+    /// (e.g. a copied screenshot) fall back to attaching a clipboard image.
+    /// Reading text first also skips the image-tool subprocess on the common
+    /// path. This complements bracketed paste (`Event::Paste`), which most
+    /// terminals deliver for a native paste; Ctrl+V covers terminals that do
+    /// not, and the explicit image-attach fallback.
+    ///
+    /// Tradeoff: when the clipboard exposes BOTH a text flavor and an image
+    /// (e.g. a browser "Copy Image" that also sets a URL), the text wins. To
+    /// attach such an image, save it and use `/attach <path>` or the Ctrl+A
+    /// file browser — text is what the overwhelming majority of pastes want.
+    fn handle_paste_action(&mut self) -> InputBarAction {
+        if let Some(text) = clipboard::read_clipboard_text() {
+            // Strip a single trailing CRLF/LF so a one-line paste stays one
+            // line; interior newlines (genuine multi-line paste) are kept.
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            if !text.is_empty() {
+                return self.handle_paste(text);
+            }
+        }
+        // No usable text on the clipboard → try an image attachment instead.
+        self.handle_clipboard_image()
     }
 
     fn handle_clipboard_image(&mut self) -> InputBarAction {

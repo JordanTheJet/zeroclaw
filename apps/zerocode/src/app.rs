@@ -168,6 +168,11 @@ pub async fn run(
     let mut show_help = false;
     let mut reload_confirm = false;
     let mut quit_confirm = false;
+    // Whether the terminal is reporting mouse events to the TUI. Toggling this
+    // off (selection mode) hands the mouse back to the terminal so the user can
+    // drag-select and copy/paste natively. Mirrors the capture enabled at
+    // startup in `config_manager::init_terminal`.
+    let mut mouse_capture_on = true;
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
@@ -360,6 +365,7 @@ pub async fn run(
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
                 needs_intervention,
+                !mouse_capture_on,
             );
 
             // Help modal overlay (drawn last so it sits on top).
@@ -380,6 +386,14 @@ pub async fn run(
                     HelpEntry::new(
                         chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
                         crate::i18n::t("zc-app-help-reload"),
+                    ),
+                    HelpEntry::new(
+                        chord_keys(crate::keymap::GlobalAction::ToggleMouseCapture.resolved()),
+                        crate::i18n::t("zc-app-help-selection-mode"),
+                    ),
+                    HelpEntry::new(
+                        vec!["Shift+drag".to_string()],
+                        crate::i18n::t("zc-app-help-native-select"),
                     ),
                     HelpEntry::new(
                         chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
@@ -609,6 +623,17 @@ pub async fn run(
                     continue;
                 }
 
+                // Selection mode: flip terminal mouse capture so the user can
+                // drag-select and copy/paste with the terminal's own clipboard.
+                // Intentionally not gated on `in_text_input` — it's a meta
+                // action that must work from any pane, even mid-compose — and it
+                // never falls through to a pane handler.
+                if global == Some(GlobalAction::ToggleMouseCapture) {
+                    mouse_capture_on = !mouse_capture_on;
+                    let _ = config_manager::set_mouse_capture(term, mouse_capture_on);
+                    continue;
+                }
+
                 let switch_to: Option<Mode> = match global {
                     Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
                     Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
@@ -810,6 +835,7 @@ fn draw_status_bar(
     tui_id: Option<&str>,
     ctx: CtxBar,
     needs_intervention: bool,
+    selection_mode: bool,
 ) {
     let (dot, label, style) = match state {
         ConnectionState::Connected => (
@@ -860,8 +886,39 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column. The bar is held back
-    // until the context-accounting feature is ready to show; there is no
+    // Left: selection-mode banner takes priority — when mouse capture is off
+    // the user needs a visible reminder of the mode and how to leave it. The
+    // exit key is read from the resolved keymap (`resolved_bindings`), so a
+    // rebind of the toggle stays accurate — matching the help modal.
+    if selection_mode {
+        use unicode_width::UnicodeWidthStr;
+        let exit_key = chords_for(
+            GlobalAction::resolved_bindings(),
+            GlobalAction::ToggleMouseCapture,
+        );
+        let full = crate::i18n::t_args("zc-app-selection-mode", &[("key", &exit_key)]);
+        // When disconnected, the connection status can crowd the left column;
+        // fall back to a compact banner that leads with the exit key so the
+        // one instruction for leaving the mode is never the part clipped.
+        let text = if UnicodeWidthStr::width(full.as_str()) as u16 <= left_area.width {
+            full
+        } else {
+            crate::i18n::t_args("zc-app-selection-mode-compact", &[("key", &exit_key)])
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 80))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            left_area,
+        );
+        return;
+    }
+
+    // Otherwise the ctx bar, left-aligned in its own column. The bar is held
+    // back until the context-accounting feature is ready to show; there is no
     // user-facing switch — the gate flips when the work lands.
     const SHOW_CTX_BAR: bool = false;
     if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
