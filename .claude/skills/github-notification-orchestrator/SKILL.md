@@ -25,7 +25,9 @@ don't send. (See `references/safety.md` for the full boundary.)
 
 ## Before you start
 
-Read `AGENTS.md` at the repo root for project conventions and risk tiers. Then
+Read `AGENTS.md` at the repo root for project conventions and risk tiers, and
+skim `ADLC.md` (this skill's worksheet — scope, the core design bet, the eval /
+iteration log, and deploy/observe notes) for the *why* behind the design. Then
 resolve three things and reuse them everywhere:
 
 1. **Identity.** If `tmp/handoff.md` carries a `reviewer:` field, use it.

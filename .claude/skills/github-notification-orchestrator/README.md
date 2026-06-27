@@ -11,6 +11,9 @@ assembles a dated digest sorted newest-to-oldest. It drafts; it never posts.
 > Built from scratch as an [agentskills.io](https://agentskills.io)-spec skill
 > (`SKILL.md` + bundled `agents/`, `references/`, `scripts/`). Also satisfies
 > Lane 1 — it is dual-eligible — but the design target is Lane 3.
+>
+> Full development lifecycle — scope, design bet, eval/iteration log, deploy &
+> observe — is in [`ADLC.md`](ADLC.md).
 
 ---
 
