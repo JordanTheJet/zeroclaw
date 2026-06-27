@@ -1,6 +1,6 @@
 # github-notification-orchestrator
 
-**Hackathon Lane 3 — Most Innovative Use of Multiple Agents and Skills.**
+**Track 3: Best Multi-Agent / Skill Composition.**
 
 A multi-agent system that works through your *entire* GitHub notification inbox:
 it **plans** the inbox, **fans out one sub-agent per notification** to draft a
@@ -10,19 +10,20 @@ assembles a dated digest sorted newest-to-oldest. It drafts; it never posts.
 
 > Built from scratch as an [agentskills.io](https://agentskills.io)-spec skill
 > (`SKILL.md` + bundled `agents/`, `references/`, `scripts/`). Also satisfies
-> Lane 1 — it is dual-eligible — but the design target is Lane 3.
+> Track 1: Best From-Scratch Agent + Skill — it is dual-eligible — but the design
+> target is Track 3.
 >
 > Full development lifecycle — scope, design bet, eval/iteration log, deploy &
 > observe — is in [`ADLC.md`](ADLC.md).
 
 ---
 
-## Why it's a Lane 3 entry
+## Why it's a Track 3 entry
 
-| Lane 3 asks for… | How this delivers |
+| Track 3 asks for… | How this delivers |
 |---|---|
-| **Multi-agent orchestration** | A planner classifies 100+ notifications and fans out one model-matched sub-agent per item. |
-| **Agent-to-agent delegation** | A second **`verifier`** agent (opus) adversarially re-checks high-stakes drafts before they're trusted — a two-layer pipeline with a quality gate, not a flat star. |
+| **Multi-agent orchestration** | The orchestrator (`gh_notif`) classifies 100+ notifications and fans out via ZeroClaw's `delegate` tool to six per-profile sub-agents, one synchronous delegation per item, model-matched. |
+| **Agent-to-agent delegation** | A second **`verifier`** agent (opus) adversarially re-checks high-stakes PR-review drafts before they're trusted — a two-layer pipeline with a quality gate, not a flat star. |
 | **Skill composition** | Composes **five skills**: hands PR reviews to `github-pr-review-session` and issue-lifecycle actions to `github-issue-triage` (via a shared `tmp/handoff.md` contract), reuses `daily-notification-triage`'s identity/worktree helpers, and calls `github-duplicate-check` to dedup against pre-existing issues/PRs before drafting. |
 
 ### Mapped to the Deep Agents pattern (planner / sub-agents / virtual filesystem / detailed prompt)
@@ -54,7 +55,7 @@ Phase 5  present       compact launchpad in chat
 
 ## The agents & model selection
 
-The rationale (the Lane-1 "model-selection" artifact) is in
+The rationale (the Track-1 "model-selection" artifact) is in
 `references/model-selection.md`. The principle: **match model strength to task
 difficulty and blast radius; use the cheapest model that clears the bar.**
 
@@ -125,8 +126,8 @@ agents/                       7 sub-agent profiles (5 workers + verifier + summa
 references/
   routing.md                  notification → profile mapping + heuristics
   report-template.md          enforced per-item output format (frontmatter = index sort key)
-  model-selection.md          per-role model rationale (Lane-1 artifact)
-  skill-composition.md        cross-skill hand-off protocol (Lane-3 core)
+  model-selection.md          per-role model rationale (Track-1 artifact)
+  skill-composition.md        cross-skill hand-off protocol (Track-3 core)
   deep-agents-mapping.md      mapping onto the Deep Agents four components
   safety.md                   draft-only boundary
 scripts/

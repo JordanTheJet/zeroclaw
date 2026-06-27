@@ -115,6 +115,34 @@ dedup, no audit trail.
   script runs four `gh` searches; the verifier counted three executable calls
   (`gh search issues --include-prs` covers issues+PRs in one). Fix: corrected to
   three.
+- **v7 — ZeroClaw-native multi-agent delegate fan-out (architecture + 2 bugs).**
+  Converted the single-agent ZeroClaw poll cron into a genuine **ZeroClaw-native
+  fan-out with no Claude Code dependency**. The orchestrator agent `gh_notif`
+  (sonnet) now runs the read-only delta script, routes each NEW notification by
+  reason/type, and uses ZeroClaw's built-in `delegate` tool to hand each one to
+  ONE of **six per-profile sub-agents** (`gh_notif_pr_reviewer`/opus,
+  `gh_notif_issue`/sonnet, `gh_notif_mention`/sonnet, `gh_notif_author`/sonnet,
+  `gh_notif_ci`/sonnet) plus an adversarial `gh_notif_verifier`/opus on PR-review
+  drafts; still **draft-only** (read-only `gh`, one local markdown report each,
+  nothing posted/commented/reviewed/labelled/closed/merged/marked-read).
+  Delegation is **synchronous/serial** (one sub-agent at a time, bounded to the 5
+  newest notifications per tick), then the delta script commits state. Two bugs
+  found + fixed while wiring it: **(1)** the parent `gh_notif` risk profile still
+  listed an allowed_root for the OLD skill name `github-prior-art` while the worker
+  profile listed the RENAMED `github-duplicate-check`; because the child root was
+  not a subset of the parent's, ZeroClaw's no-escalation guard rejected every
+  delegation (`ReadWriteRootNotInParent`) — fixed by aligning both profiles to
+  `github-duplicate-check` (also repairing a dangling path). **(2)** `background:true`
+  delegations spawn the sub-agent in an in-process tokio task whose result is
+  persisted to `workspace/delegate_results/{task_id}.json`; those tasks only
+  complete inside the persistent daemon (a single-shot `zeroclaw agent` CLI process
+  exits and aborts them) AND background re-entry requires the worker profile to have
+  `delegation_policy=allow` — so we chose **synchronous** delegation as the robust
+  default (works in CLI and daemon, lets workers stay `delegation_policy=forbidden`).
+  **Verified live:** a real run drafted 5 notifications routed to 5 DISTINCT
+  sub-agents (pr_reviewer, mention, ci, author, issue) plus 1 verifier verdict on
+  the PR-review draft, then committed state — final reply: *"delegated 5 ..., verified
+  1, deferred 0 ... Nothing was posted."*
 
 **Final:** spec-valid; **2 real bugs + 4 grounding/doc errors caught and fixed**
 by the verifier / adversarial-critic layers before they shipped. The with-skill
