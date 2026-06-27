@@ -291,7 +291,7 @@ tmp/handoff.md                  # cross-skill hand-off contract (Phase 4.5) — 
    reviews, CI root-cause, "fixed/closed" claims) before presenting. A HOLD gate
    means a load-bearing claim was refuted — surface it, don't bury it.
 9. **Dedup before drafting.** The issue- and pr-responders call the
-   `github-prior-art` skill before they draft, so the binder flags a pre-existing
+   `github-duplicate-check` skill before they draft, so the binder flags a pre-existing
    issue or a competing/duplicate PR (by anyone) instead of producing redundant
    work — see `references/skill-composition.md`.
 

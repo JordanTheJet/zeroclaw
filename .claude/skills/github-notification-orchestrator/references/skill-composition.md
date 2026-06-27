@@ -17,7 +17,7 @@ applies here, one level up: the orchestrator plans and pre-drafts across the
 | `review_requested`, code-focused PR mentions | **`github-pr-review-session`** | The pre-review binder entry (diff read, findings tagged, verifier verdict) + a review queue in `tmp/handoff.md`. The specialist owns the posting protocol and posts in the reviewer's voice. |
 | Issue lifecycle actions (label/close/dedup/stale) | **`github-issue-triage`** | The triage call + drafted comment from `issue-responder`, plus the issue number. The specialist enforces the RFC stale policy and authority bounds and executes the lifecycle action. |
 | Identity + worktree build/test | **`daily-notification-triage`** helpers | Reuse its `reviewer:` resolution and `/tmp` worktree workflow instead of duplicating them. |
-| Any issue/PR, *before* drafting | **`github-prior-art`** | Nothing is handed over — the `issue-responder` and `pr-review-responder` **call** its `prior_art_search.sh` to dedup (open+closed issues *and* PRs, by others) before drafting, so the binder flags a duplicate issue or a competing/duplicate PR instead of producing redundant work. It in turn hands lifecycle action to `github-issue-triage`. |
+| Any issue/PR, *before* drafting | **`github-duplicate-check`** | Nothing is handed over — the `issue-responder` and `pr-review-responder` **call** its `prior_art_search.sh` to dedup (open+closed issues *and* PRs, by others) before drafting, so the binder flags a duplicate issue or a competing/duplicate PR instead of producing redundant work. It in turn hands lifecycle action to `github-issue-triage`. |
 
 The orchestrator never re-implements those protocols — that would create drift
 against the single source of truth. It drafts, then points.

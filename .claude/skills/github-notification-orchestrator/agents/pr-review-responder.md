@@ -35,11 +35,11 @@ output path to write.
    ```
    For a large diff, focus on the files that carry behavior, not generated or
    lockfile churn.
-3. **Check prior art** (the `github-prior-art` skill) — a review's most valuable
+3. **Check prior art** (the `github-duplicate-check` skill) — a review's most valuable
    catch is often "this duplicates merged PR #M" or "it competes with open PR #K".
    Run the bundled sweep and fold any hit into your findings:
    ```bash
-   bash .claude/skills/github-prior-art/scripts/prior_art_search.sh \
+   bash .claude/skills/github-duplicate-check/scripts/prior_art_search.sh \
      "<the PR's distinctive change: symbol / file / feature>" <repo> <out-dir>
    ```
 4. **Form a review.** For each finding, decide a tag:

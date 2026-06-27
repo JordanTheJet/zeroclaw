@@ -1,5 +1,5 @@
 ---
-name: github-prior-art
+name: github-duplicate-check
 description: "Prior-art check for ZeroClaw GitHub work — searches whether a pre-existing issue or PR (by ANYONE, especially other people) already covers a bug, feature, or change BEFORE the user files an issue, opens a PR, or drafts a reply, so they don't duplicate work or file a dup. Use this whenever the user asks 'is this a duplicate', 'has anyone reported this', 'check for existing issues or PRs', 'is there prior art for this bug/feature', 'is someone already working on this', 'before I file this issue', 'find duplicate issues', 'did someone already open a PR for this', 'has this been fixed already', 'search existing issues', or 'who else hit this'. It runs read-only gh searches across OPEN and CLOSED issues and PRs, ranks candidates, and returns a VERDICT (novel / duplicate-of / already-in-progress / related) plus a recommendation. READ-ONLY: it only searches and reports — it never files, comments, labels, closes, or marks anything read. It hands off to github-issue-triage for any lifecycle action."
 ---
 
@@ -27,8 +27,8 @@ Surface, don't act. This is restated in the Execution Rules and is the contract.
 ## Invocation
 
 ```
-/github-prior-art "context budget"                  → search the default repo, return a verdict
-/github-prior-art "dream mode" zeroclaw-labs/zeroclaw → explicit repo
+/github-duplicate-check "context budget"                  → search the default repo, return a verdict
+/github-duplicate-check "dream mode" zeroclaw-labs/zeroclaw → explicit repo
 check for existing issues or PRs about <topic>       → same
 is this a duplicate: <paste a bug/feature>           → same, with extra synonym extraction
 before I file this issue: <paste a draft>            → same; verdict drives do-not-file vs proceed
@@ -71,7 +71,7 @@ list --search` as fallbacks for when the global index lags — dedupes by
 type+number, and writes a candidates table.
 
 ```bash
-bash .claude/skills/github-prior-art/scripts/prior_art_search.sh "<query>" <owner/repo> <out-dir>
+bash .claude/skills/github-duplicate-check/scripts/prior_art_search.sh "<query>" <owner/repo> <out-dir>
 ```
 
 It writes `candidates.tsv` and `candidates.json` (`number type state author

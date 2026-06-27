@@ -23,7 +23,7 @@ assembles a dated digest sorted newest-to-oldest. It drafts; it never posts.
 |---|---|
 | **Multi-agent orchestration** | A planner classifies 100+ notifications and fans out one model-matched sub-agent per item. |
 | **Agent-to-agent delegation** | A second **`verifier`** agent (opus) adversarially re-checks high-stakes drafts before they're trusted — a two-layer pipeline with a quality gate, not a flat star. |
-| **Skill composition** | Composes **five skills**: hands PR reviews to `github-pr-review-session` and issue-lifecycle actions to `github-issue-triage` (via a shared `tmp/handoff.md` contract), reuses `daily-notification-triage`'s identity/worktree helpers, and calls `github-prior-art` to dedup against pre-existing issues/PRs before drafting. |
+| **Skill composition** | Composes **five skills**: hands PR reviews to `github-pr-review-session` and issue-lifecycle actions to `github-issue-triage` (via a shared `tmp/handoff.md` contract), reuses `daily-notification-triage`'s identity/worktree helpers, and calls `github-duplicate-check` to dedup against pre-existing issues/PRs before drafting. |
 
 ### Mapped to the Deep Agents pattern (planner / sub-agents / virtual filesystem / detailed prompt)
 

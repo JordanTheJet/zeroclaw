@@ -35,7 +35,7 @@ sub-agents** (`pr-review-responder`, `issue-responder`, `mention-responder`,
 `author-activity-responder`, `ci-failure-investigator` + a `verifier` quality
 gate + a `daily-summarizer`) → and it **composes 4 other skills**
 (`github-pr-review-session`, `github-issue-triage`, `daily-notification-triage`,
-`github-prior-art`).
+`github-duplicate-check`).
 
 **Tools / data source:** read-only `gh` CLI against the **GitHub notifications
 API**; deterministic bash/python scripts; the Claude Code Agent/Task tool for
@@ -63,7 +63,7 @@ the verifier is the gate that catches it.
 
 **Harness + size:** an agentskills.io skill (`SKILL.md` + `agents/` + `references/`
 + `scripts/`). ~2,860 lines for the orchestrator skill + ~480 for the composed
-`github-prior-art` skill.
+`github-duplicate-check` skill.
 
 **Fixtures:** `examples/run-2026-06-27/` is a real run against the live
 145-notification inbox (shaped TSV input → plan → 5 verified reports → digest →
@@ -111,7 +111,7 @@ dedup, no audit trail.
   showed `delete_after_run` as a declarative-TOML field. The config-grounding
   verifier found it's **not** a `CronJobDecl` field — it's derived from the
   schedule kind and silently ignored in TOML. Fix: removed from the TOML example.
-- **v6 — "four searches" doc drift (doc error).** `github-prior-art` docs said the
+- **v6 — "four searches" doc drift (doc error).** `github-duplicate-check` docs said the
   script runs four `gh` searches; the verifier counted three executable calls
   (`gh search issues --include-prs` covers issues+PRs in one). Fix: corrected to
   three.
@@ -160,7 +160,7 @@ Conductor) for live runs; `examples/run-2026-06-27/` for the committed fixture.
 ## 7. Iterate
 
 Next loop, in priority order (concrete + testable):
-1. **Feed `github-prior-art` output into the digest's dedup section** so the
+1. **Feed `github-duplicate-check` output into the digest's dedup section** so the
    summarizer reconciles related items across the inbox; measure the drop in
    redundant drafts on a run with known duplicates (e.g. the dream-mode cluster).
 2. **Add an `evals/` set** (a trigger eval + a few golden notifications with

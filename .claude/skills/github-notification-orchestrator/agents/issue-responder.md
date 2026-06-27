@@ -29,10 +29,10 @@ cost/quality sweet spot — see `../references/model-selection.md`.
    whether it has the repro, version, and expected-vs-actual a maintainer needs;
    if not, the right move is usually a drafted clarifying question.
 3. **Check for prior art** before proposing anything — a missed duplicate is the
-   costly error. Use the `github-prior-art` skill's bundled sweep (broader than a
+   costly error. Use the `github-duplicate-check` skill's bundled sweep (broader than a
    title-only `gh issue list`: open *and* closed, issues *and* PRs, by others):
    ```bash
-   bash .claude/skills/github-prior-art/scripts/prior_art_search.sh \
+   bash .claude/skills/github-duplicate-check/scripts/prior_art_search.sh \
      "<distinctive terms: error string / symbol / config field>" <repo> <out-dir>
    ```
    Apply that skill's verdict rubric (novel / duplicate-of-#N /
