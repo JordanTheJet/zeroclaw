@@ -41,7 +41,7 @@ plan (planner)
         └─ high-stakes items ─► verifier (opus) edits the report with a gate
 philosophy
   └─ route specialists ─► tmp/handoff.md ─► github-pr-review-session / github-issue-triage
-        └─ summarizer (haiku) runs build_index.py ──► INDEX.md (newest→oldest, linked)
+        └─ summarizer (haiku) runs build_index.sh ──► INDEX.md (newest→oldest, linked)
 ```
 
 Every arrow is a file written to or read from the virtual filesystem — which is

@@ -48,7 +48,7 @@ Phase 1  fetch        scripts/fetch_notifications.sh  → notifications.json/tsv
 Phase 2  plan         classify + prioritize           → plan.md
 Phase 3  fan out      one sub-agent per item          → items/NNNN-*.md   (concurrent, model-matched)
 Phase 3.5 verify      verifier (opus) refutes claims  → ## Verification: PASS/REVISE/HOLD
-Phase 4  summarize    daily-summarizer (haiku)        → INDEX.md (build_index.py: newest→oldest, linked)
+Phase 4  summarize    daily-summarizer (haiku)        → INDEX.md (build_index.sh: newest→oldest, linked)
 Phase 4.5 compose     route to specialist skills      → tmp/handoff.md
 Phase 5  present       compact launchpad in chat
 ```
@@ -115,7 +115,7 @@ The two bundled scripts are independently runnable and tested:
 
 ```
 bash scripts/fetch_notifications.sh <out-dir>     # read-only fetch → JSON + shaped TSV
-python3 scripts/build_index.py <out-dir>          # deterministic INDEX.md (newest→oldest, linked)
+bash scripts/build_index.sh <out-dir>          # deterministic INDEX.md (newest→oldest, linked)
 ```
 
 ## Layout
@@ -132,7 +132,7 @@ references/
   safety.md                   draft-only boundary
 scripts/
   fetch_notifications.sh      read-only gh fetch → cache + shaped TSV
-  build_index.py              deterministic digest builder (no deps)
+  build_index.sh              deterministic digest builder (no deps)
 examples/run-2026-06-27/      a real end-to-end run (input → binder → digest → hand-off)
 ```
 

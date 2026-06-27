@@ -1,7 +1,7 @@
 # Per-item report template (enforced format)
 
 Every subagent writes exactly one report per notification using this structure.
-The frontmatter is **not optional** — `scripts/build_index.py` parses it to build
+The frontmatter is **not optional** — `scripts/build_index.sh` parses it to build
 the digest, so a report with missing or malformed frontmatter silently drops out
 of `INDEX.md`. Fill every key. Keep prose tight; this is a briefing page, not an
 essay.

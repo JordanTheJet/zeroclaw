@@ -48,7 +48,7 @@ rsync -a --ignore-existing \
 # Regenerate each day's INDEX from the REPO's own items (so links + status reflect
 # what is actually in the repo, including accepted/posted drafts).
 for d in "$CLONE"/triage/*/; do
-  [ -d "${d}items" ] && python3 "$HERE/build_index.py" "$d" >/dev/null || true
+  [ -d "${d}items" ] && bash "$HERE/build_index.sh" "$d" >/dev/null || true
 done
 
 git -C "$CLONE" add -A

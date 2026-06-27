@@ -172,7 +172,7 @@ You are the daily-summarizer. Read
 and build the digest for <OUTPUT_ROOT>/<DATE>/.
 ```
 
-The summarizer runs `scripts/build_index.py <OUTPUT_ROOT>/<DATE>` to generate
+The summarizer runs `scripts/build_index.sh <OUTPUT_ROOT>/<DATE>` to generate
 `INDEX.md` — every report parsed from its frontmatter, **sorted newest-to-oldest
 by `updated_at`**, grouped by priority, each line linking to its report file.
 Sorting and linking are mechanical, so a script does them (cheap, deterministic,

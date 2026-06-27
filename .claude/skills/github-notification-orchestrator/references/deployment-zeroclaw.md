@@ -16,7 +16,7 @@ model `sonnet` — routing + delegation, not deep reasoning) a prompt that tells
 to:
 
 1. run the bundled bash scripts via its **shell tool**
-   (`fetch_notifications.sh`, `notifications_delta.sh`, `build_index.py`), and
+   (`fetch_notifications.sh`, `notifications_delta.sh`, `build_index.sh`), and
 2. **route** each new notification by reason/type and hand it to **one** of six
    per-profile **sub-agents** via ZeroClaw's **`delegate` tool**, passing each the
    matching `agents/*.md` profile as its instructions; then, for PR-review drafts,
@@ -42,7 +42,7 @@ scheduled path expecting concurrent drafters. (The separate Claude Code
 *interactive* `/github-notification-orchestrator` skill *can* fan out in parallel
 via its Agent/Task tool; that distinction is the only place "parallel" applies.)
 
-The profiles, the report template, and `build_index.py` are **portable** — they
+The profiles, the report template, and `build_index.sh` are **portable** — they
 are reused as-is. What the cron prompts add (`agents/cron-poll-delegate.md`,
 `agents/cron-daily-digest.md`) is the scheduling-and-delegation wrapper. Two
 pieces:
@@ -278,7 +278,7 @@ orchestrator's final one-line reply:
 
 A repeating AGENT job on a **cron** schedule, `"0 9 * * *"` (9am), with a `tz` so
 the clock is anchored. It points ZeroClaw's agent at `agents/cron-daily-digest.md`,
-which runs `build_index.py` over today's binder, writes the lede (or delegates the
+which runs `build_index.sh` over today's binder, writes the lede (or delegates the
 `daily-summarizer`), and **announces** the result via the job's `delivery` block.
 
 This is a non-latency-sensitive, once-a-day fan-out → an **ideal Batch-API
@@ -292,7 +292,7 @@ happened on the poll ticks.
 [cron.gh_notif_digest]
 name = "GitHub notification daily digest"
 job_type = "agent"
-prompt = "Build today's GitHub notification digest. Read .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md and follow it. Binder = .context/triage/$(date +%Y-%m-%d). Run build_index.py over the binder, write the lede, and return a compact summary (with the INDEX path) to be announced. Roll up the existing per-item drafts; do NOT re-draft. Read/write only inside the binder; no GitHub mutation."
+prompt = "Build today's GitHub notification digest. Read .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md and follow it. Binder = .context/triage/$(date +%Y-%m-%d). Run build_index.sh over the binder, write the lede, and return a compact summary (with the INDEX path) to be announced. Roll up the existing per-item drafts; do NOT re-draft. Read/write only inside the binder; no GitHub mutation."
 schedule.kind = "cron"
 schedule.expr = "0 9 * * *"
 schedule.tz = "America/New_York"
@@ -331,7 +331,7 @@ binder to a **private** GitHub repo:
   start of Piece C) mirrors the triage tree to that repo and pushes. It is a no-op
   until `.drafts-remote` exists, and it pushes to YOUR private repo only — it never
   posts to any upstream issue/PR.
-- With `.drafts-remote` set, `build_index.py` emits absolute
+- With `.drafts-remote` set, `build_index.sh` emits absolute
   `github.com/.../items/<file>.md` links in INDEX.md, so the digest relays tappable
   links instead of a host path.
 
@@ -342,7 +342,7 @@ about other people's work.
 
 The orchestrator only DRAFTS. To act on a draft you flip its frontmatter to
 `status: accepted` (e.g. from the private drafts repo on your phone); the
-**shipper** (`scripts/ship_accepted.py`) then posts that draft's
+**shipper** (`scripts/ship_accepted.sh`) then posts that draft's
 `<!-- REPLY:BEGIN -->…<!-- REPLY:END -->` block to the thread as a COMMENT via
 `gh`, flips it to `status: posted`, and records `posted_comment_url`.
 
@@ -370,7 +370,7 @@ The orchestrator only DRAFTS. To act on a draft you flip its frontmatter to
   "name": "GitHub notification daily digest",
   "schedule": { "kind": "cron", "expr": "0 9 * * *", "tz": "America/New_York" },
   "job_type": "agent",
-  "prompt": "Build today's GitHub notification digest per .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md. Binder=.context/triage/<today>. build_index.py -> lede -> return compact summary with INDEX path. Roll up existing drafts; don't re-draft. No GitHub mutation.",
+  "prompt": "Build today's GitHub notification digest per .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md. Binder=.context/triage/<today>. build_index.sh -> lede -> return compact summary with INDEX path. Roll up existing drafts; don't re-draft. No GitHub mutation.",
   "session_target": "isolated",
   "allowed_tools": ["file_read", "file_write", "shell", "delegate"],
   "delivery": {
@@ -390,7 +390,7 @@ The orchestrator only DRAFTS. To act on a draft you flip its frontmatter to
   "schedule": "0 9 * * *",
   "tz": "America/New_York",
   "job_type": "agent",
-  "prompt": "Build today's GitHub notification digest per .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md. Binder=.context/triage/<today>. build_index.py -> lede -> compact summary with INDEX path. Roll up existing drafts; no GitHub mutation.",
+  "prompt": "Build today's GitHub notification digest per .claude/skills/github-notification-orchestrator/agents/cron-daily-digest.md. Binder=.context/triage/<today>. build_index.sh -> lede -> compact summary with INDEX path. Roll up existing drafts; no GitHub mutation.",
   "session_target": "isolated",
   "allowed_tools": ["file_read", "file_write", "shell", "delegate"],
   "delivery": {
@@ -493,7 +493,7 @@ files into a binder; the user sends.
   the `verifier`, and the `daily-summarizer`.
 - `references/report-template.md`, `references/routing.md`, `references/safety.md`,
   `references/model-selection.md`.
-- `scripts/fetch_notifications.sh` and `scripts/build_index.py`.
+- `scripts/fetch_notifications.sh` and `scripts/build_index.sh`.
 
 **Net-new for deployment:**
 - `scripts/notifications_delta.sh` — the `delta`/`commit` state machine over a

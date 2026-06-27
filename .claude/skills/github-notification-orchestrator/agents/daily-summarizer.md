@@ -27,7 +27,7 @@ The run's output directory, e.g. `<OUTPUT_ROOT>/<DATE>/`.
    groups by priority, and writes `INDEX.md` with correct relative links and a
    lede placeholder:
    ```bash
-   python3 .claude/skills/github-notification-orchestrator/scripts/build_index.py "<OUTPUT_ROOT>/<DATE>"
+   bash .claude/skills/github-notification-orchestrator/scripts/build_index.sh "<OUTPUT_ROOT>/<DATE>"
    ```
    Do not hand-sort or hand-write links — the script owns that so links never
    drift and the order is reproducible. If the script reports reports it had to

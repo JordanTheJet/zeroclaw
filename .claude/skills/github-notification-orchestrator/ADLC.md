@@ -143,6 +143,22 @@ dedup, no audit trail.
   sub-agents (pr_reviewer, mention, ci, author, issue) plus 1 verifier verdict on
   the PR-review draft, then committed state — final reply: *"delegated 5 ..., verified
   1, deferred 0 ... Nothing was posted."*
+- **v8 — delivery + acceptance, and Python removed.** Three changes. **(a)** Drafts
+  now publish to a **private** GitHub repo (`publish_drafts.sh`) and the daily digest
+  links each item to its rendered summary there — reachable from chat/mobile;
+  `build_index` emits absolute github.com blob URLs when a `.drafts-remote` is set.
+  Publish is **add-only** so a later poll tick never clobbers your accept/edits.
+  **(b)** An opt-in **accept→post shipper** (`ship_accepted.sh`): flip a draft to
+  `status: accepted` and it posts the marked reply block as a COMMENT via `gh` —
+  deterministic (no LLM in the posting path), comments only (never review/approve/
+  merge/close/label), dry-run by default, idempotent (→ `status: posted` + comment
+  URL). Ships `enabled = false` (verified ZeroClaw honors that). **(c)** Per user
+  request, **dropped the Python dependency**: `build_index.py` + `ship_accepted.py`
+  rewritten in pure bash (bash/awk/sed/sort + `gh`/`jq` — all POSIX). Verified the
+  bash index is **byte-identical** to the Python one, and the shipper
+  post→flip→idempotency end-to-end against a throwaway issue. Bug caught + fixed
+  mid-port: BSD `sed` lacks `\|` BRE alternation, so a bulk rename left broken
+  `python3 ….sh` invocations — re-fixed with portable substitutions.
 
 **Final:** spec-valid; **2 real bugs + 4 grounding/doc errors caught and fixed**
 by the verifier / adversarial-critic layers before they shipped. The with-skill

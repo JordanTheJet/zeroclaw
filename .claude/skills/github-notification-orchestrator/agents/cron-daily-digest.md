@@ -34,11 +34,11 @@ frontmatter, sorts by `updated_at` descending (newest first), groups by priority
 and writes `INDEX.md` with correct relative links and a lede placeholder:
 
 ```bash
-python3 .claude/skills/github-notification-orchestrator/scripts/build_index.py "$OUT"
+bash .claude/skills/github-notification-orchestrator/scripts/build_index.sh "$OUT"
 ```
 
 Do not hand-sort or hand-write links — the script owns that so links never drift
-and the order is reproducible. This is the **same** `build_index.py` the
+and the order is reproducible. This is the **same** `build_index.sh` the
 interactive skill uses, reused as-is. If the script reports reports it had to skip
 (malformed frontmatter), note them; don't paper over them.
 
