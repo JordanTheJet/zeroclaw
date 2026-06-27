@@ -337,6 +337,27 @@ binder to a **private** GitHub repo:
 
 Keep the repo **private**: drafts hold unsent replies and candid verifier verdicts
 about other people's work.
+
+## Phase 2 — accept → post (the shipper)
+
+The orchestrator only DRAFTS. To act on a draft you flip its frontmatter to
+`status: accepted` (e.g. from the private drafts repo on your phone); the
+**shipper** (`scripts/ship_accepted.py`) then posts that draft's
+`<!-- REPLY:BEGIN -->…<!-- REPLY:END -->` block to the thread as a COMMENT via
+`gh`, flips it to `status: posted`, and records `posted_comment_url`.
+
+- **Deterministic & narrow:** no LLM in the posting path (the text posted is
+  exactly the marked block); COMMENTS only — never review / approve /
+  request-changes / merge / close / label. Dry-run by default (`--post` to send);
+  `--repo` / `--only` scope a run; idempotent (only `status: accepted` is acted
+  on, then becomes `posted`).
+- **The accept flag is human-only:** drafters always write `status: needs-reply`
+  and are instructed never to emit `accepted`, so nothing posts without you.
+- **Run it** manually, or wire `[cron.gh_notif_ship]` (job_type `shell`, ships
+  `enabled = false`) to sweep accepted drafts on a schedule.
+- **Add-only publish:** `publish_drafts.sh` never overwrites a draft already in
+  the repo, so your `accepted` edit and the shipper's `posted` status survive the
+  next poll tick.
 - `delivery.to` — the channel-specific destination (here a Discord channel ID).
 - `delivery.best_effort = true` — don't fail the job if delivery fails (default
   `true`). `delivery.thread_id` is available too (optional; mainly for `webhook`

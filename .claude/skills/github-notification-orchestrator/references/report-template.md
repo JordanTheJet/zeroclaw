@@ -20,7 +20,7 @@ essay.
 | `url` | yes | The **html** URL (github.com/...), not the api.github.com URL. |
 | `agent_profile` | yes | Which profile produced this report. |
 | `priority` | yes | `P1` (blocked on you), `P2` (your work / assigned), `P3` (FYI). |
-| `status` | yes | One of: `needs-reply`, `action-required`, `drafted`, `fyi`, `error`. |
+| `status` | yes | One of: `needs-reply`, `action-required`, `drafted`, `fyi`, `error`. You flip it to `accepted` to authorize posting the Ready-to-post comment; the shipper sets `posted` (and appends `posted_at` + `posted_comment_url`) after it posts. |
 
 ## The template
 
@@ -69,6 +69,18 @@ Match the medium to the type:
 - CI failure → the root-cause line, the failing test, and a fix sketch.
 
 Keep it ready-to-paste. Mark anything you are unsure about with `⚠`.
+
+## Ready-to-post comment
+The EXACT text that gets posted to the thread **verbatim** if the user accepts
+this draft (sets `status: accepted`). Public reply ONLY — no analysis, priority,
+or verifier notes. Leave the block EMPTY (nothing between the markers) if posting
+a comment isn't the right move (e.g. CI-only, or the user will act in code). Keep
+the two markers on their own lines exactly as shown; the shipper posts only what
+is strictly between them.
+
+<!-- REPLY:BEGIN -->
+REPLACE_WITH_PUBLIC_REPLY_OR_LEAVE_EMPTY
+<!-- REPLY:END -->
 
 ## Next action
 - [ ] The single concrete step the user should take (e.g. "post the drafted
