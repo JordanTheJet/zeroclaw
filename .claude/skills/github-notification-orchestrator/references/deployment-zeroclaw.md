@@ -318,6 +318,25 @@ Field notes:
   `discord.default`. The bare names are the channel *types*: `telegram`, `discord`,
   `slack`, `mattermost`, `matrix`, `qq`, `whatsapp`, `webhook`, `lark`, `feishu`,
   `dingtalk`.
+
+### Clickable draft links — optional private drafts repo
+
+By default the digest footer is the on-host binder path. To make every digest line
+a tappable link to that draft's rendered summary (from chat / mobile), mirror the
+binder to a **private** GitHub repo:
+
+- Create a private repo and write its slug (one line, `owner/repo`, optional
+  `#branch`) to `<workspace>/gh-notif/.drafts-remote`.
+- `publish_drafts.sh <workspace>/gh-notif` (called at the end of Piece A and the
+  start of Piece C) mirrors the triage tree to that repo and pushes. It is a no-op
+  until `.drafts-remote` exists, and it pushes to YOUR private repo only — it never
+  posts to any upstream issue/PR.
+- With `.drafts-remote` set, `build_index.py` emits absolute
+  `github.com/.../items/<file>.md` links in INDEX.md, so the digest relays tappable
+  links instead of a host path.
+
+Keep the repo **private**: drafts hold unsent replies and candid verifier verdicts
+about other people's work.
 - `delivery.to` — the channel-specific destination (here a Discord channel ID).
 - `delivery.best_effort = true` — don't fail the job if delivery fails (default
   `true`). `delivery.thread_id` is available too (optional; mainly for `webhook`

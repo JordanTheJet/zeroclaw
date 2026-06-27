@@ -52,9 +52,44 @@ def label(rec):
     return f"{tag}{rec.get('title', '(untitled)')}"
 
 
-def bullet(rec):
+def drafts_items_base(run_dir, date):
+    """If a `.drafts-remote` config (one line: `owner/repo` or a repo URL, with an
+    optional `#branch`) is found walking up from run_dir, return the absolute
+    GitHub blob base URL for THIS run's items/ dir — so the digest can emit
+    clickable links that work from chat/mobile. Else None -> relative links
+    (which still resolve when INDEX.md is viewed inside the repo)."""
+    d = os.path.abspath(run_dir)
+    for _ in range(4):
+        cfg = os.path.join(d, ".drafts-remote")
+        if os.path.isfile(cfg):
+            with open(cfg, encoding="utf-8") as f:
+                slug = f.readline().strip()
+            if not slug:
+                return None
+            branch = "main"
+            if "#" in slug:
+                slug, _, branch = slug.partition("#")
+                slug, branch = slug.strip(), (branch.strip() or "main")
+            if slug.startswith("https://github.com/"):
+                slug = slug[len("https://github.com/"):]
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            slug = slug.strip("/")
+            return f"https://github.com/{slug}/blob/{branch}/triage/{date}/items" if slug else None
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def item_href(rec, base):
+    return f"{base}/{rec['_file']}" if base else f"items/{rec['_file']}"
+
+
+def bullet(rec, base=None):
     meta = f"{rec.get('reason', '?')} · {rec.get('repo', '?')} · {human_time(rec.get('updated_at'))}"
-    return f"- **[{label(rec)}](items/{rec['_file']})** — {meta}"
+    return f"- **[{label(rec)}]({item_href(rec, base)})** — {meta}"
 
 
 def existing_lede(run_dir):
@@ -98,6 +133,7 @@ def main():
     records.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
 
     date = os.path.basename(os.path.normpath(run_dir))
+    base = drafts_items_base(run_dir, date)
     known = {b for b, _ in BANDS}
     counts = {b: sum(1 for r in records if r.get("priority") == b) for b, _ in BANDS}
     other = sum(1 for r in records if r.get("priority") not in known)
@@ -109,23 +145,26 @@ def main():
         + ([f"{other} other"] if other else [])
     )
     out.append(f"{stat} · newest first\n")
+    if base:
+        index_url = base[: -len("/items")] + "/INDEX.md"
+        out.append(f"> 📂 [All drafts for {date} (INDEX)]({index_url})\n")
 
     for band, desc in BANDS:
         group = [r for r in records if r.get("priority") == band]
         if group:
             out.append(f"## {band} — {desc} ({len(group)})\n")
-            out.extend(bullet(r) for r in group)
+            out.extend(bullet(r, base) for r in group)
             out.append("")
 
     leftover = [r for r in records if r.get("priority") not in known]
     if leftover:
         out.append(f"## Unprioritized ({len(leftover)})\n")
-        out.extend(bullet(r) for r in leftover)
+        out.extend(bullet(r, base) for r in leftover)
         out.append("")
 
     out.append("## All items, newest → oldest\n")
     for i, r in enumerate(records, 1):
-        out.append(f"{i}. [{label(r)}](items/{r['_file']}) — {human_time(r.get('updated_at'))}")
+        out.append(f"{i}. [{label(r)}]({item_href(r, base)}) — {human_time(r.get('updated_at'))}")
     out.append("")
 
     index_path = os.path.join(run_dir, "INDEX.md")
