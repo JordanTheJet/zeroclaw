@@ -159,6 +159,28 @@ dedup, no audit trail.
   post→flip→idempotency end-to-end against a throwaway issue. Bug caught + fixed
   mid-port: BSD `sed` lacks `\|` BRE alternation, so a bulk rename left broken
   `python3 ….sh` invocations — re-fixed with portable substitutions.
+- **v9 — Discord control surface + Phase 3 PR shipper.** A ZeroClaw-native Discord
+  layer: a `gh-draft` slash skill (`/gh-draft <text>` → ask/edit/show/accept/
+  implement a draft) served by a `gh_notif_chat` agent bound to discord.default,
+  with `[COMPONENTS:]` action buttons on `show`. Wiring gotchas (now in memory):
+  skills only register as slash commands when loaded via a BUNDLE attached to the
+  channel agent; interactions are gated by `[peer_groups].external_peers` (the
+  user's Discord id). **Phase 3** (`ship_pr.sh`): accept a *code* draft → a DRAFT
+  PR from the fork, built by a LOCAL Claude Code harness + the `github-pr` skill
+  (claude.ai/code dropped — not automatable; ZeroClaw `zerocoder` = fallback).
+  An adversarial review then hardened it: untrusted-draft fencing against prompt
+  injection, a **deterministic** commit-msg hook that strips bot/AI attribution +
+  a post-run verifier (the no-attribution repo rule had been only *instructed*),
+  fork preflight, exact-basename `--only`, and `--open` refusing a bare mass-fire.
+
+- **v10 — review-with-evidence + sandboxing.** Added `review_evidence.sh`: for a
+  PR review draft, fetch the PR head (read-only) into a throwaway worktree, run the
+  battery, and append a `## Build evidence` section (pass/fail + head SHA + output)
+  to the draft. This is the harness's MAIN use (build/test others' PRs for grounded
+  review) vs. `ship_pr.sh` (write a PR — only for assigned issues). Because building
+  a PR executes its code, the battery runs in an **ephemeral container** by default
+  (only the worktree mounted; host secrets unexposed) and **refuses** on the host
+  unless `--allow-host`. Proven end-to-end on PR #8247 (`cargo check` ✅).
 
 **Final:** spec-valid; **2 real bugs + 4 grounding/doc errors caught and fixed**
 by the verifier / adversarial-critic layers before they shipped. The with-skill
