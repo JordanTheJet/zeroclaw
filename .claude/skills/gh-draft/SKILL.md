@@ -31,9 +31,9 @@ The free-text input looks like: `<action> #<number> [text]`. Extract:
 - **text** — the remainder (the question for `ask`, the instruction for `edit`).
 
 ## Paths
-- WS = `/Users/jordantian/.zeroclaw/workspace/gh-notif`
+- WS = `$HOME/.zeroclaw/workspace/gh-notif`
 - CLONE = `$WS/drafts-repo`  (the private drafts repo working copy — source of truth once published)
-- SKILL = `/Users/jordantian/.zeroclaw/skills/github-notification-orchestrator`
+- SKILL = `$HOME/.zeroclaw/skills/github-notification-orchestrator`
 
 ## Resolve the draft
 Find the file: `ls "$CLONE"/triage/*/items/ | grep -- "-<number>-"`, newest match
