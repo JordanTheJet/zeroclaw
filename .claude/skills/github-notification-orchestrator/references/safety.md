@@ -54,6 +54,8 @@ bypassing these shippers. The shippers harden the *normal* human path; they are 
 a containment boundary against a compromised worker. To close that gap, scope the
 workers' `gh` token to read-only (or restrict their shell) — then the shippers
 become the only sanctioned write path. Treat `approve`/`request-changes` as opt-in.
+See [`worker-hardening.md`](worker-hardening.md) for the turnkey procedure (a
+read-only PAT + an env-split on macOS, or the firejail sandbox on the Linux remote).
 
 ## Why this matters
 
