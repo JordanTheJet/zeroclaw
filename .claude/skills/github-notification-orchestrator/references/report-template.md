@@ -78,6 +78,12 @@ a comment isn't the right move (e.g. CI-only, or the user will act in code). Kee
 the two markers on their own lines exactly as shown; the shipper posts only what
 is strictly between them.
 
+> For a **PR-review** draft this same block doubles as the **review body**: the user
+> can submit it as a formal PR review with `scripts/ship_review.sh` (which takes the
+> verdict — Comment / Approve / Request-changes — as a ship-time `--verdict` flag,
+> **not** from this file). Write it as review notes the user can submit verbatim,
+> and put your recommended verdict in **Suggested response** for the human to decide.
+
 <!-- REPLY:BEGIN -->
 REPLACE_WITH_PUBLIC_REPLY_OR_LEAVE_EMPTY
 <!-- REPLY:END -->

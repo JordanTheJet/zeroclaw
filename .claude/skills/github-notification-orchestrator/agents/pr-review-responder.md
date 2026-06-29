@@ -61,8 +61,17 @@ followed by your recommended verdict. Mark anything you're unsure about with `âš
 changes"). Set `priority` P1 if the user is the only/explicitly-named reviewer,
 else P2. Set `status: needs-reply`.
 
+Also fill the `REPLY:BEGIN/END` block with the review notes the user could submit
+**verbatim as a PR review body**. Do **not** write any verdict into the
+frontmatter â€” the verdict (Comment / Approve / Request-changes) is a deliberate
+human decision supplied to `scripts/ship_review.sh` at ship time, not something you
+stage. Put your *recommended* verdict only as prose in **Suggested response** for
+the human to weigh.
+
 ## Hard rule
 
 Draft only. Do **not** run `gh pr review`, `gh pr comment`, `gh pr merge`, or
-approve/request-changes. You gather context and write a file. The user submits.
-(See `../references/safety.md`.)
+approve/request-changes yourself. You gather context and write a file that stages
+a **Comment-type** review; the user reviews it, optionally upgrades the verdict,
+and a gated shipper (`scripts/ship_review.sh`) submits it. (See
+`../references/safety.md`.)

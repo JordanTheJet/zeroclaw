@@ -24,11 +24,13 @@ action the user asked for.
 
 ## Parse the input
 The free-text input looks like: `<action> #<number> [text]`. Extract:
-- **action** — one of `ask`, `edit`, `show`, `accept`, `implement`. If the first
-  word isn't one of these, infer: a question → `ask`; an imperative change → `edit`;
-  bare number → `show`.
+- **action** — one of `ask`, `edit`, `show`, `accept`, `review`, `implement`. If the
+  first word isn't one of these, infer: a question → `ask`; an imperative change →
+  `edit`; bare number → `show`.
 - **draft** — the issue/PR number (tolerate a leading `#`).
-- **text** — the remainder (the question for `ask`, the instruction for `edit`).
+- **text** — the remainder (the question for `ask`, the instruction for `edit`, or
+  for `review` the verdict: `comment` (default) / `approve` / `request-changes`,
+  and a trailing `confirm` token to authorize a consequential submit).
 
 ## Paths
 - WS = `$HOME/.zeroclaw/workspace/gh-notif`
@@ -53,7 +55,8 @@ Post the draft's key sections inline: title (masked link to its `url`),
 follow-ups by ENDING the reply with this components marker (each button re-invokes
 this skill on click; if the surface doesn't render components the buttons appear
 as harmless text):
-`[COMPONENTS:{"buttons":[{"label":"Edit","prompt":"/gh-draft edit #<number> "},{"label":"Accept & post","prompt":"/gh-draft accept #<number>"},{"label":"Open PR","prompt":"/gh-draft implement #<number>"}]}]`
+`[COMPONENTS:{"buttons":[{"label":"Edit","prompt":"/gh-draft edit #<number> "},{"label":"Accept & post","prompt":"/gh-draft accept #<number>"},{"label":"Submit review","prompt":"/gh-draft review #<number> comment"},{"label":"Open PR","prompt":"/gh-draft implement #<number>"}]}]`
+(the "Submit review" button stages a Comment-type PR review; for Approve / Request-changes the user types `/gh-draft review #<number> approve` and then confirms.)
 
 ### edit
 Apply the instruction to the draft — usually the `## Ready-to-post comment` block
@@ -76,6 +79,30 @@ Report its one-line result (it posts the Ready-to-post comment as a thread
 comment, comments-only, and flips the draft to `posted`). If the reply block is
 empty, say so and do NOT accept.
 
+### review  (formal PR review — Comment / Approve / Request-changes)
+PRs only. Submits a real **PR review** (the Reviews section) via `ship_review.sh`,
+distinct from `accept` (a plain comment). The verdict is a ship-time flag the user
+chooses — `comment` (default), `approve`, or `request-changes` — NOT something read
+from the draft. Confirm the draft is a `PullRequest` (and has a non-empty `REPLY`
+block for `comment`/`request-changes`); if not, say so and STOP. Do not edit the
+draft frontmatter here; `ship_review.sh` handles everything.
+
+- **`comment`** (non-consequential): submit immediately —
+  `bash "$SKILL"/scripts/ship_review.sh "$WS" --only "<filename>" --verdict comment --post`
+- **`approve` / `request-changes`** (consequential — changes the PR's review state):
+  run **phase 1 only** (no `--post`, no `--confirm`) —
+  `bash "$SKILL"/scripts/ship_review.sh "$WS" --only "<filename>" --verdict <verdict>`
+  This validates + **arms** the draft and prints a one-time `--confirm <nonce>`.
+  Relay that exact command to the user and tell them to reply
+  `review #<number> <verdict> confirm` to authorize. ONLY on that explicit reply,
+  run **phase 2** with the nonce the shipper printed —
+  `bash "$SKILL"/scripts/ship_review.sh "$WS" --only "<filename>" --verdict <verdict> --post --confirm <nonce>`.
+  Never pass `--post`/`--confirm` on the first invocation; never invent a nonce.
+
+Report the shipper's one-line result. The shipper enforces single-draft scoping,
+fails closed on self-review, and the two-phase nonce — so a human typing
+`approve`/`request-changes` and then confirming is the deliberate escalation.
+
 ### implement
 First **validate without changing anything**: resolve the draft and confirm it has
 a `repo`, a `number`, and a non-empty change description (the `## Suggested
@@ -92,5 +119,8 @@ ONLY on that explicit confirmation, run it for real:
 Never pass `--open` on the first invocation.
 
 ## Safety
-Draft-only: ask/edit/show never reach a thread. `accept`/`implement` are the only
-paths that do, and they go through the gated shippers (comments-only / draft PR).
+Draft-only: ask/edit/show never reach a thread. `accept`/`review`/`implement` are the
+only paths that do, and they go through the gated shippers (comment / formal review /
+draft PR). `review approve` and `review request-changes` change a PR's review state,
+so they require an explicit `confirm` second step; the drafting agent never stages
+anything but `comment`.

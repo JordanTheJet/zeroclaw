@@ -36,6 +36,25 @@ confirms, and only then is one action taken. Batching ("post all of these") is
 allowed only when the user explicitly asks for the batch and the count is shown
 first.
 
+Three deterministic shippers carry out a send (no LLM in the posting path):
+- `scripts/ship_accepted.sh` — posts the `REPLY` block as a plain **comment**
+  (acts on `status: accepted`; dry-run unless `--post`).
+- `scripts/ship_review.sh` — submits a formal **PR review**. The **verdict is a
+  ship-time `--verdict` flag the human supplies**, never read from agent-written
+  frontmatter — so injected PR content can't stage an Approve. Reviews are always
+  explicit: `--only` must resolve to exactly one draft, there is no cron path, the
+  self-review check fails *closed*, and `approve`/`request-changes` require a
+  deterministic **two-phase `--confirm <nonce>`**.
+- `scripts/ship_pr.sh` — opens a **draft PR** from your fork (assigned issues).
+
+**Residual risk — the real boundary is the worker sandbox.** The per-profile
+worker agents run with a full shell and the user's `gh` token, so a fully
+prompt-injected worker could call `gh pr review --approve` (or any write) directly,
+bypassing these shippers. The shippers harden the *normal* human path; they are not
+a containment boundary against a compromised worker. To close that gap, scope the
+workers' `gh` token to read-only (or restrict their shell) — then the shippers
+become the only sanctioned write path. Treat `approve`/`request-changes` as opt-in.
+
 ## Why this matters
 
 GitHub actions are outward-facing and hard to reverse — a posted review pings
