@@ -430,13 +430,40 @@ impl Chat {
         state: &mut ChatState,
     ) -> Option<ChatPhase> {
         let alias = state.agent_alias.clone();
+        Self::start_fresh_session(
+            rpc,
+            pane_kind,
+            state,
+            alias,
+            crate::i18n::t("zc-chat-session-restarted"),
+        )
+        .await
+    }
+
+    /// Close the live session and open a fresh one bound to `target_alias`.
+    ///
+    /// `target_alias` is committed to `state.agent_alias` only after the daemon
+    /// confirms the new session, so a failed create never strands the alias
+    /// pointing at an agent the live session isn't actually running. Restarting
+    /// (same agent) and switching agents both route through here; `restart`
+    /// passes the current alias, the agent picker passes the chosen one.
+    /// `success_notice` is the info-bar message shown once the session is live.
+    async fn start_fresh_session(
+        rpc: &Arc<RpcClient>,
+        pane_kind: PaneKind,
+        state: &mut ChatState,
+        target_alias: String,
+        success_notice: String,
+    ) -> Option<ChatPhase> {
         if pane_kind == PaneKind::Acp && rpc.transport() == crate::client::Transport::Wss {
-            // For WSS ACP, go through the CWD picker for new sessions too.
+            // For WSS ACP, go through the CWD picker for new sessions too. The
+            // new alias rides on the picker and is applied when the session is
+            // built on confirm, so a cancel never mutates the live agent here.
             let _ = rpc.session_close(&state.session_id).await;
             // Remote ACP picker must start from a path the daemon understands.
             let start_dir = std::path::PathBuf::from("/");
             return Some(ChatPhase::PickCwd {
-                agent_alias: alias,
+                agent_alias: target_alias,
                 explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
             });
         }
@@ -448,20 +475,23 @@ impl Chat {
         };
         let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str, None).await
+            rpc.session_new_acp(&target_alias, cwd_str, None).await
         } else {
-            rpc.session_new(&alias, cwd_str).await
+            rpc.session_new(&target_alias, cwd_str).await
         };
         match new_session {
             Ok(s) => {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
                 state.reset_for_session(s.session_id, None);
+                // Commit the alias only now that the new session exists, so the
+                // alias and the live session can never disagree on a failure.
+                state.agent_alias = target_alias;
                 if pane_kind == PaneKind::Acp {
                     state.cwd = s.workspace_dir;
                 }
                 Self::refresh_model_identity(rpc, state).await;
-                state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
+                state.set_info_notice(success_notice);
             }
             Err(e) => {
                 state.set_info_notice(crate::i18n::t_args(
@@ -889,6 +919,67 @@ impl Chat {
             SessionOverlay::None => { /* handled below */ }
         }
 
+        // ── Agent overlay key handling ───────────────────────────
+        // While the agent picker is open it captures every key: navigate the
+        // list, Enter switches to the chosen agent (a fresh session against the
+        // new alias, same mechanics as a restart), Esc closes and returns to
+        // the current session untouched.
+        if matches!(state.agent_overlay, AgentOverlay::List { .. }) {
+            use crate::keymap::{Chord, ModalAction};
+            let mut chosen: Option<String> = None;
+            if let AgentOverlay::List { agents, list_state } = &mut state.agent_overlay {
+                match ModalAction::from_chord(&key) {
+                    Some(ModalAction::Cancel) => {
+                        state.agent_overlay = AgentOverlay::None;
+                    }
+                    Some(ModalAction::Confirm) => {
+                        if let Some(i) = list_state.selected() {
+                            chosen = agents.get(i).cloned();
+                        }
+                        state.agent_overlay = AgentOverlay::None;
+                    }
+                    _ => {
+                        if Chord::key(crossterm::event::KeyCode::Up).matches(&key) {
+                            let i = list_state.selected().unwrap_or(0);
+                            list_state.select(Some(i.saturating_sub(1)));
+                        } else if Chord::key(crossterm::event::KeyCode::Down).matches(&key) {
+                            let i = list_state.selected().unwrap_or(0);
+                            if i + 1 < agents.len() {
+                                list_state.select(Some(i + 1));
+                            }
+                        }
+                    }
+                }
+            }
+            // Switch after the overlay borrow is released. `start_fresh_session`
+            // mints a new session against the chosen agent and commits the alias
+            // only on success. Re-picking the current agent is a no-op so it
+            // never throws away the active session.
+            if let Some(alias) = chosen
+                && alias != state.agent_alias
+            {
+                // A fresh session starts empty: warn when a draft or queued
+                // messages are about to be cleared instead of dropping them
+                // silently.
+                let had_pending =
+                    state.queue_len() > 0 || !state.input_bar.input().trim().is_empty();
+                let notice_key = if had_pending {
+                    "zc-chat-agent-switched-cleared"
+                } else {
+                    "zc-chat-agent-switched"
+                };
+                let notice = crate::i18n::t_args(notice_key, &[("alias", &alias)]);
+                let rpc = self.rpc.clone();
+                let pane_kind = self.pane_kind;
+                if let Some(next_phase) =
+                    Self::start_fresh_session(&rpc, pane_kind, state, alias, notice).await
+                {
+                    self.phase = next_phase;
+                }
+            }
+            return false;
+        }
+
         {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
@@ -1248,6 +1339,30 @@ impl Chat {
                 }
                 state.session_overlay = SessionOverlay::List {
                     sessions: picker_sessions,
+                    list_state: ls,
+                };
+            }
+            Some(ChatTabAction::SwitchAgent) if !state.turn_in_flight => {
+                // Snapshot the enabled agents on demand — the same source the
+                // startup picker reads. Preselect the agent the session already
+                // runs so Enter on an unchanged choice is a cheap no-op.
+                let agents = match self.rpc.agents_status().await {
+                    Ok(result) => result
+                        .agents
+                        .into_iter()
+                        .filter(|a| a.enabled)
+                        .map(|a| a.alias)
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                let mut ls = ListState::default();
+                if !agents.is_empty() {
+                    let cur = state.agent_alias.clone();
+                    let idx = agents.iter().position(|a| *a == cur).unwrap_or(0);
+                    ls.select(Some(idx));
+                }
+                state.agent_overlay = AgentOverlay::List {
+                    agents,
                     list_state: ls,
                 };
             }
@@ -1706,6 +1821,43 @@ impl Chat {
                 return;
             }
 
+            // Agent picker overlay intercepts all mouse events when open. A
+            // click only moves the selection (Enter confirms) so a stray click
+            // never silently restarts the session against a different agent.
+            if let AgentOverlay::List { agents, list_state } = &mut state.agent_overlay {
+                let col = mouse.column;
+                let row = mouse.row;
+                let overlay_area = session_list_overlay_area(area);
+
+                match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        if !mouse::in_rect(col, row, overlay_area) {
+                            state.agent_overlay = AgentOverlay::None;
+                        } else {
+                            let count = agents.len();
+                            if let Some(idx) = mouse::list_click_index(
+                                row,
+                                overlay_area,
+                                list_state.offset(),
+                                count,
+                            ) {
+                                list_state.select(Some(idx));
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if mouse::in_rect(col, row, overlay_area) =>
+                    {
+                        let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        let count = agents.len();
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(mouse::list_scroll(i, count, up, 1)));
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             use crossterm::event::KeyModifiers as KM;
             let col = mouse.column;
             let row = mouse.row;
@@ -1985,6 +2137,12 @@ impl Chat {
                 if !matches!(s.session_overlay, SessionOverlay::None) {
                     return false;
                 }
+                // Agent picker is modal exactly like the session picker:
+                // claim a fixed posture so global keys behave the same way
+                // whether or not the input bar still holds a draft.
+                if !matches!(s.agent_overlay, AgentOverlay::None) {
+                    return false;
+                }
                 // Browse mode: single-char bindings active.
                 if s.in_browse_mode() {
                     return false;
@@ -2055,6 +2213,13 @@ impl crate::widgets::HelpContext for Chat {
                         ]);
                     }
                     SessionOverlay::None => {}
+                }
+                if let AgentOverlay::List { .. } = &state.agent_overlay {
+                    return HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], crate::i18n::t("zc-chat-help-navigate")),
+                        E::key("Enter", crate::i18n::t("zc-chat-help-switch-agent")),
+                        E::key("Esc", crate::i18n::t("zc-chat-help-close")),
+                    ]);
                 }
                 if state.pending_approval().is_some() {
                     use crate::keymap::{ChatTabAction as C, action_key_labels};
@@ -2161,6 +2326,10 @@ impl crate::widgets::HelpContext for Chat {
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
                         crate::i18n::t("zc-chat-help-session-list"),
+                    ),
+                    E::key(
+                        chord_label(ChatTabAction::SwitchAgent),
+                        crate::i18n::t("zc-chat-help-switch-agent"),
                     ),
                     E::spacer(),
                     E::key(
@@ -2400,6 +2569,13 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             render_session_list_overlay(f, area, sessions, list_state);
         }
         SessionOverlay::None => {}
+    }
+
+    match &state.agent_overlay {
+        AgentOverlay::List { agents, list_state } => {
+            render_agent_list_overlay(f, area, agents, list_state);
+        }
+        AgentOverlay::None => {}
     }
 
     // Model / model_provider picker overlay (drawn on top of content).
@@ -3196,6 +3372,34 @@ fn render_session_list_overlay(
     f.render_stateful_widget(list, inner, &mut ls);
 }
 
+fn render_agent_list_overlay(f: &mut Frame, area: Rect, agents: &[String], list_state: &ListState) {
+    // Reuse the session-overlay geometry: the two are mutually exclusive, so a
+    // shared centered box keeps the picker family visually consistent.
+    let overlay_area = session_list_overlay_area(area);
+
+    f.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Agents (Enter=switch, Esc=close) ",
+            theme::overlay_border_style(),
+        ))
+        .style(theme::overlay_border_style());
+
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    let items: Vec<ListItem> = agents
+        .iter()
+        .map(|a| ListItem::new(Span::styled(a.clone(), theme::body_style())))
+        .collect();
+
+    let list = List::new(items).highlight_style(theme::list_highlight_style());
+    let mut ls = *list_state;
+    f.render_stateful_widget(list, inner, &mut ls);
+}
+
 /// Render a single-row context usage bar showing token consumption.
 ///
 /// Shows: `ctx: 12,345 / 200,000  [████████░░░░░░░░░░░░]  6%`
@@ -3758,6 +3962,20 @@ enum SessionOverlay {
     },
 }
 
+/// Mid-session agent picker. Opened with `SwitchAgent` from an active
+/// session; confirming starts a fresh session against the chosen agent,
+/// cancelling returns to the current session untouched. The agent list is a
+/// transient on-demand snapshot of the daemon's `agents_status` — the live
+/// agent of record stays `ChatState::agent_alias`; nothing is cached here.
+#[derive(Debug)]
+enum AgentOverlay {
+    None,
+    List {
+        agents: Vec<String>,
+        list_state: ListState,
+    },
+}
+
 /// Active model / model_provider picker overlay. `None` when no picker is open.
 /// The model_provider variant is two-stage: pick a model_provider, then (after a
 /// catalog fetch) pick a model from it.
@@ -3912,6 +4130,7 @@ pub struct ChatState {
     /// Active scrollbar drag anchor.
     scrollbar_drag: Option<ScrollbarDrag>,
     session_overlay: SessionOverlay,
+    agent_overlay: AgentOverlay,
     scroll_offset: u16,
     pinned_to_bottom: bool,
     last_total_rows: u16,
@@ -4003,6 +4222,7 @@ impl ChatState {
             scrollbar_track_rect: None,
             scrollbar_drag: None,
             session_overlay: SessionOverlay::None,
+            agent_overlay: AgentOverlay::None,
             scroll_offset: 0,
             pinned_to_bottom: true,
             last_total_rows: 0,
