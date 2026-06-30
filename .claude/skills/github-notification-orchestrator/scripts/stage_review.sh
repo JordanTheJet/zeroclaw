@@ -19,15 +19,17 @@
 #     stage_review.sh --repo OWNER/REPO --pr N            # dry-run (shows what it would stage)
 #     printf '%s' "$BODY" | stage_review.sh --repo O/R --pr N --post
 #     stage_review.sh --repo O/R --pr N --body-file notes.md --post
+#     ... --post --skip-if-pending   # auto/unattended: never replace an existing pending review
 set -uo pipefail
 
-REPO=""; PR=""; BODYFILE="-"; POST=0
+REPO=""; PR=""; BODYFILE="-"; POST=0; SKIP_IF_PENDING=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)      REPO="${2:-}"; shift;;
-    --pr)        PR="${2:-}"; shift;;
-    --body-file) BODYFILE="${2:-}"; shift;;
-    --post)      POST=1;;
+    --repo)            REPO="${2:-}"; shift;;
+    --pr)              PR="${2:-}"; shift;;
+    --body-file)       BODYFILE="${2:-}"; shift;;
+    --post)            POST=1;;
+    --skip-if-pending) SKIP_IF_PENDING=1;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *)  echo "unexpected arg: $1" >&2; exit 2;;
   esac
@@ -60,12 +62,17 @@ if [ "$POST" != 1 ]; then
   echo; echo "(dry-run — pass --post to stage the pending review)"; exit 0
 fi
 
-# one-pending-review-per-PR-per-user: remove any existing pending review first
+# one-pending-review-per-PR-per-user. In auto/unattended mode (--skip-if-pending)
+# we NEVER touch an existing pending review (it may be one you're editing); we just
+# skip. Interactively, we replace it.
 me="$(gh api user --jq .login 2>/dev/null)"
 if [ -n "$me" ]; then
   existing="$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
     --jq ".[] | select(.user.login==\"$me\" and .state==\"PENDING\") | .id" 2>/dev/null | head -1)"
   if [ -n "$existing" ]; then
+    if [ "$SKIP_IF_PENDING" = 1 ]; then
+      echo "skip: $REPO#$PR already has a pending review ($existing) — not clobbering"; exit 0
+    fi
     echo "note: replacing your existing pending review ($existing)"
     gh api -X DELETE "repos/$REPO/pulls/$PR/reviews/$existing" >/dev/null 2>&1 || true
   fi
