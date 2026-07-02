@@ -51,5 +51,5 @@ MAXDIRECT=6
   [ "${tail_n:-0}" -gt 0 ] && printf '\n📄 %s more threads with activity on your/subscribed items → [inbox](<https://github.com/notifications>)\n' "$tail_n"
   [ -z "$reviews$notifs" ] && printf '\n✅ Inbox clear — nothing awaiting you.\n'
 
-  printf '\n_`/gh review #N` opus review · `/gh reply #N` draft comment · `/gh clear resolved` tidy_\n'
+  printf '\n_`/gh-draft review #N` opus review · `/gh-draft reply #N` comment · `/gh-draft clear resolved` tidy_\n'
 }
