@@ -1606,12 +1606,18 @@ async fn run_quickstart_cli(
                     std::collections::HashMap::new();
                 let mut aborted = false;
                 for d in &descriptors {
-                    if d.key == "api_key"
-                        && field_buf
-                            .get("auth_mode")
-                            .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex"))
-                    {
-                        continue;
+                    if d.key == "api_key" {
+                        let skips_api_key =
+                            quickstart_field_value_eq(&field_buf, "auth_mode", "codex")
+                                || (chosen.kind == "anthropic"
+                                    && quickstart_field_value_eq(
+                                        &field_buf,
+                                        "auth_mode",
+                                        "setup_token",
+                                    ));
+                        if skips_api_key {
+                            continue;
+                        }
                     }
                     // For the model field, upgrade the descriptor with a
                     // live catalog so `prompt_for_field` renders a picker
@@ -2238,6 +2244,16 @@ async fn run_quickstart_cli(
     }
 
     // ── Assemble submission ─────────────────────────────────────
+    let inline_auth = match form.provider.as_ref() {
+        Some(ProviderChoice::Fresh {
+            kind,
+            alias,
+            fields,
+            ..
+        }) => quickstart_inline_auth(kind, alias, fields),
+        _ => None,
+    };
+
     let provider = form.provider.expect("provider satisfied");
     let model_provider = match provider {
         ProviderChoice::Fresh {
@@ -2313,6 +2329,9 @@ async fn run_quickstart_cli(
                     "Quickstart complete."
                 )
             );
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
@@ -6628,6 +6647,175 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineProviderAuth {
+    Codex,
+    AnthropicSetupToken { alias: String },
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_field_value_eq(
+    fields: &std::collections::HashMap<String, String>,
+    key: &str,
+    expected: &str,
+) -> bool {
+    fields
+        .get(key)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_inline_auth(
+    kind: &str,
+    alias: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<InlineProviderAuth> {
+    if kind == "openai" && quickstart_field_value_eq(fields, "auth_mode", "codex") {
+        return Some(InlineProviderAuth::Codex);
+    }
+    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth_mode", "setup_token") {
+        return Some(InlineProviderAuth::AnthropicSetupToken {
+            alias: alias.to_string(),
+        });
+    }
+    None
+}
+
+/// `~/.codex/auth.json` — the credential file the upstream Codex CLI writes.
+/// When present, offer a direct import instead of starting a fresh browser flow.
+#[cfg(feature = "agent-runtime")]
+fn codex_auth_json_path() -> Option<std::path::PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().join(".codex").join("auth.json"))
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config) {
+    use dialoguer::Confirm;
+
+    match auth {
+        InlineProviderAuth::Codex => {
+            let import = codex_auth_json_path().filter(|p| p.exists());
+            let prompt = if import.is_some() {
+                t(
+                    "cli-quickstart-auth-codex-import-prompt",
+                    "Found an existing Codex login (~/.codex/auth.json) — import it now?",
+                )
+            } else {
+                t(
+                    "cli-quickstart-auth-codex-prompt",
+                    "Sign in to OpenAI Codex with your ChatGPT account now?",
+                )
+            };
+            let skip_hint = || {
+                println!(
+                    "{}",
+                    t(
+                        "cli-quickstart-auth-codex-skip-hint",
+                        "  Finish later with: zeroclaw auth login --model-provider openai-codex",
+                    )
+                );
+            };
+            if !Confirm::new()
+                .with_prompt(prompt)
+                .default(true)
+                .interact()
+                .unwrap_or(false)
+            {
+                skip_hint();
+                return;
+            }
+            let cmd = AuthCommands::Login {
+                model_provider: "openai-codex".to_string(),
+                profile: "default".to_string(),
+                device_code: false,
+                import,
+            };
+            if let Err(e) = handle_auth_command(cmd, config).await {
+                let err = e.to_string();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-auth-failed",
+                        &[("error", &err)],
+                        "  Auth setup didn't complete.",
+                    )
+                );
+                skip_hint();
+            }
+        }
+        InlineProviderAuth::AnthropicSetupToken { alias } => {
+            let skip_hint = || {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-auth-anthropic-skip-hint",
+                        &[("alias", &alias)],
+                        "  Finish later with: claude setup-token",
+                    )
+                );
+            };
+            if !Confirm::new()
+                .with_prompt(ta(
+                    "cli-quickstart-auth-anthropic-prompt",
+                    &[("alias", &alias)],
+                    "Run `claude setup-token` for this Anthropic provider now?",
+                ))
+                .default(true)
+                .interact()
+                .unwrap_or(false)
+            {
+                skip_hint();
+                return;
+            }
+            if let Err(e) = Box::pin(run_anthropic_setup_token_inline(&alias, config)).await {
+                let err = e.to_string();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-auth-failed",
+                        &[("error", &err)],
+                        "  Auth setup didn't complete.",
+                    )
+                );
+                skip_hint();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> Result<()> {
+    let status = std::process::Command::new("claude")
+        .arg("setup-token")
+        .status()
+        .context("failed to run `claude setup-token`; is the Claude CLI installed and on PATH?")?;
+    if !status.success() {
+        bail!("`claude setup-token` exited with status {status}");
+    }
+
+    let token = read_auth_input(&t(
+        "cli-quickstart-auth-anthropic-token-prompt",
+        "Paste the token from `claude setup-token`",
+    ))?;
+    if token.trim().is_empty() {
+        bail!("Token cannot be empty");
+    }
+
+    let path = format!("providers.models.anthropic.{alias}.api_key");
+    config.set_prop_persistent(&path, token.trim())?;
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-quickstart-auth-anthropic-saved",
+            &[("alias", alias)],
+            "  Saved Claude setup token.",
+        )
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -7350,6 +7538,28 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_inline_auth_uses_auth_mode_field() {
+        let fields =
+            std::collections::HashMap::from([("auth_mode".to_string(), " codex ".to_string())]);
+        assert_eq!(
+            quickstart_inline_auth("openai", "codex", &fields),
+            Some(InlineProviderAuth::Codex)
+        );
+
+        let fields =
+            std::collections::HashMap::from([("auth_mode".to_string(), "setup_token".to_string())]);
+        assert_eq!(
+            quickstart_inline_auth("anthropic", "max", &fields),
+            Some(InlineProviderAuth::AnthropicSetupToken {
+                alias: "max".to_string()
+            })
+        );
+
+        assert_eq!(quickstart_inline_auth("openai", "api", &fields), None);
     }
 
     #[test]
