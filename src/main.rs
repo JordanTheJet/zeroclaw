@@ -1554,20 +1554,30 @@ async fn run_quickstart_cli(
                     });
                     continue;
                 }
-                // Fresh: type → alias → field form.
-                let prov_labels: Vec<String> = providers
-                    .iter()
-                    .map(|p| {
-                        if p.local {
-                            qta(
-                                "cli-quickstart-provider-local-label",
-                                &[("name", &p.display_name)],
-                            )
-                        } else {
-                            p.display_name.clone()
-                        }
-                    })
-                    .collect();
+                // Fresh: type → alias → field form. A synthetic
+                // "OpenAI Codex (ChatGPT subscription)" row is pinned to
+                // the top of the picker so `codex` is findable — it maps
+                // to the `openai` slot with `requires_openai_auth = true`
+                // + `wire_api = "responses"` and skips the API-key prompt,
+                // because Codex auth comes from a ChatGPT login we run
+                // inline after apply (see `run_inline_provider_auth`).
+                // Index 0 is the synthetic row; the real provider list is
+                // offset by one.
+                let mut prov_labels: Vec<String> = Vec::with_capacity(providers.len() + 1);
+                prov_labels.push(t(
+                    "cli-quickstart-provider-codex-subscription",
+                    "OpenAI Codex (ChatGPT subscription)",
+                ));
+                prov_labels.extend(providers.iter().map(|p| {
+                    if p.local {
+                        qta(
+                            "cli-quickstart-provider-local-label",
+                            &[("name", &p.display_name)],
+                        )
+                    } else {
+                        p.display_name.clone()
+                    }
+                }));
                 let Some(pi) = FuzzySelect::new()
                     .with_prompt(t("cli-quickstart-provider-type-prompt", "Provider type"))
                     .items(&prov_labels)
@@ -1577,7 +1587,49 @@ async fn run_quickstart_cli(
                 else {
                     continue;
                 };
-                let chosen = &providers[pi];
+                if pi == 0 {
+                    // Codex subscription: `openai` slot, no API key. Ask
+                    // only for alias + served model ID; the ChatGPT login
+                    // runs inline once the agent is created.
+                    let Ok(alias) = Input::<String>::new()
+                        .with_prompt(t("cli-quickstart-codex-alias", "Alias for OpenAI Codex"))
+                        .default("codex".to_string())
+                        .allow_empty(false)
+                        .validate_with(|input: &String| {
+                            zeroclaw_config::helpers::validate_alias_key(input)
+                        })
+                        .interact_text()
+                    else {
+                        continue;
+                    };
+                    let Ok(model) = Input::<String>::new()
+                        .with_prompt(t(
+                            "cli-quickstart-codex-model",
+                            "Model (exact served ID, e.g. gpt-5-codex)",
+                        ))
+                        .default("gpt-5-codex".to_string())
+                        .allow_empty(false)
+                        .interact_text()
+                    else {
+                        continue;
+                    };
+                    // `requires_openai_auth` + `wire_api` are the two
+                    // switches that turn the `openai` slot into a Codex
+                    // subscription entry; the field buffer round-trips
+                    // them through the same apply path the web uses.
+                    let mut fields = std::collections::HashMap::new();
+                    fields.insert("requires_openai_auth".to_string(), "true".to_string());
+                    fields.insert("wire_api".to_string(), "responses".to_string());
+                    form.provider = Some(ProviderChoice::Fresh {
+                        kind: "openai".to_string(),
+                        display_name: "OpenAI Codex".to_string(),
+                        alias,
+                        model,
+                        fields,
+                    });
+                    continue;
+                }
+                let chosen = &providers[pi - 1];
                 let Ok(alias) = Input::<String>::new()
                     .with_prompt(qta(
                         "cli-quickstart-alias-for",
@@ -2224,6 +2276,33 @@ async fn run_quickstart_cli(
     }
 
     // ── Assemble submission ─────────────────────────────────────
+    // Capture whether the freshly-staged provider is a subscription /
+    // OAuth slot we can authenticate inline after apply. The config file
+    // only records *that* the slot uses subscription auth; the actual
+    // credentials live in the auth store, so we run the matching
+    // `zeroclaw auth …` flow ourselves once the agent is written.
+    // Existing-alias reuse is assumed already authenticated.
+    let inline_auth = match form.provider.as_ref() {
+        Some(ProviderChoice::Fresh { kind, fields, .. })
+            if kind == "openai"
+                && fields
+                    .get("requires_openai_auth")
+                    .map(|v| is_truthy(v))
+                    .unwrap_or(false) =>
+        {
+            Some(InlineProviderAuth::Codex)
+        }
+        Some(ProviderChoice::Fresh { kind, fields, .. })
+            if kind == "anthropic"
+                && fields
+                    .get("api_key")
+                    .map(|k| k.trim().is_empty())
+                    .unwrap_or(true) =>
+        {
+            Some(InlineProviderAuth::Anthropic)
+        }
+        _ => None,
+    };
     let provider = form.provider.expect("provider satisfied");
     let model_provider = match provider {
         ProviderChoice::Fresh {
@@ -2299,6 +2378,12 @@ async fn run_quickstart_cli(
                     "Quickstart complete."
                 )
             );
+            // Subscription / OAuth providers need credentials the config
+            // file can't carry. Run the matching auth flow inline now
+            // instead of leaving the user to discover a separate command.
+            if let Some(auth) = inline_auth {
+                run_inline_provider_auth(auth, &cfg).await;
+            }
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
@@ -6614,6 +6699,139 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+/// Subscription / OAuth model-provider slots the Quickstart can
+/// authenticate inline once the agent config is written. The config file
+/// only records *that* these slots use subscription auth; the actual
+/// credentials live in the auth store, so we run the same flow the
+/// matching `zeroclaw auth …` command would, right after apply.
+#[cfg(feature = "agent-runtime")]
+enum InlineProviderAuth {
+    /// `openai` slot with `requires_openai_auth = true` — ChatGPT/Codex login.
+    Codex,
+    /// `anthropic` slot with no API key — Claude subscription setup-token.
+    Anthropic,
+}
+
+/// Loose truthy check for the `requires_openai_auth` bool as it comes
+/// back through the string-keyed Quickstart field buffer.
+#[cfg(feature = "agent-runtime")]
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+/// `~/.codex/auth.json` — the credential file the upstream Codex CLI
+/// writes. When present, the user already signed in with Codex, so we
+/// offer a zero-friction import instead of a fresh browser login.
+#[cfg(feature = "agent-runtime")]
+fn codex_auth_json_path() -> Option<std::path::PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().join(".codex").join("auth.json"))
+}
+
+/// Run the subscription / OAuth login for a freshly-created provider
+/// inline. Always skippable: declining — or any failure — falls back to
+/// printing the manual `zeroclaw auth …` command so the agent is still
+/// usable once the user finishes auth on their own. Reuses
+/// [`handle_auth_command`] so the flow is identical to the standalone
+/// commands.
+#[cfg(feature = "agent-runtime")]
+async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &Config) {
+    use dialoguer::Confirm;
+    match auth {
+        InlineProviderAuth::Codex => {
+            let import = codex_auth_json_path().filter(|p| p.exists());
+            let prompt = if import.is_some() {
+                t(
+                    "cli-quickstart-auth-codex-import-prompt",
+                    "Found an existing Codex login (~/.codex/auth.json) — import it now?",
+                )
+            } else {
+                t(
+                    "cli-quickstart-auth-codex-prompt",
+                    "Sign in to OpenAI Codex with your ChatGPT account now?",
+                )
+            };
+            let skip_hint = || {
+                println!(
+                    "{}",
+                    t(
+                        "cli-quickstart-auth-codex-skip-hint",
+                        "  Finish later with: zeroclaw auth login --model-provider openai-codex",
+                    )
+                );
+            };
+            if !Confirm::new()
+                .with_prompt(prompt)
+                .default(true)
+                .interact()
+                .unwrap_or(false)
+            {
+                skip_hint();
+                return;
+            }
+            let cmd = AuthCommands::Login {
+                model_provider: "openai-codex".to_string(),
+                profile: "default".to_string(),
+                device_code: false,
+                import,
+            };
+            if let Err(e) = handle_auth_command(cmd, config).await {
+                let err = e.to_string();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-auth-failed",
+                        &[("error", &err)],
+                        "  Auth setup didn't complete.",
+                    )
+                );
+                skip_hint();
+            }
+        }
+        InlineProviderAuth::Anthropic => {
+            let skip_hint = || {
+                println!(
+                    "{}",
+                    t(
+                        "cli-quickstart-auth-anthropic-skip-hint",
+                        "  Finish later with: zeroclaw auth setup-token --model-provider anthropic",
+                    )
+                );
+            };
+            if !Confirm::new()
+                .with_prompt(t(
+                    "cli-quickstart-auth-anthropic-prompt",
+                    "Set up your Anthropic (Claude) subscription token now?",
+                ))
+                .default(true)
+                .interact()
+                .unwrap_or(false)
+            {
+                skip_hint();
+                return;
+            }
+            let cmd = AuthCommands::SetupToken {
+                model_provider: "anthropic".to_string(),
+                profile: "default".to_string(),
+            };
+            if let Err(e) = handle_auth_command(cmd, config).await {
+                let err = e.to_string();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-auth-failed",
+                        &[("error", &err)],
+                        "  Auth setup didn't complete.",
+                    )
+                );
+                skip_hint();
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -7336,6 +7554,19 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn is_truthy_accepts_common_bool_spellings() {
+        // The Quickstart field buffer round-trips `requires_openai_auth`
+        // as a string; the inline-auth trigger must read it back loosely.
+        for yes in ["true", "TRUE", " True ", "1", "yes", "on"] {
+            assert!(is_truthy(yes), "{yes:?} should be truthy");
+        }
+        for no in ["false", "0", "no", "off", "", "  ", "maybe"] {
+            assert!(!is_truthy(no), "{no:?} should not be truthy");
+        }
     }
 
     #[test]

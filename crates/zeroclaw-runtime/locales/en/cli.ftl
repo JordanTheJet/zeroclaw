@@ -548,6 +548,20 @@ cli-quickstart-channel-remove-row = {"  "}{$reference} (remove)
 cli-quickstart-peer-group-row = {$channel} → {$name} ({$count} peers)
 cli-quickstart-provider-local-label = {$name} (local)
 cli-quickstart-provider-type-prompt = Provider type
+# Synthetic top-of-list picker row + prompts for the OpenAI Codex
+# (ChatGPT subscription) provider. Maps to the `openai` slot with
+# `requires_openai_auth = true` + `wire_api = "responses"`.
+cli-quickstart-provider-codex-subscription = OpenAI Codex (ChatGPT subscription)
+cli-quickstart-codex-alias = Alias for OpenAI Codex
+cli-quickstart-codex-model = Model (exact served ID, e.g. gpt-5-codex)
+# Inline subscription/OAuth auth prompts, run right after the agent is
+# created so the user never has to discover a separate `auth` command.
+cli-quickstart-auth-codex-prompt = Sign in to OpenAI Codex with your ChatGPT account now?
+cli-quickstart-auth-codex-import-prompt = Found an existing Codex login (~/.codex/auth.json) — import it now?
+cli-quickstart-auth-codex-skip-hint =   Finish later with: zeroclaw auth login --model-provider openai-codex
+cli-quickstart-auth-anthropic-prompt = Set up your Anthropic (Claude) subscription token now?
+cli-quickstart-auth-anthropic-skip-hint =   Finish later with: zeroclaw auth setup-token --model-provider anthropic
+cli-quickstart-auth-failed =   Auth setup didn't complete: {$error}
 cli-quickstart-alias-for = Alias for {$name}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
