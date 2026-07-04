@@ -751,6 +751,17 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         if !essentials.contains(&field_path) {
             continue;
         }
+        // `auth_mode` is a Quickstart-only synthetic selector for the
+        // OpenAI (Codex) and Anthropic (setup-token) slots, appended
+        // explicitly below. Some config families (gemini, qwen, minimax)
+        // carry a *real* `auth_mode` schema field; surfacing that here
+        // would add a spurious required prompt AND — because apply strips
+        // `auth_mode` for the synthetic slots — the user's real selection
+        // would be silently discarded. Never emit the real field; the
+        // openai/anthropic descriptors below are the only auth_mode rows.
+        if field_path == QUICKSTART_AUTH_MODE_FIELD {
+            continue;
+        }
         // `display_value` already masks secrets as `****`; we want
         // ghost-text defaults for plain fields only. `<unset>` is the
         // placeholder for an unset Option, not a real value — emitting
@@ -1241,7 +1252,14 @@ fn apply_model_provider(
             let mut entries: Vec<(&String, &String)> = choice.fields.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in entries {
-                if key == QUICKSTART_AUTH_MODE_FIELD {
+                // `auth_mode` is a synthetic Quickstart-only selector for
+                // the openai/anthropic slots (no real schema field), so it
+                // must not be written for them. Other families (gemini,
+                // qwen, minimax) have a *real* `auth_mode` field — let it
+                // round-trip and persist normally.
+                if key == QUICKSTART_AUTH_MODE_FIELD
+                    && matches!(provider_type, "openai" | "anthropic")
+                {
                     continue;
                 }
                 if codex_auth
@@ -2218,6 +2236,60 @@ mod tests {
         assert!(
             entry.api_key.is_none(),
             "Codex auth must not persist an API key from the Quickstart form"
+        );
+    }
+
+    /// Regression: the synthetic `auth_mode` selector is for openai/anthropic
+    /// only. Families that carry a *real* `auth_mode` schema field (gemini,
+    /// qwen, minimax) must NOT surface it as a spurious required Quickstart
+    /// prompt — otherwise the extra prompt is a UX regression and the value
+    /// is dropped by apply's synthetic-field strip.
+    #[test]
+    fn field_shape_real_auth_mode_providers_omit_auth_mode_row() {
+        for provider in ["gemini", "qwen", "minimax"] {
+            let rows = super::field_shape(super::FieldSection::ModelProvider, provider);
+            let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+            assert!(
+                !keys.contains(&"auth_mode"),
+                "field_shape({provider}) must not surface the real auth_mode field as a Quickstart prompt; got {keys:?}",
+            );
+        }
+    }
+
+    /// Regression: a *real* `auth_mode` value submitted for a family that owns
+    /// the field (gemini) must persist — it must not be dropped by the
+    /// openai/anthropic synthetic-field strip.
+    #[test]
+    fn apply_gemini_persists_real_auth_mode_oauth() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "gemini".into(),
+            alias: "main".into(),
+            model: "gemini-2.5-flash".into(),
+            fields: std::collections::HashMap::from([(
+                "auth_mode".to_string(),
+                "o_auth".to_string(),
+            )]),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        assert!(
+            cfg.providers.models.find("gemini", "main").is_some(),
+            "gemini.main entry"
+        );
+        // Before the fix this round-tripped value was stripped and left
+        // `<unset>` (defaulting to ApiKey); after the fix it persists.
+        let persisted = cfg
+            .get_prop("providers.models.gemini.main.auth_mode")
+            .expect("gemini auth_mode prop should be readable");
+        assert_ne!(
+            persisted,
+            zeroclaw_config::traits::UNSET_DISPLAY,
+            "a real gemini auth_mode=OAuth selection must persist, not be stripped to unset",
         );
     }
 
