@@ -87,8 +87,10 @@ impl ChannelInstanceFactory {
         let mut store =
             crate::component::new_store_with_inbound(self.permissions.as_ref(), inbound, limits);
         let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
+        let websocket = store.data().websocket_enabled();
+        let linker = build_linker(http, websocket)?;
         crate::component::ensure_http_coherent(&store, http)?;
+        crate::component::ensure_ws_coherent(&store, websocket)?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, self.component.as_ref(), &linker).await,
             "failed to instantiate channel plugin",
@@ -172,7 +174,7 @@ fn resolve_configure_json(
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(http: bool, websocket: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     if http {
@@ -180,6 +182,9 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    // Per-permission gate: the `ws-client` import is installed only for plugins
+    // granted `WebSocketClient`, mirroring the `wasi:http` gate above.
+    options.plugins_wit_v0_websocket(websocket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
