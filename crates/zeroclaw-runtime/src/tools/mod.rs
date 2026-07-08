@@ -16,6 +16,8 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod attribution;
+pub mod config_help;
+pub mod create_agent;
 pub mod cron_add;
 pub(crate) mod cron_common;
 pub mod cron_list;
@@ -42,6 +44,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+pub mod start_agent;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -660,6 +663,17 @@ pub fn all_tools_with_runtime(
             config.clone(),
             security.clone(),
         )),
+        Arc::new(crate::tools::create_agent::CreateAgentTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias.to_string(),
+        )),
+        Arc::new(crate::tools::start_agent::StartAgentTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias.to_string(),
+        )),
+        Arc::new(crate::tools::config_help::ConfigHelpTool::new()),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(

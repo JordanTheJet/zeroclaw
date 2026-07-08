@@ -920,6 +920,114 @@ cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
 cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+# --- onboard: chat-based setup assistant ---
+cli-onboard-needs-tty = `zeroclaw onboard` is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `zeroclaw onboard --message "<request>"` for a single non-interactive command.
+cli-onboard-prompt = you
+cli-onboard-apply-prompt = Apply this change?
+cli-onboard-rerun-yes = Re-run with {$flag} to apply.
+cli-onboard-skipped = Skipped.
+cli-onboard-banner-title = ZeroClaw onboarding assistant
+cli-onboard-banner-intro-configured = Tell me what to change or check — your install already has a working agent.
+cli-onboard-banner-intro-fresh = Tell me what you want, or say `setup` and I'll walk you through your first agent.
+cli-onboard-banner-help = Type `help` for commands, or `quit` to leave.
+cli-onboard-agents-none = No agents configured yet. Run `setup` to create one.
+cli-onboard-agents-header = Agents:
+cli-onboard-agent-row = {$alias} | provider={$provider} | model={$model}{$state}
+cli-onboard-agent-inherited = (inherited)
+cli-onboard-agent-disabled = [disabled]
+cli-onboard-reachable = reachable
+cli-onboard-not-reachable = not reachable
+cli-onboard-running = running
+cli-onboard-not-running = not running
+cli-onboard-gateway-line = Gateway: {$state} ({$url})
+cli-onboard-service-line = Service: {$state}
+cli-onboard-gateway-start-hint = Start it with: {$cmd}
+cli-onboard-config-valid = {$glyph} config is valid ({$path})
+cli-onboard-config-issues = {$glyph} config has issues:
+cli-onboard-run-doctor = Run `doctor` for the full diagnostic report.
+cli-onboard-gateway-cmd-start = zeroclaw service start   (or `zeroclaw daemon` to run in the foreground)
+cli-onboard-gateway-cmd-stop = zeroclaw service stop
+cli-onboard-gateway-cmd-restart = zeroclaw service restart
+cli-onboard-gateway-run = To {$action} the gateway, run: {$cmd}
+cli-onboard-gateway-service-note = (that command targets the installed service — check `zeroclaw service status` first)
+cli-onboard-talk-start = Start your agent with: {$cmd}
+cli-onboard-talk-none = No agents configured yet. Run `setup` first.
+cli-onboard-talk-pick = Pick one and run: {$cmd} (configured: {$list})
+cli-onboard-model-usage = Use the form `set default model <family>/<model-id>` (e.g. anthropic/claude-opus-4-8).
+cli-onboard-model-empty = No model id given.
+cli-onboard-provider-missing = No provider `{$provider}` is configured. Run `setup` to add one first.
+cli-onboard-set-model-ok = {$glyph} set {$path} = {$model}
+cli-onboard-set-ok = {$glyph} set {$path}
+cli-onboard-plan = {$glyph} Plan: {$desc}.
+cli-onboard-help-intro = I can run these for you (just say it in plain language):
+cli-onboard-help-inspect = Inspect:  status · overview · doctor · models · agents · gateway status · validate config
+cli-onboard-help-change = Change:   setup · set default model <family>/<model> · config set <path> <value>
+cli-onboard-help-go = Go:       talk to agent · help · quit
+cli-onboard-help-note = Changes are previewed and need your approval before they apply.
+
+# --- onboard: parser hints (Operation::None messages) ---
+cli-onboard-empty-input = Tell me what to set up — try `setup`, `status`, `doctor`, `models`, or `agents`.
+cli-onboard-bye = Bye.
+cli-onboard-unknown-input = I didn't quite catch that. I can `setup` an agent, check things with `status`/`doctor`, list `agents`/`models`, or `talk to agent`. Say `help` to see everything.
+
+# --- onboard: overview snapshot (Overview::format / next_step) ---
+cli-onboard-ov-config = Config: {$state}
+cli-onboard-ov-present = present
+cli-onboard-ov-missing = missing (first run)
+cli-onboard-ov-path = Path: {$path}
+cli-onboard-ov-default-model = Default model: {$model}
+cli-onboard-ov-not-configured = not configured
+cli-onboard-ov-agents = Agents:
+cli-onboard-ov-none = none
+cli-onboard-ov-providers = Providers:
+cli-onboard-ov-provider-row = {$family}.{$alias} | model={$model} | key={$key}
+cli-onboard-ov-model-none = (none)
+cli-onboard-ov-key-yes = yes
+cli-onboard-ov-key-no = no
+cli-onboard-ov-gateway = Gateway: {$state} ({$url})
+cli-onboard-ov-service = Service: {$state}
+cli-onboard-ov-planner = Planner: {$state}
+cli-onboard-ov-planner-on = model-assisted for free-form requests
+cli-onboard-ov-planner-off = deterministic only until a model is configured
+cli-onboard-ov-config-issues = Config issues:
+cli-onboard-ov-next = Next: {$step}
+cli-onboard-next-setup-first = run `setup` to create your first working agent
+cli-onboard-next-validate = run `validate config` or `doctor` to inspect the issues above
+cli-onboard-next-add-agent = run `setup` to add an agent
+cli-onboard-next-gateway = run `gateway status` to check the gateway/daemon
+cli-onboard-next-talk = run `talk to agent` to start your configured agent
+
+# --- onboard: conversational setup ---
+cli-onboard-setup-needs-tty = Setup is interactive — run `zeroclaw onboard` in a terminal (or `zeroclaw quickstart`).
+cli-onboard-setup-existing = Using your configured provider {$provider} (model {$model}).
+cli-onboard-setup-provider-prompt = Choose a model provider
+cli-onboard-setup-provider-local = {$name} (local — no key)
+cli-onboard-setup-key-prompt = API key for {$provider}
+cli-onboard-setup-model-prompt = Choose a model
+cli-onboard-setup-model-input = Model id
+cli-onboard-setup-failed = {$glyph} Setup could not finish:
+cli-onboard-setup-review-header = Review:
+cli-onboard-setup-review-provider = provider  {$v}
+cli-onboard-setup-review-key = key       {$v}
+cli-onboard-setup-review-model = model     {$v}
+cli-onboard-setup-key-set = (set)
+cli-onboard-setup-key-unset = (not set)
+cli-onboard-setup-action-prompt = What next?
+cli-onboard-setup-action-apply = Apply — start the agent builder
+cli-onboard-setup-action-provider = Change provider
+cli-onboard-setup-action-key = Change API key
+cli-onboard-setup-action-model = Change model
+cli-onboard-setup-action-cancel = Cancel
+
+# --- onboard: greeting + agent handoff ---
+cli-onboard-greeting = Hi! I help you set up and run ZeroClaw. Try `setup` to create an agent, `status` to see what's configured, or `help` for everything I can do.
+cli-onboard-talk-confirm = Start agent {$alias} now?
+cli-onboard-talk-launching = Starting {$alias} — exit the agent to come back here.
+
+# --- onboard: setup assistant handoff ---
+cli-onboard-assistant-launching = Handing you to the agent builder, Zerona — she'll help build your agent. Type /quit to leave.
+cli-onboard-assistant-opening = I'm Zerona, your agent builder 🦀. What would you like your agent to help you with? Tell me as much or as little as you like, and we'll shape it together.
+cli-onboard-assistant-failed = Could not start Zerona: {$err}
 
 # ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
 # Emitted by the daemon startup guard in src/main.rs when the configured gateway
@@ -943,4 +1051,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-
