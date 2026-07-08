@@ -31,7 +31,7 @@ zeroclaw auth login --model-provider openai-codex
 Quickstart can write the provider entry for you:
 
 ```bash
-zeroclaw quickstart --model-provider openai-codex --model gpt-5-codex
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
 ```
 
 Manual config uses the same canonical OpenAI slot:

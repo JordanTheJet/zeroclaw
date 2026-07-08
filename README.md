@@ -114,7 +114,7 @@ entry for you:
 
 ```bash
 zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json  # if already signed in with Codex CLI
-zeroclaw quickstart --model-provider openai-codex --model gpt-5-codex
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
 ```
 
 The provider entry uses the canonical OpenAI shape; the alias below is an
@@ -122,7 +122,7 @@ example:
 
 ```toml
 [providers.models.openai.coding]   # type = openai; alias = coding (you choose)
-model = "gpt-5-codex"
+model = "gpt-5.4"
 wire_api = "responses"
 requires_openai_auth = true
 ```

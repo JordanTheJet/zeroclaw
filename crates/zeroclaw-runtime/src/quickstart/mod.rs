@@ -2170,7 +2170,7 @@ mod tests {
         submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
             provider_type: "openai-codex".into(),
             alias: "coding".into(),
-            model: "gpt-5-codex".into(),
+            model: "gpt-5.4".into(),
             fields: std::collections::HashMap::new(),
         });
         let mut staged = Vec::new();
@@ -2183,7 +2183,7 @@ mod tests {
             .models
             .find("openai", "coding")
             .expect("openai.coding entry");
-        assert_eq!(entry.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(entry.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(entry.wire_api, Some(WireApi::Responses));
         assert!(entry.requires_openai_auth);
         let agent = cfg.agents.get("bot").expect("agent created");
@@ -2197,7 +2197,7 @@ mod tests {
         submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
             provider_type: "openai".into(),
             alias: "coding".into(),
-            model: "gpt-5-codex".into(),
+            model: "gpt-5.4".into(),
             fields: std::collections::HashMap::from([
                 ("auth_mode".to_string(), "codex".to_string()),
                 ("api_key".to_string(), "sk-should-not-persist".to_string()),

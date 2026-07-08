@@ -58,7 +58,7 @@ For scripted setup, `openai-codex` is accepted as a quickstart input alias and
 writes the canonical `[providers.models.openai.<alias>]` entry:
 
 ```sh
-zeroclaw quickstart --model-provider openai-codex --model gpt-5-codex --agent assistant
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4 --agent assistant
 ```
 
 ### Claude subscription setup-token auth
