@@ -15,6 +15,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::ws::WsRegistry;
 
 /// A host-owned queue of inbound messages destined for a channel plugin.
 ///
@@ -116,6 +117,10 @@ pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
+    /// Host-owned outbound WebSocket connections, present only when the
+    /// manifest grants `WebSocketClient`. `None` leaves the `ws-client` import
+    /// unlinked, so the component cannot open a socket. Mirrors `http`.
+    websocket: Option<WsRegistry>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
@@ -143,10 +148,14 @@ impl PluginState {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
+        let websocket = permissions
+            .contains(&PluginPermission::WebSocketClient)
+            .then(WsRegistry::new);
         Self {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
+            websocket,
             inbound,
             limits: StoreLimitsBuilder::new()
                 .memory_size(limits.max_memory_bytes)
@@ -160,6 +169,22 @@ impl PluginState {
     /// Whether this state was built with outbound HTTP attached.
     pub fn http_enabled(&self) -> bool {
         self.http.is_some()
+    }
+
+    /// Whether this state was built with the outbound WebSocket registry
+    /// attached (the `WebSocketClient` permission was granted).
+    pub fn websocket_enabled(&self) -> bool {
+        self.websocket.is_some()
+    }
+
+    /// The connection registry backing the `ws-client` import. Panics if called
+    /// on a store built without `WebSocketClient`; the coherence guard
+    /// ([`ensure_ws_coherent`]) keeps the import from being linked in that case,
+    /// so a live call can never reach here — exactly like `WasiHttpView::http`.
+    pub(crate) fn websocket_mut(&mut self) -> &mut WsRegistry {
+        self.websocket
+            .as_mut()
+            .expect("ws-client called on a plugin without the WebSocketClient permission")
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
@@ -224,6 +249,24 @@ pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -
         anyhow::bail!(
             "plugin store/linker http mismatch: store HttpClient={store_has_http}, \
              linker wasi:http={linker_has_http}; refusing to instantiate"
+        );
+    }
+    Ok(())
+}
+
+/// Assert that a store and the linker chosen for it agree on the `ws-client`
+/// surface before instantiation, the WebSocket twin of [`ensure_http_coherent`].
+/// The store carries a `WsRegistry` only when its manifest granted
+/// `WebSocketClient`; `linker_has_ws` is whether the linker picked for it linked
+/// the `ws-client` import. A wiring that pairs a ws-linked linker with a store
+/// lacking the registry (or the reverse) gets a named startup error here instead
+/// of a `websocket_mut` panic at the first `ws-connect`.
+pub fn ensure_ws_coherent(store: &Store<PluginState>, linker_has_ws: bool) -> Result<()> {
+    let store_has_ws = store.data().websocket_enabled();
+    if store_has_ws != linker_has_ws {
+        anyhow::bail!(
+            "plugin store/linker websocket mismatch: store WebSocketClient={store_has_ws}, \
+             linker ws-client={linker_has_ws}; refusing to instantiate"
         );
     }
     Ok(())

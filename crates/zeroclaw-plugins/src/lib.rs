@@ -19,6 +19,8 @@ pub mod wasm_channel;
 pub mod wasm_memory;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_tool;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod ws;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -95,6 +97,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can open host-mediated outbound WebSocket connections (`ws-client`).
+    // snake_case would derive to `web_socket_client`; pin the wire name.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
 }
 
 /// Information about a loaded plugin.

@@ -338,6 +338,14 @@ interface channel {
 world channel-plugin {
     import logging;
     import inbound;
+    // Outbound host-mediated WebSocket, for platforms that need a persistent
+    // duplex socket (Discord Gateway, Slack Socket Mode). Gated by a distinct
+    // unstable feature so the host links it only for plugins granted the
+    // `websocket-client` permission; a plugin that does not enable the feature
+    // never imports it and is unaffected (adding a world import is
+    // backward-compatible — existing components need no rebuild).
+    @unstable(feature = plugins-wit-v0-websocket)
+    import ws-client;
     export plugin-info;
     export channel;
 }
