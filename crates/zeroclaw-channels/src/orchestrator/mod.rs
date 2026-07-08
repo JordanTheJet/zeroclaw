@@ -10004,7 +10004,25 @@ pub async fn start_channels(
                     .iter()
                     .map(|cc| (cc.channel.name(), cc.alias.as_deref())),
             );
+            let active_aliases = ActiveChannelAliases::compute(&config);
             for built in zeroclaw_runtime::plugin_channels::build_channel_plugins(&config).await {
+                // Mirror channels honor the same agent-owner gate as native
+                // channels: a per-alias mirror (Some(alias), composite dedup_key)
+                // only comes online when its `<type>.<alias>` is bound to an
+                // enabled agent — or no bindings exist anywhere (legacy mode).
+                // Novel plugins (None alias) carry no config binding and are not
+                // gated. This closes the #8013 invariant for mirrors too.
+                if built.alias.is_some() && !active_aliases.contains(&built.dedup_key) {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Plugin channel '{}' is not bound to an enabled agent; skipping",
+                            built.dedup_key
+                        )
+                    );
+                    continue;
+                }
                 if native_channel_keys.contains(&built.dedup_key) {
                     ::zeroclaw_log::record!(
                         WARN,

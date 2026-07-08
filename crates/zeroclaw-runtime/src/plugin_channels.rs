@@ -135,8 +135,9 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
                     if !enabled {
                         continue;
                     }
+                    let resolved = apply_env_fallbacks(cfg_obj, id);
                     let config_json =
-                        ::serde_json::to_string(cfg_obj).unwrap_or_else(|_| "{}".to_string());
+                        ::serde_json::to_string(&resolved).unwrap_or_else(|_| "{}".to_string());
                     match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror(
                         id,
                         alias.as_str(),
@@ -185,6 +186,45 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
     built
 }
 
+/// Overlay env-var credentials onto a mirror's canonical config, reproducing
+/// the native channels' `resolved_*` fallback (e.g. Slack's `SLACK_BOT_TOKEN`,
+/// Telegram's `TELEGRAM_BOT_TOKEN`): for each **present-but-empty string** field,
+/// fill it from `ZEROCLAW_<ID>_<FIELD>` (preferred, so ZeroClaw-scoped secrets
+/// win) or the conventional `<ID>_<FIELD>`. Config always wins over env; only
+/// blank fields are filled, and non-string / non-empty fields are untouched.
+///
+/// Limitation vs. native: a field entirely **absent** from the config object
+/// (e.g. dropped by `skip_serializing_if`) is not added — the generic view can't
+/// know a channel's field names. Set the field to `""` in config to opt it into
+/// env resolution.
+#[cfg(feature = "plugins-wasm")]
+fn apply_env_fallbacks(cfg_obj: &::serde_json::Value, id: &str) -> ::serde_json::Value {
+    let mut obj = cfg_obj.clone();
+    let Some(map) = obj.as_object_mut() else {
+        return obj;
+    };
+    let id_up = id.to_ascii_uppercase();
+    for (field, value) in map.iter_mut() {
+        if value.as_str() != Some("") {
+            continue;
+        }
+        let field_up = field.to_ascii_uppercase();
+        for key in [
+            format!("ZEROCLAW_{id_up}_{field_up}"),
+            format!("{id_up}_{field_up}"),
+        ] {
+            if let Ok(v) = std::env::var(&key) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    *value = ::serde_json::Value::String(v.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    obj
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn log_instantiate_failure(plugin: &str, err: &anyhow::Error) {
     ::zeroclaw_log::record!(
@@ -204,4 +244,50 @@ fn log_instantiate_failure(plugin: &str, err: &anyhow::Error) {
 #[cfg(not(feature = "plugins-wasm"))]
 pub async fn build_channel_plugins(_config: &Config) -> Vec<BuiltChannelPlugin> {
     Vec::new()
+}
+
+#[cfg(all(test, feature = "plugins-wasm"))]
+mod tests {
+    use super::apply_env_fallbacks;
+    use serde_json::json;
+
+    #[test]
+    fn env_fills_only_blank_string_fields() {
+        // SAFETY: unique keys owned by this test, restored before it returns.
+        unsafe {
+            std::env::set_var("ZEROCLAW_MIRRORTEST_BOT_TOKEN", "from-zeroclaw-env");
+        }
+        let cfg = json!({ "bot_token": "", "enabled": true, "kept": "config-val" });
+        let out = apply_env_fallbacks(&cfg, "mirrortest");
+        assert_eq!(
+            out["bot_token"],
+            json!("from-zeroclaw-env"),
+            "blank string is filled from env"
+        );
+        assert_eq!(
+            out["kept"],
+            json!("config-val"),
+            "non-blank field untouched"
+        );
+        assert_eq!(out["enabled"], json!(true), "non-string field untouched");
+        unsafe {
+            std::env::remove_var("ZEROCLAW_MIRRORTEST_BOT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn plain_env_name_used_and_config_wins() {
+        unsafe {
+            std::env::set_var("MIRRORTWO_BOT_TOKEN", "from-plain-env");
+        }
+        // Blank → filled from the conventional `<ID>_<FIELD>` name.
+        let blank = apply_env_fallbacks(&json!({ "bot_token": "" }), "mirrortwo");
+        assert_eq!(blank["bot_token"], json!("from-plain-env"));
+        // A non-blank config value always wins over env.
+        let set = apply_env_fallbacks(&json!({ "bot_token": "config-token" }), "mirrortwo");
+        assert_eq!(set["bot_token"], json!("config-token"));
+        unsafe {
+            std::env::remove_var("MIRRORTWO_BOT_TOKEN");
+        }
+    }
 }
