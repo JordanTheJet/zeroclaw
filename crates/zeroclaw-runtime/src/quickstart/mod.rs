@@ -15,7 +15,7 @@ use zeroclaw_config::presets::{
     AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
     SelectorChoice, risk_preset, runtime_preset,
 };
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, WireApi};
 
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
@@ -504,6 +504,30 @@ pub struct QuickstartTypeOption {
     pub local: bool,
 }
 
+/// Resolve a Quickstart provider-type input to the canonical config family.
+///
+/// The provider registry remains the source of truth for real config families.
+/// Auth-provider aliases (`openai-codex`, `claude`, `google`, `grok`, ...)
+/// are accepted as Quickstart conveniences and normalize to existing config
+/// families. Only `openai-codex` preselects a different Quickstart auth mode.
+#[must_use]
+pub fn resolve_model_provider_type(type_key: &str) -> Option<(&'static str, bool)> {
+    if let Ok(provider) = type_key.parse::<zeroclaw_providers::auth::AuthProvider>() {
+        return Some(match provider {
+            zeroclaw_providers::auth::AuthProvider::OpenaiCodex => ("openai", true),
+            zeroclaw_providers::auth::AuthProvider::Anthropic => ("anthropic", false),
+            zeroclaw_providers::auth::AuthProvider::Gemini => ("gemini", false),
+            zeroclaw_providers::auth::AuthProvider::Xai => ("xai", false),
+        });
+    }
+
+    let trimmed = type_key.trim();
+    zeroclaw_providers::list_model_providers()
+        .into_iter()
+        .find(|info| info.name.eq_ignore_ascii_case(trimmed))
+        .map(|info| (info.name, false))
+}
+
 /// Build a [`QuickstartState`] snapshot from the live config.
 ///
 /// The two `*_types` lists are populated from the canonical sources
@@ -690,13 +714,21 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
     // derive mask as "no map-keyed/list section", and field_shape
     // silently returns an empty Vec.
     const SYNTHETIC_ALIAS: &str = "qs0probe";
-    let (section_path, essentials) = match section {
-        FieldSection::ModelProvider => (
-            format!("providers.models.{type_key}"),
-            MODEL_PROVIDER_ESSENTIALS,
-        ),
-        FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
-        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS),
+    let (section_path, essentials, codex_auth_preselected) = match section {
+        FieldSection::ModelProvider => {
+            let Some((provider_type, codex_auth_preselected)) =
+                resolve_model_provider_type(type_key)
+            else {
+                return Vec::new();
+            };
+            (
+                format!("providers.models.{provider_type}"),
+                MODEL_PROVIDER_ESSENTIALS,
+                codex_auth_preselected,
+            )
+        }
+        FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS, false),
+        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS, false),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -736,28 +768,36 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
                 Some(raw.to_string())
             }
         };
+        let help = if section_path == "providers.models.anthropic" && field_path == "api_key" {
+            crate::i18n::get_required_cli_string("cli-quickstart-anthropic-api-key-help")
+        } else {
+            info.description.trim().to_string()
+        };
         out.push(FieldDescriptor {
             key: field_path.to_string(),
             label: kebab_to_snake(field_path),
-            help: info.description.trim().to_string(),
+            help,
             kind: info.kind,
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
             // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. `requires_openai_auth`
-            // and `wire_api` are OpenAI Codex subscription fields — optional
-            // for all providers, meaningful only for OpenAI. `api_key` is
-            // left non-required because local providers (Ollama) and Codex
-            // subscription auth don't need one — the runtime surfaces a
-            // clear error at request time if a remote provider is missing
-            // its key. Everything else in the essentials list is required
-            // to actually issue a request.
-            required: !matches!(
-                field_path,
-                "uri" | "api_key" | "requires_openai_auth" | "wire_api"
-            ),
+            // when pointing at a self-hosted gateway. `api_key` is left
+            // non-required because local providers (Ollama) and Codex
+            // subscription auth don't need one — the runtime surfaces a clear
+            // error at request time if a remote provider is missing its key.
+            // Everything else in the essentials list is required to actually
+            // issue a request.
+            required: !matches!(field_path, "uri" | "api_key"),
             default,
         });
+    }
+    if matches!(section, FieldSection::ModelProvider) && section_path == "providers.models.openai" {
+        out.push(openai_auth_mode_descriptor(codex_auth_preselected));
+    }
+    if matches!(section, FieldSection::ModelProvider)
+        && section_path == "providers.models.anthropic"
+    {
+        out.push(anthropic_auth_mode_descriptor());
     }
     out.sort_by_key(|d| {
         essentials
@@ -772,15 +812,89 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// provider type or channel kind lights up Quickstart for free,
 /// while keeping the modal focused on what an agent cannot start
 /// without.
-const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
-    "model",
-    "api_key",
-    "uri",
-    "requires_openai_auth",
-    "wire_api",
-];
+const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
+
+const QUICKSTART_AUTH_MODE_FIELD: &str = "auth_mode";
+const QUICKSTART_OPENAI_AUTH_MODE_API_KEY: &str = "api_key";
+const QUICKSTART_OPENAI_AUTH_MODE_CODEX: &str = "codex";
+const QUICKSTART_ANTHROPIC_AUTH_MODE_API_KEY: &str = "api_key";
+const QUICKSTART_ANTHROPIC_AUTH_MODE_SETUP_TOKEN: &str = "setup_token";
+
+fn openai_auth_mode_descriptor(codex_auth_preselected: bool) -> FieldDescriptor {
+    FieldDescriptor {
+        key: QUICKSTART_AUTH_MODE_FIELD.to_string(),
+        label: crate::i18n::get_required_cli_string("cli-quickstart-openai-auth-mode-label"),
+        help: crate::i18n::get_required_cli_string("cli-quickstart-openai-auth-mode-help"),
+        kind: zeroclaw_config::traits::PropKind::Enum,
+        is_secret: false,
+        enum_variants: Some(vec![
+            QUICKSTART_OPENAI_AUTH_MODE_API_KEY.to_string(),
+            QUICKSTART_OPENAI_AUTH_MODE_CODEX.to_string(),
+        ]),
+        required: true,
+        default: Some(
+            if codex_auth_preselected {
+                QUICKSTART_OPENAI_AUTH_MODE_CODEX
+            } else {
+                QUICKSTART_OPENAI_AUTH_MODE_API_KEY
+            }
+            .to_string(),
+        ),
+    }
+}
+
+fn anthropic_auth_mode_descriptor() -> FieldDescriptor {
+    FieldDescriptor {
+        key: QUICKSTART_AUTH_MODE_FIELD.to_string(),
+        label: crate::i18n::get_required_cli_string("cli-quickstart-anthropic-auth-mode-label"),
+        help: crate::i18n::get_required_cli_string("cli-quickstart-anthropic-auth-mode-help"),
+        kind: zeroclaw_config::traits::PropKind::Enum,
+        is_secret: false,
+        enum_variants: Some(vec![
+            QUICKSTART_ANTHROPIC_AUTH_MODE_API_KEY.to_string(),
+            QUICKSTART_ANTHROPIC_AUTH_MODE_SETUP_TOKEN.to_string(),
+        ]),
+        required: true,
+        default: Some(QUICKSTART_ANTHROPIC_AUTH_MODE_API_KEY.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiQuickstartAuthMode {
+    ApiKey,
+    Codex,
+}
+
+fn parse_openai_quickstart_auth_mode(raw: &str) -> Option<OpenAiQuickstartAuthMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | QUICKSTART_OPENAI_AUTH_MODE_API_KEY => Some(OpenAiQuickstartAuthMode::ApiKey),
+        QUICKSTART_OPENAI_AUTH_MODE_CODEX
+        | "codex_subscription"
+        | "openai-codex"
+        | "openai_codex" => Some(OpenAiQuickstartAuthMode::Codex),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicQuickstartAuthMode {
+    ApiKey,
+    SetupToken,
+}
+
+fn parse_anthropic_quickstart_auth_mode(raw: &str) -> Option<AnthropicQuickstartAuthMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | QUICKSTART_ANTHROPIC_AUTH_MODE_API_KEY | "key" => {
+            Some(AnthropicQuickstartAuthMode::ApiKey)
+        }
+        QUICKSTART_ANTHROPIC_AUTH_MODE_SETUP_TOKEN | "setup-token" | "claude_setup_token" => {
+            Some(AnthropicQuickstartAuthMode::SetupToken)
+        }
+        _ => None,
+    }
+}
 
 /// Runtime profile the Quickstart silently installs. The Runtime Profile
 /// picker was removed from every surface; apply always writes this preset.
@@ -1004,28 +1118,67 @@ fn apply_model_provider(
             // whitespace-padded value (e.g. "llamacpp ", "llama.cpp") would
             // otherwise reach `create_map_key` verbatim and fail with a cryptic
             // "no map-keyed/list section" because the family key doesn't match.
-            let provider_type = choice.provider_type.trim();
-            let provider_type = match zeroclaw_providers::list_model_providers()
-                .into_iter()
-                .find(|info| info.name.eq_ignore_ascii_case(provider_type))
-            {
-                Some(info) => info.name.to_string(),
-                None => {
-                    errors.push(QuickstartError::for_surface(
-                        ctx,
-                        QuickstartStep::ModelProvider,
-                        "provider_type",
-                        format!(
-                            "unknown model provider type `{}` — pick one from the provider list",
-                            choice.provider_type.trim()
-                        ),
-                        "cli-quickstart-error-unknown-provider-type",
-                        &[("provider", choice.provider_type.trim())],
-                    ));
-                    return None;
-                }
+            // `openai-codex` is accepted as a convenience input alias and
+            // normalizes to the existing `openai` config family.
+            let Some((provider_type, codex_alias_requested)) =
+                resolve_model_provider_type(&choice.provider_type)
+            else {
+                errors.push(QuickstartError::for_surface(
+                    ctx,
+                    QuickstartStep::ModelProvider,
+                    "provider_type",
+                    format!(
+                        "unknown model provider type `{}` — pick one from the provider list",
+                        choice.provider_type.trim()
+                    ),
+                    "cli-quickstart-error-unknown-provider-type",
+                    &[("provider", choice.provider_type.trim())],
+                ));
+                return None;
             };
-            if section_has_alias(config, "providers.models", &provider_type, &choice.alias) {
+            let auth_mode = if provider_type == "openai" {
+                match choice.fields.get(QUICKSTART_AUTH_MODE_FIELD) {
+                    Some(value) => match parse_openai_quickstart_auth_mode(value) {
+                        Some(mode) => mode,
+                        None => {
+                            errors.push(QuickstartError::for_surface(
+                                ctx,
+                                QuickstartStep::ModelProvider,
+                                QUICKSTART_AUTH_MODE_FIELD,
+                                format!(
+                                    "unknown OpenAI auth mode `{}` — pick `api_key` or `codex`",
+                                    value.trim()
+                                ),
+                                "cli-quickstart-error-unknown-openai-auth-mode",
+                                &[("mode", value.trim())],
+                            ));
+                            return None;
+                        }
+                    },
+                    None if codex_alias_requested => OpenAiQuickstartAuthMode::Codex,
+                    None => OpenAiQuickstartAuthMode::ApiKey,
+                }
+            } else {
+                OpenAiQuickstartAuthMode::ApiKey
+            };
+            if provider_type == "anthropic"
+                && let Some(value) = choice.fields.get(QUICKSTART_AUTH_MODE_FIELD)
+                && parse_anthropic_quickstart_auth_mode(value).is_none()
+            {
+                errors.push(QuickstartError::for_surface(
+                    ctx,
+                    QuickstartStep::ModelProvider,
+                    QUICKSTART_AUTH_MODE_FIELD,
+                    format!(
+                        "unknown Anthropic auth mode `{}` — pick `api_key` or `setup_token`",
+                        value.trim()
+                    ),
+                    "cli-quickstart-error-unknown-anthropic-auth-mode",
+                    &[("mode", value.trim())],
+                ));
+                return None;
+            }
+            if section_has_alias(config, "providers.models", provider_type, &choice.alias) {
                 let alias_ref = format!("{}.{}", provider_type, choice.alias);
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1037,6 +1190,8 @@ fn apply_model_provider(
                 ));
                 return None;
             }
+            let codex_auth =
+                provider_type == "openai" && matches!(auth_mode, OpenAiQuickstartAuthMode::Codex);
             let prefix = format!("providers.models.{}.{}", provider_type, choice.alias);
             if let Err(err) = config.create_map_key(
                 &format!("providers.models.{}", provider_type),
@@ -1058,12 +1213,45 @@ fn apply_model_provider(
                 ));
                 return None;
             }
+            if codex_auth {
+                if let Err(err) = config
+                    .set_prop_persistent(&format!("{prefix}.wire_api"), WireApi::Responses.as_str())
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::ModelProvider,
+                        "wire_api",
+                        err.to_string(),
+                    ));
+                    return None;
+                }
+                if let Err(err) =
+                    config.set_prop_persistent(&format!("{prefix}.requires_openai_auth"), "true")
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::ModelProvider,
+                        "requires_openai_auth",
+                        err.to_string(),
+                    ));
+                    return None;
+                }
+            }
             // Round-trip every field the surface echoed back. Keys are
             // whatever `field_shape()` emitted — the daemon authored
             // them, so it knows where they go.
             let mut entries: Vec<(&String, &String)> = choice.fields.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in entries {
+                if key == QUICKSTART_AUTH_MODE_FIELD {
+                    continue;
+                }
+                if codex_auth
+                    && matches!(
+                        key.as_str(),
+                        "api_key" | "wire_api" | "requires_openai_auth"
+                    )
+                {
+                    continue;
+                }
                 if value.is_empty() {
                     continue;
                 }
@@ -1972,6 +2160,124 @@ mod tests {
     }
 
     #[test]
+    fn apply_claude_alias_writes_canonical_anthropic_config() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "claude".into(),
+            alias: "max".into(),
+            model: "claude-sonnet-4-5".into(),
+            fields: std::collections::HashMap::from([
+                ("auth_mode".to_string(), "setup_token".to_string()),
+                ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+            ]),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        let entry = cfg
+            .providers
+            .models
+            .find("anthropic", "max")
+            .expect("anthropic.max entry");
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(entry.api_key.as_deref(), Some("sk-ant-oat01-test-token"));
+        assert!(
+            cfg.get_prop("providers.models.anthropic.max.auth_mode")
+                .is_err()
+        );
+        let agent = cfg.agents.get("bot").expect("agent created");
+        assert_eq!(agent.model_provider.as_str(), "anthropic.max");
+    }
+
+    #[test]
+    fn apply_openai_codex_alias_writes_canonical_openai_auth_config() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "openai-codex".into(),
+            alias: "coding".into(),
+            model: "gpt-5.4".into(),
+            fields: std::collections::HashMap::new(),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "coding")
+            .expect("openai.coding entry");
+        assert_eq!(entry.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(entry.wire_api, Some(WireApi::Responses));
+        assert!(entry.requires_openai_auth);
+        let agent = cfg.agents.get("bot").expect("agent created");
+        assert_eq!(agent.model_provider.as_str(), "openai.coding");
+    }
+
+    #[test]
+    fn apply_openai_auth_mode_codex_ignores_api_key_field() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "openai".into(),
+            alias: "coding".into(),
+            model: "gpt-5.4".into(),
+            fields: std::collections::HashMap::from([
+                ("auth_mode".to_string(), "codex".to_string()),
+                ("api_key".to_string(), "sk-should-not-persist".to_string()),
+            ]),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "coding")
+            .expect("openai.coding entry");
+        assert_eq!(entry.wire_api, Some(WireApi::Responses));
+        assert!(entry.requires_openai_auth);
+        assert!(
+            entry.api_key.is_none(),
+            "Codex auth must not persist an API key from the Quickstart form"
+        );
+    }
+
+    #[test]
+    fn apply_unknown_anthropic_auth_mode_errors_clearly() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.model_provider = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "anthropic".into(),
+            alias: "main".into(),
+            model: "claude-sonnet-4-5".into(),
+            fields: std::collections::HashMap::from([(
+                "auth_mode".to_string(),
+                "not_real".to_string(),
+            )]),
+        });
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+        assert!(applied.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.step == QuickstartStep::ModelProvider
+                    && e.field == "auth_mode"
+                    && e.message.contains("unknown Anthropic auth mode")),
+            "expected a clear unknown-Anthropic-auth-mode error, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn apply_unknown_provider_type_errors_clearly() {
         let mut cfg = Config::default();
         let mut submission = fresh_submission("bot");
@@ -2070,33 +2376,32 @@ mod tests {
         }
     }
 
-    /// Codex subscription auth: `field_shape(ModelProvider, "openai")` must
-    /// include the `requires_openai_auth` and `wire_api` rows so the
-    /// Quickstart form can offer Codex subscription auth (no API key needed).
-    /// These fields are non-required — they default to `false`/empty and are
-    /// harmless for non-OpenAI providers.
+    /// Codex subscription auth: `field_shape(ModelProvider, "openai")` exposes
+    /// one Quickstart-only auth selector instead of raw config toggles. Apply
+    /// translates `auth_mode = "codex"` into the canonical persisted
+    /// `wire_api = "responses"` + `requires_openai_auth = true` fields.
     #[test]
-    fn field_shape_openai_includes_codex_auth_fields() {
+    fn field_shape_openai_includes_codex_auth_mode() {
         let rows = super::field_shape(super::FieldSection::ModelProvider, "openai");
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert!(
-            keys.contains(&"requires_openai_auth"),
-            "field_shape for openai must include `requires_openai_auth` for Codex subscription; got {keys:?}",
+            keys.contains(&"auth_mode"),
+            "field_shape for openai must include `auth_mode` for Codex subscription; got {keys:?}",
         );
         assert!(
-            keys.contains(&"wire_api"),
-            "field_shape for openai must include `wire_api` for Codex subscription; got {keys:?}",
+            !keys.contains(&"requires_openai_auth") && !keys.contains(&"wire_api"),
+            "field_shape for openai should hide raw Codex config toggles; got {keys:?}",
         );
-        // Both must be non-required so Quickstart doesn't block on them.
-        for row in &rows {
-            if row.key == "requires_openai_auth" || row.key == "wire_api" {
-                assert!(
-                    !row.required,
-                    "`{}` must be non-required in the Quickstart form",
-                    row.key
-                );
-            }
-        }
+        let auth = rows
+            .iter()
+            .find(|row| row.key == "auth_mode")
+            .expect("auth_mode row");
+        assert!(auth.required);
+        assert_eq!(
+            auth.enum_variants.as_deref(),
+            Some(["api_key".to_string(), "codex".to_string()].as_slice())
+        );
+        assert_eq!(auth.default.as_deref(), Some("api_key"));
         // No row may carry the `<unset>` placeholder as its default.
         // It's a display sentinel for an unset Option; echoing it back
         // through any surface (CLI/TUI/web) makes the daemon validate
@@ -2109,6 +2414,45 @@ mod tests {
                 row.key
             );
         }
+    }
+
+    #[test]
+    fn field_shape_openai_codex_alias_preselects_codex_auth() {
+        let rows = super::field_shape(super::FieldSection::ModelProvider, "openai-codex");
+        let auth = rows
+            .iter()
+            .find(|row| row.key == "auth_mode")
+            .expect("auth_mode row");
+        assert_eq!(auth.default.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn field_shape_anthropic_includes_claude_auth_mode() {
+        let rows = super::field_shape(super::FieldSection::ModelProvider, "claude");
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert!(
+            keys.contains(&"auth_mode"),
+            "field_shape for claude/anthropic must include `auth_mode`; got {keys:?}",
+        );
+        let auth = rows
+            .iter()
+            .find(|row| row.key == "auth_mode")
+            .expect("auth_mode row");
+        assert!(auth.required);
+        assert_eq!(
+            auth.enum_variants.as_deref(),
+            Some(["api_key".to_string(), "setup_token".to_string()].as_slice())
+        );
+        assert_eq!(auth.default.as_deref(), Some("api_key"));
+        let api_key = rows
+            .iter()
+            .find(|row| row.key == "api_key")
+            .expect("api_key row");
+        assert!(
+            api_key.help.contains("claude setup-token"),
+            "Anthropic API key help should mention setup-token flow; got {:?}",
+            api_key.help
+        );
     }
 
     /// `api_key` must be non-required in the Quickstart form so Codex
