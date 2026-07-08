@@ -1487,7 +1487,7 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let plugins_start = tool_arcs.len();
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1498,6 +1498,19 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
+                    // Provider resolution: a compiled-in (native) tool wins over
+                    // a plugin that would register the same tool name. Mirrors
+                    // the skill-tool shadow policy in
+                    // `register_skill_tools_with_context_and_runtime`. Before
+                    // this guard, a plugin whose tool name collided with a
+                    // built-in was pushed anyway and exposed to the model as a
+                    // duplicate name — the built-in still won dispatch (first
+                    // match), leaving the plugin as dead, confusing weight. The
+                    // set is seeded from already-registered tools and grows as
+                    // plugins register, so plugin-vs-plugin name clashes are
+                    // resolved first-wins too.
+                    let mut registered_names: std::collections::HashSet<String> =
+                        tool_arcs.iter().map(|t| t.name().to_string()).collect();
                     for (manifest, wasm_path) in details {
                         // SSOT: `config` is the snapshot the whole tool set is
                         // built from, identical to every other tool here. A
@@ -1512,19 +1525,38 @@ pub fn all_tools_with_runtime(
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                        let wasm_tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
                             plugin_limits,
-                        )));
+                        );
+                        if registered_names.contains(wasm_tool.name()) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "Plugin tool '{}' shadows a compiled-in tool, skipping",
+                                    wasm_tool.name()
+                                )
+                            );
+                            continue;
+                        }
+                        registered_names.insert(wasm_tool.name().to_string());
+                        tool_arcs.push(Arc::new(wasm_tool));
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
+                            .with_attrs(::serde_json::json!({
+                                "count": tool_arcs.len() - plugins_start
+                            })),
                         "Loaded  WASM plugin tools"
                     );
                 }
