@@ -18,7 +18,7 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
@@ -31,10 +31,12 @@ mod component {
 
     struct EchoChannel;
 
-    // Deliver the canned inbound message exactly once, so a host poll loop sees
-    // one message and then `none`.
+    // Deliver one inbound message, then `none`, so a host poll loop terminates.
+    // The message echoes the JSON this plugin received from `configure`, so a
+    // host test can assert exactly what config (plaintext, typed) reached it.
     thread_local! {
         static DELIVERED: Cell<bool> = const { Cell::new(false) };
+        static CONFIG: RefCell<String> = RefCell::new(String::new());
     }
 
     impl PluginInfo for EchoChannel {
@@ -51,7 +53,8 @@ mod component {
             PLUGIN_NAME.to_string()
         }
 
-        fn configure(_config: String) -> Result<(), String> {
+        fn configure(config: String) -> Result<(), String> {
+            CONFIG.with(|c| *c.borrow_mut() = config);
             Ok(())
         }
 
@@ -64,11 +67,14 @@ mod component {
             if already {
                 return None;
             }
+            // Echo the config this plugin received, so the host test can assert
+            // the exact (plaintext, typed) JSON that reached `configure`.
+            let content = CONFIG.with(|c| c.borrow().clone());
             Some(InboundMessage {
                 id: "fixture-1".to_string(),
                 sender: "tester".to_string(),
                 reply_target: "tester".to_string(),
-                content: "ping".to_string(),
+                content,
                 channel: PLUGIN_NAME.to_string(),
                 channel_alias: None,
                 timestamp: 0,

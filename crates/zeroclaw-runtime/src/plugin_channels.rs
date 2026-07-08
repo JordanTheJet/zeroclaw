@@ -14,21 +14,37 @@ use std::sync::Arc;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::Config;
 
-/// Instantiate every installed channel plugin as an `(id, channel)` pair.
+/// A channel plugin built into a runnable trait object, plus the identity the
+/// orchestrator needs to dedup it against native channels.
+pub struct BuiltChannelPlugin {
+    /// Native-wins dedup key. A **mirror** (a plugin that `provides` a built-in
+    /// channel id) uses the composite `"<id>.<alias>"` so it matches a
+    /// compiled-in channel's per-alias registry key; a **novel** plugin uses its
+    /// bare manifest name.
+    pub dedup_key: String,
+    /// ZeroClaw channel alias for the runtime registry: `Some(<config-alias>)`
+    /// for a mirror, `None` for a novel singleton plugin channel.
+    pub alias: Option<String>,
+    /// The runnable channel, registered and supervised exactly like a native one.
+    pub channel: Arc<dyn Channel>,
+}
+
+/// Instantiate every installed channel plugin.
 ///
-/// `id` is the plugin's manifest name — its channel kind key, used by the caller
-/// as the dedup key against compiled-in channels and returned by the built
-/// channel's `name()`. `channel` is the runnable trait object the orchestrator
-/// registers and supervises exactly like a native channel (`WasmChannel::listen`
-/// drives the `poll-message` bridge under the standard supervised listener).
+/// A plugin that declares `provides = "<channel-id>"` **mirrors** the compiled
+/// channel of that id: one instance per configured & enabled
+/// `[channels.<id>.<alias>]`, each fed that alias's plaintext canonical config
+/// (the same source of truth the native channel reads — no second config home).
+/// A plugin without `provides` is **novel**: a single instance keyed by its
+/// manifest name, configured from its `[[plugins.entries.<name>]]` map.
 ///
-/// Returns an empty vec when the plugin system is disabled, the plugins
-/// directory is absent, or the host fails to load. Per-plugin instantiation
-/// failures are logged and skipped so one broken component cannot sink channel
-/// startup. The `#[cfg(not(feature = "plugins-wasm"))]` stub below returns empty
-/// for builds with no WASM engine, so the call site compiles unconditionally.
+/// Returns empty when the plugin system is disabled, the plugins directory is
+/// absent, or the host fails to load. Per-plugin failures are logged and skipped
+/// so one broken component cannot sink channel startup. The
+/// `#[cfg(not(feature = "plugins-wasm"))]` stub returns empty for builds with no
+/// WASM engine, so the call site compiles unconditionally.
 #[cfg(feature = "plugins-wasm")]
-pub async fn build_channel_plugins(config: &Config) -> Vec<(String, Arc<dyn Channel>)> {
+pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
     let plugin_path = config.plugins.resolved_plugins_dir();
     if !config.plugins.enabled || !plugin_path.exists() {
         return Vec::new();
@@ -67,50 +83,125 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<(String, Arc<dyn Chan
         max_instances: config.plugins.limits.max_instances,
     };
 
-    let mut built: Vec<(String, Arc<dyn Channel>)> = Vec::new();
+    // Serialize the live (post-decrypt) channel config once. Secrets are
+    // plaintext here — the `#[secret]` `mask()` is applied only to throwaway
+    // display/gateway clones, never to the runtime `Config` the daemon holds.
+    // Indexing `[id][alias]` gives a mirror the exact typed section its native
+    // counterpart reads, so there is no second config home (AGENTS.md SSOT).
+    let channels_json =
+        ::serde_json::to_value(&config.channels).unwrap_or(::serde_json::Value::Null);
+
+    let mut built: Vec<BuiltChannelPlugin> = Vec::new();
     for (manifest, wasm_path) in host.channel_plugin_details() {
-        // Per-plugin config comes from `[[plugins.entries.<name>]]`. A plugin
-        // that mirrors a built-in channel will instead resolve that channel's
-        // canonical `[channels.<id>.*]` section (via the `provides` manifest
-        // field) — a follow-on; a novel channel plugin's sole config home is
-        // here, so this is not duplicate state.
-        let plugin_config = config
-            .plugins
-            .entry_config(&manifest.name)
-            .cloned()
-            .unwrap_or_default();
-        match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
-            manifest.name.clone(),
-            wasm_path,
-            &manifest.permissions,
-            &plugin_config,
-            limits,
-        )
-        .await
-        {
-            Ok(channel) => {
-                built.push((manifest.name.clone(), Arc::new(channel) as Arc<dyn Channel>))
+        match manifest.provides.as_deref() {
+            Some(id) => {
+                let Some(aliases) = channels_json.get(id).and_then(|v| v.as_object()) else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name.clone(),
+                                "provides": id,
+                            })),
+                        "Channel plugin `provides` an unknown or unconfigured channel id; skipping"
+                    );
+                    continue;
+                };
+                // A mirror is configured from the canonical section, which is
+                // withheld without ConfigRead — a credential-less channel is
+                // worse than none, so skip rather than start it dead.
+                if !manifest
+                    .permissions
+                    .contains(&zeroclaw_plugins::PluginPermission::ConfigRead)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name.clone(),
+                                "provides": id,
+                            })),
+                        "Mirror channel plugin lacks config_read; skipping (would start unconfigured)"
+                    );
+                    continue;
+                }
+                for (alias, cfg_obj) in aliases {
+                    let enabled = cfg_obj
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !enabled {
+                        continue;
+                    }
+                    let config_json =
+                        ::serde_json::to_string(cfg_obj).unwrap_or_else(|_| "{}".to_string());
+                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror(
+                        id,
+                        alias.as_str(),
+                        wasm_path,
+                        &manifest.permissions,
+                        &config_json,
+                        limits,
+                    )
+                    .await
+                    {
+                        Ok(channel) => built.push(BuiltChannelPlugin {
+                            dedup_key: format!("{id}.{alias}"),
+                            alias: Some(alias.clone()),
+                            channel: Arc::new(channel),
+                        }),
+                        Err(e) => log_instantiate_failure(&manifest.name, &e),
+                    }
+                }
             }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "plugin": manifest.name.clone(),
-                            "error": format!("{}", e),
-                        })),
-                    "Failed to instantiate WASM channel plugin"
-                );
+            None => {
+                // Novel plugin: sole config home is [[plugins.entries.<name>]].
+                let plugin_config = config
+                    .plugins
+                    .entry_config(&manifest.name)
+                    .cloned()
+                    .unwrap_or_default();
+                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
+                    manifest.name.clone(),
+                    wasm_path,
+                    &manifest.permissions,
+                    &plugin_config,
+                    limits,
+                )
+                .await
+                {
+                    Ok(channel) => built.push(BuiltChannelPlugin {
+                        dedup_key: manifest.name.clone(),
+                        alias: None,
+                        channel: Arc::new(channel),
+                    }),
+                    Err(e) => log_instantiate_failure(&manifest.name, &e),
+                }
             }
         }
     }
     built
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn log_instantiate_failure(plugin: &str, err: &anyhow::Error) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "plugin": plugin,
+                "error": format!("{}", err),
+            })),
+        "Failed to instantiate WASM channel plugin"
+    );
+}
+
 /// Stub for builds without a WASM engine: channel plugins are unavailable, so no
 /// channels are contributed. Keeps the orchestrator call site feature-agnostic.
 #[cfg(not(feature = "plugins-wasm"))]
-pub async fn build_channel_plugins(_config: &Config) -> Vec<(String, Arc<dyn Channel>)> {
+pub async fn build_channel_plugins(_config: &Config) -> Vec<BuiltChannelPlugin> {
     Vec::new()
 }

@@ -31,7 +31,13 @@ use zeroclaw_api::media::MediaAttachment;
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
-    alias: String,
+    /// Platform id for routing, session keys, and native-wins dedup — the
+    /// plugin's manifest name for a novel plugin, or the built-in channel id it
+    /// `provides` for a mirror.
+    name: String,
+    /// Host-owned config alias stamped onto inbound messages so routing and
+    /// session keys never trust the plugin. `None` for novel plugins.
+    stamped_alias: Option<String>,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
     inbound: InboundQueue,
@@ -57,7 +63,7 @@ impl Attributable for WasmChannel {
         Role::Channel(ChannelKind::Plugin)
     }
     fn alias(&self) -> &str {
-        &self.alias
+        self.stamped_alias.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -96,19 +102,23 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
-    /// Compile and instantiate a channel plugin, caching its capabilities and
-    /// the static-identity exports needed by the sync trait methods. The
-    /// permission set decides whether the store and linker expose outbound
-    /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
-    /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
-    /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
-    /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
-    /// and the memory/table/instance ceilings.
-    pub async fn from_wasm(
-        alias: impl Into<String>,
+    /// Compile + instantiate a channel plugin and cache its capabilities and the
+    /// static-identity exports the sync trait methods return. `name` is the
+    /// platform id used for routing, session keys, and native-wins dedup;
+    /// `stamped_alias` is the host-owned config alias stamped onto inbound
+    /// messages (`None` for novel plugins). `config_json` is the already
+    /// `ConfigRead`-resolved JSON object handed to the plugin's `configure` once,
+    /// before any other call. The permission set decides whether the store and
+    /// linker expose outbound `wasi:http`; without `HttpClient` the channel
+    /// cannot reach the network. The returned channel owns an [`InboundQueue`];
+    /// a host-run listener obtains its handle via [`WasmChannel::inbound`].
+    /// `limits` bounds the per-call fuel and the memory/table/instance ceilings.
+    async fn instantiate(
+        name: String,
+        stamped_alias: Option<String>,
         wasm_path: &Path,
         permissions: &[PluginPermission],
-        config: &HashMap<String, String>,
+        config_json: String,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
         let component = load_component(wasm_path)?;
@@ -125,11 +135,6 @@ impl WasmChannel {
 
         let channel = bindings.zeroclaw_plugin_channel();
 
-        // Hand the plugin its resolved config once, before any other call. The
-        // section is withheld unless the manifest granted `ConfigRead`, matching
-        // the tool-plugin `__config` rule, so a plugin without the permission is
-        // configured with an empty object rather than another channel's secrets.
-        let config_json = resolve_configure_json(config, permissions);
         wt(
             channel.call_configure(&mut store, &config_json).await,
             "channel.configure trapped",
@@ -169,7 +174,8 @@ impl WasmChannel {
             };
 
         Ok(Self {
-            alias: alias.into(),
+            name,
+            stamped_alias,
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
             inbound,
@@ -178,6 +184,60 @@ impl WasmChannel {
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Instantiate a **novel** channel plugin: identity is the plugin's own
+    /// `name`, config comes from its `[[plugins.entries]]` map (withheld unless
+    /// `ConfigRead` is granted — matching the tool-plugin `__config` rule), and
+    /// inbound messages carry no host-stamped alias.
+    pub async fn from_wasm(
+        name: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        let config_json = resolve_configure_json(config, permissions);
+        Self::instantiate(
+            name.into(),
+            None,
+            wasm_path,
+            permissions,
+            config_json,
+            limits,
+        )
+        .await
+    }
+
+    /// Instantiate a **mirror** channel plugin — one that `provides` a compiled
+    /// channel id. Identity is the built-in `name` (routing/dedup key), `alias`
+    /// is the host-owned config alias stamped onto inbound messages, and
+    /// `config_json` is the plaintext canonical `[channels.<name>.<alias>]`
+    /// section serialized as a JSON object (preserving typed fields the flat
+    /// string-map path would lose). Config is withheld (`"{}"`) unless
+    /// `ConfigRead` is granted, exactly as `from_wasm`.
+    pub async fn from_wasm_mirror(
+        name: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config_json: &str,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        let config_json = if permissions.contains(&PluginPermission::ConfigRead) {
+            config_json.to_string()
+        } else {
+            "{}".to_string()
+        };
+        Self::instantiate(
+            name.into(),
+            Some(alias.into()),
+            wasm_path,
+            permissions,
+            config_json,
+            limits,
+        )
+        .await
     }
 
     /// Handle to this channel's inbound queue. A host-run listener clones it and
@@ -215,14 +275,20 @@ fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     }
 }
 
-fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessage {
+fn from_wit_inbound(
+    msg: WitInboundMessage,
+    channel_name: &str,
+    stamped_alias: Option<&str>,
+) -> ChannelMessage {
     ChannelMessage {
         id: msg.id,
         sender: msg.sender,
         reply_target: msg.reply_target,
         content: msg.content,
         channel: channel_name.to_string(),
-        channel_alias: msg.channel_alias,
+        // Host-stamped alias wins over any value the plugin supplied, so routing
+        // and session keys never depend on plugin cooperation.
+        channel_alias: stamped_alias.map(str::to_string).or(msg.channel_alias),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
         interruption_scope_id: msg.interruption_scope_id,
@@ -254,7 +320,7 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        &self.alias
+        &self.name
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -275,7 +341,8 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_name = self.alias.clone();
+        let channel_name = self.name.clone();
+        let stamped_alias = self.stamped_alias.clone();
         let state = Arc::clone(&self.state);
         let poll_healthy = Arc::clone(&self.poll_healthy);
         zeroclaw_spawn::spawn!(async move {
@@ -297,7 +364,11 @@ impl Channel for WasmChannel {
                         mark_poll_healthy(&poll_healthy, true);
                         backoff = INITIAL_BACKOFF;
                         if tx
-                            .send(from_wit_inbound(wit_msg, &channel_name))
+                            .send(from_wit_inbound(
+                                wit_msg,
+                                &channel_name,
+                                stamped_alias.as_deref(),
+                            ))
                             .await
                             .is_err()
                         {
@@ -848,5 +919,34 @@ mod tests {
         assert_eq!(drained.id, "evt-1");
         assert_eq!(drained.content, "inbound sms");
         assert_eq!(queue.pending(), 0, "draining empties the shared queue");
+    }
+
+    #[test]
+    fn from_wit_inbound_host_stamps_alias_over_plugin() {
+        let make = || WitInboundMessage {
+            id: "1".into(),
+            sender: "u".into(),
+            reply_target: "u".into(),
+            content: "hi".into(),
+            channel: "plugin-ignored".into(),
+            channel_alias: Some("plugin-supplied".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+        };
+
+        // A mirror stamps the host-owned alias, overriding whatever the plugin
+        // put in `channel_alias`, so routing/session keys never trust the plugin.
+        let stamped = from_wit_inbound(make(), "telegram", Some("main"));
+        assert_eq!(stamped.channel, "telegram");
+        assert_eq!(stamped.channel_alias.as_deref(), Some("main"));
+
+        // A novel plugin carries no host stamp, so the plugin's own value passes
+        // through unchanged.
+        let novel = from_wit_inbound(make(), "echo-channel", None);
+        assert_eq!(novel.channel, "echo-channel");
+        assert_eq!(novel.channel_alias.as_deref(), Some("plugin-supplied"));
     }
 }
