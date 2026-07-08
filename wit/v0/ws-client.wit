@@ -29,9 +29,13 @@ interface ws-client {
         /// exactly as it backs off on an empty `inbound-poll`.
         idle,
         /// The connection closed (server close frame, transport error, or
-        /// stream end); the string carries a human-readable reason. The handle
-        /// is spent — the plugin must `ws-connect` again to reconnect. Any text
-        /// frames buffered before the close are still delivered first.
+        /// stream end). For a server close frame the string is the numeric close
+        /// code, optionally followed by `": <reason>"` (e.g. `"4014: Disallowed
+        /// intent(s)."`); for a transport error or stream end it is a plain
+        /// human-readable reason with no leading code. A plugin can parse the
+        /// leading code to distinguish fatal protocol closes from transient ones.
+        /// The handle is spent — the plugin must `ws-connect` again to reconnect.
+        /// Any text frames buffered before the close are still delivered first.
         closed(string),
     }
 

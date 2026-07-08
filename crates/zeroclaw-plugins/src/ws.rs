@@ -31,6 +31,7 @@ use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 use crate::component::PluginState;
 use crate::component::bindings;
@@ -172,10 +173,7 @@ impl WsRegistry {
                         | Message::Frame(_),
                     )) => {}
                     Some(Ok(Message::Close(frame))) => {
-                        let reason = frame
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_else(|| "server closed the connection".to_string());
-                        *lock(&reason_r) = reason;
+                        *lock(&reason_r) = format_close_reason(frame);
                         dead_r.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -268,6 +266,26 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The `Closed` reason string for a server close frame: the numeric close code
+/// as a leading `"<code>"`, optionally followed by `": <reason>"`. A plugin can
+/// parse the leading code to distinguish fatal protocol closes (e.g. a Discord
+/// 4004/4014, which must stop reconnecting) from transient ones. A close with no
+/// frame gets a plain reason with no code.
+fn format_close_reason(frame: Option<CloseFrame>) -> String {
+    match frame {
+        Some(f) => {
+            let code = u16::from(f.code);
+            let text = f.reason.as_str();
+            if text.is_empty() {
+                code.to_string()
+            } else {
+                format!("{code}: {text}")
+            }
+        }
+        None => "server closed the connection".to_string(),
+    }
+}
+
 impl bindings::channel::zeroclaw::plugin::ws_client::Host for PluginState {
     async fn ws_connect(
         &mut self,
@@ -299,5 +317,33 @@ impl bindings::channel::zeroclaw::plugin::ws_client::Host for PluginState {
 
     async fn ws_close(&mut self, handle: u64) {
         self.websocket_mut().close(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_close_reason;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    #[test]
+    fn close_reason_surfaces_the_numeric_code() {
+        assert_eq!(
+            format_close_reason(Some(CloseFrame {
+                code: CloseCode::from(4014),
+                reason: "Disallowed intent(s).".into(),
+            })),
+            "4014: Disallowed intent(s)."
+        );
+        // Empty reason → bare code.
+        assert_eq!(
+            format_close_reason(Some(CloseFrame {
+                code: CloseCode::from(1000),
+                reason: "".into(),
+            })),
+            "1000"
+        );
+        // No frame → plain reason, no leading code for the plugin to misparse.
+        assert_eq!(format_close_reason(None), "server closed the connection");
     }
 }
