@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use wasmtime::Store;
 use wasmtime::component::Linker;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
@@ -28,6 +29,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
@@ -45,6 +47,9 @@ pub struct WasmChannel {
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
     poll_healthy: Arc<AtomicBool>,
+    /// Sink-drain end for host-fed webhooks (set by the orchestrator when this
+    /// channel declares a `webhook-path`). Taken once by `listen`.
+    webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -183,7 +188,43 @@ impl WasmChannel {
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
+            webhook_rx: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Whether this plugin advertises `webhook-ingress` (serves inbound via a
+    /// host webhook route rather than self-polling).
+    pub fn has_webhook_ingress(&self) -> bool {
+        self.capabilities
+            .contains(ChannelCapabilities::WEBHOOK_INGRESS)
+    }
+
+    /// The URL path segment this channel serves webhooks on, or `None` for a
+    /// poll-only channel. Calls the plugin's `webhook-path` export (only when it
+    /// advertised the capability).
+    pub async fn webhook_path(&self) -> Option<String> {
+        if !self.has_webhook_ingress() {
+            return None;
+        }
+        let result: Result<Option<String>> = call_plugin!(
+            self,
+            async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                wt(
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_webhook_path(store)
+                        .await,
+                    "channel.webhook-path failed",
+                )
+            }
+        );
+        result.ok().flatten()
+    }
+
+    /// Hand this channel the drain end of its webhook sink, before it is boxed
+    /// into an `Arc<dyn Channel>`; `listen` takes it once.
+    pub fn set_webhook_rx(&self, rx: mpsc::Receiver<RawWebhook>) {
+        *self.webhook_rx.lock().expect("webhook_rx poisoned") = Some(rx);
     }
 
     /// Instantiate a **novel** channel plugin: identity is the plugin's own
@@ -345,6 +386,55 @@ impl Channel for WasmChannel {
         let stamped_alias = self.stamped_alias.clone();
         let state = Arc::clone(&self.state);
         let poll_healthy = Arc::clone(&self.poll_healthy);
+
+        // Webhook ingress: if the gateway feeds this channel raw webhooks via a
+        // registered sink, drain them on a second task. Each is decoded by the
+        // plugin's `parse-webhook` export (which also verifies authenticity) and
+        // forwarded on `tx` — the exact path native inbound takes. The two tasks
+        // share the store mutex, so there is no store aliasing.
+        if let Some(mut webhook_rx) = self.webhook_rx.lock().expect("webhook_rx poisoned").take() {
+            let wh_state = Arc::clone(&self.state);
+            let wh_name = self.name.clone();
+            let wh_alias = self.stamped_alias.clone();
+            let wh_tx = tx.clone();
+            zeroclaw_spawn::spawn!(async move {
+                while let Some(RawWebhook {
+                    headers,
+                    body,
+                    reply,
+                }) = webhook_rx.recv().await
+                {
+                    let decoded = {
+                        let mut guard = wh_state.lock().await;
+                        let (ref mut store, ref mut bindings) = *guard;
+                        crate::component::refuel(store);
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_parse_webhook(store, &headers, &body)
+                            .await
+                    };
+                    match decoded {
+                        Ok(Ok(msgs)) => {
+                            for m in msgs {
+                                let _ = wh_tx
+                                    .send(from_wit_inbound(m, &wh_name, wh_alias.as_deref()))
+                                    .await;
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        // Plugin rejected the webhook (bad signature / payload).
+                        Ok(Err(reason)) => {
+                            let _ = reply.send(Err(WebhookReject::Unauthorized(reason)));
+                        }
+                        // The plugin trapped decoding the webhook.
+                        Err(e) => {
+                            let _ = reply.send(Err(WebhookReject::BadRequest(format!("{e:#}"))));
+                        }
+                    }
+                }
+            });
+        }
+
         zeroclaw_spawn::spawn!(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
             const MAX_BACKOFF: Duration = Duration::from_millis(500);

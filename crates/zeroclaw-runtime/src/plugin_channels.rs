@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::webhook::PluginWebhookRegistry;
 use zeroclaw_config::schema::Config;
 
 /// A channel plugin built into a runnable trait object, plus the identity the
@@ -44,7 +45,10 @@ pub struct BuiltChannelPlugin {
 /// `#[cfg(not(feature = "plugins-wasm"))]` stub returns empty for builds with no
 /// WASM engine, so the call site compiles unconditionally.
 #[cfg(feature = "plugins-wasm")]
-pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
+pub async fn build_channel_plugins(
+    config: &Config,
+    webhooks: Option<&PluginWebhookRegistry>,
+) -> Vec<BuiltChannelPlugin> {
     let plugin_path = config.plugins.resolved_plugins_dir();
     if !config.plugins.enabled || !plugin_path.exists() {
         return Vec::new();
@@ -148,11 +152,20 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
                     )
                     .await
                     {
-                        Ok(channel) => built.push(BuiltChannelPlugin {
-                            dedup_key: format!("{id}.{alias}"),
-                            alias: Some(alias.clone()),
-                            channel: Arc::new(channel),
-                        }),
+                        Ok(channel) => {
+                            register_plugin_webhook(
+                                &channel,
+                                &manifest.name,
+                                &manifest.permissions,
+                                webhooks,
+                            )
+                            .await;
+                            built.push(BuiltChannelPlugin {
+                                dedup_key: format!("{id}.{alias}"),
+                                alias: Some(alias.clone()),
+                                channel: Arc::new(channel),
+                            });
+                        }
                         Err(e) => log_instantiate_failure(&manifest.name, &e),
                     }
                 }
@@ -173,11 +186,20 @@ pub async fn build_channel_plugins(config: &Config) -> Vec<BuiltChannelPlugin> {
                 )
                 .await
                 {
-                    Ok(channel) => built.push(BuiltChannelPlugin {
-                        dedup_key: manifest.name.clone(),
-                        alias: None,
-                        channel: Arc::new(channel),
-                    }),
+                    Ok(channel) => {
+                        register_plugin_webhook(
+                            &channel,
+                            &manifest.name,
+                            &manifest.permissions,
+                            webhooks,
+                        )
+                        .await;
+                        built.push(BuiltChannelPlugin {
+                            dedup_key: manifest.name.clone(),
+                            alias: None,
+                            channel: Arc::new(channel),
+                        });
+                    }
                     Err(e) => log_instantiate_failure(&manifest.name, &e),
                 }
             }
@@ -239,10 +261,73 @@ fn log_instantiate_failure(plugin: &str, err: &anyhow::Error) {
     );
 }
 
+/// If a built channel advertises `webhook-ingress`, claim its declared path in
+/// the shared registry and hand it the sink drain end so the gateway can feed
+/// inbound. Requires `ConfigRead` (the channel's secret home — it verifies the
+/// webhook signature). Path collisions, a missing registry, or a missing
+/// permission are logged and skipped (the channel simply gets no inbound), never
+/// fatal to startup.
+#[cfg(feature = "plugins-wasm")]
+async fn register_plugin_webhook(
+    channel: &zeroclaw_plugins::wasm_channel::WasmChannel,
+    plugin: &str,
+    permissions: &[zeroclaw_plugins::PluginPermission],
+    webhooks: Option<&PluginWebhookRegistry>,
+) {
+    let Some(registry) = webhooks else { return };
+    if !channel.has_webhook_ingress() {
+        return;
+    }
+    if !permissions.contains(&zeroclaw_plugins::PluginPermission::ConfigRead) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "plugin": plugin })),
+            "Webhook channel plugin lacks config_read; inbound disabled"
+        );
+        return;
+    }
+    let Some(path) = channel.webhook_path().await else {
+        return;
+    };
+    if path.is_empty() || path.contains('/') || path.contains('.') {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "plugin": plugin, "path": path })),
+            "Webhook plugin declared an invalid path (must be a single segment); skipping"
+        );
+        return;
+    }
+    let (tx, rx) = ::tokio::sync::mpsc::channel::<zeroclaw_api::webhook::RawWebhook>(64);
+    if registry.insert(path.clone(), tx) {
+        channel.set_webhook_rx(rx);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "plugin": plugin, "path": path })),
+            "Registered plugin webhook route at /plugin/<path>"
+        );
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "plugin": plugin, "path": path })),
+            "Webhook path already claimed by another plugin; skipping"
+        );
+    }
+}
+
 /// Stub for builds without a WASM engine: channel plugins are unavailable, so no
 /// channels are contributed. Keeps the orchestrator call site feature-agnostic.
 #[cfg(not(feature = "plugins-wasm"))]
-pub async fn build_channel_plugins(_config: &Config) -> Vec<BuiltChannelPlugin> {
+pub async fn build_channel_plugins(
+    _config: &Config,
+    _webhooks: Option<&PluginWebhookRegistry>,
+) -> Vec<BuiltChannelPlugin> {
     Vec::new()
 }
 
