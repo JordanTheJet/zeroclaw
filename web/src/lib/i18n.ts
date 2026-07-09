@@ -1190,6 +1190,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.cron': 'Automations',
     'nav.integrations': 'Integrations',
     'nav.skills': 'Skills',
+    'nav.plugins': 'Plugins',
     'nav.memory': 'Memory',
     'nav.config': 'Config',
     'nav.cost': 'Cost Tracker',
