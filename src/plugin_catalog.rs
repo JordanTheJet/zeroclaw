@@ -162,6 +162,102 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
     merge_capabilities(builtins, installed, available)
 }
 
+// ── enable / disable ──────────────────────────────────────────────────────────
+
+/// Configured aliases for a channel type, read from the serialized channels tree
+/// (the keys of `[channels.<type>]`).
+pub fn channel_aliases(config: &Config, channel_type: &str) -> Vec<String> {
+    serde_json::to_value(&config.channels)
+        .ok()
+        .and_then(|v| {
+            v.get(channel_type)
+                .and_then(|m| m.as_object())
+                .map(|o| o.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `id` names a known channel type — compiled into this binary or
+/// configured (a configured-uncompiled channel has alias entries).
+pub fn is_channel_id(config: &Config, id: &str) -> bool {
+    zeroclaw_channels::listing::is_channel_type_compiled(id)
+        || !channel_aliases(config, id).is_empty()
+}
+
+/// Whether an installed plugin serves this channel id (mirror via `provides`, or
+/// a novel channel plugin named `id`), so enabling it must also turn the plugin
+/// subsystem on.
+fn channel_is_plugin_backed(host: &PluginHost, id: &str) -> bool {
+    host.channel_plugins()
+        .iter()
+        .any(|m| m.provides.as_deref() == Some(id) || m.name == id)
+}
+
+/// Flip a channel capability's config `enabled` (the SSOT — never a new
+/// `[features]` table) and persist. v1 handles channels only; a novel tool/skill
+/// plugin runs whenever `plugins.enabled` is on and has no per-entry toggle yet.
+/// Resolves the alias (0 → error/skip, 1 → auto, many → require `--alias`), and
+/// turns the plugin subsystem on when enabling a plugin-backed channel.
+pub async fn set_capability_enabled(
+    config: &mut Config,
+    host: &PluginHost,
+    id: &str,
+    alias: Option<String>,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    if !is_channel_id(config, id) {
+        anyhow::bail!(
+            "'{id}' is not a channel. Only channels can be enabled/disabled today; \
+             novel tool/skill plugins run whenever `plugins.enabled` is on. \
+             See `zeroclaw plugin list`."
+        );
+    }
+
+    let aliases = channel_aliases(config, id);
+    let targets: Vec<String> = match alias {
+        Some(a) => vec![a],
+        None => match aliases.as_slice() {
+            [] if enabled => anyhow::bail!(
+                "no configured '{id}' channel to enable — add one first \
+                 (set `channels.{id}.<alias>.<field> ...`) or pass --alias <name>."
+            ),
+            [] => {
+                println!("No configured '{id}' channel to disable.");
+                return Ok(());
+            }
+            [one] => vec![one.clone()],
+            many => anyhow::bail!(
+                "'{id}' has multiple aliases ({}); pass --alias <name>.",
+                many.join(", ")
+            ),
+        },
+    };
+
+    let val = if enabled { "true" } else { "false" };
+    let mut changes: Vec<(String, String)> = Vec::new();
+    for a in &targets {
+        let base = format!("channels.{id}.{a}");
+        config.ensure_map_key_for_path(&base);
+        let path = format!("{base}.enabled");
+        config.set_prop_persistent(&path, val)?;
+        changes.push((path, val.to_string()));
+    }
+    // A plugin-backed channel needs the plugin subsystem on to load at all.
+    if enabled && channel_is_plugin_backed(host, id) && !config.plugins.enabled {
+        config.set_prop_persistent("plugins.enabled", "true")?;
+        changes.push(("plugins.enabled".to_string(), "true".to_string()));
+    }
+
+    // `save_dirty` pulls the whole Config into its future; box it to keep this
+    // fn's future small (clippy::large_futures), matching the CLI `config set`.
+    Box::pin(config.save_dirty()).await?;
+    for (p, v) in &changes {
+        println!("  set {p} = {v}");
+    }
+    println!("Restart or reload the daemon for this to take effect.");
+    Ok(())
+}
+
 fn kind_label(k: &CapabilityKind) -> &str {
     match k {
         CapabilityKind::Channel => "Channels",

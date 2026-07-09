@@ -2765,6 +2765,22 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Enable a channel capability (flips its config `enabled`)
+    Enable {
+        /// Capability id (channel type, e.g. `telegram`)
+        id: String,
+        /// The specific alias to toggle (required when several are configured)
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Disable a channel capability (flips its config `enabled`)
+    Disable {
+        /// Capability id (channel type, e.g. `telegram`)
+        id: String,
+        /// The specific alias to toggle (required when several are configured)
+        #[arg(long)]
+        alias: Option<String>,
+    },
     /// Show information about a plugin
     Info {
         /// Plugin name
@@ -6320,6 +6336,30 @@ async fn main() -> Result<()> {
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
                 );
+                Ok(())
+            }
+            PluginCommands::Enable { id, alias } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                Box::pin(crate::plugin_catalog::set_capability_enabled(
+                    &mut config,
+                    &host,
+                    &id,
+                    alias,
+                    true,
+                ))
+                .await?;
+                Ok(())
+            }
+            PluginCommands::Disable { id, alias } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                Box::pin(crate::plugin_catalog::set_capability_enabled(
+                    &mut config,
+                    &host,
+                    &id,
+                    alias,
+                    false,
+                ))
+                .await?;
                 Ok(())
             }
             PluginCommands::Info { name } => {
