@@ -43,9 +43,11 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 2. **At release** — remove `@unstable`, add `@since(version = 0.x.0)`.
    `bindgen!` callers without a feature gate now see the item automatically.
 
-All current content in `wit/v0/` is gated behind
-`@unstable(feature = plugins-wit-v0)`. It graduates when the first
-stable Component Model release ships.
+All current content in `wit/v0/` is gated behind `@unstable` feature gates:
+`plugins-wit-v0` for the core interfaces, and the distinct
+`plugins-wit-v0-sockets` for the `socket` interface so the host can link it
+per-plugin. Everything graduates when the first stable Component Model
+release ships.
 
 #### Host compatibility window
 

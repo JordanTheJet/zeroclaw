@@ -318,7 +318,7 @@ world channel-plugin {
     // Outbound host-mediated raw TCP (+TLS), for platforms that speak a raw byte
     // protocol over a socket (IRC, email IMAP/SMTP, MQTT, AMQP). Gated by a
     // distinct unstable feature so the host links it only for plugins granted the
-    // `socket-client` permission; a plugin that does not enable the feature never
+    // `socket_client` permission; a plugin that does not enable the feature never
     // imports it and is unaffected (adding a world import is backward-compatible —
     // existing components need no rebuild).
     @unstable(feature = plugins-wit-v0-sockets)

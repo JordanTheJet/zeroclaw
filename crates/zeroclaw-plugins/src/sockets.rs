@@ -144,7 +144,7 @@ impl SocketRegistry {
         type ReadHalf = Box<dyn AsyncRead + Unpin + Send>;
         type WriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
         let (mut read_half, mut write_half): (ReadHalf, WriteHalf) = if tls {
-            let connector = tls_connector();
+            let connector = tls_connector()?;
             let server_name = ServerName::try_from(host.clone())
                 .map_err(|e| format!("invalid tls server name {host:?}: {e}"))?;
             let stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
@@ -296,7 +296,7 @@ fn format_read_close_reason(error: Option<&std::io::Error>) -> String {
 /// per-connection. Deliberately self-contained (`builder_with_provider`, no
 /// global `install_default`) so linking this crate never mutates process-wide
 /// rustls state another component may have configured differently.
-fn tls_connector() -> tokio_rustls::TlsConnector {
+fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -304,10 +304,12 @@ fn tls_connector() -> tokio_rustls::TlsConnector {
         tokio_rustls::rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .expect("rustls default protocol versions")
+    .map_err(|e| format!("tls client config rejected safe default protocol versions: {e}"))?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    Ok(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        config,
+    )))
 }
 
 impl bindings::channel::zeroclaw::plugin::socket::Host for PluginState {

@@ -11,7 +11,7 @@ fields are the serde surface of `PluginManifest` in
 | `author` | no | Author name or organization. |
 | `wasm_path` | for WASM capabilities | Component file name, relative to the plugin directory. Required unless the only capability is `skill`. Discovery skips the plugin if the named file does not exist. |
 | `capabilities` | yes, non-empty | What the plugin is: any of `tool`, `channel`, `memory`, `observer`, `skill` (`PluginCapability`, serialized snake_case). |
-| `permissions` | no | Host services the code may reach: `http_client`, `config_read`, `file_read`, `file_write`, `memory_read`, `memory_write` (`PluginPermission`). Only the first two are enforced today; the rest are accepted but inert. |
+| `permissions` | no | Host services the code may reach: `http_client`, `config_read`, `socket_client`, `file_read`, `file_write`, `memory_read`, `memory_write` (`PluginPermission`). Only the first three are enforced today; the rest are accepted but inert. |
 | `signature` | no | Base64url Ed25519 signature over the canonical manifest bytes. Set when signing for distribution. |
 | `publisher_key` | no | Hex-encoded Ed25519 public key of the signer. |
 
