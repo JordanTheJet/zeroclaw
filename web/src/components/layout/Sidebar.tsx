@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  Blocks,
   Bot,
   Clock,
   LayoutDashboard,
@@ -50,6 +51,7 @@ const navGroups: NavGroup[] = [
       { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
       { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
       { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+      { to: '/plugins', icon: Blocks, labelKey: 'nav.plugins' },
       { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
     ],
   },

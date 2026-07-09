@@ -14,6 +14,7 @@ import {
   Integrations,
   Logs,
   Pairing,
+  Plugins,
   Quickstart,
   Skills,
   Tools,
@@ -43,6 +44,7 @@ export const Router = () => (
         <Route path="/cron" element={<Cron />} />
         <Route path="/skills" element={<Skills />} />
         <Route path="/integrations" element={<Integrations />} />
+        <Route path="/plugins" element={<Plugins />} />
         <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />
         <Route path="/config/:section" element={<Config />} />

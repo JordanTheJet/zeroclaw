@@ -4,6 +4,7 @@ import type {
   CronJob,
   CronRun,
   Integration,
+  PluginsResponse,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -1931,6 +1932,17 @@ export function getIntegrations(): Promise<Integration[]> {
     const result = unwrapField(data, "integrations");
     return Array.isArray(result) ? result : [];
   });
+}
+
+/** The unified capability catalog: built-in channels, installed plugins, and
+ *  registry-available plugins. Enable/disable is done through the Channels
+ *  config (`PATCH /api/config/prop`), not here. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins").then((data) => ({
+    plugins_enabled: Boolean(data?.plugins_enabled),
+    plugins_dir: data?.plugins_dir ?? "",
+    capabilities: Array.isArray(data?.capabilities) ? data.capabilities : [],
+  }));
 }
 
 // ---------------------------------------------------------------------------
