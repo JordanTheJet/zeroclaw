@@ -12,10 +12,18 @@ pub mod tray;
 use gateway_client::GatewayClient;
 use state::shared_state;
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_store::StoreExt;
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
 /// port baked into [`state::AppState::default`]'s `gateway_url`.
 const GATEWAY_PORT: u16 = 42617;
+
+/// tauri-plugin-store file and key where the desktop app persists its gateway
+/// bearer token. Reused across launches so we don't mint (and orphan) a fresh
+/// paired token on every start — which otherwise accumulates never-revoked
+/// tokens and device rows on the long-lived daemon.
+const TOKEN_STORE_FILE: &str = "desktop.json";
+const TOKEN_STORE_KEY: &str = "gateway_token";
 
 /// Status the splash listens for (`zeroclaw://splash-status`). Drives the
 /// splash copy when we're starting our own daemon or hit a problem; the happy
@@ -151,7 +159,29 @@ async fn open_dashboard(
         let s = state.read().await;
         s.gateway_url.clone()
     };
+
+    // Reuse a previously-persisted token so we don't mint a fresh one on every
+    // launch. `auto_pair` validates it below and only re-pairs if it's stale.
+    if let Ok(store) = app.store(TOKEN_STORE_FILE)
+        && let Some(saved) = store
+            .get(TOKEN_STORE_KEY)
+            .and_then(|v| v.as_str().map(str::to_string))
+    {
+        let mut s = state.write().await;
+        if s.token.is_none() {
+            s.token = Some(saved);
+        }
+    }
+
     let token = auto_pair(state.inner()).await;
+
+    // Persist whatever token we ended up with so the next launch reuses it.
+    if let Some(ref tok) = token
+        && let Ok(store) = app.store(TOKEN_STORE_FILE)
+    {
+        store.set(TOKEN_STORE_KEY, tok.clone());
+        let _ = store.save();
+    }
 
     let dashboard_url = format!("{}/", base.trim_end_matches('/'));
     let parsed = tauri::Url::parse(&dashboard_url).map_err(|e| e.to_string())?;
@@ -256,9 +286,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, event| {
-            // Keep the app running in the background when all windows are closed.
-            // This is the standard pattern for menu bar / tray apps.
-            if let RunEvent::ExitRequested { api, .. } = event {
+            // Keep the app resident in the tray when the user merely closes the
+            // window — that arrives as `ExitRequested` with `code: None`, so we
+            // veto it (the standard menu-bar/tray pattern). An explicit quit
+            // (tray "Quit ZeroClaw" → `app.exit(0)`) arrives with `code: Some(_)`;
+            // let it through so Quit actually quits instead of being vetoed.
+            if let RunEvent::ExitRequested { code, api, .. } = event
+                && code.is_none()
+            {
                 api.prevent_exit();
             }
         });

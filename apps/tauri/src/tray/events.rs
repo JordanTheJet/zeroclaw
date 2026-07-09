@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager, Runtime, menu::MenuEvent};
 pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
     match event.id().as_ref() {
         "show" => show_main_window(app, None),
-        "chat" => show_main_window(app, Some("/agent")),
+        "chat" => show_main_window(app, Some("/agents")),
         "quit" => {
             app.exit(0);
         }
@@ -18,7 +18,14 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>, navigate_to: Option<&str>) {
         let _ = window.show();
         let _ = window.set_focus();
         if let Some(path) = navigate_to {
-            let script = format!("window.location.hash = '{path}'");
+            // The dashboard is a History-API SPA (react-router BrowserRouter),
+            // so assigning `location.hash` does not navigate it. Push the path
+            // and fire `popstate`, which react-router listens for.
+            let escaped = path.replace('\\', "\\\\").replace('\'', "\\'");
+            let script = format!(
+                "window.history.pushState({{}}, '', '{escaped}'); \
+                 window.dispatchEvent(new PopStateEvent('popstate'));"
+            );
             let _ = window.eval(&script);
         }
     }
