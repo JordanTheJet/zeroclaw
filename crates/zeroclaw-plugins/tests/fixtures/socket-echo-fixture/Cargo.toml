@@ -1,0 +1,29 @@
+# Standalone crate (own [workspace]): built for wasm32-wasip2 as a test fixture,
+# NOT part of the host workspace. Proves the host `socket` capability: the
+# plugin dials a host-mediated raw TCP connection, sends bytes, and reads the echo.
+#
+# Build:  rustup target add wasm32-wasip2
+#         cargo build --target wasm32-wasip2 --release
+# then copy target/wasm32-wasip2/release/socket_echo_fixture.wasm to
+# crates/zeroclaw-plugins/tests/fixtures/socket-echo-fixture.wasm
+[package]
+name = "socket-echo-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "ZeroClaw WIT channel plugin test fixture: a raw TCP echo round-trip."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]

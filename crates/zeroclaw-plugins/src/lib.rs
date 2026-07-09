@@ -14,6 +14,8 @@ pub mod registry;
 pub mod runtime;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
+pub mod sockets;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_memory;
@@ -86,6 +88,8 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can open host-mediated outbound raw TCP (+TLS) connections (`socket`).
+    SocketClient,
 }
 
 /// Information about a loaded plugin.

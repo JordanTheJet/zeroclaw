@@ -1,0 +1,65 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated outbound raw TCP (+TLS) client for channel plugins whose
+/// platform speaks a raw byte protocol over a socket (IRC, IMAP/SMTP email,
+/// MQTT, AMQP).
+///
+/// A channel plugin runs in a WASI sandbox with no network and no sockets, so
+/// it cannot open a TCP connection itself. Exactly as the host runs a plugin's
+/// inbound listener and performs its `wasi:http` TLS, the host owns the socket
+/// here: it resolves and dials `host:port`, optionally performs the TLS client
+/// handshake (`tls = true`), and pumps bytes, exposing each live connection to
+/// the plugin as an opaque `u64` handle. The plugin drives the application
+/// protocol — it queues outbound byte chunks and drains received ones — while
+/// the host stays protocol-agnostic. The host performs no app-level protocol
+/// work (IRC registration, IMAP login, MQTT keepalive); that all stays in the
+/// plugin, which owns the platform's framing and timing.
+///
+/// Gated by the `socket-client` permission: a plugin without it never gets a
+/// connection registry, the import is not linked, and a guest that imports this
+/// interface fails closed at instantiation.
+@unstable(feature = plugins-wit-v0-sockets)
+interface socket {
+    /// One event drained from a live connection by `tcp-receive`.
+    @unstable(feature = plugins-wit-v0-sockets)
+    variant socket-event {
+        /// A chunk of received bytes. Raw TCP has no framing: chunk boundaries
+        /// are arbitrary, and the plugin must reassemble its own protocol units.
+        data(list<u8>),
+        /// No bytes were ready. The plugin should back off and poll again,
+        /// exactly as it backs off on an empty `inbound-poll`.
+        idle,
+        /// The connection closed (peer close, transport error, or stream end);
+        /// the string is a human-readable reason. The handle is spent — the
+        /// plugin must `tcp-connect` again to reconnect. Any bytes buffered
+        /// before the close are still delivered first.
+        closed(string),
+    }
+
+    /// Open a TCP connection to `host:port`. When `tls` is true the host
+    /// performs a TLS client handshake (SNI from `host`, WebPKI roots) over the
+    /// socket before returning. Returns an opaque connection handle on success,
+    /// or an error string when the resolve, dial, or handshake fails.
+    tcp-connect: func(host: string, port: u16, tls: bool) -> result<u64, string>;
+
+    /// Queue a chunk of bytes to send on the connection. Errors if the handle
+    /// is unknown or the outbound buffer is full; a full buffer signals the
+    /// plugin is producing faster than the socket drains.
+    tcp-send: func(handle: u64, bytes: list<u8>) -> result<_, string>;
+
+    /// Drain the next event from the connection without blocking. Returns
+    /// `idle` immediately when no bytes are queued, or `closed` once the
+    /// connection has ended and its buffered chunks are exhausted. Errors only
+    /// if the handle is unknown.
+    tcp-receive: func(handle: u64) -> result<socket-event, string>;
+
+    /// Number of byte chunks currently buffered for the connection, so the
+    /// plugin can drain in batches without a sentinel `idle` between each.
+    /// Errors if the handle is unknown.
+    tcp-pending: func(handle: u64) -> result<u32, string>;
+
+    /// Close the connection and release the handle, aborting its host pump
+    /// tasks. Idempotent: closing an already-closed or unknown handle is a
+    /// no-op.
+    tcp-close: func(handle: u64);
+}

@@ -9,7 +9,15 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+plugins-wasmtime = [
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+  "dep:wasmtime-wasi-http",
+  "dep:tokio-rustls",
+  "dep:webpki-roots",
+  "tokio/net",
+  "tokio/io-util",
+]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -40,6 +48,13 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+# Host-owned outbound raw TCP (+TLS) for channel plugins (socket). Present only
+# in `plugins-wasmtime` builds; the plugin sandbox itself never opens the socket.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "tls12",
+], optional = true }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.26"

@@ -15,6 +15,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::sockets::SocketRegistry;
 
 /// A host-owned queue of inbound messages destined for a channel plugin.
 ///
@@ -116,6 +117,10 @@ pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
+    /// Host-owned outbound raw TCP (+TLS) connections, present only when the
+    /// manifest grants `SocketClient`. `None` leaves the `socket` import
+    /// unlinked, so the component cannot open a socket. Mirrors `http`.
+    socket: Option<SocketRegistry>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
@@ -143,10 +148,14 @@ impl PluginState {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
+        let socket = permissions
+            .contains(&PluginPermission::SocketClient)
+            .then(SocketRegistry::new);
         Self {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
+            socket,
             inbound,
             limits: StoreLimitsBuilder::new()
                 .memory_size(limits.max_memory_bytes)
@@ -160,6 +169,23 @@ impl PluginState {
     /// Whether this state was built with outbound HTTP attached.
     pub fn http_enabled(&self) -> bool {
         self.http.is_some()
+    }
+
+    /// Whether this state was built with the outbound raw TCP registry attached
+    /// (the `SocketClient` permission was granted).
+    pub fn socket_enabled(&self) -> bool {
+        self.socket.is_some()
+    }
+
+    /// The connection registry backing the `socket` import. Panics if called on
+    /// a store built without `SocketClient`; the coherence guard
+    /// ([`ensure_socket_coherent`]) keeps the import from being linked in that
+    /// case, so a live call can never reach here — exactly like
+    /// `WasiHttpView::http`.
+    pub(crate) fn socket_mut(&mut self) -> &mut SocketRegistry {
+        self.socket
+            .as_mut()
+            .expect("socket called on a plugin without the SocketClient permission")
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
@@ -224,6 +250,24 @@ pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -
         anyhow::bail!(
             "plugin store/linker http mismatch: store HttpClient={store_has_http}, \
              linker wasi:http={linker_has_http}; refusing to instantiate"
+        );
+    }
+    Ok(())
+}
+
+/// Assert that a store and the linker chosen for it agree on the `socket`
+/// surface before instantiation, the raw-TCP twin of [`ensure_http_coherent`].
+/// The store carries a `SocketRegistry` only when its manifest granted
+/// `SocketClient`; `linker_has_socket` is whether the linker picked for it
+/// linked the `socket` import. A wiring that pairs a socket-linked linker with
+/// a store lacking the registry (or the reverse) gets a named startup error
+/// here instead of a `socket_mut` panic at the first `tcp-connect`.
+pub fn ensure_socket_coherent(store: &Store<PluginState>, linker_has_socket: bool) -> Result<()> {
+    let store_has_socket = store.data().socket_enabled();
+    if store_has_socket != linker_has_socket {
+        anyhow::bail!(
+            "plugin store/linker socket mismatch: store SocketClient={store_has_socket}, \
+             linker socket={linker_has_socket}; refusing to instantiate"
         );
     }
     Ok(())

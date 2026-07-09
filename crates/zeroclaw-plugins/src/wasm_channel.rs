@@ -76,7 +76,7 @@ fn resolve_configure_json(
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(http: bool, socket: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     if http {
@@ -84,6 +84,9 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    // Per-permission gate: the `socket` import is installed only for plugins
+    // granted `SocketClient`, mirroring the `wasi:http` gate above.
+    options.plugins_wit_v0_sockets(socket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -116,8 +119,10 @@ impl WasmChannel {
         let mut store =
             crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
         let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
+        let socket = store.data().socket_enabled();
+        let linker = build_linker(http, socket)?;
         crate::component::ensure_http_coherent(&store, http)?;
+        crate::component::ensure_socket_coherent(&store, socket)?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, &component, &linker).await,
             "failed to instantiate channel plugin",
