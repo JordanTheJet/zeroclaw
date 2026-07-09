@@ -11,19 +11,11 @@
 
 use serde_json::Value;
 use zeroclaw_config::schema::Config;
-use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::catalog::{
-    AvailableSeed, BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin,
-    InstalledSeed, merge_capabilities,
+    BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin, available_seeds,
+    installed_seeds, merge_capabilities,
 };
 use zeroclaw_plugins::host::PluginHost;
-
-fn perm_wire(p: &PluginPermission) -> String {
-    serde_json::to_value(p)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
-}
 
 /// Build the unified catalog from the binary's three capability sources. `all`
 /// includes every compiled-in channel; otherwise only configured/active
@@ -73,91 +65,13 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
         });
     }
 
-    // ── Installed plugins ──────────────────────────────────────────────────
-    let plugins_enabled = config.plugins.enabled;
-    let infos = host.list_plugins();
-    let version_of = |name: &str| {
-        infos
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| i.version.clone())
-    };
-    let loaded_of = |name: &str| {
-        infos
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| i.loaded)
-            .unwrap_or(false)
-    };
-
-    let mut installed: Vec<InstalledSeed> = Vec::new();
-    for m in host.channel_plugins() {
-        let mirrors = m.provides.is_some();
-        let id = m.provides.clone().unwrap_or_else(|| m.name.clone());
-        let loaded = loaded_of(&m.name);
-        // A mirror is live only when its mirrored channel is enabled; a novel
-        // plugin is live when the subsystem is on and it loaded (there is no
-        // per-entry `enabled` yet).
-        let enabled = plugins_enabled && loaded && if mirrors { type_enabled(&id) } else { true };
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id,
-            kind: CapabilityKind::Channel,
-            mirrors_builtin: mirrors,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled,
-        });
-    }
-    for m in host.tool_plugins() {
-        let loaded = loaded_of(&m.name);
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id: m.name.clone(),
-            kind: CapabilityKind::Tool,
-            mirrors_builtin: false,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled: plugins_enabled && loaded,
-        });
-    }
-    for m in host.skill_plugins() {
-        let loaded = loaded_of(&m.name);
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id: m.name.clone(),
-            kind: CapabilityKind::Skill,
-            mirrors_builtin: false,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled: plugins_enabled && loaded,
-        });
-    }
-
-    // ── Registry-available ─────────────────────────────────────────────────
-    let available: Vec<AvailableSeed> =
-        zeroclaw_plugins::registry::read_cached_registry_index(&config.data_dir)
-            .ok()
-            .flatten()
-            .map(|idx| {
-                idx.plugins
-                    .iter()
-                    .flat_map(|e| {
-                        // One row per declared capability kind (a plugin may be both a
-                        // channel and a tool); unknown strings bucket into Other.
-                        e.capabilities.iter().map(move |c| AvailableSeed {
-                            id: e.name.clone(),
-                            kind: CapabilityKind::from_wire(c),
-                            version: Some(e.version.clone()),
-                            description: e.description.clone(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    // ── Installed plugins + registry (shared folding) ──────────────────────
+    let installed = installed_seeds(host, config.plugins.enabled, type_enabled);
+    let available = zeroclaw_plugins::registry::read_cached_registry_index(&config.data_dir)
+        .ok()
+        .flatten()
+        .map(|idx| available_seeds(&idx))
+        .unwrap_or_default();
 
     merge_capabilities(builtins, installed, available)
 }

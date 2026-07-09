@@ -15,6 +15,10 @@
 
 use serde::Serialize;
 
+use crate::PluginPermission;
+use crate::host::PluginHost;
+use crate::registry::PluginRegistryIndex;
+
 /// The kind of capability a catalog row describes. Mirrors `PluginCapability`
 /// plus an `Other` bucket for registry entries that carry an unrecognized
 /// capability string (so nothing is silently dropped).
@@ -283,6 +287,105 @@ fn kind_rank(k: &CapabilityKind) -> u8 {
         CapabilityKind::Skill => 4,
         CapabilityKind::Other(_) => 5,
     }
+}
+
+// ── Shared seed gathering from installed plugins + the registry ────────────────
+//
+// These fold the plugin/registry sources (both `zeroclaw-plugins`-owned types)
+// into neutral seeds, so every surface reuses them. Building the *built-in*
+// channel seeds stays per-surface because it needs `zeroclaw-channels`, which
+// this crate deliberately does not depend on.
+
+/// A plugin permission's snake_case wire string (`"config_read"`, …).
+fn perm_wire(p: &PluginPermission) -> String {
+    serde_json::to_value(p)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// Fold every installed plugin (channel / tool / skill) into seeds.
+/// `plugins_enabled` is the subsystem switch; `channel_enabled(id)` reports
+/// whether a mirrored channel id is enabled in config — a mirror is live only
+/// then, while a novel plugin is live whenever the subsystem is on and it loaded.
+pub fn installed_seeds(
+    host: &PluginHost,
+    plugins_enabled: bool,
+    channel_enabled: impl Fn(&str) -> bool,
+) -> Vec<InstalledSeed> {
+    let infos = host.list_plugins();
+    let version_of = |name: &str| {
+        infos
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| i.version.clone())
+    };
+    let loaded_of = |name: &str| {
+        infos
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| i.loaded)
+            .unwrap_or(false)
+    };
+
+    let mut out = Vec::new();
+    for m in host.channel_plugins() {
+        let mirrors = m.provides.is_some();
+        let id = m.provides.clone().unwrap_or_else(|| m.name.clone());
+        let loaded = loaded_of(&m.name);
+        let enabled =
+            plugins_enabled && loaded && if mirrors { channel_enabled(&id) } else { true };
+        out.push(InstalledSeed {
+            plugin_name: m.name.clone(),
+            id,
+            kind: CapabilityKind::Channel,
+            mirrors_builtin: mirrors,
+            version: version_of(&m.name),
+            description: m.description.clone(),
+            permissions: m.permissions.iter().map(perm_wire).collect(),
+            enabled,
+        });
+    }
+    for (m, kind) in host
+        .tool_plugins()
+        .into_iter()
+        .map(|m| (m, CapabilityKind::Tool))
+        .chain(
+            host.skill_plugins()
+                .into_iter()
+                .map(|m| (m, CapabilityKind::Skill)),
+        )
+    {
+        let loaded = loaded_of(&m.name);
+        out.push(InstalledSeed {
+            plugin_name: m.name.clone(),
+            id: m.name.clone(),
+            kind,
+            mirrors_builtin: false,
+            version: version_of(&m.name),
+            description: m.description.clone(),
+            permissions: m.permissions.iter().map(perm_wire).collect(),
+            enabled: plugins_enabled && loaded,
+        });
+    }
+    out
+}
+
+/// Fold a cached registry index into available seeds — one row per declared
+/// capability kind (a plugin may be both a channel and a tool).
+pub fn available_seeds(index: &PluginRegistryIndex) -> Vec<AvailableSeed> {
+    index
+        .plugins
+        .iter()
+        .flat_map(|e| {
+            e.capabilities.iter().map(move |c| AvailableSeed {
+                id: e.name.clone(),
+                kind: CapabilityKind::from_wire(c),
+                version: Some(e.version.clone()),
+                description: e.description.clone(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
