@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+use zeroclaw_api::webhook::{RawWebhook, WebhookOutcome, WebhookReject};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
@@ -203,10 +203,12 @@ async fn webhook_ingress_delivers_inbound() {
     channel.listen(tx).await.expect("listen starts");
 
     // Valid signature → the body is decoded into an inbound message and the
-    // reply resolves Ok.
+    // reply resolves Ok(Ack).
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
             body: b"hello from webhook".to_vec(),
             reply: reply_tx,
@@ -214,8 +216,8 @@ async fn webhook_ingress_delivers_inbound() {
         .await
         .expect("sink accepts");
     assert!(
-        matches!(reply_rx.await, Ok(Ok(()))),
-        "valid webhook → reply Ok"
+        matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Ack))),
+        "valid webhook → reply Ok(Ack)"
     );
 
     // Both the fixture's one-shot config echo (poll) and the webhook message
@@ -236,6 +238,8 @@ async fn webhook_ingress_delivers_inbound() {
     let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
     sink_tx
         .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), "wrong".to_string())],
             body: b"nope".to_vec(),
             reply: reply_tx2,
@@ -245,5 +249,24 @@ async fn webhook_ingress_delivers_inbound() {
     assert!(
         matches!(reply_rx2.await, Ok(Err(WebhookReject::Unauthorized(_)))),
         "bad signature → Unauthorized"
+    );
+
+    // Verification handshake: a GET with a `challenge` query → the fixture
+    // returns the reserved `__webhook_reply__` message, and the host answers
+    // 200 with that challenge as the body (echo), enqueuing nothing.
+    let (reply_tx3, reply_rx3) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            method: "GET".to_string(),
+            query: "hub.mode=subscribe&challenge=echo-me-42".to_string(),
+            headers: vec![],
+            body: Vec::new(),
+            reply: reply_tx3,
+        })
+        .await
+        .expect("sink accepts");
+    assert!(
+        matches!(reply_rx3.await, Ok(Ok(WebhookOutcome::Body(b))) if b == "echo-me-42"),
+        "GET verification → 200 with the echoed challenge body"
     );
 }

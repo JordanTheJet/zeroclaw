@@ -404,28 +404,50 @@ impl Channel for WasmChannel {
             let wh_tx = tx.clone();
             zeroclaw_spawn::spawn!(async move {
                 while let Some(RawWebhook {
+                    method,
+                    query,
                     headers,
                     body,
                     reply,
                 }) = webhook_rx.recv().await
                 {
+                    // Surface the HTTP method + query to the plugin as reserved
+                    // headers (parse-webhook's WIT signature is (headers, body),
+                    // so this stays additive — no plugin rebuild). A GET
+                    // verification or Slack url_verification POST reads these.
+                    let mut wh_headers = Vec::with_capacity(headers.len() + 2);
+                    wh_headers.push(("x-webhook-method".to_string(), method));
+                    wh_headers.push(("x-webhook-query".to_string(), query));
+                    wh_headers.extend(headers);
+
                     let decoded = {
                         let mut guard = wh_state.lock().await;
                         let (ref mut store, ref mut bindings) = *guard;
                         crate::component::refuel(store);
                         bindings
                             .zeroclaw_plugin_channel()
-                            .call_parse_webhook(store, &headers, &body)
+                            .call_parse_webhook(store, &wh_headers, &body)
                             .await
                     };
                     match decoded {
                         Ok(Ok(msgs)) => {
+                            // A single reserved-`channel` message is a
+                            // verification-handshake echo: reply with its body,
+                            // enqueue nothing.
+                            if let [m] = msgs.as_slice()
+                                && m.channel == zeroclaw_api::webhook::WEBHOOK_REPLY_CHANNEL
+                            {
+                                let _ = reply.send(Ok(
+                                    zeroclaw_api::webhook::WebhookOutcome::Body(m.content.clone()),
+                                ));
+                                continue;
+                            }
                             for m in msgs {
                                 let _ = wh_tx
                                     .send(from_wit_inbound(m, &wh_name, wh_alias.as_deref()))
                                     .await;
                             }
-                            let _ = reply.send(Ok(()));
+                            let _ = reply.send(Ok(zeroclaw_api::webhook::WebhookOutcome::Ack));
                         }
                         // Plugin rejected the webhook (bad signature / payload).
                         Ok(Err(reason)) => {

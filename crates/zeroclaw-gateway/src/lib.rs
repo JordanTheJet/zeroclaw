@@ -1693,7 +1693,12 @@ pub async fn run_gateway(
         // Inbound webhooks for plugin channels: a plugin claims `<segment>` via
         // its `webhook-path` export; the registry carries the sink. Disjoint
         // from every native channel route by the `/plugin/` prefix.
-        .route("/plugin/{path}", post(handle_plugin_webhook))
+        // GET too: platform webhook-verification handshakes (WhatsApp/wecom
+        // `hub.challenge`) arrive as GET; the plugin echoes the challenge body.
+        .route(
+            "/plugin/{path}",
+            get(handle_plugin_webhook).post(handle_plugin_webhook),
+        )
         .layer(axum::Extension(plugin_webhooks.clone()))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
@@ -2666,10 +2671,12 @@ pub struct WebhookQuery {
 async fn handle_plugin_webhook(
     axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     axum::extract::Path(path): axum::extract::Path<String>,
+    method: axum::http::Method,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+    use zeroclaw_api::webhook::{RawWebhook, WebhookOutcome, WebhookReject};
 
     let Some(sink) = registry.get(&path) else {
         return (StatusCode::NOT_FOUND, "no plugin serves this webhook path").into_response();
@@ -2687,6 +2694,8 @@ async fn handle_plugin_webhook(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let raw = RawWebhook {
+        method: method.as_str().to_string(),
+        query: raw_query.unwrap_or_default(),
         headers: header_pairs,
         body: body.to_vec(),
         reply: reply_tx,
@@ -2698,7 +2707,10 @@ async fn handle_plugin_webhook(
     }
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
-        Ok(Ok(Ok(()))) => StatusCode::OK.into_response(),
+        // Verification handshake (Slack url_verification / WhatsApp hub.challenge)
+        // → 200 with the plugin-supplied body; ordinary events → 200 empty.
+        Ok(Ok(Ok(WebhookOutcome::Body(b)))) => (StatusCode::OK, b).into_response(),
+        Ok(Ok(Ok(WebhookOutcome::Ack))) => StatusCode::OK.into_response(),
         Ok(Ok(Err(WebhookReject::Unauthorized(m)))) => {
             (StatusCode::UNAUTHORIZED, m).into_response()
         }
