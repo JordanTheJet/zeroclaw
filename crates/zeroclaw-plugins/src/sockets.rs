@@ -54,6 +54,16 @@ const OUTBOUND_CAP: usize = 256;
 /// arbitrary anyway; the plugin reassembles its own protocol units.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// Max live connections per plugin store. Each connection is a host socket
+/// plus two spawned pump tasks — resources that live outside the guest's
+/// memory/table/fuel limits — so without a cap a plugin holding
+/// `socket_client` could loop `tcp-connect` and exhaust host file
+/// descriptors and tasks. The protocols this import exists for need a
+/// handful (IRC one; email one IMAP + one SMTP; MQTT one), so a small
+/// constant bounds abuse without constraining real use; `tcp-close` frees
+/// capacity.
+const MAX_CONNS: usize = 16;
+
 /// Bound on the DNS resolve + TCP dial, and separately on the TLS handshake,
 /// in [`SocketRegistry::connect`]. The guest's `tcp-connect` call holds the
 /// plugin store lock, so an unbounded dial against a firewall that silently
@@ -126,6 +136,14 @@ impl SocketRegistry {
     /// Dial `host:port` (TLS client handshake on top when `tls` is set), spawn
     /// the read/write pumps, and register the connection. Returns its handle.
     pub async fn connect(&mut self, host: String, port: u16, tls: bool) -> Result<u64, String> {
+        // Refuse before dialing: the cap bounds host sockets and pump tasks,
+        // so a connection that would exceed it must never be created at all.
+        if self.conns.len() >= MAX_CONNS {
+            return Err(format!(
+                "socket connection limit reached ({MAX_CONNS} live connections); \
+                 tcp-close one before connecting again"
+            ));
+        }
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
             .await
             .map_err(|_| {
@@ -344,7 +362,7 @@ impl bindings::channel::zeroclaw::plugin::socket::Host for PluginState {
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRegistry, format_read_close_reason};
+    use super::{MAX_CONNS, SocketRegistry, format_read_close_reason};
 
     #[test]
     fn read_close_reason_distinguishes_eof_from_error() {
@@ -383,5 +401,45 @@ mod tests {
         let mut registry = SocketRegistry::new();
         registry.close(42);
         registry.close(42);
+    }
+
+    #[tokio::test]
+    async fn connect_fails_at_cap_and_close_frees_capacity() {
+        // Sockets and pump tasks are host resources outside the guest's wasm
+        // limits, so the registry itself must refuse work past MAX_CONNS —
+        // with a named error, not a panic — and must hand the slot back on
+        // close so a well-behaved plugin can rotate connections.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        zeroclaw_spawn::spawn!(async move {
+            // Hold every accepted socket so the registry's ends stay live.
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+
+        let mut registry = SocketRegistry::new();
+        for _ in 0..MAX_CONNS {
+            registry
+                .connect("127.0.0.1".to_string(), port, false)
+                .await
+                .unwrap();
+        }
+        let err = registry
+            .connect("127.0.0.1".to_string(), port, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("socket connection limit reached"),
+            "cap error must be named, got: {err}"
+        );
+
+        // Handles start at 1, so the first connection is handle 1.
+        registry.close(1);
+        registry
+            .connect("127.0.0.1".to_string(), port, false)
+            .await
+            .unwrap();
     }
 }

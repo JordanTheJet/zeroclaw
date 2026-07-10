@@ -284,7 +284,7 @@ below).
 
 The plugin contract is the set of WIT files in `wit/v0/`, package
 `zeroclaw:plugin@0.1.0`. Every item is gated behind an `@unstable` feature
-until the package stabilizes — `plugins-wit-v0` for the core interfaces, and
+until the package stabilizes: `plugins-wit-v0` for the core interfaces, and
 the distinct `plugins-wit-v0-sockets` for the `socket` interface; see
 `wit/VERSIONING.md` for the compatibility rules. The interfaces below are
 summarized for orientation; the `.wit` files are authoritative for the exact

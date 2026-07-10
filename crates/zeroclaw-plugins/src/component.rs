@@ -128,10 +128,11 @@ pub struct PluginState {
 
 impl PluginState {
     /// Build store state for a plugin holding `permissions` under `limits`.
-    /// `HttpClient` is the only permission that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Every other permission resolves elsewhere (config jail, memory bridge)
-    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
+    /// `HttpClient` and `SocketClient` are the permissions that widen the host
+    /// surface here: the former attaches a `WasiHttpCtx` so the gated
+    /// `wasi:http` import can be linked, the latter a `SocketRegistry` so the
+    /// gated `socket` import can be. Every other permission resolves elsewhere
+    /// (config jail, memory bridge) and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
     /// the memory/table/instance ceilings the store limiter enforces.
     pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
         Self::with_inbound(permissions, InboundQueue::default(), limits)

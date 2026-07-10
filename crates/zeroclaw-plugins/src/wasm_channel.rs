@@ -102,7 +102,8 @@ impl WasmChannel {
     /// Compile and instantiate a channel plugin, caching its capabilities and
     /// the static-identity exports needed by the sync trait methods. The
     /// permission set decides whether the store and linker expose outbound
-    /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
+    /// `wasi:http` and the host-mediated `socket` import; without `HttpClient`
+    /// or `SocketClient` the channel cannot reach the network.
     /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
     /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
     /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
