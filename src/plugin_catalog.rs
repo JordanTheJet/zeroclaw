@@ -17,6 +17,7 @@ use zeroclaw_plugins::catalog::{
     InstalledSeed, merge_capabilities,
 };
 use zeroclaw_plugins::host::PluginHost;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 fn perm_wire(p: &PluginPermission) -> String {
     serde_json::to_value(p)
@@ -222,7 +223,13 @@ pub async fn set_capability_enabled(
                  (set `channels.{id}.<alias>.<field> ...`) or pass --alias <name>."
             ),
             [] => {
-                println!("No configured '{id}' channel to disable.");
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-plugin-disable-none-configured",
+                        &[("id", id)],
+                    )
+                );
                 return Ok(());
             }
             [one] => vec![one.clone()],
@@ -252,9 +259,15 @@ pub async fn set_capability_enabled(
     // fn's future small (clippy::large_futures), matching the CLI `config set`.
     Box::pin(config.save_dirty()).await?;
     for (p, v) in &changes {
-        println!("  set {p} = {v}");
+        println!(
+            "  {}",
+            get_required_cli_string_with_args(
+                "cli-plugin-set-applied",
+                &[("path", p.as_str()), ("value", v.as_str())],
+            )
+        );
     }
-    println!("Restart or reload the daemon for this to take effect.");
+    println!("{}", get_required_cli_string("cli-plugin-reload-hint"));
     Ok(())
 }
 
@@ -284,7 +297,7 @@ fn source_label(e: &CapabilityCatalogEntry) -> String {
 /// Print the catalog as a grouped table to stdout.
 pub fn render(entries: &[CapabilityCatalogEntry]) {
     if entries.is_empty() {
-        println!("No capabilities to show.");
+        println!("{}", get_required_cli_string("cli-plugin-catalog-empty"));
         return;
     }
     let mut current: Option<&CapabilityKind> = None;

@@ -816,6 +816,12 @@ cli-plugin-capabilities = Capabilities: {$v}
 cli-plugin-permissions = Permissions: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (skill-only plugin)
+
+# ── plugin enable/disable + capability catalog (zeroclaw plugin list/enable/disable) ──
+cli-plugin-disable-none-configured = No configured '{$id}' channel to disable.
+cli-plugin-set-applied = set {$path} = {$value}
+cli-plugin-reload-hint = Restart or reload the daemon for this to take effect.
+cli-plugin-catalog-empty = No capabilities to show.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
