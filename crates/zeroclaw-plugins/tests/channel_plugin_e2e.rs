@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -30,7 +31,13 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::webhook::{RawWebhook, WebhookOutcome, WebhookReject};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
-use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::wasm_channel::{SenderAuthorizer, WasmChannel};
+
+/// Allow-all sender gate for the tests that aren't exercising authorization —
+/// the daemon injects the real per-channel `peer_groups` allowlist here.
+fn allow_all() -> SenderAuthorizer {
+    Arc::new(|_: &str| true)
+}
 
 fn fixture() -> Option<PathBuf> {
     let path =
@@ -89,6 +96,7 @@ async fn novel_channel_plugin_runs_end_to_end() {
         &[PluginPermission::ConfigRead],
         &config,
         test_limits(),
+        allow_all(),
     )
     .await
     .expect("channel plugin instantiates (configure + get-channel-capabilities)");
@@ -128,6 +136,7 @@ async fn mirror_channel_plugin_receives_plaintext_typed_config() {
         &[PluginPermission::ConfigRead],
         config_json,
         test_limits(),
+        allow_all(),
     )
     .await
     .expect("mirror channel plugin instantiates");
@@ -163,10 +172,17 @@ async fn mirror_without_config_read_is_withheld() {
     // No ConfigRead → the canonical section (with its secret) is withheld; the
     // plugin is configured with `{}`, never another channel's credentials.
     let config_json = r#"{"bot_token":"secret-123","enabled":true}"#;
-    let channel =
-        WasmChannel::from_wasm_mirror("telegram", "main", &wasm, &[], config_json, test_limits())
-            .await
-            .expect("instantiates with empty config");
+    let channel = WasmChannel::from_wasm_mirror(
+        "telegram",
+        "main",
+        &wasm,
+        &[],
+        config_json,
+        test_limits(),
+        allow_all(),
+    )
+    .await
+    .expect("instantiates with empty config");
 
     assert_eq!(
         first_inbound_content(&channel).await,
@@ -190,6 +206,7 @@ async fn webhook_ingress_delivers_inbound() {
         &[PluginPermission::ConfigRead],
         "test-secret",
         test_limits(),
+        allow_all(),
     )
     .await
     .expect("fixture instantiates");
@@ -268,5 +285,74 @@ async fn webhook_ingress_delivers_inbound() {
     assert!(
         matches!(reply_rx3.await, Ok(Ok(WebhookOutcome::Body(b))) if b == "echo-me-42"),
         "GET verification → 200 with the echoed challenge body"
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_sender_is_dropped_but_webhook_still_acks() {
+    let Some(wasm) = fixture() else {
+        return;
+    };
+
+    // The host injects the per-channel sender allowlist here, exactly as the
+    // daemon does from `peer_groups`. Deny the fixture's webhook sender
+    // ("webhook") while allowing its poll-echo sender ("tester"), so we can
+    // prove the gate is per-sender and selective, not a dead channel.
+    let deny_webhook: SenderAuthorizer = Arc::new(|sender: &str| sender != "webhook");
+    let channel = WasmChannel::from_wasm_mirror(
+        "fixture",
+        "default",
+        &wasm,
+        &[PluginPermission::ConfigRead],
+        "test-secret",
+        test_limits(),
+        deny_webhook,
+    )
+    .await
+    .expect("fixture instantiates");
+
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channel.listen(tx).await.expect("listen starts");
+
+    // A *valid* webhook (correct signature) from the denied sender: the plugin
+    // decodes it fine, but the host's allowlist drops the message. The platform
+    // still gets a 200 Ack — a valid webhook carrying a non-allowlisted sender
+    // is not a rejection (matching native, which drops the message, not the
+    // connection).
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
+            headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+            body: b"hello from webhook".to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("sink accepts");
+    assert!(
+        matches!(reply_rx.await, Ok(Ok(WebhookOutcome::Ack))),
+        "valid webhook from a denied sender still ACKs (200), it is not rejected"
+    );
+
+    // Collect everything that reaches the agent. The allowed poll-echo (sender
+    // "tester", content = the configured secret) must arrive; the denied
+    // webhook body must not.
+    let mut delivered = Vec::new();
+    if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        delivered.push(m.content);
+    }
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+        delivered.push(m.content);
+    }
+    assert!(
+        delivered.iter().any(|c| c == "test-secret"),
+        "the authorized sender's inbound is delivered: {delivered:?}"
+    );
+    assert!(
+        !delivered.iter().any(|c| c == "hello from webhook"),
+        "the unauthorized sender's inbound is dropped: {delivered:?}"
     );
 }

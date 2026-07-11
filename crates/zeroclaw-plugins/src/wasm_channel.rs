@@ -31,6 +31,15 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 
+/// Host-supplied sender authorization: returns `true` when an inbound message
+/// from `sender` may be forwarded to the agent. The runtime builds it from the
+/// **same** `channel_external_peers` allowlist (and the same per-channel matcher
+/// — case-sensitive/insensitive exact id, or domain-class email) a native
+/// channel uses, so a channel plugin authenticates senders identically to its
+/// built-in counterpart. Default-deny: an empty allowlist admits no one, exactly
+/// as a native channel drops inbound when it is "configured but not opened".
+pub type SenderAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
     /// Platform id for routing, session keys, and native-wins dedup — the
@@ -50,6 +59,9 @@ pub struct WasmChannel {
     /// Sink-drain end for host-fed webhooks (set by the orchestrator when this
     /// channel declares a `webhook-path`). Taken once by `listen`.
     webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
+    /// Per-channel sender allowlist gate applied to every inbound message
+    /// before it reaches the agent, mirroring the native channel's own check.
+    authorizer: SenderAuthorizer,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -128,6 +140,7 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         config_json: String,
         limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
     ) -> Result<Self> {
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
@@ -194,6 +207,7 @@ impl WasmChannel {
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
             webhook_rx: std::sync::Mutex::new(None),
+            authorizer,
         })
     }
 
@@ -242,6 +256,7 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
     ) -> Result<Self> {
         let config_json = resolve_configure_json(config, permissions);
         Self::instantiate(
@@ -251,6 +266,7 @@ impl WasmChannel {
             permissions,
             config_json,
             limits,
+            authorizer,
         )
         .await
     }
@@ -269,6 +285,7 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         config_json: &str,
         limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
     ) -> Result<Self> {
         let config_json = if permissions.contains(&PluginPermission::ConfigRead) {
             config_json.to_string()
@@ -282,6 +299,7 @@ impl WasmChannel {
             permissions,
             config_json,
             limits,
+            authorizer,
         )
         .await
     }
@@ -344,6 +362,36 @@ fn from_wit_inbound(
     }
 }
 
+/// Forward an inbound message on `tx` only if the host authorizes its sender,
+/// applying the same per-channel allowlist a native channel enforces before it
+/// dispatches. An unauthorized sender is dropped with a WARN and *not*
+/// forwarded — a plugin can no longer surface inbound from a sender the built-in
+/// channel would have ignored. Returns `Err` only when the receiver is gone, so
+/// the poll loop can stop; the webhook drain ignores the result and still ACKs
+/// the platform (a valid webhook carrying a non-allowlisted sender is a 200, not
+/// a rejection — matching native, which drops the message but keeps the socket).
+async fn forward_if_authorized(
+    tx: &mpsc::Sender<ChannelMessage>,
+    authorizer: &SenderAuthorizer,
+    channel_name: &str,
+    msg: ChannelMessage,
+) -> Result<(), mpsc::error::SendError<ChannelMessage>> {
+    if !authorizer(&msg.sender) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "channel": channel_name,
+                    "sender": msg.sender,
+                })),
+            "ignoring inbound from unauthorized sender (not in the channel allowlist)"
+        );
+        return Ok(());
+    }
+    tx.send(msg).await
+}
+
 fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
     WitApprovalRequest {
         tool_name: req.tool_name.clone(),
@@ -391,6 +439,7 @@ impl Channel for WasmChannel {
         let stamped_alias = self.stamped_alias.clone();
         let state = Arc::clone(&self.state);
         let poll_healthy = Arc::clone(&self.poll_healthy);
+        let authorizer = Arc::clone(&self.authorizer);
 
         // Webhook ingress: if the gateway feeds this channel raw webhooks via a
         // registered sink, drain them on a second task. Each is decoded by the
@@ -402,6 +451,7 @@ impl Channel for WasmChannel {
             let wh_name = self.name.clone();
             let wh_alias = self.stamped_alias.clone();
             let wh_tx = tx.clone();
+            let wh_auth = Arc::clone(&self.authorizer);
             zeroclaw_spawn::spawn!(async move {
                 while let Some(RawWebhook {
                     method,
@@ -443,9 +493,13 @@ impl Channel for WasmChannel {
                                 continue;
                             }
                             for m in msgs {
-                                let _ = wh_tx
-                                    .send(from_wit_inbound(m, &wh_name, wh_alias.as_deref()))
-                                    .await;
+                                let _ = forward_if_authorized(
+                                    &wh_tx,
+                                    &wh_auth,
+                                    &wh_name,
+                                    from_wit_inbound(m, &wh_name, wh_alias.as_deref()),
+                                )
+                                .await;
                             }
                             let _ = reply.send(Ok(zeroclaw_api::webhook::WebhookOutcome::Ack));
                         }
@@ -480,14 +534,14 @@ impl Channel for WasmChannel {
                     Ok(Some(wit_msg)) => {
                         mark_poll_healthy(&poll_healthy, true);
                         backoff = INITIAL_BACKOFF;
-                        if tx
-                            .send(from_wit_inbound(
-                                wit_msg,
-                                &channel_name,
-                                stamped_alias.as_deref(),
-                            ))
-                            .await
-                            .is_err()
+                        if forward_if_authorized(
+                            &tx,
+                            &authorizer,
+                            &channel_name,
+                            from_wit_inbound(wit_msg, &channel_name, stamped_alias.as_deref()),
+                        )
+                        .await
+                        .is_err()
                         {
                             break;
                         }

@@ -104,6 +104,7 @@ async fn ws_client_round_trips_a_text_frame() {
         ],
         &config,
         test_limits(),
+        std::sync::Arc::new(|_: &str| true),
     )
     .await
     .expect("ws channel plugin instantiates with WebSocketClient granted");
@@ -139,6 +140,7 @@ async fn ws_plugin_without_permission_fails_closed() {
         &[PluginPermission::ConfigRead],
         &config,
         test_limits(),
+        std::sync::Arc::new(|_: &str| true),
     )
     .await;
 

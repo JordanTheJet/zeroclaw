@@ -10008,6 +10008,7 @@ pub async fn start_channels(
             let active_aliases = ActiveChannelAliases::compute(&config);
             for built in zeroclaw_runtime::plugin_channels::build_channel_plugins(
                 &config,
+                &config_arc,
                 plugin_webhooks.as_deref(),
             )
             .await

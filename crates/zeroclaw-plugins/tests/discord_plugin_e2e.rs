@@ -141,6 +141,7 @@ async fn discord_plugin_delivers_a_gateway_message() {
         ],
         &config,
         test_limits(),
+        std::sync::Arc::new(|_: &str| true),
     )
     .await
     .expect("discord plugin instantiates with ws-client + wasi:http granted");

@@ -11,9 +11,12 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::webhook::PluginWebhookRegistry;
 use zeroclaw_config::schema::Config;
+#[cfg(feature = "plugins-wasm")]
+use zeroclaw_plugins::wasm_channel::SenderAuthorizer;
 
 /// A channel plugin built into a runnable trait object, plus the identity the
 /// orchestrator needs to dedup it against native channels.
@@ -47,6 +50,7 @@ pub struct BuiltChannelPlugin {
 #[cfg(feature = "plugins-wasm")]
 pub async fn build_channel_plugins(
     config: &Config,
+    config_arc: &Arc<RwLock<Config>>,
     webhooks: Option<&PluginWebhookRegistry>,
 ) -> Vec<BuiltChannelPlugin> {
     let plugin_path = config.plugins.resolved_plugins_dir();
@@ -142,6 +146,10 @@ pub async fn build_channel_plugins(
                     let resolved = apply_env_fallbacks(cfg_obj, id);
                     let config_json =
                         ::serde_json::to_string(&resolved).unwrap_or_else(|_| "{}".to_string());
+                    // Same default-deny sender allowlist the native channel of
+                    // this id enforces, resolved live from `peer_groups`.
+                    let authorizer = channel_authorizer(config_arc, id, alias.as_str());
+                    note_if_no_allowlist(config, id, alias.as_str(), &manifest.name);
                     match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror(
                         id,
                         alias.as_str(),
@@ -149,6 +157,7 @@ pub async fn build_channel_plugins(
                         &manifest.permissions,
                         &config_json,
                         limits,
+                        authorizer,
                     )
                     .await
                     {
@@ -177,12 +186,19 @@ pub async fn build_channel_plugins(
                     .entry_config(&manifest.name)
                     .cloned()
                     .unwrap_or_default();
+                // A novel channel has no native counterpart; it still gets a
+                // default-deny gate keyed on `peer_groups.<name>`, so an
+                // operator opens it by allowlisting senders (or `["*"]`), never
+                // fail-open. Exact-id match (no domain-class channel is novel).
+                let authorizer = channel_authorizer(config_arc, &manifest.name, "");
+                note_if_no_allowlist(config, &manifest.name, "", &manifest.name);
                 match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
                     manifest.name.clone(),
                     wasm_path,
                     &manifest.permissions,
                     &plugin_config,
                     limits,
+                    authorizer,
                 )
                 .await
                 {
@@ -245,6 +261,112 @@ fn apply_env_fallbacks(cfg_obj: &::serde_json::Value, id: &str) -> ::serde_json:
         }
     }
     obj
+}
+
+/// Which allowlist matcher a channel type authorizes senders with — a faithful
+/// mirror of the per-channel choice each native channel hard-codes. Keep this in
+/// sync with the native `is_user_allowed*` call sites in `zeroclaw-channels`.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SenderMatch {
+    /// Case-sensitive exact id — the common case (platform user ids, and the
+    /// E.164 phone a phone channel plugin normalizes the same way native does).
+    Exact,
+    /// Case-insensitive exact — `git` usernames, `irc` nicks, `imessage`,
+    /// `matrix` MXIDs (all case-insensitive in their native channel).
+    CaseInsensitive,
+    /// `telegram`: mirror `normalize_identity` — trim + strip a leading `@` on
+    /// both the sender and each peer, then case-sensitive exact. NOTE: native
+    /// telegram also accepts EITHER a user's @username OR numeric id; a single
+    /// `sender` field can carry only one, so the telegram plugin must emit a
+    /// consistent identity and operators must allowlist that same identity.
+    Handle,
+    /// Domain-class email (`@host` admits a whole domain) — `gmail_push`, `email`.
+    Email,
+}
+
+/// The matcher a channel type authorizes with, mirroring native. Pure (no
+/// config) so the taxonomy — the logic that must stay in lockstep with the
+/// native channels — is unit-testable on its own.
+#[cfg(feature = "plugins-wasm")]
+fn matcher_for(channel_type: &str) -> SenderMatch {
+    match channel_type {
+        "gmail_push" | "email" => SenderMatch::Email,
+        "telegram" => SenderMatch::Handle,
+        "git" | "irc" | "imessage" | "matrix" => SenderMatch::CaseInsensitive,
+        _ => SenderMatch::Exact,
+    }
+}
+
+/// Apply a matcher to an already-resolved peer list — the pure decision the
+/// live authorizer wraps. Default-deny (empty ⇒ none, `["*"]` ⇒ anyone) via the
+/// shared `zeroclaw_config::allowlist` primitives every native channel uses.
+#[cfg(feature = "plugins-wasm")]
+fn sender_allowed(matcher: SenderMatch, peers: &[String], sender: &str) -> bool {
+    use zeroclaw_config::allowlist::{self, Match};
+    match matcher {
+        SenderMatch::Email => allowlist::is_user_allowed_by(peers, sender, allowlist::email_match),
+        SenderMatch::CaseInsensitive => {
+            allowlist::is_user_allowed(peers, sender, Match::CaseInsensitive)
+        }
+        SenderMatch::Exact => allowlist::is_user_allowed(peers, sender, Match::Sensitive),
+        SenderMatch::Handle => {
+            // Mirror native telegram `normalize_identity` (telegram.rs): trim +
+            // strip a leading `@` on both sides, drop entries that normalize to
+            // empty, then a case-sensitive exact compare.
+            let norm = |s: &str| s.trim().trim_start_matches('@').to_string();
+            let normalized_peers: Vec<String> = peers
+                .iter()
+                .map(|p| norm(p))
+                .filter(|p| !p.is_empty())
+                .collect();
+            allowlist::is_user_allowed(&normalized_peers, &norm(sender), Match::Sensitive)
+        }
+    }
+}
+
+/// Build the sender-authorization gate for a plugin channel: the **same**
+/// default-deny allowlist a native channel of this `channel_type` applies,
+/// resolved live from `peer_groups` (via `channel_external_peers`) on every
+/// inbound message, so a channel plugin authenticates senders identically to
+/// its built-in counterpart. An empty allowlist admits no one (`["*"]` admits
+/// everyone) — the exact stance the native channel takes.
+#[cfg(feature = "plugins-wasm")]
+fn channel_authorizer(
+    config_arc: &Arc<RwLock<Config>>,
+    channel_type: &str,
+    alias: &str,
+) -> SenderAuthorizer {
+    let cfg = Arc::clone(config_arc);
+    let channel_type = channel_type.to_string();
+    let alias = alias.to_string();
+    let matcher = matcher_for(&channel_type);
+    Arc::new(move |sender: &str| {
+        let peers = cfg.read().channel_external_peers(&channel_type, &alias);
+        sender_allowed(matcher, &peers, sender)
+    })
+}
+
+/// A channel plugin with an empty sender allowlist accepts no inbound (default
+/// deny — the same stance the native channel takes). That is silent per-message,
+/// so surface it once at startup: it is the usual reason a freshly-installed
+/// plugin channel "does nothing", and the fix is a `[peer_groups]` entry (or
+/// `"*"`). Purely informational — the authorization decision is unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn note_if_no_allowlist(config: &Config, channel_type: &str, alias: &str, plugin: &str) {
+    if config
+        .channel_external_peers(channel_type, alias)
+        .is_empty()
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({ "plugin": plugin, "channel": channel_type, "alias": alias })
+            ),
+            "Channel plugin has an empty sender allowlist; it will accept no inbound until \
+             a peer group authorizes senders for it (or \"*\" for anyone)"
+        );
+    }
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -326,6 +448,7 @@ async fn register_plugin_webhook(
 #[cfg(not(feature = "plugins-wasm"))]
 pub async fn build_channel_plugins(
     _config: &Config,
+    _config_arc: &Arc<RwLock<Config>>,
     _webhooks: Option<&PluginWebhookRegistry>,
 ) -> Vec<BuiltChannelPlugin> {
     Vec::new()
@@ -333,8 +456,104 @@ pub async fn build_channel_plugins(
 
 #[cfg(all(test, feature = "plugins-wasm"))]
 mod tests {
-    use super::apply_env_fallbacks;
+    use super::{SenderMatch, apply_env_fallbacks, matcher_for, sender_allowed};
     use serde_json::json;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn matcher_for_mirrors_native_per_channel_choice() {
+        // Keep in lockstep with the native is_user_allowed* call sites.
+        assert_eq!(matcher_for("gmail_push"), SenderMatch::Email);
+        assert_eq!(matcher_for("email"), SenderMatch::Email);
+        assert_eq!(matcher_for("telegram"), SenderMatch::Handle);
+        for ci in ["git", "irc", "imessage", "matrix"] {
+            assert_eq!(matcher_for(ci), SenderMatch::CaseInsensitive, "{ci}");
+        }
+        for exact in [
+            "slack",
+            "discord",
+            "wati",
+            "linq",
+            "whatsapp",
+            "a-novel-plugin",
+        ] {
+            assert_eq!(matcher_for(exact), SenderMatch::Exact, "{exact}");
+        }
+    }
+
+    #[test]
+    fn every_matcher_is_default_deny_and_wildcard_open() {
+        for m in [
+            SenderMatch::Exact,
+            SenderMatch::CaseInsensitive,
+            SenderMatch::Handle,
+            SenderMatch::Email,
+        ] {
+            assert!(!sender_allowed(m, &[], "anyone"), "empty ⇒ deny ({m:?})");
+            assert!(
+                sender_allowed(m, &v(&["*"]), "anyone"),
+                "wildcard ⇒ allow ({m:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_is_case_sensitive() {
+        assert!(sender_allowed(SenderMatch::Exact, &v(&["alice"]), "alice"));
+        assert!(!sender_allowed(SenderMatch::Exact, &v(&["alice"]), "Alice"));
+    }
+
+    #[test]
+    fn case_insensitive_matches_matrix_mxid_casing() {
+        // Native matrix authorizes case-insensitively; @Bot:Example.org must
+        // match @bot:example.org.
+        assert!(sender_allowed(
+            SenderMatch::CaseInsensitive,
+            &v(&["@Bot:Example.org"]),
+            "@bot:example.org"
+        ));
+    }
+
+    #[test]
+    fn handle_strips_at_and_trims_both_sides() {
+        // Mirror native telegram normalize_identity: "@alice" and "alice" are the
+        // same identity, from either the peer or the sender side.
+        assert!(sender_allowed(
+            SenderMatch::Handle,
+            &v(&["@alice"]),
+            "alice"
+        ));
+        assert!(sender_allowed(
+            SenderMatch::Handle,
+            &v(&["alice"]),
+            "@alice"
+        ));
+        assert!(sender_allowed(
+            SenderMatch::Handle,
+            &v(&[" @alice "]),
+            "alice"
+        ));
+        assert!(!sender_allowed(SenderMatch::Handle, &v(&["@alice"]), "bob"));
+        // A peer entry that normalizes to empty (bare "@") never admits anyone.
+        assert!(!sender_allowed(SenderMatch::Handle, &v(&["@"]), ""));
+    }
+
+    #[test]
+    fn email_matches_domain_class() {
+        assert!(sender_allowed(
+            SenderMatch::Email,
+            &v(&["@example.com"]),
+            "anyone@example.com"
+        ));
+        assert!(!sender_allowed(
+            SenderMatch::Email,
+            &v(&["@example.com"]),
+            "stranger@evil.com"
+        ));
+    }
 
     #[test]
     fn env_fills_only_blank_string_fields() {
