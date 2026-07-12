@@ -15,7 +15,7 @@ package zeroclaw:plugin@0.1.0;
 /// that all stays in the plugin, which owns the platform's framing and timing.
 /// Transport-level Ping/Pong is answered by the host automatically.
 ///
-/// Gated by the `websocket-client` permission: a plugin without it never gets a
+/// Gated by the `websocket_client` permission: a plugin without it never gets a
 /// connection registry, the import is not linked, and a guest that imports this
 /// interface fails closed at instantiation.
 @unstable(feature = plugins-wit-v0-websocket)

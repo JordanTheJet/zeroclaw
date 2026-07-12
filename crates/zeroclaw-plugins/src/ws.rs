@@ -24,6 +24,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc};
@@ -45,6 +46,17 @@ const INBOUND_CAP: usize = 1024;
 /// exceed it fails fast rather than blocking the guest call, signalling the
 /// plugin is producing faster than the socket drains.
 const OUTBOUND_CAP: usize = 256;
+
+/// Max live WebSocket connections per plugin store. Each entry owns a host
+/// socket and two pump tasks outside the guest's memory/table/fuel limits, so
+/// the existing `WsRegistry::conns` table is checked before every dial.
+/// `ws-close` removes the entry and immediately frees capacity.
+const MAX_CONNS: usize = 16;
+
+/// Bound on DNS resolution, TCP/TLS setup, and the WebSocket handshake. A
+/// plugin call holds the warm store lock while connecting, so an unbounded
+/// handshake would stall every other export for that channel.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single event surfaced to the plugin by [`WsRegistry::receive`], decoupled
 /// from the generated `ws-event` bindings type (mapped to it in the `Host` impl).
@@ -111,6 +123,23 @@ impl WsRegistry {
         url: String,
         headers: Vec<(String, String)>,
     ) -> Result<u64, String> {
+        self.connect_with_timeout(url, headers, CONNECT_TIMEOUT)
+            .await
+    }
+
+    async fn connect_with_timeout(
+        &mut self,
+        url: String,
+        headers: Vec<(String, String)>,
+        connect_timeout: Duration,
+    ) -> Result<u64, String> {
+        if self.conns.len() >= MAX_CONNS {
+            return Err(format!(
+                "websocket connection limit reached ({MAX_CONNS} live connections); \
+                 ws-close one before connecting again"
+            ));
+        }
+
         let mut request = url
             .as_str()
             .into_client_request()
@@ -126,9 +155,13 @@ impl WsRegistry {
             }
         }
 
-        let (stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| format!("websocket connect to {url:?} failed: {e}"))?;
+        let (stream, _response) =
+            tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(request))
+                .await
+                .map_err(|_| {
+                    format!("websocket connect to {url:?} timed out after {connect_timeout:?}")
+                })?
+                .map_err(|e| format!("websocket connect to {url:?} failed: {e}"))?;
         let (mut write, mut read) = stream.split();
 
         let inbound: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -322,7 +355,9 @@ impl bindings::channel::zeroclaw::plugin::ws_client::Host for PluginState {
 
 #[cfg(test)]
 mod tests {
-    use super::format_close_reason;
+    use super::{MAX_CONNS, WsRegistry, format_close_reason};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
@@ -345,5 +380,72 @@ mod tests {
         );
         // No frame → plain reason, no leading code for the plugin to misparse.
         assert_eq!(format_close_reason(None), "server closed the connection");
+    }
+
+    #[tokio::test]
+    async fn connect_fails_at_cap_and_close_frees_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket server");
+        let addr = listener.local_addr().expect("read listener address");
+        zeroclaw_spawn::spawn!(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(websocket) = tokio_tungstenite::accept_async(tcp).await {
+                    held.push(websocket);
+                }
+            }
+        });
+
+        let mut registry = WsRegistry::new();
+        for _ in 0..MAX_CONNS {
+            registry
+                .connect(format!("ws://{addr}"), Vec::new())
+                .await
+                .expect("connection below the cap succeeds");
+        }
+
+        let err = registry
+            .connect(format!("ws://{addr}"), Vec::new())
+            .await
+            .expect_err("connection above the cap fails");
+        assert!(
+            err.contains("websocket connection limit reached"),
+            "cap error must be named, got: {err}"
+        );
+
+        registry.close(1);
+        registry
+            .connect(format!("ws://{addr}"), Vec::new())
+            .await
+            .expect("ws-close returns capacity to the registry");
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_when_peer_never_finishes_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled handshake server");
+        let addr = listener.local_addr().expect("read listener address");
+        zeroclaw_spawn::spawn!(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _held_open = tcp;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let mut registry = WsRegistry::new();
+        let err = registry
+            .connect_with_timeout(
+                format!("ws://{addr}"),
+                Vec::new(),
+                Duration::from_millis(25),
+            )
+            .await
+            .expect_err("a stalled handshake must hit the host deadline");
+        assert!(
+            err.contains("timed out"),
+            "timeout error must be named, got: {err}"
+        );
     }
 }
