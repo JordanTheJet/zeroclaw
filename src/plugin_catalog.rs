@@ -11,12 +11,12 @@
 
 use serde_json::Value;
 use zeroclaw_config::schema::Config;
-use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::catalog::{
     AvailableSeed, BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin,
     InstalledSeed, merge_capabilities,
 };
 use zeroclaw_plugins::host::PluginHost;
+use zeroclaw_plugins::{PluginCapability, PluginPermission};
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 fn perm_wire(p: &PluginPermission) -> String {
@@ -137,28 +137,64 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
             enabled: plugins_enabled && loaded,
         });
     }
+    // Memory and observer bridges are not yet exposed through dedicated host
+    // accessors, but their manifest capabilities still belong in the installed
+    // catalog. `PluginInfo` is derived from that same canonical manifest.
+    for info in &infos {
+        for capability in &info.capabilities {
+            let kind = match capability {
+                PluginCapability::Memory => CapabilityKind::Memory,
+                PluginCapability::Observer => CapabilityKind::Observer,
+                PluginCapability::Tool | PluginCapability::Channel | PluginCapability::Skill => {
+                    continue;
+                }
+            };
+            installed.push(InstalledSeed {
+                plugin_name: info.name.clone(),
+                id: info.name.clone(),
+                kind,
+                mirrors_builtin: false,
+                version: Some(info.version.clone()),
+                description: info.description.clone(),
+                permissions: info.permissions.iter().map(perm_wire).collect(),
+                enabled: plugins_enabled && info.loaded,
+            });
+        }
+    }
 
     // ── Registry-available ─────────────────────────────────────────────────
-    let available: Vec<AvailableSeed> =
-        zeroclaw_plugins::registry::read_cached_registry_index(&config.data_dir)
-            .ok()
-            .flatten()
-            .map(|idx| {
-                idx.plugins
-                    .iter()
-                    .flat_map(|e| {
-                        // One row per declared capability kind (a plugin may be both a
-                        // channel and a tool); unknown strings bucket into Other.
-                        e.capabilities.iter().map(move |c| AvailableSeed {
-                            id: e.name.clone(),
-                            kind: CapabilityKind::from_wire(c),
-                            version: Some(e.version.clone()),
-                            description: e.description.clone(),
-                        })
+    let cached_index =
+        match zeroclaw_plugins::registry::read_cached_registry_index(&config.data_dir) {
+            Ok(index) => index,
+            Err(error) => {
+                let error = error.to_string();
+                eprintln!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-plugin-catalog-cache-failed",
+                        &[("error", error.as_str())],
+                    )
+                );
+                None
+            }
+        };
+    let available: Vec<AvailableSeed> = cached_index
+        .map(|idx| {
+            idx.plugins
+                .iter()
+                .flat_map(|e| {
+                    // One row per declared capability kind (a plugin may be both a
+                    // channel and a tool); unknown strings bucket into Other.
+                    e.capabilities.iter().map(move |c| AvailableSeed {
+                        id: e.name.clone(),
+                        kind: CapabilityKind::from_wire(c),
+                        version: Some(e.version.clone()),
+                        description: e.description.clone(),
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     merge_capabilities(builtins, installed, available)
 }
@@ -194,11 +230,54 @@ fn channel_is_plugin_backed(host: &PluginHost, id: &str) -> bool {
         .any(|m| m.provides.as_deref() == Some(id) || m.name == id)
 }
 
+fn resolve_channel_targets(
+    id: &str,
+    aliases: &[String],
+    requested_alias: Option<String>,
+    enabled: bool,
+) -> anyhow::Result<Option<Vec<String>>> {
+    if let Some(alias) = requested_alias {
+        if aliases.iter().any(|configured| configured == &alias) {
+            return Ok(Some(vec![alias]));
+        }
+        let available = if aliases.is_empty() {
+            get_required_cli_string("cli-plugin-aliases-none")
+        } else {
+            aliases.join(", ")
+        };
+        anyhow::bail!(get_required_cli_string_with_args(
+            "cli-plugin-toggle-unknown-alias",
+            &[
+                ("id", id),
+                ("alias", alias.as_str()),
+                ("aliases", available.as_str()),
+            ],
+        ));
+    }
+
+    match aliases {
+        [] if enabled => anyhow::bail!(get_required_cli_string_with_args(
+            "cli-plugin-enable-none-configured",
+            &[("id", id)],
+        )),
+        [] => Ok(None),
+        [one] => Ok(Some(vec![one.clone()])),
+        many => {
+            let available = many.join(", ");
+            anyhow::bail!(get_required_cli_string_with_args(
+                "cli-plugin-toggle-multiple-aliases",
+                &[("id", id), ("aliases", available.as_str())],
+            ));
+        }
+    }
+}
+
 /// Flip a channel capability's config `enabled` (the SSOT — never a new
 /// `[features]` table) and persist. v1 handles channels only; a novel tool/skill
 /// plugin runs whenever `plugins.enabled` is on and has no per-entry toggle yet.
-/// Resolves the alias (0 → error/skip, 1 → auto, many → require `--alias`), and
-/// turns the plugin subsystem on when enabling a plugin-backed channel.
+/// Resolves only existing aliases (0 → error/skip, 1 → auto, many → require
+/// `--alias`) and turns the plugin subsystem on when enabling a plugin-backed
+/// channel.
 pub async fn set_capability_enabled(
     config: &mut Config,
     host: &PluginHost,
@@ -206,45 +285,26 @@ pub async fn set_capability_enabled(
     alias: Option<String>,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    if !is_channel_id(config, id) {
-        anyhow::bail!(
-            "'{id}' is not a channel. Only channels can be enabled/disabled today; \
-             novel tool/skill plugins run whenever `plugins.enabled` is on. \
-             See `zeroclaw plugin list`."
-        );
+    if !is_channel_id(config, id) && !channel_is_plugin_backed(host, id) {
+        anyhow::bail!(get_required_cli_string_with_args(
+            "cli-plugin-toggle-not-channel",
+            &[("id", id)],
+        ));
     }
 
     let aliases = channel_aliases(config, id);
-    let targets: Vec<String> = match alias {
-        Some(a) => vec![a],
-        None => match aliases.as_slice() {
-            [] if enabled => anyhow::bail!(
-                "no configured '{id}' channel to enable — add one first \
-                 (set `channels.{id}.<alias>.<field> ...`) or pass --alias <name>."
-            ),
-            [] => {
-                println!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-plugin-disable-none-configured",
-                        &[("id", id)],
-                    )
-                );
-                return Ok(());
-            }
-            [one] => vec![one.clone()],
-            many => anyhow::bail!(
-                "'{id}' has multiple aliases ({}); pass --alias <name>.",
-                many.join(", ")
-            ),
-        },
+    let Some(targets) = resolve_channel_targets(id, &aliases, alias, enabled)? else {
+        println!(
+            "{}",
+            get_required_cli_string_with_args("cli-plugin-disable-none-configured", &[("id", id)],)
+        );
+        return Ok(());
     };
 
     let val = if enabled { "true" } else { "false" };
     let mut changes: Vec<(String, String)> = Vec::new();
     for a in &targets {
         let base = format!("channels.{id}.{a}");
-        config.ensure_map_key_for_path(&base);
         let path = format!("{base}.enabled");
         config.set_prop_persistent(&path, val)?;
         changes.push((path, val.to_string()));
@@ -271,27 +331,27 @@ pub async fn set_capability_enabled(
     Ok(())
 }
 
-fn kind_label(k: &CapabilityKind) -> &str {
-    match k {
-        CapabilityKind::Channel => "Channels",
-        CapabilityKind::Tool => "Tools",
-        CapabilityKind::Memory => "Memory backends",
-        CapabilityKind::Observer => "Observers",
-        CapabilityKind::Skill => "Skills",
-        CapabilityKind::Other(_) => "Other",
-    }
+fn kind_label(k: &CapabilityKind) -> String {
+    get_required_cli_string(match k {
+        CapabilityKind::Channel => "cli-plugin-kind-channels",
+        CapabilityKind::Tool => "cli-plugin-kind-tools",
+        CapabilityKind::Memory => "cli-plugin-kind-memory",
+        CapabilityKind::Observer => "cli-plugin-kind-observers",
+        CapabilityKind::Skill => "cli-plugin-kind-skills",
+        CapabilityKind::Other(_) => "cli-plugin-kind-other",
+    })
 }
 
 /// The `origin`/flags rendered as a compact source label, e.g. `built-in`,
 /// `built-in + plugin`, `plugin`, or `available`.
 fn source_label(e: &CapabilityCatalogEntry) -> String {
-    match e.origin {
-        CapabilityOrigin::BuiltIn if e.installed => "built-in + plugin".to_string(),
-        CapabilityOrigin::BuiltIn => "built-in".to_string(),
-        CapabilityOrigin::Plugin if e.mirrors_builtin => "plugin (mirror)".to_string(),
-        CapabilityOrigin::Plugin => "plugin".to_string(),
-        CapabilityOrigin::Registry => "available".to_string(),
-    }
+    get_required_cli_string(match e.origin {
+        CapabilityOrigin::BuiltIn if e.installed => "cli-plugin-source-builtin-plugin",
+        CapabilityOrigin::BuiltIn => "cli-plugin-source-builtin",
+        CapabilityOrigin::Plugin if e.mirrors_builtin => "cli-plugin-source-plugin-mirror",
+        CapabilityOrigin::Plugin => "cli-plugin-source-plugin",
+        CapabilityOrigin::Registry => "cli-plugin-source-available",
+    })
 }
 
 /// Print the catalog as a grouped table to stdout.
@@ -331,8 +391,47 @@ pub fn render(entries: &[CapabilityCatalogEntry]) {
             source_label(e),
         );
     }
-    println!(
-        "\n  ● enabled   ○ installed/built-in (off)   · installable\n  \
-         `zeroclaw plugin install <name>` to add · items."
-    );
+    println!("\n{}", get_required_cli_string("cli-plugin-catalog-legend"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_channel_targets;
+
+    fn aliases(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn explicit_alias_must_already_exist() {
+        let result = resolve_channel_targets(
+            "telegram",
+            &aliases(&["main"]),
+            Some("typo".to_string()),
+            true,
+        );
+        assert!(result.is_err(), "a typo must not create a new alias");
+    }
+
+    #[test]
+    fn one_alias_is_selected_implicitly() {
+        let targets = resolve_channel_targets("telegram", &aliases(&["main"]), None, true)
+            .expect("one configured alias resolves")
+            .expect("enable has a target");
+        assert_eq!(targets, ["main"]);
+    }
+
+    #[test]
+    fn multiple_aliases_require_an_explicit_choice() {
+        let result =
+            resolve_channel_targets("telegram", &aliases(&["main", "alerts"]), None, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn disabling_an_unconfigured_channel_is_a_noop() {
+        let targets = resolve_channel_targets("telegram", &[], None, false)
+            .expect("disable without aliases is not an error");
+        assert!(targets.is_none());
+    }
 }

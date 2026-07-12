@@ -2738,7 +2738,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List capabilities: built-in, installed plugins, and what's installable
+    /// List built-in channels, installed plugin capabilities, and what's installable
     List {
         /// Include every compiled-in built-in, not just configured/active ones
         #[arg(long)]

@@ -819,9 +819,29 @@ cli-plugin-wasm-none = WASM: (skill-only plugin)
 
 # ── plugin enable/disable + capability catalog (zeroclaw plugin list/enable/disable) ──
 cli-plugin-disable-none-configured = No configured '{$id}' channel to disable.
+cli-plugin-enable-none-configured = No configured '{$id}' channel to enable. Add an alias under `channels.{$id}` first.
+cli-plugin-toggle-not-channel = '{$id}' is not a channel. Only channels can be enabled or disabled today; other plugin capabilities follow `plugins.enabled`. See `zeroclaw plugin list`.
+cli-plugin-toggle-unknown-alias = '{$alias}' is not a configured alias for '{$id}'. Available aliases: {$aliases}.
+cli-plugin-toggle-multiple-aliases = '{$id}' has multiple aliases ({$aliases}); pass `--alias <name>`.
+cli-plugin-aliases-none = none
 cli-plugin-set-applied = set {$path} = {$value}
 cli-plugin-reload-hint = Restart or reload the daemon for this to take effect.
 cli-plugin-catalog-empty = No capabilities to show.
+cli-plugin-catalog-cache-failed = Warning: failed to read the cached plugin registry: {$error}
+cli-plugin-kind-channels = Channels
+cli-plugin-kind-tools = Tools
+cli-plugin-kind-memory = Memory backends
+cli-plugin-kind-observers = Observers
+cli-plugin-kind-skills = Skills
+cli-plugin-kind-other = Other
+cli-plugin-source-builtin-plugin = built-in + plugin
+cli-plugin-source-builtin = built-in
+cli-plugin-source-plugin-mirror = plugin (mirror)
+cli-plugin-source-plugin = plugin
+cli-plugin-source-available = available
+cli-plugin-catalog-legend =
+    ● enabled   ○ installed/built-in (off)   · installable
+    `zeroclaw plugin install <name>` to add · items.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
@@ -1041,4 +1061,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-
