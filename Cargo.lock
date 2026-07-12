@@ -13261,6 +13261,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-embedding-sidecar"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "futures-util",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-memory",
+ "zeroclaw-plugins",
+]
+
+[[package]]
 name = "zeroclaw-eval"
 version = "0.8.2"
 dependencies = [
@@ -13319,6 +13343,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-embedding-sidecar",
  "zeroclaw-hardware",
  "zeroclaw-infra",
  "zeroclaw-log",
@@ -13594,6 +13619,7 @@ dependencies = [
  "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-embedding-sidecar",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
@@ -13769,6 +13795,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-embedding-sidecar",
  "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",

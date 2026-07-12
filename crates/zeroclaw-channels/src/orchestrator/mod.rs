@@ -10129,7 +10129,7 @@ pub async fn start_channels(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
+        let mem: Arc<dyn Memory> = zeroclaw_runtime::create_memory_for_agent(
             &config,
             agent_alias,
             provider_api_key.as_deref(),

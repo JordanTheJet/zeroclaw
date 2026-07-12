@@ -14,6 +14,7 @@ zeroclaw-config.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
+zeroclaw-embedding-sidecar = { workspace = true, optional = true }
 zeroclaw-tools.workspace = true
 zeroclaw-sop-graph.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
@@ -107,7 +108,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 
 browser-native = []
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm = ["dep:zeroclaw-plugins", "dep:zeroclaw-embedding-sidecar", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
 

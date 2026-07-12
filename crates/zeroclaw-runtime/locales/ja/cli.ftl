@@ -679,6 +679,7 @@ cli-plugin-no-description = (説明なし)
 cli-plugin-install-resolving = プラグインレジストリから '{$source}' を解決しています...
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
+cli-plugin-embedding-setup = ネイティブ埋め込みプロバイダー '{$name}' をインストールしました（モデル '{$model}'、{$dimensions} 次元）。バンドルを確認して信頼した後、plugins.enabled=true、plugins.allow_native_sidecars=true、memory.embedding_provider='plugin:{$name}'、memory.embedding_model='{$model}'、memory.embedding_dimensions={$dimensions} を設定してください。同梱スキルは承認を得てこれらの設定を適用できます。
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
 cli-plugin-config-entry-seed-unaddressable = 警告: '{$name}' の設定エントリ作成をスキップしました: '.' を含むプラグイン名はドット区切りの設定パスで指定できません (`config set` は '.' で分割します)。設定ファイルに `name = "{$name}"` を含む [[plugins.entries]] ブロックを手動で追加してください。
@@ -710,6 +711,7 @@ cli-plugin-capabilities = 機能: {$v}
 cli-plugin-permissions = 権限: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (スキルのみのプラグイン)
+cli-plugin-wasm-not-required = WASM: (不要)
 cli-estop-domains-none = {"  "}domain_blocks:  (なし)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (なし)

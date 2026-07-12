@@ -752,14 +752,22 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_with_storage_and_routes(
+        #[cfg(feature = "plugins-wasm")]
+        let memory_result = zeroclaw_embedding_sidecar::create_memory(
+            &config,
+            &config.data_dir,
+            fallback.and_then(|entry| entry.api_key.as_deref()),
+        );
+        #[cfg(not(feature = "plugins-wasm"))]
+        let memory_result = zeroclaw_memory::create_memory_with_storage_and_routes(
             &config.memory,
             &config.embedding_routes,
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
             Some(&config.providers.models),
-        ) {
+        );
+        match memory_result {
             Ok(m) => Arc::from(m),
             Err(e) => {
                 ::zeroclaw_log::record!(

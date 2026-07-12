@@ -680,6 +680,7 @@ cli-plugin-no-description = (sin descripción)
 cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de complementos...
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
+cli-plugin-embedding-setup = El proveedor nativo de embeddings '{$name}' está instalado (modelo '{$model}', {$dimensions} dimensiones). Después de revisar y confiar en el paquete, configura plugins.enabled=true, plugins.allow_native_sidecars=true, memory.embedding_provider='plugin:{$name}', memory.embedding_model='{$model}' y memory.embedding_dimensions={$dimensions}. La habilidad incluida puede aplicar estos ajustes con tu aprobación.
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
@@ -711,6 +712,7 @@ cli-plugin-capabilities = Capacidades: {$v}
 cli-plugin-permissions = Permisos: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (plugin solo de skill)
+cli-plugin-wasm-not-required = WASM: (no es necesario)
 cli-estop-domains-none = {"  "}domain_blocks:  (ninguno)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (ninguno)

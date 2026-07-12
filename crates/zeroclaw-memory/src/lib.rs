@@ -519,6 +519,33 @@ pub fn create_memory_with_storage_and_routes(
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage_routes_and_embedding_factory(
+        config,
+        embedding_routes,
+        active_storage,
+        workspace_dir,
+        api_key,
+        providers,
+        None,
+    )
+}
+
+/// Routes-aware memory factory with an optional external embedding-provider
+/// factory. External factories get first refusal; returning `None` preserves
+/// the built-in `openai` / `openrouter` / `custom:` behavior.
+///
+/// Built-in providers persist the canonical provider string. External
+/// factories return a verified, transport-independent identity, so an
+/// ephemeral endpoint never becomes part of vector compatibility state.
+pub fn create_memory_with_storage_routes_and_embedding_factory(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    active_storage: ActiveStorage<'_>,
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+    providers: Option<&ModelProviders>,
+    embedding_factory: Option<&dyn embeddings::EmbeddingProviderFactory>,
+) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
@@ -594,21 +621,17 @@ pub fn create_memory_with_storage_and_routes(
         sqlite_open_timeout_secs: Option<u64>,
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
+        embedding_factory: Option<&dyn embeddings::EmbeddingProviderFactory>,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
-        let has_embedder = embedder.dimensions() > 0;
+        let resolved_provider =
+            create_resolved_embedding_provider(resolved_embedding, embedding_factory)?;
+        let has_embedder = resolved_provider.provider.dimensions() > 0;
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(
             "sqlite",
             workspace_dir,
-            embedder,
+            resolved_provider.provider,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
@@ -625,7 +648,7 @@ pub fn create_memory_with_storage_and_routes(
             reconcile_embedding_identity(
                 &mem,
                 &embeddings::EmbeddingIdentity {
-                    provider: resolved_embedding.model_provider.clone(),
+                    provider: resolved_provider.identity_provider,
                     model: resolved_embedding.model.clone(),
                     dimensions: resolved_embedding.dimensions,
                 },
@@ -657,13 +680,8 @@ pub fn create_memory_with_storage_and_routes(
             .context("Qdrant memory backend requires `url` in [storage.qdrant.<alias>]")?;
         let collection = qdrant_cfg.collection.clone();
         let qdrant_api_key = qdrant_cfg.api_key.clone().filter(|s| !s.trim().is_empty());
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
+        let embedder =
+            create_resolved_embedding_provider(&resolved_embedding, embedding_factory)?.provider;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -701,10 +719,52 @@ pub fn create_memory_with_storage_and_routes(
                 sqlite_open_timeout_secs,
                 workspace_dir,
                 &resolved_embedding,
+                embedding_factory,
             )
         },
         "",
     )
+}
+
+fn create_resolved_embedding_provider(
+    resolved: &ResolvedEmbeddingConfig,
+    factory: Option<&dyn embeddings::EmbeddingProviderFactory>,
+) -> anyhow::Result<embeddings::ResolvedEmbeddingProvider> {
+    if let Some(factory) = factory
+        && let Some(provider) = factory.create(
+            &resolved.model_provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        )?
+    {
+        anyhow::ensure!(
+            provider.provider.dimensions() == resolved.dimensions,
+            "embedding provider '{}' reported {} dimensions; configuration requires {}",
+            resolved.model_provider,
+            provider.provider.dimensions(),
+            resolved.dimensions
+        );
+        return Ok(provider);
+    }
+
+    anyhow::ensure!(
+        !resolved
+            .model_provider
+            .starts_with(zeroclaw_api::embedding::MANAGED_EMBEDDING_PROVIDER_PREFIX),
+        "embedding provider '{}' requires managed plugin support",
+        resolved.model_provider
+    );
+
+    Ok(embeddings::ResolvedEmbeddingProvider {
+        provider: Arc::from(embeddings::create_embedding_provider(
+            &resolved.model_provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        )),
+        identity_provider: resolved.model_provider.clone(),
+    })
 }
 
 /// Outcome of a startup embedding-identity reconciliation.
@@ -889,6 +949,18 @@ pub async fn create_memory_for_agent(
     agent_alias: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
+    create_memory_for_agent_with_embedding_factory(config, agent_alias, api_key, None).await
+}
+
+/// Per-agent memory factory with the same optional external embedding
+/// composition hook as
+/// [`create_memory_with_storage_routes_and_embedding_factory`].
+pub async fn create_memory_for_agent_with_embedding_factory(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    api_key: Option<&str>,
+    embedding_factory: Option<&dyn embeddings::EmbeddingProviderFactory>,
+) -> anyhow::Result<Arc<dyn Memory>> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
     let agent_cfg = config
         .agents
@@ -925,13 +997,14 @@ pub async fn create_memory_for_agent(
     // install-wide factory using the install workspace_dir, then wrap
     // with AgentScopedMemory holding the agent's UUID + resolved
     // allowlist UUIDs.
-    let inner = create_memory_with_storage_and_routes(
+    let inner = create_memory_with_storage_routes_and_embedding_factory(
         &config.memory,
         &config.embedding_routes,
         config.resolve_active_storage(),
         &config.data_dir,
         api_key,
         Some(&config.providers.models),
+        embedding_factory,
     )?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
@@ -1003,6 +1076,26 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    #[test]
+    fn managed_plugin_provider_fails_closed_without_external_factory() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            embedding_provider: "plugin:local-embedding".into(),
+            embedding_model: "fixture".into(),
+            embedding_dimensions: 4,
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("plugin provider must require its managed factory");
+        assert!(
+            error
+                .to_string()
+                .contains("requires managed plugin support")
+        );
     }
 
     // ── Embedding identity reconciliation policy (issue #7948) ────

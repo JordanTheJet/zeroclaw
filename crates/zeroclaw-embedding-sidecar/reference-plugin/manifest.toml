@@ -1,0 +1,17 @@
+name = "reference-local-embedding"
+version = "0.1.0"
+description = "Deterministic local embedding provider used to exercise managed sidecars"
+capabilities = ["skill"]
+permissions = []
+
+[embedding_provider]
+model = "zeroclaw-fixture-feature-hash-v1"
+dimensions = 64
+args = []
+artifacts = []
+
+[embedding_provider.executable]
+path = "bin/zeroclaw-reference-embedding-sidecar"
+# Packaging replaces this source-template value with the built executable's
+# digest before installation.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

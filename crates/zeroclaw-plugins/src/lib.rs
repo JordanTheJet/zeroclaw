@@ -39,6 +39,10 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// Native embedding sidecar entrypoint and bundle artifacts. This table is
+    /// the sole declaration; the embedding capability is derived from it.
+    #[serde(default)]
+    pub embedding_provider: Option<EmbeddingProviderManifest>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests
@@ -67,6 +71,33 @@ pub enum PluginCapability {
     Observer,
     /// Provides one or more agentskills.io-format skills under `skills/`
     Skill,
+    /// Provides an OpenAI-compatible embedding sidecar supervised by the host
+    EmbeddingProvider,
+}
+
+/// Files that make up a host-supervised embedding provider bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingProviderManifest {
+    /// Model identifier served by this bundle.
+    pub model: String,
+    /// Vector width served by this bundle.
+    pub dimensions: usize,
+    /// Native executable and its signed content digest.
+    pub executable: EmbeddingArtifactManifest,
+    /// Literal arguments passed directly to the executable (never through a shell).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Additional signed files or directory trees required by the executable.
+    #[serde(default)]
+    pub artifacts: Vec<EmbeddingArtifactManifest>,
+}
+
+/// One content-bound path inside a native plugin bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingArtifactManifest {
+    pub path: String,
+    /// Lowercase SHA-256 of the file or canonical directory tree.
+    pub sha256: String,
 }
 
 /// Permissions a plugin may request.
@@ -96,7 +127,8 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub capabilities: Vec<PluginCapability>,
     pub permissions: Vec<PluginPermission>,
-    /// Resolved path to the WASM file. `None` for skill-only plugins.
+    /// Resolved path to the WASM file. `None` for skill-only and native
+    /// embedding-provider plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
 }

@@ -678,6 +678,7 @@ cli-plugin-no-description = （无描述）
 cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
+cli-plugin-embedding-setup = 已安装原生嵌入提供商“{$name}”（模型“{$model}”，{$dimensions} 维）。审查并信任该插件包后，请设置 plugins.enabled=true、plugins.allow_native_sidecars=true、memory.embedding_provider='plugin:{$name}'、memory.embedding_model='{$model}' 和 memory.embedding_dimensions={$dimensions}。经你批准，随附技能可以应用这些设置。
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
 cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
@@ -709,6 +710,7 @@ cli-plugin-capabilities = 功能：{$v}
 cli-plugin-permissions = 权限：{$v}
 cli-plugin-wasm = WASM：{$path}
 cli-plugin-wasm-none = WASM：（仅技能插件）
+cli-plugin-wasm-not-required = WASM：（不需要）
 cli-estop-domains-none = {"  "}domain_blocks:  （无）
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    （无）

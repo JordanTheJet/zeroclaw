@@ -1323,7 +1323,7 @@ pub async fn run(
             match overrides.memory {
                 Some(m) => m,
                 None => {
-                    zeroclaw_memory::create_memory_for_agent(
+                    crate::create_memory_for_agent(
                         &config,
                         agent_alias,
                         agent_model_provider.and_then(|e| e.api_key.as_deref()),
@@ -1365,7 +1365,7 @@ pub async fn run(
         // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+                crate::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
@@ -2967,7 +2967,7 @@ pub async fn process_message(
             }
         };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
+        let mem: Arc<dyn Memory> = crate::create_memory_for_agent(
             &config,
             agent_alias,
             agent_model_provider
@@ -2989,7 +2989,7 @@ pub async fn process_message(
         // runtime behavior, matching the documented rollback path.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+                crate::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))

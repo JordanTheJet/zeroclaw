@@ -2084,14 +2084,14 @@ mod tests {
         };
 
         // Using the session alias ("ops") must succeed even with no "default" agent.
-        let mem = zeroclaw_memory::create_memory_for_agent(&config, "ops", None).await;
+        let mem = crate::create_memory_for_agent(&config, "ops", None).await;
         assert!(
             mem.is_ok(),
             "create_memory_for_agent with session alias should succeed"
         );
 
         // The old hardcoded "default" must fail — proving the fix is load-bearing.
-        let mem_default = zeroclaw_memory::create_memory_for_agent(&config, "default", None).await;
+        let mem_default = crate::create_memory_for_agent(&config, "default", None).await;
         assert!(
             mem_default.is_err(),
             "create_memory_for_agent(\"default\") must fail when agents.default is absent"

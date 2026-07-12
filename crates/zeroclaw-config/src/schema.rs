@@ -8121,6 +8121,13 @@ pub struct PluginsConfig {
     /// Enable the plugin system (default: false)
     #[serde(default)]
     pub enabled: bool,
+    /// Explicitly allow selected plugin bundles to launch native embedding
+    /// sidecars with the current user's host permissions.
+    #[serde(default)]
+    pub allow_native_sidecars: bool,
+    /// Maximum time to wait for a native embedding model to become ready.
+    #[serde(default = "default_native_sidecar_startup_timeout_secs")]
+    pub native_sidecar_startup_timeout_secs: u64,
     /// Directory where plugins are stored
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: String,
@@ -8187,6 +8194,10 @@ pub struct PluginSecurityConfig {
 
 fn default_signature_mode() -> String {
     "disabled".to_string()
+}
+
+fn default_native_sidecar_startup_timeout_secs() -> u64 {
+    300
 }
 
 impl Default for PluginSecurityConfig {
@@ -8261,6 +8272,8 @@ impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_native_sidecars: false,
+            native_sidecar_startup_timeout_secs: default_native_sidecar_startup_timeout_secs(),
             plugins_dir: default_plugins_dir(),
             auto_discover: false,
             max_plugins: default_max_plugins(),
@@ -10324,7 +10337,7 @@ pub struct MemoryConfig {
     /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
-    /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
+    /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.); `plugin:NAME` = an installed host-supervised local embedding provider (requires plugin support in the build).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
@@ -20092,6 +20105,13 @@ impl Config {
             }
         }
 
+        if self.plugins.native_sidecar_startup_timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.native_sidecar_startup_timeout_secs",
+                "plugins.native_sidecar_startup_timeout_secs must be greater than 0"
+            );
+        }
         if self.plugins.limits.call_fuel == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -22723,6 +22743,20 @@ enabled = true
             .expect_err("zero call_fuel must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_native_sidecar_startup_timeout() {
+        let mut config = Config::default();
+        config.plugins.native_sidecar_startup_timeout_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("zero native sidecar startup timeout must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.native_sidecar_startup_timeout_secs"),
             "error must name the offending path; got: {err}"
         );
     }

@@ -783,6 +783,7 @@ cli-plugin-no-description = (no description)
 cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
+cli-plugin-embedding-setup = Native embedding provider '{$name}' is installed (model '{$model}', {$dimensions} dimensions). After reviewing and trusting the bundle, set plugins.enabled=true, plugins.allow_native_sidecars=true, memory.embedding_provider='plugin:{$name}', memory.embedding_model='{$model}', and memory.embedding_dimensions={$dimensions}. Its bundled skill can apply these settings with your approval.
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
@@ -816,6 +817,7 @@ cli-plugin-capabilities = Capabilities: {$v}
 cli-plugin-permissions = Permissions: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (skill-only plugin)
+cli-plugin-wasm-not-required = WASM: (not required)
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
@@ -1035,4 +1037,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-

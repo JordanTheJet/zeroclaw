@@ -923,7 +923,7 @@ async fn resolve_memory_handle(
     let api_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+    zeroclaw_runtime::create_memory_for_agent(&config, alias, api_key.as_deref())
         .await
         .map_err(|e| {
             (

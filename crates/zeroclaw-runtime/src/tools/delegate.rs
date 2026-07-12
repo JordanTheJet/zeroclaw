@@ -755,7 +755,7 @@ impl DelegateTool {
         let api_key = config
             .resolved_model_provider_for_agent(agent_name)
             .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
-        zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
+        crate::create_memory_for_agent(config, agent_name, api_key)
             .await
             .map(Some)
     }

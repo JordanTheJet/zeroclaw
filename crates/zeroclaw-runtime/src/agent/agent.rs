@@ -1515,7 +1515,7 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
+        let memory: Arc<dyn Memory> = crate::create_memory_for_agent(
             config,
             agent_alias,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
@@ -1541,7 +1541,7 @@ impl Agent {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.sops_dir.is_some() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
-                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                    crate::create_memory_for_agent(config, agent_alias, None).await?;
                 let (engine, audit) =
                     crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
                 (Some(engine), Some(audit))

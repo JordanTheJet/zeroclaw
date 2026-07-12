@@ -682,6 +682,7 @@ cli-plugin-no-description = (aucune description)
 cli-plugin-install-resolving = Résolution de '{$source}' depuis le registre de plugins...
 cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
+cli-plugin-embedding-setup = Le fournisseur d'embeddings natif « {$name} » est installé (modèle « {$model} », {$dimensions} dimensions). Après vérification et approbation du paquet, définissez plugins.enabled=true, plugins.allow_native_sidecars=true, memory.embedding_provider='plugin:{$name}', memory.embedding_model='{$model}' et memory.embedding_dimensions={$dimensions}. La compétence incluse peut appliquer ces réglages avec votre accord.
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-seed-unaddressable = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : les noms de plugin contenant '.' ne peuvent pas être adressés par des chemins de configuration pointés (`config set` découpe sur '.'). Ajoutez manuellement un bloc [[plugins.entries]] avec `name = "{$name}"` au fichier de configuration.
@@ -713,6 +714,7 @@ cli-plugin-capabilities = Capacités : { $v }
 cli-plugin-permissions = Permissions : { $v }
 cli-plugin-wasm = WASM : { $path }
 cli-plugin-wasm-none = WASM : (plugin compétence uniquement)
+cli-plugin-wasm-not-required = WASM : (non requis)
 cli-estop-domains-none = {"  "}domain_blocks:  (aucun)
 cli-estop-domains = {"  "}domain_blocks:  { $v }
 cli-estop-tools-none = {"  "}tool_freeze:    (aucun)

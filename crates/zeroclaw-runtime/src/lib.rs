@@ -43,3 +43,8 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+#[cfg(feature = "plugins-wasm")]
+pub use zeroclaw_embedding_sidecar::create_memory_for_agent;
+#[cfg(not(feature = "plugins-wasm"))]
+pub use zeroclaw_memory::create_memory_for_agent;

@@ -2785,6 +2785,28 @@ fn plugin_host_with_configured_security(
     )
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn print_embedding_provider_setup(host: &zeroclaw::plugins::host::PluginHost, plugin_name: &str) {
+    let Some((manifest, _, _)) = host.embedding_provider_details(plugin_name) else {
+        return;
+    };
+    let Some(embedding) = manifest.embedding_provider.as_ref() else {
+        return;
+    };
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-embedding-setup",
+            &[
+                ("name", &manifest.name),
+                ("model", &embedding.model),
+                ("dimensions", &embedding.dimensions.to_string()),
+            ],
+            "Native embedding provider installed. Review the bundle, then explicitly opt in through plugin and memory configuration."
+        )
+    );
+}
+
 /// Seed an empty `[[plugins.entries]]` block named after a freshly installed
 /// plugin. `config set plugins.entries.<name>.config.<key>` routes through
 /// natural-key path resolution, which only matches entries already present in
@@ -4221,8 +4243,8 @@ async fn main() -> Result<()> {
                 // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory(
-                            &current_config.memory,
+                        Arc::from(crate::memory::create_configured_memory(
+                            &current_config,
                             &current_config.data_dir,
                             None,
                         )?);
@@ -4985,7 +5007,7 @@ async fn main() -> Result<()> {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-                        zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
+                        crate::memory::create_configured_memory(&config, &config.data_dir, None)?,
                     );
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
@@ -6272,6 +6294,7 @@ async fn main() -> Result<()> {
                         )
                     );
                     Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    print_embedding_provider_setup(&host, &name);
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6302,6 +6325,7 @@ async fn main() -> Result<()> {
                         )
                     );
                     Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    print_embedding_provider_setup(&host, &name);
                 }
                 Ok(())
             }
@@ -6348,6 +6372,9 @@ async fn main() -> Result<()> {
                                 "Permissions"
                             )
                         );
+                        let is_embedding_provider = info
+                            .capabilities
+                            .contains(&zeroclaw::plugins::PluginCapability::EmbeddingProvider);
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
@@ -6356,6 +6383,10 @@ async fn main() -> Result<()> {
                                     &[("path", &path.display().to_string())],
                                     "WASM"
                                 )
+                            ),
+                            None if is_embedding_provider => println!(
+                                "{}",
+                                t("cli-plugin-wasm-not-required", "WASM: (not required)")
                             ),
                             None => println!(
                                 "{}",

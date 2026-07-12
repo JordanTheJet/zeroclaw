@@ -583,14 +583,19 @@ pub async fn run(
         {
             None
         } else {
-            match zeroclaw_memory::create_memory_with_storage_and_routes(
+            #[cfg(feature = "plugins-wasm")]
+            let memory_result =
+                zeroclaw_embedding_sidecar::create_memory(&config, &config.data_dir, None);
+            #[cfg(not(feature = "plugins-wasm"))]
+            let memory_result = zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
                 &config.embedding_routes,
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
                 Some(&config.providers.models),
-            ) {
+            );
+            match memory_result {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
                     ::zeroclaw_log::record!(
@@ -1258,6 +1263,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         // (and dotted `model_provider` refs) resolve here exactly as on the
         // gateway/RPC paths — otherwise heartbeat recall would silently fall
         // back to keyword-only for hint-routed embeddings.
+        #[cfg(feature = "plugins-wasm")]
+        let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
+            zeroclaw_embedding_sidecar::create_memory(
+                &config,
+                &config.data_dir,
+                config
+                    .model_provider_for_agent(&agent_alias)
+                    .and_then(|entry| entry.api_key.as_deref()),
+            )
+            .ok();
+        #[cfg(not(feature = "plugins-wasm"))]
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
             zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
