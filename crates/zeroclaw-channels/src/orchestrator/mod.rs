@@ -6814,23 +6814,32 @@ pub fn bind_channel_identity_into(
     Ok(true)
 }
 
-/// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
-/// for the CLI entry point and its unit tests.
-fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
-    bind_channel_identity_into(config, "telegram", alias, identity)
-}
-
-pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str) -> Result<()> {
-    let normalized = normalize_telegram_identity(identity);
+/// Add `identity` to the allowlist for `<channel_type>.<alias>`, persist the
+/// config, and reload a managed daemon if one is running.
+///
+/// The async, side-effecting CLI entry point shared by `bind-telegram` /
+/// `bind-wechat` / `bind-line`; the pure alias routing lives in
+/// [`bind_channel_identity_into`].
+pub async fn bind_channel_identity(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Result<()> {
+    let normalized = channel_identity_normalizer(channel_type)
+        .map(|normalize| normalize(identity))
+        .unwrap_or_else(|| identity.trim().to_string());
     let mut updated = config.clone();
 
-    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
-        println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
+    if !bind_channel_identity_into(&mut updated, channel_type, alias, identity)? {
+        println!(
+            "✅ {channel_type} identity already bound to {channel_type}.{alias}: {normalized}"
+        );
         return Ok(());
     }
 
     updated.save().await?;
-    println!("✅ Bound Telegram identity {normalized} to telegram.{alias}");
+    println!("✅ Bound {channel_type} identity {normalized} to {channel_type}.{alias}");
     println!("   Saved to {}", updated.config_path.display());
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
@@ -6849,6 +6858,11 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str
         }
     }
     Ok(())
+}
+
+/// Telegram CLI entry point — delegates to the generic [`bind_channel_identity`].
+pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str) -> Result<()> {
+    bind_channel_identity(config, "telegram", alias, identity).await
 }
 
 fn maybe_restart_managed_daemon_service() -> Result<bool> {
@@ -24728,7 +24742,8 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_non_default_alias_is_resolvable() {
         let mut config = config_with_telegram_alias("alerts");
-        let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
+        let newly =
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").unwrap();
         assert!(newly, "first bind should report newly added");
         // The live resolver the channel uses must now see the identity.
         assert!(
@@ -24752,7 +24767,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_default_alias_unchanged() {
         let mut config = config_with_telegram_alias("default");
-        bind_telegram_identity_into(&mut config, "@zeroclaw_user", "default").unwrap();
+        bind_channel_identity_into(&mut config, "telegram", "default", "@zeroclaw_user").unwrap();
         let group = config
             .peer_groups
             .get("telegram_default")
@@ -24770,9 +24785,9 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_is_idempotent() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
+        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "123").unwrap());
         assert!(
-            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            !bind_channel_identity_into(&mut config, "telegram", "alerts", "123").unwrap(),
             "second bind of same identity should report already present"
         );
         assert_eq!(
@@ -24788,7 +24803,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_unconfigured_alias_bails() {
         let mut config = config_with_telegram_alias("default");
-        let err = bind_telegram_identity_into(&mut config, "123", "typoalias")
+        let err = bind_channel_identity_into(&mut config, "telegram", "typoalias", "123")
             .expect_err("unconfigured alias must bail");
         assert!(
             err.to_string().contains("typoalias"),
@@ -24848,6 +24863,66 @@ This is an example JSON object for profile settings."#;
         assert!(channel_identity_normalizer("telegram").is_some());
         assert!(channel_identity_normalizer("wechat").is_some());
         assert!(channel_identity_normalizer("line").is_some());
+    }
+
+    /// WeChat parity: the generic bind routes a WeChat id into
+    /// `wechat_<alias>` / `wechat.<alias>` (trim-normalized) so the running
+    /// channel resolves it — the `bind-wechat` CLI verb's core.
+    #[test]
+    fn bind_channel_into_wechat_alias_is_resolvable() {
+        let mut config = Config::default();
+        config.channels.wechat.insert(
+            "support".to_string(),
+            zeroclaw_config::schema::WeChatConfig::default(),
+        );
+        assert!(
+            bind_channel_identity_into(&mut config, "wechat", "support", " wx_user_1 ").unwrap()
+        );
+        assert!(
+            config
+                .channel_external_peers("wechat", "support")
+                .contains(&"wx_user_1".to_string()),
+            "bound WeChat id must resolve for the wechat.support channel"
+        );
+        assert_eq!(
+            config
+                .peer_groups
+                .get("wechat_support")
+                .expect("wechat bind must use the wechat_support group")
+                .channel
+                .as_str(),
+            "wechat.support"
+        );
+    }
+
+    /// LINE parity: same routing invariant for a LINE user id, plus the
+    /// phantom-alias guard applies to LINE too.
+    #[test]
+    fn bind_channel_into_line_alias_is_resolvable() {
+        let mut config = Config::default();
+        config.channels.line.insert(
+            "support".to_string(),
+            zeroclaw_config::schema::LineConfig::default(),
+        );
+        assert!(bind_channel_identity_into(&mut config, "line", "support", "U123abc").unwrap());
+        assert!(
+            config
+                .channel_external_peers("line", "support")
+                .contains(&"U123abc".to_string())
+        );
+        assert_eq!(
+            config
+                .peer_groups
+                .get("line_support")
+                .expect("line bind must use the line_support group")
+                .channel
+                .as_str(),
+            "line.support"
+        );
+        assert!(
+            bind_channel_identity_into(&mut config, "line", "typo", "U1").is_err(),
+            "an unconfigured LINE alias must bail"
+        );
     }
 
     #[cfg(feature = "channel-voice-call")]
