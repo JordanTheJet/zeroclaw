@@ -762,4 +762,37 @@ mod tests {
         // channels (aaa, zzz) before tools (redact)
         assert_eq!(ids, vec!["aaa", "zzz", "redact"]);
     }
+
+    #[test]
+    fn installed_seeds_include_every_declared_non_channel_kind() {
+        let dir = tempfile::tempdir().expect("temporary plugin root");
+        let plugin_dir = dir.path().join("plugins").join("multi-capability");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"").expect("placeholder component");
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "multi-capability"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool", "memory", "observer"]
+"#,
+        )
+        .expect("plugin manifest");
+
+        let host = PluginHost::new(dir.path()).expect("discover plugin");
+        let seeds = installed_seeds(&host, true, |_| false);
+
+        for kind in [
+            CapabilityKind::Tool,
+            CapabilityKind::Memory,
+            CapabilityKind::Observer,
+        ] {
+            assert!(
+                seeds.iter().any(|seed| seed.kind == kind && seed.enabled),
+                "missing enabled {kind:?} seed"
+            );
+        }
+        assert_eq!(seeds.len(), 3, "one seed per declared capability");
+    }
 }
