@@ -270,15 +270,15 @@ when the manifest grants `config_read`, and strips any caller-supplied
 section through its `configure` export under the same rule. `http_client`
 attaches an outbound `wasi:http` context to the plugin's store and links the
 `wasi:http` interface, so a granted plugin can make HTTP requests and one
-without the permission has no network surface at all. `socket_client` registers
-a socket connection registry on a channel plugin's store and links the `socket`
+without the permission has no `wasi:http` surface. `socket_client` registers a
+socket connection registry on a channel plugin's store and links the `socket`
 import, so a granted plugin can open host-mediated outbound raw TCP (+TLS)
 connections; without it the import is not linked and a guest that imports
-`socket` fails closed at instantiation. The remaining variants (`file_read`, `file_write`,
-`memory_read`, `memory_write`) are accepted by the manifest schema but are not
-yet wired to a host import: declaring them grants nothing on its own. They
-reserve the names for the host functions that will gate them (see Host imports
-below).
+`socket` fails closed at instantiation. The remaining variants (`file_read`,
+`file_write`, `memory_read`, `memory_write`) are accepted by the manifest schema
+but are not yet wired to a host import: declaring them grants nothing on its
+own. They reserve the names for the host functions that will gate them (see
+Host imports below).
 
 ## WIT interfaces
 
