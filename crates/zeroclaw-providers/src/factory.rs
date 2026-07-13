@@ -418,6 +418,7 @@ use zeroclaw_config::schema::{
     TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZeroRouterModelProviderConfig,
 };
 
 /// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
@@ -1515,6 +1516,54 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for ZeroRouterModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let base_url = api_url.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "family": "zerorouter",
+                        "alias": alias,
+                        "missing": "uri",
+                    })),
+                "factory: zerorouter provider missing uri"
+            );
+            anyhow::Error::msg(
+                "ZeroRouter model_provider requires `uri`: set \
+                 `[providers.models.zerorouter.<alias>] uri = \"https://your-router.example/v1\"` in config.toml.",
+            )
+        })?;
+        let mut provider = OpenAiCompatibleModelProvider::new(
+            alias,
+            "ZeroRouter",
+            base_url,
+            key,
+            AuthStyle::Bearer,
+        )
+        .with_public_model_listing();
+        if opts.native_tools == Some(false) {
+            provider = provider.without_native_tools();
+        }
+        if opts.merge_system_into_user {
+            provider = provider.with_merge_system_into_user();
+        }
+        // ZeroRouter's chat-completions schema rejects `reasoning_effort` as
+        // an unknown top-level field. Materialize a per-call options view so
+        // the operator's canonical runtime config remains untouched.
+        let mut compatible_options = opts.clone();
+        compatible_options.reasoning_effort = None;
+        Ok(apply_compat_options(provider, &compatible_options))
+    }
+}
+
 impl FamilyProviderFactory for CustomModelProviderConfig {
     fn create_provider(
         &self,
@@ -1879,6 +1928,182 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn zerorouter_factory_requires_uri_and_defaults_to_native_tools() {
+        let cfg = ZeroRouterModelProviderConfig::default();
+        let error = match cfg.create_provider(
+            "default",
+            Some("test-router-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("zerorouter must reject a missing deployment URI"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires `uri`"));
+
+        let provider = cfg
+            .create_provider(
+                "default",
+                Some("test-router-key"),
+                Some("https://router.example.test/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("zerorouter provider should build with a URI");
+        assert!(provider.supports_native_tools());
+        assert!(!provider.supports_vision());
+
+        let no_native_tools = cfg
+            .create_provider(
+                "default",
+                Some("test-router-key"),
+                Some("https://router.example.test/v1"),
+                &ModelProviderRuntimeOptions {
+                    native_tools: Some(false),
+                    ..Default::default()
+                },
+            )
+            .expect("zerorouter provider should honor native-tools override");
+        assert!(!no_native_tools.supports_native_tools());
+    }
+
+    #[tokio::test]
+    async fn zerorouter_factory_uses_unauthenticated_models_and_bearer_chat_transport() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, Uri},
+            routing::{get, post},
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Vec<(String, Option<String>, Option<Value>)>>>;
+
+        fn capture_request(capture: &Capture, uri: &Uri, headers: &HeaderMap, body: Option<Value>) {
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            capture.lock().expect("capture lock poisoned").push((
+                uri.path().to_string(),
+                authorization,
+                body,
+            ));
+        }
+
+        async fn models(
+            State(capture): State<Capture>,
+            uri: Uri,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            capture_request(&capture, &uri, &headers, None);
+            Json(json!({"data": [{"id": "router-test-model"}]}))
+        }
+
+        async fn chat(
+            State(capture): State<Capture>,
+            uri: Uri,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture_request(&capture, &uri, &headers, Some(body));
+            Json(json!({
+                "choices": [{"message": {"content": "routed"}}]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/models", get(models))
+            .route("/v1/chat/completions", post(chat))
+            .with_state(Arc::clone(&capture));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}/v1");
+        let cfg = ZeroRouterModelProviderConfig::default();
+        let public_provider = cfg
+            .create_provider(
+                "public",
+                None,
+                Some(&base_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("public zerorouter provider should build");
+        assert_eq!(
+            public_provider
+                .list_models()
+                .await
+                .expect("public model listing should succeed"),
+            vec!["router-test-model".to_string()]
+        );
+
+        let authenticated_provider = cfg
+            .create_provider(
+                "authenticated",
+                Some("test-router-key"),
+                Some(&base_url),
+                &ModelProviderRuntimeOptions {
+                    reasoning_effort: Some("high".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("authenticated zerorouter provider should build");
+        let response = authenticated_provider
+            .chat_with_tools(
+                &[crate::traits::ChatMessage::user("hello")],
+                &[json!({
+                    "type": "function",
+                    "function": {
+                        "name": "backend_health",
+                        "description": "Check backend health",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                "gpt-5-router-test",
+                Some(0.1),
+            )
+            .await
+            .expect("zerorouter native-tools chat should succeed");
+        assert_eq!(response.text.as_deref(), Some("routed"));
+
+        let requests = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], ("/v1/models".to_string(), None, None));
+        assert_eq!(requests[1].0, "/v1/chat/completions");
+        assert_eq!(requests[1].1.as_deref(), Some("Bearer test-router-key"));
+        let chat_body = requests[1]
+            .2
+            .as_ref()
+            .expect("chat request body should be captured");
+        assert_eq!(
+            chat_body.get("model").and_then(Value::as_str),
+            Some("gpt-5-router-test")
+        );
+        assert!(
+            chat_body.get("reasoning_effort").is_none(),
+            "ZeroRouter rejects reasoning_effort as an unknown request field"
+        );
+        assert_eq!(
+            chat_body.get("tool_choice").and_then(Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            chat_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        server.abort();
     }
 
     #[test]

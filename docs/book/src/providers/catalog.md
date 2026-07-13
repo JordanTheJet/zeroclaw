@@ -76,8 +76,8 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 Every canonical slot, its default endpoint, whether it runs locally, and its
 full config field set, generated from the provider registry and the config
 schema. Click a slot to expand its fields; click a field to see how to set it.
-Slots with no fixed default need `uri` set on the alias entry (Azure, `custom`,
-multi-region families, CLI shims).
+Slots with no fixed default need `uri` set on the alias entry (Azure,
+`zerorouter`, `custom`, multi-region families, CLI shims).
 
 {{#model-provider-fields}}
 

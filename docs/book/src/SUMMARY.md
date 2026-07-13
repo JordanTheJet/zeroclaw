@@ -64,6 +64,7 @@
   - [History management](./agents/history-management.md)
 - [Model Providers](./providers/overview.md)
   - [Provider catalog](./providers/catalog.md)
+  - [ZeroRouter](./providers/zerorouter.md)
   - [Configuration](./providers/configuration.md)
   - [Streaming](./providers/streaming.md)
   - [Routing](./providers/routing.md)

@@ -65,6 +65,7 @@ pub use schema::{
     SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZeroRouterModelProviderConfig,
 };
 pub use traits::HasPropKind;
 pub use traits::PropFieldInfo;

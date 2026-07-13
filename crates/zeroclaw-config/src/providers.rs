@@ -28,6 +28,7 @@ use super::schema::{
     TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZeroRouterModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -255,6 +256,7 @@ macro_rules! for_each_model_provider_slot {
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),
             (kilo, "kilo", KiloModelProviderConfig),
+            (zerorouter, "zerorouter", ZeroRouterModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -727,6 +729,27 @@ impl TranscriptionProviders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zerorouter_slot_round_trips_operator_owned_connection_fields() {
+        let raw = r#"
+[zerorouter.edge]
+uri = "https://router.example.test/v1"
+model = "router-test-model"
+"#;
+        let providers: ModelProviders = toml::from_str(raw).expect("zerorouter config should load");
+        let entry = providers
+            .find("zerorouter", "edge")
+            .expect("zerorouter.edge should resolve through the canonical slot");
+        assert_eq!(entry.uri.as_deref(), Some("https://router.example.test/v1"));
+        assert_eq!(entry.model.as_deref(), Some("router-test-model"));
+        assert_eq!(providers.resolved_endpoint_uri("zerorouter", "edge"), None);
+        assert!(ModelProviders::slot_names().contains(&"zerorouter"));
+
+        let serialized = toml::to_string(&providers).expect("zerorouter config should save");
+        assert!(serialized.contains("[zerorouter.edge]"));
+        assert!(serialized.contains("uri = \"https://router.example.test/v1\""));
+    }
 
     #[test]
     fn transcription_iter_entries_walks_every_typed_slot() {

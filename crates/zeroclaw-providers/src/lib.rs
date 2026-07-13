@@ -1946,6 +1946,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("arcee", "Arcee AI", false),
             ("lambda_ai", "Lambda AI", false),
             ("inception", "Inception Labs (Mercury)", false),
+            ("zerorouter", "ZeroRouter", false),
             ("custom", "Custom (OpenAI-compatible)", false),
         ],
     );
@@ -3012,6 +3013,11 @@ mod tests {
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
         );
+        assert_eq!(
+            default_model_provider_url("zerorouter"),
+            None,
+            "ZeroRouter deployment URIs are operator-owned"
+        );
     }
 
     // ── Custom / BYOP model model_provider ─────────────────────────
@@ -3209,8 +3215,9 @@ mod tests {
         // Canonical family names only — legacy synonyms are collapsed by
         // `normalize_model_provider_type` in `schema/v2.rs` and never reach
         // the runtime. `azure` is excluded (typed-config required, see
-        // `listed_model_providers_are_constructible` skip list); `custom` is
-        // excluded (URI required, covered by `factory_custom_*` tests).
+        // `listed_model_providers_are_constructible` skip list); `custom` and
+        // `zerorouter` are excluded (URI required, covered by dedicated
+        // factory tests).
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3307,9 +3314,9 @@ mod tests {
             if model_provider.name == "azure" {
                 continue;
             }
-            // The custom slot requires a uri (no family-default endpoint);
-            // covered by dedicated factory tests.
-            if model_provider.name == "custom" {
+            // These slots require a uri (no family-default endpoint); covered
+            // by dedicated factory tests.
+            if matches!(model_provider.name, "custom" | "zerorouter") {
                 continue;
             }
             assert!(

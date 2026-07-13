@@ -1224,6 +1224,20 @@ pub struct OpenRouterModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── ZeroRouter (operator-deployed endpoint) ──
+
+/// ZeroRouter's OpenAI-compatible API. Deployments own their endpoint, so
+/// operators must set `base.uri`; model IDs are discovered from that
+/// deployment's public `/models` endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zerorouter"]
+pub struct ZeroRouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Ollama (local-default endpoint) ──
 
 #[derive(
@@ -3267,6 +3281,7 @@ impl_default_family_endpoint! {
     SyntheticModelProviderConfig,
     OpencodeModelProviderConfig,
     KiloCliModelProviderConfig,
+    ZeroRouterModelProviderConfig,
     CustomModelProviderConfig,
     BedrockModelProviderConfig,
 }
