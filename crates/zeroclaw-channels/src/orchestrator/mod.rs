@@ -6781,10 +6781,11 @@ pub fn bind_channel_identity_into(
     // reads (it resolves authorization per the alias the channel actually
     // runs under), so fail loudly instead of silently authorizing nobody.
     if !channel_alias_configured(config, channel_type, alias) {
+        // Credential fields differ by channel, so keep the guidance neutral.
         anyhow::bail!(
-            "{channel_type} channel alias `{alias}` is not configured. Run \
-             `zeroclaw config set channels.{channel_type}.{alias}.bot-token=<token>` first \
-             (see docs/book/src/channels/overview.md for the full field list)."
+            "{channel_type} channel alias `{alias}` is not configured. Configure the \
+             [channels.{channel_type}.{alias}] section first \
+             (see docs/book/src/channels/overview.md for its required fields)."
         );
     }
 
