@@ -24,9 +24,11 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
         "macOS desktop release must restore web-dist at the embedded-web source path"
     );
     assert!(
-        macos_job
-            .contains("prepare-kernel.sh --target universal-apple-darwin --features embedded-web"),
-        "macOS desktop kernel must enable the existing embedded-web Cargo feature"
+        workflow.contains("  MACOS_DESKTOP_FEATURES: embedded-web")
+            && macos_job.contains(
+                "prepare-kernel.sh --target universal-apple-darwin --features \"$MACOS_DESKTOP_FEATURES\""
+            ),
+        "macOS desktop kernel must use the canonical feature selection"
     );
     let stage_position = macos_job
         .find("- name: Stage bundled kernel sidecar (universal)")
