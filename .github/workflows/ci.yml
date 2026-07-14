@@ -404,10 +404,11 @@ jobs:
       - name: Check
         if: steps.changed.outputs.run == 'true'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
-      - name: Run channel plugin component test
+      - name: Run channel plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: |
           cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+          cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test ws_client_e2e
           cargo test --locked --features plugins-wasm-cranelift --test integration channel_plugin_shadow -- --nocapture
 
   check-32bit:
