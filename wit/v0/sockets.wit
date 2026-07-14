@@ -18,10 +18,12 @@ package zeroclaw:plugin@0.1.0;
 /// Gated by the `socket_client` permission: a plugin without it never gets a
 /// connection registry, the import is not linked, and a guest that imports this
 /// interface fails closed at instantiation.
-@unstable(feature = plugins-wit-v0-sockets)
+///
+/// The feature annotation lives on the `channel-plugin` world import. Keeping
+/// this definition visible avoids a `wit-parser` feature-remapping failure when
+/// another transport feature is enabled without sockets.
 interface socket {
     /// One event drained from a live connection by `tcp-receive`.
-    @unstable(feature = plugins-wit-v0-sockets)
     variant socket-event {
         /// A chunk of received bytes. Raw TCP has no framing: chunk boundaries
         /// are arbitrary, and the plugin must reassemble its own protocol units.

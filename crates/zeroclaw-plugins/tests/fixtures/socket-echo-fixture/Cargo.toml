@@ -16,6 +16,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+core-wit-parse = []
+
 [dependencies]
 wit-bindgen = "0.46"
 

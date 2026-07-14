@@ -41,6 +41,25 @@ fn fixture() -> PathBuf {
             let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/socket-echo-fixture");
             let target_dir = fixture_dir.join("target");
+            let core_only_status = Command::new(env!("CARGO"))
+                .current_dir(&fixture_dir)
+                .args([
+                    "check",
+                    "--locked",
+                    "--quiet",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--features",
+                    "core-wit-parse",
+                    "--target-dir",
+                ])
+                .arg(&target_dir)
+                .status()
+                .expect("run cargo to parse the core-only channel world");
+            assert!(
+                core_only_status.success(),
+                "optional socket annotations must not break core-only channel bindings"
+            );
             let status = Command::new(env!("CARGO"))
                 .current_dir(&fixture_dir)
                 .args([

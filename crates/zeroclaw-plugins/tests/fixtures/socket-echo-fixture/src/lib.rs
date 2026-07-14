@@ -13,7 +13,19 @@
 //! The host E2E tests build this source on demand with the checked-in lockfile.
 //! Manual build: `cargo build --locked --target wasm32-wasip2`.
 
-#[cfg(target_family = "wasm")]
+// Parse the same world with only the core feature. This catches feature
+// annotations inside optional transport interfaces that would otherwise make
+// unrelated channel components fail before code generation.
+#[cfg(all(target_family = "wasm", feature = "core-wit-parse"))]
+mod core_only_wit_parse {
+    wit_bindgen::generate!({
+        path: "../../../../../wit/v0",
+        world: "channel-plugin",
+        features: ["plugins-wit-v0"],
+    });
+}
+
+#[cfg(all(target_family = "wasm", not(feature = "core-wit-parse")))]
 mod component {
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
