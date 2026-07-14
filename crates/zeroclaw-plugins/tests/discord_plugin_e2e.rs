@@ -25,6 +25,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +36,7 @@ use zeroclaw_api::channel::Channel;
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::ws::{WsEgressException, WsEgressPolicy};
 
 fn fixture() -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discord-plugin.wasm");
@@ -48,6 +50,16 @@ fn test_limits() -> PluginLimits {
         max_table_elements: 100_000,
         max_instances: 64,
     }
+}
+
+fn loopback_test_policy() -> WsEgressPolicy {
+    Arc::new(|host, exception| {
+        host == "127.0.0.1"
+            && matches!(
+                exception,
+                WsEgressException::Plaintext | WsEgressException::PrivateNetwork
+            )
+    })
 }
 
 /// A minimal in-process Discord Gateway: on each connection it sends Hello,
@@ -130,7 +142,7 @@ async fn discord_plugin_delivers_a_gateway_message() {
 
     // Mirror the built-in `discord` id; the plugin needs HttpClient (it imports
     // wasi:http via waki) + WebSocketClient (the Gateway) + ConfigRead.
-    let channel = WasmChannel::from_wasm_mirror(
+    let channel = WasmChannel::from_wasm_mirror_with_ws_egress_policy(
         "discord",
         "main",
         &wasm,
@@ -141,6 +153,7 @@ async fn discord_plugin_delivers_a_gateway_message() {
         ],
         &config,
         test_limits(),
+        loopback_test_policy(),
     )
     .await
     .expect("discord plugin instantiates with ws-client + wasi:http granted");

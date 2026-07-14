@@ -47,8 +47,9 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only for
-  a plugin whose manifest grants `http_client`.
+  more. Outbound HTTP and host-mediated WebSockets are the network surfaces that
+  can be opened, and only for manifests granting `http_client` or
+  `websocket_client`, respectively.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -57,16 +58,19 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, config injection, `http_client`, and host-fed inbound are wired.**
+- **`logging`, config injection, `http_client`, `websocket_client`, and host-fed inbound are wired.**
   Of the permissions a manifest can declare, `config_read` injects the plugin's
   own config section, and `http_client` attaches an outbound `wasi:http` surface
-  so the plugin can make HTTP requests. Filesystem and memory-access permissions
-  are still accepted by the manifest schema but inert: their host functions are
-  not yet registered in the linker. See Permissions and Host imports below.
+  so the plugin can make HTTP requests. `websocket_client` exposes only the
+  bounded, SSRF-guarded `ws-client` import. Filesystem and memory-access
+  permissions are still accepted by the manifest schema but inert: their host
+  functions are not yet registered in the linker. See Permissions and Host
+  imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
-  nothing else; it cannot listen. Channel plugins that must receive inbound
+  through ambient WASI. A `http_client` plugin gets outbound `wasi:http`; a
+  `websocket_client` channel plugin gets the host-mediated `ws-client` import.
+  Neither permission grants a listener. Channel plugins that must receive inbound
   traffic do not open a listener themselves: the host runs the listener and
   feeds messages through the `inbound` import, which the plugin drains from its
   `poll-message` export.
@@ -296,14 +300,17 @@ contains or copies the authorized identities themselves.
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read` and `http_client` have behavioral effect. `runtime.rs` passes a
+`config_read`, `http_client`, and `websocket_client` have behavioral effect.
+`runtime.rs` passes a
 tool plugin's resolved config section into `execute` only when the manifest
 grants `config_read`, and strips any caller-supplied `__config` so the section
 cannot be spoofed; a channel plugin receives the same section through its
 `configure` export under the same rule. `http_client` attaches an outbound
 `wasi:http` context to the plugin's store and links the `wasi:http` interface,
-so a granted plugin can make HTTP requests and one without the permission has no
-network surface at all. The remaining variants (`file_read`, `file_write`,
+so a granted plugin can make HTTP requests. `websocket_client` attaches the
+host-owned `ws-client` registry only to channel stores and links its import only
+for the same permission; a component importing it without the permission fails
+at instantiation. The remaining variants (`file_read`, `file_write`,
 `memory_read`, `memory_write`) are accepted by the manifest schema but are not
 yet wired to a host import: declaring them grants nothing on its own. They
 reserve the names for the host functions that will gate them (see Host imports
@@ -382,6 +389,24 @@ permissions remain inert: the host functions that would gate them are not yet
 wired into the linker. A plugin's ambient authority is the WASI context (no
 preopens, no ambient network) plus exactly the host imports its world and
 permissions wire in.
+
+### `ws-client`
+
+`wit/v0/ws-client.wit` is an unstable, channel-only host import for persistent
+duplex protocols such as Discord Gateway and Slack Socket Mode. The default
+egress policy accepts only public `wss://` destinations. Resolution is performed
+once, every answer is checked for non-global and metadata addresses, and the TCP
+dial is pinned to that validated set to close DNS-rebinding races. Plaintext or
+private destinations require an explicit host operator-policy exception; a guest
+cannot request or encode that exception in its URL or headers.
+
+The host bounds each store to 16 live handles and each resolution/dial/handshake
+to 30 seconds. Upgrade headers are limited to 32 entries and 16 KiB total.
+Inbound and outbound text messages are limited to 1 MiB, inbound frames to
+256 KiB, inbound queued payloads to 4 MiB/1,024 frames, and outbound queued
+payloads to 2 MiB/256 frames. After buffered text is drained, the terminal
+`closed` event consumes the handle, stops both pumps, and releases connection
+capacity; explicit `ws-close` remains idempotent.
 
 ### `inbound`
 

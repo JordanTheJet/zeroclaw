@@ -76,6 +76,7 @@ struct ChannelInstanceFactory {
     component: Arc<Component>,
     permissions: Arc<[PluginPermission]>,
     runtime: ChannelRuntimeResolver,
+    ws_egress_policy: crate::ws::WsEgressPolicy,
 }
 
 impl ChannelInstanceFactory {
@@ -84,8 +85,12 @@ impl ChannelInstanceFactory {
         inbound: InboundQueue,
     ) -> Result<(Store<PluginState>, ChannelPlugin)> {
         let (config_json, limits) = (self.runtime)()?;
-        let mut store =
-            crate::component::new_store_with_inbound(self.permissions.as_ref(), inbound, limits);
+        let mut store = crate::component::new_store_with_inbound_and_ws_policy(
+            self.permissions.as_ref(),
+            inbound,
+            limits,
+            Arc::clone(&self.ws_egress_policy),
+        );
         let http = store.data().http_enabled();
         let websocket = store.data().websocket_enabled();
         let linker = build_linker(http, websocket)?;
@@ -200,7 +205,8 @@ impl WasmChannel {
     /// Compile and instantiate one channel plugin from digest-bound bytes.
     /// `channel_ref` is the host-owned routing identity. `runtime` resolves the
     /// current permission-filtered config and execution limits whenever a warm
-    /// or disposable instance is configured.
+    /// or disposable instance is configured. `ws_egress_policy` resolves
+    /// operator exceptions at each dial instead of caching allowlist state.
     async fn instantiate(
         channel_ref: String,
         wasm_path: &Path,
@@ -208,11 +214,13 @@ impl WasmChannel {
         permissions: &[PluginPermission],
         runtime: ChannelRuntimeResolver,
         authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
     ) -> Result<Self> {
         let factory = ChannelInstanceFactory {
             component: Arc::new(load_component_with_digest(wasm_path, expected_sha256)?),
             permissions: Arc::from(permissions),
             runtime,
+            ws_egress_policy,
         };
         let inbound = InboundQueue::default();
         let (mut store, bindings) = factory.instantiate(inbound.clone()).await?;
@@ -380,6 +388,29 @@ impl WasmChannel {
         runtime: ChannelRuntimeResolver,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
+        Self::from_wasm_with_runtime_resolver_and_digest_and_ws_egress_policy(
+            plugin_name,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            runtime,
+            authorizer,
+            crate::ws::deny_ws_egress_exceptions(),
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel with live runtime and WebSocket policy
+    /// resolvers while binding the executable to its verified digest.
+    pub async fn from_wasm_with_runtime_resolver_and_digest_and_ws_egress_policy(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+    ) -> Result<Self> {
         let plugin_name = plugin_name.into();
         let channel_ref = zeroclaw_api::channel::plugin_channel_ref(&plugin_name);
         Self::instantiate(
@@ -389,6 +420,7 @@ impl WasmChannel {
             permissions,
             runtime,
             authorizer,
+            ws_egress_policy,
         )
         .await
     }
@@ -412,6 +444,31 @@ impl WasmChannel {
             config_json,
             limits,
             authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel with a live host resolver for explicit
+    /// WebSocket egress exceptions. The standard constructor remains public
+    /// `wss://` only.
+    pub async fn from_wasm_with_ws_egress_policy(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+    ) -> Result<Self> {
+        let config_json = resolve_configure_json(config, permissions);
+        Self::from_wasm_with_runtime_resolver_and_digest_and_ws_egress_policy(
+            plugin_name,
+            wasm_path,
+            None,
+            permissions,
+            fixed_runtime_resolver(config_json, limits),
+            authorizer,
+            ws_egress_policy,
         )
         .await
     }
@@ -480,6 +537,31 @@ impl WasmChannel {
         runtime: ChannelRuntimeResolver,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
+        Self::from_wasm_mirror_with_runtime_resolver_and_digest_and_ws_egress_policy(
+            channel_type,
+            alias,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            runtime,
+            authorizer,
+            crate::ws::deny_ws_egress_exceptions(),
+        )
+        .await
+    }
+
+    /// Instantiate a mirrored channel with live runtime and WebSocket policy
+    /// resolvers while binding the executable to its verified digest.
+    pub async fn from_wasm_mirror_with_runtime_resolver_and_digest_and_ws_egress_policy(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+    ) -> Result<Self> {
         let channel_type = channel_type.into();
         let alias = alias.into();
         Self::instantiate(
@@ -489,6 +571,38 @@ impl WasmChannel {
             permissions,
             runtime,
             authorizer,
+            ws_egress_policy,
+        )
+        .await
+    }
+
+    /// Instantiate a mirror channel with a live host resolver for explicit
+    /// WebSocket egress exceptions. The standard constructor remains public
+    /// `wss://` only.
+    pub async fn from_wasm_mirror_with_ws_egress_policy(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config_json: &str,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+    ) -> Result<Self> {
+        let config_json = if permissions.contains(&PluginPermission::ConfigRead) {
+            config_json.to_string()
+        } else {
+            "{}".to_string()
+        };
+        Self::from_wasm_mirror_with_runtime_resolver_and_digest_and_ws_egress_policy(
+            channel_type,
+            alias,
+            wasm_path,
+            None,
+            permissions,
+            fixed_runtime_resolver(config_json, limits),
+            authorizer,
+            ws_egress_policy,
         )
         .await
     }

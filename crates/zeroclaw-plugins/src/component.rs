@@ -15,7 +15,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
-use crate::ws::WsRegistry;
+use crate::ws::{WsEgressPolicy, WsRegistry, deny_ws_egress_exceptions};
 
 /// A host-owned queue of inbound messages destined for a channel plugin.
 ///
@@ -128,11 +128,11 @@ pub struct PluginState {
 
 impl PluginState {
     /// Build store state for a plugin holding `permissions` under `limits`.
-    /// `HttpClient` is the only permission that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Every other permission resolves elsewhere (config jail, memory bridge)
-    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
-    /// the memory/table/instance ceilings the store limiter enforces.
+    /// `HttpClient` attaches gated `wasi:http`; `WebSocketClient` attaches the
+    /// separately gated, destination-checked `ws-client` registry. Every other
+    /// permission resolves elsewhere (config jail, memory bridge) and leaves
+    /// the WASI sandbox closed. `limits` sets the per-call fuel and the
+    /// memory/table/instance ceilings the store limiter enforces.
     pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
         Self::with_inbound(permissions, InboundQueue::default(), limits)
     }
@@ -145,12 +145,24 @@ impl PluginState {
         inbound: InboundQueue,
         limits: PluginLimits,
     ) -> Self {
+        Self::with_inbound_and_ws_policy(permissions, inbound, limits, deny_ws_egress_exceptions())
+    }
+
+    /// Build channel store state with a live host resolver for WebSocket egress
+    /// exceptions. The resolver is consulted per dial and carries no copied
+    /// allowlist state; stores without `WebSocketClient` discard it.
+    pub fn with_inbound_and_ws_policy(
+        permissions: &[PluginPermission],
+        inbound: InboundQueue,
+        limits: PluginLimits,
+        ws_egress_policy: WsEgressPolicy,
+    ) -> Self {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
         let websocket = permissions
             .contains(&PluginPermission::WebSocketClient)
-            .then(WsRegistry::new);
+            .then(|| WsRegistry::with_egress_policy(ws_egress_policy));
         Self {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
@@ -293,7 +305,19 @@ pub fn new_store_with_inbound(
     inbound: InboundQueue,
     limits: PluginLimits,
 ) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+    new_store_with_inbound_and_ws_policy(permissions, inbound, limits, deny_ws_egress_exceptions())
+}
+
+/// Like [`new_store_with_inbound`], with a live host resolver for explicit
+/// WebSocket private-network or plaintext exceptions.
+pub fn new_store_with_inbound_and_ws_policy(
+    permissions: &[PluginPermission],
+    inbound: InboundQueue,
+    limits: PluginLimits,
+    ws_egress_policy: WsEgressPolicy,
+) -> Store<PluginState> {
+    let state =
+        PluginState::with_inbound_and_ws_policy(permissions, inbound, limits, ws_egress_policy);
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
     set_call_fuel(&mut store, limits.call_fuel);

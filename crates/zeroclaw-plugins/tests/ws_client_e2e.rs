@@ -8,23 +8,17 @@
 //! protocol, and that the capability is permission-gated: without
 //! `WebSocketClient` the import is not linked and the component fails closed.
 //!
-//! The component is provisioned out of band as a build artifact (never
-//! committed), same as the other channel/tool fixtures:
-//!
-//! ```text
-//! cd crates/zeroclaw-plugins/tests/fixtures/ws-echo-fixture
-//! cargo build --target wasm32-wasip2 --release
-//! cp target/wasm32-wasip2/release/ws_echo_fixture.wasm ../ws-echo-fixture.wasm
-//! ```
-//!
-//! When the fixture is absent these tests skip, so they never fail a checkout
-//! that did not build it.
+//! The test builds the checked-in fixture source for `wasm32-wasip2` before it
+//! runs. Missing target support or a fixture compile failure is a test failure,
+//! so this guest boundary can no longer disappear from a green run.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -34,11 +28,41 @@ use zeroclaw_api::channel::Channel;
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::ws::{WsEgressException, WsEgressPolicy};
 
-fn fixture() -> Option<PathBuf> {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws-echo-fixture.wasm");
-    path.exists().then_some(path)
+fn fixture() -> PathBuf {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws-echo-fixture");
+    let status = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--locked",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+        ])
+        .current_dir(&fixture_dir)
+        .status()
+        .expect("start mandatory ws-echo fixture build");
+    assert!(status.success(), "mandatory ws-echo fixture must build");
+
+    let path = fixture_dir.join("target/wasm32-wasip2/release/ws_echo_fixture.wasm");
+    assert!(
+        path.is_file(),
+        "fixture build did not produce {}",
+        path.display()
+    );
+    path
+}
+
+fn loopback_test_policy() -> WsEgressPolicy {
+    Arc::new(|host, exception| {
+        host == "127.0.0.1"
+            && matches!(
+                exception,
+                WsEgressException::Plaintext | WsEgressException::PrivateNetwork
+            )
+    })
 }
 
 fn test_limits() -> PluginLimits {
@@ -85,17 +109,14 @@ async fn start_echo_server() -> SocketAddr {
 
 #[tokio::test]
 async fn ws_client_round_trips_a_text_frame() {
-    let Some(wasm) = fixture() else {
-        eprintln!("ws-echo-fixture.wasm absent; skipping (build it per the module docs).");
-        return;
-    };
+    let wasm = fixture();
 
     let addr = start_echo_server().await;
     let mut config = HashMap::new();
     config.insert("url".to_string(), format!("ws://{addr}"));
 
     // ConfigRead delivers the URL; WebSocketClient links the `ws-client` import.
-    let channel = WasmChannel::from_wasm(
+    let channel = WasmChannel::from_wasm_with_ws_egress_policy(
         "ws-echo-channel",
         &wasm,
         &[
@@ -104,6 +125,7 @@ async fn ws_client_round_trips_a_text_frame() {
         ],
         &config,
         test_limits(),
+        loopback_test_policy(),
     )
     .await
     .expect("ws channel plugin instantiates with WebSocketClient granted");
@@ -124,9 +146,7 @@ async fn ws_client_round_trips_a_text_frame() {
 
 #[tokio::test]
 async fn ws_plugin_without_permission_fails_closed() {
-    let Some(wasm) = fixture() else {
-        return;
-    };
+    let wasm = fixture();
 
     // No WebSocketClient → the `ws-client` import is not linked. A component that
     // imports it must fail to instantiate rather than silently run without a

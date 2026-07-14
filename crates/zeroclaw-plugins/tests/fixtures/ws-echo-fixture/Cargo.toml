@@ -2,10 +2,9 @@
 # NOT part of the host workspace. Proves the host `ws-client` capability: the
 # plugin dials a host-mediated WebSocket, sends a frame, and reads the echo.
 #
-# Build:  rustup target add wasm32-wasip2
-#         cargo build --target wasm32-wasip2 --release
-# then copy target/wasm32-wasip2/release/ws_echo_fixture.wasm to
-# crates/zeroclaw-plugins/tests/fixtures/ws-echo-fixture.wasm
+# `tests/ws_client_e2e.rs` builds this crate in place with `--locked` and consumes
+# `target/wasm32-wasip2/release/ws_echo_fixture.wasm` directly. Missing target
+# support or a failed build is a test failure.
 [package]
 name = "ws-echo-fixture"
 version = "0.1.0"
