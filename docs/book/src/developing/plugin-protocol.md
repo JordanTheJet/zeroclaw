@@ -400,6 +400,19 @@ dial is pinned to that validated set to close DNS-rebinding races. Plaintext or
 private destinations require an explicit host operator-policy exception; a guest
 cannot request or encode that exception in its URL or headers.
 
+Operators grant exceptions as exact hosts under `[plugins.security]`:
+
+```toml
+[plugins.security]
+websocket_allowed_private_hosts = ["gateway.internal", "127.0.0.1"]
+websocket_allowed_plaintext_hosts = ["127.0.0.1"]
+```
+
+Entries are case-insensitive exact hostname or IP matches; they do not include a
+scheme, port, path, or wildcard. A private `ws://` target must appear in both
+lists. The host rereads canonical config for every dial, so a policy update does
+not leave a stale allowlist in an existing plugin store.
+
 The host bounds each store to 16 live handles and each resolution/dial/handshake
 to 30 seconds. Upgrade headers are limited to 32 entries and 16 KiB total.
 Inbound and outbound text messages are limited to 1 MiB, inbound frames to

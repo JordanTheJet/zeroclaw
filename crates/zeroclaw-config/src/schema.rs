@@ -8258,6 +8258,15 @@ pub struct PluginSecurityConfig {
     /// Hex-encoded Ed25519 public keys of trusted plugin publishers.
     #[serde(default)]
     pub trusted_publisher_keys: Vec<String>,
+    /// Exact hosts that WebSocket-enabled plugins may reach when DNS resolves
+    /// them to loopback, private, link-local, or otherwise non-global addresses.
+    #[serde(default)]
+    pub websocket_allowed_private_hosts: Vec<String>,
+    /// Exact hosts that WebSocket-enabled plugins may reach over plaintext
+    /// `ws://`. Private plaintext destinations must also be present in
+    /// `websocket_allowed_private_hosts`.
+    #[serde(default)]
+    pub websocket_allowed_plaintext_hosts: Vec<String>,
 }
 
 fn default_signature_mode() -> String {
@@ -8269,6 +8278,8 @@ impl Default for PluginSecurityConfig {
         Self {
             signature_mode: default_signature_mode(),
             trusted_publisher_keys: Vec::new(),
+            websocket_allowed_private_hosts: Vec::new(),
+            websocket_allowed_plaintext_hosts: Vec::new(),
         }
     }
 }
@@ -21806,6 +21817,26 @@ max_height = 8
         assert!(sd.get("api_key").is_none());
 
         assert!(plugins.entry_config("unknown").is_none());
+    }
+
+    #[test]
+    async fn plugin_websocket_egress_exceptions_default_closed_and_deserialize() {
+        let defaults = super::PluginSecurityConfig::default();
+        assert!(defaults.websocket_allowed_private_hosts.is_empty());
+        assert!(defaults.websocket_allowed_plaintext_hosts.is_empty());
+
+        let parsed: super::PluginSecurityConfig = ::toml::from_str(
+            r#"
+            websocket_allowed_private_hosts = ["gateway.internal", "127.0.0.1"]
+            websocket_allowed_plaintext_hosts = ["127.0.0.1"]
+            "#,
+        )
+        .expect("parse plugin WebSocket egress policy");
+        assert_eq!(
+            parsed.websocket_allowed_private_hosts,
+            ["gateway.internal", "127.0.0.1"]
+        );
+        assert_eq!(parsed.websocket_allowed_plaintext_hosts, ["127.0.0.1"]);
     }
 
     #[test]

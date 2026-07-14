@@ -160,7 +160,7 @@ async fn discord_plugin_delivers_a_gateway_message() {
     assert_eq!(channel.name(), "discord");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    channel.listen(tx).await.expect("listen starts");
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
 
     let content = tokio::time::timeout(Duration::from_secs(15), rx.recv())
         .await
@@ -172,4 +172,11 @@ async fn discord_plugin_delivers_a_gateway_message() {
         content, "hello from user",
         "the plugin ran the full Hello→Identify→Ready→Message flow over host ws-client"
     );
+
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(2), listener)
+        .await
+        .expect("listener stops after its receiver closes")
+        .expect("listener task joins")
+        .expect("listener exits cleanly");
 }

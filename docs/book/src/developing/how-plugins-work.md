@@ -118,6 +118,10 @@ zeroclaw config set plugins.security.signature_mode strict
 
 # Hex-encoded Ed25519 public keys allowed to publish plugins under strict mode.
 zeroclaw config set plugins.security.trusted_publisher_keys '["a1b2c3d4e5f6..."]'
+
+# Exact private and plaintext WebSocket destinations trusted by the operator.
+zeroclaw config set plugins.security.websocket_allowed_private_hosts '["gateway.internal"]'
+zeroclaw config set plugins.security.websocket_allowed_plaintext_hosts '["gateway.internal"]'
 ```
 
 A host meant to load third-party plugins should set `enabled = true`,

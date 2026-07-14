@@ -110,9 +110,9 @@ pub mod bindings {
 
 /// Per-store host state. Carries a sandboxed WASI context (no preopens, no
 /// network) so Rust-compiled wasip2 components instantiate, plus the resource
-/// table WASI requires. Outbound HTTP is present only when the plugin's manifest
-/// grants `HttpClient`; otherwise `http` is `None` and `wasi:http` is never
-/// linked, so the component cannot reach the network at all.
+/// table WASI requires. Outbound HTTP and WebSockets are attached only when the
+/// manifest grants their corresponding permission; otherwise those imports are
+/// not linked and the component has no host network surface.
 pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,

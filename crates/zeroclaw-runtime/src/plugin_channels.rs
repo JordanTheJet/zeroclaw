@@ -29,6 +29,41 @@ struct BuiltChannelCandidate {
 }
 
 #[cfg(feature = "plugins-wasm")]
+fn websocket_host_is_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+    fn normalize(host: &str) -> String {
+        host.trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase()
+    }
+
+    let host = normalize(host);
+    !host.is_empty()
+        && allowed_hosts
+            .iter()
+            .any(|allowed| !allowed.trim().is_empty() && normalize(allowed) == host)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn websocket_egress_policy(
+    config: &Arc<RwLock<Config>>,
+) -> zeroclaw_plugins::ws::WsEgressPolicy {
+    let config = Arc::clone(config);
+    Arc::new(move |host, exception| {
+        let config = config.read();
+        let allowed_hosts = match exception {
+            zeroclaw_plugins::ws::WsEgressException::Plaintext => {
+                &config.plugins.security.websocket_allowed_plaintext_hosts
+            }
+            zeroclaw_plugins::ws::WsEgressException::PrivateNetwork => {
+                &config.plugins.security.websocket_allowed_private_hosts
+            }
+        };
+        websocket_host_is_allowed(host, allowed_hosts)
+    })
+}
+
+#[cfg(feature = "plugins-wasm")]
 fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHost> {
     let plugin_path = config.plugins.resolved_plugins_dir();
     if !config.plugins.enabled || !plugin_path.exists() {
@@ -245,6 +280,7 @@ pub async fn build_channel_plugins(
     let channels_json = canonical_channels_json(&config);
     let mut claimed_channel_keys = occupied_channel_keys.clone();
     let mut candidates = Vec::new();
+    let ws_egress_policy = websocket_egress_policy(&config_handle);
     let plugin_details = host.channel_plugin_details();
     let ambiguous = ambiguous_mirror_types(plugin_details.iter().map(|(manifest, _)| *manifest));
 
@@ -343,7 +379,7 @@ pub async fn build_channel_plugins(
                         manifest.sender_match,
                     );
                     note_if_no_allowlist(&config, channel_type, alias, &manifest.name);
-                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest(
+                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest_and_ws_egress_policy(
                         channel_type,
                         alias.as_str(),
                         &wasm_path,
@@ -351,6 +387,7 @@ pub async fn build_channel_plugins(
                         &manifest.permissions,
                         runtime,
                         authorizer,
+                        Arc::clone(&ws_egress_policy),
                     )
                     .await
                     {
@@ -401,13 +438,14 @@ pub async fn build_channel_plugins(
                 let authorizer =
                     channel_authorizer(&config_handle, &manifest.name, "", manifest.sender_match);
                 note_if_no_allowlist(&config, &manifest.name, "", &manifest.name);
-                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_runtime_resolver_and_digest(
+                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_runtime_resolver_and_digest_and_ws_egress_policy(
                     manifest.name.clone(),
                     &wasm_path,
                     manifest.wasm_sha256.as_deref(),
                     &manifest.permissions,
                     runtime,
                     authorizer,
+                    Arc::clone(&ws_egress_policy),
                 )
                 .await
                 {
@@ -809,6 +847,56 @@ mod tests {
             .filter(|key| channel_key_is_available(key, &claimed))
             .collect();
         assert_eq!(available, ["weather-alerts"]);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn websocket_exception_policy_reads_live_canonical_config() {
+        use zeroclaw_plugins::ws::WsEgressException;
+
+        let config = Arc::new(RwLock::new(Config::default()));
+        let policy = websocket_egress_policy(&config);
+
+        assert!(!policy(
+            "gateway.internal",
+            WsEgressException::PrivateNetwork
+        ));
+        assert!(!policy("gateway.internal", WsEgressException::Plaintext));
+
+        {
+            let mut config = config.write();
+            config
+                .plugins
+                .security
+                .websocket_allowed_private_hosts
+                .push("Gateway.Internal".to_string());
+        }
+        assert!(policy(
+            "gateway.internal",
+            WsEgressException::PrivateNetwork
+        ));
+        assert!(
+            !policy("gateway.internal", WsEgressException::Plaintext),
+            "private access must not imply plaintext access"
+        );
+
+        config
+            .write()
+            .plugins
+            .security
+            .websocket_allowed_plaintext_hosts
+            .push("gateway.internal".to_string());
+        assert!(policy("gateway.internal", WsEgressException::Plaintext));
+        assert!(
+            !policy("sub.gateway.internal", WsEgressException::PrivateNetwork),
+            "operator exceptions are exact-host only"
+        );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn websocket_exception_policy_normalizes_bracketed_ipv6() {
+        assert!(websocket_host_is_allowed("::1", &[" [::1] ".to_string()]));
     }
 
     #[cfg(feature = "plugins-wasm")]

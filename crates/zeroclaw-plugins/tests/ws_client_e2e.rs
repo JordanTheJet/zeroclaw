@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -31,28 +31,33 @@ use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::ws::{WsEgressException, WsEgressPolicy};
 
 fn fixture() -> PathBuf {
-    let fixture_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws-echo-fixture");
-    let status = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "--locked",
-            "--target",
-            "wasm32-wasip2",
-            "--release",
-        ])
-        .current_dir(&fixture_dir)
-        .status()
-        .expect("start mandatory ws-echo fixture build");
-    assert!(status.success(), "mandatory ws-echo fixture must build");
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let fixture_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws-echo-fixture");
+            let status = Command::new(env!("CARGO"))
+                .args([
+                    "build",
+                    "--locked",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--release",
+                ])
+                .current_dir(&fixture_dir)
+                .status()
+                .expect("start mandatory ws-echo fixture build");
+            assert!(status.success(), "mandatory ws-echo fixture must build");
 
-    let path = fixture_dir.join("target/wasm32-wasip2/release/ws_echo_fixture.wasm");
-    assert!(
-        path.is_file(),
-        "fixture build did not produce {}",
-        path.display()
-    );
-    path
+            let path = fixture_dir.join("target/wasm32-wasip2/release/ws_echo_fixture.wasm");
+            assert!(
+                path.is_file(),
+                "fixture build did not produce {}",
+                path.display()
+            );
+            path
+        })
+        .clone()
 }
 
 fn loopback_test_policy() -> WsEgressPolicy {
@@ -131,7 +136,7 @@ async fn ws_client_round_trips_a_text_frame() {
     .expect("ws channel plugin instantiates with WebSocketClient granted");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    channel.listen(tx).await.expect("listen starts");
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("echoed frame arrives within timeout")
@@ -142,6 +147,13 @@ async fn ws_client_round_trips_a_text_frame() {
         content, "ping",
         "the host dials, the plugin sends a frame, and the host pumps the echo back"
     );
+
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(2), listener)
+        .await
+        .expect("listener stops after its receiver closes")
+        .expect("listener task joins")
+        .expect("listener exits cleanly");
 }
 
 #[tokio::test]

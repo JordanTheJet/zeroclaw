@@ -25,7 +25,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::ws_client::{self, WsEvent};
@@ -247,8 +247,8 @@ mod component {
         fn parse_webhook(
             _headers: Vec<(String, String)>,
             _body: Vec<u8>,
-        ) -> Result<Vec<InboundMessage>, String> {
-            Err("unsupported".to_string())
+        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+            Err(WebhookRejection::BadRequest("unsupported".to_string()))
         }
     }
 
