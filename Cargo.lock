@@ -13443,6 +13443,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "rcgen",
  "ring",
  "serde",
  "serde_json",

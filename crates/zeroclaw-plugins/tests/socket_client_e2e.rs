@@ -1,31 +1,30 @@
-//! End-to-end: drive a real WASM channel plugin that opens a host-mediated raw
-//! TCP connection through the `socket` import, exactly as the daemon would.
+//! End-to-end: drive a real WASM channel plugin through the production
+//! permission and destination-policy boundary for the `socket` import.
 //! Loads `socket-echo-fixture.wasm` — a channel built for `wasm32-wasip2`
 //! (source in `tests/fixtures/socket-echo-fixture/`) that dials a `host:port`
-//! from its config, sends a `"ping"` chunk, and returns the echoed bytes as its
-//! one inbound message — against a local in-process TCP echo server. Proves the
-//! host owns the socket (dial + duplex byte pumping + buffered receive) while
-//! the plugin drives the protocol, and that the capability is permission-gated:
-//! without `SocketClient` the import is not linked and the component fails
-//! closed.
+//! from its config. The production-path tests prove that loopback is rejected
+//! with the stable destination-policy error and that the capability is
+//! permission-gated: without `SocketClient` the import is not linked and the
+//! component fails closed. The offline byte round-trip lives beside the socket
+//! host unit tests, where an exact test-only endpoint exception is unavailable
+//! to production builds.
 //!
-//! The component is provisioned out of band as a build artifact (never
-//! committed), same as the other channel/tool fixtures:
+//! The test builds the component from its checked-in source on demand. The
+//! fixture is mandatory: a missing `wasm32-wasip2` target or a failed component
+//! build fails the test rather than silently skipping the boundary proof.
 //!
 //! ```text
 //! cd crates/zeroclaw-plugins/tests/fixtures/socket-echo-fixture
-//! cargo build --target wasm32-wasip2 --release
-//! cp target/wasm32-wasip2/release/socket_echo_fixture.wasm ../socket-echo-fixture.wasm
+//! cargo build --target wasm32-wasip2
 //! ```
-//!
-//! When the fixture is absent these tests skip, so they never fail a checkout
-//! that did not build it.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,10 +34,35 @@ use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 
-fn fixture() -> Option<PathBuf> {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/socket-echo-fixture.wasm");
-    path.exists().then_some(path)
+fn fixture() -> PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/socket-echo-fixture");
+            let target_dir = fixture_dir.join("target");
+            let status = Command::new(env!("CARGO"))
+                .current_dir(&fixture_dir)
+                .args([
+                    "build",
+                    "--locked",
+                    "--quiet",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--target-dir",
+                ])
+                .arg(&target_dir)
+                .status()
+                .expect("run cargo to build socket component fixture");
+            assert!(
+                status.success(),
+                "socket component fixture must build; install the wasm32-wasip2 target"
+            );
+            let wasm = target_dir.join("wasm32-wasip2/debug/socket_echo_fixture.wasm");
+            assert!(wasm.is_file(), "socket component fixture was not produced");
+            wasm
+        })
+        .clone()
 }
 
 fn test_limits() -> PluginLimits {
@@ -80,12 +104,8 @@ async fn start_echo_server() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn socket_client_round_trips_bytes() {
-    let Some(wasm) = fixture() else {
-        eprintln!("socket-echo-fixture.wasm absent; skipping (build it per the module docs).");
-        return;
-    };
-
+async fn socket_client_rejects_loopback_destination() {
+    let wasm = fixture();
     let addr = start_echo_server().await;
     let mut config = HashMap::new();
     config.insert("url".to_string(), addr.to_string());
@@ -109,17 +129,15 @@ async fn socket_client_round_trips_bytes() {
         .expect("channel sender not dropped")
         .content;
 
-    assert_eq!(
-        content, "ping",
-        "the host dials, the plugin sends bytes, and the host pumps the echo back"
+    assert!(
+        content.starts_with("connect: socket_destination_not_allowed:"),
+        "production socket policy must reject loopback, got: {content}"
     );
 }
 
 #[tokio::test]
 async fn socket_plugin_without_permission_fails_closed() {
-    let Some(wasm) = fixture() else {
-        return;
-    };
+    let wasm = fixture();
 
     // No SocketClient → the `socket` import is not linked. A component that
     // imports it must fail to instantiate rather than silently run without a

@@ -50,7 +50,9 @@ omits the compiled component.
   more. The network surfaces that can be opened are host-mediated and
   permission-gated: outbound HTTP for a plugin whose manifest grants
   `http_client`, and outbound raw TCP (+TLS) for a channel plugin whose
-  manifest grants `socket_client`.
+  manifest grants `socket_client`. Raw TCP is public-network-only: local,
+  private, link-local, metadata, documentation, and reserved destinations are
+  rejected before dialing.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -64,9 +66,10 @@ before you design around a capability that is not there.
   injects the plugin's own config section, `http_client` attaches an outbound
   `wasi:http` surface so the plugin can make HTTP requests, and `socket_client`
   links the `socket` import so a channel plugin can drive host-mediated
-  outbound raw TCP (+TLS) connections. Filesystem and memory-access permissions
-  are still accepted by the manifest schema but inert: their host functions are
-  not yet registered in the linker. See Permissions and Host imports below.
+  outbound raw TCP (+TLS) connections to globally routable destinations.
+  Filesystem and memory-access permissions are still accepted by the manifest
+  schema but inert: their host functions are not yet registered in the linker.
+  See Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
   through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
@@ -273,12 +276,15 @@ attaches an outbound `wasi:http` context to the plugin's store and links the
 without the permission has no `wasi:http` surface. `socket_client` registers a
 socket connection registry on a channel plugin's store and links the `socket`
 import, so a granted plugin can open host-mediated outbound raw TCP (+TLS)
-connections; without it the import is not linked and a guest that imports
-`socket` fails closed at instantiation. The remaining variants (`file_read`,
-`file_write`, `memory_read`, `memory_write`) are accepted by the manifest schema
-but are not yet wired to a host import: declaring them grants nothing on its
-own. They reserve the names for the host functions that will gate them (see
-Host imports below).
+connections to public addresses. The host resolves each destination once,
+rejects the whole answer set if any address is non-global, and dials the checked
+addresses directly. There is no private-network exception. Without the
+permission the import is not linked and a guest that imports `socket` fails
+closed at instantiation. The remaining variants (`file_read`, `file_write`,
+`memory_read`, `memory_write`) are accepted by the manifest schema but are not
+yet wired to a host import: declaring them grants nothing on its own. They
+reserve the names for the host functions that will gate them (see Host imports
+below).
 
 ## WIT interfaces
 
@@ -352,12 +358,12 @@ manifest grants `http_client` (`add_wasi_http` in `component.rs`), gated so the
 context and the linked interface always agree. The `socket` import is linked
 the same way for a channel plugin whose manifest grants `socket_client` (the
 `plugins-wit-v0-sockets` link option in `component.rs`): the host owns the
-dial, the optional TLS handshake, and the byte pumps, and a guest that imports
-`socket` without the permission fails closed at instantiation. The filesystem and memory-access
-permissions remain inert: the host functions that would gate them are not yet
-wired into the linker. A plugin's ambient authority is the WASI context (no
-preopens, no ambient network) plus exactly the host imports its world and
-permissions wire in.
+public-destination check, dial, optional TLS handshake, bounded byte queues, and
+pumps. A guest that imports `socket` without the permission fails closed at
+instantiation. The filesystem and memory-access permissions remain inert: the
+host functions that would gate them are not yet wired into the linker. A
+plugin's ambient authority is the WASI context (no preopens, no ambient network)
+plus exactly the host imports its world and permissions wire in.
 
 ### `inbound`
 

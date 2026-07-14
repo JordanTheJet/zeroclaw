@@ -10,8 +10,8 @@
 //! dial, duplex byte pumping, buffered receive — end-to-end against a local echo
 //! server. No filesystem, no direct network (the host owns the socket).
 //!
-//! Build:  rustup target add wasm32-wasip2
-//!         cargo build --target wasm32-wasip2 --release
+//! The host E2E tests build this source on demand with the checked-in lockfile.
+//! Manual build: `cargo build --locked --target wasm32-wasip2`.
 
 #[cfg(target_family = "wasm")]
 mod component {

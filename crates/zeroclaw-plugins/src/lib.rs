@@ -88,7 +88,8 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
-    /// Can open host-mediated outbound raw TCP (+TLS) connections (`socket`).
+    /// Can open host-mediated outbound raw TCP (+TLS) connections (`socket`)
+    /// to globally routable destinations.
     SocketClient,
 }
 

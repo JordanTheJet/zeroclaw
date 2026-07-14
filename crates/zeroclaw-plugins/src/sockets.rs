@@ -18,14 +18,15 @@
 //! the whole [`SocketRegistry`] drops with its `PluginState`), so a plugin
 //! restart never orphans a socket or a task.
 //!
-//! TODO(follow-up): extract the concrete dialer behind a `SocketTransport` trait
-//! injected from `zeroclaw-runtime`, so this crate's no-network invariant stays
-//! literal (see the strategy plan's Phase-C notes) — and add a manifest host/port
-//! allowlist: raw TCP to any `host:port` is a wider SSRF surface than the
-//! WebSocket capability's URL dial, so a granted plugin should be confinable to
-//! the endpoints its manifest declares.
+//! `socket_client` grants public-network egress, not arbitrary host access.
+//! Before dialing, the host rejects local/private names and resolves the target
+//! once; every resolved address must pass [`zeroclaw_infra::net_guard`], and the
+//! checked address set is passed directly to `TcpStream` so DNS cannot redirect
+//! the subsequent dial to loopback, link-local, private, metadata, or reserved
+//! space. There is no private-network exception in this capability.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +39,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::component::PluginState;
 use crate::component::bindings;
+use zeroclaw_infra::net_guard::{is_non_global_v4, is_non_global_v6, is_private_or_local_host};
 
 /// Max byte chunks buffered per connection before the read pump parks. Bounds
 /// host memory if the plugin stops draining; parking the pump lets TCP flow
@@ -49,10 +51,20 @@ const INBOUND_CAP: usize = 1024;
 /// producing faster than the socket drains.
 const OUTBOUND_CAP: usize = 256;
 
-/// Size of the read pump's scratch buffer, and therefore the largest single
-/// chunk surfaced to the plugin. Raw TCP has no framing, so the boundary is
-/// arbitrary anyway; the plugin reassembles its own protocol units.
-const READ_CHUNK: usize = 16 * 1024;
+/// Largest byte chunk retained by either pump. The read side never produces a
+/// larger chunk, and `tcp-send` rejects a larger guest-owned vector before it
+/// can enter the host queue. Combined with the fixed queue depths and
+/// connection cap, this bounds retained host memory independently of Wasm
+/// linear-memory limits.
+const MAX_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Stable error key returned when a guest exceeds [`MAX_CHUNK_BYTES`]. The WIT
+/// contract documents this key so plugins can classify the failure without
+/// parsing the human-readable byte counts that follow it.
+const OUTBOUND_CHUNK_TOO_LARGE: &str = "socket_outbound_chunk_too_large";
+
+/// Stable error key for a destination rejected by the public-network policy.
+const DESTINATION_NOT_ALLOWED: &str = "socket_destination_not_allowed";
 
 /// Max live connections per plugin store. Each connection is a host socket
 /// plus two spawned pump tasks — resources that live outside the guest's
@@ -73,6 +85,21 @@ const MAX_CONNS: usize = 16;
 /// tighter than the WebSocket capability's unbounded `ws-connect` (a known gap
 /// there, not a template behavior to preserve).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Exact loopback endpoint admitted only while an offline component test is
+    /// scoped inside it. This symbol and its bypass do not exist in production
+    /// builds.
+    static TEST_SOCKET_DESTINATION: SocketAddr;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// One generated certificate trusted only inside the local TLS regression.
+    /// Production builds contain neither this root nor this override.
+    static TEST_TLS_ROOT: tokio_rustls::rustls::pki_types::CertificateDer<'static>;
+}
 
 /// A single event surfaced to the plugin by [`SocketRegistry::receive`],
 /// decoupled from the generated `socket-event` bindings type (mapped to it in
@@ -144,15 +171,15 @@ impl SocketRegistry {
                  tcp-close one before connecting again"
             ));
         }
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+        let normalized_host = normalized_host(&host)?.to_string();
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, connect_public(&normalized_host, port))
             .await
             .map_err(|_| {
                 format!(
-                    "tcp connect to {host}:{port} timed out after {}s",
+                    "tcp resolve/connect to {host}:{port} timed out after {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )
-            })?
-            .map_err(|e| format!("tcp connect to {host}:{port} failed: {e}"))?;
+            })??;
         // Byte protocols multiplexed over this import (IRC lines, IMAP commands)
         // are latency-sensitive and small; trade batching for prompt delivery.
         let _ = tcp.set_nodelay(true);
@@ -163,7 +190,7 @@ impl SocketRegistry {
         type WriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
         let (mut read_half, mut write_half): (ReadHalf, WriteHalf) = if tls {
             let connector = tls_connector()?;
-            let server_name = ServerName::try_from(host.clone())
+            let server_name = ServerName::try_from(normalized_host.clone())
                 .map_err(|e| format!("invalid tls server name {host:?}: {e}"))?;
             let stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
                 .await
@@ -204,7 +231,7 @@ impl SocketRegistry {
         let reason_r = close_reason.clone();
         let notify_r = notify.clone();
         let reader = zeroclaw_spawn::spawn!(async move {
-            let mut buf = vec![0u8; READ_CHUNK];
+            let mut buf = vec![0u8; MAX_CHUNK_BYTES];
             loop {
                 // Backpressure: park while the buffer is full so we stop reading
                 // and TCP flow control kicks in; `receive` wakes us after a drain.
@@ -251,6 +278,7 @@ impl SocketRegistry {
     /// call (which holds the plugin store lock).
     pub fn send(&self, handle: u64, bytes: Vec<u8>) -> Result<(), String> {
         let conn = self.conn(handle)?;
+        validate_outbound_chunk(bytes.len())?;
         if conn.dead.load(Ordering::SeqCst) {
             return Err("socket connection is closed".to_string());
         }
@@ -294,6 +322,117 @@ impl SocketRegistry {
     }
 }
 
+/// Resolve once, reject the entire answer set if any address is non-global,
+/// then dial those exact addresses. Passing the resolved set to `TcpStream`
+/// avoids a second DNS lookup between authorization and connection.
+async fn connect_public(host: &str, port: u16) -> Result<TcpStream, String> {
+    let host = normalized_host(host)?;
+    if is_private_or_local_host(host) && !test_literal_destination_allowed(host, port) {
+        return Err(format!(
+            "{DESTINATION_NOT_ALLOWED}: {host}:{port} is local or non-global"
+        ));
+    }
+
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("tcp resolve for {host}:{port} failed: {e}"))?
+        .collect::<Vec<_>>();
+    validate_resolved_destinations(host, port, &resolved)?;
+
+    TcpStream::connect(resolved.as_slice())
+        .await
+        .map_err(|e| format!("tcp connect to {host}:{port} failed: {e}"))
+}
+
+fn validate_resolved_destinations(
+    host: &str,
+    port: u16,
+    resolved: &[SocketAddr],
+) -> Result<(), String> {
+    if resolved.is_empty() {
+        return Err(format!(
+            "tcp resolve for {host}:{port} returned no addresses"
+        ));
+    }
+
+    if let Some(blocked) = resolved
+        .iter()
+        .copied()
+        .find(|addr| !destination_allowed(*addr))
+    {
+        return Err(format!(
+            "{DESTINATION_NOT_ALLOWED}: {host}:{port} resolved to non-global address {blocked}"
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_host(host: &str) -> Result<&str, String> {
+    if host.is_empty() || host.trim() != host {
+        return Err("socket host must be non-empty and contain no surrounding whitespace".into());
+    }
+    if let Some(without_open) = host.strip_prefix('[') {
+        return without_open
+            .strip_suffix(']')
+            .ok_or_else(|| "socket host has invalid IPv6 brackets".to_string());
+    }
+    if host.ends_with(']') {
+        return Err("socket host has invalid IPv6 brackets".to_string());
+    }
+    Ok(host)
+}
+
+fn destination_allowed(addr: SocketAddr) -> bool {
+    let public = match addr.ip() {
+        IpAddr::V4(v4) => !is_non_global_v4(v4),
+        IpAddr::V6(v6) => !is_non_global_v6(v6),
+    };
+    if public {
+        return true;
+    }
+
+    #[cfg(test)]
+    {
+        TEST_SOCKET_DESTINATION
+            .try_with(|allowed| *allowed == addr)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn test_literal_destination_allowed(host: &str, port: u16) -> bool {
+    #[cfg(test)]
+    {
+        host.parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, port))
+            .is_some_and(|addr| {
+                TEST_SOCKET_DESTINATION
+                    .try_with(|allowed| *allowed == addr)
+                    .unwrap_or(false)
+            })
+    }
+
+    #[cfg(not(test))]
+    {
+        let _ = (host, port);
+        false
+    }
+}
+
+fn validate_outbound_chunk(len: usize) -> Result<(), String> {
+    if len > MAX_CHUNK_BYTES {
+        return Err(format!(
+            "{OUTBOUND_CHUNK_TOO_LARGE}: {len} bytes exceeds the {MAX_CHUNK_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
 /// Lock a mutex, recovering a poisoned guard so a panic in one pump task cannot
 /// strand a connection's buffer — matching `InboundQueue`'s recovery policy.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -318,6 +457,12 @@ fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(test)]
+    if let Ok(cert) = TEST_TLS_ROOT.try_with(Clone::clone) {
+        roots
+            .add(cert)
+            .map_err(|e| format!("test tls root rejected: {e}"))?;
+    }
     let config = ClientConfig::builder_with_provider(std::sync::Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
     ))
@@ -362,7 +507,143 @@ impl bindings::channel::zeroclaw::plugin::socket::Host for PluginState {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONNS, SocketRegistry, format_read_close_reason};
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    use std::path::PathBuf;
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    use std::process::Command;
+    use std::sync::Arc;
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    use zeroclaw_api::channel::Channel;
+
+    use super::{
+        DESTINATION_NOT_ALLOWED, MAX_CHUNK_BYTES, MAX_CONNS, OUTBOUND_CHUNK_TOO_LARGE,
+        SocketRegistry, TEST_SOCKET_DESTINATION, TEST_TLS_ROOT, destination_allowed,
+        format_read_close_reason, normalized_host, validate_outbound_chunk,
+        validate_resolved_destinations,
+    };
+    use crate::PluginPermission;
+    use crate::component::PluginLimits;
+
+    fn test_limits() -> PluginLimits {
+        PluginLimits {
+            call_fuel: 1_000_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 64,
+        }
+    }
+
+    async fn connect_local(registry: &mut SocketRegistry, addr: SocketAddr) -> Result<u64, String> {
+        TEST_SOCKET_DESTINATION
+            .scope(
+                addr,
+                registry.connect(addr.ip().to_string(), addr.port(), false),
+            )
+            .await
+    }
+
+    /// Accept one connection and report both acceptance and peer EOF. EOF is
+    /// the externally observable proof that dropping the registry-owned pump
+    /// tasks released their socket halves.
+    async fn start_observed_peer() -> (SocketAddr, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut buf = [0_u8; 64];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+        (addr, accepted_rx, closed_rx)
+    }
+
+    async fn start_tls_echo_server() -> (
+        SocketAddr,
+        tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+    ) {
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let config = ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut buf = [0_u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+        (addr, cert_der)
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn socket_fixture() -> PathBuf {
+        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/socket-echo-fixture");
+                let target_dir = fixture_dir.join("target");
+                let status = Command::new(env!("CARGO"))
+                    .current_dir(&fixture_dir)
+                    .args([
+                        "build",
+                        "--locked",
+                        "--quiet",
+                        "--target",
+                        "wasm32-wasip2",
+                        "--target-dir",
+                    ])
+                    .arg(&target_dir)
+                    .status()
+                    .expect("run cargo to build socket component fixture");
+                assert!(
+                    status.success(),
+                    "socket component fixture must build; install the wasm32-wasip2 target"
+                );
+                let wasm = target_dir.join("wasm32-wasip2/debug/socket_echo_fixture.wasm");
+                assert!(wasm.is_file(), "socket component fixture was not produced");
+                wasm
+            })
+            .clone()
+    }
 
     #[test]
     fn read_close_reason_distinguishes_eof_from_error() {
@@ -403,6 +684,174 @@ mod tests {
         registry.close(42);
     }
 
+    #[test]
+    fn outbound_chunk_accepts_exact_limit_and_rejects_one_byte_over() {
+        assert_eq!(validate_outbound_chunk(MAX_CHUNK_BYTES), Ok(()));
+        let err = validate_outbound_chunk(MAX_CHUNK_BYTES + 1).unwrap_err();
+        assert!(err.starts_with(OUTBOUND_CHUNK_TOO_LARGE));
+        assert!(err.contains(&(MAX_CHUNK_BYTES + 1).to_string()));
+        assert!(err.contains(&MAX_CHUNK_BYTES.to_string()));
+    }
+
+    #[test]
+    fn destination_policy_allows_only_global_addresses() {
+        for addr in [
+            SocketAddr::from(([127, 0, 0, 1], 443)),
+            SocketAddr::from(([10, 0, 0, 1], 443)),
+            SocketAddr::from(([169, 254, 169, 254], 80)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443),
+            SocketAddr::new("fe80::1".parse().unwrap(), 443),
+        ] {
+            assert!(!destination_allowed(addr), "{addr} must be blocked");
+        }
+        for addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+            SocketAddr::new("2606:4700:4700::1111".parse().unwrap(), 443),
+        ] {
+            assert!(destination_allowed(addr), "{addr} must be allowed");
+        }
+    }
+
+    #[test]
+    fn destination_policy_rejects_empty_and_mixed_dns_answers() {
+        let public = SocketAddr::from(([1, 1, 1, 1], 443));
+        let private = SocketAddr::from(([10, 0, 0, 1], 443));
+
+        let empty = validate_resolved_destinations("example.com", 443, &[]).unwrap_err();
+        assert!(empty.contains("returned no addresses"), "{empty}");
+        assert!(validate_resolved_destinations("example.com", 443, &[public]).is_ok());
+
+        let mixed =
+            validate_resolved_destinations("example.com", 443, &[public, private]).unwrap_err();
+        assert!(mixed.starts_with(DESTINATION_NOT_ALLOWED), "{mixed}");
+        assert!(mixed.contains(&private.to_string()), "{mixed}");
+    }
+
+    #[test]
+    fn host_normalization_accepts_bracketed_ipv6_only_when_balanced() {
+        assert_eq!(normalized_host("[::1]").unwrap(), "::1");
+        assert_eq!(normalized_host("example.com").unwrap(), "example.com");
+        assert!(normalized_host("[::1").is_err());
+        assert!(normalized_host("::1]").is_err());
+        assert!(normalized_host(" example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn private_destination_is_rejected_before_dial() {
+        let mut registry = SocketRegistry::new();
+        let err = registry
+            .connect("169.254.169.254".to_string(), 80, false)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with(DESTINATION_NOT_ALLOWED), "{err}");
+        assert!(registry.conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_send_is_not_retained_and_connection_remains_usable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut registry = SocketRegistry::new();
+        let handle = connect_local(&mut registry, addr).await.unwrap();
+        let err = registry
+            .send(handle, vec![0; MAX_CHUNK_BYTES + 1])
+            .unwrap_err();
+        assert!(err.starts_with(OUTBOUND_CHUNK_TOO_LARGE), "{err}");
+
+        registry
+            .send(handle, vec![0; MAX_CHUNK_BYTES])
+            .expect("the rejected vector did not consume queue capacity");
+        registry.close(handle);
+    }
+
+    #[tokio::test]
+    async fn tls_connect_verifies_certificate_and_round_trips_bytes() {
+        let (addr, root) = start_tls_echo_server().await;
+        let mut registry = SocketRegistry::new();
+        let handle = TEST_TLS_ROOT
+            .scope(
+                root,
+                TEST_SOCKET_DESTINATION.scope(
+                    addr,
+                    registry.connect(addr.ip().to_string(), addr.port(), true),
+                ),
+            )
+            .await
+            .expect("TLS connection trusts the scoped test certificate");
+
+        registry.send(handle, b"ping".to_vec()).unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match registry.receive(handle).unwrap() {
+                    super::SocketPoll::Data(bytes) => break bytes,
+                    super::SocketPoll::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
+                    super::SocketPoll::Closed(reason) => {
+                        panic!("TLS echo connection closed before data: {reason}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("TLS echo arrives");
+        assert_eq!(bytes, b"ping");
+        registry.close(handle);
+    }
+
+    #[tokio::test]
+    async fn tls_connect_rejects_untrusted_certificate() {
+        let (addr, _untrusted_root) = start_tls_echo_server().await;
+        let mut registry = SocketRegistry::new();
+        let err = TEST_SOCKET_DESTINATION
+            .scope(
+                addr,
+                registry.connect(addr.ip().to_string(), addr.port(), true),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("tls handshake"), "unexpected error: {err}");
+        assert!(registry.conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_terminates_pumps_and_releases_socket() {
+        let (addr, accepted, closed) = start_observed_peer().await;
+        let mut registry = SocketRegistry::new();
+        let handle = connect_local(&mut registry, addr).await.unwrap();
+        accepted.await.unwrap();
+
+        registry.close(handle);
+        assert!(
+            registry.conns.is_empty(),
+            "tcp-close releases registry capacity"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("peer observes EOF after tcp-close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_store_drop_terminates_pumps_and_releases_socket() {
+        let (addr, accepted, closed) = start_observed_peer().await;
+        let mut store =
+            crate::component::new_store(&[PluginPermission::SocketClient], test_limits());
+        connect_local(store.data_mut().socket_mut(), addr)
+            .await
+            .unwrap();
+        accepted.await.unwrap();
+
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("peer observes EOF after plugin store state drops")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn connect_fails_at_cap_and_close_frees_capacity() {
         // Sockets and pump tasks are host resources outside the guest's wasm
@@ -421,13 +870,11 @@ mod tests {
 
         let mut registry = SocketRegistry::new();
         for _ in 0..MAX_CONNS {
-            registry
-                .connect("127.0.0.1".to_string(), port, false)
+            connect_local(&mut registry, SocketAddr::from(([127, 0, 0, 1], port)))
                 .await
                 .unwrap();
         }
-        let err = registry
-            .connect("127.0.0.1".to_string(), port, false)
+        let err = connect_local(&mut registry, SocketAddr::from(([127, 0, 0, 1], port)))
             .await
             .unwrap_err();
         assert!(
@@ -437,9 +884,50 @@ mod tests {
 
         // Handles start at 1, so the first connection is handle 1.
         registry.close(1);
-        registry
-            .connect("127.0.0.1".to_string(), port, false)
+        connect_local(&mut registry, SocketAddr::from(([127, 0, 0, 1], port)))
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn real_component_round_trips_through_socket_import() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        let mut config = HashMap::new();
+        config.insert("url".to_string(), addr.to_string());
+        let channel = TEST_SOCKET_DESTINATION
+            .scope(
+                addr,
+                crate::wasm_channel::WasmChannel::from_wasm(
+                    "socket-echo-channel",
+                    &socket_fixture(),
+                    &[PluginPermission::ConfigRead, PluginPermission::SocketClient],
+                    &config,
+                    test_limits(),
+                ),
+            )
+            .await
+            .expect("real socket component instantiates");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        channel.listen(tx).await.unwrap();
+        let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("component receives echoed bytes")
+            .expect("channel sender remains open")
+            .content;
+        assert_eq!(content, "ping");
     }
 }

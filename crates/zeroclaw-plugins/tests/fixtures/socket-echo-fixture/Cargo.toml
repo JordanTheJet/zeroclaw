@@ -2,10 +2,9 @@
 # NOT part of the host workspace. Proves the host `socket` capability: the
 # plugin dials a host-mediated raw TCP connection, sends bytes, and reads the echo.
 #
-# Build:  rustup target add wasm32-wasip2
-#         cargo build --target wasm32-wasip2 --release
-# then copy target/wasm32-wasip2/release/socket_echo_fixture.wasm to
-# crates/zeroclaw-plugins/tests/fixtures/socket-echo-fixture.wasm
+# The host E2E tests build this source on demand with the checked-in lockfile.
+# Manual build: rustup target add wasm32-wasip2
+#               cargo build --locked --target wasm32-wasip2
 [package]
 name = "socket-echo-fixture"
 version = "0.1.0"
