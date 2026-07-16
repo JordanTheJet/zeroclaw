@@ -1533,7 +1533,7 @@ pub fn all_tools_with_runtime(
                             plugin_config,
                             plugin_limits,
                         );
-                        if registered_names.contains(wasm_tool.name()) {
+                        if !claim_plugin_tool_name(&mut registered_names, wasm_tool.name()) {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -1548,7 +1548,6 @@ pub fn all_tools_with_runtime(
                             );
                             continue;
                         }
-                        registered_names.insert(wasm_tool.name().to_string());
                         tool_arcs.push(Arc::new(wasm_tool));
                     }
                     ::zeroclaw_log::record!(
@@ -1610,6 +1609,14 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
+) -> bool {
+    registered_names.insert(plugin_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1656,22 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_or_prior_plugin_tools() {
+        let mut registered_names = std::collections::HashSet::from(["shell".to_string()]);
+        let loaded_count = ["shell", "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .count();
+
+        assert_eq!(loaded_count, 1, "only the novel plugin tool is loaded");
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from(["shell".to_string(), "novel-tool".to_string()])
+        );
     }
 
     /// Regression: SOP tools must NOT appear in the tool registry when the
