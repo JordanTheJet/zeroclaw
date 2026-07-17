@@ -5305,7 +5305,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_paircode_state(&tmp, true, false);
 
-        let response = api_plugins::list_plugins(State(state), HeaderMap::new()).await;
+        let response = api_plugins::list_plugins(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer not-a-paired-token"),
+        );
+        let response = api_plugins::list_plugins(State(state), headers).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 

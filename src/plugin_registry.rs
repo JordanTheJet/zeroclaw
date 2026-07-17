@@ -5,15 +5,13 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use zeroclaw::plugins::PluginManifest;
-pub(crate) use zeroclaw::plugins::registry::search_entries;
+pub(crate) use zeroclaw::plugins::registry::{DEFAULT_REGISTRY_URL, search_entries};
 use zeroclaw::plugins::registry::{
     PluginRegistryEntry, PluginRegistryIndex, parse_plugin_spec, resolve_entry,
     write_cached_registry_index,
 };
 use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
-pub(crate) const DEFAULT_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json";
 pub(crate) const MAX_PLUGIN_ZIP_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 50 * 1024 * 1024;
 const REGISTRY_URL_ENV: &str = "ZEROCLAW_PLUGIN_REGISTRY_URL";

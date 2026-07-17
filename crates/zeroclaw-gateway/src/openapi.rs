@@ -116,6 +116,7 @@ pub fn build_spec() -> serde_json::Value {
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
             "PluginCatalogOrigin": schema_value::<crate::api_plugins::PluginCatalogOrigin>(),
+            "PluginCatalogRegistryOrigin": schema_value::<crate::api_plugins::PluginCatalogRegistryOrigin>(),
             "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
             "InstalledPlugin": schema_value::<crate::api_plugins::InstalledPlugin>(),
             "PluginCatalogIssueSource": schema_value::<crate::api_plugins::PluginCatalogIssueSource>(),
@@ -569,6 +570,7 @@ mod tests {
         let schemas = spec.pointer("/components/schemas").unwrap();
         for schema in [
             "PluginCatalogEntry",
+            "PluginCatalogRegistryOrigin",
             "InstalledPlugin",
             "PluginCatalogIssue",
             "PluginsResponse",

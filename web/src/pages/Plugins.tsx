@@ -13,21 +13,23 @@ import type { PluginCatalogEntry, PluginCatalogIssue } from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import type { BadgeTone } from '@/components/ui';
-
-const KIND_LABEL_KEYS: Record<string, string> = {
-  channel: 'plugins.kind.channel',
-  tool: 'plugins.kind.tool',
-  memory: 'plugins.kind.memory',
-  observer: 'plugins.kind.observer',
-  skill: 'plugins.kind.skill',
-};
+import {
+  catalogKindLabelKey,
+  groupCatalogEntries,
+  isConfiguredProviderUnavailable,
+  pluginCardActions,
+  pluginCardStatus,
+} from './pluginCardActions';
 
 function kindLabel(kind: string): string {
-  const key = KIND_LABEL_KEYS[kind];
+  const key = catalogKindLabelKey(kind);
   return key ? t(key) : kind;
 }
 
 function sourceLabel(entry: PluginCatalogEntry): string {
+  if (isConfiguredProviderUnavailable(entry)) {
+    return t('plugins.source.unavailable');
+  }
   if (entry.origin === 'built_in') {
     return t(entry.installed ? 'plugins.source.builtin_plugin' : 'plugins.source.builtin');
   }
@@ -41,41 +43,26 @@ function statusBadge(
   entry: PluginCatalogEntry,
   pluginsEnabled: boolean,
 ): { label: string; tone: BadgeTone; icon: typeof Check } {
-  if (entry.origin === 'registry' && !entry.installed) {
-    return { label: t('plugins.status.installable'), tone: 'neutral', icon: Download };
+  switch (pluginCardStatus(entry, pluginsEnabled)) {
+    case 'conflict':
+      return { label: t('plugins.status.conflict'), tone: 'warn', icon: TriangleAlert };
+    case 'configured_unavailable':
+      return {
+        label: t('plugins.status.configured_unavailable'),
+        tone: 'warn',
+        icon: TriangleAlert,
+      };
+    case 'installable':
+      return { label: t('plugins.status.installable'), tone: 'neutral', icon: Download };
+    case 'installed_off':
+      return { label: t('plugins.status.installed_off'), tone: 'neutral', icon: Circle };
+    case 'configured':
+      return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
+    case 'installed':
+      return { label: t('plugins.status.installed'), tone: 'neutral', icon: Check };
+    case 'not_configured':
+      return { label: t('plugins.status.not_configured'), tone: 'neutral', icon: Circle };
   }
-  if (entry.origin === 'built_in' && entry.configured) {
-    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
-  }
-  if (entry.installed && !pluginsEnabled) {
-    return { label: t('plugins.status.installed_off'), tone: 'neutral', icon: Circle };
-  }
-  if (entry.configured && entry.mirrors_builtin) {
-    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
-  }
-  if (entry.installed) {
-    return { label: t('plugins.status.installed'), tone: 'neutral', icon: Check };
-  }
-  if (entry.configured) {
-    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
-  }
-  return { label: t('plugins.status.not_configured'), tone: 'neutral', icon: Circle };
-}
-
-/** Channel cards link only when the row carries evidence of a canonical
- * built-in/config family. Novel plugin and registry-only channel IDs do not
- * necessarily have a schema route. */
-function configHref(entry: PluginCatalogEntry): string | null {
-  const hasConfigFamily =
-    entry.compiled_in || entry.mirrors_builtin || entry.display_name != null;
-  return entry.kind === 'channel' && hasConfigFamily
-    ? `/config/channels/${encodeURIComponent(entry.id)}`
-    : null;
-}
-
-function installCommand(entry: PluginCatalogEntry): string | null {
-  if (!entry.available || entry.installed) return null;
-  return `zeroclaw plugin install ${entry.plugin_name ?? entry.id}`;
 }
 
 function issueLabel(issue: PluginCatalogIssue): string {
@@ -130,10 +117,7 @@ export default function Plugins() {
   const kinds = ['all', ...Array.from(new Set(entries.map((entry) => entry.kind))).sort()];
   const filtered =
     activeKind === 'all' ? entries : entries.filter((entry) => entry.kind === activeKind);
-  const grouped = filtered.reduce<Record<string, PluginCatalogEntry[]>>((groups, entry) => {
-    (groups[entry.kind] ??= []).push(entry);
-    return groups;
-  }, {});
+  const grouped = groupCatalogEntries(filtered);
 
   if (error) {
     return (
@@ -241,13 +225,13 @@ export default function Plugins() {
         })}
       </div>
 
-      {Object.keys(grouped).length === 0 ? (
+      {grouped.size === 0 ? (
         <Card className="p-10 text-center">
           <Puzzle aria-hidden="true" className="mx-auto mb-3 h-10 w-10 text-pc-text-faint" />
           <p className="text-sm text-pc-text-muted">{t('plugins.empty')}</p>
         </Card>
       ) : (
-        Object.entries(grouped)
+        Array.from(grouped.entries())
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([kind, items], groupIndex) => {
             const headingId = `plugin-kind-${groupIndex}`;
@@ -263,8 +247,10 @@ export default function Plugins() {
                   {items.map((entry) => {
                     const badge = statusBadge(entry, pluginsEnabled);
                     const BadgeIcon = badge.icon;
-                    const href = configHref(entry);
-                    const command = installCommand(entry);
+                    const actions = pluginCardActions(entry);
+                    const href = actions.configHref;
+                    const installSource = actions.installSource;
+                    const cardHref = actions.primary === 'configure' ? href : null;
                     const title = entry.display_name ?? entry.id;
                     const body = (
                       <>
@@ -287,7 +273,27 @@ export default function Plugins() {
                         </div>
                         <div className="flex items-center justify-between gap-2">
                           <Badge tone="neutral">{sourceLabel(entry)}</Badge>
-                          {href ? (
+                          {installSource ? (
+                            <span className="flex min-w-0 items-center justify-end gap-2">
+                              <span className="min-w-0 text-right text-[11px] text-pc-text-faint">
+                                {t(actions.registryOrigin === 'custom'
+                                  ? 'plugins.install_source.custom'
+                                  : 'plugins.install_source.default')}
+                                {': '}
+                                <code className="break-all">{installSource}</code>
+                              </span>
+                              {href && (
+                                <Link
+                                  to={href}
+                                  aria-label={interpolate('plugins.configure_aria', title)}
+                                  className="flex flex-shrink-0 items-center gap-1 text-[13px] font-medium text-pc-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+                                >
+                                  {t('plugins.configure')}
+                                  <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
+                                </Link>
+                              )}
+                            </span>
+                          ) : href ? (
                             <span className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
                               {t('plugins.configure')}
                               <ArrowRight
@@ -295,16 +301,14 @@ export default function Plugins() {
                                 className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5"
                               />
                             </span>
-                          ) : command ? (
-                            <code className="truncate text-[11px] text-pc-text-faint">{command}</code>
                           ) : null}
                         </div>
                       </>
                     );
-                    return href ? (
+                    return cardHref ? (
                       <Link
                         key={`${kind}:${entry.id}`}
-                        to={href}
+                        to={cardHref}
                         aria-label={interpolate('plugins.configure_aria', title)}
                         className={[
                           'group flex w-full flex-col gap-3 rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-5 text-left',

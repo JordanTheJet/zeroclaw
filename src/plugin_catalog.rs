@@ -74,9 +74,7 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
                 active_channels.contains(id)
             }
         },
-        |id, mirrors_builtin| {
-            mirrors_builtin && !channel_aliases(config, id).is_empty()
-        },
+        |id, mirrors_builtin| mirrors_builtin && !channel_aliases(config, id).is_empty(),
     );
 
     // ── Registry-available ─────────────────────────────────────────────────
