@@ -62,6 +62,20 @@ fn websocket_egress_policy(config: &Arc<RwLock<Config>>) -> zeroclaw_plugins::ws
 }
 
 #[cfg(feature = "plugins-wasm")]
+fn socket_plaintext_policy(
+    config: &Arc<RwLock<Config>>,
+) -> zeroclaw_plugins::sockets::SocketPlaintextPolicy {
+    let config = Arc::clone(config);
+    Arc::new(move |host| {
+        config
+            .read()
+            .plugins
+            .security
+            .socket_plaintext_host_allowed(host)
+    })
+}
+
+#[cfg(feature = "plugins-wasm")]
 fn load_plugin_host(config: &Config) -> Option<zeroclaw_plugins::host::PluginHost> {
     let plugin_path = config.plugins.resolved_plugins_dir();
     if !config.plugins.enabled || !plugin_path.exists() {
@@ -279,6 +293,7 @@ pub async fn build_channel_plugins(
     let mut claimed_channel_keys = occupied_channel_keys.clone();
     let mut candidates = Vec::new();
     let ws_egress_policy = websocket_egress_policy(&config_handle);
+    let socket_plaintext_policy = socket_plaintext_policy(&config_handle);
     let plugin_details = host.channel_plugin_details();
     let ambiguous = ambiguous_mirror_types(plugin_details.iter().map(|(manifest, _)| *manifest));
 
@@ -377,7 +392,7 @@ pub async fn build_channel_plugins(
                         manifest.sender_match,
                     );
                     note_if_no_allowlist(&config, channel_type, alias, &manifest.name);
-                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest_and_ws_egress_policy(
+                    match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_mirror_with_runtime_resolver_and_digest_and_transport_policies(
                         channel_type,
                         alias.as_str(),
                         &wasm_path,
@@ -386,6 +401,7 @@ pub async fn build_channel_plugins(
                         runtime,
                         authorizer,
                         Arc::clone(&ws_egress_policy),
+                        Arc::clone(&socket_plaintext_policy),
                     )
                     .await
                     {
@@ -436,7 +452,7 @@ pub async fn build_channel_plugins(
                 let authorizer =
                     channel_authorizer(&config_handle, &manifest.name, "", manifest.sender_match);
                 note_if_no_allowlist(&config, &manifest.name, "", &manifest.name);
-                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_runtime_resolver_and_digest_and_ws_egress_policy(
+                match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_with_runtime_resolver_and_digest_and_transport_policies(
                     manifest.name.clone(),
                     &wasm_path,
                     manifest.wasm_sha256.as_deref(),
@@ -444,6 +460,7 @@ pub async fn build_channel_plugins(
                     runtime,
                     authorizer,
                     Arc::clone(&ws_egress_policy),
+                    Arc::clone(&socket_plaintext_policy),
                 )
                 .await
                 {
@@ -895,6 +912,34 @@ mod tests {
     #[test]
     fn websocket_exception_policy_normalizes_bracketed_ipv6() {
         assert!(websocket_host_is_allowed("::1", &[" [::1] ".to_string()]));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn socket_plaintext_policy_reads_live_canonical_config() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let policy = socket_plaintext_policy(&config);
+
+        assert!(!policy("irc.example.org"));
+
+        config
+            .write()
+            .plugins
+            .security
+            .socket_plaintext_allowed_hosts
+            .push("IRC.Example.Org".to_string());
+        assert!(policy("irc.example.org"));
+
+        config
+            .write()
+            .plugins
+            .security
+            .socket_plaintext_allowed_hosts
+            .clear();
+        assert!(
+            !policy("irc.example.org"),
+            "removing the canonical exception takes effect without rebuilding the channel"
+        );
     }
 
     #[cfg(feature = "plugins-wasm")]
