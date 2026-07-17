@@ -331,6 +331,16 @@ interface channel {
     /// from `headers`) and returns a typed rejection to make the gateway reply
     /// 401 or 400 and enqueue nothing. `headers` are lower-cased; `body` is the
     /// exact received bytes.
+    ///
+    /// The host also serves GET on the route and surfaces the request line via
+    /// two reserved lower-cased headers: `x-webhook-method` (`"GET"`/`"POST"`)
+    /// and `x-webhook-query` (the raw query string, e.g. carrying
+    /// `hub.challenge`). To answer a verification handshake that must echo a
+    /// challenge in the HTTP response body, return exactly one
+    /// `inbound-message` whose `channel` is the reserved value
+    /// `__webhook_reply__` and whose `content` is the body to send. The host
+    /// replies 200 with that body and enqueues nothing. This response-body path
+    /// is additive: the `parse-webhook` signature is unchanged.
     /// Gated by `webhook-ingress`; stub: return
     /// `err(bad-request("unsupported"))`.
     parse-webhook: func(
@@ -358,6 +368,14 @@ world channel-plugin {
     // backward-compatible — existing components need no rebuild).
     @unstable(feature = plugins-wit-v0-websocket)
     import ws-client;
+    // Outbound host-mediated raw TCP (+TLS), for platforms that speak a raw byte
+    // protocol over a socket (IRC, email IMAP/SMTP, MQTT, AMQP). Gated by a
+    // distinct unstable feature so the host links it only for plugins granted the
+    // `socket_client` permission; a plugin that does not enable the feature never
+    // imports it and is unaffected (adding a world import is backward-compatible —
+    // existing components need no rebuild).
+    @unstable(feature = plugins-wit-v0-sockets)
+    import socket;
     export plugin-info;
     export channel;
 }

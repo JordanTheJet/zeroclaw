@@ -77,6 +77,7 @@ struct ChannelInstanceFactory {
     permissions: Arc<[PluginPermission]>,
     runtime: ChannelRuntimeResolver,
     ws_egress_policy: crate::ws::WsEgressPolicy,
+    socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
 }
 
 impl ChannelInstanceFactory {
@@ -85,17 +86,20 @@ impl ChannelInstanceFactory {
         inbound: InboundQueue,
     ) -> Result<(Store<PluginState>, ChannelPlugin)> {
         let (config_json, limits) = (self.runtime)()?;
-        let mut store = crate::component::new_store_with_inbound_and_ws_policy(
+        let mut store = crate::component::new_store_with_inbound_and_transport_policies(
             self.permissions.as_ref(),
             inbound,
             limits,
             Arc::clone(&self.ws_egress_policy),
+            Arc::clone(&self.socket_plaintext_policy),
         );
         let http = store.data().http_enabled();
         let websocket = store.data().websocket_enabled();
-        let linker = build_linker(http, websocket)?;
+        let socket = store.data().socket_enabled();
+        let linker = build_linker(http, websocket, socket)?;
         crate::component::ensure_http_coherent(&store, http)?;
         crate::component::ensure_ws_coherent(&store, websocket)?;
+        crate::component::ensure_socket_coherent(&store, socket)?;
         let bindings = wt(
             ChannelPlugin::instantiate_async(&mut store, self.component.as_ref(), &linker).await,
             "failed to instantiate channel plugin",
@@ -179,7 +183,7 @@ fn resolve_configure_json(
     }
 }
 
-fn build_linker(http: bool, websocket: bool) -> Result<Linker<PluginState>> {
+fn build_linker(http: bool, websocket: bool, socket: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
     if http {
@@ -190,6 +194,9 @@ fn build_linker(http: bool, websocket: bool) -> Result<Linker<PluginState>> {
     // Per-permission gate: the `ws-client` import is installed only for plugins
     // granted `WebSocketClient`, mirroring the `wasi:http` gate above.
     options.plugins_wit_v0_websocket(websocket);
+    // Per-permission gate: the `socket` import is installed only for plugins
+    // granted `SocketClient`, mirroring the `wasi:http` gate above.
+    options.plugins_wit_v0_sockets(socket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -205,8 +212,8 @@ impl WasmChannel {
     /// Compile and instantiate one channel plugin from digest-bound bytes.
     /// `channel_ref` is the host-owned routing identity. `runtime` resolves the
     /// current permission-filtered config and execution limits whenever a warm
-    /// or disposable instance is configured. `ws_egress_policy` resolves
-    /// operator exceptions at each dial instead of caching allowlist state.
+    /// or disposable instance is configured. The transport policy callbacks
+    /// resolve operator exceptions at each dial instead of caching allowlists.
     async fn instantiate(
         channel_ref: String,
         wasm_path: &Path,
@@ -215,12 +222,14 @@ impl WasmChannel {
         runtime: ChannelRuntimeResolver,
         authorizer: SenderAuthorizer,
         ws_egress_policy: crate::ws::WsEgressPolicy,
+        socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
     ) -> Result<Self> {
         let factory = ChannelInstanceFactory {
             component: Arc::new(load_component_with_digest(wasm_path, expected_sha256)?),
             permissions: Arc::from(permissions),
             runtime,
             ws_egress_policy,
+            socket_plaintext_policy,
         };
         let inbound = InboundQueue::default();
         let (mut store, bindings) = factory.instantiate(inbound.clone()).await?;
@@ -411,6 +420,32 @@ impl WasmChannel {
         authorizer: SenderAuthorizer,
         ws_egress_policy: crate::ws::WsEgressPolicy,
     ) -> Result<Self> {
+        Self::from_wasm_with_runtime_resolver_and_digest_and_transport_policies(
+            plugin_name,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            runtime,
+            authorizer,
+            ws_egress_policy,
+            crate::sockets::deny_socket_plaintext(),
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel with live runtime and transport policy
+    /// resolvers while binding the executable to its verified digest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_wasm_with_runtime_resolver_and_digest_and_transport_policies(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+        socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
+    ) -> Result<Self> {
         let plugin_name = plugin_name.into();
         let channel_ref = zeroclaw_api::channel::plugin_channel_ref(&plugin_name);
         Self::instantiate(
@@ -421,6 +456,7 @@ impl WasmChannel {
             runtime,
             authorizer,
             ws_egress_policy,
+            socket_plaintext_policy,
         )
         .await
     }
@@ -469,6 +505,31 @@ impl WasmChannel {
             fixed_runtime_resolver(config_json, limits),
             authorizer,
             ws_egress_policy,
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel with a live host resolver for exact-host
+    /// plaintext raw-TCP exceptions. TLS dials do not require an exception.
+    pub async fn from_wasm_with_socket_policy(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+        socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
+    ) -> Result<Self> {
+        let config_json = resolve_configure_json(config, permissions);
+        Self::from_wasm_with_runtime_resolver_and_digest_and_transport_policies(
+            plugin_name,
+            wasm_path,
+            None,
+            permissions,
+            fixed_runtime_resolver(config_json, limits),
+            authorizer,
+            crate::ws::deny_ws_egress_exceptions(),
+            socket_plaintext_policy,
         )
         .await
     }
@@ -562,6 +623,34 @@ impl WasmChannel {
         authorizer: SenderAuthorizer,
         ws_egress_policy: crate::ws::WsEgressPolicy,
     ) -> Result<Self> {
+        Self::from_wasm_mirror_with_runtime_resolver_and_digest_and_transport_policies(
+            channel_type,
+            alias,
+            wasm_path,
+            expected_sha256,
+            permissions,
+            runtime,
+            authorizer,
+            ws_egress_policy,
+            crate::sockets::deny_socket_plaintext(),
+        )
+        .await
+    }
+
+    /// Instantiate a mirrored channel with live runtime and transport policy
+    /// resolvers while binding the executable to its verified digest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_wasm_mirror_with_runtime_resolver_and_digest_and_transport_policies(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        runtime: ChannelRuntimeResolver,
+        authorizer: SenderAuthorizer,
+        ws_egress_policy: crate::ws::WsEgressPolicy,
+        socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
+    ) -> Result<Self> {
         let channel_type = channel_type.into();
         let alias = alias.into();
         Self::instantiate(
@@ -572,6 +661,7 @@ impl WasmChannel {
             runtime,
             authorizer,
             ws_egress_policy,
+            socket_plaintext_policy,
         )
         .await
     }

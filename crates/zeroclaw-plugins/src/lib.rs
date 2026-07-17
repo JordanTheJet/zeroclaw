@@ -14,6 +14,8 @@ pub mod registry;
 pub mod runtime;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
+pub mod sockets;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_memory;
@@ -128,6 +130,10 @@ pub enum PluginPermission {
     // snake_case would derive to `web_socket_client`; pin the wire name.
     #[serde(rename = "websocket_client")]
     WebSocketClient,
+    /// Can open host-mediated outbound raw TCP (+TLS) connections (`socket`)
+    /// to globally routable destinations. TLS is allowed by default; plaintext
+    /// also requires an exact operator-authorized host.
+    SocketClient,
 }
 
 /// Information about a loaded plugin.

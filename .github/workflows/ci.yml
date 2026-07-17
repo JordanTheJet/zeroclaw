@@ -409,6 +409,7 @@ jobs:
         run: |
           cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
           cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test ws_client_e2e
+          cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test socket_client_e2e
           cargo test --locked --features plugins-wasm-cranelift --test integration channel_plugin_shadow -- --nocapture
 
   check-32bit:
