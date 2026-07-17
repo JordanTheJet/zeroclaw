@@ -37,7 +37,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::socket::{self, SocketEvent};
@@ -260,6 +260,17 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            None
+        }
+
+        fn parse_webhook(
+            _headers: Vec<(String, String)>,
+            _body: Vec<u8>,
+        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+            Err(WebhookRejection::BadRequest("unsupported".to_string()))
         }
     }
 
