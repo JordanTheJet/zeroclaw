@@ -31,7 +31,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
-use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+use zeroclaw_api::webhook::{RawWebhook, WEBHOOK_REPLY_CHANNEL, WebhookOutcome, WebhookReject};
 
 /// Host-supplied sender authorization for normalized inbound messages.
 ///
@@ -918,6 +918,8 @@ impl Channel for WasmChannel {
         let webhook_factory = self.webhook_factory.clone();
         let webhook_loop = async move {
             while let Some(RawWebhook {
+                method,
+                query,
                 headers,
                 body,
                 cancellation,
@@ -925,13 +927,31 @@ impl Channel for WasmChannel {
                 reply,
             }) = webhook_rx.recv().await
             {
+                // `parse-webhook` keeps its additive `(headers, body)` WIT
+                // signature. Materialize the host-owned request line as
+                // reserved headers for this call only.
+                let webhook_headers = reserved_webhook_headers(method, query, headers);
                 let decoded = tokio::select! {
                     biased;
                     () = cancellation.cancelled() => None,
-                    result = webhook_factory.parse_webhook(&headers, &body) => Some(result),
+                    result = webhook_factory.parse_webhook(&webhook_headers, &body) => Some(result),
                 };
                 match decoded {
                     Some(Ok(Ok(messages))) => {
+                        // A single reserved-channel message is a verification
+                        // handshake response. It never enters sender
+                        // authorization, idempotency, or the agent queue.
+                        if let [message] = messages.as_slice()
+                            && message.channel == WEBHOOK_REPLY_CHANNEL
+                        {
+                            let response = if cancellation.is_cancelled() {
+                                Err(WebhookReject::Timeout)
+                            } else {
+                                Ok(WebhookOutcome::Body(message.content.clone()))
+                            };
+                            let _ = reply.send(response);
+                            continue;
+                        }
                         let mut delivery_failed = false;
                         for message in messages {
                             let message = from_wit_inbound(message, &webhook_channel_ref);
@@ -995,7 +1015,7 @@ impl Channel for WasmChannel {
                                 "channel inbound receiver closed".to_string(),
                             ))
                         } else {
-                            Ok(())
+                            Ok(WebhookOutcome::Ack)
                         };
                         let _ = reply.send(response);
                     }
@@ -1459,9 +1479,73 @@ impl Channel for WasmChannel {
     }
 }
 
+/// Build the plugin-visible webhook header list: the host's authoritative HTTP
+/// `method` / `query` as the reserved `x-webhook-method` / `x-webhook-query`
+/// headers, followed by the inbound headers with any inbound copies of those
+/// reserved names dropped. Verification handlers branch on the reserved names,
+/// so an external caller must not be able to spoof them past the plugin
+/// boundary — a plugin that folds headers into a last-write-wins map would
+/// otherwise read the attacker value appended after the host's.
+fn reserved_webhook_headers(
+    method: String,
+    query: String,
+    inbound: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::with_capacity(inbound.len() + 2);
+    headers.push(("x-webhook-method".to_string(), method));
+    headers.push(("x-webhook-query".to_string(), query));
+    headers.extend(inbound.into_iter().filter(|(k, _)| {
+        !k.eq_ignore_ascii_case("x-webhook-method") && !k.eq_ignore_ascii_case("x-webhook-query")
+    }));
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_webhook_headers_drop_spoofed_inbound() {
+        // An external caller supplies the reserved names on the HTTP request
+        // (including a mixed-case copy); the host method/query must still win.
+        let out = reserved_webhook_headers(
+            "GET".to_string(),
+            "hub.challenge=real".to_string(),
+            vec![
+                ("x-webhook-method".to_string(), "POST".to_string()),
+                (
+                    "x-webhook-query".to_string(),
+                    "hub.challenge=attacker".to_string(),
+                ),
+                ("X-Webhook-Method".to_string(), "DELETE".to_string()),
+                ("x-fixture-secret".to_string(), "s".to_string()),
+            ],
+        );
+        let methods: Vec<&str> = out
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-webhook-method"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let queries: Vec<&str> = out
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-webhook-query"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            ["GET"],
+            "only the host method survives; spoofed copies dropped"
+        );
+        assert_eq!(
+            queries,
+            ["hub.challenge=real"],
+            "only the host query survives"
+        );
+        assert!(
+            out.iter().any(|(k, v)| k == "x-fixture-secret" && v == "s"),
+            "legitimate inbound headers are preserved"
+        );
+    }
 
     #[test]
     fn media_round_trip() {
