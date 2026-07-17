@@ -45,9 +45,7 @@ fn websocket_host_is_allowed(host: &str, allowed_hosts: &[String]) -> bool {
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn websocket_egress_policy(
-    config: &Arc<RwLock<Config>>,
-) -> zeroclaw_plugins::ws::WsEgressPolicy {
+fn websocket_egress_policy(config: &Arc<RwLock<Config>>) -> zeroclaw_plugins::ws::WsEgressPolicy {
     let config = Arc::clone(config);
     Arc::new(move |host, exception| {
         let config = config.read();

@@ -27,8 +27,12 @@ use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
-use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::wasm_channel::{SenderAuthorizer, WasmChannel};
 use zeroclaw_plugins::ws::{WsEgressException, WsEgressPolicy};
+
+fn allow_all() -> SenderAuthorizer {
+    Arc::new(|_| true)
+}
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -130,6 +134,7 @@ async fn ws_client_round_trips_a_text_frame() {
         ],
         &config,
         test_limits(),
+        allow_all(),
         loopback_test_policy(),
     )
     .await
@@ -171,6 +176,7 @@ async fn ws_plugin_without_permission_fails_closed() {
         &[PluginPermission::ConfigRead],
         &config,
         test_limits(),
+        allow_all(),
     )
     .await;
 

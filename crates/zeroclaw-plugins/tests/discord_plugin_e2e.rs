@@ -35,8 +35,12 @@ use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
-use zeroclaw_plugins::wasm_channel::WasmChannel;
+use zeroclaw_plugins::wasm_channel::{SenderAuthorizer, WasmChannel};
 use zeroclaw_plugins::ws::{WsEgressException, WsEgressPolicy};
+
+fn allow_all() -> SenderAuthorizer {
+    Arc::new(|_| true)
+}
 
 fn fixture() -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discord-plugin.wasm");
@@ -153,6 +157,7 @@ async fn discord_plugin_delivers_a_gateway_message() {
         ],
         &config,
         test_limits(),
+        allow_all(),
         loopback_test_policy(),
     )
     .await
