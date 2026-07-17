@@ -115,10 +115,37 @@ impl WasmChannel {
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
+        Self::from_wasm_with_socket_policy(
+            alias,
+            wasm_path,
+            permissions,
+            config,
+            limits,
+            crate::sockets::deny_socket_plaintext(),
+        )
+        .await
+    }
+
+    /// Compile and instantiate a channel plugin with a live host resolver for
+    /// exact-host plaintext raw-TCP exceptions. The callback, rather than an
+    /// allowlist snapshot, is retained in the store and consulted on every
+    /// `tcp-connect`; TLS connections do not require an exception.
+    pub async fn from_wasm_with_socket_policy(
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+        socket_plaintext_policy: crate::sockets::SocketPlaintextPolicy,
+    ) -> Result<Self> {
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
-        let mut store =
-            crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
+        let mut store = crate::component::new_store_with_inbound_and_socket_policy(
+            permissions,
+            inbound.clone(),
+            limits,
+            socket_plaintext_policy,
+        );
         let http = store.data().http_enabled();
         let socket = store.data().socket_enabled();
         let linker = build_linker(http, socket)?;

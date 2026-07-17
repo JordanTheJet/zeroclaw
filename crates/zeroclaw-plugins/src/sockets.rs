@@ -23,11 +23,12 @@
 //! once; every resolved address must pass [`zeroclaw_infra::net_guard`], and the
 //! checked address set is passed directly to `TcpStream` so DNS cannot redirect
 //! the subsequent dial to loopback, link-local, private, metadata, or reserved
-//! space. There is no private-network exception in this capability.
+//! space. There is no private-network exception in this capability. TLS is the
+//! default transport; plaintext is additionally denied unless the embedding
+//! runtime's live operator policy authorizes the exact destination host.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,6 +66,9 @@ const OUTBOUND_CHUNK_TOO_LARGE: &str = "socket_outbound_chunk_too_large";
 
 /// Stable error key for a destination rejected by the public-network policy.
 const DESTINATION_NOT_ALLOWED: &str = "socket_destination_not_allowed";
+
+/// Stable error key returned when plaintext is not authorized for a host.
+const PLAINTEXT_NOT_ALLOWED: &str = "socket_plaintext_not_allowed";
 
 /// Max live connections per plugin store. Each connection is a host socket
 /// plus two spawned pump tasks — resources that live outside the guest's
@@ -113,15 +117,26 @@ pub enum SocketPoll {
     Closed(String),
 }
 
+/// Live host-side resolver for plaintext exceptions. The callback receives the
+/// normalized destination host. Keeping the resolver, rather than copied
+/// config values, lets the embedding runtime consult canonical configuration
+/// at each dial.
+pub type SocketPlaintextPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Secure default: globally routable destinations over TLS only.
+#[must_use]
+pub fn deny_socket_plaintext() -> SocketPlaintextPolicy {
+    Arc::new(|_| false)
+}
+
 /// One live host-owned connection: the outbound queue the writer drains, the
 /// inbound buffer the reader fills, and the abort handles for both pump tasks.
 struct SocketConn {
     outbound: mpsc::Sender<Vec<u8>>,
     inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Set by the read pump once the socket closes or errors; further receives
-    /// drain the buffer, then report [`SocketPoll::Closed`].
-    dead: Arc<AtomicBool>,
-    close_reason: Arc<Mutex<String>>,
+    /// The first reader or writer terminal reason. Further receives drain the
+    /// buffer, then consume this state and retire the connection handle.
+    terminal: Arc<Mutex<Option<String>>>,
     /// Woken after a drain so a pump parked on a full buffer resumes reading.
     notify: Arc<Notify>,
     reader: AbortHandle,
@@ -143,6 +158,7 @@ impl Drop for SocketConn {
 pub struct SocketRegistry {
     conns: HashMap<u64, SocketConn>,
     next: u64,
+    plaintext_policy: SocketPlaintextPolicy,
 }
 
 impl Default for SocketRegistry {
@@ -152,11 +168,19 @@ impl Default for SocketRegistry {
 }
 
 impl SocketRegistry {
+    /// Build a registry with the secure TLS-only policy.
     pub fn new() -> Self {
+        Self::with_plaintext_policy(deny_socket_plaintext())
+    }
+
+    /// Build a registry whose plaintext decisions are resolved by live host
+    /// policy. Public-destination validation remains mandatory in either mode.
+    pub fn with_plaintext_policy(plaintext_policy: SocketPlaintextPolicy) -> Self {
         Self {
             conns: HashMap::new(),
             // Start at 1 so 0 is never a valid handle.
             next: 1,
+            plaintext_policy,
         }
     }
 
@@ -171,7 +195,12 @@ impl SocketRegistry {
                  tcp-close one before connecting again"
             ));
         }
-        let normalized_host = normalized_host(&host)?.to_string();
+        let normalized_host = normalized_host(&host)?.to_ascii_lowercase();
+        if !tls && !(self.plaintext_policy)(&normalized_host) {
+            return Err(format!(
+                "{PLAINTEXT_NOT_ALLOWED}: plaintext TCP to {normalized_host:?} is not authorized"
+            ));
+        }
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, connect_public(&normalized_host, port))
             .await
             .map_err(|_| {
@@ -209,27 +238,22 @@ impl SocketRegistry {
         };
 
         let inbound: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let dead = Arc::new(AtomicBool::new(false));
-        let close_reason = Arc::new(Mutex::new(String::new()));
+        let terminal = Arc::new(Mutex::new(None));
         let notify = Arc::new(Notify::new());
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
 
         // Writer: forward queued outbound chunks until the queue closes (the
-        // connection was dropped) or the socket errors, then flush a shutdown.
+        // connection was dropped) or the socket errors. A write failure is a
+        // terminal connection event even if the read half remains open.
+        let terminal_w = Arc::clone(&terminal);
         let writer = zeroclaw_spawn::spawn!(async move {
-            while let Some(bytes) = out_rx.recv().await {
-                if write_half.write_all(&bytes).await.is_err() {
-                    break;
-                }
-            }
-            let _ = write_half.shutdown().await;
+            write_outbound(&mut write_half, &mut out_rx, &terminal_w).await;
         });
 
         // Reader: drain byte chunks into the bounded buffer; record close/error.
-        let inbound_r = inbound.clone();
-        let dead_r = dead.clone();
-        let reason_r = close_reason.clone();
-        let notify_r = notify.clone();
+        let inbound_r = Arc::clone(&inbound);
+        let terminal_r = Arc::clone(&terminal);
+        let notify_r = Arc::clone(&notify);
         let reader = zeroclaw_spawn::spawn!(async move {
             let mut buf = vec![0u8; MAX_CHUNK_BYTES];
             loop {
@@ -240,16 +264,14 @@ impl SocketRegistry {
                 }
                 match read_half.read(&mut buf).await {
                     Ok(0) => {
-                        *lock(&reason_r) = format_read_close_reason(None);
-                        dead_r.store(true, Ordering::SeqCst);
+                        mark_terminal(&terminal_r, format_read_close_reason(None));
                         break;
                     }
                     Ok(n) => {
                         lock(&inbound_r).push_back(buf[..n].to_vec());
                     }
                     Err(e) => {
-                        *lock(&reason_r) = format_read_close_reason(Some(&e));
-                        dead_r.store(true, Ordering::SeqCst);
+                        mark_terminal(&terminal_r, format_read_close_reason(Some(&e)));
                         break;
                     }
                 }
@@ -263,8 +285,7 @@ impl SocketRegistry {
             SocketConn {
                 outbound: out_tx,
                 inbound,
-                dead,
-                close_reason,
+                terminal,
                 notify,
                 reader: reader.abort_handle(),
                 writer: writer.abort_handle(),
@@ -279,7 +300,7 @@ impl SocketRegistry {
     pub fn send(&self, handle: u64, bytes: Vec<u8>) -> Result<(), String> {
         let conn = self.conn(handle)?;
         validate_outbound_chunk(bytes.len())?;
-        if conn.dead.load(Ordering::SeqCst) {
+        if lock(&conn.terminal).is_some() {
             return Err("socket connection is closed".to_string());
         }
         conn.outbound.try_send(bytes).map_err(|e| match e {
@@ -290,15 +311,23 @@ impl SocketRegistry {
 
     /// Pop the next buffered chunk, `Idle` when none is queued and the socket is
     /// live, or `Closed` once it has ended and its buffer is drained.
-    pub fn receive(&self, handle: u64) -> Result<SocketPoll, String> {
-        let conn = self.conn(handle)?;
-        let chunk = lock(&conn.inbound).pop_front();
-        // Wake the read pump in case it parked on a full buffer.
-        conn.notify.notify_one();
-        match chunk {
-            Some(bytes) => Ok(SocketPoll::Data(bytes)),
-            None if conn.dead.load(Ordering::SeqCst) => {
-                Ok(SocketPoll::Closed(lock(&conn.close_reason).clone()))
+    pub fn receive(&mut self, handle: u64) -> Result<SocketPoll, String> {
+        let terminal_reason = {
+            let conn = self.conn(handle)?;
+            if let Some(bytes) = lock(&conn.inbound).pop_front() {
+                // Wake the read pump in case it parked on a full buffer.
+                conn.notify.notify_one();
+                return Ok(SocketPoll::Data(bytes));
+            }
+            lock(&conn.terminal).clone()
+        };
+
+        match terminal_reason {
+            Some(reason) => {
+                // A terminal receive consumes the handle, aborts both pumps,
+                // and immediately returns its slot to the per-store cap.
+                self.conns.remove(&handle);
+                Ok(SocketPoll::Closed(reason))
             }
             None => Ok(SocketPoll::Idle),
         }
@@ -433,6 +462,29 @@ fn validate_outbound_chunk(len: usize) -> Result<(), String> {
     Ok(())
 }
 
+async fn write_outbound<W>(
+    writer: &mut W,
+    outbound: &mut mpsc::Receiver<Vec<u8>>,
+    terminal: &Mutex<Option<String>>,
+) where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    while let Some(bytes) = outbound.recv().await {
+        if let Err(error) = writer.write_all(&bytes).await {
+            mark_terminal(terminal, format!("socket write error: {error}"));
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+fn mark_terminal(terminal: &Mutex<Option<String>>, reason: String) {
+    let mut terminal = lock(terminal);
+    if terminal.is_none() {
+        *terminal = Some(reason);
+    }
+}
+
 /// Lock a mutex, recovering a poisoned guard so a panic in one pump task cannot
 /// strand a connection's buffer — matching `InboundQueue`'s recovery policy.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -509,26 +561,27 @@ impl bindings::channel::zeroclaw::plugin::socket::Host for PluginState {
 mod tests {
     #[cfg(feature = "plugins-wasm-cranelift")]
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     #[cfg(feature = "plugins-wasm-cranelift")]
     use std::path::PathBuf;
     #[cfg(feature = "plugins-wasm-cranelift")]
     use std::process::Command;
-    use std::sync::Arc;
     #[cfg(feature = "plugins-wasm-cranelift")]
     use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     #[cfg(feature = "plugins-wasm-cranelift")]
     use zeroclaw_api::channel::Channel;
 
     use super::{
         DESTINATION_NOT_ALLOWED, MAX_CHUNK_BYTES, MAX_CONNS, OUTBOUND_CHUNK_TOO_LARGE,
-        SocketRegistry, TEST_SOCKET_DESTINATION, TEST_TLS_ROOT, destination_allowed,
-        format_read_close_reason, normalized_host, validate_outbound_chunk,
-        validate_resolved_destinations,
+        PLAINTEXT_NOT_ALLOWED, SocketConn, SocketPlaintextPolicy, SocketPoll, SocketRegistry,
+        TEST_SOCKET_DESTINATION, TEST_TLS_ROOT, destination_allowed, format_read_close_reason,
+        normalized_host, validate_outbound_chunk, validate_resolved_destinations, write_outbound,
     };
     use crate::PluginPermission;
     use crate::component::PluginLimits;
@@ -540,6 +593,14 @@ mod tests {
             max_table_elements: 100_000,
             max_instances: 64,
         }
+    }
+
+    fn loopback_plaintext_policy() -> SocketPlaintextPolicy {
+        Arc::new(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"))
+    }
+
+    fn plaintext_registry() -> SocketRegistry {
+        SocketRegistry::with_plaintext_policy(loopback_plaintext_policy())
     }
 
     async fn connect_local(registry: &mut SocketRegistry, addr: SocketAddr) -> Result<u64, String> {
@@ -663,7 +724,7 @@ mod tests {
     fn unknown_handle_is_a_named_error() {
         // Handles start at 1 and no connection was opened, so every operation
         // on an arbitrary handle must fail with the handle named — never panic.
-        let registry = SocketRegistry::new();
+        let mut registry = SocketRegistry::new();
         assert_eq!(
             registry.send(7, b"x".to_vec()).unwrap_err(),
             "unknown socket handle 7"
@@ -738,13 +799,51 @@ mod tests {
 
     #[tokio::test]
     async fn private_destination_is_rejected_before_dial() {
-        let mut registry = SocketRegistry::new();
+        // Authorizing plaintext must never bypass the independent public-only
+        // destination guard.
+        let mut registry = SocketRegistry::with_plaintext_policy(Arc::new(|_| true));
         let err = registry
             .connect("169.254.169.254".to_string(), 80, false)
             .await
             .unwrap_err();
         assert!(err.starts_with(DESTINATION_NOT_ALLOWED), "{err}");
         assert!(registry.conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plaintext_policy_is_closed_by_default_and_resolved_live_per_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let security = Arc::new(RwLock::new(
+            zeroclaw_config::schema::PluginSecurityConfig::default(),
+        ));
+        let security_for_policy = Arc::clone(&security);
+        let mut registry = SocketRegistry::with_plaintext_policy(Arc::new(move |host| {
+            security_for_policy
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .socket_plaintext_host_allowed(host)
+        }));
+
+        let denied = connect_local(&mut registry, addr).await.unwrap_err();
+        assert!(denied.starts_with(PLAINTEXT_NOT_ALLOWED), "{denied}");
+        assert!(registry.conns.is_empty());
+
+        security
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .socket_plaintext_allowed_hosts
+            .push("127.0.0.1".to_string());
+
+        let handle = connect_local(&mut registry, addr)
+            .await
+            .expect("the retained resolver observes the live config update");
+        registry.close(handle);
     }
 
     #[tokio::test]
@@ -756,7 +855,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let mut registry = SocketRegistry::new();
+        let mut registry = plaintext_registry();
         let handle = connect_local(&mut registry, addr).await.unwrap();
         let err = registry
             .send(handle, vec![0; MAX_CHUNK_BYTES + 1])
@@ -820,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn close_terminates_pumps_and_releases_socket() {
         let (addr, accepted, closed) = start_observed_peer().await;
-        let mut registry = SocketRegistry::new();
+        let mut registry = plaintext_registry();
         let handle = connect_local(&mut registry, addr).await.unwrap();
         accepted.await.unwrap();
 
@@ -838,8 +937,12 @@ mod tests {
     #[tokio::test]
     async fn plugin_store_drop_terminates_pumps_and_releases_socket() {
         let (addr, accepted, closed) = start_observed_peer().await;
-        let mut store =
-            crate::component::new_store(&[PluginPermission::SocketClient], test_limits());
+        let mut store = crate::component::new_store_with_inbound_and_socket_policy(
+            &[PluginPermission::SocketClient],
+            crate::component::InboundQueue::default(),
+            test_limits(),
+            loopback_plaintext_policy(),
+        );
         connect_local(store.data_mut().socket_mut(), addr)
             .await
             .unwrap();
@@ -868,7 +971,7 @@ mod tests {
             }
         });
 
-        let mut registry = SocketRegistry::new();
+        let mut registry = plaintext_registry();
         for _ in 0..MAX_CONNS {
             connect_local(&mut registry, SocketAddr::from(([127, 0, 0, 1], port)))
                 .await
@@ -887,6 +990,99 @@ mod tests {
         connect_local(&mut registry, SocketAddr::from(([127, 0, 0, 1], port)))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_eof_terminal_receive_retires_handle_and_frees_capacity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let mut registry = plaintext_registry();
+        let mut handles = Vec::with_capacity(MAX_CONNS);
+        for _ in 0..MAX_CONNS {
+            handles.push(connect_local(&mut registry, addr).await.unwrap());
+        }
+        assert_eq!(registry.conns.len(), MAX_CONNS);
+
+        for handle in handles {
+            let reason = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match registry.receive(handle).unwrap() {
+                        SocketPoll::Data(_) | SocketPoll::Idle => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        SocketPoll::Closed(reason) => break reason,
+                    }
+                }
+            })
+            .await
+            .expect("remote EOF becomes a terminal receive");
+            assert!(!reason.is_empty());
+            assert_eq!(
+                registry.receive(handle).map(|_| ()).unwrap_err(),
+                format!("unknown socket handle {handle}")
+            );
+        }
+
+        assert!(registry.conns.is_empty());
+        connect_local(&mut registry, addr)
+            .await
+            .expect("terminal receives return every slot to the connection cap");
+    }
+
+    #[tokio::test]
+    async fn writer_failure_becomes_terminal_instead_of_remaining_idle() {
+        let (mut broken_writer, peer) = tokio::io::duplex(64);
+        drop(peer);
+
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let terminal = Arc::new(Mutex::new(None));
+        let terminal_for_writer = Arc::clone(&terminal);
+        let writer = zeroclaw_spawn::spawn!(async move {
+            write_outbound(&mut broken_writer, &mut outbound_rx, &terminal_for_writer).await;
+        });
+        let reader = zeroclaw_spawn::spawn!(async move {
+            std::future::pending::<()>().await;
+        });
+
+        let handle = 1;
+        let mut registry = SocketRegistry::new();
+        registry.next = handle + 1;
+        registry.conns.insert(
+            handle,
+            SocketConn {
+                outbound,
+                inbound: Arc::new(Mutex::new(VecDeque::new())),
+                terminal,
+                notify: Arc::new(tokio::sync::Notify::new()),
+                reader: reader.abort_handle(),
+                writer: writer.abort_handle(),
+            },
+        );
+
+        registry.send(handle, b"trigger write".to_vec()).unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match registry.receive(handle).unwrap() {
+                    SocketPoll::Closed(reason) => break reason,
+                    SocketPoll::Data(_) | SocketPoll::Idle => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("writer failure marks the connection terminal");
+
+        assert!(reason.starts_with("socket write error:"), "{reason}");
+        assert!(registry.conns.is_empty());
+        assert_eq!(
+            registry.receive(handle).map(|_| ()).unwrap_err(),
+            "unknown socket handle 1"
+        );
     }
 
     #[cfg(feature = "plugins-wasm-cranelift")]
@@ -910,12 +1106,13 @@ mod tests {
         let channel = TEST_SOCKET_DESTINATION
             .scope(
                 addr,
-                crate::wasm_channel::WasmChannel::from_wasm(
+                crate::wasm_channel::WasmChannel::from_wasm_with_socket_policy(
                     "socket-echo-channel",
                     &socket_fixture(),
                     &[PluginPermission::ConfigRead, PluginPermission::SocketClient],
                     &config,
                     test_limits(),
+                    loopback_plaintext_policy(),
                 ),
             )
             .await

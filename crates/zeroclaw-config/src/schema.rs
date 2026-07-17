@@ -8167,9 +8167,10 @@ impl PluginsConfig {
     }
 }
 
-/// Plugin signature verification configuration (`[plugins.security]`).
+/// Plugin trust and network security configuration (`[plugins.security]`).
 ///
-/// Controls Ed25519 signature verification for plugin manifests.
+/// Controls Ed25519 signature verification for plugin manifests and the exact
+/// destinations that may use otherwise-denied plugin transport exceptions.
 /// In `strict` mode, only plugins signed by a trusted publisher key are loaded.
 /// In `permissive` mode, unsigned or untrusted plugins produce warnings but are
 /// still loaded. In `disabled` mode (the default), no signature checking occurs.
@@ -8183,6 +8184,40 @@ pub struct PluginSecurityConfig {
     /// Hex-encoded Ed25519 public keys of trusted plugin publishers.
     #[serde(default)]
     pub trusted_publisher_keys: Vec<String>,
+    /// Exact globally routable hosts that socket-enabled plugins may reach over
+    /// plaintext TCP. TLS remains allowed without an entry; private and local
+    /// destinations remain blocked even when named here.
+    #[serde(default)]
+    pub socket_plaintext_allowed_hosts: Vec<String>,
+}
+
+impl PluginSecurityConfig {
+    /// Resolve an exact plaintext-host exception from this canonical config.
+    /// Hostnames are case-insensitive and bracketed IPv6 is normalized; no
+    /// wildcard or suffix matching is performed.
+    #[must_use]
+    pub fn socket_plaintext_host_allowed(&self, host: &str) -> bool {
+        let Some(host) = normalize_socket_policy_host(host) else {
+            return false;
+        };
+        self.socket_plaintext_allowed_hosts
+            .iter()
+            .filter_map(|allowed| normalize_socket_policy_host(allowed))
+            .any(|allowed| allowed == host)
+    }
+}
+
+fn normalize_socket_policy_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let host = match (host.strip_prefix('['), host.strip_suffix(']')) {
+        (Some(without_open), Some(_)) => without_open.strip_suffix(']')?,
+        (None, None) => host,
+        _ => return None,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 fn default_signature_mode() -> String {
@@ -8194,6 +8229,7 @@ impl Default for PluginSecurityConfig {
         Self {
             signature_mode: default_signature_mode(),
             trusted_publisher_keys: Vec::new(),
+            socket_plaintext_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -21474,6 +21510,24 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn socket_plaintext_policy_defaults_closed_and_matches_exact_hosts() {
+        let defaults = super::PluginSecurityConfig::default();
+        assert!(defaults.socket_plaintext_allowed_hosts.is_empty());
+        assert!(!defaults.socket_plaintext_host_allowed("irc.example.org"));
+
+        let policy: super::PluginSecurityConfig = toml::from_str(
+            r#"
+socket_plaintext_allowed_hosts = ["IRC.Example.Org", " [2606:4700:4700::1111] "]
+"#,
+        )
+        .unwrap();
+        assert!(policy.socket_plaintext_host_allowed("irc.example.org"));
+        assert!(policy.socket_plaintext_host_allowed("2606:4700:4700::1111"));
+        assert!(!policy.socket_plaintext_host_allowed("sub.irc.example.org"));
+        assert!(!policy.socket_plaintext_host_allowed("[2606:4700:4700::1111"));
+    }
 
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {

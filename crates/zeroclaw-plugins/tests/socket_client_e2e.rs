@@ -2,12 +2,13 @@
 //! permission and destination-policy boundary for the `socket` import.
 //! Loads `socket-echo-fixture.wasm` — a channel built for `wasm32-wasip2`
 //! (source in `tests/fixtures/socket-echo-fixture/`) that dials a `host:port`
-//! from its config. The production-path tests prove that loopback is rejected
-//! with the stable destination-policy error and that the capability is
-//! permission-gated: without `SocketClient` the import is not linked and the
-//! component fails closed. The offline byte round-trip lives beside the socket
-//! host unit tests, where an exact test-only endpoint exception is unavailable
-//! to production builds.
+//! from its config. The production-path tests prove that plaintext fails closed
+//! without live operator authorization, that authorization never bypasses the
+//! public-only destination guard, and that the capability is permission-gated:
+//! without `SocketClient` the import is not linked and the component fails
+//! closed. The offline byte round-trip lives beside the socket host unit tests,
+//! where an exact test-only endpoint exception is unavailable to production
+//! builds.
 //!
 //! The test builds the component from its checked-in source on demand. The
 //! fixture is mandatory: a missing `wasm32-wasip2` target or a failed component
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -123,7 +124,7 @@ async fn start_echo_server() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn socket_client_rejects_loopback_destination() {
+async fn socket_client_rejects_plaintext_without_operator_policy() {
     let wasm = fixture();
     let addr = start_echo_server().await;
     let mut config = HashMap::new();
@@ -149,8 +150,40 @@ async fn socket_client_rejects_loopback_destination() {
         .content;
 
     assert!(
+        content.starts_with("connect: socket_plaintext_not_allowed:"),
+        "production socket policy must fail closed for plaintext, got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn plaintext_authorization_does_not_bypass_destination_policy() {
+    let wasm = fixture();
+    let addr = start_echo_server().await;
+    let mut config = HashMap::new();
+    config.insert("url".to_string(), addr.to_string());
+
+    let channel = WasmChannel::from_wasm_with_socket_policy(
+        "socket-echo-channel",
+        &wasm,
+        &[PluginPermission::ConfigRead, PluginPermission::SocketClient],
+        &config,
+        test_limits(),
+        Arc::new(|host| host == "127.0.0.1"),
+    )
+    .await
+    .expect("socket channel plugin instantiates with SocketClient granted");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channel.listen(tx).await.expect("listen starts");
+    let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("policy error arrives within timeout")
+        .expect("channel sender not dropped")
+        .content;
+
+    assert!(
         content.starts_with("connect: socket_destination_not_allowed:"),
-        "production socket policy must reject loopback, got: {content}"
+        "plaintext authorization must not permit loopback, got: {content}"
     );
 }
 

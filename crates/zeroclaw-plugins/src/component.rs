@@ -15,7 +15,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
-use crate::sockets::SocketRegistry;
+use crate::sockets::{SocketPlaintextPolicy, SocketRegistry, deny_socket_plaintext};
 
 /// A host-owned queue of inbound messages destined for a channel plugin.
 ///
@@ -145,12 +145,24 @@ impl PluginState {
         inbound: InboundQueue,
         limits: PluginLimits,
     ) -> Self {
+        Self::with_inbound_and_socket_policy(permissions, inbound, limits, deny_socket_plaintext())
+    }
+
+    /// Build channel store state with a live host resolver for plaintext raw
+    /// TCP exceptions. The resolver is consulted per dial and carries no copied
+    /// allowlist state; stores without `SocketClient` discard it.
+    pub fn with_inbound_and_socket_policy(
+        permissions: &[PluginPermission],
+        inbound: InboundQueue,
+        limits: PluginLimits,
+        socket_plaintext_policy: SocketPlaintextPolicy,
+    ) -> Self {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
         let socket = permissions
             .contains(&PluginPermission::SocketClient)
-            .then(SocketRegistry::new);
+            .then(|| SocketRegistry::with_plaintext_policy(socket_plaintext_policy));
         Self {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
@@ -294,7 +306,23 @@ pub fn new_store_with_inbound(
     inbound: InboundQueue,
     limits: PluginLimits,
 ) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+    new_store_with_inbound_and_socket_policy(permissions, inbound, limits, deny_socket_plaintext())
+}
+
+/// Like [`new_store_with_inbound`], with a live resolver for exact-host
+/// plaintext exceptions. The callback is the only retained policy state.
+pub fn new_store_with_inbound_and_socket_policy(
+    permissions: &[PluginPermission],
+    inbound: InboundQueue,
+    limits: PluginLimits,
+    socket_plaintext_policy: SocketPlaintextPolicy,
+) -> Store<PluginState> {
+    let state = PluginState::with_inbound_and_socket_policy(
+        permissions,
+        inbound,
+        limits,
+        socket_plaintext_policy,
+    );
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
     set_call_fuel(&mut store, limits.call_fuel);

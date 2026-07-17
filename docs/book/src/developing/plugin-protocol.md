@@ -52,7 +52,9 @@ omits the compiled component.
   `http_client`, and outbound raw TCP (+TLS) for a channel plugin whose
   manifest grants `socket_client`. Raw TCP is public-network-only: local,
   private, link-local, metadata, documentation, and reserved destinations are
-  rejected before dialing.
+  rejected before dialing. TLS is allowed by default; plaintext additionally
+  requires an exact host match in the operator's live
+  `plugins.security.socket_plaintext_allowed_hosts` policy.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -66,7 +68,9 @@ before you design around a capability that is not there.
   injects the plugin's own config section, `http_client` attaches an outbound
   `wasi:http` surface so the plugin can make HTTP requests, and `socket_client`
   links the `socket` import so a channel plugin can drive host-mediated
-  outbound raw TCP (+TLS) connections to globally routable destinations.
+  outbound raw TCP (+TLS) connections to globally routable destinations. TLS
+  is allowed by default; plaintext fails closed unless the operator authorizes
+  the exact host in `plugins.security.socket_plaintext_allowed_hosts`.
   Filesystem and memory-access permissions are still accepted by the manifest
   schema but inert: their host functions are not yet registered in the linker.
   See Permissions and Host imports below.
@@ -278,13 +282,27 @@ socket connection registry on a channel plugin's store and links the `socket`
 import, so a granted plugin can open host-mediated outbound raw TCP (+TLS)
 connections to public addresses. The host resolves each destination once,
 rejects the whole answer set if any address is non-global, and dials the checked
-addresses directly. There is no private-network exception. Without the
-permission the import is not linked and a guest that imports `socket` fails
-closed at instantiation. The remaining variants (`file_read`, `file_write`,
-`memory_read`, `memory_write`) are accepted by the manifest schema but are not
-yet wired to a host import: declaring them grants nothing on its own. They
-reserve the names for the host functions that will gate them (see Host imports
-below).
+addresses directly. TLS is allowed by default. Plaintext additionally requires
+an exact host entry in `plugins.security.socket_plaintext_allowed_hosts`; the
+host consults that canonical operator config on every dial rather than caching
+an allowlist in the plugin store. There is no private-network exception, even
+for an authorized plaintext host. Without the permission the import is not
+linked and a guest that imports `socket` fails closed at instantiation. The
+remaining variants (`file_read`, `file_write`, `memory_read`, `memory_write`)
+are accepted by the manifest schema but are not yet wired to a host import:
+declaring them grants nothing on its own. They reserve the names for the host
+functions that will gate them (see Host imports below).
+
+Authorize plaintext only for a protocol that cannot use TLS, and name each
+host exactly (no wildcard or suffix matching):
+
+```bash
+zeroclaw config set plugins.security.socket_plaintext_allowed_hosts \
+  '["irc.example.org"]'
+```
+
+Changing the canonical config changes later dial decisions without rebuilding
+the plugin store. Existing connections are unaffected.
 
 ## WIT interfaces
 
@@ -358,9 +376,11 @@ manifest grants `http_client` (`add_wasi_http` in `component.rs`), gated so the
 context and the linked interface always agree. The `socket` import is linked
 the same way for a channel plugin whose manifest grants `socket_client` (the
 `plugins-wit-v0-sockets` link option in `component.rs`): the host owns the
-public-destination check, dial, optional TLS handshake, bounded byte queues, and
-pumps. A guest that imports `socket` without the permission fails closed at
-instantiation. The filesystem and memory-access permissions remain inert: the
+public-destination check, live plaintext-policy decision, dial, optional TLS
+handshake, bounded byte queues, and pumps. A terminal receive retires the opaque
+handle and returns its slot to the per-plugin connection cap. A guest that
+imports `socket` without the permission fails closed at instantiation. The
+filesystem and memory-access permissions remain inert: the
 host functions that would gate them are not yet wired into the linker. A
 plugin's ambient authority is the WASI context (no preopens, no ambient network)
 plus exactly the host imports its world and permissions wire in.
