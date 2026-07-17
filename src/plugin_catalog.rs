@@ -733,6 +733,7 @@ mod tests {
                     author: None,
                     capabilities: vec!["channel".to_string()],
                     provides: None,
+                    sender_match: None,
                     url: "https://example.invalid/telegram.zip".to_string(),
                     sha256: None,
                 }],

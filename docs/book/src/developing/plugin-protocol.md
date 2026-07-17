@@ -169,6 +169,12 @@ and an enabled agent owns that exact binding. When no agent declares any
 channel binding, the existing legacy admission rule selects them. Novel
 channels have no per-plugin toggle.
 
+For non-channel capabilities, the catalog `id` is the manifest package name.
+It may differ from a WIT-exported member name (for example, a hyphenated package
+can export an underscored tool). The catalog reports package discovery and
+configuration intent, not successful runtime admission of each exported
+member.
+
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
 the archive, and then hands the extracted plugin directory to the existing
@@ -198,13 +204,14 @@ Registry entries use this shape:
 {
   "plugins": [
     {
-      "name": "team-calendar",
+      "name": "gitea",
       "version": "0.2.0",
-      "description": "Schedule meetings on a team calendar",
+      "description": "Gitea channel plugin",
       "author": "Example Team",
-      "capabilities": ["tool"],
-      "provides": null,
-      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "capabilities": ["channel"],
+      "provides": "git",
+      "sender_match": "case_insensitive",
+      "url": "https://example.invalid/gitea-0.2.0.zip",
       "sha256": "sha256:<hex digest of the zip>"
     }
   ]
@@ -216,7 +223,11 @@ canonical channel id from its `manifest.toml` (for example, the `gitea` package
 uses `"provides": "git"`). Registry publishers must generate this projection
 from the packaged manifest instead of maintaining a second, independently
 authored identity. Novel channels and non-channel packages omit it or use
-`null`.
+`null`. A channel entry may likewise project the manifest's `sender_match`.
+Older registries may omit `sender_match`, but when present it is verified
+against the packaged manifest before installation. Non-empty registry
+`capabilities` are verified the same way; an empty legacy list is treated as
+omitted metadata.
 
 The archive must contain either a root-level `manifest.toml` or one nested
 plugin directory containing `manifest.toml`. Archives with traversal paths,

@@ -10,6 +10,7 @@ use zeroclaw::plugins::registry::{
     PluginRegistryEntry, PluginRegistryIndex, parse_plugin_spec, resolve_entry,
     write_cached_registry_index,
 };
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 pub(crate) const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json";
@@ -292,27 +293,38 @@ fn verify_manifest_matches_registry(
     manifest: &PluginManifest,
 ) -> Result<()> {
     if manifest.name != entry.name {
-        bail!(
-            "plugin archive manifest name '{}' does not match registry name '{}'",
-            manifest.name,
-            entry.name
-        );
+        return Err(manifest_projection_mismatch("name"));
     }
     if manifest.version != entry.version {
-        bail!(
-            "plugin archive manifest version '{}' does not match registry version '{}'",
-            manifest.version,
-            entry.version
-        );
+        return Err(manifest_projection_mismatch("version"));
+    }
+    if !entry.capabilities.is_empty() {
+        let mut registry_capabilities = entry.capabilities.clone();
+        registry_capabilities.sort();
+        let mut manifest_capabilities: Vec<String> = serde_json::from_value(
+            serde_json::to_value(&manifest.capabilities)
+                .context("serializing plugin manifest capabilities")?,
+        )
+        .context("reading serialized plugin manifest capabilities")?;
+        manifest_capabilities.sort();
+        if manifest_capabilities != registry_capabilities {
+            return Err(manifest_projection_mismatch("capabilities"));
+        }
     }
     if entry.provides.is_some() && manifest.provides != entry.provides {
-        bail!(
-            "plugin archive manifest provides {:?} does not match registry provides {:?}",
-            manifest.provides,
-            entry.provides
-        );
+        return Err(manifest_projection_mismatch("provides"));
+    }
+    if entry.sender_match.is_some() && entry.sender_match != Some(manifest.sender_match) {
+        return Err(manifest_projection_mismatch("sender_match"));
     }
     Ok(())
+}
+
+fn manifest_projection_mismatch(field: &str) -> anyhow::Error {
+    anyhow::Error::msg(get_required_cli_string_with_args(
+        "cli-plugin-registry-manifest-mismatch",
+        &[("field", field)],
+    ))
 }
 
 #[cfg(test)]
@@ -437,6 +449,7 @@ capabilities = ["tool"]
             author: None,
             capabilities: Vec::new(),
             provides: None,
+            sender_match: None,
             url: "https://example.invalid/team-calendar.zip".to_string(),
             sha256: None,
         };
@@ -467,6 +480,7 @@ capabilities = ["tool"]
             author: None,
             capabilities: vec!["channel".to_string()],
             provides: Some("git".to_string()),
+            sender_match: None,
             url: "https://example.invalid/gitea.zip".to_string(),
             sha256: None,
         };
@@ -486,6 +500,77 @@ capabilities = ["tool"]
         };
 
         assert!(verify_manifest_matches_registry(&entry, &manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_registry_capabilities_projection_mismatch() {
+        let (mut entry, manifest) = matching_channel_projection();
+        entry.capabilities = vec!["tool".to_string()];
+
+        let err = verify_manifest_matches_registry(&entry, &manifest)
+            .expect_err("registry capability projection must match manifest");
+
+        assert!(err.to_string().contains("capabilities"));
+    }
+
+    #[test]
+    fn rejects_registry_sender_match_projection_mismatch() {
+        let (mut entry, manifest) = matching_channel_projection();
+        entry.sender_match = Some(zeroclaw::plugins::SenderMatch::Handle);
+
+        let err = verify_manifest_matches_registry(&entry, &manifest)
+            .expect_err("registry sender projection must match manifest");
+
+        assert!(err.to_string().contains("sender_match"));
+    }
+
+    #[test]
+    fn accepts_legacy_registry_without_optional_manifest_projections() {
+        let (mut entry, manifest) = matching_channel_projection();
+        entry.capabilities.clear();
+        entry.provides = None;
+        entry.sender_match = None;
+
+        verify_manifest_matches_registry(&entry, &manifest)
+            .expect("legacy registries may omit generated projections");
+    }
+
+    #[test]
+    fn accepts_matching_generated_manifest_projections() {
+        let (entry, manifest) = matching_channel_projection();
+
+        verify_manifest_matches_registry(&entry, &manifest)
+            .expect("generated projections should verify against their manifest");
+    }
+
+    fn matching_channel_projection() -> (PluginRegistryEntry, PluginManifest) {
+        (
+            PluginRegistryEntry {
+                name: "gitea".to_string(),
+                version: "0.2.0".to_string(),
+                description: None,
+                author: None,
+                capabilities: vec!["channel".to_string()],
+                provides: Some("git".to_string()),
+                sender_match: Some(zeroclaw::plugins::SenderMatch::CaseInsensitive),
+                url: "https://example.invalid/gitea.zip".to_string(),
+                sha256: None,
+            },
+            PluginManifest {
+                name: "gitea".to_string(),
+                version: "0.2.0".to_string(),
+                description: None,
+                author: None,
+                wasm_path: Some("plugin.wasm".to_string()),
+                wasm_sha256: None,
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Channel],
+                provides: Some("git".to_string()),
+                sender_match: zeroclaw::plugins::SenderMatch::CaseInsensitive,
+                permissions: Vec::new(),
+                signature: None,
+                publisher_key: None,
+            },
+        )
     }
 
     #[test]

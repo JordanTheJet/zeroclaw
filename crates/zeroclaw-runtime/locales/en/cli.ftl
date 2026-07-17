@@ -816,6 +816,7 @@ cli-plugin-capabilities = Capabilities: {$v}
 cli-plugin-permissions = Permissions: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (skill-only plugin)
+cli-plugin-registry-manifest-mismatch = Plugin archive manifest field '{$field}' does not match registry metadata.
 
 # ── plugin enable/disable + capability catalog (zeroclaw plugin list/enable/disable) ──
 cli-plugin-disable-none-configured = No configured '{$id}' channel to disable.
