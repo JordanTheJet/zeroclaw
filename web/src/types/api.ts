@@ -121,38 +121,6 @@ export interface Integration {
   status: "Available" | "Active";
 }
 
-/** One row of the unified capability catalog from `GET /api/plugins`. Mirrors
- *  the backend `CapabilityCatalogEntry`. `kind` is a snake_case string
- *  (`"channel"`, `"tool"`, …) except an unrecognized registry capability, which
- *  serializes as `{ other: string }`. */
-export interface PluginCatalogEntry {
-  kind: string | { other: string };
-  id: string;
-  display_name: string | null;
-  description: string | null;
-  /** Compiled into this binary. */
-  compiled_in: boolean;
-  /** An installed plugin serves or mirrors this id. */
-  installed: boolean;
-  /** Listed in the registry (installable). */
-  available: boolean;
-  /** The installed plugin `provides` a compiled-in built-in (mirror). */
-  mirrors_builtin: boolean;
-  /** Resolved provider after precedence (built-in > plugin > registry). */
-  origin: "built_in" | "plugin" | "registry";
-  /** The resolved provider is enabled/live. */
-  enabled: boolean;
-  version: string | null;
-  plugin_name: string | null;
-  permissions: string[];
-}
-
-export interface PluginsResponse {
-  plugins_enabled: boolean;
-  plugins_dir: string;
-  capabilities: PluginCatalogEntry[];
-}
-
 export interface DiagResult {
   severity: "ok" | "warn" | "error";
   category: string;

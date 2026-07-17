@@ -4,7 +4,6 @@ import type {
   CronJob,
   CronRun,
   Integration,
-  PluginsResponse,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -59,6 +58,9 @@ export class ApiError extends Error {
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -1946,11 +1948,7 @@ export function getIntegrations(): Promise<Integration[]> {
  *  registry-available plugins. Enable/disable is done through the Channels
  *  config (`PATCH /api/config/prop`), not here. */
 export function getPlugins(): Promise<PluginsResponse> {
-  return apiFetch<PluginsResponse>("/api/plugins").then((data) => ({
-    plugins_enabled: Boolean(data?.plugins_enabled),
-    plugins_dir: data?.plugins_dir ?? "",
-    capabilities: Array.isArray(data?.capabilities) ? data.capabilities : [],
-  }));
+  return apiFetch<PluginsResponse>("/api/plugins");
 }
 
 // ---------------------------------------------------------------------------

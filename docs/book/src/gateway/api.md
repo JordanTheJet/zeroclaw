@@ -69,6 +69,16 @@ CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
 returned.
 
+`GET /api/plugins` returns the read-only capability catalog used by the
+dashboard. The route exists in every gateway build: without WASM plugin support
+it still reports compiled/configured built-ins and sets
+`wasm_plugins_available: false`. Installed plugin discovery also runs while the
+canonical `[plugins].enabled` switch is off, so installed-but-disabled entries
+remain visible. Catalog `configured` values describe configuration intent, not
+runtime health. Source failures appear as stable `issues` codes while detailed
+diagnostics stay in gateway logs, allowing clients to distinguish a partial
+catalog from a valid empty source.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |

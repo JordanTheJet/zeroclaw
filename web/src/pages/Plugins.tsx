@@ -1,86 +1,155 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Puzzle, Check, Circle, Download, ArrowRight } from 'lucide-react';
-import type { PluginCatalogEntry } from '@/types/api';
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  ArrowRight,
+  Check,
+  Circle,
+  Download,
+  Puzzle,
+  TriangleAlert,
+} from 'lucide-react';
 import { getPlugins } from '@/lib/api';
+import type { PluginCatalogEntry, PluginCatalogIssue } from '@/lib/api';
+import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import type { BadgeTone } from '@/components/ui';
 
-/** `kind` is a snake_case string, except an unrecognized registry capability
- *  which serializes as `{ other: string }`. Normalize to a plain key. */
-function kindKey(k: PluginCatalogEntry['kind']): string {
-  return typeof k === 'string' ? k : (k?.other ?? 'other');
-}
-
-const KIND_LABELS: Record<string, string> = {
-  channel: 'Channels',
-  tool: 'Tools',
-  memory: 'Memory backends',
-  observer: 'Observers',
-  skill: 'Skills',
+const KIND_LABEL_KEYS: Record<string, string> = {
+  channel: 'plugins.kind.channel',
+  tool: 'plugins.kind.tool',
+  memory: 'plugins.kind.memory',
+  observer: 'plugins.kind.observer',
+  skill: 'plugins.kind.skill',
 };
 
-function kindLabel(k: string): string {
-  return KIND_LABELS[k] ?? k.charAt(0).toUpperCase() + k.slice(1);
+function kindLabel(kind: string): string {
+  const key = KIND_LABEL_KEYS[kind];
+  return key ? t(key) : kind;
 }
 
-/** A compact "where does this come from" label from the resolved origin + flags. */
-function sourceLabel(e: PluginCatalogEntry): string {
-  if (e.origin === 'built_in') return e.installed ? 'Built-in + plugin' : 'Built-in';
-  if (e.origin === 'plugin') return e.mirrors_builtin ? 'Plugin (mirror)' : 'Plugin';
-  return 'Available';
+function sourceLabel(entry: PluginCatalogEntry): string {
+  if (entry.origin === 'built_in') {
+    return t(entry.installed ? 'plugins.source.builtin_plugin' : 'plugins.source.builtin');
+  }
+  if (entry.origin === 'plugin') {
+    return t(entry.mirrors_builtin ? 'plugins.source.plugin_mirror' : 'plugins.source.plugin');
+  }
+  return t('plugins.source.registry');
 }
 
-function statusBadge(e: PluginCatalogEntry): {
-  label: string;
-  tone: BadgeTone;
-  icon: typeof Check;
-} {
-  if (e.enabled) return { label: 'Enabled', tone: 'ok', icon: Check };
-  if (e.origin === 'registry') return { label: 'Installable', tone: 'neutral', icon: Download };
-  return { label: 'Off', tone: 'neutral', icon: Circle };
+function statusBadge(
+  entry: PluginCatalogEntry,
+  pluginsEnabled: boolean,
+): { label: string; tone: BadgeTone; icon: typeof Check } {
+  if (entry.origin === 'registry' && !entry.installed) {
+    return { label: t('plugins.status.installable'), tone: 'neutral', icon: Download };
+  }
+  if (entry.origin === 'built_in' && entry.configured) {
+    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
+  }
+  if (entry.installed && !pluginsEnabled) {
+    return { label: t('plugins.status.installed_off'), tone: 'neutral', icon: Circle };
+  }
+  if (entry.configured && entry.mirrors_builtin) {
+    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
+  }
+  if (entry.installed) {
+    return { label: t('plugins.status.installed'), tone: 'neutral', icon: Check };
+  }
+  if (entry.configured) {
+    return { label: t('plugins.status.configured'), tone: 'ok', icon: Check };
+  }
+  return { label: t('plugins.status.not_configured'), tone: 'neutral', icon: Circle };
 }
 
-/** Where a card's "Configure" CTA lands: channels deep-link into the
- *  schema-driven Channels config (which owns per-alias enable/disable);
- *  everything else has no in-app config target yet. */
-function configHref(e: PluginCatalogEntry): string | null {
-  return kindKey(e.kind) === 'channel' ? `/config/channels/${e.id}` : null;
+/** Channel cards link only when the row carries evidence of a canonical
+ * built-in/config family. Novel plugin and registry-only channel IDs do not
+ * necessarily have a schema route. */
+function configHref(entry: PluginCatalogEntry): string | null {
+  const hasConfigFamily =
+    entry.compiled_in || entry.mirrors_builtin || entry.display_name != null;
+  return entry.kind === 'channel' && hasConfigFamily
+    ? `/config/channels/${encodeURIComponent(entry.id)}`
+    : null;
+}
+
+function installCommand(entry: PluginCatalogEntry): string | null {
+  if (!entry.available || entry.installed) return null;
+  return `zeroclaw plugin install ${entry.plugin_name ?? entry.id}`;
+}
+
+function issueLabel(issue: PluginCatalogIssue): string {
+  if (issue.source === 'installed' && issue.code === 'discovery_failed') {
+    return t('plugins.issue.discovery_failed');
+  }
+  if (issue.source === 'registry' && issue.code === 'cache_read_failed') {
+    return t('plugins.issue.registry_cache_failed');
+  }
+  return t('plugins.issue.unknown');
+}
+
+function interpolate(key: string, value: string): string {
+  return t(key).replace('{name}', value);
 }
 
 export default function Plugins() {
-  const navigate = useNavigate();
   const [entries, setEntries] = useState<PluginCatalogEntry[]>([]);
+  const [issues, setIssues] = useState<PluginCatalogIssue[]>([]);
   const [pluginsEnabled, setPluginsEnabled] = useState(false);
+  const [wasmPluginsAvailable, setWasmPluginsAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeKind, setActiveKind] = useState<string>('all');
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
     getPlugins()
-      .then((res) => {
-        setEntries(res.capabilities);
-        setPluginsEnabled(res.plugins_enabled);
+      .then((response) => {
+        if (cancelled) return;
+        setEntries(response.capabilities);
+        setIssues(response.issues);
+        setPluginsEnabled(response.plugins_enabled);
+        setWasmPluginsAvailable(response.wasm_plugins_available);
       })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, []);
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reload]);
 
-  const kinds = ['all', ...Array.from(new Set(entries.map((e) => kindKey(e.kind)))).sort()];
+  const kinds = ['all', ...Array.from(new Set(entries.map((entry) => entry.kind))).sort()];
   const filtered =
-    activeKind === 'all' ? entries : entries.filter((e) => kindKey(e.kind) === activeKind);
-
-  const grouped = filtered.reduce<Record<string, PluginCatalogEntry[]>>((acc, item) => {
-    const key = kindKey(item.kind);
-    (acc[key] ??= []).push(item);
-    return acc;
+    activeKind === 'all' ? entries : entries.filter((entry) => entry.kind === activeKind);
+  const grouped = filtered.reduce<Record<string, PluginCatalogEntry[]>>((groups, entry) => {
+    (groups[entry.kind] ??= []).push(entry);
+    return groups;
   }, {});
 
   if (error) {
     return (
       <div className="p-6">
-        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-4 text-sm text-status-error">
-          Failed to load plugins: {error}
+        <div
+          role="alert"
+          className="space-y-3 rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-4 text-sm text-status-error"
+        >
+          <p>{t('plugins.load_error')}: {error}</p>
+          <button
+            type="button"
+            onClick={() => setReload((value) => value + 1)}
+            className="rounded-[var(--radius-sm)] border border-current px-3 py-1.5 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+          >
+            {t('common.retry')}
+          </button>
         </div>
       </div>
     );
@@ -88,42 +157,85 @@ export default function Plugins() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div
-          className="h-8 w-8 border-2 rounded-full animate-spin border-pc-border"
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex h-64 items-center justify-center gap-3 text-sm text-pc-text-muted"
+      >
+        <span
+          aria-hidden="true"
+          className="h-8 w-8 animate-spin rounded-full border-2 border-pc-border"
           style={{ borderTopColor: 'var(--pc-accent)' }}
         />
+        <span>{t('plugins.loading')}</span>
       </div>
     );
   }
 
+  const systemStatus = !wasmPluginsAvailable
+    ? t('plugins.system_unavailable')
+    : pluginsEnabled
+      ? t('plugins.system_on')
+      : t('plugins.system_off');
+
   return (
-    <div className="p-6 space-y-6">
+    <div className="space-y-6 p-6">
       <PageHeader
-        title="Plugins"
-        description="Built-in, installed, and installable capabilities. Toggle channels from their config; add installable ones with `zeroclaw plugin install`."
-        actions={<Badge tone={pluginsEnabled ? 'ok' : 'neutral'}>
-          plugins {pluginsEnabled ? 'on' : 'off'}
+        title={t('plugins.title')}
+        description={t('plugins.subtitle')}
+        actions={<Badge tone={wasmPluginsAvailable && pluginsEnabled ? 'ok' : 'neutral'}>
+          {systemStatus}
         </Badge>}
       />
 
-      {/* Kind filter tabs */}
-      <div className="flex flex-wrap gap-2">
-        {kinds.map((k) => {
-          const active = activeKind === k;
+      {!wasmPluginsAvailable && (
+        <div
+          role="status"
+          className="rounded-[var(--radius-md)] border border-pc-border bg-pc-surface p-4 text-sm text-pc-text-muted"
+        >
+          {t('plugins.wasm_unavailable_hint')}
+        </div>
+      )}
+
+      {issues.length > 0 && (
+        <div
+          role="alert"
+          className="rounded-[var(--radius-md)] border border-status-warning/25 bg-status-warning/10 p-4 text-sm text-pc-text"
+        >
+          <div className="mb-2 flex items-center gap-2 font-medium">
+            <TriangleAlert aria-hidden="true" className="h-4 w-4 text-status-warning" />
+            {t('plugins.partial_title')}
+          </div>
+          <ul className="list-disc space-y-1 pl-5 text-pc-text-muted">
+            {issues.map((issue) => (
+              <li key={`${issue.source}:${issue.code}`}>{issueLabel(issue)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div
+        className="flex flex-wrap gap-2"
+        role="group"
+        aria-label={t('plugins.filter_label')}
+      >
+        {kinds.map((kind) => {
+          const active = activeKind === kind;
           return (
             <button
-              key={k}
+              key={kind}
               type="button"
-              onClick={() => setActiveKind(k)}
+              aria-pressed={active}
+              onClick={() => setActiveKind(kind)}
               className={[
-                'px-3 h-7 inline-flex items-center rounded-[var(--radius-md)] text-[13px] font-medium transition-colors cursor-pointer border',
+                'inline-flex h-7 cursor-pointer items-center rounded-[var(--radius-md)] border px-3 text-[13px] font-medium transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
                 active
-                  ? 'bg-pc-accent border-transparent text-[#0b1220]'
-                  : 'bg-transparent border-pc-border text-pc-text-secondary hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong',
+                  ? 'border-transparent bg-pc-accent text-[#0b1220]'
+                  : 'border-pc-border bg-transparent text-pc-text-secondary hover:border-pc-border-strong hover:bg-[var(--pc-hover)] hover:text-pc-text',
               ].join(' ')}
             >
-              {k === 'all' ? 'All' : kindLabel(k)}
+              {kind === 'all' ? t('plugins.kind.all') : kindLabel(kind)}
             </button>
           );
         })}
@@ -131,85 +243,91 @@ export default function Plugins() {
 
       {Object.keys(grouped).length === 0 ? (
         <Card className="p-10 text-center">
-          <Puzzle className="h-10 w-10 mx-auto mb-3 text-pc-text-faint" />
-          <p className="text-sm text-pc-text-muted">No capabilities to show.</p>
+          <Puzzle aria-hidden="true" className="mx-auto mb-3 h-10 w-10 text-pc-text-faint" />
+          <p className="text-sm text-pc-text-muted">{t('plugins.empty')}</p>
         </Card>
       ) : (
         Object.entries(grouped)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([kind, items]) => (
-            <div key={kind}>
-              <h3 className="text-[11px] font-medium uppercase tracking-wider mb-3 text-pc-text-faint">
-                {kindLabel(kind)}
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {items.map((e) => {
-                  const badge = statusBadge(e);
-                  const BadgeIcon = badge.icon;
-                  const href = configHref(e);
-                  const title = e.display_name ?? e.id;
-                  const body = (
-                    <>
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <h4 className="text-sm font-medium truncate text-pc-text">
-                            {title}
-                            {e.version && (
-                              <span className="text-pc-text-faint font-normal"> v{e.version}</span>
-                            )}
-                          </h4>
-                          <p className="text-sm mt-1 line-clamp-2 text-pc-text-muted">
-                            {e.description ?? sourceLabel(e)}
-                          </p>
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([kind, items], groupIndex) => {
+            const headingId = `plugin-kind-${groupIndex}`;
+            return (
+              <section key={kind} aria-labelledby={headingId}>
+                <h2
+                  id={headingId}
+                  className="mb-3 text-[11px] font-medium uppercase tracking-wider text-pc-text-faint"
+                >
+                  {kindLabel(kind)}
+                </h2>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {items.map((entry) => {
+                    const badge = statusBadge(entry, pluginsEnabled);
+                    const BadgeIcon = badge.icon;
+                    const href = configHref(entry);
+                    const command = installCommand(entry);
+                    const title = entry.display_name ?? entry.id;
+                    const body = (
+                      <>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <h3 className="truncate text-sm font-medium text-pc-text">
+                              {title}
+                              {entry.version && (
+                                <span className="font-normal text-pc-text-faint"> v{entry.version}</span>
+                              )}
+                            </h3>
+                            <p className="mt-1 line-clamp-2 text-sm text-pc-text-muted">
+                              {entry.description ?? sourceLabel(entry)}
+                            </p>
+                          </div>
+                          <Badge tone={badge.tone} className="flex-shrink-0">
+                            <BadgeIcon aria-hidden="true" className="h-3 w-3" />
+                            {badge.label}
+                          </Badge>
                         </div>
-                        <Badge tone={badge.tone} className="flex-shrink-0">
-                          <BadgeIcon className="h-3 w-3" />
-                          {badge.label}
-                        </Badge>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <Badge tone="neutral">{sourceLabel(e)}</Badge>
-                        {href ? (
-                          <span className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
-                            Configure
-                            <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
-                          </span>
-                        ) : e.available && !e.installed ? (
-                          <code className="text-[11px] text-pc-text-faint truncate">
-                            plugin install {e.id}
-                          </code>
-                        ) : null}
-                      </div>
-                    </>
-                  );
-                  return href ? (
-                    <button
-                      key={`${kind}:${e.id}`}
-                      type="button"
-                      onClick={() => navigate(href)}
-                      aria-label={`Configure: ${title}`}
-                      className={[
-                        'group p-5 w-full text-left flex flex-col gap-3 cursor-pointer',
-                        'bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]',
-                        'transition-colors hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
-                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-                        'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
-                      ].join(' ')}
-                    >
-                      {body}
-                    </button>
-                  ) : (
-                    <div
-                      key={`${kind}:${e.id}`}
-                      className="p-5 w-full text-left flex flex-col gap-3 bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]"
-                    >
-                      {body}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))
+                        <div className="flex items-center justify-between gap-2">
+                          <Badge tone="neutral">{sourceLabel(entry)}</Badge>
+                          {href ? (
+                            <span className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
+                              {t('plugins.configure')}
+                              <ArrowRight
+                                aria-hidden="true"
+                                className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5"
+                              />
+                            </span>
+                          ) : command ? (
+                            <code className="truncate text-[11px] text-pc-text-faint">{command}</code>
+                          ) : null}
+                        </div>
+                      </>
+                    );
+                    return href ? (
+                      <Link
+                        key={`${kind}:${entry.id}`}
+                        to={href}
+                        aria-label={interpolate('plugins.configure_aria', title)}
+                        className={[
+                          'group flex w-full flex-col gap-3 rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-5 text-left',
+                          'transition-colors hover:border-pc-border-strong hover:bg-[var(--pc-hover)]',
+                          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+                          'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+                        ].join(' ')}
+                      >
+                        {body}
+                      </Link>
+                    ) : (
+                      <article
+                        key={`${kind}:${entry.id}`}
+                        className="flex w-full flex-col gap-3 rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-5 text-left"
+                      >
+                        {body}
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })
       )}
     </div>
   );
