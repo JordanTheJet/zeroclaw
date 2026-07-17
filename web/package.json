@@ -9,7 +9,8 @@
   },
   "scripts": {
     "build": "tsc -b && vite build",
-    "dev": "vite"
+    "dev": "vite",
+    "test": "node --test src/pages/pluginCardActions.test.ts"
   },
   "browserslist": [
     "chrome >= 111",

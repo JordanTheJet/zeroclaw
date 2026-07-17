@@ -16,6 +16,10 @@
 use serde::Serialize;
 use std::collections::HashSet;
 
+use crate::host::PluginHost;
+use crate::registry::PluginRegistryIndex;
+use crate::{PluginCapability, PluginPermission};
+
 /// The kind of capability a catalog row describes. Mirrors `PluginCapability`
 /// plus an `Other` bucket for registry entries that carry an unrecognized
 /// capability string (so nothing is silently dropped).
@@ -55,6 +59,16 @@ pub enum CapabilityOrigin {
     Plugin,
     /// Only listed in the registry (installable, not configured locally).
     Registry,
+}
+
+/// Whether an installable package came from the canonical default registry or
+/// from a caller-selected registry. The registry URL itself is deliberately
+/// not carried into catalog/UI projections because it may contain credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRegistryOrigin {
+    Default,
+    Custom,
 }
 
 // ── Neutral input seeds ───────────────────────────────────────────────────────
@@ -100,6 +114,9 @@ pub struct AvailableSeed {
     pub kind: CapabilityKind,
     pub version: Option<String>,
     pub description: Option<String>,
+    /// Exact registry package identity (`name@version`) for install guidance.
+    pub install_source: String,
+    pub registry_origin: CatalogRegistryOrigin,
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
@@ -122,8 +139,9 @@ pub struct CapabilityCatalogEntry {
     /// The installed plugin `provides` a compiled-in built-in (mirror, not an
     /// override).
     pub mirrors_builtin: bool,
-    /// More than one installed or registry plugin package claims this
-    /// `(kind, id)`. The catalog must not choose one based on discovery order.
+    /// More than one provider at the highest available precedence claims this
+    /// `(kind, id)`. Ambiguity among losing lower-precedence sources only
+    /// withholds their metadata; it does not invalidate the selected provider.
     pub conflicted: bool,
     /// The current config has a concrete lifecycle control for this
     /// capability. Novel plugins remain false until per-plugin activation has
@@ -139,6 +157,11 @@ pub struct CapabilityCatalogEntry {
     pub version: Option<String>,
     /// The installed plugin's name, when a plugin is involved.
     pub plugin_name: Option<String>,
+    /// Exact registry package identity for an unambiguous available provider.
+    /// This is display metadata, not an executable shell command.
+    pub install_source: Option<String>,
+    /// Registry classification without exposing the cached registry URL.
+    pub registry_origin: Option<CatalogRegistryOrigin>,
     /// Permissions the installed plugin requests (empty for pure built-ins).
     pub permissions: Vec<String>,
 }
@@ -188,6 +211,8 @@ pub fn merge_capabilities(
                 configured: false,
                 version: None,
                 plugin_name: None,
+                install_source: None,
+                registry_origin: None,
                 permissions: Vec::new(),
             },
             builtin_configured: Some(b.configured),
@@ -205,10 +230,10 @@ pub fn merge_capabilities(
                     continue;
                 }
                 if a.installed_plugin_names.len() > 1 {
-                    a.entry.conflicted = true;
                     a.entry.mirrors_builtin |= p.mirrors_builtin;
-                    a.entry.toggleable = false;
                     a.entry.plugin_name = None;
+                    a.entry.install_source = None;
+                    a.entry.registry_origin = None;
                     a.entry.version = None;
                     a.entry.permissions.clear();
                     if a.builtin_configured.is_none() {
@@ -245,6 +270,8 @@ pub fn merge_capabilities(
                     configured: false,
                     version: p.version,
                     plugin_name: Some(p.plugin_name.clone()),
+                    install_source: None,
+                    registry_origin: None,
                     permissions: p.permissions,
                 },
                 builtin_configured: None,
@@ -265,8 +292,8 @@ pub fn merge_capabilities(
                 let entry = &mut a.entry;
                 entry.available = true;
                 if a.available_plugin_names.len() > 1 {
-                    entry.conflicted = true;
-                    entry.toggleable = false;
+                    entry.install_source = None;
+                    entry.registry_origin = None;
                     if !entry.installed {
                         entry.plugin_name = None;
                         entry.version = None;
@@ -276,8 +303,13 @@ pub fn merge_capabilities(
                     }
                     continue;
                 }
-                if !entry.conflicted && entry.plugin_name.is_none() {
+                let installed_provider_is_ambiguous = a.installed_plugin_names.len() > 1;
+                if !installed_provider_is_ambiguous && entry.plugin_name.is_none() {
                     entry.plugin_name = Some(r.plugin_name);
+                }
+                if !installed_provider_is_ambiguous {
+                    entry.install_source = Some(r.install_source);
+                    entry.registry_origin = Some(r.registry_origin);
                 }
                 if !entry.compiled_in && !entry.installed {
                     entry.version = r.version;
@@ -302,6 +334,8 @@ pub fn merge_capabilities(
                     configured: false,
                     version: r.version,
                     plugin_name: Some(r.plugin_name.clone()),
+                    install_source: Some(r.install_source),
+                    registry_origin: Some(r.registry_origin),
                     permissions: Vec::new(),
                 },
                 builtin_configured: None,
@@ -317,6 +351,8 @@ pub fn merge_capabilities(
     let mut out: Vec<CapabilityCatalogEntry> = accs
         .into_iter()
         .map(|a| {
+            let installed_conflicted = a.installed_plugin_names.len() > 1;
+            let registry_conflicted = a.available_plugin_names.len() > 1;
             let mut e = a.entry;
             e.origin = if e.compiled_in {
                 CapabilityOrigin::BuiltIn
@@ -333,6 +369,14 @@ pub fn merge_capabilities(
                 CapabilityOrigin::Plugin => a.plugin_configured.unwrap_or(false),
                 CapabilityOrigin::Registry => false,
             };
+            e.conflicted = match e.origin {
+                CapabilityOrigin::BuiltIn => false,
+                CapabilityOrigin::Plugin => installed_conflicted,
+                CapabilityOrigin::Registry => registry_conflicted,
+            };
+            if e.conflicted {
+                e.toggleable = false;
+            }
             e
         })
         .collect();
@@ -354,6 +398,123 @@ fn kind_rank(k: &CapabilityKind) -> u8 {
         CapabilityKind::Skill => 4,
         CapabilityKind::Other(_) => 5,
     }
+}
+
+// ── Shared seed gathering from installed plugins + the registry ────────────────
+//
+// These fold the plugin/registry sources (both `zeroclaw-plugins`-owned types)
+// into neutral seeds, so every surface reuses them. Building the *built-in*
+// channel seeds stays per-surface because it needs `zeroclaw-channels`, which
+// this crate deliberately does not depend on.
+
+/// A plugin permission's snake_case wire string (`"config_read"`, …).
+fn perm_wire(p: &PluginPermission) -> String {
+    serde_json::to_value(p)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// Fold every installed plugin capability into seeds.
+///
+/// `plugins_configured` is the subsystem switch. The two callbacks derive a
+/// channel's configuration and lifecycle control from the caller's live
+/// config view. `mirrors_builtin` distinguishes canonical built-in ids from
+/// novel `plugin.<name>` bindings without moving config ownership into this
+/// crate.
+pub fn installed_seeds(
+    host: &PluginHost,
+    plugins_configured: bool,
+    channel_configured: impl Fn(&str, bool) -> bool,
+    channel_toggleable: impl Fn(&str, bool) -> bool,
+) -> Vec<InstalledSeed> {
+    let infos = host.list_plugins();
+    let version_of = |name: &str| {
+        infos
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| i.version.clone())
+    };
+    let mut out = Vec::new();
+    for m in host.channel_plugins() {
+        let mirrors = m.provides.is_some();
+        let id = m
+            .provides
+            .clone()
+            .unwrap_or_else(|| zeroclaw_api::channel::plugin_channel_ref(&m.name));
+        out.push(InstalledSeed {
+            plugin_name: m.name.clone(),
+            configured: plugins_configured && channel_configured(&id, mirrors),
+            toggleable: channel_toggleable(&id, mirrors),
+            id,
+            kind: CapabilityKind::Channel,
+            mirrors_builtin: mirrors,
+            version: version_of(&m.name),
+            description: m.description.clone(),
+            permissions: m.permissions.iter().map(perm_wire).collect(),
+        });
+    }
+    for info in &infos {
+        for capability in &info.capabilities {
+            let kind = match capability {
+                PluginCapability::Channel => continue,
+                PluginCapability::Tool => CapabilityKind::Tool,
+                PluginCapability::Memory => CapabilityKind::Memory,
+                PluginCapability::Observer => CapabilityKind::Observer,
+                PluginCapability::Skill => CapabilityKind::Skill,
+            };
+            out.push(InstalledSeed {
+                plugin_name: info.name.clone(),
+                id: info.name.clone(),
+                kind,
+                mirrors_builtin: false,
+                version: Some(info.version.clone()),
+                description: info.description.clone(),
+                permissions: info.permissions.iter().map(perm_wire).collect(),
+                configured: plugins_configured,
+                toggleable: false,
+            });
+        }
+    }
+    out
+}
+
+/// Fold a cached registry index into available seeds — one row per declared
+/// capability kind (a plugin may be both a channel and a tool).
+pub fn available_seeds(index: &PluginRegistryIndex) -> Vec<AvailableSeed> {
+    let registry_origin = match index
+        .registry_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        Some(crate::registry::DEFAULT_REGISTRY_URL) | None => CatalogRegistryOrigin::Default,
+        Some(_) => CatalogRegistryOrigin::Custom,
+    };
+    crate::registry::resolved_entries(index)
+        .into_iter()
+        .flat_map(|e| {
+            e.capabilities.iter().map(move |capability| {
+                let kind = CapabilityKind::from_wire(capability);
+                let id = if kind == CapabilityKind::Channel {
+                    e.provides
+                        .clone()
+                        .unwrap_or_else(|| zeroclaw_api::channel::plugin_channel_ref(&e.name))
+                } else {
+                    e.name.clone()
+                };
+                AvailableSeed {
+                    plugin_name: e.name.clone(),
+                    id,
+                    kind,
+                    version: Some(e.version.clone()),
+                    description: e.description.clone(),
+                    install_source: crate::registry::install_source(e),
+                    registry_origin,
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -393,6 +554,8 @@ mod tests {
             kind,
             version: Some("2.0".to_string()),
             description: Some("from registry".to_string()),
+            install_source: format!("{id}@2.0"),
+            registry_origin: CatalogRegistryOrigin::Default,
         }
     }
 
@@ -466,6 +629,30 @@ mod tests {
         assert_eq!(e.origin, CapabilityOrigin::Registry);
         assert!(e.available && !e.installed && !e.compiled_in);
         assert!(!e.configured, "registry-only has no local configuration");
+        assert_eq!(e.install_source.as_deref(), Some("bluesky@2.0"));
+        assert_eq!(e.registry_origin, Some(CatalogRegistryOrigin::Default));
+    }
+
+    #[test]
+    fn registry_metadata_keeps_exact_release_when_compiled_builtin_wins() {
+        let out = merge_capabilities(
+            vec![builtin("git", true, true)],
+            vec![],
+            vec![AvailableSeed {
+                plugin_name: "gitea".to_string(),
+                id: "git".to_string(),
+                kind: CapabilityKind::Channel,
+                version: Some("0.2.0".to_string()),
+                description: None,
+                install_source: "gitea@0.2.0".to_string(),
+                registry_origin: CatalogRegistryOrigin::Custom,
+            }],
+        );
+        let entry = get(&out, "git");
+        assert_eq!(entry.origin, CapabilityOrigin::BuiltIn);
+        assert_eq!(entry.version, None, "resolved built-in has no version");
+        assert_eq!(entry.install_source.as_deref(), Some("gitea@0.2.0"));
+        assert_eq!(entry.registry_origin, Some(CatalogRegistryOrigin::Custom));
     }
 
     #[test]
@@ -509,6 +696,8 @@ mod tests {
         assert!(!entry.configured, "ambiguous plugin provider fails closed");
         assert_eq!(entry.description.as_deref(), Some("canonical git channel"));
         assert_eq!(entry.plugin_name, None);
+        assert_eq!(entry.install_source, None);
+        assert_eq!(entry.registry_origin, None);
         assert_eq!(entry.version, None);
         assert!(entry.permissions.is_empty());
     }
@@ -527,6 +716,8 @@ mod tests {
                 kind: CapabilityKind::Channel,
                 version: Some("1.0".to_string()),
                 description: None,
+                install_source: "gitea-a@1.0".to_string(),
+                registry_origin: CatalogRegistryOrigin::Default,
             }],
         );
         let entry = get(&out, "git");
@@ -543,6 +734,8 @@ mod tests {
             kind: CapabilityKind::Channel,
             version: Some("1.0.0".to_string()),
             description: Some("provider a".to_string()),
+            install_source: "gitea@1.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
         };
         let second = AvailableSeed {
             plugin_name: "forgejo".to_string(),
@@ -550,6 +743,8 @@ mod tests {
             kind: CapabilityKind::Channel,
             version: Some("2.0.0".to_string()),
             description: Some("provider b".to_string()),
+            install_source: "forgejo@2.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
         };
 
         let forward = merge_capabilities(vec![], vec![], vec![first.clone(), second.clone()]);
@@ -563,6 +758,8 @@ mod tests {
         assert_eq!(entry.plugin_name, None);
         assert_eq!(entry.version, None);
         assert_eq!(entry.description, None);
+        assert_eq!(entry.install_source, None);
+        assert_eq!(entry.registry_origin, None);
     }
 
     #[test]
@@ -575,6 +772,8 @@ mod tests {
             kind: CapabilityKind::Channel,
             version: Some("1.0.0".to_string()),
             description: Some("provider a".to_string()),
+            install_source: "gitea@1.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
         };
         let second = AvailableSeed {
             plugin_name: "forgejo".to_string(),
@@ -582,6 +781,8 @@ mod tests {
             kind: CapabilityKind::Channel,
             version: Some("2.0.0".to_string()),
             description: Some("provider b".to_string()),
+            install_source: "forgejo@2.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
         };
 
         let forward = merge_capabilities(
@@ -601,6 +802,78 @@ mod tests {
     }
 
     #[test]
+    fn lower_registry_conflict_preserves_compiled_builtin_controls() {
+        let first = AvailableSeed {
+            plugin_name: "gitea".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("1.0.0".to_string()),
+            description: None,
+            install_source: "gitea@1.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
+        };
+        let second = AvailableSeed {
+            plugin_name: "forgejo".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("2.0.0".to_string()),
+            description: None,
+            install_source: "forgejo@2.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
+        };
+
+        let entry = merge_capabilities(
+            vec![builtin("git", true, true)],
+            vec![],
+            vec![first, second],
+        )
+        .remove(0);
+        assert_eq!(entry.origin, CapabilityOrigin::BuiltIn);
+        assert!(!entry.conflicted, "selected native provider is unambiguous");
+        assert!(entry.configured && entry.toggleable);
+        assert_eq!(entry.install_source, None, "registry install is ambiguous");
+        assert_eq!(entry.registry_origin, None);
+    }
+
+    #[test]
+    fn lower_registry_conflict_preserves_installed_provider_controls() {
+        let first = AvailableSeed {
+            plugin_name: "gitea-release".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("1.0.0".to_string()),
+            description: None,
+            install_source: "gitea-release@1.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
+        };
+        let second = AvailableSeed {
+            plugin_name: "forgejo-release".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("2.0.0".to_string()),
+            description: None,
+            install_source: "forgejo-release@2.0.0".to_string(),
+            registry_origin: CatalogRegistryOrigin::Default,
+        };
+
+        let entry = merge_capabilities(
+            vec![],
+            vec![plugin("git", "installed-git", true, true)],
+            vec![first, second],
+        )
+        .remove(0);
+        assert_eq!(entry.origin, CapabilityOrigin::Plugin);
+        assert!(
+            !entry.conflicted,
+            "selected installed provider is unambiguous"
+        );
+        assert!(entry.configured && entry.toggleable);
+        assert_eq!(entry.plugin_name.as_deref(), Some("installed-git"));
+        assert_eq!(entry.install_source, None, "registry update is ambiguous");
+        assert_eq!(entry.registry_origin, None);
+    }
+
+    #[test]
     fn registry_package_name_can_differ_from_canonical_capability_id() {
         let out = merge_capabilities(
             vec![builtin("git", false, false)],
@@ -611,6 +884,8 @@ mod tests {
                 kind: CapabilityKind::Channel,
                 version: Some("0.1.0".to_string()),
                 description: None,
+                install_source: "gitea@0.1.0".to_string(),
+                registry_origin: CatalogRegistryOrigin::Default,
             }],
         );
         assert_eq!(out.len(), 1);
@@ -651,5 +926,117 @@ mod tests {
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
         // channels (aaa, zzz) before tools (redact)
         assert_eq!(ids, vec!["aaa", "zzz", "redact"]);
+    }
+
+    #[test]
+    fn installed_seeds_include_every_declared_non_channel_kind() {
+        let dir = tempfile::tempdir().expect("temporary plugin root");
+        let plugin_dir = dir.path().join("plugins").join("multi-capability");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"").expect("placeholder component");
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "multi-capability"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool", "memory", "observer"]
+"#,
+        )
+        .expect("plugin manifest");
+
+        let host = PluginHost::new(dir.path()).expect("discover plugin");
+        let seeds = installed_seeds(&host, true, |_, _| false, |_, _| false);
+
+        for kind in [
+            CapabilityKind::Tool,
+            CapabilityKind::Memory,
+            CapabilityKind::Observer,
+        ] {
+            assert!(
+                seeds
+                    .iter()
+                    .any(|seed| seed.kind == kind && seed.configured),
+                "missing configured {kind:?} seed"
+            );
+        }
+        assert_eq!(seeds.len(), 3, "one seed per declared capability");
+    }
+
+    #[test]
+    fn installed_novel_channel_uses_canonical_binding_and_config_view() {
+        let dir = tempfile::tempdir().expect("temporary plugin root");
+        let plugin_dir = dir.path().join("plugins").join("novel-channel");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"").expect("placeholder component");
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "novel-channel"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+"#,
+        )
+        .expect("plugin manifest");
+
+        let host = PluginHost::new(dir.path()).expect("discover plugin");
+        let seeds = installed_seeds(
+            &host,
+            true,
+            |id, mirrors_builtin| id == "plugin.novel-channel" && !mirrors_builtin,
+            |_, _| false,
+        );
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].id, "plugin.novel-channel");
+        assert!(seeds[0].configured);
+        assert!(!seeds[0].toggleable);
+    }
+
+    #[test]
+    fn available_seeds_use_resolved_release_and_canonical_channel_identity() {
+        fn entry(
+            name: &str,
+            version: &str,
+            provides: Option<&str>,
+        ) -> crate::registry::PluginRegistryEntry {
+            crate::registry::PluginRegistryEntry {
+                name: name.to_string(),
+                version: version.to_string(),
+                description: None,
+                author: None,
+                capabilities: vec!["channel".to_string()],
+                provides: provides.map(str::to_string),
+                sender_match: None,
+                url: format!("https://example.invalid/{name}-{version}.zip"),
+                sha256: None,
+            }
+        }
+
+        let index = PluginRegistryIndex {
+            plugins: vec![
+                entry("novel", "0.1.0", None),
+                entry("mirror", "0.2.0", Some("git")),
+                entry("novel", "0.2.0", None),
+            ],
+            registry_url: None,
+        };
+
+        let seeds = available_seeds(&index);
+        assert_eq!(seeds.len(), 2, "one resolved release per package");
+        let novel = seeds
+            .iter()
+            .find(|seed| seed.plugin_name == "novel")
+            .expect("novel package seed");
+        assert_eq!(novel.id, "plugin.novel");
+        assert_eq!(novel.version.as_deref(), Some("0.2.0"));
+        assert_eq!(novel.install_source, "novel@0.2.0");
+        assert_eq!(novel.registry_origin, CatalogRegistryOrigin::Default);
+        let mirror = seeds
+            .iter()
+            .find(|seed| seed.plugin_name == "mirror")
+            .expect("mirror package seed");
+        assert_eq!(mirror.id, "git");
     }
 }

@@ -69,6 +69,29 @@ CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
 returned.
 
+`GET /api/plugins` returns the read-only capability catalog used by the
+dashboard. The route exists in every gateway build: without WASM plugin support
+it still reports compiled/configured built-ins and sets
+`wasm_plugins_available: false`. Installed plugin discovery also runs while the
+canonical `[plugins].enabled` switch is off, so installed-but-disabled entries
+remain visible. Catalog `configured` values describe configuration intent, not
+runtime health. Source failures appear as stable `issues` codes while detailed
+diagnostics stay in gateway logs, allowing clients to distinguish a partial
+catalog from a valid empty source.
+Rows also carry `toggleable`, which is the only signal clients should use to
+offer a configuration action, and `conflicted`, which withholds an arbitrary
+winner when multiple providers claim the capability at the selected
+precedence. A conflict among lower-precedence registry candidates withholds
+ambiguous install metadata without disabling an unambiguous built-in or
+installed provider. Novel channel IDs use the canonical `plugin.<package>`
+binding. For non-channel capabilities, `id` is package discovery identity and
+need not equal a WIT-exported runtime member name. An unambiguous registry row
+can include `install_source`, an exact `name@version` package identity for
+display as data rather than as an executable shell command. `registry_origin`
+identifies only `default` or `custom`; the gateway intentionally withholds the
+registry URL because custom URLs can carry credentials in user-info or query
+parameters.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |

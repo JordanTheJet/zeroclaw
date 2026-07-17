@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 pub const REGISTRY_CACHE_DIR_NAME: &str = "plugin-registry";
 pub const REGISTRY_CACHE_FILE_NAME: &str = "registry.json";
+/// Canonical public registry used when the operator does not select one.
+pub const DEFAULT_REGISTRY_URL: &str =
+    "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json";
 
 /// Metadata entry from an installable plugin registry.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

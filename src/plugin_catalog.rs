@@ -12,19 +12,11 @@
 use serde_json::Value;
 use zeroclaw_config::schema::{ActiveChannelAliases, Config};
 use zeroclaw_plugins::catalog::{
-    AvailableSeed, BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin,
-    InstalledSeed, merge_capabilities,
+    BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin, available_seeds,
+    installed_seeds, merge_capabilities,
 };
 use zeroclaw_plugins::host::PluginHost;
-use zeroclaw_plugins::{PluginCapability, PluginPermission};
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-
-fn perm_wire(p: &PluginPermission) -> String {
-    serde_json::to_value(p)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
-}
 
 /// Build the unified catalog from the binary's three capability sources. `all`
 /// includes every compiled-in channel; otherwise only configured
@@ -72,96 +64,21 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
     // ── Installed plugins ──────────────────────────────────────────────────
     let plugins_configured = config.plugins.enabled;
     let active_channels = ActiveChannelAliases::compute(config);
-    let infos = host.list_plugins();
-    let version_of = |name: &str| {
-        infos
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| i.version.clone())
-    };
-    let mut installed: Vec<InstalledSeed> = Vec::new();
-    for m in host.channel_plugins() {
-        let mirrors = m.provides.is_some();
-        let id = m
-            .provides
-            .clone()
-            .unwrap_or_else(|| zeroclaw_api::channel::plugin_channel_ref(&m.name));
-        let toggleable = mirrors && !channel_aliases(config, &id).is_empty();
-        // This reports canonical config intent only. Component loading and
-        // health are runtime concerns rather than catalog state. Novel channel
-        // ownership comes from the same on-demand agent-binding view used by
-        // runtime admission.
-        let configured = plugins_configured
-            && if mirrors {
-                channel_type_configured(config, &id)
+    let installed = installed_seeds(
+        host,
+        plugins_configured,
+        |id, mirrors_builtin| {
+            if mirrors_builtin {
+                channel_type_configured(config, id)
             } else {
-                active_channels.contains(&id)
-            };
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id,
-            kind: CapabilityKind::Channel,
-            mirrors_builtin: mirrors,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            configured,
-            toggleable,
-        });
-    }
-    for m in host.tool_plugins() {
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id: m.name.clone(),
-            kind: CapabilityKind::Tool,
-            mirrors_builtin: false,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            configured: plugins_configured,
-            toggleable: false,
-        });
-    }
-    for m in host.skill_plugins() {
-        installed.push(InstalledSeed {
-            plugin_name: m.name.clone(),
-            id: m.name.clone(),
-            kind: CapabilityKind::Skill,
-            mirrors_builtin: false,
-            version: version_of(&m.name),
-            description: m.description.clone(),
-            permissions: m.permissions.iter().map(perm_wire).collect(),
-            configured: plugins_configured,
-            toggleable: false,
-        });
-    }
-    // Memory and observer bridges are not yet exposed through dedicated host
-    // accessors, but their manifest capabilities still belong in the installed
-    // catalog. `PluginInfo` is derived from that same canonical manifest.
-    for info in &infos {
-        for capability in &info.capabilities {
-            let kind = match capability {
-                PluginCapability::Memory => CapabilityKind::Memory,
-                PluginCapability::Observer => CapabilityKind::Observer,
-                PluginCapability::Tool | PluginCapability::Channel | PluginCapability::Skill => {
-                    continue;
-                }
-            };
-            installed.push(InstalledSeed {
-                plugin_name: info.name.clone(),
-                id: info.name.clone(),
-                kind,
-                mirrors_builtin: false,
-                version: Some(info.version.clone()),
-                description: info.description.clone(),
-                permissions: info.permissions.iter().map(perm_wire).collect(),
-                configured: plugins_configured,
-                toggleable: false,
-            });
-        }
-    }
+                active_channels.contains(id)
+            }
+        },
+        |id, mirrors_builtin| mirrors_builtin && !channel_aliases(config, id).is_empty(),
+    );
 
     // ── Registry-available ─────────────────────────────────────────────────
+    // ── Installed plugins + registry (shared folding) ──────────────────────
     let cached_index =
         match zeroclaw_plugins::registry::read_cached_registry_index(&config.data_dir) {
             Ok(index) => index,
@@ -177,33 +94,8 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
                 None
             }
         };
-    let available: Vec<AvailableSeed> = cached_index
-        .map(|idx| {
-            zeroclaw_plugins::registry::resolved_entries(&idx)
-                .into_iter()
-                .flat_map(|e| {
-                    // One row per declared capability kind (a plugin may be both a
-                    // channel and a tool); unknown strings bucket into Other.
-                    e.capabilities.iter().map(move |c| {
-                        let kind = CapabilityKind::from_wire(c);
-                        let id = if kind == CapabilityKind::Channel {
-                            e.provides.clone().unwrap_or_else(|| {
-                                zeroclaw_api::channel::plugin_channel_ref(&e.name)
-                            })
-                        } else {
-                            e.name.clone()
-                        };
-                        AvailableSeed {
-                            plugin_name: e.name.clone(),
-                            id,
-                            kind,
-                            version: Some(e.version.clone()),
-                            description: e.description.clone(),
-                        }
-                    })
-                })
-                .collect()
-        })
+    let available = cached_index
+        .map(|index| available_seeds(&index))
         .unwrap_or_default();
 
     merge_capabilities(builtins, installed, available)

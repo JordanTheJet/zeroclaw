@@ -115,6 +115,14 @@ pub fn build_spec() -> serde_json::Value {
             "ApprovalDecision": schema_value::<zeroclaw_runtime::sop::ApprovalDecision>(),
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
+            "PluginCatalogOrigin": schema_value::<crate::api_plugins::PluginCatalogOrigin>(),
+            "PluginCatalogRegistryOrigin": schema_value::<crate::api_plugins::PluginCatalogRegistryOrigin>(),
+            "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
+            "InstalledPlugin": schema_value::<crate::api_plugins::InstalledPlugin>(),
+            "PluginCatalogIssueSource": schema_value::<crate::api_plugins::PluginCatalogIssueSource>(),
+            "PluginCatalogIssueCode": schema_value::<crate::api_plugins::PluginCatalogIssueCode>(),
+            "PluginCatalogIssue": schema_value::<crate::api_plugins::PluginCatalogIssue>(),
+            "PluginsResponse": schema_value::<crate::api_plugins::PluginsResponse>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -234,6 +242,22 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "The slash-option kind registry.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlashOptionKindsResult" } } }
+                    }
+                }
+            }
+        },
+        "/api/plugins": {
+            "get": {
+                "tags": ["plugins"],
+                "summary": "List plugin capabilities",
+                "description": "Returns a request-time catalog derived from canonical channel/plugin config, installed plugin discovery, and the cached registry index. The endpoint remains available without WASM support; `wasm_plugins_available` identifies that build-time limitation. `configured` is configuration intent, not runtime health.",
+                "responses": {
+                    "200": {
+                        "description": "The unified capability catalog and source status.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PluginsResponse" } } }
+                    },
+                    "401": {
+                        "description": "A valid pairing-derived bearer token is required."
                     }
                 }
             }
@@ -525,6 +549,7 @@ mod tests {
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
         assert!(paths.get("/api/skills/slash-option-kinds").is_some());
+        assert!(paths.get("/api/plugins").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
     }
@@ -536,6 +561,29 @@ mod tests {
         let schemas = spec.pointer("/components/schemas").unwrap();
         assert!(schemas.get("A2aTaskRequest").is_some());
         assert!(schemas.get("A2aTask").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn spec_registers_plugin_catalog_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        for schema in [
+            "PluginCatalogEntry",
+            "PluginCatalogRegistryOrigin",
+            "InstalledPlugin",
+            "PluginCatalogIssue",
+            "PluginsResponse",
+        ] {
+            assert!(schemas.get(schema).is_some(), "missing schema {schema}");
+        }
+        assert_eq!(
+            spec.pointer(
+                "/paths/~1api~1plugins/get/responses/200/content/application~1json/schema/$ref"
+            )
+            .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PluginsResponse")
+        );
     }
 
     #[cfg(feature = "schema-export")]

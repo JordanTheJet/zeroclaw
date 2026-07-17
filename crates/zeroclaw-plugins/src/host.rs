@@ -24,6 +24,35 @@ struct LoadedPlugin {
     plugin_dir: PathBuf,
 }
 
+/// Request-time summary of plugin candidates rejected during discovery.
+///
+/// This report is returned to the caller and is never stored on [`PluginHost`];
+/// manifests and signature policy remain the canonical sources. Runtime paths
+/// that only need accepted plugins may keep using the existing constructors.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PluginDiscoveryReport {
+    failure_count: usize,
+}
+
+impl PluginDiscoveryReport {
+    /// Number of directory entries or plugin candidates discovery could not
+    /// inspect or accept.
+    #[must_use]
+    pub fn failure_count(self) -> usize {
+        self.failure_count
+    }
+
+    /// Whether discovery was partial rather than a valid complete scan.
+    #[must_use]
+    pub fn has_failures(self) -> bool {
+        self.failure_count != 0
+    }
+
+    fn record_failure(&mut self) {
+        self.failure_count += 1;
+    }
+}
+
 impl PluginHost {
     /// Create a new plugin host rooted at `workspace_dir`, scanning its
     /// `plugins/` subdirectory.
@@ -58,6 +87,23 @@ impl PluginHost {
         signature_mode: SignatureMode,
         trusted_publisher_keys: Vec<String>,
     ) -> Result<Self, PluginError> {
+        Self::from_plugins_dir_with_security_report(
+            plugins_dir,
+            signature_mode,
+            trusted_publisher_keys,
+        )
+        .map(|(host, _report)| host)
+    }
+
+    /// Discover plugins with the same policy as
+    /// [`Self::from_plugins_dir_with_security`], returning a request-local
+    /// report when individual candidates were rejected while valid plugins
+    /// remained usable.
+    pub fn from_plugins_dir_with_security_report(
+        plugins_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+    ) -> Result<(Self, PluginDiscoveryReport), PluginError> {
         if !plugins_dir.exists() {
             std::fs::create_dir_all(plugins_dir)?;
         }
@@ -69,8 +115,8 @@ impl PluginHost {
             trusted_publisher_keys,
         };
 
-        host.discover()?;
-        Ok(host)
+        let report = host.discover()?;
+        Ok((host, report))
     }
 
     /// Parse the signature mode string from config into a `SignatureMode`.
@@ -121,56 +167,89 @@ impl PluginHost {
     }
 
     /// Discover plugins in the plugins directory.
-    fn discover(&mut self) -> Result<(), PluginError> {
+    fn discover(&mut self) -> Result<PluginDiscoveryReport, PluginError> {
+        let mut report = PluginDiscoveryReport::default();
         if !self.plugins_dir.exists() {
-            return Ok(());
+            return Ok(report);
         }
 
         let entries = std::fs::read_dir(&self.plugins_dir)?;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.record_failure();
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": error.to_string(), "error_key": "plugin_discovery_entry_read_failed"})), "plugin directory entry could not be read");
+                    continue;
+                }
+            };
             let path = entry.path();
-            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                let manifest_path = path.join("manifest.toml");
-                if manifest_path.exists()
-                    && let Ok((manifest_toml, manifest)) = read_manifest(&manifest_path)
-                {
-                    if path.file_name().and_then(|name| name.to_str())
-                        != Some(manifest.name.as_str())
-                    {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "manifest_name": manifest.name.clone()})), "skipping plugin whose manifest name does not match its directory");
-                        continue;
-                    }
-                    if let Err(e) = validate_manifest_shape(&manifest, &path) {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid manifest shape");
-                        continue;
-                    }
-
-                    if let Err(e) =
-                        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)
-                    {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to signature verification failure");
-                        continue;
-                    }
-
-                    if let Some(relative) = manifest.wasm_path.as_deref()
-                        && let Err(e) = resolve_confined_wasm_path(&path, relative)
-                    {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to unsafe wasm_path");
-                        continue;
-                    }
-
-                    self.loaded.insert(
-                        manifest.name.clone(),
-                        LoadedPlugin {
-                            manifest,
-                            plugin_dir: path.clone(),
-                        },
-                    );
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    report.record_failure();
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_file_type_failed"})), "plugin directory entry type could not be read");
+                    continue;
+                }
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("manifest.toml");
+            match manifest_path.try_exists() {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    report.record_failure();
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_manifest_metadata_failed"})), "plugin manifest metadata could not be read");
+                    continue;
                 }
             }
+            let (manifest_toml, manifest) = match read_manifest(&manifest_path) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    report.record_failure();
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_manifest_read_failed"})), "skipping plugin whose manifest could not be read");
+                    continue;
+                }
+            };
+            if path.file_name().and_then(|name| name.to_str()) != Some(manifest.name.as_str()) {
+                report.record_failure();
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "manifest_name": manifest.name.clone(), "error_key": "plugin_discovery_name_mismatch"})), "skipping plugin whose manifest name does not match its directory");
+                continue;
+            }
+            if let Err(error) = validate_manifest_shape(&manifest, &path) {
+                report.record_failure();
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_manifest_shape_invalid"})), "skipping plugin due to invalid manifest shape");
+                continue;
+            }
+
+            if let Err(error) =
+                self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)
+            {
+                report.record_failure();
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_signature_rejected"})), "skipping plugin due to signature verification failure");
+                continue;
+            }
+
+            if let Some(relative) = manifest.wasm_path.as_deref()
+                && let Err(error) = resolve_confined_wasm_path(&path, relative)
+            {
+                report.record_failure();
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": error.to_string(), "error_key": "plugin_discovery_wasm_path_rejected"})), "skipping plugin due to unsafe wasm_path");
+                continue;
+            }
+
+            self.loaded.insert(
+                manifest.name.clone(),
+                LoadedPlugin {
+                    manifest,
+                    plugin_dir: path,
+                },
+            );
         }
 
-        Ok(())
+        Ok(report)
     }
 
     /// Verify a plugin's signature against configured policy.
@@ -1220,7 +1299,7 @@ provides = "nextcloud_talk"
         let dir = tempdir().unwrap();
         write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
 
-        let host = PluginHost::from_plugins_dir_with_security(
+        let (host, report) = PluginHost::from_plugins_dir_with_security_report(
             dir.path(),
             SignatureMode::Strict,
             Vec::new(),
@@ -1231,6 +1310,28 @@ provides = "nextcloud_talk"
             host.list_plugins().is_empty(),
             "strict mode must reject an unsigned plugin during discovery"
         );
+        assert_eq!(report.failure_count(), 1);
+    }
+
+    #[test]
+    fn discovery_report_preserves_valid_plugins_and_counts_malformed_candidates() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "valid-tool");
+        let malformed = dir.path().join("malformed-tool");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("manifest.toml"), "this is not toml").unwrap();
+
+        let (host, report) = PluginHost::from_plugins_dir_with_security_report(
+            dir.path(),
+            SignatureMode::Disabled,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(report.failure_count(), 1);
+        assert!(report.has_failures());
+        assert_eq!(host.list_plugins().len(), 1);
+        assert_eq!(host.list_plugins()[0].name, "valid-tool");
     }
 
     #[test]
