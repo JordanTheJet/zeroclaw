@@ -75,8 +75,13 @@ pub fn registry_cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn read_cached_registry_index(data_dir: &Path) -> Result<Option<PluginRegistryIndex>> {
     let path = registry_cache_path(data_dir);
-    let Ok(registry_json) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let registry_json = match std::fs::read_to_string(&path) {
+        Ok(registry_json) => registry_json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading cached plugin registry {}", path.display()));
+        }
     };
     serde_json::from_str::<PluginRegistryIndex>(&registry_json)
         .map(Some)
@@ -323,5 +328,22 @@ mod tests {
             cached.plugins[0].sender_match,
             Some(SenderMatch::CaseInsensitive)
         );
+    }
+
+    #[test]
+    fn cache_absence_is_distinct_from_an_unreadable_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            read_cached_registry_index(dir.path()).unwrap().is_none(),
+            "a missing cache is a valid empty source"
+        );
+
+        let path = registry_cache_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        let error = read_cached_registry_index(dir.path())
+            .expect_err("invalid UTF-8 must be reported instead of treated as absence");
+        assert!(error.to_string().contains("reading cached plugin registry"));
     }
 }
