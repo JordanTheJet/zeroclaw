@@ -143,12 +143,13 @@ async fn socket_client_rejects_plaintext_without_operator_policy() {
     .expect("socket channel plugin instantiates with SocketClient granted");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    channel.listen(tx).await.expect("listen starts");
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("echoed bytes arrive within timeout")
         .expect("channel sender not dropped")
         .content;
+    listener.abort();
 
     assert!(
         content.starts_with("connect: socket_plaintext_not_allowed:"),
@@ -176,12 +177,13 @@ async fn plaintext_authorization_does_not_bypass_destination_policy() {
     .expect("socket channel plugin instantiates with SocketClient granted");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    channel.listen(tx).await.expect("listen starts");
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("policy error arrives within timeout")
         .expect("channel sender not dropped")
         .content;
+    listener.abort();
 
     assert!(
         content.starts_with("connect: socket_destination_not_allowed:"),

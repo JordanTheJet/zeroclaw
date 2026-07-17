@@ -1120,12 +1120,13 @@ mod tests {
             .expect("real socket component instantiates");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        channel.listen(tx).await.unwrap();
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
         let content = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("component receives echoed bytes")
             .expect("channel sender remains open")
             .content;
+        listener.abort();
         assert_eq!(content, "ping");
     }
 }
