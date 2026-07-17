@@ -383,6 +383,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -2736,8 +2738,12 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
-    List,
+    /// List built-in channels, installed plugin capabilities, and what's installable
+    List {
+        /// Include every compiled-in built-in, not just configured/active ones
+        #[arg(long)]
+        all: bool,
+    },
     /// Search an installable plugin registry
     Search {
         /// Query to match against plugin names and descriptions
@@ -2758,6 +2764,22 @@ enum PluginCommands {
     Remove {
         /// Plugin name
         name: String,
+    },
+    /// Enable a channel capability (flips its config `enabled`)
+    Enable {
+        /// Capability id (channel type, e.g. `telegram`)
+        id: String,
+        /// The specific alias to toggle (required when several are configured)
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Disable a channel capability (flips its config `enabled`)
+    Disable {
+        /// Capability id (channel type, e.g. `telegram`)
+        id: String,
+        /// The specific alias to toggle (required when several are configured)
+        #[arg(long)]
+        alias: Option<String>,
     },
     /// Show information about a plugin
     Info {
@@ -6183,22 +6205,13 @@ async fn main() -> Result<()> {
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
-            PluginCommands::List => {
+            PluginCommands::List { all } => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                // Unified capability catalog: built-in + installed + installable,
+                // deduped by the shared resolver (built-in wins; a plugin that
+                // `provides` a built-in mirrors it).
+                let catalog = crate::plugin_catalog::gather(&config, &host, all);
+                crate::plugin_catalog::render(&catalog);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -6323,6 +6336,30 @@ async fn main() -> Result<()> {
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
                 );
+                Ok(())
+            }
+            PluginCommands::Enable { id, alias } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                Box::pin(crate::plugin_catalog::set_capability_enabled(
+                    &mut config,
+                    &host,
+                    &id,
+                    alias,
+                    true,
+                ))
+                .await?;
+                Ok(())
+            }
+            PluginCommands::Disable { id, alias } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                Box::pin(crate::plugin_catalog::set_capability_enabled(
+                    &mut config,
+                    &host,
+                    &id,
+                    alias,
+                    false,
+                ))
+                .await?;
                 Ok(())
             }
             PluginCommands::Info { name } => {

@@ -1,3 +1,4 @@
+use crate::SenderMatch;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,16 @@ pub struct PluginRegistryEntry {
     pub author: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Canonical built-in channel id mirrored by this package. Registry
+    /// publishers generate this from the manifest's `provides`; it is not an
+    /// independently authored identity.
+    #[serde(default)]
+    pub provides: Option<String>,
+    /// Sender representation emitted by a channel package. Registry publishers
+    /// generate this projection from the packaged manifest; the manifest
+    /// remains the source of truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_match: Option<SenderMatch>,
     pub url: String,
     #[serde(default)]
     pub sha256: Option<String>,
@@ -142,6 +153,31 @@ pub fn resolve_entry<'a>(
         .ok_or_else(|| anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name)))
 }
 
+/// Resolve the install-default entry for every distinct package in registry
+/// order. This deliberately delegates version choice to [`resolve_entry`] so
+/// search, install, and catalog surfaces cannot disagree about which unpinned
+/// version is current.
+pub fn resolved_entries(index: &PluginRegistryIndex) -> Vec<&PluginRegistryEntry> {
+    let mut seen = std::collections::HashSet::new();
+    index
+        .plugins
+        .iter()
+        .filter_map(|entry| {
+            if !seen.insert(entry.name.as_str()) {
+                return None;
+            }
+            resolve_entry(
+                index,
+                &PluginSpec {
+                    name: entry.name.clone(),
+                    version: None,
+                },
+            )
+            .ok()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +191,8 @@ mod tests {
                     description: Some("Schedule meetings".to_string()),
                     author: None,
                     capabilities: vec!["tool".to_string()],
+                    provides: None,
+                    sender_match: None,
                     url: "https://example.invalid/team-calendar-0.1.0.zip".to_string(),
                     sha256: None,
                 },
@@ -164,6 +202,8 @@ mod tests {
                     description: Some("Research web pages".to_string()),
                     author: None,
                     capabilities: vec!["tool".to_string()],
+                    provides: None,
+                    sender_match: None,
                     url: "https://example.invalid/web-research-0.1.0.zip".to_string(),
                     sha256: None,
                 },
@@ -173,12 +213,24 @@ mod tests {
                     description: Some("Team calendar scheduling".to_string()),
                     author: None,
                     capabilities: vec!["tool".to_string()],
+                    provides: None,
+                    sender_match: None,
                     url: "https://example.invalid/team-calendar-0.2.0.zip".to_string(),
                     sha256: None,
                 },
             ],
             registry_url: None,
         }
+    }
+
+    #[test]
+    fn resolved_entries_use_the_same_last_version_as_unpinned_install() {
+        let index = sample_index();
+        let resolved = resolved_entries(&index);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "team-calendar");
+        assert_eq!(resolved[0].version, "0.2.0");
+        assert_eq!(resolved[1].name, "web-research");
     }
 
     #[test]
@@ -241,5 +293,35 @@ mod tests {
             Some("https://example.invalid/registry.json")
         );
         assert!(registry_cache_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn official_channel_projections_round_trip_through_cache() {
+        let index: PluginRegistryIndex = serde_json::from_str(
+            r#"{
+                "plugins": [{
+                    "name": "gitea",
+                    "version": "0.2.0",
+                    "capabilities": ["channel"],
+                    "provides": "git",
+                    "sender_match": "case_insensitive",
+                    "url": "https://example.invalid/gitea-0.2.0.zip"
+                }]
+            }"#,
+        )
+        .expect("official registry shape should parse");
+        let dir = tempfile::tempdir().unwrap();
+
+        write_cached_registry_index(dir.path(), "https://example.invalid/registry.json", &index)
+            .unwrap();
+        let cached = read_cached_registry_index(dir.path())
+            .unwrap()
+            .expect("cache should exist");
+
+        assert_eq!(cached.plugins, index.plugins);
+        assert_eq!(
+            cached.plugins[0].sender_match,
+            Some(SenderMatch::CaseInsensitive)
+        );
     }
 }
