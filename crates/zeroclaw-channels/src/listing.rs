@@ -339,6 +339,40 @@ mod tests {
     }
 
     #[test]
+    fn every_typed_compile_alias_resolves_to_channel_presence() {
+        let cfg = ChannelsConfig::default();
+        let canonical_names: BTreeSet<_> = cfg
+            .channel_presence()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+
+        for spec in CHANNEL_COMPILE_SPECS {
+            if spec.schema_name.is_none() {
+                assert_eq!(
+                    spec.type_keys,
+                    &["acp-server", "acp_server"],
+                    "only ACP is configured outside ChannelsConfig"
+                );
+                for alias in spec.type_keys {
+                    assert_eq!(canonical_channel_type(&cfg, alias), None);
+                }
+                continue;
+            }
+
+            for alias in spec.type_keys {
+                let canonical = canonical_channel_type(&cfg, alias).unwrap_or_else(|| {
+                    panic!("typed channel alias `{alias}` has no config family")
+                });
+                assert!(
+                    canonical_names.contains(canonical),
+                    "typed channel alias `{alias}` resolved outside channel_presence"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compiled_channel_names_are_schema_names() {
         let cfg = ChannelsConfig::default();
         let schema_names: BTreeSet<_> = cfg.channels().into_iter().map(|info| info.name).collect();

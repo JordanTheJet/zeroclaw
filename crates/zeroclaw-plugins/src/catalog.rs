@@ -14,6 +14,7 @@
 //! resolved provider when the built-in is not compiled into this binary.
 
 use serde::Serialize;
+use std::collections::HashSet;
 
 /// The kind of capability a catalog row describes. Mirrors `PluginCapability`
 /// plus an `Other` bucket for registry entries that carry an unrecognized
@@ -52,7 +53,7 @@ pub enum CapabilityOrigin {
     BuiltIn,
     /// Served by an installed WASM plugin.
     Plugin,
-    /// Only listed in the registry (installable, not live).
+    /// Only listed in the registry (installable, not configured locally).
     Registry,
 }
 
@@ -60,8 +61,8 @@ pub enum CapabilityOrigin {
 
 /// A compiled-in / configured built-in capability (e.g. a channel from
 /// `CHANNEL_COMPILE_SPECS`). `compiled` is whether the feature is in this
-/// binary; `enabled` is the caller-computed live state (compiled && configured
-/// && at least one alias enabled).
+/// binary; `configured` is the caller-computed config intent. It deliberately
+/// does not claim that a runtime component started or passed its health check.
 #[derive(Debug, Clone)]
 pub struct BuiltinSeed {
     pub id: String,
@@ -69,13 +70,13 @@ pub struct BuiltinSeed {
     pub display: Option<String>,
     pub description: Option<String>,
     pub compiled: bool,
-    pub enabled: bool,
+    pub configured: bool,
     pub toggleable: bool,
 }
 
 /// An installed plugin capability. `id` is the `provides` id when it mirrors a
-/// built-in, else the plugin's own name. `enabled` is the caller-computed live
-/// state (plugins.enabled && loaded && its config `enabled`).
+/// built-in, else the canonical `plugin.<name>` binding for a novel channel.
+/// `configured` is the caller-computed config intent, not runtime liveness.
 #[derive(Debug, Clone)]
 pub struct InstalledSeed {
     pub plugin_name: String,
@@ -85,7 +86,7 @@ pub struct InstalledSeed {
     pub version: Option<String>,
     pub description: Option<String>,
     pub permissions: Vec<String>,
-    pub enabled: bool,
+    pub configured: bool,
     pub toggleable: bool,
 }
 
@@ -105,7 +106,7 @@ pub struct AvailableSeed {
 
 /// One catalog row: a capability id, every place it comes from (the `*_in`
 /// flags), and the resolved provider's details.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityCatalogEntry {
     pub kind: CapabilityKind,
     pub id: String,
@@ -121,9 +122,8 @@ pub struct CapabilityCatalogEntry {
     /// The installed plugin `provides` a compiled-in built-in (mirror, not an
     /// override).
     pub mirrors_builtin: bool,
-    /// More than one installed plugin claims this `(kind, id)`. Runtime
-    /// resolution fails closed for the ambiguous providers; the catalog must
-    /// not choose one based on discovery order.
+    /// More than one installed or registry plugin package claims this
+    /// `(kind, id)`. The catalog must not choose one based on discovery order.
     pub conflicted: bool,
     /// The current config has a concrete lifecycle control for this
     /// capability. Novel plugins remain false until per-plugin activation has
@@ -132,8 +132,9 @@ pub struct CapabilityCatalogEntry {
 
     /// Which source wins after precedence (built-in > plugin > registry).
     pub origin: CapabilityOrigin,
-    /// The resolved provider is enabled/live.
-    pub enabled: bool,
+    /// The resolved source is selected by canonical configuration. This is
+    /// configuration intent, not proof that a component loaded or is healthy.
+    pub configured: bool,
     /// Version of the resolved provider (plugin version; `None` for built-ins).
     pub version: Option<String>,
     /// The installed plugin's name, when a plugin is involved.
@@ -142,12 +143,14 @@ pub struct CapabilityCatalogEntry {
     pub permissions: Vec<String>,
 }
 
-/// Internal accumulator carrying both providers' enabled/version so the resolved
-/// value can be chosen in a final pass.
+/// Per-call accumulator carrying source-specific configured state and provider
+/// identities so the resolved view can be chosen without an order winner.
 struct Acc {
     entry: CapabilityCatalogEntry,
-    builtin_enabled: Option<bool>,
-    plugin_enabled: Option<bool>,
+    builtin_configured: Option<bool>,
+    plugin_configured: Option<bool>,
+    installed_plugin_names: HashSet<String>,
+    available_plugin_names: HashSet<String>,
 }
 
 /// Merge the three seed sets into one deduped, precedence-resolved catalog,
@@ -182,13 +185,15 @@ pub fn merge_capabilities(
                 toggleable: b.toggleable,
                 // finalized below
                 origin: CapabilityOrigin::BuiltIn,
-                enabled: false,
+                configured: false,
                 version: None,
                 plugin_name: None,
                 permissions: Vec::new(),
             },
-            builtin_enabled: Some(b.enabled),
-            plugin_enabled: None,
+            builtin_configured: Some(b.configured),
+            plugin_configured: None,
+            installed_plugin_names: HashSet::new(),
+            available_plugin_names: HashSet::new(),
         });
     }
 
@@ -196,13 +201,20 @@ pub fn merge_capabilities(
         match find(&accs, &p.kind, &p.id) {
             Some(i) => {
                 let a = &mut accs[i];
-                if a.entry.installed {
+                if !a.installed_plugin_names.insert(p.plugin_name.clone()) {
+                    continue;
+                }
+                if a.installed_plugin_names.len() > 1 {
                     a.entry.conflicted = true;
                     a.entry.mirrors_builtin |= p.mirrors_builtin;
+                    a.entry.toggleable = false;
                     a.entry.plugin_name = None;
                     a.entry.version = None;
                     a.entry.permissions.clear();
-                    a.plugin_enabled = Some(false);
+                    if a.builtin_configured.is_none() {
+                        a.entry.description = None;
+                    }
+                    a.plugin_configured = Some(false);
                     continue;
                 }
                 a.entry.installed = true;
@@ -211,9 +223,9 @@ pub fn merge_capabilities(
                 a.entry.plugin_name = Some(p.plugin_name);
                 a.entry.version = p.version;
                 a.entry.permissions = p.permissions;
-                a.plugin_enabled = Some(p.enabled);
-                // Take the plugin's description when the built-in had none.
-                if a.entry.description.is_none() {
+                a.plugin_configured = Some(p.configured);
+                // Provider metadata never replaces a canonical built-in view.
+                if a.builtin_configured.is_none() {
                     a.entry.description = p.description;
                 }
             }
@@ -230,13 +242,15 @@ pub fn merge_capabilities(
                     conflicted: false,
                     toggleable: p.toggleable,
                     origin: CapabilityOrigin::Plugin,
-                    enabled: false,
+                    configured: false,
                     version: p.version,
-                    plugin_name: Some(p.plugin_name),
+                    plugin_name: Some(p.plugin_name.clone()),
                     permissions: p.permissions,
                 },
-                builtin_enabled: None,
-                plugin_enabled: Some(p.enabled),
+                builtin_configured: None,
+                plugin_configured: Some(p.configured),
+                installed_plugin_names: HashSet::from([p.plugin_name]),
+                available_plugin_names: HashSet::new(),
             }),
         }
     }
@@ -244,14 +258,30 @@ pub fn merge_capabilities(
     for r in available {
         match find(&accs, &r.kind, &r.id) {
             Some(i) => {
-                let entry = &mut accs[i].entry;
+                let a = &mut accs[i];
+                if !a.available_plugin_names.insert(r.plugin_name.clone()) {
+                    continue;
+                }
+                let entry = &mut a.entry;
                 entry.available = true;
+                if a.available_plugin_names.len() > 1 {
+                    entry.conflicted = true;
+                    entry.toggleable = false;
+                    if !entry.installed {
+                        entry.plugin_name = None;
+                        entry.version = None;
+                        if a.builtin_configured.is_none() {
+                            entry.description = None;
+                        }
+                    }
+                    continue;
+                }
                 if !entry.conflicted && entry.plugin_name.is_none() {
                     entry.plugin_name = Some(r.plugin_name);
                 }
                 if !entry.compiled_in && !entry.installed {
                     entry.version = r.version;
-                    if entry.description.is_none() {
+                    if a.builtin_configured.is_none() {
                         entry.description = r.description;
                     }
                 }
@@ -269,19 +299,21 @@ pub fn merge_capabilities(
                     conflicted: false,
                     toggleable: false,
                     origin: CapabilityOrigin::Registry,
-                    enabled: false,
+                    configured: false,
                     version: r.version,
-                    plugin_name: Some(r.plugin_name),
+                    plugin_name: Some(r.plugin_name.clone()),
                     permissions: Vec::new(),
                 },
-                builtin_enabled: None,
-                plugin_enabled: None,
+                builtin_configured: None,
+                plugin_configured: None,
+                installed_plugin_names: HashSet::new(),
+                available_plugin_names: HashSet::from([r.plugin_name]),
             }),
         }
     }
 
     // Finalize: resolve origin (built-in > plugin > registry) and the resolved
-    // provider's `enabled`.
+    // provider's configured state.
     let mut out: Vec<CapabilityCatalogEntry> = accs
         .into_iter()
         .map(|a| {
@@ -296,9 +328,9 @@ pub fn merge_capabilities(
                 // A known-but-uncompiled built-in with no plugin/registry source.
                 CapabilityOrigin::BuiltIn
             };
-            e.enabled = match e.origin {
-                CapabilityOrigin::BuiltIn => a.builtin_enabled.unwrap_or(false),
-                CapabilityOrigin::Plugin => a.plugin_enabled.unwrap_or(false),
+            e.configured = match e.origin {
+                CapabilityOrigin::BuiltIn => a.builtin_configured.unwrap_or(false),
+                CapabilityOrigin::Plugin => a.plugin_configured.unwrap_or(false),
                 CapabilityOrigin::Registry => false,
             };
             e
@@ -328,19 +360,19 @@ fn kind_rank(k: &CapabilityKind) -> u8 {
 mod tests {
     use super::*;
 
-    fn builtin(id: &str, compiled: bool, enabled: bool) -> BuiltinSeed {
+    fn builtin(id: &str, compiled: bool, configured: bool) -> BuiltinSeed {
         BuiltinSeed {
             id: id.to_string(),
             kind: CapabilityKind::Channel,
             display: Some(id.to_string()),
             description: None,
             compiled,
-            enabled,
+            configured,
             toggleable: true,
         }
     }
 
-    fn plugin(id: &str, name: &str, mirrors: bool, enabled: bool) -> InstalledSeed {
+    fn plugin(id: &str, name: &str, mirrors: bool, configured: bool) -> InstalledSeed {
         InstalledSeed {
             plugin_name: name.to_string(),
             id: id.to_string(),
@@ -349,7 +381,7 @@ mod tests {
             version: Some("1.0".to_string()),
             description: None,
             permissions: vec!["config_read".to_string()],
-            enabled,
+            configured,
             toggleable: mirrors,
         }
     }
@@ -373,7 +405,7 @@ mod tests {
         let out = merge_capabilities(vec![builtin("telegram", true, true)], vec![], vec![]);
         let e = get(&out, "telegram");
         assert_eq!(e.origin, CapabilityOrigin::BuiltIn);
-        assert!(e.compiled_in && e.enabled);
+        assert!(e.compiled_in && e.configured);
         assert!(!e.installed && !e.available);
     }
 
@@ -392,14 +424,14 @@ mod tests {
         assert!(e.compiled_in && e.installed && e.mirrors_builtin);
         assert_eq!(e.plugin_name.as_deref(), Some("discord-plugin"));
         assert_eq!(e.version.as_deref(), Some("1.0"));
-        // Enabled reflects the resolved (built-in) provider.
-        assert!(e.enabled);
+        // Configured state reflects the resolved built-in source.
+        assert!(e.configured);
     }
 
     #[test]
     fn plugin_mirroring_uncompiled_builtin_becomes_resolved() {
         // whatsapp-cloud NOT compiled + a plugin provides it → the plugin is the
-        // live provider; enabled comes from the plugin.
+        // selected provider; configured state comes from the plugin config.
         let out = merge_capabilities(
             vec![builtin("whatsapp_cloud", false, false)],
             vec![plugin("whatsapp_cloud", "wa-plugin", true, true)],
@@ -408,10 +440,7 @@ mod tests {
         let e = get(&out, "whatsapp_cloud");
         assert_eq!(e.origin, CapabilityOrigin::Plugin);
         assert!(!e.compiled_in && e.installed && e.mirrors_builtin);
-        assert!(
-            e.enabled,
-            "plugin provider's enabled wins when native absent"
-        );
+        assert!(e.configured, "plugin config wins when native is absent");
     }
 
     #[test]
@@ -427,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_only_entry_is_available_not_enabled() {
+    fn registry_only_entry_is_available_not_configured() {
         let out = merge_capabilities(
             vec![],
             vec![],
@@ -436,7 +465,7 @@ mod tests {
         let e = get(&out, "bluesky");
         assert_eq!(e.origin, CapabilityOrigin::Registry);
         assert!(e.available && !e.installed && !e.compiled_in);
-        assert!(!e.enabled, "registry-only is never live");
+        assert!(!e.configured, "registry-only has no local configuration");
     }
 
     #[test]
@@ -454,20 +483,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_installed_providers_fail_closed_without_order_winner() {
-        let out = merge_capabilities(
-            vec![],
-            vec![
-                plugin("git", "gitea-a", true, true),
-                plugin("git", "gitea-b", true, true),
-            ],
+    fn duplicate_installed_providers_are_order_independent_and_restore_builtin_metadata() {
+        let mut builtin = builtin("git", false, true);
+        builtin.description = Some("canonical git channel".to_string());
+        let mut first = plugin("git", "gitea-a", true, true);
+        first.version = Some("1.0.0".to_string());
+        first.description = Some("provider a".to_string());
+        first.permissions = vec!["config_read".to_string()];
+        let mut second = plugin("git", "gitea-b", true, false);
+        second.version = Some("2.0.0".to_string());
+        second.description = Some("provider b".to_string());
+        second.permissions = vec!["http_client".to_string()];
+
+        let forward = merge_capabilities(
+            vec![builtin.clone()],
+            vec![first.clone(), second.clone()],
             vec![],
         );
-        assert_eq!(out.len(), 1);
-        let entry = get(&out, "git");
+        let reverse = merge_capabilities(vec![builtin], vec![second, first], vec![]);
+
+        assert_eq!(forward, reverse);
+        let entry = get(&forward, "git");
         assert!(entry.conflicted);
-        assert!(!entry.enabled);
+        assert!(!entry.toggleable);
+        assert!(!entry.configured, "ambiguous plugin provider fails closed");
+        assert_eq!(entry.description.as_deref(), Some("canonical git channel"));
         assert_eq!(entry.plugin_name, None);
+        assert_eq!(entry.version, None);
+        assert!(entry.permissions.is_empty());
     }
 
     #[test]
@@ -488,7 +531,73 @@ mod tests {
         );
         let entry = get(&out, "git");
         assert!(entry.conflicted && entry.available);
+        assert!(!entry.toggleable);
         assert_eq!(entry.plugin_name, None);
+    }
+
+    #[test]
+    fn duplicate_registry_packages_are_order_independent_without_a_winner() {
+        let first = AvailableSeed {
+            plugin_name: "gitea".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("1.0.0".to_string()),
+            description: Some("provider a".to_string()),
+        };
+        let second = AvailableSeed {
+            plugin_name: "forgejo".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("2.0.0".to_string()),
+            description: Some("provider b".to_string()),
+        };
+
+        let forward = merge_capabilities(vec![], vec![], vec![first.clone(), second.clone()]);
+        let reverse = merge_capabilities(vec![], vec![], vec![second, first]);
+
+        assert_eq!(forward, reverse);
+        let entry = get(&forward, "git");
+        assert!(entry.conflicted && entry.available);
+        assert!(!entry.toggleable);
+        assert!(!entry.configured);
+        assert_eq!(entry.plugin_name, None);
+        assert_eq!(entry.version, None);
+        assert_eq!(entry.description, None);
+    }
+
+    #[test]
+    fn duplicate_registry_packages_restore_builtin_metadata() {
+        let mut canonical = builtin("git", false, true);
+        canonical.description = Some("canonical git channel".to_string());
+        let first = AvailableSeed {
+            plugin_name: "gitea".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("1.0.0".to_string()),
+            description: Some("provider a".to_string()),
+        };
+        let second = AvailableSeed {
+            plugin_name: "forgejo".to_string(),
+            id: "git".to_string(),
+            kind: CapabilityKind::Channel,
+            version: Some("2.0.0".to_string()),
+            description: Some("provider b".to_string()),
+        };
+
+        let forward = merge_capabilities(
+            vec![canonical.clone()],
+            vec![],
+            vec![first.clone(), second.clone()],
+        );
+        let reverse = merge_capabilities(vec![canonical], vec![], vec![second, first]);
+
+        assert_eq!(forward, reverse);
+        let entry = get(&forward, "git");
+        assert!(entry.conflicted && entry.available);
+        assert!(!entry.toggleable);
+        assert_eq!(entry.description.as_deref(), Some("canonical git channel"));
+        assert_eq!(entry.plugin_name, None);
+        assert_eq!(entry.version, None);
     }
 
     #[test]

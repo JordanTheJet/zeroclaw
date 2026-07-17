@@ -159,6 +159,16 @@ zeroclaw plugin install team-calendar --registry https://example.invalid/registr
 plugin names and descriptions. It does not install, enable, or execute plugin
 code.
 
+`zeroclaw plugin list` merges built-ins, installed manifests, and cached
+registry packages into one capability view. Its configured marker reports
+operator intent from canonical config; it is not a component-health signal and
+does not claim that a WASM guest loaded. Typed channel rows read their existing
+`[channels.<type>.<alias>].enabled` values. Novel channels use the canonical
+`plugin.<manifest-name>` identity and are selected when `plugins.enabled` is on
+and an enabled agent owns that exact binding. When no agent declares any
+channel binding, the existing legacy admission rule selects them. Novel
+channels have no per-plugin toggle.
+
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
 the archive, and then hands the extracted plugin directory to the existing

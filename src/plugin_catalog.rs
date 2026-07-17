@@ -10,7 +10,7 @@
 //! gateway and zerocode surfaces resolve capabilities identically.
 
 use serde_json::Value;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{ActiveChannelAliases, Config};
 use zeroclaw_plugins::catalog::{
     AvailableSeed, BuiltinSeed, CapabilityCatalogEntry, CapabilityKind, CapabilityOrigin,
     InstalledSeed, merge_capabilities,
@@ -27,8 +27,8 @@ fn perm_wire(p: &PluginPermission) -> String {
 }
 
 /// Build the unified catalog from the binary's three capability sources. `all`
-/// includes every compiled-in channel; otherwise only configured/active
-/// built-ins are seeded so the default view stays focused on what's in use or
+/// includes every compiled-in channel; otherwise only configured
+/// built-ins are seeded so the default view stays focused on operator intent or
 /// installable.
 pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCatalogEntry> {
     // Per-channel-type: is any configured alias enabled? Read the serialized
@@ -49,12 +49,12 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
         let id = zeroclaw_channels::listing::canonical_channel_type(&config.channels, ci.kind)
             .unwrap_or(ci.kind)
             .to_string();
-        let enabled = compiled && channel_type_enabled(config, &id);
+        let configured = channel_type_configured(config, &id);
         builtins_by_id
             .entry(id.clone())
             .and_modify(|seed| {
                 seed.compiled |= compiled;
-                seed.enabled |= enabled;
+                seed.configured |= configured;
                 seed.toggleable |= ci.configured;
             })
             .or_insert_with(|| BuiltinSeed {
@@ -63,14 +63,15 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
                 display: Some(ci.name.to_string()),
                 description: Some(ci.desc.to_string()),
                 compiled,
-                enabled,
+                configured,
                 toggleable: ci.configured,
             });
     }
     let builtins = builtins_by_id.into_values().collect();
 
     // ── Installed plugins ──────────────────────────────────────────────────
-    let plugins_enabled = config.plugins.enabled;
+    let plugins_configured = config.plugins.enabled;
+    let active_channels = ActiveChannelAliases::compute(config);
     let infos = host.list_plugins();
     let version_of = |name: &str| {
         infos
@@ -78,29 +79,23 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
             .find(|i| i.name == name)
             .map(|i| i.version.clone())
     };
-    let loaded_of = |name: &str| {
-        infos
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| i.loaded)
-            .unwrap_or(false)
-    };
-
     let mut installed: Vec<InstalledSeed> = Vec::new();
     for m in host.channel_plugins() {
         let mirrors = m.provides.is_some();
-        let id = m.provides.clone().unwrap_or_else(|| m.name.clone());
-        let loaded = loaded_of(&m.name);
+        let id = m
+            .provides
+            .clone()
+            .unwrap_or_else(|| zeroclaw_api::channel::plugin_channel_ref(&m.name));
         let toggleable = mirrors && !channel_aliases(config, &id).is_empty();
-        // A mirror is live only when its mirrored channel is enabled; a novel
-        // plugin is live when the subsystem is on and it loaded (there is no
-        // per-entry `enabled` yet).
-        let enabled = plugins_enabled
-            && loaded
+        // This reports canonical config intent only. Component loading and
+        // health are runtime concerns rather than catalog state. Novel channel
+        // ownership comes from the same on-demand agent-binding view used by
+        // runtime admission.
+        let configured = plugins_configured
             && if mirrors {
-                channel_type_enabled(config, &id)
+                channel_type_configured(config, &id)
             } else {
-                true
+                active_channels.contains(&id)
             };
         installed.push(InstalledSeed {
             plugin_name: m.name.clone(),
@@ -110,12 +105,11 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
             version: version_of(&m.name),
             description: m.description.clone(),
             permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled,
+            configured,
             toggleable,
         });
     }
     for m in host.tool_plugins() {
-        let loaded = loaded_of(&m.name);
         installed.push(InstalledSeed {
             plugin_name: m.name.clone(),
             id: m.name.clone(),
@@ -124,12 +118,11 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
             version: version_of(&m.name),
             description: m.description.clone(),
             permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled: plugins_enabled && loaded,
+            configured: plugins_configured,
             toggleable: false,
         });
     }
     for m in host.skill_plugins() {
-        let loaded = loaded_of(&m.name);
         installed.push(InstalledSeed {
             plugin_name: m.name.clone(),
             id: m.name.clone(),
@@ -138,7 +131,7 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
             version: version_of(&m.name),
             description: m.description.clone(),
             permissions: m.permissions.iter().map(perm_wire).collect(),
-            enabled: plugins_enabled && loaded,
+            configured: plugins_configured,
             toggleable: false,
         });
     }
@@ -162,7 +155,7 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
                 version: Some(info.version.clone()),
                 description: info.description.clone(),
                 permissions: info.permissions.iter().map(perm_wire).collect(),
-                enabled: plugins_enabled && info.loaded,
+                configured: plugins_configured,
                 toggleable: false,
             });
         }
@@ -194,7 +187,9 @@ pub fn gather(config: &Config, host: &PluginHost, all: bool) -> Vec<CapabilityCa
                     e.capabilities.iter().map(move |c| {
                         let kind = CapabilityKind::from_wire(c);
                         let id = if kind == CapabilityKind::Channel {
-                            e.provides.clone().unwrap_or_else(|| e.name.clone())
+                            e.provides.clone().unwrap_or_else(|| {
+                                zeroclaw_api::channel::plugin_channel_ref(&e.name)
+                            })
                         } else {
                             e.name.clone()
                         };
@@ -234,7 +229,7 @@ pub fn channel_aliases(config: &Config, channel_type: &str) -> Vec<String> {
 
 /// Whether any configured alias in this canonical channel family is enabled.
 /// This is an on-demand view over `Config.channels`, not stored catalog state.
-fn channel_type_enabled(config: &Config, channel_type: &str) -> bool {
+fn channel_type_configured(config: &Config, channel_type: &str) -> bool {
     let channel_type =
         zeroclaw_channels::listing::canonical_channel_type(&config.channels, channel_type)
             .unwrap_or(channel_type);
@@ -261,9 +256,12 @@ pub fn is_channel_id(config: &Config, id: &str) -> bool {
 /// a novel channel plugin named `id`), so enabling it must also turn the plugin
 /// subsystem on.
 fn channel_is_plugin_backed(host: &PluginHost, id: &str) -> bool {
-    host.channel_plugins()
-        .iter()
-        .any(|m| m.provides.as_deref() == Some(id) || m.name == id)
+    host.channel_plugins().iter().any(|manifest| {
+        manifest.provides.as_deref().map_or_else(
+            || zeroclaw_api::channel::plugin_channel_ref(&manifest.name) == id,
+            |provides| provides == id,
+        )
+    })
 }
 
 fn resolve_channel_targets(
@@ -317,7 +315,7 @@ fn channel_toggle_paths(id: &str, aliases: &[String]) -> Vec<String> {
 
 /// Flip a channel capability's config `enabled` (the SSOT — never a new
 /// `[features]` table) and persist. v1 handles channels only; a novel tool/skill
-/// plugin runs whenever `plugins.enabled` is on and has no per-entry toggle yet.
+/// plugin has no per-entry config toggle yet.
 /// Resolves only existing aliases (0 → error/skip, 1 → auto, many → require
 /// `--alias`) and turns the plugin subsystem on when enabling a plugin-backed
 /// channel.
@@ -419,8 +417,9 @@ pub fn render(entries: &[CapabilityCatalogEntry]) {
             println!("\n{}:", kind_label(&e.kind));
             current = Some(&e.kind);
         }
-        // status glyph: ● enabled/live, ○ installed-but-off, · installable-only.
-        let glyph = if e.enabled {
+        // Status glyph: ● selected by config, ○ present but not selected,
+        // · registry-only.
+        let glyph = if e.configured {
             '●'
         } else if e.origin == CapabilityOrigin::Registry {
             '·'
@@ -450,11 +449,15 @@ pub fn render(entries: &[CapabilityCatalogEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_aliases, channel_toggle_paths, channel_type_enabled, gather, is_channel_id,
+        channel_aliases, channel_toggle_paths, channel_type_configured, gather, is_channel_id,
         resolve_channel_targets, set_capability_enabled,
     };
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::providers::ChannelRef;
+    use zeroclaw_config::schema::{AliasedAgentConfig, Config};
     use zeroclaw_plugins::host::PluginHost;
+    use zeroclaw_plugins::registry::{
+        PluginRegistryEntry, PluginRegistryIndex, write_cached_registry_index,
+    };
     use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
     fn aliases(values: &[&str]) -> Vec<String> {
@@ -566,7 +569,7 @@ mod tests {
             ("whatsapp-web", "whatsapp"),
         ];
         for (inventory_id, canonical) in cases {
-            assert!(channel_type_enabled(&config, inventory_id));
+            assert!(channel_type_configured(&config, inventory_id));
             assert_eq!(channel_aliases(&config, inventory_id), [alias.clone()]);
             assert_eq!(
                 channel_toggle_paths(canonical, std::slice::from_ref(&alias)),
@@ -594,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn novel_channel_plugin_reports_its_actual_global_lifecycle() {
+    async fn novel_channel_configured_state_follows_global_flag_and_active_owner() {
         let temp = tempfile::tempdir().expect("temp plugin catalog directory");
         let plugin_dir = temp.path().join("plugins/novel-channel");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -616,25 +619,163 @@ mod tests {
             ..Config::default()
         };
         let catalog = gather(&config, &host, true);
+        let novel_id = zeroclaw_api::channel::plugin_channel_ref("novel-channel");
         let novel = catalog
             .iter()
-            .find(|entry| entry.id == "novel-channel")
+            .find(|entry| entry.id == novel_id)
             .expect("novel channel is listed");
         assert!(!novel.toggleable);
+        assert!(!novel.configured);
 
-        let error = set_capability_enabled(&mut config, &host, "novel-channel", None, true)
+        config.plugins.enabled = true;
+        let catalog = gather(&config, &host, true);
+        let novel = catalog
+            .iter()
+            .find(|entry| entry.id == novel_id)
+            .expect("novel channel remains listed");
+        assert!(
+            novel.configured,
+            "legacy mode selects novel channels when plugins are enabled"
+        );
+
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                channels: vec![ChannelRef::new("telegram.main")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let catalog = gather(&config, &host, true);
+        let novel = catalog
+            .iter()
+            .find(|entry| entry.id == novel_id)
+            .expect("novel channel remains listed");
+        assert!(
+            !novel.configured,
+            "an explicit unrelated binding ends legacy admission"
+        );
+
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("test agent")
+            .channels
+            .push(ChannelRef::new(novel_id.clone()));
+        let catalog = gather(&config, &host, true);
+        let novel = catalog
+            .iter()
+            .find(|entry| entry.id == novel_id)
+            .expect("novel channel remains listed");
+        assert!(
+            novel.configured,
+            "an enabled owner selects the novel channel"
+        );
+
+        config.agents.get_mut("alpha").expect("test agent").enabled = false;
+        let catalog = gather(&config, &host, true);
+        let novel = catalog
+            .iter()
+            .find(|entry| entry.id == novel_id)
+            .expect("novel channel remains listed");
+        assert!(
+            !novel.configured,
+            "a disabled owner does not select the novel channel"
+        );
+        config.agents.get_mut("alpha").expect("test agent").enabled = true;
+
+        let error = set_capability_enabled(&mut config, &host, &novel_id, None, false)
             .await
             .expect_err("novel channel must not claim a typed per-channel toggle");
         assert_eq!(
             error.to_string(),
             get_required_cli_string_with_args(
                 "cli-plugin-toggle-novel-channel",
-                &[("id", "novel-channel")],
+                &[("id", novel_id.as_str())],
             )
         );
+        assert!(config.plugins.enabled, "the failed toggle changes no state");
+    }
+
+    #[tokio::test]
+    async fn novel_telegram_package_does_not_merge_with_or_toggle_typed_telegram() {
+        let temp = tempfile::tempdir().expect("temp plugin catalog directory");
+        let plugin_dir = temp.path().join("plugins/telegram");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            concat!(
+                "name = \"telegram\"\n",
+                "version = \"0.1.0\"\n",
+                "capabilities = [\"channel\"]\n",
+                "wasm_path = \"plugin.wasm\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+
+        let host = PluginHost::new(temp.path()).expect("discover novel telegram plugin");
+        let mut config = Config {
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        config
+            .channels
+            .telegram
+            .insert("main".to_string(), Default::default());
+        write_cached_registry_index(
+            &config.data_dir,
+            "https://example.invalid/registry.json",
+            &PluginRegistryIndex {
+                plugins: vec![PluginRegistryEntry {
+                    name: "telegram".to_string(),
+                    version: "0.1.0".to_string(),
+                    description: Some("novel package".to_string()),
+                    author: None,
+                    capabilities: vec!["channel".to_string()],
+                    provides: None,
+                    url: "https://example.invalid/telegram.zip".to_string(),
+                    sha256: None,
+                }],
+                registry_url: None,
+            },
+        )
+        .expect("cache registry fixture");
+
+        let catalog = gather(&config, &host, true);
+        let novel_id = zeroclaw_api::channel::plugin_channel_ref("telegram");
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry.id == "telegram")
+                .count(),
+            1,
+            "typed Telegram keeps one canonical row"
+        );
+        let novel = catalog
+            .iter()
+            .find(|entry| entry.id == novel_id)
+            .expect("installed and registry novel package share plugin.telegram");
+        assert!(novel.installed && novel.available);
+        assert!(!novel.toggleable);
+
+        let error = set_capability_enabled(&mut config, &host, &novel_id, None, true)
+            .await
+            .expect_err("novel identity cannot toggle typed Telegram");
+        assert_eq!(
+            error.to_string(),
+            get_required_cli_string_with_args(
+                "cli-plugin-toggle-novel-channel",
+                &[("id", novel_id.as_str())],
+            )
+        );
+        assert!(!config.plugins.enabled);
         assert!(
-            !config.plugins.enabled,
-            "the failed toggle changes no state"
+            !config
+                .channels
+                .telegram
+                .get("main")
+                .expect("typed Telegram alias")
+                .enabled
         );
     }
 }

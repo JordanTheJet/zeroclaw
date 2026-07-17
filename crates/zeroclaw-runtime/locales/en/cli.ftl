@@ -842,7 +842,7 @@ cli-plugin-source-plugin-mirror = plugin (mirror)
 cli-plugin-source-plugin = plugin
 cli-plugin-source-available = available
 cli-plugin-catalog-legend =
-    ● enabled   ○ installed/built-in (off)   · installable
+    ● selected by config   ○ present (not selected)   · installable
     `zeroclaw plugin install <name>` to add · items.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
