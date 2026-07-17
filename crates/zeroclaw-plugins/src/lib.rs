@@ -19,6 +19,8 @@ pub mod wasm_channel;
 pub mod wasm_memory;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_tool;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod ws;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -39,8 +41,29 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// SHA-256 of the exact bytes at `wasm_path`, encoded as 64 hexadecimal
+    /// characters. Strict signature mode requires this for executable plugins;
+    /// the field is covered by the manifest signature.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
+    /// The compiled-in channel id this plugin *mirrors*, when it is a drop-in
+    /// for a built-in channel — the snake_case config id (e.g. `"telegram"`,
+    /// `"gmail_push"`). When set, the host builds one instance per configured
+    /// `[channels.<id>.<alias>]` and feeds each that alias's canonical config,
+    /// instead of a `[[plugins.entries]]` block. `None` (the default) means a
+    /// novel plugin with no built-in equivalent, configured from its own
+    /// `[[plugins.entries.<name>]]` map.
+    #[serde(default)]
+    pub provides: Option<String>,
+    /// How this channel guest normalizes the sender identity string it emits.
+    ///
+    /// The host uses this manifest-owned contract when matching live
+    /// `Config::peer_groups` membership. Omitted by older manifests, it
+    /// defaults to case-sensitive exact matching.
+    #[serde(default)]
+    pub sender_match: SenderMatch,
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
@@ -51,6 +74,21 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+}
+
+/// Sender-identity representation emitted by a channel plugin.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderMatch {
+    /// Case-sensitive exact identity.
+    #[default]
+    Exact,
+    /// ASCII case-insensitive exact identity.
+    CaseInsensitive,
+    /// User handle, compared after trimming and removing a leading `@`.
+    Handle,
+    /// Full email address or domain-class identity.
+    Email,
 }
 
 /// What a plugin can do.
@@ -86,6 +124,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can open host-mediated outbound WebSocket connections (`ws-client`).
+    // snake_case would derive to `web_socket_client`; pin the wire name.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
 }
 
 /// Information about a loaded plugin.
@@ -99,4 +141,43 @@ pub struct PluginInfo {
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHANNEL_MANIFEST: &str = r#"
+name = "fixture-channel"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+"#;
+
+    #[test]
+    fn sender_match_defaults_to_exact_for_existing_manifests() {
+        let manifest: PluginManifest = toml::from_str(CHANNEL_MANIFEST).expect("valid manifest");
+        assert_eq!(manifest.sender_match, SenderMatch::Exact);
+    }
+
+    #[test]
+    fn sender_match_accepts_every_documented_value() {
+        for (value, expected) in [
+            ("exact", SenderMatch::Exact),
+            ("case_insensitive", SenderMatch::CaseInsensitive),
+            ("handle", SenderMatch::Handle),
+            ("email", SenderMatch::Email),
+        ] {
+            let manifest_toml = format!("{CHANNEL_MANIFEST}\nsender_match = \"{value}\"\n");
+            let manifest: PluginManifest =
+                toml::from_str(&manifest_toml).expect("documented sender_match value");
+            assert_eq!(manifest.sender_match, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn sender_match_rejects_unknown_values() {
+        let manifest_toml = format!("{CHANNEL_MANIFEST}\nsender_match = \"username\"\n");
+        assert!(toml::from_str::<PluginManifest>(&manifest_toml).is_err());
+    }
 }

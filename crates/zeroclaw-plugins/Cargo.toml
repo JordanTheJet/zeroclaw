@@ -9,7 +9,14 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+plugins-wasmtime = [
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+  "dep:wasmtime-wasi-http",
+  "dep:tokio-tungstenite",
+  "dep:futures-util",
+  "tokio/net",
+]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -22,8 +29,10 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 ring = "0.17"
+same-file = "1.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tempfile = "3.26"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
 toml = "1.0"
@@ -40,7 +49,16 @@ wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+# Host-owned outbound WebSocket for channel plugins (ws-client). Present only in
+# `plugins-wasmtime` builds; the plugin sandbox itself never opens the socket.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+  "connect",
+  "handshake",
+  "rustls-tls-webpki-roots",
+], optional = true }
+futures-util = { version = "0.3", default-features = false, features = [
+  "sink",
+], optional = true }
 
 [dev-dependencies]
-tempfile = "3.26"
 zeroclaw-config = { path = "../zeroclaw-config" }

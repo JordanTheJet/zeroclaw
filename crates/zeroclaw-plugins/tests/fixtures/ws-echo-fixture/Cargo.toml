@@ -1,0 +1,28 @@
+# Standalone crate (own [workspace]): built for wasm32-wasip2 as a test fixture,
+# NOT part of the host workspace. Proves the host `ws-client` capability: the
+# plugin dials a host-mediated WebSocket, sends a frame, and reads the echo.
+#
+# `tests/ws_client_e2e.rs` builds this crate in place with `--locked` and consumes
+# `target/wasm32-wasip2/release/ws_echo_fixture.wasm` directly. Missing target
+# support or a failed build is a test failure.
+[package]
+name = "ws-echo-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "ZeroClaw WIT channel plugin test fixture: a WebSocket echo round-trip."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]

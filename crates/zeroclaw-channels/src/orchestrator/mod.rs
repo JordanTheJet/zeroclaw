@@ -128,7 +128,7 @@ use url::Url;
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{ActiveChannelAliases, Config};
 #[cfg(test)]
 use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
@@ -4313,7 +4313,12 @@ fn spawn_supervised_listener(
     )
 }
 
-fn spawn_supervised_listener_with_health_interval(
+/// Spawn the production channel-listener supervisor with a custom heartbeat.
+///
+/// The custom interval is primarily useful for deterministic lifecycle tests;
+/// normal channel startup uses [`spawn_supervised_listener`].
+#[doc(hidden)]
+pub fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
     tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
@@ -7914,6 +7919,20 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
+/// The set of keys a plugin channel must not collide with to honor native-wins.
+/// For each native channel it includes BOTH the bare platform id and the
+/// composite `<name>.<alias>` registry key, so a per-alias mirror plugin (dedup
+/// key `<id>.<alias>`) and a novel plugin (bare name) are each shadowed by the
+/// matching native form — and a *different* alias is left free (native-wins is
+/// per-alias, not per-platform).
+pub(crate) fn native_channel_dedup_keys<'a>(
+    channels: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> std::collections::HashSet<String> {
+    channels
+        .flat_map(|(name, alias)| [name.to_string(), composite_channel_key(name, alias)])
+        .collect()
+}
+
 fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
     let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
@@ -8027,62 +8046,6 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents.
-///
-/// An empty set means no enabled agent declared channel bindings, so
-/// collection falls back to legacy behavior and accepts all enabled channels.
-struct ActiveChannelAliases {
-    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
-    /// explicit-binding mode: only enabled owners' bindings count.
-    enabled_bindings: HashSet<String>,
-    /// `<type>.<alias>` declared by ALL agents (enabled or disabled).
-    /// Distinguishes "true legacy fallback" (no bindings anywhere) from
-    /// "bindings exist but every owner is disabled" — the #8013 bug path.
-    /// When non-empty and `enabled_bindings` is empty, legacy mode must
-    /// NOT fire; otherwise disabled owners would still bring their bound
-    /// channels online.
-    all_known_bindings: HashSet<String>,
-}
-
-impl ActiveChannelAliases {
-    /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings anywhere and legacy "accept all enabled channels"
-    /// mode applies.
-    fn contains(&self, channel_ref: &str) -> bool {
-        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
-    }
-
-    /// True when bindings exist somewhere in the config but every owner is
-    /// `enabled = false`. The #8013 bug fires when this returns true.
-    fn disabled_owners_exist(&self) -> bool {
-        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
-    }
-
-    /// Build an `ActiveChannelAliases` from a config snapshot.
-    ///
-    /// Single source of truth for the "is this channel reference currently
-    /// active under the agent binding state?" decision. Used by
-    /// `collect_configured_channels` (Discord/Telegram/Mattermost/etc.) and
-    /// by the Nostr startup / health-check paths so the #8013 invariant
-    /// ("a disabled agent must not bring its bound channel online") is
-    /// enforced uniformly across the orchestrator.
-    fn compute(config: &Config) -> Self {
-        Self {
-            enabled_bindings: config
-                .agents
-                .values()
-                .filter(|a| a.enabled)
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect(),
-            all_known_bindings: config
-                .agents
-                .values()
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect(),
-        }
-    }
-}
-
 /// Build `channel_key → Arc<dyn Channel>` map from config.
 ///
 /// Constructs channel instances without starting listen loops.
@@ -8167,7 +8130,7 @@ fn collect_configured_channels(
     let active_channel_aliases = ActiveChannelAliases::compute(&config);
 
     if active_channel_aliases.disabled_owners_exist() {
-        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings().iter().collect();
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9753,8 +9716,8 @@ fn collect_configured_channels(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({
-                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
-                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+                "activated_bindings": active_channel_aliases.enabled_bindings().len(),
+                "bindings": active_channel_aliases.enabled_bindings().iter().collect::<Vec<_>>(),
             })),
         "channel binding(s) activated from enabled agents"
     );
@@ -9953,6 +9916,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
 ) -> Result<()> {
     // Wrap into the canonical shared handle so channels and persistence
     // paths share one source of truth. The local `config` shadowing
@@ -10643,6 +10607,33 @@ pub async fn start_channels(
                     "Filesystem channel is configured but this build was compiled without \
                      `channel-filesystem`; skipping Filesystem."
                 );
+            }
+            // WASM channel plugins — registered and supervised exactly like
+            // native channels, but a compiled-in channel of the same id wins
+            // (native-wins), mirroring the tool-plugin and skill-tool shadow
+            // policy. Building lives in `zeroclaw-runtime` (this crate has no
+            // `zeroclaw-plugins` dependency). Dedup is by both the bare platform
+            // id and the composite `"<type>.<alias>"` key, so a per-alias mirror
+            // (`"telegram.main"`) is shadowed by the matching native channel,
+            // while a novel plugin is shadowed by name. The runtime builder
+            // applies this materialized view before invoking any plugin export.
+            let native_channel_keys = native_channel_dedup_keys(
+                configured_channels
+                    .iter()
+                    .map(|cc| (cc.channel.name(), cc.alias.as_deref())),
+            );
+            for (alias, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
+                &config_arc,
+                &native_channel_keys,
+                plugin_webhooks.as_deref(),
+            )
+            .await
+            {
+                configured_channels.push(ConfiguredChannel {
+                    display_name: "Plugin",
+                    alias: Some(alias),
+                    channel,
+                });
             }
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
@@ -11696,6 +11687,19 @@ temperature = 0.3
     }
 
     #[test]
+    fn native_channel_dedup_keys_cover_bare_and_composite() {
+        let keys =
+            native_channel_dedup_keys([("telegram", Some("main")), ("notion", None)].into_iter());
+        // A per-alias mirror (dedup key "telegram.main") and a novel bare-name
+        // plugin are both shadowed by their native counterparts.
+        assert!(keys.contains("telegram"));
+        assert!(keys.contains("telegram.main"));
+        assert!(keys.contains("notion"));
+        // A DIFFERENT alias is not shadowed — native-wins is per-alias.
+        assert!(!keys.contains("telegram.other"));
+    }
+
+    #[test]
     fn configured_channel_map_adds_bare_key_for_singleton_type() {
         let matrix = mock_channel("matrix");
         let configured = vec![ConfiguredChannel {
@@ -12057,6 +12061,50 @@ temperature = 0.3
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
         assert!(Arc::ptr_eq(&resolved, &notion_agent_ctx));
+    }
+
+    #[test]
+    fn agent_router_routes_plugin_binding_alongside_native_binding() {
+        let plugin_ref = zeroclaw_api::channel::plugin_channel_ref("weather-alerts");
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "native-owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.main".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "plugin-owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![plugin_ref.clone().into()],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = vec!["native-owner".to_string(), "plugin-owner".to_string()];
+        let collected = vec!["telegram.main".to_string(), plugin_ref];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected);
+
+        let native_ctx = router_test_ctx();
+        let plugin_ctx = router_test_ctx();
+        let by_agent = HashMap::from([
+            ("native-owner".to_string(), native_ctx),
+            ("plugin-owner".to_string(), Arc::clone(&plugin_ctx)),
+        ]);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let message = channel_message(
+            zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE,
+            Some("weather-alerts"),
+        );
+
+        let resolved = router
+            .resolve(&message)
+            .expect("plugin binding resolves with explicit native bindings present");
+        assert!(Arc::ptr_eq(&resolved, &plugin_ctx));
     }
 
     #[test]
@@ -25333,40 +25381,81 @@ This is an example JSON object for profile settings."#;
         assert!(result.contains("[REDACTED"));
     }
 
+    /// Regression test for a redaction bypass: an AWS-shaped credential
+    /// dropped into a markdown link destination -- exactly where a
+    /// prompt-injected model would try to exfiltrate one -- must not sail
+    /// through unredacted just because a link destination is otherwise
+    /// protected from the high-entropy heuristic.
     #[test]
-    fn sanitize_channel_response_preserves_markdown_link_destination_credentials() {
+    fn sanitize_channel_response_detects_aws_key_smuggled_in_markdown_link_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // AKIAABCDEFGHIJKLMNOP gitleaks:allow
+        let target = "https://exfil.example.invalid/callback?key=AKIAABCDEFGHIJKLMNOP";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP"), "result: {result}"); // gitleaks:allow
+        assert!(
+            result.contains("[REDACTED_AWS_CREDENTIAL]"),
+            "result: {result}"
+        );
+    }
+
+    // A protected link destination shields the *shape-based* high-entropy
+    // heuristic (the #8722 false-positive), never a deterministic credential
+    // pattern. A real credential dropped into a link destination -- exactly
+    // where a prompt-injected model would try to smuggle one past the
+    // detector -- must still be caught.
+
+    #[test]
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_link_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_markdown_reference_destination_credentials() {
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_markdown_reference_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://example.invalid/callback?api_key=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let response = format!("See [callback][cb]\n\n[cb]: {target}");
 
         let result = sanitize_channel_response(&response, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_entity_escaped_markdown_destination_credentials() {
+    fn sanitize_channel_response_still_detects_deterministic_credential_in_entity_escaped_markdown_destination()
+     {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_entity_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_entity_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25375,13 +25464,19 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        // The destination span computation is still correct (used by the
+        // entropy heuristic), but the deterministic "Token value" pattern is
+        // not suppressed by it, so both the destination and the distinct
+        // title copy are caught.
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_reference_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_reference_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25390,13 +25485,15 @@ This is an example JSON object for profile settings."#;
 
         let result = sanitize_channel_response(&response, &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_protects_url_entity_destination_before_title_copy() {
+    fn sanitize_channel_response_still_detects_credential_in_url_entity_destination_and_title() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target =
             "https&colon;&sol;&sol;example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
@@ -25405,19 +25502,22 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
-        assert!(!result.contains(title), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
         assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_markdown_autolink_destination_credentials() {
+    fn sanitize_channel_response_still_detects_bot_token_in_markdown_autolink_destination() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
 
         let result = sanitize_channel_response(&format!("<{target}>"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains("123456:ABC-def_GHI"), "result: {result}");
+        assert!(result.contains("[REDACTED_BOT_TOKEN]"), "result: {result}");
     }
 
     #[test]
@@ -25440,8 +25540,13 @@ This is an example JSON object for profile settings."#;
         let result =
             sanitize_channel_response(&format!("[password=longsecretvalue]({target})"), &tools);
 
-        assert!(!result.contains("longsecretvalue"));
-        assert!(result.contains(target), "result: {result}");
+        // The generic-secret pattern is greedy and, starting outside the
+        // destination, can span into it; deterministic patterns are never
+        // suppressed by a protected span, so the whole overlapping match is
+        // redacted. That is the safe direction: losing an adjacent file
+        // reference is preferable to leaking the secret it was next to.
+        assert!(!result.contains("longsecretvalue"), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
@@ -25460,21 +25565,26 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_escaped_markdown_destination_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_escaped_markdown_destination() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report\\(1\\).md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
 
         let result = sanitize_channel_response(&format!("[report]({target})"), &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded {target}.");
 
+        // The entropy-protected span is still computed correctly...
         let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
         assert_eq!(
             spans
@@ -25483,13 +25593,23 @@ This is an example JSON object for profile settings."#;
                 .collect::<Vec<_>>(),
             vec![target],
         );
+        // ...but the deterministic "Token value" pattern inside it is not
+        // suppressed by that protection.
         let result = sanitize_channel_response(&outbound, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_keyed_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_keyed_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded path={target}.");
@@ -25505,13 +25625,18 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(&outbound, &tools);
 
         assert!(
-            result.contains(&format!("path={target}")),
+            result.contains("path=file:///tmp/report.md?"),
             "result: {result}"
         );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
-    fn sanitize_channel_response_preserves_json_keyed_raw_file_uri_credentials() {
+    fn sanitize_channel_response_still_detects_credential_in_json_keyed_raw_file_uri() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!(r#"{{"uri":"{target}"}}"#);
@@ -25526,7 +25651,15 @@ This is an example JSON object for profile settings."#;
         );
         let result = sanitize_channel_response(&outbound, &tools);
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains(r#""uri":"file:///tmp/report.md?"#),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]
@@ -25591,7 +25724,7 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn leak_only_guard_preserves_raw_file_uri_credentials() {
+    fn leak_only_guard_still_detects_credential_in_raw_file_uri() {
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let input = format!("Cron output: {target}");
 
@@ -25601,7 +25734,15 @@ This is an example JSON object for profile settings."#;
             OutboundContentFormat::Markdown,
         );
 
-        assert!(result.contains(target), "result: {result}");
+        assert!(
+            result.contains("file:///tmp/report.md?"),
+            "result: {result}"
+        );
+        assert!(
+            !result.contains("aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            "result: {result}"
+        );
+        assert!(result.contains("[REDACTED"), "result: {result}");
     }
 
     #[test]

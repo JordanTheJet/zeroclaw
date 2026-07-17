@@ -15,6 +15,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::ws::{WsEgressPolicy, WsRegistry, deny_ws_egress_exceptions};
 
 /// A host-owned queue of inbound messages destined for a channel plugin.
 ///
@@ -109,13 +110,17 @@ pub mod bindings {
 
 /// Per-store host state. Carries a sandboxed WASI context (no preopens, no
 /// network) so Rust-compiled wasip2 components instantiate, plus the resource
-/// table WASI requires. Outbound HTTP is present only when the plugin's manifest
-/// grants `HttpClient`; otherwise `http` is `None` and `wasi:http` is never
-/// linked, so the component cannot reach the network at all.
+/// table WASI requires. Outbound HTTP and WebSockets are attached only when the
+/// manifest grants their corresponding permission; otherwise those imports are
+/// not linked and the component has no host network surface.
 pub struct PluginState {
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
+    /// Host-owned outbound WebSocket connections, present only when the
+    /// manifest grants `WebSocketClient`. `None` leaves the `ws-client` import
+    /// unlinked, so the component cannot open a socket. Mirrors `http`.
+    websocket: Option<WsRegistry>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
@@ -123,11 +128,11 @@ pub struct PluginState {
 
 impl PluginState {
     /// Build store state for a plugin holding `permissions` under `limits`.
-    /// `HttpClient` is the only permission that widens the host surface here: it
-    /// attaches a `WasiHttpCtx` so the gated `wasi:http` import can be linked.
-    /// Every other permission resolves elsewhere (config jail, memory bridge)
-    /// and leaves the WASI sandbox closed. `limits` sets the per-call fuel and
-    /// the memory/table/instance ceilings the store limiter enforces.
+    /// `HttpClient` attaches gated `wasi:http`; `WebSocketClient` attaches the
+    /// separately gated, destination-checked `ws-client` registry. Every other
+    /// permission resolves elsewhere (config jail, memory bridge) and leaves
+    /// the WASI sandbox closed. `limits` sets the per-call fuel and the
+    /// memory/table/instance ceilings the store limiter enforces.
     pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
         Self::with_inbound(permissions, InboundQueue::default(), limits)
     }
@@ -140,13 +145,29 @@ impl PluginState {
         inbound: InboundQueue,
         limits: PluginLimits,
     ) -> Self {
+        Self::with_inbound_and_ws_policy(permissions, inbound, limits, deny_ws_egress_exceptions())
+    }
+
+    /// Build channel store state with a live host resolver for WebSocket egress
+    /// exceptions. The resolver is consulted per dial and carries no copied
+    /// allowlist state; stores without `WebSocketClient` discard it.
+    pub fn with_inbound_and_ws_policy(
+        permissions: &[PluginPermission],
+        inbound: InboundQueue,
+        limits: PluginLimits,
+        ws_egress_policy: WsEgressPolicy,
+    ) -> Self {
         let http = permissions
             .contains(&PluginPermission::HttpClient)
             .then(WasiHttpCtx::new);
+        let websocket = permissions
+            .contains(&PluginPermission::WebSocketClient)
+            .then(|| WsRegistry::with_egress_policy(ws_egress_policy));
         Self {
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
+            websocket,
             inbound,
             limits: StoreLimitsBuilder::new()
                 .memory_size(limits.max_memory_bytes)
@@ -160,6 +181,22 @@ impl PluginState {
     /// Whether this state was built with outbound HTTP attached.
     pub fn http_enabled(&self) -> bool {
         self.http.is_some()
+    }
+
+    /// Whether this state was built with the outbound WebSocket registry
+    /// attached (the `WebSocketClient` permission was granted).
+    pub fn websocket_enabled(&self) -> bool {
+        self.websocket.is_some()
+    }
+
+    /// The connection registry backing the `ws-client` import. Panics if called
+    /// on a store built without `WebSocketClient`; the coherence guard
+    /// ([`ensure_ws_coherent`]) keeps the import from being linked in that case,
+    /// so a live call can never reach here — exactly like `WasiHttpView::http`.
+    pub(crate) fn websocket_mut(&mut self) -> &mut WsRegistry {
+        self.websocket
+            .as_mut()
+            .expect("ws-client called on a plugin without the WebSocketClient permission")
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
@@ -229,6 +266,24 @@ pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -
     Ok(())
 }
 
+/// Assert that a store and the linker chosen for it agree on the `ws-client`
+/// surface before instantiation, the WebSocket twin of [`ensure_http_coherent`].
+/// The store carries a `WsRegistry` only when its manifest granted
+/// `WebSocketClient`; `linker_has_ws` is whether the linker picked for it linked
+/// the `ws-client` import. A wiring that pairs a ws-linked linker with a store
+/// lacking the registry (or the reverse) gets a named startup error here instead
+/// of a `websocket_mut` panic at the first `ws-connect`.
+pub fn ensure_ws_coherent(store: &Store<PluginState>, linker_has_ws: bool) -> Result<()> {
+    let store_has_ws = store.data().websocket_enabled();
+    if store_has_ws != linker_has_ws {
+        anyhow::bail!(
+            "plugin store/linker websocket mismatch: store WebSocketClient={store_has_ws}, \
+             linker ws-client={linker_has_ws}; refusing to instantiate"
+        );
+    }
+    Ok(())
+}
+
 pub fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -250,7 +305,19 @@ pub fn new_store_with_inbound(
     inbound: InboundQueue,
     limits: PluginLimits,
 ) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+    new_store_with_inbound_and_ws_policy(permissions, inbound, limits, deny_ws_egress_exceptions())
+}
+
+/// Like [`new_store_with_inbound`], with a live host resolver for explicit
+/// WebSocket private-network or plaintext exceptions.
+pub fn new_store_with_inbound_and_ws_policy(
+    permissions: &[PluginPermission],
+    inbound: InboundQueue,
+    limits: PluginLimits,
+    ws_egress_policy: WsEgressPolicy,
+) -> Store<PluginState> {
+    let state =
+        PluginState::with_inbound_and_ws_policy(permissions, inbound, limits, ws_egress_policy);
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
     set_call_fuel(&mut store, limits.call_fuel);
@@ -278,12 +345,31 @@ pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
 /// component is compiled on load; in runtime-only builds the file is a
 /// precompiled `.cwasm` deserialized directly.
 pub fn load_component(wasm_path: &Path) -> Result<Component> {
-    wt(load_inner(wasm_path), "failed to load WASM component")
+    load_component_with_digest(wasm_path, None)
+}
+
+/// Load a component from one identity-checked file handle while binding
+/// execution to an optional signed payload digest. The bytes are compiled or
+/// deserialized from that same buffer, so no path reopen can swap the
+/// executable after confinement or digest verification.
+pub fn load_component_with_digest(
+    wasm_path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<Component> {
+    let bytes = crate::host::read_stable_file(wasm_path).map_err(anyhow::Error::new)?;
+    if let Some(expected_sha256) = expected_sha256 {
+        crate::signature::verify_payload_digest(&bytes, expected_sha256)
+            .map_err(anyhow::Error::new)?;
+    }
+    wt(
+        load_inner_bytes(&bytes),
+        "failed to load confined WASM component",
+    )
 }
 
 #[cfg(feature = "plugins-wasm-cranelift")]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
-    Component::from_file(engine(), wasm_path)
+fn load_inner_bytes(bytes: &[u8]) -> wasmtime::Result<Component> {
+    Component::from_binary(engine(), bytes)
 }
 
 #[cfg(not(feature = "plugins-wasm-cranelift"))]
@@ -291,6 +377,19 @@ fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
     // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
     unsafe { Component::deserialize_file(engine(), wasm_path) }
+}
+
+#[cfg(not(feature = "plugins-wasm-cranelift"))]
+fn load_inner_bytes(bytes: &[u8]) -> wasmtime::Result<Component> {
+    // Keep the only unsafe deserialization call in `load_inner`: materialize
+    // the already-opened buffer in a private directory, then deserialize that
+    // exact file before the directory is dropped.
+    let dir = tempfile::Builder::new()
+        .prefix("zeroclaw-component-")
+        .tempdir()?;
+    let path = dir.path().join("component.cwasm");
+    std::fs::write(&path, bytes)?;
+    load_inner(&path)
 }
 
 /// Run an async call against a warm `Arc<Mutex<(Store, bindings)>>` plugin,
