@@ -204,14 +204,23 @@ Registry entries use this shape:
 {
   "plugins": [
     {
+      "name": "team-calendar",
+      "version": "0.8.3",
+      "description": "Schedule meetings on a team calendar",
+      "author": "Example Team",
+      "capabilities": ["tool"],
+      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "sha256": "sha256:<hex digest of the zip>"
+    },
+    {
       "name": "gitea",
-      "version": "0.2.0",
+      "version": "0.8.3",
       "description": "Gitea channel plugin",
       "author": "Example Team",
       "capabilities": ["channel"],
       "provides": "git",
       "sender_match": "case_insensitive",
-      "url": "https://example.invalid/gitea-0.2.0.zip",
+      "url": "https://example.invalid/gitea-0.8.3.zip",
       "sha256": "sha256:<hex digest of the zip>"
     }
   ]
