@@ -453,7 +453,11 @@ mod tests {
         resolve_channel_targets, set_capability_enabled,
     };
     use zeroclaw_config::providers::ChannelRef;
-    use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+    use zeroclaw_config::scattered_types::{GmailPushConfig, VoiceCallConfig};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, Config, NextcloudTalkConfig, TelegramConfig, VoiceWakeConfig,
+        WeComWsConfig, WhatsAppConfig,
+    };
     use zeroclaw_plugins::host::PluginHost;
     use zeroclaw_plugins::registry::{
         PluginRegistryEntry, PluginRegistryIndex, write_cached_registry_index,
@@ -519,27 +523,27 @@ mod tests {
         config
             .channels
             .gmail_push
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), GmailPushConfig::default());
         config
             .channels
             .wecom_ws
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), WeComWsConfig::default());
         config
             .channels
             .voice_call
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), VoiceCallConfig::default());
         config
             .channels
             .voice_wake
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), VoiceWakeConfig::default());
         config
             .channels
             .nextcloud_talk
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), NextcloudTalkConfig::default());
         config
             .channels
             .whatsapp
-            .insert(alias.clone(), Default::default());
+            .insert(alias.clone(), WhatsAppConfig::default());
         config.channels.gmail_push.get_mut(&alias).unwrap().enabled = true;
         config.channels.wecom_ws.get_mut(&alias).unwrap().enabled = true;
         config.channels.voice_call.get_mut(&alias).unwrap().enabled = true;
@@ -570,7 +574,10 @@ mod tests {
         ];
         for (inventory_id, canonical) in cases {
             assert!(channel_type_configured(&config, inventory_id));
-            assert_eq!(channel_aliases(&config, inventory_id), [alias.clone()]);
+            assert_eq!(
+                channel_aliases(&config, inventory_id),
+                std::slice::from_ref(&alias)
+            );
             assert_eq!(
                 channel_toggle_paths(canonical, std::slice::from_ref(&alias)),
                 [format!("channels.{canonical}.{alias}.enabled")]
@@ -721,7 +728,7 @@ mod tests {
         config
             .channels
             .telegram
-            .insert("main".to_string(), Default::default());
+            .insert("main".to_string(), TelegramConfig::default());
         write_cached_registry_index(
             &config.data_dir,
             "https://example.invalid/registry.json",
