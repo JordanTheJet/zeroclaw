@@ -247,18 +247,59 @@ pub fn configured_uncompiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> 
 /// Accepts both kebab-case keys emitted by the config schema and legacy
 /// underscore spellings used in channel references.
 pub fn is_channel_type_compiled(channel_type: &str) -> bool {
-    for spec in CHANNEL_COMPILE_SPECS {
-        if spec.type_keys.contains(&channel_type) {
-            return spec.compiled;
-        }
+    CHANNEL_COMPILE_SPECS
+        .iter()
+        .filter(|spec| spec.type_keys.contains(&channel_type))
+        .any(|spec| spec.compiled)
+}
+
+/// Resolve a display/legacy channel type to its canonical config-family key.
+///
+/// The canonical names come from [`ChannelsConfig::channel_presence`]; the
+/// compile-spec aliases only connect accepted spellings and implementation
+/// names (for example `whatsapp-web`) back to that existing schema source.
+pub fn canonical_channel_type(cfg: &ChannelsConfig, channel_type: &str) -> Option<&'static str> {
+    let presence = cfg.channel_presence();
+    let normalized = channel_type.replace('-', "_");
+    if let Some(canonical) = presence
+        .iter()
+        .map(|(name, _, _)| *name)
+        .find(|name| *name == channel_type || *name == normalized)
+    {
+        return Some(canonical);
     }
-    false
+    let matching_specs: Vec<_> = CHANNEL_COMPILE_SPECS
+        .iter()
+        .filter(|spec| spec.type_keys.contains(&channel_type))
+        .collect();
+    matching_specs
+        .iter()
+        .flat_map(|spec| spec.type_keys.iter().copied())
+        .find(|candidate| presence.iter().any(|(name, _, _)| name == candidate))
+        .or_else(|| {
+            // Some implementations are variants of a canonical config family
+            // rather than independent config families (for example
+            // `whatsapp-web` uses `[channels.whatsapp]`). Derive that relation
+            // from the known implementation key and canonical schema names.
+            presence.iter().map(|(name, _, _)| *name).find(|canonical| {
+                matching_specs.iter().any(|spec| {
+                    spec.type_keys.iter().any(|alias| {
+                        alias
+                            .strip_prefix(canonical)
+                            .is_some_and(|suffix| matches!(suffix.chars().next(), Some('-' | '_')))
+                    })
+                })
+            })
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CHANNEL_COMPILE_SPECS, ChannelsConfig};
-    use super::{compiled_channels, configured_uncompiled_channels, is_channel_type_compiled};
+    use super::{
+        canonical_channel_type, compiled_channels, configured_uncompiled_channels,
+        is_channel_type_compiled,
+    };
     use std::collections::BTreeSet;
 
     #[cfg(feature = "default-channels")]
@@ -277,6 +318,24 @@ mod tests {
             is_channel_type_compiled("linq"),
             cfg!(feature = "channel-linq")
         );
+    }
+
+    #[test]
+    fn display_and_legacy_keys_resolve_to_canonical_config_families() {
+        let cfg = ChannelsConfig::default();
+        for (canonical, _, _) in cfg.channel_presence() {
+            assert_eq!(canonical_channel_type(&cfg, canonical), Some(canonical));
+        }
+        for (input, expected) in [
+            ("gmail-push", "gmail_push"),
+            ("wecom-ws", "wecom_ws"),
+            ("nextcloud", "nextcloud_talk"),
+            ("whatsapp-web", "whatsapp"),
+            ("voice-call", "voice_call"),
+        ] {
+            assert_eq!(canonical_channel_type(&cfg, input), Some(expected));
+        }
+        assert_eq!(canonical_channel_type(&cfg, "not-a-channel"), None);
     }
 
     #[test]

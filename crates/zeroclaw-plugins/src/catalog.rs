@@ -70,6 +70,7 @@ pub struct BuiltinSeed {
     pub description: Option<String>,
     pub compiled: bool,
     pub enabled: bool,
+    pub toggleable: bool,
 }
 
 /// An installed plugin capability. `id` is the `provides` id when it mirrors a
@@ -85,11 +86,15 @@ pub struct InstalledSeed {
     pub description: Option<String>,
     pub permissions: Vec<String>,
     pub enabled: bool,
+    pub toggleable: bool,
 }
 
 /// A registry-listed (installable, not installed) capability.
 #[derive(Debug, Clone)]
 pub struct AvailableSeed {
+    /// Registry package name used by install/update commands. This can differ
+    /// from `id` when a package mirrors a canonical capability.
+    pub plugin_name: String,
     pub id: String,
     pub kind: CapabilityKind,
     pub version: Option<String>,
@@ -116,6 +121,14 @@ pub struct CapabilityCatalogEntry {
     /// The installed plugin `provides` a compiled-in built-in (mirror, not an
     /// override).
     pub mirrors_builtin: bool,
+    /// More than one installed plugin claims this `(kind, id)`. Runtime
+    /// resolution fails closed for the ambiguous providers; the catalog must
+    /// not choose one based on discovery order.
+    pub conflicted: bool,
+    /// The current config has a concrete lifecycle control for this
+    /// capability. Novel plugins remain false until per-plugin activation has
+    /// a canonical config source.
+    pub toggleable: bool,
 
     /// Which source wins after precedence (built-in > plugin > registry).
     pub origin: CapabilityOrigin,
@@ -165,6 +178,8 @@ pub fn merge_capabilities(
                 installed: false,
                 available: false,
                 mirrors_builtin: false,
+                conflicted: false,
+                toggleable: b.toggleable,
                 // finalized below
                 origin: CapabilityOrigin::BuiltIn,
                 enabled: false,
@@ -181,8 +196,18 @@ pub fn merge_capabilities(
         match find(&accs, &p.kind, &p.id) {
             Some(i) => {
                 let a = &mut accs[i];
+                if a.entry.installed {
+                    a.entry.conflicted = true;
+                    a.entry.mirrors_builtin |= p.mirrors_builtin;
+                    a.entry.plugin_name = None;
+                    a.entry.version = None;
+                    a.entry.permissions.clear();
+                    a.plugin_enabled = Some(false);
+                    continue;
+                }
                 a.entry.installed = true;
                 a.entry.mirrors_builtin = p.mirrors_builtin;
+                a.entry.toggleable |= p.toggleable;
                 a.entry.plugin_name = Some(p.plugin_name);
                 a.entry.version = p.version;
                 a.entry.permissions = p.permissions;
@@ -202,6 +227,8 @@ pub fn merge_capabilities(
                     installed: true,
                     available: false,
                     mirrors_builtin: p.mirrors_builtin,
+                    conflicted: false,
+                    toggleable: p.toggleable,
                     origin: CapabilityOrigin::Plugin,
                     enabled: false,
                     version: p.version,
@@ -217,7 +244,17 @@ pub fn merge_capabilities(
     for r in available {
         match find(&accs, &r.kind, &r.id) {
             Some(i) => {
-                accs[i].entry.available = true;
+                let entry = &mut accs[i].entry;
+                entry.available = true;
+                if !entry.conflicted && entry.plugin_name.is_none() {
+                    entry.plugin_name = Some(r.plugin_name);
+                }
+                if !entry.compiled_in && !entry.installed {
+                    entry.version = r.version;
+                    if entry.description.is_none() {
+                        entry.description = r.description;
+                    }
+                }
             }
             None => accs.push(Acc {
                 entry: CapabilityCatalogEntry {
@@ -229,10 +266,12 @@ pub fn merge_capabilities(
                     installed: false,
                     available: true,
                     mirrors_builtin: false,
+                    conflicted: false,
+                    toggleable: false,
                     origin: CapabilityOrigin::Registry,
                     enabled: false,
                     version: r.version,
-                    plugin_name: None,
+                    plugin_name: Some(r.plugin_name),
                     permissions: Vec::new(),
                 },
                 builtin_enabled: None,
@@ -297,6 +336,7 @@ mod tests {
             description: None,
             compiled,
             enabled,
+            toggleable: true,
         }
     }
 
@@ -310,11 +350,13 @@ mod tests {
             description: None,
             permissions: vec!["config_read".to_string()],
             enabled,
+            toggleable: mirrors,
         }
     }
 
     fn available(id: &str, kind: CapabilityKind) -> AvailableSeed {
         AvailableSeed {
+            plugin_name: id.to_string(),
             id: id.to_string(),
             kind,
             version: Some("2.0".to_string()),
@@ -409,6 +451,65 @@ mod tests {
         let e = get(&out, "weather");
         assert_eq!(e.origin, CapabilityOrigin::Plugin);
         assert!(e.installed && e.available);
+    }
+
+    #[test]
+    fn duplicate_installed_providers_fail_closed_without_order_winner() {
+        let out = merge_capabilities(
+            vec![],
+            vec![
+                plugin("git", "gitea-a", true, true),
+                plugin("git", "gitea-b", true, true),
+            ],
+            vec![],
+        );
+        assert_eq!(out.len(), 1);
+        let entry = get(&out, "git");
+        assert!(entry.conflicted);
+        assert!(!entry.enabled);
+        assert_eq!(entry.plugin_name, None);
+    }
+
+    #[test]
+    fn registry_metadata_does_not_hide_an_installed_provider_conflict() {
+        let out = merge_capabilities(
+            vec![],
+            vec![
+                plugin("git", "gitea-a", true, true),
+                plugin("git", "gitea-b", true, true),
+            ],
+            vec![AvailableSeed {
+                plugin_name: "gitea-a".to_string(),
+                id: "git".to_string(),
+                kind: CapabilityKind::Channel,
+                version: Some("1.0".to_string()),
+                description: None,
+            }],
+        );
+        let entry = get(&out, "git");
+        assert!(entry.conflicted && entry.available);
+        assert_eq!(entry.plugin_name, None);
+    }
+
+    #[test]
+    fn registry_package_name_can_differ_from_canonical_capability_id() {
+        let out = merge_capabilities(
+            vec![builtin("git", false, false)],
+            vec![],
+            vec![AvailableSeed {
+                plugin_name: "gitea".to_string(),
+                id: "git".to_string(),
+                kind: CapabilityKind::Channel,
+                version: Some("0.1.0".to_string()),
+                description: None,
+            }],
+        );
+        assert_eq!(out.len(), 1);
+        let entry = get(&out, "git");
+        assert!(entry.available);
+        assert_eq!(entry.origin, CapabilityOrigin::Registry);
+        assert_eq!(entry.plugin_name.as_deref(), Some("gitea"));
+        assert_eq!(entry.version.as_deref(), Some("0.1.0"));
     }
 
     #[test]

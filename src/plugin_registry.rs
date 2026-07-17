@@ -305,6 +305,13 @@ fn verify_manifest_matches_registry(
             entry.version
         );
     }
+    if entry.provides.is_some() && manifest.provides != entry.provides {
+        bail!(
+            "plugin archive manifest provides {:?} does not match registry provides {:?}",
+            manifest.provides,
+            entry.provides
+        );
+    }
     Ok(())
 }
 
@@ -429,6 +436,7 @@ capabilities = ["tool"]
             description: None,
             author: None,
             capabilities: Vec::new(),
+            provides: None,
             url: "https://example.invalid/team-calendar.zip".to_string(),
             sha256: None,
         };
@@ -442,6 +450,34 @@ capabilities = ["tool"]
             capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
             provides: None,
             sender_match: zeroclaw::plugins::SenderMatch::Exact,
+            permissions: Vec::new(),
+            signature: None,
+            publisher_key: None,
+        };
+
+        assert!(verify_manifest_matches_registry(&entry, &manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_registry_provides_projection_mismatch() {
+        let entry = PluginRegistryEntry {
+            name: "gitea".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["channel".to_string()],
+            provides: Some("git".to_string()),
+            url: "https://example.invalid/gitea.zip".to_string(),
+            sha256: None,
+        };
+        let manifest = PluginManifest {
+            name: "gitea".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            wasm_path: Some("plugin.wasm".to_string()),
+            capabilities: vec![zeroclaw::plugins::PluginCapability::Channel],
+            provides: Some("gitea".to_string()),
             permissions: Vec::new(),
             signature: None,
             publisher_key: None,

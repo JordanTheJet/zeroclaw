@@ -193,12 +193,20 @@ Registry entries use this shape:
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
+      "provides": null,
       "url": "https://example.invalid/team-calendar-0.2.0.zip",
       "sha256": "sha256:<hex digest of the zip>"
     }
   ]
 }
 ```
+
+For a channel package that mirrors a built-in channel family, `provides` is the
+canonical channel id from its `manifest.toml` (for example, the `gitea` package
+uses `"provides": "git"`). Registry publishers must generate this projection
+from the packaged manifest instead of maintaining a second, independently
+authored identity. Novel channels and non-channel packages omit it or use
+`null`.
 
 The archive must contain either a root-level `manifest.toml` or one nested
 plugin directory containing `manifest.toml`. Archives with traversal paths,
