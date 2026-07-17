@@ -1552,7 +1552,7 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let mut count = 0_usize;
+                    let plugins_start = tool_arcs.len();
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1563,6 +1563,19 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
+                    // Provider resolution: a compiled-in (native) tool wins over
+                    // a plugin that would register the same tool name. Mirrors
+                    // the skill-tool shadow policy in
+                    // `register_skill_tools_with_context_and_runtime`. Before
+                    // this guard, a plugin whose tool name collided with a
+                    // built-in was pushed anyway and exposed to the model as a
+                    // duplicate name — the built-in still won dispatch (first
+                    // match), leaving the plugin as dead, confusing weight. The
+                    // set is seeded from already-registered tools and grows as
+                    // plugins register, so plugin-vs-plugin name clashes are
+                    // resolved first-wins too.
+                    let mut registered_names: std::collections::HashSet<String> =
+                        tool_arcs.iter().map(|t| t.name().to_string()).collect();
                     for (manifest, wasm_path) in details {
                         // SSOT: `config` is the snapshot the whole tool set is
                         // built from, identical to every other tool here. A
@@ -1587,7 +1600,21 @@ pub fn all_tools_with_runtime(
                             plugin_limits,
                         ) {
                             Ok(tool) => {
-                                count += 1;
+                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                        &format!(
+                                            "Plugin tool '{}' shadows an already registered tool, skipping",
+                                            tool.name()
+                                        )
+                                    );
+                                    continue;
+                                }
                                 tool_arcs.push(Arc::new(tool));
                             }
                             Err(error) => {
@@ -1612,7 +1639,9 @@ pub fn all_tools_with_runtime(
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
+                            .with_attrs(::serde_json::json!({
+                                "count": tool_arcs.len() - plugins_start
+                            })),
                         "Loaded  WASM plugin tools"
                     );
                 }
@@ -1666,6 +1695,14 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
+) -> bool {
+    registered_names.insert(plugin_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,6 +1742,22 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_or_prior_plugin_tools() {
+        let mut registered_names = std::collections::HashSet::from(["shell".to_string()]);
+        let loaded_count = ["shell", "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .count();
+
+        assert_eq!(loaded_count, 1, "only the novel plugin tool is loaded");
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from(["shell".to_string(), "novel-tool".to_string()])
+        );
     }
 
     /// Regression: SOP tools must NOT appear in the tool registry when the
