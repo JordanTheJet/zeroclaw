@@ -18,7 +18,9 @@ the warm-store lifecycle from the
 > runtime does not yet construct it as a configurable backend; the host lacks
 > a memory counterpart to `channel_plugin_details()`. As with channels, build
 > against the contract: the WIT world and the adapter semantics are the part
-> that freezes.
+> that freezes. The memory world also has no config export yet, so do not
+> request `config_read`; add that only after a typed config ABI and resolver are
+> wired into `WasmMemory`.
 
 ## The data model
 
@@ -168,9 +170,10 @@ edges:
 
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
-For a memory backend: `capabilities` containing `memory`; `config_read` if
-the backend needs connection settings; `http_client` only if it talks to a
-remote store.
+For a memory backend: `capabilities` containing `memory`; `http_client` only if
+it talks to a remote store. Do not request `config_read` yet: admission requires
+a schema, but the current memory world has no export through which the host can
+deliver the resulting object.
 
 {{#include ../_snippets/plugin-build-component.md}}
 
