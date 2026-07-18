@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "plugins-wasmtime")]
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -278,6 +279,7 @@ impl TlsProfile {
 /// Returns [`EgressError`] when a referenced secret is unavailable, PEM is
 /// malformed or empty, a certificate cannot be trusted, or a client
 /// certificate and private key do not form a valid rustls identity.
+#[cfg(feature = "plugins-wasmtime")]
 pub fn build_tls_client_config(
     profile: Option<&TlsProfile>,
     mut resolve_secret: impl FnMut(&SecretPropertyRef) -> Result<String, EgressError>,
@@ -332,6 +334,7 @@ pub fn build_tls_client_config(
     Ok(Arc::new(config))
 }
 
+#[cfg(feature = "plugins-wasmtime")]
 fn parse_pem_certificates(
     pem: &str,
     profile: &str,
@@ -1242,6 +1245,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "plugins-wasmtime")]
     #[test]
     fn implicit_tls_profile_uses_system_roots_without_secret_resolution() {
         let config = build_tls_client_config(None, |_| {
@@ -1250,6 +1254,7 @@ mod tests {
         assert!(config.is_ok());
     }
 
+    #[cfg(feature = "plugins-wasmtime")]
     #[test]
     fn tls_builder_resolves_custom_trust_and_client_identity_by_reference() {
         let ca_key = rcgen::KeyPair::generate().unwrap();
@@ -1292,6 +1297,7 @@ mod tests {
         assert_eq!(resolved, ["ca_pem", "client_cert_pem", "client_key_pem"]);
     }
 
+    #[cfg(feature = "plugins-wasmtime")]
     #[test]
     fn tls_builder_rejects_empty_custom_ca_material() {
         let profile = TlsProfile::new(
