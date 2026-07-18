@@ -1,6 +1,7 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 
+use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
@@ -63,14 +64,15 @@ impl Attributable for WasmChannel {
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
-    if http {
+    if state.http_enabled() {
         crate::component::add_wasi_http(&mut linker)?;
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_websocket(state.permission_enabled(PluginPermission::WebSocketClient));
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -97,8 +99,17 @@ impl WasmChannel {
                 .with_inbound(inbound.clone()),
         );
         let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
+        let websocket = store
+            .data()
+            .permission_enabled(PluginPermission::WebSocketClient);
+        let linker = build_linker(store.data())?;
         crate::component::ensure_http_coherent(&store, http)?;
+        crate::component::ensure_permission_coherent(
+            &store,
+            PluginPermission::WebSocketClient,
+            "zeroclaw:plugin/websocket",
+            websocket,
+        )?;
         let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
             wt(
                 ChannelPlugin::instantiate_async(store, &component, &linker).await,

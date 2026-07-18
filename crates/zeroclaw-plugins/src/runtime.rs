@@ -1,7 +1,6 @@
 //! Tool plugin execution: bridges the `tool-plugin` world to the runtime's
 //! `ToolMetadata`/`ToolResult` surface. Fresh store per call, stateless.
 
-use crate::PluginCapability;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
@@ -10,10 +9,10 @@ use crate::component::{
 };
 use crate::instance::PluginInstanceScope;
 use crate::services::PluginHostServices;
+use crate::{PluginCapability, PluginPermission};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use wasmtime::Store;
 use wasmtime::component::Linker;
@@ -32,11 +31,15 @@ pub struct Plugin {
     state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
 }
 
-fn base_linker() -> Result<Linker<PluginState>> {
+fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
+    if state.http_enabled() {
+        crate::component::add_wasi_http(&mut linker)?;
+    }
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_websocket(state.permission_enabled(PluginPermission::WebSocketClient));
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -48,30 +51,12 @@ fn base_linker() -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
-/// Cached linker for plugins without `HttpClient`: base WASI plus the tool
-/// world, no network.
-fn tool_linker() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| base_linker().expect("tool linker"))
-}
-
-/// Cached linker for `HttpClient` plugins: the base surface plus `wasi:http`.
-/// Built only once, on first use by an HTTP-granted plugin.
-fn tool_linker_http() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| {
-        let mut linker = base_linker().expect("tool linker");
-        crate::component::add_wasi_http(&mut linker).expect("tool http linker");
-        linker
-    })
-}
-
 /// Compile and instantiate a tool plugin under one host-issued scope.
 ///
-/// The scope decides whether the store carries an outbound-HTTP context and
-/// whether the linker exposes `wasi:http`; deriving both from the same scope
-/// prevents authority from drifting between instantiation and execution. The
-/// required service bundle resolves canonical live config for that same scope.
+/// The scope decides whether the store/linker expose outbound HTTP and
+/// WebSocket imports. Deriving both from the same admission prevents authority
+/// from drifting between instantiation and execution. The required service
+/// bundle resolves canonical live config for that same scope.
 pub async fn create_plugin(
     wasm_path: &Path,
     scope: &PluginInstanceScope,
@@ -86,15 +71,20 @@ pub async fn create_plugin(
         limits,
     ));
     let http = store.data().http_enabled();
-    let linker = if http {
-        tool_linker_http()
-    } else {
-        tool_linker()
-    };
+    let websocket = store
+        .data()
+        .permission_enabled(PluginPermission::WebSocketClient);
+    let linker = build_linker(store.data())?;
     crate::component::ensure_http_coherent(&store, http)?;
+    crate::component::ensure_permission_coherent(
+        &store,
+        PluginPermission::WebSocketClient,
+        "zeroclaw:plugin/websocket",
+        websocket,
+    )?;
     let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
         wt(
-            ToolPlugin::instantiate_async(store, &component, linker).await,
+            ToolPlugin::instantiate_async(store, &component, &linker).await,
             "failed to instantiate tool plugin",
         )
     });

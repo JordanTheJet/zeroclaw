@@ -41,6 +41,10 @@ world tool-plugin {
     import logging;
     /// Read schema-designated secrets for this admitted tool instance.
     import secrets;
+    /// Open host-mediated outbound WebSocket resources when the admitted
+    /// instance holds the `websocket_client` grant.
+    @unstable(feature = plugins-wit-v0-websocket)
+    import websocket;
     export plugin-info;
     export tool;
 }

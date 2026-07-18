@@ -243,10 +243,12 @@ config or credential cache.
 
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
-For a channel: `capabilities` containing `channel`, and almost certainly both
-`config_read` (no platform works without credentials) and `http_client` (the
-outbound `wasi:http` surface is the only network you have; without the
-permission, `send` has no way to reach the platform at all).
+For a channel: `capabilities` containing `channel`, and almost certainly
+`config_read` because platforms require credentials. Request the narrow network
+surface the implementation actually uses: `http_client` for outbound
+`wasi:http`, `websocket_client` for the host-mediated WebSocket resource, or
+both for a platform with separate REST and streaming APIs. Neither permission
+allows a listener; inbound host-owned traffic arrives through `inbound`.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 

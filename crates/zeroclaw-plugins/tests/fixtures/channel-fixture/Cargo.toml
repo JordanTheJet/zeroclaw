@@ -5,10 +5,21 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+websocket = []
+
 [lib]
 crate-type = ["cdylib"]
 doc = false
 doctest = false
+test = false
+
+[[example]]
+name = "zeroclaw-channel-websocket-fixture"
+path = "examples/websocket.rs"
+crate-type = ["cdylib"]
+required-features = ["websocket"]
+doc = false
 test = false
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

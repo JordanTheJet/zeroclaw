@@ -83,12 +83,13 @@ The manifest declares two orthogonal things:
   `PluginPermission` enum in the same file. Today `config_read` (tool and
   channel adapters receive their own schema-validated public config and can
   resolve schema-designated secrets in authorized service calls) and
-  `http_client` (outbound `wasi:http` is wired into its store and linker) are
-  enforced.
+  `http_client` (outbound `wasi:http` is wired into its store and linker) and
+  `websocket_client` (a bounded host-mediated WebSocket resource is linked for
+  tool and channel worlds) are enforced.
   `config_read` must be paired with the manifest's `config_schema`; either one
-  without the other is rejected. The filesystem and memory-access permissions
-  are accepted by the schema but not yet backed by host functions, so declaring
-  them grants nothing.
+  without the other is rejected. Raw sockets, filesystem, and memory-access
+  permissions are accepted by the schema but not yet backed by host functions,
+  so declaring them grants nothing.
 
 ## The worlds
 
@@ -122,10 +123,11 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
   optional HTTP context, and the fuel budget;
 - a `Linker` with exactly the imports its world and permissions call for:
   `logging` always, `secrets` for tools and channels, `config` and `inbound` for
-  channels, and `wasi:http` only when the manifest grants `http_client`. The
-  HTTP context and the linked interface are derived from the same permission
-  set and cross-checked at instantiation
-  (`ensure_http_coherent`), so they cannot disagree.
+  channels, `wasi:http` only when the manifest grants `http_client`, and the
+  `websocket` resource only when it grants `websocket_client`. Each optional
+  surface and the store authority are derived from the same admitted scope and
+  cross-checked at instantiation (`ensure_http_coherent` and
+  `ensure_permission_coherent`), so they cannot disagree.
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
 store, runs the call, and drops it. Channels and memory backends hold one warm
