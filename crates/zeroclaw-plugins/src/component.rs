@@ -397,9 +397,9 @@ impl PluginState {
         self.http.is_some()
     }
 
-    /// Whether the admitted scope exposes the socket host interface.
-    pub(crate) fn sockets_enabled(&self) -> bool {
-        self.scope.grants().allows(PluginPermission::SocketClient)
+    /// Resolve optional host-import authority from the admitted scope.
+    pub(crate) fn permission_enabled(&self, permission: PluginPermission) -> bool {
+        self.scope.grants().allows(permission)
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
@@ -456,6 +456,29 @@ pub fn ensure_http_coherent(store: &Store<PluginState>, linker_has_http: bool) -
         anyhow::bail!(
             "plugin store/linker http mismatch: store HttpClient={store_has_http}, \
              linker wasi:http={linker_has_http}; refusing to instantiate"
+        );
+    }
+    ensure_permission_coherent(
+        store,
+        PluginPermission::HttpClient,
+        "wasi:http",
+        linker_has_http,
+    )
+}
+
+/// Reject optional-import authority that differs from the admitted scope.
+pub(crate) fn ensure_permission_coherent(
+    store: &Store<PluginState>,
+    permission: PluginPermission,
+    import_name: &str,
+    linker_has_import: bool,
+) -> Result<()> {
+    let store_has_permission = store.data().permission_enabled(permission);
+    if store_has_permission != linker_has_import {
+        anyhow::bail!(
+            "plugin store/linker permission mismatch for {import_name}: \
+             store {permission:?}={store_has_permission}, linker import={linker_has_import}; \
+             refusing to instantiate"
         );
     }
     Ok(())
@@ -992,6 +1015,7 @@ mod tests {
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
         );
+        assert!(state.permission_enabled(PluginPermission::HttpClient));
     }
 
     #[test]
@@ -1022,6 +1046,29 @@ mod tests {
         assert!(
             ensure_http_coherent(&plain, true).is_err(),
             "plain store with an http linker would panic on first outbound call"
+        );
+    }
+
+    #[test]
+    fn optional_import_coherence_uses_the_admitted_scope() {
+        let granted = new_store(spec([PluginPermission::WebSocketClient], 0));
+        assert!(
+            ensure_permission_coherent(
+                &granted,
+                PluginPermission::WebSocketClient,
+                "zeroclaw:plugin/websocket",
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_permission_coherent(
+                &granted,
+                PluginPermission::WebSocketClient,
+                "zeroclaw:plugin/websocket",
+                false,
+            )
+            .is_err()
         );
     }
 
