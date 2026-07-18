@@ -6,6 +6,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/event.rs"]
+mod event_support;
 mod support;
 
 use std::collections::HashMap;
@@ -19,10 +21,7 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
-use zeroclaw_plugins::event::{
-    PluginEventDispatcher, PluginEventEnvelope, PluginEventError, PluginEventResolution,
-    PluginEventRouteResolver, PluginEventRouter, ResolvedPluginEventRoute,
-};
+use zeroclaw_plugins::event::PluginEventRouter;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
@@ -113,59 +112,8 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
     PluginHostServices::new(resolver, state_service(), support::egress_service())
 }
 
-struct AcceptingDispatcher;
-
-#[async_trait::async_trait]
-impl PluginEventDispatcher for AcceptingDispatcher {
-    async fn dispatch(
-        &self,
-        _route: ResolvedPluginEventRoute,
-        _event: PluginEventEnvelope,
-    ) -> Result<(), PluginEventError> {
-        Ok(())
-    }
-}
-
-fn accepting_router() -> PluginEventRouter {
-    let resolver = PluginEventRouteResolver::new(|instance, _| {
-        Ok(PluginEventResolution::Authorized(
-            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
-        ))
-    });
-    PluginEventRouter::new(resolver, Arc::new(AcceptingDispatcher))
-}
-
-struct RecordingDispatcher {
-    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-}
-
-#[async_trait::async_trait]
-impl PluginEventDispatcher for RecordingDispatcher {
-    async fn dispatch(
-        &self,
-        _route: ResolvedPluginEventRoute,
-        event: PluginEventEnvelope,
-    ) -> Result<(), PluginEventError> {
-        self.sender
-            .send(event.into_message())
-            .await
-            .map_err(|_| PluginEventError::DispatchFailed("test receiver closed".to_string()))
-    }
-}
-
-fn recording_router(
-    sender: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-) -> PluginEventRouter {
-    let resolver = PluginEventRouteResolver::new(|instance, _| {
-        Ok(PluginEventResolution::Authorized(
-            ResolvedPluginEventRoute::agent(instance, "fixture-agent")?,
-        ))
-    });
-    PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender }))
-}
-
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
-    build_channel_with_router(binding, services, accepting_router()).await
+    build_channel_with_router(binding, services, event_support::event_router(None, true)).await
 }
 
 async fn build_channel_with_router(
@@ -218,7 +166,12 @@ async fn channel_component_runs_through_host_ingress() {
     let config = canonical_config("main", "v1", "token-main");
     let services = host_services(config);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
-    let channel = build_channel_with_router("main", &services, recording_router(event_tx)).await;
+    let channel = build_channel_with_router(
+        "main",
+        &services,
+        event_support::event_router(Some(event_tx), true),
+    )
+    .await;
 
     assert_eq!(channel.name(), "plugin");
     assert_eq!(channel.alias(), "main");
@@ -270,9 +223,7 @@ async fn channel_listener_drops_events_denied_by_live_host_routing() {
     let config = canonical_config("main", "v1", "token-main");
     let services = host_services(config);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
-    let resolver = PluginEventRouteResolver::new(|_, _| Ok(PluginEventResolution::Denied));
-    let router =
-        PluginEventRouter::new(resolver, Arc::new(RecordingDispatcher { sender: event_tx }));
+    let router = event_support::event_router(Some(event_tx), false);
     let channel = build_channel_with_router("main", &services, router).await;
     let inbound = channel.inbound();
     inbound.enqueue(HostInboundMessage {

@@ -4,6 +4,8 @@
 
 #[path = "support/admit.rs"]
 mod admit_support;
+#[path = "support/event.rs"]
+mod event_support;
 #[path = "support/state.rs"]
 mod state_support;
 
@@ -146,13 +148,21 @@ fn host_services(url: String) -> PluginHostServices {
 async fn build_channel(
     url: String,
     grants: impl IntoIterator<Item = PluginPermission>,
+    event_sender: Option<tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>>,
 ) -> anyhow::Result<WasmChannel> {
     let manifest = manifest();
     let scope =
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, "main", grants)?;
     let endpoint = PluginChannelEndpoint::new(scope, "websocket_fixture")?;
     let component = admit_fixture(&fixture(), &manifest);
-    WasmChannel::from_wasm(endpoint, &component, &host_services(url), limits()).await
+    WasmChannel::from_wasm(
+        endpoint,
+        &component,
+        &host_services(url),
+        limits(),
+        event_support::event_router(event_sender, true),
+    )
+    .await
 }
 
 async fn run_echo_server(listener: TcpListener) {
@@ -181,17 +191,18 @@ async fn channel_component_exchanges_typed_websocket_messages() {
     let port = listener.local_addr().expect("echo listener address").port();
     let server = zeroclaw_spawn::spawn!(run_echo_server(listener));
     let url = format!("ws://{ECHO_HOST}:{port}/echo");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
     let channel = build_channel(
         url,
         [
             PluginPermission::ConfigRead,
             PluginPermission::WebSocketClient,
         ],
+        Some(tx.clone()),
     )
     .await
     .expect("instantiate WebSocket channel fixture");
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
     let channel_listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -225,6 +236,7 @@ async fn linker_omits_websocket_import_without_effective_permission() {
     let error = match build_channel(
         format!("ws://{ECHO_HOST}:1/echo"),
         [PluginPermission::ConfigRead],
+        None,
     )
     .await
     {

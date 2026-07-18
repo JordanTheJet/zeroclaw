@@ -4,6 +4,8 @@
 
 #[path = "support/admit.rs"]
 mod admit_support;
+#[path = "support/event.rs"]
+mod event_support;
 #[path = "support/state.rs"]
 mod state_support;
 
@@ -202,10 +204,16 @@ async fn channel_component_round_trips_through_the_socket_resource() {
     )
     .expect("socket channel endpoint");
     let component = admit_fixture(&channel_fixture(), &manifest);
-    let channel = WasmChannel::from_wasm(endpoint, &component, &services, limits())
-        .await
-        .expect("instantiate socket channel component");
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let channel = WasmChannel::from_wasm(
+        endpoint,
+        &component,
+        &services,
+        limits(),
+        event_support::event_router(Some(tx.clone()), true),
+    )
+    .await
+    .expect("instantiate socket channel component");
     let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -249,7 +257,14 @@ async fn socket_import_is_unlinked_without_the_effective_grant() {
     )
     .expect("denied endpoint");
     let component = admit_fixture(&channel_fixture(), &manifest);
-    let result = WasmChannel::from_wasm(endpoint, &component, &services, limits()).await;
+    let result = WasmChannel::from_wasm(
+        endpoint,
+        &component,
+        &services,
+        limits(),
+        event_support::event_router(None, true),
+    )
+    .await;
     assert!(
         result.is_err(),
         "a component importing sockets must not instantiate without SocketClient"
@@ -267,10 +282,16 @@ async fn component_plaintext_fails_closed_without_shared_policy() {
     )
     .expect("policy-denied endpoint");
     let component = admit_fixture(&channel_fixture(), &manifest);
-    let error = WasmChannel::from_wasm(endpoint, &component, &services, limits())
-        .await
-        .err()
-        .expect("plaintext policy denies configure");
+    let error = WasmChannel::from_wasm(
+        endpoint,
+        &component,
+        &services,
+        limits(),
+        event_support::event_router(None, true),
+    )
+    .await
+    .err()
+    .expect("plaintext policy denies configure");
     let error = format!("{error:#}");
     assert!(error.contains("access-denied"), "{error}");
 }
