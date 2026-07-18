@@ -5,6 +5,7 @@
 //! scope, keeping identity and authorization out of guest-controlled inputs.
 
 use crate::config::{PluginConfigResolver, ResolvedPluginConfig};
+use crate::egress::EgressHostService;
 use crate::error::PluginError;
 use crate::instance::PluginInstanceScope;
 
@@ -16,6 +17,7 @@ use crate::instance::PluginInstanceScope;
 #[derive(Clone)]
 pub struct PluginHostServices {
     config: PluginConfigResolver,
+    egress: EgressHostService,
 }
 
 /// Detail-free internal result converted to each WIT world's generated enum.
@@ -36,8 +38,8 @@ pub(crate) enum ConfigLookupError {
 impl PluginHostServices {
     /// Build the complete required host-service bundle.
     #[must_use]
-    pub fn new(config: PluginConfigResolver) -> Self {
-        Self { config }
+    pub fn new(config: PluginConfigResolver, egress: EgressHostService) -> Self {
+        Self { config, egress }
     }
 
     /// Resolve a typed, validated config view from canonical host state.
@@ -52,6 +54,12 @@ impl PluginHostServices {
     ) -> Result<ResolvedPluginConfig, PluginError> {
         self.config.resolve(scope)
     }
+
+    /// Shared live-policy egress boundary for every plugin transport.
+    #[must_use]
+    pub fn egress(&self) -> &EgressHostService {
+        &self.egress
+    }
 }
 
 /// Empty config service for store-plumbing tests. Production callers must
@@ -60,7 +68,7 @@ impl PluginHostServices {
 pub(crate) fn test_host_services() -> PluginHostServices {
     use crate::{PluginManifest, PluginPermission, config::resolve_plugin_config};
 
-    PluginHostServices::new(PluginConfigResolver::new(|scope| {
+    let config = PluginConfigResolver::new(|scope| {
         let manifest = PluginManifest {
             name: scope.id().package().to_string(),
             version: "0.0.0-test".to_string(),
@@ -79,5 +87,21 @@ pub(crate) fn test_host_services() -> PluginHostServices {
             publisher_key: None,
         };
         resolve_plugin_config(&manifest, scope, None)
+    });
+    test_services(config)
+}
+
+/// Complete service bundle around a test-owned config resolver.
+#[cfg(test)]
+pub(crate) fn test_services(config: PluginConfigResolver) -> PluginHostServices {
+    PluginHostServices::new(config, test_egress_service())
+}
+
+#[cfg(test)]
+pub(crate) fn test_egress_service() -> EgressHostService {
+    use crate::egress::{EgressPolicy, EgressPolicyResolver};
+
+    EgressHostService::new(EgressPolicyResolver::new(|_| {
+        EgressPolicy::new([], [], [], 16)
     }))
 }

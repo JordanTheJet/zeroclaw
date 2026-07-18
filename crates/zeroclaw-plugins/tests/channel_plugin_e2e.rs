@@ -6,6 +6,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -120,7 +122,7 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
         })?;
         resolve_plugin_config(&manifest, scope, Some(values))
     });
-    PluginHostServices::new(resolver)
+    PluginHostServices::new(resolver, support::egress_service())
 }
 
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {

@@ -618,7 +618,7 @@ mod tests {
         manifest: PluginManifest,
         values: HashMap<String, String>,
     ) -> PluginHostServices {
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolve_plugin_config(&manifest, scope, Some(&values))
         }))
     }
@@ -633,7 +633,7 @@ mod tests {
             let denied = secret_scope(&manifest, capability, "main", false);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("denied lookup must not invoke config resolution")
             }));
@@ -662,7 +662,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Channel, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             panic!("disabled secret frame must not invoke config resolution")
         }));
@@ -688,7 +688,7 @@ mod tests {
             let scope = secret_scope(&manifest, capability, "main", true);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("a mismatched call phase must not resolve secrets")
             }));
@@ -730,7 +730,7 @@ mod tests {
         let requested = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let issued = secret_scope(&manifest, PluginCapability::Tool, "backup", true);
         let resolver_manifest = Arc::clone(&manifest);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             let values = configured("one", "backup-token");
             resolve_plugin_config(&resolver_manifest, &issued, Some(&values))
         }));
@@ -754,7 +754,7 @@ mod tests {
         let resolver_manifest = Arc::clone(&manifest);
         let resolver_values = Arc::clone(&values);
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             let values = resolver_values
                 .read()
@@ -790,7 +790,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             Err(PluginError::InvalidConfig("resolver detail".to_string()))
         }));

@@ -5,6 +5,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -125,9 +127,12 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     );
     let resolver_manifest = manifest.clone();
     let resolver_section = section.clone();
-    let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
-    }));
+    let services = PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+        }),
+        support::egress_service(),
+    );
     let mut plugin = runtime::create_plugin(
         wasm_path,
         &scope,

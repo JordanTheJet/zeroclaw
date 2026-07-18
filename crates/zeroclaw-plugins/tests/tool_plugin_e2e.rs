@@ -2,6 +2,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,7 +95,7 @@ async fn execute(binding: &str) -> String {
     let resolver = PluginConfigResolver::new(move |scope| {
         resolve_plugin_config(&manifest, scope, Some(&configured))
     });
-    let services = PluginHostServices::new(resolver);
+    let services = PluginHostServices::new(resolver, support::egress_service());
     let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, limits())
         .await
         .expect("instantiate fixture tool");

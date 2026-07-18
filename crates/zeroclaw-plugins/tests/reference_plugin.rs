@@ -5,6 +5,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -64,9 +66,12 @@ fn host_services(
     manifest: PluginManifest,
     configured: Option<HashMap<String, String>>,
 ) -> PluginHostServices {
-    PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&manifest, scope, configured.as_ref())
-    }))
+    PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, configured.as_ref())
+        }),
+        support::egress_service(),
+    )
 }
 
 #[tokio::test]
