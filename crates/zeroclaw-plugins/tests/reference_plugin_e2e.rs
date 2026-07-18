@@ -29,6 +29,8 @@ use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
+use support::state_service;
+
 /// The fixture package's manifest: the single source of truth for both the
 /// seeded `manifest.toml` and the instance key its config entry is stored under.
 const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
@@ -239,9 +241,12 @@ async fn reference_plugin_from_config_subprocess() {
 
     let resolver_manifest = manifest.clone();
     let resolver_section = section.clone();
-    let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
-    }));
+    let services = PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+        }),
+        state_service(),
+    );
     let mut plugin = runtime::create_plugin(
         wasm_path,
         &scope,

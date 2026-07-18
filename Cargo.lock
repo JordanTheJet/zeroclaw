@@ -14103,6 +14103,7 @@ dependencies = [
  "clap",
  "directories",
  "hex",
+ "hmac 0.12.1",
  "hostname",
  "libc",
  "parking_lot",
@@ -14403,6 +14404,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-spawn",
+ "zeroize",
 ]
 
 [[package]]

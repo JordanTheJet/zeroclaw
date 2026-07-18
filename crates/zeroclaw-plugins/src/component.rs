@@ -15,7 +15,10 @@ use crate::egress::EgressHostService;
 use crate::error::PluginError;
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
-use crate::services::{ConfigLookupError, PluginHostServices, SecretLookupError};
+use crate::services::{
+    ConfigLookupError, PluginHostServices, PluginStateError, PluginStateKey, PluginStateValue,
+    SecretLookupError,
+};
 use crate::wasi_http::PluginEgressHooks;
 use crate::{PluginCapability, PluginPermission};
 
@@ -340,8 +343,8 @@ impl PluginState {
         true
     }
 
-    /// Whether the active frame may resolve this instance's secret properties.
-    fn secret_service_enabled(&self) -> bool {
+    /// Whether the active frame may use this instance's scoped host services.
+    fn instance_services_enabled(&self) -> bool {
         matches!(
             (self.call_config.phase(), self.scope.id().capability()),
             (Some(PluginCallPhase::ToolExecute), PluginCapability::Tool)
@@ -377,7 +380,7 @@ impl PluginState {
         if !self.charge_host_call() {
             return Err(SecretLookupError::Unavailable);
         }
-        if !self.secret_service_enabled() {
+        if !self.instance_services_enabled() {
             return Err(SecretLookupError::Unavailable);
         }
         if !self.scope.grants().allows(PluginPermission::ConfigRead) {
@@ -386,6 +389,60 @@ impl PluginState {
         self.with_call_config(|config| config.secret(name).map(ToOwned::to_owned))
             .map_err(|_| SecretLookupError::Unavailable)?
             .ok_or(SecretLookupError::NotFound)
+    }
+
+    /// Read durable state under the immutable store-owned instance scope.
+    pub(crate) async fn state_get(
+        &mut self,
+        key: String,
+    ) -> Result<Option<PluginStateValue>, PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateRead) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.get(&scope, &key).await
+    }
+
+    /// Commit durable state with compare-and-swap semantics.
+    pub(crate) async fn state_put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateWrite) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.put(&scope, &key, &value, expected_revision).await
+    }
+
+    /// Delete durable state with compare-and-swap semantics.
+    pub(crate) async fn state_delete(
+        &mut self,
+        key: String,
+        expected_revision: u64,
+    ) -> Result<(), PluginStateError> {
+        if !self.charge_host_call() || !self.instance_services_enabled() {
+            return Err(PluginStateError::Unavailable);
+        }
+        if !self.scope.grants().allows(PluginPermission::StateWrite) {
+            return Err(PluginStateError::AccessDenied);
+        }
+        let key = PluginStateKey::parse(key)?;
+        let state = self.services.state().clone();
+        let scope = self.scope.clone();
+        state.delete(&scope, &key, expected_revision).await
     }
 
     /// Whether this state was built with outbound HTTP attached.
@@ -788,7 +845,7 @@ mod tests {
         manifest: PluginManifest,
         values: HashMap<String, String>,
     ) -> PluginHostServices {
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolve_plugin_config(&manifest, scope, Some(&values))
         }))
     }
@@ -803,7 +860,7 @@ mod tests {
             let denied = secret_scope(&manifest, capability, "main", false);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("denied lookup must not invoke config resolution")
             }));
@@ -832,7 +889,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Channel, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             panic!("disabled secret frame must not invoke config resolution")
         }));
@@ -858,7 +915,7 @@ mod tests {
             let scope = secret_scope(&manifest, capability, "main", true);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("a mismatched call phase must not resolve secrets")
             }));
@@ -900,7 +957,7 @@ mod tests {
         let requested = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let issued = secret_scope(&manifest, PluginCapability::Tool, "backup", true);
         let resolver_manifest = Arc::clone(&manifest);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             let values = configured("one", "backup-token");
             resolve_plugin_config(&resolver_manifest, &issued, Some(&values))
         }));
@@ -924,7 +981,7 @@ mod tests {
         let resolver_manifest = Arc::clone(&manifest);
         let resolver_values = Arc::clone(&values);
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             let values = resolver_values
                 .read()
@@ -960,7 +1017,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             Err(PluginError::InvalidConfig("resolver detail".to_string()))
         }));

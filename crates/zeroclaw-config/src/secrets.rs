@@ -23,6 +23,8 @@
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
@@ -37,6 +39,10 @@ const KEY_LEN: usize = 32;
 
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
+
+/// Domain prefix for [`SecretStore::keyed_digest`], so a blind-index digest
+/// can never collide with another use of the install key.
+const KEYED_DIGEST_DOMAIN: &[u8] = b"zeroclaw.secret-store.keyed-digest.v1\0";
 
 const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -325,6 +331,7 @@ impl SecretStore {
 
     /// Decrypt using ChaCha20-Poly1305 (current secure format).
     fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
+        self.require_existing_key()?;
         let blob =
             hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
         anyhow::ensure!(
@@ -369,6 +376,7 @@ impl SecretStore {
 
     /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
+        self.require_existing_key()?;
         let ciphertext = hex_decode(hex_str)
             .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
 
@@ -377,6 +385,36 @@ impl SecretStore {
             String::from_utf8(plaintext_bytes)
                 .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
         })
+    }
+
+    /// Compute a domain-separated keyed digest with the existing install key.
+    ///
+    /// Never provisions a key: callers fail closed when none exists. Suits
+    /// blind database indexes that must not be enumerable without the
+    /// install secret.
+    pub fn keyed_digest(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+        self.require_existing_key()?;
+        self.get_key(|key| keyed_digest_with_key(key, domain, data))
+    }
+
+    /// Compute a domain-separated keyed digest, provisioning the install key
+    /// when needed for a write that will persist new encrypted material.
+    pub fn keyed_digest_or_create(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+        self.get_key(|key| keyed_digest_with_key(key, domain, data))
+    }
+
+    /// Refuse a read-side key use when no key has been provisioned. Reads
+    /// must never mint a replacement: a new key cannot decrypt what the lost
+    /// one encrypted, and creating it hides the loss.
+    fn require_existing_key(&self) -> Result<()> {
+        if self.key_source.provisioning_state() == ProvisioningState::NeedsInitialization {
+            anyhow::bail!(
+                "No existing `.secret_key` for the '{}' key source; refusing to create a \
+                 replacement on a read. Restore the original key material from backup.",
+                self.key_source.backend_name()
+            );
+        }
+        Ok(())
     }
 
     /// Check if a value is already encrypted or externally resolved.
@@ -393,6 +431,16 @@ impl SecretStore {
     pub fn is_secure_encrypted(value: &str) -> bool {
         value.starts_with("enc2:")
     }
+}
+
+fn keyed_digest_with_key(key: &[u8], domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
+    mac.update(KEYED_DIGEST_DOMAIN);
+    mac.update(&(domain.len() as u64).to_be_bytes());
+    mac.update(domain);
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
 }
 
 // ── Atomic key publication ──────────────────────────────────────
@@ -1153,6 +1201,54 @@ mod tests {
     }
 
     // ── SecretStore basics ─────────────────────────────────────
+
+    #[test]
+    fn decrypt_with_missing_key_fails_without_creating_a_replacement() {
+        let source = TempDir::new().unwrap();
+        let missing = TempDir::new().unwrap();
+        let encrypted = SecretStore::new(source.path(), true)
+            .encrypt("preserve-recovery-path")
+            .unwrap();
+        let store = SecretStore::new(missing.path(), true);
+
+        let error = store
+            .decrypt(&encrypted)
+            .expect_err("missing install key must fail closed");
+        assert!(error.to_string().contains(".secret_key"), "{error}");
+        assert!(
+            !missing.path().join(".secret_key").exists(),
+            "a read failure must not create a replacement key"
+        );
+    }
+
+    #[test]
+    fn keyed_digests_are_stable_domain_separated_and_read_only_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(store.keyed_digest(b"owner", b"same").is_err());
+        assert!(!tmp.path().join(".secret_key").exists());
+
+        let first = store.keyed_digest_or_create(b"owner", b"same").unwrap();
+        assert_eq!(store.keyed_digest(b"owner", b"same").unwrap(), first);
+        assert_ne!(store.keyed_digest(b"row", b"same").unwrap(), first);
+        assert_ne!(store.keyed_digest(b"owner", b"other").unwrap(), first);
+        assert_eq!(
+            SecretStore::new(tmp.path(), false)
+                .keyed_digest(b"owner", b"same")
+                .unwrap(),
+            first,
+            "blind-index derivation is independent of the plaintext preference"
+        );
+    }
+
+    #[test]
+    fn wrong_length_secret_key_is_rejected_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".secret_key"), "00").unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(store.keyed_digest(b"owner", b"value").is_err());
+        assert!(store.encrypt("value").is_err());
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -2583,6 +2679,9 @@ exit 65
         let tmp2 = TempDir::new().unwrap();
         let store1 = SecretStore::new(tmp1.path(), true);
         let store2 = SecretStore::new(tmp2.path(), true);
+        // Give store2 its own key: a missing key fails earlier, as a missing
+        // key rather than as a wrong one.
+        store2.encrypt("provision-store2-key").unwrap();
 
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
