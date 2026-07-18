@@ -9,7 +9,8 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
 use crate::component::{
-    PluginState, PluginStoreSpec, call_plugin, call_store, engine, load_component, wt,
+    PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
+    load_component, wt,
 };
 use crate::endpoint::PluginChannelEndpoint;
 use crate::services::PluginHostServices;
@@ -33,6 +34,9 @@ pub struct WasmChannel {
     capabilities: ChannelCapabilities,
     state: Mutex<(Store<PluginState>, ChannelPlugin)>,
     inbound: InboundQueue,
+    // Static component metadata, fixed for one admitted logical binding.
+    // Changing the external account or these capabilities requires rebuilding
+    // the channel; point-of-use config refresh is only for that same binding.
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
@@ -105,13 +109,13 @@ impl WasmChannel {
 
         let channel = bindings.zeroclaw_plugin_channel();
 
-        // Hand the plugin its public config once, before any other export.
+        // Let the plugin initialize before static discovery. Config stays
+        // host-owned and is available through point-of-use imports in this
+        // channel-service frame.
         let configure_result: Result<()> =
-            call_store!(store, async |store: &mut Store<PluginState>| {
-                let config = store.data_mut().public_config()?;
-                let config_json = serde_json::to_string(&config)?;
+            call_channel_store!(store, async |store: &mut Store<PluginState>| {
                 wt(
-                    channel.call_configure(store, &config_json).await,
+                    channel.call_configure(store).await,
                     "channel.configure trapped",
                 )?
                 .map_err(anyhow::Error::msg)
@@ -258,7 +262,7 @@ impl Channel for WasmChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -281,7 +285,7 @@ impl Channel for WasmChannel {
         // orchestrator owns cancellation and restart supervision; detaching a
         // second task here would make every apparent exit leak another loop.
         loop {
-            let polled = call_plugin!(
+            let polled = call_channel!(
                 self,
                 async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                     bindings
@@ -340,7 +344,7 @@ impl Channel for WasmChannel {
         {
             return true;
         }
-        let result: Result<bool> = call_plugin!(
+        let result: Result<bool> = call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -380,7 +384,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -400,7 +404,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -425,7 +429,7 @@ impl Channel for WasmChannel {
             return Ok(None);
         }
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -452,7 +456,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -484,7 +488,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -517,7 +521,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -540,7 +544,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (recipient, message_id) = (recipient.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -576,7 +580,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -603,7 +607,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -623,7 +627,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -646,7 +650,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -674,7 +678,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -702,7 +706,7 @@ impl Channel for WasmChannel {
         }
         let recipient = recipient.to_string();
         let wit_req = to_wit_approval_request(request);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 let out = wt(
@@ -733,7 +737,7 @@ impl Channel for WasmChannel {
         let question = question.to_string();
         let choices = choices.to_vec();
         let timeout_secs = timeout.as_secs();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
