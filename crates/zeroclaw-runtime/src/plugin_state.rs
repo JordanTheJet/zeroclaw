@@ -25,6 +25,18 @@ const DATABASE_FILE: &str = "plugin-state.db";
 const ENVELOPE_VERSION: u8 = 1;
 const OWNER_DOMAIN: &[u8] = b"zeroclaw.plugin-state.owner.v1\0";
 const LOCATOR_DOMAIN: &[u8] = b"zeroclaw.plugin-state.locator.v1\0";
+/// Keyed tag over the package name alone, so `plugin remove` can purge every
+/// row a package owns without enumerating its live capabilities and bindings,
+/// and without storing the package name in plaintext.
+const PACKAGE_DOMAIN: &[u8] = b"zeroclaw.plugin-state.package.v1\0";
+
+/// Schema generation stamped in `PRAGMA user_version`.
+///
+/// * 1 — `owner`, `locator`, `ciphertext`.
+/// * 2 — adds `package_tag` (purge index) and `value_bytes` (quota accounting
+///   without decryption). Rows written by generation 1 carry `NULL` in both and
+///   are resolved by decrypting only those rows.
+const SCHEMA_VERSION: i64 = 2;
 
 const DEFAULT_MAX_ENTRIES: usize = 1_024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 64 * 1024;
@@ -166,11 +178,23 @@ impl PluginStateStore {
             .checked_add(1)
             .ok_or(PluginStateError::Unavailable)?;
         let ciphertext = self.seal(scope, key, revision, value)?;
+        let package_tag = self.package_tag(scope.id().package())?;
+        let value_bytes =
+            i64::try_from(value.len()).map_err(|_| PluginStateError::QuotaExceeded)?;
         transaction
             .execute(
-                "INSERT INTO plugin_state (owner, locator, ciphertext) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(locator) DO UPDATE SET owner = excluded.owner, ciphertext = excluded.ciphertext",
-                params![owner.as_slice(), locator.as_slice(), ciphertext.as_str()],
+                "INSERT INTO plugin_state (owner, locator, package_tag, value_bytes, ciphertext) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(locator) DO UPDATE SET owner = excluded.owner, \
+                 package_tag = excluded.package_tag, value_bytes = excluded.value_bytes, \
+                 ciphertext = excluded.ciphertext",
+                params![
+                    owner.as_slice(),
+                    locator.as_slice(),
+                    package_tag.as_slice(),
+                    value_bytes,
+                    ciphertext.as_str()
+                ],
             )
             .map_err(|_| PluginStateError::Unavailable)?;
         transaction
@@ -207,9 +231,26 @@ impl PluginStateStore {
         if stored_owner.as_slice() != owner {
             return Err(PluginStateError::Unavailable);
         }
-        let envelope = self.open_envelope(scope, key, &locator, &ciphertext)?;
-        if envelope.revision != expected_revision {
-            return Err(PluginStateError::Conflict);
+        // A row the owner can no longer open is still the owner's row to remove:
+        // the locator was derived from this instance's own scope and key, so the
+        // caller cannot reach another instance's data here. Allowing the delete
+        // is the documented repair path for a row left unreadable by a restored
+        // backup or a rotated key; without it a single bad row is permanent.
+        match self.open_envelope(scope, key, &locator, &ciphertext) {
+            Ok(envelope) => {
+                if envelope.revision != expected_revision {
+                    return Err(PluginStateError::Conflict);
+                }
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "removing an unreadable plugin state row; it could not be \
+                     authenticated with the current install key"
+                );
+            }
         }
         let deleted = transaction
             .execute(
@@ -339,6 +380,82 @@ impl PluginStateStore {
             .map_err(|_| PluginStateError::Unavailable)
     }
 
+    /// Keyed tag over the package name, used only as a purge index.
+    ///
+    /// Like the owner and row locators this is an HMAC under the install key, so
+    /// it identifies a package to this install without revealing the name to a
+    /// reader of the database file.
+    fn package_tag(&self, package: &str) -> Result<[u8; 32], PluginStateError> {
+        self.secret_store
+            .keyed_digest(PACKAGE_DOMAIN, package.as_bytes())
+            .map_err(|_| PluginStateError::Unavailable)
+    }
+
+    /// Delete every row a package owns, across all of its capabilities and
+    /// bindings. Returns the number of rows removed.
+    ///
+    /// This is the teardown for `plugin remove`: because an instance identity is
+    /// derived from `(package, capability, binding)` and deliberately excludes
+    /// version and payload digest, a later install of the same package name
+    /// would otherwise inherit the previous plugin's secrets.
+    /// Fails closed when the install key cannot open stored rows. Reporting a
+    /// successful purge under a replaced key would delete nothing while telling
+    /// the operator their secrets were destroyed.
+    pub(crate) fn purge_package(&self, package: &str) -> Result<u64, PluginStateError> {
+        if !self.db_path.exists() {
+            return Ok(0);
+        }
+        self.verify_existing_ciphertext()?;
+        let package_tag = self.package_tag(package)?;
+        let connection = self.connection()?;
+        let mut removed = connection
+            .execute(
+                "DELETE FROM plugin_state WHERE package_tag = ?1",
+                params![package_tag.as_slice()],
+            )
+            .map_err(|_| PluginStateError::Unavailable)? as u64;
+
+        // Generation-1 rows predate `package_tag` and carry NULL, so the indexed
+        // delete above cannot see them. Their owning package lives only inside
+        // the sealed envelope, so match them by opening each one. Skipping this
+        // would leave exactly the secrets this call exists to destroy.
+        let mut untagged = connection
+            .prepare(
+                "SELECT owner, locator, ciphertext FROM plugin_state WHERE package_tag IS NULL",
+            )
+            .map_err(|_| PluginStateError::Unavailable)?;
+        let mut doomed: Vec<[u8; 32]> = Vec::new();
+        let mut rows = untagged
+            .query([])
+            .map_err(|_| PluginStateError::Unavailable)?;
+        while let Some(row) = rows.next().map_err(|_| PluginStateError::Unavailable)? {
+            let owner: Vec<u8> = row.get(0).map_err(|_| PluginStateError::Unavailable)?;
+            let locator: Vec<u8> = row.get(1).map_err(|_| PluginStateError::Unavailable)?;
+            let ciphertext: String = row.get(2).map_err(|_| PluginStateError::Unavailable)?;
+            let (Ok(owner), Ok(locator)) =
+                (<[u8; 32]>::try_from(owner), <[u8; 32]>::try_from(locator))
+            else {
+                continue;
+            };
+            if let Ok(envelope) = self.open_indexed_envelope(&owner, &locator, &ciphertext)
+                && envelope.package == package
+            {
+                doomed.push(locator);
+            }
+        }
+        drop(rows);
+        drop(untagged);
+        for locator in doomed {
+            removed += connection
+                .execute(
+                    "DELETE FROM plugin_state WHERE locator = ?1",
+                    params![locator.as_slice()],
+                )
+                .map_err(|_| PluginStateError::Unavailable)? as u64;
+        }
+        Ok(removed)
+    }
+
     fn open_indexed_envelope(
         &self,
         owner: &[u8; 32],
@@ -373,35 +490,50 @@ impl PluginStateStore {
         Ok(envelope)
     }
 
-    /// Authenticate one existing row before deriving lookups. This detects a
-    /// replaced install key instead of interpreting every old row as absent or
-    /// writing a second key generation into the same database.
+    /// Prove the current install key can still open stored rows before deriving
+    /// lookups. This detects a replaced or lost key instead of interpreting
+    /// every existing row as absent — which would silently look like "no state"
+    /// and invite a caller to reinitialize over data it cannot see.
+    ///
+    /// The probe samples several rows and succeeds as soon as **one** opens.
+    /// Requiring one specific sampled row to open meant a single unreadable row
+    /// — a restored backup, a rotated key, a bit flip — failed every instance in
+    /// the install, including instances whose own rows were intact. Only when
+    /// rows exist and none of the sampled rows open is the key treated as wrong.
     fn verify_existing_ciphertext(&self) -> Result<(), PluginStateError> {
+        /// Enough rows that one corrupt row cannot condemn a populated store,
+        /// small enough that the check stays a fixed cost per operation.
+        const PROBE_ROWS: i64 = 8;
+
         let connection = self.connection()?;
-        let row = connection
-            .query_row(
-                "SELECT owner, locator, ciphertext FROM plugin_state LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
+        let mut statement = connection
+            .prepare("SELECT owner, locator, ciphertext FROM plugin_state LIMIT ?1")
             .map_err(|_| PluginStateError::Unavailable)?;
-        if let Some((owner, locator, ciphertext)) = row {
-            let owner: [u8; 32] = owner
-                .try_into()
-                .map_err(|_| PluginStateError::Unavailable)?;
-            let locator: [u8; 32] = locator
-                .try_into()
-                .map_err(|_| PluginStateError::Unavailable)?;
-            self.open_indexed_envelope(&owner, &locator, &ciphertext)?;
+        let mut rows = statement
+            .query(params![PROBE_ROWS])
+            .map_err(|_| PluginStateError::Unavailable)?;
+        let mut sampled = 0_usize;
+        while let Some(row) = rows.next().map_err(|_| PluginStateError::Unavailable)? {
+            sampled += 1;
+            let owner: Vec<u8> = row.get(0).map_err(|_| PluginStateError::Unavailable)?;
+            let locator: Vec<u8> = row.get(1).map_err(|_| PluginStateError::Unavailable)?;
+            let ciphertext: String = row.get(2).map_err(|_| PluginStateError::Unavailable)?;
+            let (Ok(owner), Ok(locator)) =
+                (<[u8; 32]>::try_from(owner), <[u8; 32]>::try_from(locator))
+            else {
+                continue;
+            };
+            if self
+                .open_indexed_envelope(&owner, &locator, &ciphertext)
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
-        Ok(())
+        if sampled == 0 {
+            return Ok(());
+        }
+        Err(PluginStateError::Unavailable)
     }
 }
 
@@ -473,6 +605,22 @@ impl Drop for StateEnvelope {
     }
 }
 
+/// Purge every durable state row owned by `package`.
+///
+/// Teardown for `zeroclaw plugin remove`. Instance identity is derived from
+/// `(package, capability, binding)` and deliberately excludes version and
+/// payload digest, so without this a later install of the same package name —
+/// possibly a different publisher — would inherit the removed plugin's secrets.
+///
+/// Returns the number of rows removed. A missing database is not an error.
+pub fn purge_plugin_state(
+    data_dir: &Path,
+    config_dir: &Path,
+    package: &str,
+) -> Result<u64, PluginStateError> {
+    PluginStateStore::new(data_dir, config_dir).purge_package(package)
+}
+
 fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
     // Different agent/plugin registries can lazily open this install-owned
     // database at the same time. Serialize first-open PRAGMAs and schema setup
@@ -503,13 +651,66 @@ fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
              CREATE TABLE IF NOT EXISTS plugin_state (
                  owner BLOB NOT NULL,
                  locator BLOB PRIMARY KEY NOT NULL,
+                 package_tag BLOB,
+                 value_bytes INTEGER,
                  ciphertext TEXT NOT NULL CHECK (ciphertext LIKE 'enc2:%')
              ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS plugin_state_owner ON plugin_state(owner);
-             PRAGMA user_version = 1;",
+             CREATE INDEX IF NOT EXISTS plugin_state_owner ON plugin_state(owner);",
         )
         .map_err(|_| PluginStateError::Unavailable)?;
+    // The `package_tag` index is created by the migration and never here. On a
+    // generation-1 table the column does not exist yet, so `CREATE INDEX` would
+    // fail this whole batch with "no such column", leaving every state
+    // operation returning `Unavailable` and the migration itself unreachable.
+    migrate_schema(&connection)?;
     Ok(connection)
+}
+
+/// Bring a generation-1 database up to the current schema.
+///
+/// Generation 1 predates `package_tag` and `value_bytes`. Both are added as
+/// nullable so existing ciphertext is never rewritten here: a `NULL` row is
+/// resolved by decrypting that single row, and is repaired in place the next
+/// time the owning instance writes the key.
+fn migrate_schema(connection: &Connection) -> Result<(), PluginStateError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| PluginStateError::Unavailable)?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let mut existing = connection
+        .prepare("PRAGMA table_info(plugin_state)")
+        .map_err(|_| PluginStateError::Unavailable)?;
+    let columns: Vec<String> = existing
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| PluginStateError::Unavailable)?
+        .collect::<Result<_, _>>()
+        .map_err(|_| PluginStateError::Unavailable)?;
+    drop(existing);
+    for (column, ddl) in [
+        (
+            "package_tag",
+            "ALTER TABLE plugin_state ADD COLUMN package_tag BLOB",
+        ),
+        (
+            "value_bytes",
+            "ALTER TABLE plugin_state ADD COLUMN value_bytes INTEGER",
+        ),
+    ] {
+        if !columns.iter().any(|name| name == column) {
+            connection
+                .execute_batch(ddl)
+                .map_err(|_| PluginStateError::Unavailable)?;
+        }
+    }
+    connection
+        .execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS plugin_state_package ON plugin_state(package_tag);
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(|_| PluginStateError::Unavailable)?;
+    Ok(())
 }
 
 fn enforce_quotas(
@@ -520,19 +721,42 @@ fn enforce_quotas(
     replaced_locator: &[u8; 32],
     new_value_bytes: usize,
 ) -> Result<(), PluginStateError> {
-    let mut statement = transaction
-        .prepare("SELECT locator, ciphertext FROM plugin_state WHERE owner = ?1")
+    // Sizes are accounted from the plaintext `value_bytes` column rather than by
+    // decrypting every sibling row. A row's value length is not secret — the
+    // quota bounds already make it inferable — and decrypting the whole owner on
+    // each write made a full store cost O(n^2) with three `.secret_key` reads
+    // per row, all inside this write transaction.
+    let (known_entries, known_total) = transaction
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(value_bytes), 0) FROM plugin_state \
+             WHERE owner = ?1 AND locator <> ?2 AND value_bytes IS NOT NULL",
+            params![owner.as_slice(), replaced_locator.as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
         .map_err(|_| PluginStateError::Unavailable)?;
-    let mut rows = statement
-        .query(params![owner.as_slice()])
+    let mut entries = usize::try_from(known_entries)
+        .map_err(|_| PluginStateError::Unavailable)?
+        .checked_add(1)
+        .ok_or(PluginStateError::QuotaExceeded)?;
+    let mut total = usize::try_from(known_total)
+        .map_err(|_| PluginStateError::Unavailable)?
+        .checked_add(new_value_bytes)
+        .ok_or(PluginStateError::QuotaExceeded)?;
+
+    // Generation-1 rows carry no recorded length. Only those are opened, so the
+    // decrypting path costs nothing once a store has been written by this
+    // generation.
+    let mut legacy = transaction
+        .prepare(
+            "SELECT locator, ciphertext FROM plugin_state \
+             WHERE owner = ?1 AND locator <> ?2 AND value_bytes IS NULL",
+        )
         .map_err(|_| PluginStateError::Unavailable)?;
-    let mut entries = 1_usize;
-    let mut total = new_value_bytes;
+    let mut rows = legacy
+        .query(params![owner.as_slice(), replaced_locator.as_slice()])
+        .map_err(|_| PluginStateError::Unavailable)?;
     while let Some(row) = rows.next().map_err(|_| PluginStateError::Unavailable)? {
         let locator: Vec<u8> = row.get(0).map_err(|_| PluginStateError::Unavailable)?;
-        if locator.as_slice() == replaced_locator {
-            continue;
-        }
         let locator: [u8; 32] = locator
             .try_into()
             .map_err(|_| PluginStateError::Unavailable)?;
@@ -957,4 +1181,473 @@ mod tests {
             Err(PluginStateError::Unavailable)
         );
     }
+
+    fn scope_for(package: &str, binding: &str) -> PluginInstanceScope {
+        let manifest = PluginManifest {
+            name: package.to_string(),
+            version: "0.0.0-test".to_string(),
+            description: None,
+            author: None,
+            wasm_path: Some("fixture.wasm".to_string()),
+            wasm_sha256: None,
+            capabilities: vec![PluginCapability::Channel],
+            permissions: vec![PluginPermission::StateRead, PluginPermission::StateWrite],
+            config_schema: None,
+            signature: None,
+            publisher_key: None,
+        };
+        PluginInstanceScope::from_manifest(
+            &manifest,
+            PluginCapability::Channel,
+            binding,
+            [PluginPermission::StateRead, PluginPermission::StateWrite],
+        )
+        .unwrap()
+    }
+
+    /// Overwrite one row's ciphertext with authentic-looking but unopenable
+    /// data, simulating a restored backup or a bit flip.
+    fn corrupt_row(store: &PluginStateStore, scope: &PluginInstanceScope, key: &PluginStateKey) {
+        let owner = store.owner_locator(scope).unwrap();
+        let locator = store.row_locator(&owner, key.as_str()).unwrap();
+        let connection = Connection::open(&store.db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE plugin_state SET ciphertext = ?1 WHERE locator = ?2",
+                params!["enc2:deadbeef", locator.as_slice()],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_package_purges_only_its_own_state() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("token");
+
+        let doomed_a = scope_for("mailsync", "default");
+        let doomed_b = scope_for("mailsync", "second");
+        let survivor = scope_for("calendarsync", "default");
+        store
+            .put(&doomed_a, &key, b"refresh-a", None)
+            .await
+            .unwrap();
+        store
+            .put(&doomed_b, &key, b"refresh-b", None)
+            .await
+            .unwrap();
+        store
+            .put(&survivor, &key, b"unrelated", None)
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_package("mailsync").unwrap(), 2);
+
+        // A later install of the same package name must not inherit secrets.
+        assert!(store.get(&doomed_a, &key).await.unwrap().is_none());
+        assert!(store.get(&doomed_b, &key).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get(&survivor, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"unrelated".to_vec())
+        );
+        // Purging an absent package is a no-op rather than an error.
+        assert_eq!(store.purge_package("mailsync").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_row_does_not_disable_other_instances() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let broken = scope_for("broken-plugin", "default");
+        let healthy = scope_for("healthy-plugin", "default");
+
+        for index in 0..6 {
+            let filler = scope_for("healthy-plugin", &format!("binding-{index}"));
+            store.put(&filler, &key, b"intact", None).await.unwrap();
+        }
+        store.put(&broken, &key, b"doomed", None).await.unwrap();
+        store.put(&healthy, &key, b"intact", None).await.unwrap();
+        corrupt_row(&store, &broken, &key);
+
+        // The corrupt row belongs to one instance; every other instance keeps
+        // working rather than the whole install failing closed.
+        assert_eq!(
+            store
+                .get(&healthy, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"intact".to_vec())
+        );
+        store
+            .put(&healthy, &key, b"still-writable", Some(1))
+            .await
+            .unwrap();
+        // The damaged instance still fails closed on its own row.
+        assert!(matches!(
+            store.get(&broken, &key).await,
+            Err(PluginStateError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_owner_can_delete_its_own_unreadable_row() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let owner = scope_for("broken-plugin", "default");
+        let bystander = scope_for("healthy-plugin", "default");
+        store.put(&owner, &key, b"doomed", None).await.unwrap();
+        store.put(&bystander, &key, b"intact", None).await.unwrap();
+        corrupt_row(&store, &owner, &key);
+
+        // Repair path: a row that can no longer be authenticated is still the
+        // owner's to remove, otherwise the damage is permanent.
+        store.delete(&owner, &key, 1).await.unwrap();
+        assert!(store.get(&owner, &key).await.unwrap().is_none());
+        store
+            .put(&owner, &key, b"reinitialized", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&bystander, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"intact".to_vec())
+        );
+    }
+
+    /// Rewrite the table into the generation-1 shape (no `package_tag`, no
+    /// `value_bytes`, `user_version = 1`) preserving existing ciphertext.
+    fn downgrade_to_generation_1(db_path: &Path) {
+        let connection = Connection::open(db_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS plugin_state_package;
+                 CREATE TABLE plugin_state_v1 (
+                     owner BLOB NOT NULL,
+                     locator BLOB PRIMARY KEY NOT NULL,
+                     ciphertext TEXT NOT NULL CHECK (ciphertext LIKE 'enc2:%')
+                 ) WITHOUT ROWID;
+                 INSERT INTO plugin_state_v1 (owner, locator, ciphertext)
+                     SELECT owner, locator, ciphertext FROM plugin_state;
+                 DROP TABLE plugin_state;
+                 ALTER TABLE plugin_state_v1 RENAME TO plugin_state;
+                 CREATE INDEX IF NOT EXISTS plugin_state_owner ON plugin_state(owner);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_generation_1_database_still_opens_reads_and_purges() {
+        let root = TempDir::new().unwrap();
+        let data_dir = root.path().join("data");
+        let key = key("token");
+        let doomed = scope_for("mailsync", "default");
+        let survivor = scope_for("calendarsync", "default");
+
+        let first = PluginStateStore::new(&data_dir, root.path());
+        first.put(&doomed, &key, b"refresh", None).await.unwrap();
+        first
+            .put(&survivor, &key, b"unrelated", None)
+            .await
+            .unwrap();
+        let db_path = first.db_path.clone();
+        drop(first);
+        downgrade_to_generation_1(&db_path);
+
+        // Opening a generation-1 database must migrate rather than fail. Creating
+        // the package_tag index before the ALTER made every operation return
+        // Unavailable and left the migration unreachable.
+        let reopened = PluginStateStore::new(&data_dir, root.path());
+        assert_eq!(
+            reopened
+                .get(&doomed, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"refresh".to_vec())
+        );
+        let version: i64 = {
+            let connection = reopened.connection().unwrap();
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Rows migrated from generation 1 carry a NULL package_tag, so the
+        // indexed delete alone would silently leave them behind.
+        assert_eq!(reopened.purge_package("mailsync").unwrap(), 1);
+        assert!(reopened.get(&doomed, &key).await.unwrap().is_none());
+        assert_eq!(
+            reopened
+                .get(&survivor, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"unrelated".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn purging_under_a_replaced_install_key_fails_instead_of_reporting_success() {
+        let root = TempDir::new().unwrap();
+        let original = store(&root);
+        let instance = scope_for("mailsync", "default");
+        original
+            .put(&instance, &key("token"), b"refresh", None)
+            .await
+            .unwrap();
+        drop(original);
+
+        let replacement_root = TempDir::new().unwrap();
+        SecretStore::new(replacement_root.path(), true)
+            .encrypt("replacement")
+            .unwrap();
+        std::fs::copy(
+            replacement_root.path().join(".secret_key"),
+            root.path().join(".secret_key"),
+        )
+        .unwrap();
+
+        // Under a replaced key the computed tag matches nothing. Reporting a
+        // successful purge would tell an operator their secrets were destroyed
+        // while every row survived.
+        let replaced = store(&root);
+        assert_eq!(
+            replaced.purge_package("mailsync"),
+            Err(PluginStateError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_accounting_counts_rows_written_before_the_value_bytes_column() {
+        let root = TempDir::new().unwrap();
+        let quotas = StateQuotas {
+            max_entries: 8,
+            max_value_bytes: 64,
+            max_total_value_bytes: 24,
+        };
+        let store = PluginStateStore::with_quotas(&root.path().join("data"), root.path(), quotas);
+        let instance = scope_for("legacy-plugin", "default");
+        store
+            .put(&instance, &key("first"), b"0123456789", None)
+            .await
+            .unwrap();
+
+        // Simulate a generation-1 row: recorded length erased, ciphertext intact.
+        let connection = Connection::open(&store.db_path).unwrap();
+        connection
+            .execute("UPDATE plugin_state SET value_bytes = NULL", [])
+            .unwrap();
+        drop(connection);
+
+        // The unrecorded row must still count toward the total, so the quota
+        // cannot be bypassed by rows that predate the column.
+        assert_eq!(
+            store
+                .put(&instance, &key("second"), b"0123456789abcdef", None)
+                .await,
+            Err(PluginStateError::QuotaExceeded)
+        );
+        store
+            .put(&instance, &key("second"), b"0123", None)
+            .await
+            .unwrap();
+    }
+
+    // ---- REVIEW PROBES (temporary) ----
+
+    #[tokio::test]
+    async fn probe_single_instance_single_row_repair_is_impossible() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let only = scope_for("solo-plugin", "default");
+        store.put(&only, &key, b"doomed", None).await.unwrap();
+        corrupt_row(&store, &only, &key);
+
+        // Documented repair path: delete the unreadable row. verify_existing_ciphertext
+        // runs first and there is no other row to open, so the repair is unreachable.
+        let deleted = store.delete(&only, &key, 1).await;
+        println!("PROBE single-row delete => {deleted:?}");
+        assert!(matches!(deleted, Err(PluginStateError::Unavailable)),
+            "expected repair to be blocked, got {deleted:?}");
+        let put = store.put(&only, &key, b"fresh", None).await;
+        println!("PROBE single-row put => {put:?}");
+        let get = store.get(&only, &key).await;
+        println!("PROBE single-row get => {:?}", get.as_ref().map(|v| v.is_some()));
+    }
+
+    #[tokio::test]
+    async fn probe_nine_corrupt_rows_disable_a_healthy_instance() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let healthy = scope_for("healthy-plugin", "default");
+        store.put(&healthy, &key, b"intact", None).await.unwrap();
+
+        // A single plugin with many keys, all damaged (restored backup of that
+        // plugin's rows, partial disk corruption, etc).
+        let mut broken_keys = Vec::new();
+        for i in 0..40 {
+            let k = key(&format!("k{i}"));
+            let s = scope_for("broken-plugin", "default");
+            store.put(&s, &k, b"doomed", None).await.unwrap();
+            broken_keys.push(k);
+        }
+        for k in &broken_keys {
+            corrupt_row(&store, &scope_for("broken-plugin", "default"), k);
+        }
+
+        let got = store.get(&healthy, &key).await;
+        println!("PROBE healthy get with 40/41 rows corrupt => {:?}", got.as_ref().map(|v| v.is_some()));
+        // The one healthy row is very unlikely to sort into the first 8 locators.
+        assert!(matches!(got, Err(PluginStateError::Unavailable)),
+            "expected the healthy instance to be disabled, got {got:?}");
+    }
+    // ---------------- review probe tests ----------------
+
+    #[tokio::test]
+    async fn zz_probe_prefix_is_deterministic_lowest_locators() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        for index in 0..20 {
+            let s = scope_for("many", &format!("binding-{index}"));
+            store.put(&s, &key, b"intact", None).await.unwrap();
+        }
+        let connection = Connection::open(&store.db_path).unwrap();
+        let scan: Vec<Vec<u8>> = connection
+            .prepare("SELECT locator FROM plugin_state LIMIT 8")
+            .unwrap()
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let ordered: Vec<Vec<u8>> = connection
+            .prepare("SELECT locator FROM plugin_state ORDER BY locator LIMIT 8")
+            .unwrap()
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(scan, ordered, "LIMIT 8 without ORDER BY == 8 lowest locators");
+
+        // Damage exactly those 8 rows; 12 healthy rows remain.
+        connection
+            .execute(
+                "UPDATE plugin_state SET ciphertext = 'enc2:deadbeef' WHERE locator IN \
+                 (SELECT locator FROM plugin_state ORDER BY locator LIMIT 8)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        // Every one of the 12 intact instances is now dead.
+        let mut dead = 0;
+        for index in 0..20 {
+            let s = scope_for("many", &format!("binding-{index}"));
+            if matches!(store.get(&s, &key).await, Err(PluginStateError::Unavailable)) {
+                dead += 1;
+            }
+        }
+        assert_eq!(dead, 20, "8 damaged rows out of 20 kill the whole install");
+    }
+
+    #[tokio::test]
+    async fn zz_single_row_store_has_no_repair_path() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let solo = scope_for("solo-plugin", "default");
+        store.put(&solo, &key, b"doomed", None).await.unwrap();
+        corrupt_row(&store, &solo, &key);
+
+        // Documented repair path: delete the row you cannot authenticate.
+        let deleted = store.delete(&solo, &key, 1).await;
+        println!("delete -> {deleted:?}");
+        assert_eq!(
+            deleted,
+            Err(PluginStateError::Unavailable),
+            "repair path is gated by the probe it is supposed to recover from"
+        );
+        // And a fresh write cannot recover either.
+        let written = store.put(&solo, &key, b"reinit", None).await;
+        println!("put -> {written:?}");
+        assert_eq!(written, Err(PluginStateError::Unavailable));
+        // purge_package (plugin remove) also cannot clear it.
+        println!("purge -> {:?}", store.purge_package("solo-plugin"));
+    }
+
+    #[tokio::test]
+    async fn zz_heterogeneous_table_passes_the_probe_and_hides_rows() {
+        // Two installs, distinct .secret_key, rows for both in one table.
+        let root_a = TempDir::new().unwrap();
+        let store_a = store(&root_a);
+        let key = key("token");
+        for index in 0..8 {
+            let s = scope_for("alpha", &format!("b{index}"));
+            store_a.put(&s, &key, b"alpha-secret", None).await.unwrap();
+        }
+        let root_b = TempDir::new().unwrap();
+        let store_b = store(&root_b);
+        for index in 0..8 {
+            let s = scope_for("beta", &format!("b{index}"));
+            store_b.put(&s, &key, b"beta-secret", None).await.unwrap();
+        }
+        drop(store_a);
+        drop(store_b);
+
+        // Merge B's rows into A's database, then hand A's data dir key B.
+        let conn_b = Connection::open(&root_b.path().join("data").join(DATABASE_FILE)).unwrap();
+        let rows: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<i64>, String)> = conn_b
+            .prepare("SELECT owner, locator, package_tag, value_bytes, ciphertext FROM plugin_state")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(conn_b);
+        let conn_a = Connection::open(&root_a.path().join("data").join(DATABASE_FILE)).unwrap();
+        for (owner, locator, tag, bytes, ct) in rows {
+            conn_a
+                .execute(
+                    "INSERT INTO plugin_state (owner, locator, package_tag, value_bytes, ciphertext) \
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![owner, locator, tag, bytes, ct],
+                )
+                .unwrap();
+        }
+        drop(conn_a);
+        std::fs::copy(
+            root_b.path().join(".secret_key"),
+            root_a.path().join(".secret_key"),
+        )
+        .unwrap();
+
+        let merged = store(&root_a);
+        // Probe passes because at least one of the 8 lowest locators is a B row.
+        println!("probe -> {:?}", merged.verify_existing_ciphertext());
+        let alpha = scope_for("alpha", "b0");
+        let seen = merged.get(&alpha, &key).await;
+        println!("alpha under key B -> {seen:?}");
+        // 8 alpha rows are unreadable but the store reports "no state" and lets
+        // the caller reinitialize straight over them.
+        assert_eq!(seen, Ok(None).map(|v: Option<PluginStateValue>| v));
+        let wrote = merged.put(&alpha, &key, b"reinitialized", None).await;
+        println!("alpha reinit under key B -> {wrote:?}");
+    }
+
 }

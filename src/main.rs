@@ -6206,6 +6206,24 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             PluginCommands::Remove { name } => {
                 let mut host = plugin_host_with_configured_security(&config)?;
+                // Purge durable state before dropping the package directory. An
+                // instance identity is derived from (package, capability,
+                // binding) and excludes version and payload digest, so leaving
+                // rows behind would hand this plugin's secrets to whatever is
+                // installed under the same name next. Failing here leaves the
+                // plugin installed rather than orphaning its state.
+                #[cfg(feature = "plugins-wasm")]
+                {
+                    let config_dir = config
+                        .config_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf();
+                    zeroclaw_runtime::purge_plugin_state(&config.data_dir, &config_dir, &name)
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to purge plugin state for {name}: {error}")
+                        })?;
+                }
                 host.remove(&name)?;
                 println!(
                     "{}",
