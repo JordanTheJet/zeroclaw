@@ -212,7 +212,16 @@ impl PluginStateStore {
         if !self.db_path.exists() {
             return Err(PluginStateError::NotFound);
         }
-        self.verify_existing_ciphertext()?;
+        // Deliberately NOT gated on `verify_existing_ciphertext`. Delete is the
+        // repair path, so gating it on the very probe it exists to recover from
+        // makes a damaged store unrecoverable — most visibly when the unreadable
+        // row is the only row, where nothing else can satisfy the probe.
+        //
+        // Skipping the probe is safe: `owner` and `locator` are derived from the
+        // caller's own scope and key under the current install key, and the
+        // delete is constrained by both columns below. Under a wrong key the
+        // derivation simply matches no row and the call reports `NotFound`, so
+        // this cannot be used to destroy data the caller could not already name.
         let owner = self.owner_locator(scope)?;
         let locator = self.row_locator(&owner, key.as_str())?;
         let mut connection = self.connection()?;
@@ -1430,6 +1439,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sole_unreadable_row_is_still_repairable() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let key = key("session");
+        let solo = scope_for("solo-plugin", "default");
+        store.put(&solo, &key, b"doomed", None).await.unwrap();
+        corrupt_row(&store, &solo, &key);
+
+        // With one row in the table there is nothing else that can satisfy the
+        // key probe, so gating delete on that probe would make the documented
+        // repair path unreachable in exactly the case it exists for.
+        store.delete(&solo, &key, 1).await.unwrap();
+        assert!(store.get(&solo, &key).await.unwrap().is_none());
+        store.put(&solo, &key, b"reinit", None).await.unwrap();
+        assert_eq!(
+            store
+                .get(&solo, &key)
+                .await
+                .unwrap()
+                .map(|value| value.value().to_vec()),
+            Some(b"reinit".to_vec())
+        );
+    }
+
+    #[tokio::test]
     async fn quota_accounting_counts_rows_written_before_the_value_bytes_column() {
         let root = TempDir::new().unwrap();
         let quotas = StateQuotas {
@@ -1464,190 +1498,4 @@ mod tests {
             .await
             .unwrap();
     }
-
-    // ---- REVIEW PROBES (temporary) ----
-
-    #[tokio::test]
-    async fn probe_single_instance_single_row_repair_is_impossible() {
-        let root = TempDir::new().unwrap();
-        let store = store(&root);
-        let key = key("session");
-        let only = scope_for("solo-plugin", "default");
-        store.put(&only, &key, b"doomed", None).await.unwrap();
-        corrupt_row(&store, &only, &key);
-
-        // Documented repair path: delete the unreadable row. verify_existing_ciphertext
-        // runs first and there is no other row to open, so the repair is unreachable.
-        let deleted = store.delete(&only, &key, 1).await;
-        println!("PROBE single-row delete => {deleted:?}");
-        assert!(matches!(deleted, Err(PluginStateError::Unavailable)),
-            "expected repair to be blocked, got {deleted:?}");
-        let put = store.put(&only, &key, b"fresh", None).await;
-        println!("PROBE single-row put => {put:?}");
-        let get = store.get(&only, &key).await;
-        println!("PROBE single-row get => {:?}", get.as_ref().map(|v| v.is_some()));
-    }
-
-    #[tokio::test]
-    async fn probe_nine_corrupt_rows_disable_a_healthy_instance() {
-        let root = TempDir::new().unwrap();
-        let store = store(&root);
-        let key = key("session");
-        let healthy = scope_for("healthy-plugin", "default");
-        store.put(&healthy, &key, b"intact", None).await.unwrap();
-
-        // A single plugin with many keys, all damaged (restored backup of that
-        // plugin's rows, partial disk corruption, etc).
-        let mut broken_keys = Vec::new();
-        for i in 0..40 {
-            let k = key(&format!("k{i}"));
-            let s = scope_for("broken-plugin", "default");
-            store.put(&s, &k, b"doomed", None).await.unwrap();
-            broken_keys.push(k);
-        }
-        for k in &broken_keys {
-            corrupt_row(&store, &scope_for("broken-plugin", "default"), k);
-        }
-
-        let got = store.get(&healthy, &key).await;
-        println!("PROBE healthy get with 40/41 rows corrupt => {:?}", got.as_ref().map(|v| v.is_some()));
-        // The one healthy row is very unlikely to sort into the first 8 locators.
-        assert!(matches!(got, Err(PluginStateError::Unavailable)),
-            "expected the healthy instance to be disabled, got {got:?}");
-    }
-    // ---------------- review probe tests ----------------
-
-    #[tokio::test]
-    async fn zz_probe_prefix_is_deterministic_lowest_locators() {
-        let root = TempDir::new().unwrap();
-        let store = store(&root);
-        let key = key("session");
-        for index in 0..20 {
-            let s = scope_for("many", &format!("binding-{index}"));
-            store.put(&s, &key, b"intact", None).await.unwrap();
-        }
-        let connection = Connection::open(&store.db_path).unwrap();
-        let scan: Vec<Vec<u8>> = connection
-            .prepare("SELECT locator FROM plugin_state LIMIT 8")
-            .unwrap()
-            .query_map([], |r| r.get::<_, Vec<u8>>(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let ordered: Vec<Vec<u8>> = connection
-            .prepare("SELECT locator FROM plugin_state ORDER BY locator LIMIT 8")
-            .unwrap()
-            .query_map([], |r| r.get::<_, Vec<u8>>(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(scan, ordered, "LIMIT 8 without ORDER BY == 8 lowest locators");
-
-        // Damage exactly those 8 rows; 12 healthy rows remain.
-        connection
-            .execute(
-                "UPDATE plugin_state SET ciphertext = 'enc2:deadbeef' WHERE locator IN \
-                 (SELECT locator FROM plugin_state ORDER BY locator LIMIT 8)",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        // Every one of the 12 intact instances is now dead.
-        let mut dead = 0;
-        for index in 0..20 {
-            let s = scope_for("many", &format!("binding-{index}"));
-            if matches!(store.get(&s, &key).await, Err(PluginStateError::Unavailable)) {
-                dead += 1;
-            }
-        }
-        assert_eq!(dead, 20, "8 damaged rows out of 20 kill the whole install");
-    }
-
-    #[tokio::test]
-    async fn zz_single_row_store_has_no_repair_path() {
-        let root = TempDir::new().unwrap();
-        let store = store(&root);
-        let key = key("session");
-        let solo = scope_for("solo-plugin", "default");
-        store.put(&solo, &key, b"doomed", None).await.unwrap();
-        corrupt_row(&store, &solo, &key);
-
-        // Documented repair path: delete the row you cannot authenticate.
-        let deleted = store.delete(&solo, &key, 1).await;
-        println!("delete -> {deleted:?}");
-        assert_eq!(
-            deleted,
-            Err(PluginStateError::Unavailable),
-            "repair path is gated by the probe it is supposed to recover from"
-        );
-        // And a fresh write cannot recover either.
-        let written = store.put(&solo, &key, b"reinit", None).await;
-        println!("put -> {written:?}");
-        assert_eq!(written, Err(PluginStateError::Unavailable));
-        // purge_package (plugin remove) also cannot clear it.
-        println!("purge -> {:?}", store.purge_package("solo-plugin"));
-    }
-
-    #[tokio::test]
-    async fn zz_heterogeneous_table_passes_the_probe_and_hides_rows() {
-        // Two installs, distinct .secret_key, rows for both in one table.
-        let root_a = TempDir::new().unwrap();
-        let store_a = store(&root_a);
-        let key = key("token");
-        for index in 0..8 {
-            let s = scope_for("alpha", &format!("b{index}"));
-            store_a.put(&s, &key, b"alpha-secret", None).await.unwrap();
-        }
-        let root_b = TempDir::new().unwrap();
-        let store_b = store(&root_b);
-        for index in 0..8 {
-            let s = scope_for("beta", &format!("b{index}"));
-            store_b.put(&s, &key, b"beta-secret", None).await.unwrap();
-        }
-        drop(store_a);
-        drop(store_b);
-
-        // Merge B's rows into A's database, then hand A's data dir key B.
-        let conn_b = Connection::open(&root_b.path().join("data").join(DATABASE_FILE)).unwrap();
-        let rows: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<i64>, String)> = conn_b
-            .prepare("SELECT owner, locator, package_tag, value_bytes, ciphertext FROM plugin_state")
-            .unwrap()
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        drop(conn_b);
-        let conn_a = Connection::open(&root_a.path().join("data").join(DATABASE_FILE)).unwrap();
-        for (owner, locator, tag, bytes, ct) in rows {
-            conn_a
-                .execute(
-                    "INSERT INTO plugin_state (owner, locator, package_tag, value_bytes, ciphertext) \
-                     VALUES (?1,?2,?3,?4,?5)",
-                    params![owner, locator, tag, bytes, ct],
-                )
-                .unwrap();
-        }
-        drop(conn_a);
-        std::fs::copy(
-            root_b.path().join(".secret_key"),
-            root_a.path().join(".secret_key"),
-        )
-        .unwrap();
-
-        let merged = store(&root_a);
-        // Probe passes because at least one of the 8 lowest locators is a B row.
-        println!("probe -> {:?}", merged.verify_existing_ciphertext());
-        let alpha = scope_for("alpha", "b0");
-        let seen = merged.get(&alpha, &key).await;
-        println!("alpha under key B -> {seen:?}");
-        // 8 alpha rows are unreadable but the store reports "no state" and lets
-        // the caller reinitialize straight over them.
-        assert_eq!(seen, Ok(None).map(|v: Option<PluginStateValue>| v));
-        let wrote = merged.put(&alpha, &key, b"reinitialized", None).await;
-        println!("alpha reinit under key B -> {wrote:?}");
-    }
-
 }

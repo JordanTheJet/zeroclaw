@@ -5054,9 +5054,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.48.0"
+version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef8d91fd7994744fd927438d8a642528d989c4a0248fb3f6208f47bffcefb0d"
+checksum = "f05a6cff806294a7699d48761d4ae2bdebab7fa2eef05e4a0b83320f0ff46901"
 dependencies = [
  "ahash",
  "bytecount",
@@ -5068,6 +5068,7 @@ dependencies = [
  "idna",
  "itoa",
  "jsonschema-regex",
+ "jsonschema-value",
  "num-cmp",
  "num-traits",
  "percent-encoding",
@@ -5075,17 +5076,32 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "strum 0.28.0",
  "unicode-general-category",
  "uuid-simd",
 ]
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.48.0"
+version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "794a08daa4c4b0e566fae7f2787090d793082eed95e4b46bfdec9817b533df22"
+checksum = "84708dd3f6c5327478a96f37378adb27deed6a626cf84d19de780d9e8ae84b17"
 dependencies = [
  "regex-syntax",
+]
+
+[[package]]
+name = "jsonschema-value"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd8c04ab4ce60e42c4e302d3bd9d184652bb56f212495d2eea23573bcbf72556"
+dependencies = [
+ "ahash",
+ "bytecount",
+ "fraction",
+ "num-cmp",
+ "num-traits",
+ "serde_json",
 ]
 
 [[package]]
@@ -8119,9 +8135,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.48.0"
+version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4967fa93675ff599754790711e2f19b6a910739784ac357bd10f34e146616f9"
+checksum = "980e77f5cfffc592c0e7dfb6d20770a0b96a6ab94d403de7454ed9799505e4ba"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -13434,6 +13450,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -13557,6 +13574,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
@@ -13669,7 +13687,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "flate2",
  "fluent",
  "futures-util",
  "glob",
@@ -13738,7 +13755,6 @@ dependencies = [
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zeroize",
- "zip",
 ]
 
 [[package]]
@@ -13956,6 +13972,7 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "url",
 ]
 
 [[package]]
