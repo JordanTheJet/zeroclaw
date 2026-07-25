@@ -1,9 +1,10 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
-import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
+import { WebSocketClient } from '@/lib/ws';
+import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { ApiError, getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -11,6 +12,7 @@ import {
   loadChatHistory,
   mapServerMessagesToPersisted,
   persistedToUiMessages,
+  removeChatHistory,
   saveChatHistory,
   uiMessagesToPersisted,
 } from '@/lib/chatHistoryStorage';
@@ -56,6 +58,26 @@ interface AgentContextValue {
   refreshModels: () => void;
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
+  /** Conversation currently on screen for this agent (issue #7543). */
+  sessionId: string;
+  /**
+   * True once the active conversation's transcript has loaded. Sending before
+   * this would race the hydration fetch, whose all-or-nothing mutation fence
+   * then drops the fetched history entirely — so the composer waits on it.
+   */
+  hydrated: boolean;
+  /**
+   * Whether the gateway stores conversations; null before the first answer.
+   * False means only the live socket holds context, so there is nothing to
+   * switch back to and session management is withheld.
+   */
+  sessionPersistence: boolean | null;
+  /** Begin an additional conversation without discarding the current one. */
+  startNewSession: () => void;
+  /** Resume a stored conversation; its transcript is rehydrated. */
+  goToSession: (sessionId: string) => void;
+  /** Delete a stored conversation, moving off it when it is the active one. */
+  removeSession: (sessionId: string) => Promise<void>;
   /**
    * Append a locally-generated info/system message to the transcript without
    * sending anything to the gateway. Used by web slash-command handlers
@@ -109,12 +131,24 @@ export interface AgentProviderProps {
 }
 
 export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
-  const sessionIdRef = useRef(getOrCreateSessionId(agentAlias));
+  // The conversation this provider is showing. State, not a ref: switching it
+  // is what re-runs hydration and rebuilds the socket, which is how one agent
+  // serves several independent conversations (issue #7543).
+  const [sessionId, setSessionId] = useState(() => getActiveSessionId(agentAlias));
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const persisted = loadChatHistory(sessionIdRef.current);
+    const persisted = loadChatHistory(sessionId);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
   });
-  const [historyReady, setHistoryReady] = useState(false);
+  // Session whose transcript has finished hydrating into `messages`. Null until
+  // the first hydration lands, and never equal to `sessionId` while a switch is
+  // in flight — which is what stops the mirror effect below from writing one
+  // conversation's transcript under another conversation's key.
+  const [hydratedSessionId, setHydratedSessionId] = useState<string | null>(null);
+  // Whether the gateway stores transcripts, as reported by the hydration fetch.
+  // Null until the first answer. When false there is no server-side record of a
+  // conversation, so switching away from one strands it — the picker uses this
+  // to withhold the controls that would do that.
+  const [sessionPersistence, setSessionPersistence] = useState<boolean | null>(null);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
@@ -144,9 +178,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     void primeModelProviderCatalog();
   }, []);
 
-  // Hydrate chat from server (preferred) or localStorage fallback
+  // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
+  // every session switch, which is what rehydrates the transcript of the
+  // conversation the operator just selected.
   useEffect(() => {
-    const sid = sessionIdRef.current;
+    const sid = sessionId;
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     let cancelled = false;
 
@@ -154,6 +190,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       try {
         const res = await getSessionMessages(sid);
         if (cancelled) return;
+        setSessionPersistence(res.session_persistence);
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
             setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
@@ -174,20 +211,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           });
         }
       } finally {
-        if (!cancelled) setHistoryReady(true);
+        if (!cancelled) setHydratedSessionId(sid);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sessionId]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
-    if (!historyReady) return;
-    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
-  }, [messages, historyReady]);
+    if (hydratedSessionId !== sessionId) return;
+    saveChatHistory(sessionId, uiMessagesToPersisted(messages));
+  }, [messages, hydratedSessionId, sessionId]);
 
   // Auto-clear a pending approval when its timeout elapses on the backend.
   // The gateway auto-denies after `timeout_secs`; without this effect the
@@ -519,18 +556,29 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     };
   }, [handleWsMessage]);
 
-  // WebSocket bound to the configured agent. Re-keys (via the outer
-  // <AgentProvider key={alias}>) when the alias changes.
+  // WebSocket bound to the configured agent and the active conversation.
+  // Re-keys (via the outer <AgentProvider key={alias}>) when the alias changes,
+  // and re-runs on a session switch so the gateway seeds a fresh Agent from the
+  // selected session's persisted history.
   useEffect(() => {
-    const ws = new WebSocketClient({ agentAlias });
+    const ws = new WebSocketClient({ agentAlias, sessionId });
     attachSocketCallbacks(ws);
     ws.connect();
     wsRef.current = ws;
 
     return () => {
       ws.disconnect();
+      // switchModel and clearAllMessages replace the socket this effect
+      // created. Before sessions were switchable the effect only re-ran on an
+      // alias change, so that replacement was never left behind; now a session
+      // switch tears the effect down at any time, and closing only the captured
+      // socket would strand the replacement — still connected, still streaming
+      // into a conversation the UI has left.
+      if (wsRef.current && wsRef.current !== ws) {
+        wsRef.current.disconnect();
+      }
     };
-  }, [attachSocketCallbacks, agentAlias]);
+  }, [attachSocketCallbacks, agentAlias, sessionId]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -626,6 +674,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     if (modelLoading) return; // debounce
     setModelLoading(true);
     pendingModelSwitchRef.current = model;
+    // Socket identity at the start of the switch, checked before the rebuild
+    // below so a concurrent session switch wins instead of being clobbered.
+    const wsAtSwitch = wsRef.current;
 
     // Watchdog so the UI can never get stuck on the loading spinner. It is
     // armed once per phase — for the config write, then again for the socket
@@ -669,7 +720,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (typing) {
         try {
           await Promise.race([
-            abortSession(sessionIdRef.current),
+            abortSession(sessionId),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error('abort-timeout')), 1_500),
             ),
@@ -697,6 +748,22 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // one step no awaited promise covers. Bail first if the write phase
       // already timed out (or a newer switch superseded this one).
       if (pendingModelSwitchRef.current !== model) return;
+      // A session switch during the awaits above already rebuilt the socket for
+      // a different conversation; reconnecting here would bind the new model to
+      // the session the operator just left. The config write has landed, so the
+      // preference is stored and the live socket picks it up — settle the UI
+      // from the server rather than leaving the watchdog to report a timeout
+      // for a switch that did not actually fail.
+      if (wsRef.current !== wsAtSwitch) {
+        if (switchTimeoutRef.current) {
+          clearTimeout(switchTimeoutRef.current);
+          switchTimeoutRef.current = null;
+        }
+        pendingModelSwitchRef.current = null;
+        setModelLoading(false);
+        setModelInfoVersion((v) => v + 1);
+        return;
+      }
       armWatchdog();
 
       // Tear down the old socket and create a fresh one.
@@ -711,7 +778,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.disconnect();
       }
 
-      const ws = new WebSocketClient({ agentAlias });
+      const ws = new WebSocketClient({ agentAlias, sessionId });
       // Point wsRef at the NEW client before connect(), so a synchronous
       // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
       // leaves a live, reconnect-capable socket in the ref instead of the old
@@ -734,17 +801,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, sessionId]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
     setMessages((prev) => prev.filter((m) => m.id !== id));
   }, []);
 
-  const clearAllMessages = useCallback(() => {
-    // Optimistically wipe the rendered transcript and any in-flight streaming
-    // state. Bumping the mutation version fences off a racing hydration fetch
-    // so it can't repopulate the just-cleared view.
+  /**
+   * Wipe the rendered transcript and any in-flight streaming state. Bumping the
+   * mutation version fences off a racing hydration fetch so it can't repopulate
+   * the just-cleared view. Shared by "clear chat" and by session switching,
+   * which must not show the outgoing conversation while the new one loads.
+   */
+  const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
     pendingContentRef.current = '';
@@ -754,8 +824,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setStreamingThinking('');
     setTyping(false);
     setPendingApproval(null);
+    // Context-window figures describe the transcript we just dropped; leaving
+    // them would show the outgoing conversation's token usage against an empty
+    // one until the next `done` frame refreshes them.
+    setContextInputTokens(null);
+  }, []);
 
-    const sid = sessionIdRef.current;
+  const clearAllMessages = useCallback(() => {
+    resetTranscriptState();
+
+    const sid = sessionId;
+    // Socket identity at the moment of the clear. If it changes while the
+    // delete is in flight, a session switch (or another rebuild) has taken over
+    // and this closure must not resurrect a connection for the old session.
+    const wsAtClear = wsRef.current;
 
     // The live WebSocket Agent holds the full conversation in memory for the
     // life of the connection, and the gateway persists each turn to the
@@ -777,6 +859,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // so the live in-memory context is reset regardless.
       }
 
+      if (wsRef.current !== wsAtClear) return;
+
       // Rebuild the socket so the backend constructs a new Agent with no seeded
       // history. Detach the old socket's callbacks first so its onClose does
       // not write stale connection state. If there is no socket (disconnected),
@@ -789,7 +873,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.onMessage = null;
         oldWs.disconnect();
 
-        const ws = new WebSocketClient({ agentAlias });
+        const ws = new WebSocketClient({ agentAlias, sessionId });
         // Assign wsRef before connect() so a synchronous throw can't strand the
         // page on the old intentionally-closed socket (see switchModel).
         wsRef.current = ws;
@@ -797,7 +881,63 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks]);
+  }, [agentAlias, attachSocketCallbacks, sessionId, resetTranscriptState]);
+
+  /**
+   * Point this agent at `nextSessionId`. The socket effect tears down the old
+   * connection and reconnects with the new id, and the hydration effect pulls
+   * that conversation's transcript — so nothing here touches either directly.
+   *
+   * A turn streaming in the outgoing conversation is aborted first: the socket
+   * is going away regardless, and leaving it running would keep executing tools
+   * against a session the operator has navigated away from.
+   */
+  const goToSession = useCallback((nextSessionId: string) => {
+    if (nextSessionId === sessionId) return;
+
+    if (typing) {
+      void abortSession(sessionId).catch(() => {
+        // Best-effort: never block the switch on a failed abort.
+      });
+    }
+
+    resetTranscriptState();
+    // Invalidate the hydration marker in the same batch. Without it, switching
+    // A -> B -> A before B's fetch lands would leave the marker on A while
+    // `messages` is empty, and the mirror effect would write that empty
+    // transcript over A's cache — the only copy when persistence is off.
+    setHydratedSessionId(null);
+    setActiveSessionId(agentAlias, nextSessionId);
+    setSessionId(nextSessionId);
+  }, [agentAlias, resetTranscriptState, sessionId, typing]);
+
+  /** Start an additional conversation, leaving the current one intact. */
+  const startNewSession = useCallback(() => {
+    goToSession(newSessionId());
+  }, [goToSession]);
+
+  /**
+   * Drop a stored conversation. Deleting the one on screen leaves nothing to
+   * display, so the agent moves to a fresh conversation rather than showing a
+   * transcript the gateway no longer has.
+   */
+  const removeSession = useCallback(async (targetSessionId: string) => {
+    try {
+      await deleteSession(targetSessionId);
+    } catch (err) {
+      // 404 means the gateway has nothing stored for this conversation, which
+      // is already the outcome the operator asked for. Anything else is a real
+      // failure — the transcript is still on the server, so say so instead of
+      // quietly dropping the row and implying it is gone.
+      if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    }
+    // The browser cache is a second copy of the same transcript; a delete that
+    // leaves it behind is not a delete.
+    removeChatHistory(targetSessionId);
+    if (targetSessionId === sessionId) {
+      goToSession(newSessionId());
+    }
+  }, [goToSession, sessionId]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -841,6 +981,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     refreshModels: () => setModelInfoVersion((v) => v + 1),
     deleteMessage,
     clearAllMessages,
+    sessionId,
+    hydrated: hydratedSessionId === sessionId,
+    sessionPersistence,
+    startNewSession,
+    goToSession,
+    removeSession,
     addLocalMessage,
     abortSession: async () => {
       // Clear local approval state immediately — the in-flight request_id
@@ -849,7 +995,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // to round-trip; the user clicked Stop and expects the UI to follow.
       setPendingApproval(null);
       try {
-        await abortSession(sessionIdRef.current);
+        await abortSession(sessionId);
       } catch {
         // Best-effort abort
       }
