@@ -30,7 +30,7 @@
 # tidux-primary areas (providers, API, infra, hardware, firmware).
 # Web (/web, /dist) stays with @JordanTheJet (+ @IftekharUddin).
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-providers/** @tidux @Nillth
+/crates/zeroclaw-providers/** @tidux @Audacity88
 /crates/zeroclaw-api/**       @tidux
 /crates/zeroclaw-infra/**     @tidux
 /crates/zeroclaw-hardware/**  @tidux
@@ -38,7 +38,7 @@
 /crates/robot-kit/**          @tidux
 /crates/zeroclaw-macros/**    @tidux
 /firmware/**                  @tidux
-/src/providers/**             @tidux @Nillth
+/src/providers/**             @tidux @Audacity88
 /src/hardware/**              @tidux
 /web/**                       @JordanTheJet @IftekharUddin
 /dist/**                      @JordanTheJet
@@ -107,8 +107,13 @@
 # ---------------------------------------------------------------------------
 # Channels (Audacity primary + tidux specialist)
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-channels/** @Audacity88 @tidux @Nillth
-/src/channels/**             @Audacity88 @tidux @Nillth
+/crates/zeroclaw-channels/** @Audacity88 @tidux
+/src/channels/**             @Audacity88 @tidux
+
+# Git forge channel: Nillth authored the subsystem (#8609 GitHub provider,
+# #8611 Gitea/Forgejo). Narrower than the channels rules above, so it must
+# come after them (last match wins).
+/crates/zeroclaw-channels/src/git/** @Audacity88 @Nillth
 
 # ---------------------------------------------------------------------------
 # Skills, plugins (per Jordan's suggested patch on PR #6537)
@@ -229,7 +234,7 @@ Cargo.lock @JordanTheJet
 # Specific overrides (must be last)
 # ---------------------------------------------------------------------------
 # Channels-crate Cargo.toml: legacy steward + channels owners
-/crates/zeroclaw-channels/Cargo.toml @Audacity88 @tidux @JordanTheJet @Nillth
+/crates/zeroclaw-channels/Cargo.toml @Audacity88 @tidux @JordanTheJet
 
 # Matrix backend
 /crates/zeroclaw-channels/src/matrix.rs @tidux @Audacity88
