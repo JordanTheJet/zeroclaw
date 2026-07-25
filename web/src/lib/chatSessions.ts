@@ -28,6 +28,36 @@ export function newSessionId(): string {
   return generateUUID();
 }
 
+/** Longest auto-title we will store, in characters. */
+const MAX_TITLE_LENGTH = 48;
+
+/**
+ * Derive a conversation title from its opening message.
+ *
+ * Without this every conversation lists as "Conversation 3f2a91b4", which tells
+ * the operator nothing about which one to pick. Returns null when the message
+ * carries no usable text, in which case the conversation stays untitled rather
+ * than being named something meaningless.
+ */
+export function deriveSessionTitle(firstMessage: string): string | null {
+  const firstLine = firstMessage
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstLine) return null;
+
+  const collapsed = firstLine.replace(/\s+/g, ' ');
+  if (collapsed.length <= MAX_TITLE_LENGTH) return collapsed;
+
+  // Prefer cutting at a word boundary, but only when that keeps enough of the
+  // line to stay recognisable — otherwise a long first word would shrink the
+  // title to almost nothing.
+  const clipped = collapsed.slice(0, MAX_TITLE_LENGTH);
+  const lastSpace = clipped.lastIndexOf(' ');
+  const body = lastSpace > MAX_TITLE_LENGTH / 2 ? clipped.slice(0, lastSpace) : clipped;
+  return `${body.trimEnd()}…`;
+}
+
 /**
  * Resolve the active session id for `agentAlias`, creating one when the agent
  * has never been opened. Adopts the pre-multi-session key when present so an

@@ -1,10 +1,10 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
-import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
+import { deriveSessionTitle, getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { ApiError, getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { ApiError, getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession, renameSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -72,6 +72,8 @@ interface AgentContextValue {
    * switch back to and session management is withheld.
    */
   sessionPersistence: boolean | null;
+  /** Changes when the session listing goes stale (auto-title, delete). */
+  sessionsVersion: number;
   /** Begin an additional conversation without discarding the current one. */
   startNewSession: () => void;
   /** Resume a stored conversation; its transcript is rehydrated. */
@@ -149,6 +151,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   // conversation, so switching away from one strands it — the picker uses this
   // to withhold the controls that would do that.
   const [sessionPersistence, setSessionPersistence] = useState<boolean | null>(null);
+  // Bumped whenever this provider changes something the session listing shows,
+  // so the picker re-reads instead of displaying a name or count it has already
+  // invalidated.
+  const [sessionsVersion, setSessionsVersion] = useState(0);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
@@ -171,6 +177,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+  // Conversation this provider has already auto-titled, so a name is derived
+  // once per conversation and never re-derived from a later message.
+  const autoTitledSessionRef = useRef<string | null>(null);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -651,6 +660,34 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     if (!wsRef.current?.connected) return;
     try {
       wsRef.current.sendMessage(content);
+
+      // Name a conversation after its opening message. Without this every entry
+      // in the picker reads "Conversation 3f2a91b4", which says nothing about
+      // which one to resume. Only ever fires on an empty transcript, so a name
+      // the operator set by hand is never overwritten.
+      // The ref, not just the length check: two sends in one tick would both
+      // read length 0 from their render's closure and race two renames.
+      if (messages.length === 0 && autoTitledSessionRef.current !== sessionId) {
+        const title = deriveSessionTitle(content);
+        if (title) {
+          const titledSession = sessionId;
+          autoTitledSessionRef.current = titledSession;
+          void renameSession(titledSession, title)
+            .then(() => {
+              // Refresh the picker so the trigger stops showing the raw id.
+              setSessionsVersion((v) => v + 1);
+            })
+            .catch(() => {
+              // Cosmetic: an unnamed conversation is still fully usable, and
+              // the operator can rename it by hand. Release the guard so a
+              // later message can try again.
+              if (autoTitledSessionRef.current === titledSession) {
+                autoTitledSessionRef.current = null;
+              }
+            });
+        }
+      }
+
       setTyping(true);
       pendingContentRef.current = '';
       pendingThinkingRef.current = '';
@@ -668,7 +705,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     } catch {
       setError(t('agent.send_error'));
     }
-  }, []);
+  }, [messages.length, sessionId]);
 
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
@@ -984,6 +1021,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     sessionId,
     hydrated: hydratedSessionId === sessionId,
     sessionPersistence,
+    sessionsVersion,
     startNewSession,
     goToSession,
     removeSession,

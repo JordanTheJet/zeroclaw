@@ -35,7 +35,14 @@ function rowLabel(row: SessionRow): string {
  * honest message count.
  */
 export function SessionPicker({ agentAlias }: { agentAlias: string }) {
-  const { sessionId, sessionPersistence, startNewSession, goToSession, removeSession } = useAgent();
+  const {
+    sessionId,
+    sessionPersistence,
+    sessionsVersion,
+    startNewSession,
+    goToSession,
+    removeSession,
+  } = useAgent();
 
   // With persistence off the gateway keeps no record of a conversation, so a
   // new one would strand the current transcript with nothing to switch back to.
@@ -105,12 +112,14 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     }
   }, [agentAlias, sessionId]);
 
-  // Load on mount and after every session switch, so the trigger shows the
-  // conversation's name rather than a slice of its id. Opening the menu
-  // reloads separately (see the trigger's onClick) to refresh message counts.
+  // Load on mount, after every session switch, and whenever the provider
+  // invalidates the listing — notably when a conversation is auto-titled from
+  // its first message, so the trigger stops showing a slice of the raw id.
+  // Opening the menu reloads separately (see the trigger's onClick) to refresh
+  // message counts.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, sessionsVersion]);
 
   // Close on outside click, mirroring the model dropdown in the same header.
   useEffect(() => {
