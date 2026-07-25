@@ -6276,10 +6276,24 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
                         .to_path_buf();
-                    zeroclaw_runtime::purge_plugin_state(&config.data_dir, &config_dir, &name)
-                        .map_err(|error| {
-                            anyhow::anyhow!("failed to purge plugin state for {name}: {error}")
-                        })?;
+                    if let Err(error) =
+                        zeroclaw_runtime::purge_plugin_state(&config.data_dir, &config_dir, &name)
+                    {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": name,
+                                "error": format!("{error}"),
+                            })),
+                            "failed to purge plugin state; leaving the plugin installed"
+                        );
+                        bail!("failed to purge plugin state for {name}: {error}");
+                    }
                 }
                 host.remove(&name)?;
                 println!(
