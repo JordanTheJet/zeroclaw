@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK};
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -985,6 +985,24 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
             } else {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // Context window. An unset value resolves to a conservative stub
+            // that is almost always far below the model's real limit, and the
+            // agent trims against it with no other symptom — so say so here
+            // rather than let the profile look healthy.
+            if let Some(context_window) = entry.context_window {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("{label}: context window: {context_window} tokens"),
+                ));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "{label}: no context_window set — using {UNCONFIGURED_CONTEXT_WINDOW_FALLBACK} token fallback, likely far below this model's real limit; set context_window on this profile"
+                    ),
+                ));
             }
 
             // Temperature range

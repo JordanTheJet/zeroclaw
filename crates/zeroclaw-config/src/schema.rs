@@ -4036,19 +4036,29 @@ impl Config {
             .unwrap_or(32_000)
     }
 
+    /// The model's context window exactly as configured, or `None` when no
+    /// provider profile declares one.
+    ///
+    /// `None` means *unknown*, not "small". Report it to an operator as unset
+    /// rather than resolving it to [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`],
+    /// which would present a stub as though it were the model's real capacity.
+    /// Use [`Config::effective_model_context_window`] when a number is required
+    /// for budget arithmetic.
+    #[must_use]
+    pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
+        // Provider config (config.toml) is the source of truth for this value.
+        self.resolved_model_provider_for_agent(agent_alias)
+            .and_then(|(_, _, provider_config)| provider_config.context_window)
+    }
+
     /// Returns the model's context window size (max input tokens).
-    /// Source: provider config `context_window` → fallback 32,000.
+    /// Source: provider config `context_window` →
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`].
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
-        // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
-        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
-            && let Some(ctx) = provider_config.context_window
-        {
-            return ctx;
-        }
-        // 2. Hard fallback 32,000 (stub)
-        32_000
+        self.configured_model_context_window(agent_alias)
+            .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
     }
 
     #[must_use]
@@ -4530,6 +4540,18 @@ fn default_delegate_agentic_timeout_secs() -> u64 {
 
 /// Valid temperature range for all paths (config, CLI, env override).
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Context window assumed when no provider profile declares one.
+///
+/// Deliberately conservative: it has to be safe for any model, which means it
+/// is almost always *wrong* for the model actually in use — a 1M-context model
+/// on a profile that omits `context_window` runs against this number. It exists
+/// so budget arithmetic has an operand, not because it describes any model.
+///
+/// Anything reporting to an operator must call
+/// [`Config::configured_model_context_window`] and say "not configured" when it
+/// returns `None`, rather than echoing this value as the model's real capacity.
+pub const UNCONFIGURED_CONTEXT_WINDOW_FALLBACK: usize = 32_000;
 
 /// Defaults to 0 so configs without an explicit `schema_version` are recognized
 /// as pre-versioning and get migrated.
@@ -22490,6 +22512,28 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole point of splitting the accessor: an operator-facing caller
+    /// must be able to tell "unconfigured" from a real 32,000, which a bare
+    /// `usize` cannot express.
+    #[::core::prelude::v1::test]
+    fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
+        let cfg = super::Config::default();
+        // Nothing configured — the honest answer is "unknown", not a number.
+        assert_eq!(cfg.configured_model_context_window("absent"), None);
+        // Budget arithmetic still gets an operand, unchanged from before.
+        assert_eq!(
+            cfg.effective_model_context_window("absent"),
+            super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn unconfigured_context_window_fallback_is_documented_stub_value() {
+        // Pinned so a change to the stub is a deliberate, reviewed edit — the
+        // value is load-bearing for trim budgets on unconfigured profiles.
+        assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
+    }
 
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {
