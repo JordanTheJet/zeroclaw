@@ -1225,8 +1225,17 @@ jobs:
     uses: ./.github/workflows/pub-crates.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
+      # Bind the publish to the exact commit this release built and tagged, so
+      # crates.io cannot receive a different tree than the GitHub release did.
+      release_sha: ${{ github.sha }}
       dry_run: false
-    secrets: inherit
+    # Deliberately NOT `secrets: inherit`. Only the registry credential is
+    # forwarded, so an unrelated secret cannot leak into a workflow that runs
+    # `cargo publish`. The credential itself should live on the `crates-io`
+    # environment rather than the repository, so it is unavailable until the
+    # gate's protection rules pass.
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # ── Post-publish: announce after release + website are live ───────────
   # Docker push can be slow; don't let it block announcements.

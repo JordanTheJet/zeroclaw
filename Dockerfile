@@ -80,7 +80,11 @@ COPY Cargo.toml Cargo.lock ./
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
-COPY --parents crates/*/Cargo.toml ./
+# `**` rather than `*`: workspace members are not all one level under
+# crates/ (crates/zeroclaw-plugins/tests/fixtures/channel-fixture is a member
+# too). A single-level glob silently omits nested manifests, and cargo then
+# fails to load the workspace in this stage rather than at COPY time.
+COPY --parents crates/**/Cargo.toml ./
 # zeroclaw-macros is a proc-macro crate, compiled for the host even on a cross
 # build. If only a stub lib.rs is present during the pre-fetch, its host-cached
 # artifact is reused in the real build under the target-triple dir, leaving

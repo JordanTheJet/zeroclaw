@@ -17,6 +17,10 @@ on:
         description: "Existing release tag (vX.Y.Z)"
         required: true
         type: string
+      release_sha:
+        description: "Commit the release was built from; preflight fails unless the tag resolves to it"
+        required: false
+        type: string
       dry_run:
         description: "Run preflight only (no upload)"
         required: false
@@ -63,6 +67,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
         run: |
           set -euo pipefail
 
@@ -91,6 +96,15 @@ jobs:
           # out rather than re-resolving the tag, so a tag moved between the two
           # jobs cannot cause an unverified commit to be published with the token.
           sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+
+          # When the caller knows which commit the release was built from, refuse
+          # to publish anything else. Without this, the tag could be moved between
+          # building the binaries and publishing the crates, and the two would
+          # describe different trees under one version number.
+          if [[ -n "${RELEASE_SHA:-}" && "$sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Tag ${RELEASE_TAG} resolves to ${sha}, but the release was built from ${RELEASE_SHA}."
+            exit 1
+          fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
