@@ -132,28 +132,56 @@ if [[ -n "$leaks" ]]; then
   exit 1
 fi
 
-# ── Preflight 3: which crates are already on crates.io at this version ──────
-# This is what makes a re-run resumable: the publish loop below skips exactly
-# what this query found, rather than trusting cargo to do it.
+# ── Preflight 3: what is already on crates.io, and what would be created ────
+# Two distinct questions, and the difference decides how fast the loop may run:
+#
+#   does <crate>@<version> exist?  -> whether to skip it (resumability)
+#   does <crate> exist at all?     -> whether publishing it CREATES a crate
+#
+# crates.io rate-limits creation far harder than a new version, so the loop
+# below paces creations slowly and moves through version bumps quickly. Asking
+# only the first question, as this script originally did, cannot tell them apart
+# and paces everything at the fast cadence, which 429s partway through a
+# first-time workspace publish.
+#
+# A yanked version still answers 200 here, and that is the behaviour we want:
+# yanking does not free a version number, so cargo would reject a re-publish.
+crates_io_status() {
+  curl -sS -o /dev/null -w '%{http_code}' \
+    -H "User-Agent: zeroclaw-release (https://github.com/zeroclaw-labs/zeroclaw)" \
+    "https://crates.io/api/v1/crates/$1" || echo 000
+}
+
 already=()
 todo=()
+creations=()
 for crate in "${PUBLISHABLE[@]}"; do
-  crate_version="$VERSION"
-  code="$(curl -sS -o /dev/null -w '%{http_code}' \
-    -H "User-Agent: zeroclaw-release (https://github.com/zeroclaw-labs/zeroclaw)" \
-    "https://crates.io/api/v1/crates/${crate}/${crate_version}" || echo 000)"
+  code="$(crates_io_status "${crate}/${VERSION}")"
   case "$code" in
-    200) already+=("${crate}@${crate_version}") ;;
-    404) todo+=("${crate}@${crate_version}") ;;
+    200)
+      already+=("${crate}@${VERSION}")
+      continue
+      ;;
+    404) todo+=("${crate}@${VERSION}") ;;
     *)
-      echo "error: crates.io returned HTTP $code for ${crate}/${crate_version}; refusing to guess." >&2
+      echo "error: crates.io returned HTTP $code for ${crate}/${VERSION}; refusing to guess." >&2
+      exit 1
+      ;;
+  esac
+
+  crate_code="$(crates_io_status "${crate}")"
+  case "$crate_code" in
+    200) ;;
+    404) creations+=("$crate") ;;
+    *)
+      echo "error: crates.io returned HTTP $crate_code for ${crate}; refusing to guess." >&2
       exit 1
       ;;
   esac
 done
 
 if [[ ${#already[@]} -gt 0 ]]; then
-  echo "Already on crates.io (will be skipped):"
+  echo "Already on crates.io, will be skipped (a yanked version also counts as present):"
   printf '  %s\n' "${already[@]}"
   echo
 fi
@@ -163,6 +191,12 @@ if [[ ${#todo[@]} -eq 0 ]]; then
 fi
 echo "To publish:"
 printf '  %s\n' "${todo[@]}"
+if [[ ${#creations[@]} -gt 0 ]]; then
+  echo
+  echo "Of those, ${#creations[@]} do not exist on crates.io yet and will be CREATED:"
+  printf '  %s\n' "${creations[@]}"
+  echo "Creation is the rate-limited operation; this run will pace itself accordingly."
+fi
 echo
 
 # ── Preflight 4: token present before anything irreversible starts ──────────
@@ -199,9 +233,26 @@ fi
 #     versions (a small burst, then roughly one per 10 minutes). Publishing
 #     sequentially lets the run pace itself and report exactly where it stopped.
 #
-# PUBLISH_DELAY_SECONDS paces the loop; raise it if crates.io starts 429ing, or
-# request a limit increase from the crates.io team before a large first publish.
+# Two cadences, because the limits differ by roughly two orders of magnitude.
+# A new version of an existing crate is cheap; creating a crate that does not
+# exist yet is documented at about one per 10 minutes after a small burst.
+# Pacing everything at the fast cadence 429s partway through a first-time
+# workspace publish, which is exactly the run we least want to babysit.
+#
+# Override either when crates.io has granted a temporary limit increase.
 DELAY="${PUBLISH_DELAY_SECONDS:-15}"
+CREATE_DELAY="${PUBLISH_CREATE_DELAY_SECONDS:-620}"
+# 429 is throttling, not failure. Wait and retry rather than aborting a sequence
+# that cannot be rolled back.
+MAX_RETRIES="${PUBLISH_MAX_RETRIES:-6}"
+
+is_creation() {
+  local needle="$1" c
+  for c in ${creations[@]+"${creations[@]}"}; do
+    [[ "$c" == "$needle" ]] && return 0
+  done
+  return 1
+}
 
 # Topological order over the publishable set, so each crate's dependencies are
 # already on the registry when it uploads. Derived from cargo metadata, never
@@ -239,7 +290,8 @@ PY
 published=0
 skipped=0
 echo "── Publishing to crates.io (IRREVERSIBLE) ──"
-echo "   pacing: ${DELAY}s between uploads"
+echo "   ${#todo[@]} to publish, ${#creations[@]} of them new crates"
+echo "   pacing: ${DELAY}s between versions, ${CREATE_DELAY}s after creating a crate"
 echo
 for crate in $ORDER; do
   # `${arr[@]+...}` guards the empty-array expansion, which is an unbound-variable
@@ -249,22 +301,45 @@ for crate in $ORDER; do
     skipped=$((skipped + 1))
     continue
   fi
-  echo "publish ${crate} ${VERSION}"
+
+  creating=0
+  pause="$DELAY"
+  if is_creation "$crate"; then
+    creating=1
+    pause="$CREATE_DELAY"
+  fi
+  echo "publish ${crate} ${VERSION}$([[ $creating -eq 1 ]] && echo ' (new crate)')"
+
   # `--no-verify`: the preflight job already ran a full verifying dry run over
   # this exact tree, building every crate from its own tarball. Re-verifying all
   # 18 here would add ~40 minutes inside a rate-limited window, and a timeout
   # midway through an irreversible sequence is the worst outcome available.
-  if ! cargo publish -p "$crate" --locked --no-verify; then
+  attempt=1
+  log="$(mktemp)"
+  while true; do
+    if cargo publish -p "$crate" --locked --no-verify 2>&1 | tee "$log"; then
+      break
+    fi
+    # Throttling is not failure. Back off and retry rather than abandoning a
+    # sequence that cannot be rolled back.
+    if grep -qiE '429|too many requests|rate limit' "$log" && [[ $attempt -lt $MAX_RETRIES ]]; then
+      wait_for="$CREATE_DELAY"
+      echo "  rate-limited by crates.io; waiting ${wait_for}s then retrying (${attempt}/${MAX_RETRIES})"
+      sleep "$wait_for"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    rm -f "$log"
     echo >&2
     echo "error: publishing ${crate} failed." >&2
     echo "       ${published} crate(s) uploaded before this point and CANNOT be undone." >&2
     echo "       Fix the cause and re-run this script; it will skip what already landed." >&2
-    echo "       If crates.io returned a rate-limit error, wait and re-run — the limit on" >&2
-    echo "       creating new crates is roughly one per 10 minutes." >&2
     exit 1
-  fi
+  done
+  rm -f "$log"
+
   published=$((published + 1))
-  sleep "$DELAY"
+  sleep "$pause"
 done
 
 echo

@@ -400,9 +400,13 @@ partway through leaves the earlier crates published; that is recoverable, see
 **The first release is the slow one.** Sixteen of the eighteen crates do not yet
 exist on crates.io, and crates.io rate-limits *creating* a crate far harder than
 publishing a new version of one: a small burst, then roughly one per ten
-minutes. Expect the first run to pace itself or stop partway with a rate-limit
-error; re-running resumes from where it stopped. To avoid that entirely, ask the
-crates.io team for a temporary limit increase before the first publish.
+minutes. `publish-crates.sh` detects which crates are creations and paces those
+separately, retrying rather than aborting when crates.io throttles it, so the
+run completes unattended. Budget two to three hours of wall clock for it.
+
+If the crates.io team grants a temporary limit increase, shorten the wait with
+`PUBLISH_CREATE_DELAY_SECONDS`; `PUBLISH_DELAY_SECONDS` paces ordinary version
+bumps and `PUBLISH_MAX_RETRIES` bounds the throttle retries.
 
 ---
 
