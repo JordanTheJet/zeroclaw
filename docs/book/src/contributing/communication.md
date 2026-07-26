@@ -61,10 +61,10 @@ Everyone below is Core Team, the Tier 3 role defined in [FND-003](../foundations
 
 | Handle | Role | Focus |
 |---|---|---|
-| [@JordanTheJet](https://github.com/JordanTheJet) | Core Team, project lead | Hardware, edge deployments, infra, web, i18n |
-| [@Audacity88](https://github.com/Audacity88) | Core Team | Runtime, agent, tools, gateway, config |
-| [@Nillth](https://github.com/Nillth) | Core Team | Providers, channels |
-| [@tidux](https://github.com/tidux) | Core Team | Channels (Matrix, ACP) |
+| [@JordanTheJet](https://github.com/JordanTheJet) | Core Team, project lead | Web, plugins and skills, desktop app, tests and repository tooling, Cargo and license stewardship |
+| [@Audacity88](https://github.com/Audacity88) | Core Team | Runtime, agent, tools, gateway, memory, config, providers, build and release tooling |
+| [@Nillth](https://github.com/Nillth) | Core Team | Git forge channel (GitHub, Gitea, Forgejo) |
+| [@tidux](https://github.com/tidux) | Core Team | Providers, API, infra, hardware, firmware, channels (Matrix, ACP), auth and the legacy `src/` tree, i18n, docs |
 | [@IftekharUddin](https://github.com/IftekharUddin) | Core Team | Web GUI, maintainer process docs, labels and issue templates |
 | [@vyahhi](https://github.com/vyahhi) | Core Team | Repository automation and ZeroClaw-Bot |
 | [@Stalesamy](https://github.com/Stalesamy) | Core Team | Marketing and community, plus occasional PRs |
