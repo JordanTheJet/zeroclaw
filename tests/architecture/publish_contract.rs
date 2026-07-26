@@ -7,11 +7,13 @@
 //!
 //! Each gate below encodes a defect that actually occurred:
 //!
-//! * a `publish = false` crate inside the root's dependency closure (#5811,
-//!   which blocked every release after the microkernel split)
+//! * a `publish = false` crate inside the root's dependency closure, which
+//!   blocked every release after the microkernel split
 //! * a git dependency with no `version`, which crates.io rejects outright
-//! * an `include_str!` reaching outside its own crate directory, which packages
-//!   fine and then fails to compile from the tarball
+//! * a compile-time file reference reaching outside its own crate directory,
+//!   which packages fine and then fails to compile from the tarball. Feature
+//!   gated ones are the dangerous case: `cargo publish --dry-run` verifies
+//!   default features only, so they pass preflight and ship broken
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

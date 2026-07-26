@@ -42,7 +42,7 @@ A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
 
 ### A note on `cargo install`, `cargo binstall`, and `nix run`
 
-`cargo install zeroclaw --locked` builds from source and works — the workspace
+`cargo install zeroclaw --locked` builds from source and works: the workspace
 publishes to crates.io as of v0.8.4. Expect a long compile; `install.sh`
 downloads a prebuilt binary and remains the faster path.
 

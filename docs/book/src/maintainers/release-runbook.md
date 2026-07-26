@@ -316,7 +316,7 @@ standard PR off master.
 
 ### Dry-run the crates.io publish directly
 
-The crates.io preflight needs no `act` and no token — run it against your
+The crates.io preflight needs no `act` and no token. Run it against your
 working tree:
 
 <div class="os-tabs-src">
@@ -333,9 +333,9 @@ It reports which crates are publishable, which are already on crates.io at this
 version, and which would be uploaded, then packages each one and compiles it
 from its own tarball. That last part is the whole point: a crate can build fine
 in the workspace and still fail from its tarball, because `cargo package`
-archives only files under the crate root. Both defects this catches — an
-`include_str!` reaching into a sibling crate, and a git dependency with no
-`version` — are invisible to `cargo build`.
+archives only files under the crate root. Both defects this catches, an
+`include_str!` reaching into a sibling crate and a git dependency with no
+`version`, are invisible to `cargo build`.
 
 Budget 10-20 minutes for a cold run and several GB of disk; it compiles the
 workspace once per crate. Nothing here can reach crates.io: the upload requires
@@ -382,10 +382,10 @@ job from the workflow run page; you do not need to restart from scratch.
 
 **Treat the `crates-io` gate differently from the other two.** A GitHub Release
 can be deleted and a container tag can be overwritten, but a crates.io version
-can only be yanked — never replaced or reused. Before approving, open the
+can only be yanked, never replaced or reused. Before approving, open the
 `crates-io / preflight` job that has already run: it packaged every crate and
 compiled each one from its own tarball. If preflight is green the upload is
-mechanical; if it is red, do not approve — fix the manifest and re-run.
+mechanical; if it is red, do not approve: fix the manifest and re-run.
 
 Eighteen crates publish in dependency order, with `zeroclaw` last. A failure
 partway through leaves the earlier crates published; that is recoverable, see
@@ -393,7 +393,7 @@ partway through leaves the earlier crates published; that is recoverable, see
 
 **The first release is the slow one.** Sixteen of the eighteen crates do not yet
 exist on crates.io, and crates.io rate-limits *creating* a crate far harder than
-publishing a new version of one — a small burst, then roughly one per ten
+publishing a new version of one: a small burst, then roughly one per ten
 minutes. Expect the first run to pace itself or stop partway with a rate-limit
 error; re-running resumes from where it stopped. To avoid that entirely, ask the
 crates.io team for a temporary limit increase before the first publish.
@@ -531,7 +531,7 @@ first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
 failed distribution job does not invalidate the release itself.
 
 **The crates.io publish failed partway through:** Some crates uploaded and the
-rest did not. Do not bump the version to work around it — the published crates
+rest did not. Do not bump the version to work around it; the published crates
 are already at this version and cannot be replaced.
 
 Fix the underlying problem, then re-run `pub-crates.yml` for the same tag.
@@ -546,7 +546,7 @@ master, cut the next patch version, and yank the partial set with
 Yanking does not break existing lockfiles that already reference it.
 
 **A crate was published that should not have been:** Yank it
-(`cargo yank --vers X.Y.Z <crate>`). Yanking is the only lever — crates.io has
+(`cargo yank --vers X.Y.Z <crate>`). Yanking is the only lever; crates.io has
 no delete. Deletion requires a support request and is reserved for genuine
 emergencies such as leaked secrets.
 
