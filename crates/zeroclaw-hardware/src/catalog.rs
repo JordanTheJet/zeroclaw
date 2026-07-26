@@ -10,15 +10,10 @@ pub const BASE_TOOLS: &[&str] = &[
     "device_exec",
 ];
 
-/// Tools loaded only when at least one Aardvark adapter is present at boot.
-pub const AARDVARK_TOOLS: &[&str] = &[
-    "i2c_scan",
-    "i2c_read",
-    "i2c_write",
-    "spi_transfer",
-    "gpio_aardvark",
-    "datasheet",
-];
+/// Datasheet lookup, loaded with the `hardware` feature. Previously gated on an
+/// Aardvark adapter being present; that adapter support was removed, and the
+/// tool is useful for any connected device.
+pub const DATASHEET_TOOLS: &[&str] = &["datasheet"];
 
 /// probe-rs backed introspection tools (in `zeroclaw-tools`).
 pub const PROBE_TOOLS: &[&str] = &[
@@ -40,7 +35,7 @@ mod tests {
     fn no_duplicate_tool_names_across_sets() {
         let mut all: Vec<&str> = BASE_TOOLS
             .iter()
-            .chain(AARDVARK_TOOLS)
+            .chain(DATASHEET_TOOLS)
             .chain(PROBE_TOOLS)
             .copied()
             .collect();

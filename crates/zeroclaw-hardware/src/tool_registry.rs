@@ -75,33 +75,20 @@ impl ToolRegistry {
             }
         }
 
-        // Aardvark I2C / SPI / GPIO tools + datasheet tool (hardware feature only,
-        // and only when at least one Aardvark adapter is present at startup).
+        // Datasheet tool (hardware feature only). This was previously gated on an
+        // Aardvark adapter being present at startup; with that adapter support
+        // removed the gate could never be satisfied, and datasheet lookup is
+        // useful for any connected device, so it now loads unconditionally.
         #[cfg(feature = "hardware")]
         {
-            let has_aardvark = {
-                let reg = devices.read().await;
-                reg.has_aardvark()
-            };
-            if has_aardvark {
-                for tool in super::aardvark_tools::aardvark_tools(devices.clone()) {
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
+            {
+                let tool: Box<dyn Tool> = Box::new(super::datasheet::DatasheetTool::new());
+                let name = tool.name().to_string();
+                if tools.contains_key(&name) {
+                    anyhow::bail!("duplicate built-in tool name: '{}'", name);
                 }
-                // Datasheet tool: always useful once an Aardvark is connected.
-                {
-                    let tool: Box<dyn Tool> = Box::new(super::datasheet::DatasheetTool::new());
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
-                }
+                println!("[registry] loaded built-in: {}", name);
+                tools.insert(name, tool);
             }
         }
 
@@ -256,10 +243,22 @@ mod tests {
                 names
             );
         }
+        // `datasheet` used to load only when an Aardvark adapter was present. That
+        // adapter support was removed, so it now loads with the `hardware` feature
+        // like the rest — the registry is BASE_TOOLS + DATASHEET_TOOLS.
+        for tool_name in super::super::catalog::DATASHEET_TOOLS {
+            assert!(
+                names.contains(tool_name),
+                "catalog tool '{}' missing; got: {:?}",
+                tool_name,
+                names
+            );
+        }
         assert_eq!(
             registry.len(),
-            super::super::catalog::BASE_TOOLS.len(),
-            "registry tool count must equal catalog::BASE_TOOLS (got {}, names: {:?})",
+            super::super::catalog::BASE_TOOLS.len() + super::super::catalog::DATASHEET_TOOLS.len(),
+            "registry tool count must equal catalog::BASE_TOOLS + DATASHEET_TOOLS \
+             (got {}, names: {:?})",
             registry.len(),
             names
         );
