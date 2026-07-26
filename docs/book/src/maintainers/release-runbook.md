@@ -18,7 +18,7 @@ Last verified against the `v0.8.2` release cycle.
 2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
 3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
 4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
-5. [Approve the three environment gates when prompted](#step-5-approve-the-environment-gates)
+5. [Approve the crates.io environment gate when prompted](#step-5-approve-the-environment-gates)
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
@@ -366,16 +366,22 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Three jobs are gated by GitHub environment protection rules. When each becomes
-pending you will see a **"Waiting for review"** banner in the workflow run.
+Three jobs run against a GitHub environment. Only one of them currently
+**pauses** for approval, because an environment gates a job only when it has
+required reviewers configured:
 
-Approve each when it appears:
+| Environment | Job | What it does | Pauses for approval? |
+|---|---|---|---|
+| `crates-io` | `crates-io / publish` | Uploads the workspace to crates.io | **Yes** |
+| `github-releases` | `publish` | Creates the GitHub Release and uploads assets | No: no required reviewers |
+| `docker` | `docker` | Pushes images to GHCR | No: no required reviewers |
 
-| Environment | Job | What it does |
-|---|---|---|
-| `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
-| `docker` | `docker` | Pushes images to GHCR |
-| `crates-io` | `crates-io / publish` | Uploads the workspace to crates.io |
+So expect exactly one **"Waiting for review"** banner, on `crates-io / publish`.
+The other two proceed unattended. That is a deliberate asymmetry: a GitHub
+Release can be deleted and a container tag can be overwritten, while a crates.io
+version can only be yanked. If you want the other two gated as well, add required
+reviewers to those environments in Settings, Environments; the runbook will then
+be wrong in the other direction, so update this table when you do.
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
