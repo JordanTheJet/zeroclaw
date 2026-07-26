@@ -371,13 +371,15 @@ These always require explicit Core Team votes.
 
 ### 5.3 Recording Team Membership
 
-Core Team membership is recorded in three places, none of which is a hand-maintained roster file:
+Membership itself is established by decision, not by any file or GitHub setting. Per §5.1, someone becomes Core Team by invitation from existing Core Team members, announced publicly in Discussions. That decision, and its public announcement, is the source of truth. Everything below is a record of something downstream of it, and none of them is a membership roster:
 
-**The `core-contributors` GitHub team** in the organization settings. This is the functional record, because team membership is what grants write access to the repository. Treat it as the authority on who is on the Core Team. Some people hold write access as direct repository collaborators rather than through the team, so the team roster and the collaborator list can differ; the collaborator list is the ground truth for access.
+**The `core-contributors` GitHub team** and the repository collaborator list, in the organization settings: **access controls**, not membership records. They answer who can write to the repository, which is a consequence of membership rather than a definition of it. Expect them to differ from the member list in both directions. They include automation accounts that are not people, and access can be granted directly, held from before a membership decision, or still pending acceptance of an invitation. When you need to know who can push, read these. When you need to know who is Core Team, read the announcement that admitted them.
 
-**`.github/CODEOWNERS`** at the repository root: the authoritative record of who reviews which paths. Changes to it require an explicit Core Team vote, per §5.2.
+**`.github/CODEOWNERS`** at the repository root: **review routing**, not membership. It records who is requested on which paths. Being listed does not confer membership and being a member does not imply being listed. Changes to it require an explicit Core Team vote, per §5.2.
 
-**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of who works on what. It is a convenience view over CODEOWNERS, and where the two disagree, CODEOWNERS wins.
+**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of current members and what each works on. It is the closest thing to a published roster, and it is maintained by hand, so treat it as a summary of admission decisions rather than as an authority. For focus areas it is a convenience view over CODEOWNERS, and where those two disagree, CODEOWNERS wins.
+
+Removals work the same way as admissions: they are decisions, recorded where they are made. Revoking access or removing someone from CODEOWNERS implements a departure; it does not by itself constitute one.
 
 Revisions 1 through 7 of this document specified a `CONTRIBUTORS.md` file at the repository root as a tier-organized membership record, and named `zeroclaw-core` and `zeroclaw-contributors` GitHub teams. None of the three was ever created; the organization uses a single `core-contributors` team instead. RFC #6808 reached the same finding independently, recording that the FND-003 team-tier structure is not the visible current routing model and that new lane rules should not be built on it. Those references are retired here rather than left standing as a description of machinery that does not exist.
 

@@ -57,7 +57,9 @@ Close the loop when a Discussion moves. Add a short summary and link to the issu
 
 ## Maintainer contacts
 
-Everyone below is Core Team, the Tier 3 role defined in [FND-003](../foundations/fnd-003-governance.md#5-team-tiers-and-contribution-authority). The Focus column describes where each person works, not how much authority they hold: Core Team is flat. Routine calls run on lazy consensus, and CODEOWNERS changes, releases, RFC outcomes, governance edits, and Core Team additions all require an explicit Core Team vote regardless of role. "Project lead" is a coordination and escalation role within Core Team, not a tier above it.
+Everyone below is Core Team, the Tier 3 role defined in [FND-003](../foundations/fnd-003-governance.md#5-team-tiers-and-contribution-authority). Membership comes from invitation and public announcement, per §5.1; this table is a published summary of those decisions, not the record that establishes them. Expect it to differ from the `core-contributors` GitHub team and the collaborator list, which are access controls rather than membership records: they include automation accounts, and access can be direct, inherited, or pending. See [§5.3](../foundations/fnd-003-governance.md#53-recording-team-membership) for which record answers which question.
+
+The Focus column describes where each person works, not how much authority they hold: Core Team is flat. Routine calls run on lazy consensus, and CODEOWNERS changes, releases, RFC outcomes, governance edits, and Core Team additions all require an explicit Core Team vote regardless of role. "Project lead" is a coordination and escalation role within Core Team, not a tier above it.
 
 | Handle | Role | Focus |
 |---|---|---|
