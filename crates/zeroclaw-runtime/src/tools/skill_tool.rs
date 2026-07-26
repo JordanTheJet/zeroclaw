@@ -1,6 +1,7 @@
 //! Shell-based tool derived from a skill's `[[tools]]` section.
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
+use crate::security::Sandbox;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -103,6 +104,12 @@ pub struct SkillShellTool {
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Sandbox applied to every spawned command.
+    ///
+    /// Skill tools run shell commands exactly as the shell tool does, so they
+    /// need the same OS-level confinement. Before this they spawned bare:
+    /// `wrap_command` had a single production call site, in the shell tool.
+    sandbox: Arc<dyn Sandbox>,
     /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
     /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
     timeout_secs: u64,
@@ -126,6 +133,25 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
+        Self::new_with_sandbox(
+            skill_name,
+            tool,
+            security,
+            runtime,
+            Arc::new(crate::security::NoopSandbox),
+        )
+    }
+
+    /// Construct with an explicit sandbox. Production builds pass the same
+    /// sandbox the shell tool receives; the no-sandbox constructors above exist
+    /// for tests and mirror `ShellTool::new`.
+    pub fn new_with_sandbox(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
@@ -133,6 +159,7 @@ impl SkillShellTool {
             args: tool.args.clone(),
             security,
             runtime,
+            sandbox,
             timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
@@ -191,8 +218,15 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Security validation — always requires explicit approval (approved=true)
-        // since skill tools are user-defined and should be treated as medium-risk.
+        // `approved = true` GRANTS approval, it does not require it: the
+        // medium-risk prompt under `Supervised` is skipped for skill commands.
+        // The justification is that a skill's command template is operator-
+        // authored at install time rather than model-authored per call, so the
+        // approval was given when the skill was installed. Note the model still
+        // supplies the *arguments* substituted into that template, and skill
+        // tools are not covered by `is_runtime_approved_arg_tool`, so unlike
+        // `shell` this value is not host-owned. Narrowing it means teaching the
+        // approval gate about dynamically-named tools.
         match self.security.validate_command_execution(&command, true) {
             Ok(_) => {}
             Err(reason) => {
@@ -227,6 +261,24 @@ impl Tool for SkillShellTool {
                 });
             }
         };
+        // Same confinement the shell tool applies, for the same reason: a
+        // static scan of a command string cannot bound what the spawned
+        // process touches, so the OS has to.
+        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "skill tool: sandbox wrap_command failed"
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Sandbox error: {e}")),
+            });
+        }
+
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -426,6 +478,63 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
     use zeroclaw_config::schema::DockerRuntimeConfig;
+
+    /// Records whether the tool asked the sandbox to wrap its command.
+    ///
+    /// A `NoopSandbox` cannot distinguish "wrapped with a no-op" from "never
+    /// wrapped at all", which is precisely the bug this guards: skill commands
+    /// previously spawned bare, and `wrap_command` had a single production
+    /// call site in the shell tool.
+    #[derive(Default)]
+    struct RecordingSandbox {
+        wrapped: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::security::traits::Sandbox for RecordingSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            self.wrapped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn description(&self) -> &str {
+            "test double that records wrap_command calls"
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_command_is_sandbox_wrapped_before_execution() {
+        // Permissive allowlist so the call reaches execution: this test is
+        // about whether the spawn is wrapped, not about command filtering.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let sandbox = Arc::new(RecordingSandbox::default());
+        let tool = SkillShellTool::new_with_sandbox(
+            "my_skill",
+            &sample_skill_tool(),
+            security,
+            Arc::new(crate::platform::NativeRuntime::new()),
+            sandbox.clone(),
+        );
+
+        let _ = tool
+            .execute(serde_json::json!({"file": "x.rs", "format": "json"}))
+            .await;
+
+        assert!(
+            sandbox.wrapped.load(std::sync::atomic::Ordering::SeqCst),
+            "skill commands must be sandbox-wrapped, as shell commands are"
+        );
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
