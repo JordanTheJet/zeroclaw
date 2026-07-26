@@ -25,6 +25,7 @@
 | 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
 | 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
 | 7 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions |
+| 8 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records |
 
 ---
 
@@ -315,7 +316,7 @@ Anyone. No approval required.
 
 Community members who have had at least two PRs merged into the `master` branch.
 
-*How to become one:* Have two PRs merged. A Core Team member adds you to the Contributors team in GitHub and to `CONTRIBUTORS.md`.
+*How to become one:* Have two PRs merged, recognized by a Core Team member. Tier 2 has no durable membership record today; see §5.3.
 
 *What they gain beyond Community:*
 - Can be assigned issues
@@ -370,11 +371,17 @@ These always require explicit Core Team votes.
 
 ### 5.3 Recording Team Membership
 
-Team membership is recorded in two places:
+Core Team membership is recorded in three places, none of which is a hand-maintained roster file:
 
-**`CONTRIBUTORS.md`** at the repository root: a public record of everyone who has contributed, organized by tier. Updated by Core Team members as contributors are recognized.
+**The `core-contributors` GitHub team** in the organization settings. This is the functional record, because team membership is what grants write access to the repository. Treat it as the authority on who is on the Core Team. Some people hold write access as direct repository collaborators rather than through the team, so the team roster and the collaborator list can differ; the collaborator list is the ground truth for access.
 
-**GitHub Teams** in the organization settings: `zeroclaw-core` and `zeroclaw-contributors` teams, referenced in CODEOWNERS and used for notification routing.
+**`.github/CODEOWNERS`** at the repository root: the authoritative record of who reviews which paths. Changes to it require an explicit Core Team vote, per §5.2.
+
+**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of who works on what. It is a convenience view over CODEOWNERS, and where the two disagree, CODEOWNERS wins.
+
+Revisions 1 through 7 of this document specified a `CONTRIBUTORS.md` file at the repository root as a tier-organized membership record, and named `zeroclaw-core` and `zeroclaw-contributors` GitHub teams. None of the three was ever created; the organization uses a single `core-contributors` team instead. RFC #6808 reached the same finding independently, recording that the FND-003 team-tier structure is not the visible current routing model and that new lane rules should not be built on it. Those references are retired here rather than left standing as a description of machinery that does not exist.
+
+Tier 2 has no durable membership record at present. Establishing one, or retiring the tier, is an open question for the team.
 
 ---
 
@@ -384,7 +391,7 @@ Team membership is recorded in two places:
 
 The `CODEOWNERS` file makes governance automatic. It defines which paths require review from which team before a PR can merge. GitHub enforces this as a required review: the PR cannot be merged until the requirement is satisfied.
 
-Create `.github/CODEOWNERS`:
+The block below is the original illustrative proposal, kept for the reasoning it shows about routing by risk tier. It is not the current file and should not be copied. `.github/CODEOWNERS` already exists and is actively maintained; it routes to individual handles rather than team handles, and its paths follow the post-microkernel crate layout established in #6537. The `@zeroclaw-labs/zeroclaw-core` and `@zeroclaw-labs/zeroclaw-contributors` handles used here were never created; see §5.3. Read the live file for current routing.
 
 ```
 # CODEOWNERS — Automatic review routing by risk tier
@@ -801,10 +808,9 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 - [ ] Populate the Backlog with deliverables from the documentation standards RFC
 - [ ] Conduct the first formal RFC votes on the three existing proposals
 - [ ] Complete the selected foundational ADR set (ADR-001 through ADR-007 per the docs RFC)
-- [ ] Add the `CONTRIBUTORS.md` file with current team members in their tiers
 - [ ] Implement the auto-label by path Actions workflow
 - [ ] Implement the stale issue management workflow
-- [ ] Create the `zeroclaw-core` and `zeroclaw-contributors` GitHub Teams
+- [x] Create the Core Team GitHub team, shipped as a single `core-contributors` team rather than the two originally planned. The `CONTRIBUTORS.md` roster item that sat alongside it is retired; see §5.3.
 
 **Success signal:** The team is using the board daily. Items move through stages with visible gate checks. The RFC for the microkernel architecture has a recorded vote outcome.
 
