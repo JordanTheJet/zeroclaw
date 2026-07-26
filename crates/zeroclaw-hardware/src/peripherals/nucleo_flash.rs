@@ -28,12 +28,24 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         );
     }
 
-    // CARGO_MANIFEST_DIR = repo root (zeroclaw's Cargo.toml)
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let firmware_dir = repo_root.join("firmware").join("nucleo");
+    // CARGO_MANIFEST_DIR is this crate's directory; `firmware` is a symlink from
+    // it to the repo-root firmware tree, so this resolves to firmware/nucleo in a
+    // source checkout.
+    //
+    // It is deliberately absent from the published crate: firmware/nucleo is its
+    // own cargo project, which `cargo package` excludes as a nested package, and
+    // flashing shells out to `cargo build` for an embedded target anyway. Bundling
+    // it would ship a second crate's sources and still need a toolchain the user
+    // may not have — so a crates.io install reports the gap instead.
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let firmware_dir = crate_dir.join("firmware").join("nucleo");
     if !firmware_dir.join("Cargo.toml").exists() {
         anyhow::bail!(
-            "Nucleo firmware not found at {}. Run from zeroclaw repo root.",
+            "Nucleo firmware sources not found at {}.\n\
+             Flashing builds the firmware from source, which needs the ZeroClaw \
+             repository — the published crate does not carry it.\n\
+             Clone https://github.com/zeroclaw-labs/zeroclaw and run this command \
+             from the repository root.",
             firmware_dir.display()
         );
     }

@@ -135,10 +135,18 @@ authoritative automation.
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
 | `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
+| `CARGO_REGISTRY_TOKEN` | `pub-crates.yml`; crates.io token scoped to the `zeroclaw*` crates. The first release needs **`publish-new`** (16 of the 18 crates do not exist on crates.io yet); once every crate exists, `publish-update` alone suffices |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
-Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. The release pipeline does not publish to crates.io, so no `CARGO_REGISTRY_TOKEN` is required.
+Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token.
+
+`CARGO_REGISTRY_TOKEN` is read only by the `publish` job in `pub-crates.yml`,
+which sits behind the `crates-io` environment gate. The preflight job that
+packages and compiles every crate runs without it, so a dry run can never reach
+the registry. Scope the token to this project's crates rather than minting an
+account-wide one: a crates.io version can be yanked but never replaced, so a
+leaked broad token is not recoverable by re-publishing.
 
 The organization currently disables deploy keys on the Scoop bucket, and the
 automatic `GITHUB_TOKEN` cannot write another repository. Keep

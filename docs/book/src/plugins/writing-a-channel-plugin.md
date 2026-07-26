@@ -253,8 +253,16 @@ capability-gated dispatch, and poll-health accounting.
 
 To run your own component under those exact semantics, write an integration
 test that instantiates it through the real host adapter. `zeroclaw-plugins`
-is not published to crates.io, so pull it as a git dev-dependency pinned to
-the tag matching your target host:
+publishes to crates.io as of v0.8.4, so add it as a dev-dependency at the
+version matching your target host:
+
+```bash
+cargo add --dev zeroclaw-plugins@<host-version> \
+  --no-default-features --features plugins-wasm-cranelift
+```
+
+To test against an unreleased host, pin a git dev-dependency to the tag
+instead:
 
 ```bash
 cargo add --dev zeroclaw-plugins \

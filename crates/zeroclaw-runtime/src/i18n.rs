@@ -16,7 +16,11 @@ static LOCALE: OnceLock<String> = OnceLock::new();
 /// `locales/list` handler) get a long-lived reference with no runtime file I/O.
 static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
 
-const LOCALES_TOML: &str = include_str!("../../../locales.toml");
+// Read through `../locales.toml`, a symlink to the repo-root registry that
+// xtask owns. The indirection is what makes this crate publishable: `cargo
+// package` archives only files under the crate root, so including the repo-root
+// path directly produced a tarball that could not compile.
+const LOCALES_TOML: &str = include_str!("../locales.toml");
 
 /// One selectable locale: its `code` (e.g. `ja`) and display `label`
 /// (e.g. `日本語`).

@@ -8,7 +8,12 @@ static TOOL_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static TOOL_FTL_SOURCES: OnceLock<ToolFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
-const EN_TOOLS_FTL: &str = include_str!("../../zeroclaw-runtime/locales/en/tools.ftl");
+// Read through `locales/en/tools.ftl`, a symlink into the canonical tree at
+// `crates/zeroclaw-runtime/locales` that xtask's fluent tooling owns. The
+// indirection is what makes this crate publishable: `cargo package` archives
+// only files under the crate root, so including the sibling crate's path
+// directly produced a tarball that could not compile.
+const EN_TOOLS_FTL: &str = include_str!("../locales/en/tools.ftl");
 
 struct ToolFtlSources {
     locale: String,

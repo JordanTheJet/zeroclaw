@@ -40,15 +40,21 @@ Homebrew-on-Linux installs follow Homebrew's service path convention, your works
 
 A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
 
-### A note on `cargo binstall` and `nix run`
+### A note on `cargo install`, `cargo binstall`, and `nix run`
 
-Neither works yet. `cargo binstall zeroclaw` resolves crate metadata from
-crates.io, but ZeroClaw is not published there (`publish = false`), so there is
-nothing for it to fetch; `nix run github:zeroclaw-labs/zeroclaw` does not launch
-the agent because the flake exposes only a dev toolchain, not a runnable package
-([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)). `install.sh`
-already does what `binstall` would (download a prebuilt release binary), so it
-remains the supported one-liner.
+`cargo install zeroclaw --locked` builds from source and works — the workspace
+publishes to crates.io as of v0.8.4. Expect a long compile; `install.sh`
+downloads a prebuilt binary and remains the faster path.
+
+One caveat applies to a crates.io build: the `whatsapp-web` feature resolves the
+WhatsApp stack from released crates.io versions rather than the git revision this
+repository pins, so build from the repository if you need that channel.
+
+`cargo binstall zeroclaw` still does not work: it looks for prebuilt artifacts
+named to its own convention, which the release does not publish.
+`nix run github:zeroclaw-labs/zeroclaw` does not launch the agent because the
+flake exposes only a dev toolchain, not a runnable package
+([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)).
 
 ## System dependencies
 

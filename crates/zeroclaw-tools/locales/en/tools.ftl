@@ -1,0 +1,1 @@
+../../../zeroclaw-runtime/locales/en/tools.ftl

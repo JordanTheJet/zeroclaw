@@ -268,12 +268,11 @@ All application crates, the kernel, the gateway, tool plugin crates, channel plu
 - It reflects ZeroClaw's identity as a **product**, not a library ecosystem
 - The WIT interface version, not the Rust crate version, is the actual plugin ABI contract (see §5.2)
 
-Three crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
+Two crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
 
 | Crate | Reason for independence |
 |---|---|
 | `zeroclaw-api` | Starts at `0.1.0`; its `1.0.0` release is a formal milestone deliverable of v1.0.0, signalling a stable Rust trait surface for plugin SDK authors |
-| `aardvark-sys`, `zeroclaw-robot-kit` | Hardware library crates with their own user audiences and maintenance cadences; not application components |
 | WIT interface files (`wit/*.wit`) | Versioned via `@since` and `@unstable` annotations per the WASI component model spec; these are the primary plugin ABI contract and are independent of Cargo semver entirely |
 
 ---

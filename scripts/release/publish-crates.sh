@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# publish-crates.sh: publish the ZeroClaw workspace to crates.io.
+#
+# Usage:
+#   scripts/release/publish-crates.sh                 # dry run (default, safe)
+#   scripts/release/publish-crates.sh --execute       # real publish
+#   scripts/release/publish-crates.sh --execute 0.8.4 # real publish, assert version
+#
+# Publishing is IRREVERSIBLE: a crates.io version can be yanked but never
+# replaced or deleted. The default is therefore a dry run; the real publish
+# requires an explicit --execute.
+#
+# The dry run uses `cargo publish --workspace --dry-run`, which packages and
+# compiles every crate from its own tarball. The real publish does NOT use
+# --workspace: it walks the crates one at a time in dependency order so the run
+# can be paced against crates.io's rate limits and can demonstrably resume after
+# a partial failure. See the comment above the publish loop.
+#
+# What this adds over cargo alone:
+#
+#   1. every publishable crate carries the same version as [workspace.package]
+#   2. which crates are already on crates.io, queried before anything uploads,
+#      so a re-run skips them without relying on cargo's behaviour
+#   3. no publishable crate depends on an unpublishable workspace crate
+#   4. CARGO_REGISTRY_TOKEN is present before anything irreversible starts
+#
+# The set of crates and their order are derived from `cargo metadata` — never
+# hardcoded here, so they cannot drift from the manifests.
+# tests/architecture/publish_contract.rs asserts the same invariants in CI.
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+EXECUTE=0
+EXPECTED_VERSION=""
+for arg in "$@"; do
+  case "$arg" in
+    --execute) EXECUTE=1 ;;
+    --dry-run) EXECUTE=0 ;;
+    -h | --help)
+      sed -n '3,28p' "$0"
+      exit 0
+      ;;
+    -*)
+      echo "error: unknown flag: $arg" >&2
+      exit 2
+      ;;
+    *) EXPECTED_VERSION="$arg" ;;
+  esac
+done
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: $1 is required" >&2
+    exit 1
+  }
+}
+need cargo
+need jq
+need curl
+need python3
+
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: [workspace.package] version is not a stable semver: '$VERSION'" >&2
+  exit 1
+fi
+if [[ -n "$EXPECTED_VERSION" && "$VERSION" != "$EXPECTED_VERSION" ]]; then
+  echo "error: workspace version is $VERSION but $EXPECTED_VERSION was requested." >&2
+  echo "       Run scripts/release/bump-version.sh first." >&2
+  exit 1
+fi
+
+META="$(cargo metadata --format-version 1 --no-deps)"
+
+# `publish` is null when unrestricted (publishable) and [] when publish = false.
+# Built with a read loop rather than `mapfile`, which macOS's bash 3.2 lacks —
+# maintainers dry-run this locally before triggering the release workflow.
+PUBLISHABLE=()
+PRIVATE=()
+while IFS= read -r name; do
+  [[ -n "$name" ]] && PUBLISHABLE+=("$name")
+done < <(jq -r '.packages[] | select(.publish == null) | .name' <<<"$META" | sort)
+while IFS= read -r name; do
+  [[ -n "$name" ]] && PRIVATE+=("$name")
+done < <(jq -r '.packages[] | select(.publish != null) | .name' <<<"$META" | sort)
+
+if [[ ${#PUBLISHABLE[@]} -eq 0 ]]; then
+  echo "error: no publishable crates found — every manifest has publish = false." >&2
+  exit 1
+fi
+
+echo "ZeroClaw crates.io publish"
+echo "  version:      $VERSION"
+echo "  mode:         $([[ $EXECUTE -eq 1 ]] && echo 'EXECUTE (irreversible)' || echo 'dry run')"
+echo "  publishable:  ${#PUBLISHABLE[@]} crates"
+echo "  private:      ${#PRIVATE[@]} crates (${PRIVATE[*]})"
+echo
+
+# ── Preflight 1: every publishable crate is at the workspace version ────────
+mismatched=0
+while IFS=$'\t' read -r name ver; do
+  if [[ "$ver" != "$VERSION" ]]; then
+    echo "error: $name is at $ver, expected $VERSION" >&2
+    mismatched=1
+  fi
+done < <(jq -r '.packages[] | select(.publish == null) | [.name, .version] | @tsv' <<<"$META")
+if [[ $mismatched -eq 1 ]]; then
+  echo "       Run scripts/release/bump-version.sh to sync versions." >&2
+  exit 1
+fi
+
+# ── Preflight 2: no publishable crate depends on a private one ──────────────
+# cargo only reports this once it reaches the offending crate, which can be
+# after several irreversible uploads have already succeeded.
+leaks="$(jq -r --argjson priv "$(printf '%s\n' "${PRIVATE[@]}" | jq -R . | jq -s .)" '
+  [ .packages[]
+    | select(.publish == null) as $p
+    | $p.dependencies[]
+    | select(.kind == null)
+    | select(.name as $n | $priv | index($n))
+    | "\($p.name) -> \(.name)"
+  ] | unique | .[]' <<<"$META")"
+if [[ -n "$leaks" ]]; then
+  echo "error: publishable crates depend on unpublishable workspace crates:" >&2
+  while IFS= read -r leak; do
+    echo "       $leak" >&2
+  done <<<"$leaks"
+  echo "       Either publish the dependency or drop the edge." >&2
+  exit 1
+fi
+
+# ── Preflight 3: which crates are already on crates.io at this version ──────
+# This is what makes a re-run resumable: the publish loop below skips exactly
+# what this query found, rather than trusting cargo to do it.
+already=()
+todo=()
+for crate in "${PUBLISHABLE[@]}"; do
+  crate_version="$VERSION"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "User-Agent: zeroclaw-release (https://github.com/zeroclaw-labs/zeroclaw)" \
+    "https://crates.io/api/v1/crates/${crate}/${crate_version}" || echo 000)"
+  case "$code" in
+    200) already+=("${crate}@${crate_version}") ;;
+    404) todo+=("${crate}@${crate_version}") ;;
+    *)
+      echo "error: crates.io returned HTTP $code for ${crate}/${crate_version}; refusing to guess." >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ${#already[@]} -gt 0 ]]; then
+  echo "Already on crates.io (will be skipped):"
+  printf '  %s\n' "${already[@]}"
+  echo
+fi
+if [[ ${#todo[@]} -eq 0 ]]; then
+  echo "Nothing to publish — every crate is already at $VERSION on crates.io."
+  exit 0
+fi
+echo "To publish:"
+printf '  %s\n' "${todo[@]}"
+echo
+
+# ── Preflight 4: token present before anything irreversible starts ──────────
+# Scope matters: a crate that does not yet exist needs `publish-new`.
+# `publish-update` alone is enough only once every crate has been created.
+if [[ $EXECUTE -eq 1 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+  echo "error: CARGO_REGISTRY_TOKEN is required for --execute." >&2
+  echo "       Mint one at https://crates.io/settings/tokens." >&2
+  echo "       First publish of a new crate needs the 'publish-new' scope;" >&2
+  echo "       subsequent version bumps need 'publish-update'." >&2
+  exit 1
+fi
+
+if [[ $EXECUTE -eq 0 ]]; then
+  echo "── Dry run: packaging and verifying every crate (no upload) ──"
+  # `--workspace --dry-run` verifies default features only. Feature-gated code
+  # that reaches outside its crate directory therefore passes here and fails
+  # from the tarball; tests/architecture/publish_contract.rs is what catches
+  # that class, so it is not duplicated here.
+  cargo publish --workspace --dry-run --locked
+  echo
+  echo "Dry run OK. Re-run with --execute to publish for real."
+  exit 0
+fi
+
+# ── Publish, one crate at a time, in dependency order ───────────────────────
+# Deliberately NOT `cargo publish --workspace`. Two reasons, both about what
+# happens when a run dies partway through an irreversible sequence:
+#
+#   * Resumability must not rest on an assumption about how cargo treats a
+#     version already in the index. Skipping is decided here, from the crates.io
+#     query above, so a re-run demonstrably continues instead of restarting.
+#   * crates.io rate-limits the creation of *new* crates far harder than new
+#     versions (a small burst, then roughly one per 10 minutes). Publishing
+#     sequentially lets the run pace itself and report exactly where it stopped.
+#
+# PUBLISH_DELAY_SECONDS paces the loop; raise it if crates.io starts 429ing, or
+# request a limit increase from the crates.io team before a large first publish.
+DELAY="${PUBLISH_DELAY_SECONDS:-15}"
+
+# Topological order over the publishable set, so each crate's dependencies are
+# already on the registry when it uploads. Derived from cargo metadata, never
+# hand-maintained.
+ORDER="$(python3 - "$META" <<'PY'
+import json, sys
+meta = json.loads(sys.argv[1])
+pkgs = {p["name"]: p for p in meta["packages"]}
+pub = {n for n, p in pkgs.items() if p["publish"] is None}
+deps = {
+    n: sorted({d["name"] for d in p["dependencies"]
+               if d["name"] in pub and d["kind"] in (None, "build")})
+    for n, p in pkgs.items()
+}
+order, state = [], {}
+def visit(n, trail=()):
+    if state.get(n) == "done":
+        return
+    if state.get(n) == "visiting":
+        sys.exit("dependency cycle: " + " -> ".join(trail + (n,)))
+    state[n] = "visiting"
+    for d in deps[n]:
+        visit(d, trail + (n,))
+    state[n] = "done"
+    order.append(n)
+for n in sorted(pub):
+    visit(n)
+print("\n".join(order))
+PY
+)" || {
+  echo "error: could not compute publish order." >&2
+  exit 1
+}
+
+published=0
+skipped=0
+echo "── Publishing to crates.io (IRREVERSIBLE) ──"
+echo "   pacing: ${DELAY}s between uploads"
+echo
+for crate in $ORDER; do
+  # `${arr[@]+...}` guards the empty-array expansion, which is an unbound-variable
+  # error under `set -u` on macOS's bash 3.2.
+  if printf '%s\n' ${already[@]+"${already[@]}"} | grep -qx "${crate}@${VERSION}"; then
+    echo "skip  ${crate} ${VERSION} (already on crates.io)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  echo "publish ${crate} ${VERSION}"
+  # `--no-verify`: the preflight job already ran a full verifying dry run over
+  # this exact tree, building every crate from its own tarball. Re-verifying all
+  # 18 here would add ~40 minutes inside a rate-limited window, and a timeout
+  # midway through an irreversible sequence is the worst outcome available.
+  if ! cargo publish -p "$crate" --locked --no-verify; then
+    echo >&2
+    echo "error: publishing ${crate} failed." >&2
+    echo "       ${published} crate(s) uploaded before this point and CANNOT be undone." >&2
+    echo "       Fix the cause and re-run this script; it will skip what already landed." >&2
+    echo "       If crates.io returned a rate-limit error, wait and re-run — the limit on" >&2
+    echo "       creating new crates is roughly one per 10 minutes." >&2
+    exit 1
+  fi
+  published=$((published + 1))
+  sleep "$DELAY"
+done
+
+echo
+echo "Published ${published} crate(s) at ${VERSION}; skipped ${skipped} already present."
+echo "Verify: cargo install zeroclaw --version $VERSION --locked"

@@ -18,15 +18,19 @@ Last verified against the `v0.8.2` release cycle.
 2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
 3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
 4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
-5. [Approve the two environment gates when prompted](#step-5-approve-the-environment-gates)
+5. [Approve the three environment gates when prompted](#step-5-approve-the-environment-gates)
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
 That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
-detects the stable GitHub release through its own autobump service. You do not
-need to do anything for those unless a job explicitly fails or Homebrew's
+AUR, crates.io, Discord, tweet) runs automatically as downstream jobs. Homebrew
+Core detects the stable GitHub release through its own autobump service. You do
+not need to do anything for those unless a job explicitly fails or Homebrew's
 external bump remains stale.
+
+The one downstream job that needs your judgement rather than just your approval
+is crates.io: it is the only step in the release that cannot be undone. Step 5
+covers what to check before approving it.
 
 ---
 
@@ -301,7 +305,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`publish`, `docker`): the
+- Environment-gated jobs (`publish`, `docker`, `crates-io / publish`): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -309,6 +313,33 @@ Everything else, a `tsc` error, a missing file, a Rust compile
 failure, a `cargo` lockfile mismatch, is a real defect. Do not click
 **Run workflow** on the GitHub Actions form until those are fixed via a
 standard PR off master.
+
+### Dry-run the crates.io publish directly
+
+The crates.io preflight needs no `act` and no token — run it against your
+working tree:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+./scripts/release/publish-crates.sh
+```
+
+</div>
+
+It reports which crates are publishable, which are already on crates.io at this
+version, and which would be uploaded, then packages each one and compiles it
+from its own tarball. That last part is the whole point: a crate can build fine
+in the workspace and still fail from its tarball, because `cargo package`
+archives only files under the crate root. Both defects this catches — an
+`include_str!` reaching into a sibling crate, and a git dependency with no
+`version` — are invisible to `cargo build`.
+
+Budget 10-20 minutes for a cold run and several GB of disk; it compiles the
+workspace once per crate. Nothing here can reach crates.io: the upload requires
+an explicit `--execute`, which CI passes only after the environment gate.
 
 ---
 
@@ -335,18 +366,37 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Two jobs are gated by GitHub environment protection rules. When each becomes
+Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve both when they appear:
+Approve each when it appears:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
 | `docker` | `docker` | Pushes images to GHCR |
+| `crates-io` | `crates-io / publish` | Uploads the workspace to crates.io |
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
+
+**Treat the `crates-io` gate differently from the other two.** A GitHub Release
+can be deleted and a container tag can be overwritten, but a crates.io version
+can only be yanked — never replaced or reused. Before approving, open the
+`crates-io / preflight` job that has already run: it packaged every crate and
+compiled each one from its own tarball. If preflight is green the upload is
+mechanical; if it is red, do not approve — fix the manifest and re-run.
+
+Eighteen crates publish in dependency order, with `zeroclaw` last. A failure
+partway through leaves the earlier crates published; that is recoverable, see
+[If something goes wrong](#if-something-goes-wrong).
+
+**The first release is the slow one.** Sixteen of the eighteen crates do not yet
+exist on crates.io, and crates.io rate-limits *creating* a crate far harder than
+publishing a new version of one — a small burst, then roughly one per ten
+minutes. Expect the first run to pace itself or stop partway with a rate-limit
+error; re-running resumes from where it stopped. To avoid that entirely, ask the
+crates.io team for a temporary limit increase before the first publish.
 
 ---
 
@@ -363,6 +413,8 @@ Once `publish` completes, confirm:
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
+[ ] crates.io shows the new version at https://crates.io/crates/zeroclaw
+[ ] `cargo install zeroclaw --version X.Y.Z --locked` succeeds from a clean machine
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the
@@ -478,6 +530,26 @@ manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
 failed distribution job does not invalidate the release itself.
 
+**The crates.io publish failed partway through:** Some crates uploaded and the
+rest did not. Do not bump the version to work around it — the published crates
+are already at this version and cannot be replaced.
+
+Fix the underlying problem, then re-run `pub-crates.yml` for the same tag.
+`publish-crates.sh` queries crates.io for every crate before uploading anything
+and reports which are already present, and `cargo publish --workspace` skips
+those, so a re-run resumes rather than restarts. Re-run with `dry_run: true`
+first to see the resume plan.
+
+If the fix needs a code change, the tag has already shipped: land the fix on
+master, cut the next patch version, and yank the partial set with
+`cargo yank --vers X.Y.Z <crate>` so nobody resolves a half-published version.
+Yanking does not break existing lockfiles that already reference it.
+
+**A crate was published that should not have been:** Yank it
+(`cargo yank --vers X.Y.Z <crate>`). Yanking is the only lever — crates.io has
+no delete. Deletion requires a support request and is reserved for genuine
+emergencies such as leaked secrets.
+
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump
 path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
@@ -498,6 +570,16 @@ block it:
 | `version-sync.yml` | Committed directly to master as a bot, bypassing review |
 | `checks-on-pr.yml` | Duplicate CI: produced confusing conflicting status |
 | `pre-release-validate.yml` | Unused generated checklist; this runbook replaces it |
+
+`pub-crates.yml` is **not** a return of `publish-crates-auto.yml`. What made the
+old workflow unacceptable was that a version change alone triggered an
+irreversible upload, with no human in the loop. The replacement never fires on a
+version change: it runs only as a downstream job of a manually dispatched
+release (or by explicit `workflow_dispatch`, where `dry_run` defaults to true),
+it packages and compiles every crate in a token-less preflight job first, and
+the upload itself waits on the `crates-io` environment gate. If a PR proposes
+publishing on push, on merge, or without the gate, that *is* the regression the
+table above is warning about.
 
 The full inventory of the workflows that remain (automatic and manual) lives
 in [CI & Actions](./ci-and-actions.md).

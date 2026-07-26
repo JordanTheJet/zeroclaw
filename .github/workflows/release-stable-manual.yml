@@ -1213,6 +1213,21 @@ jobs:
       dry_run: false
     secrets: inherit
 
+  # Unlike Scoop and AUR, a crates.io publish cannot be re-run or corrected — a
+  # version can be yanked but never replaced. The called workflow therefore runs
+  # a full package-and-compile preflight first and puts the upload itself behind
+  # the `crates-io` environment gate, so approval happens with a green dry run
+  # already visible. Failure here does not invalidate the GitHub release.
+  crates-io:
+    name: Publish to crates.io
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
   # ── Post-publish: announce after release + website are live ───────────
   # Docker push can be slow; don't let it block announcements.
   tweet:

@@ -193,7 +193,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \
@@ -279,7 +279,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         --target "$TARGET" \
         --no-default-features \
         --features "${ZEROCLAW_FEATURES}" \
-        -p zeroclawlabs
+        -p zeroclaw
 
     # Release build — zerocode (TUI config manager)
     CARGO_TARGET_DIR=/target \
