@@ -233,18 +233,22 @@ fi
 #     versions (a small burst, then roughly one per 10 minutes). Publishing
 #     sequentially lets the run pace itself and report exactly where it stopped.
 #
-# Two cadences, because the limits differ by roughly two orders of magnitude.
-# A new version of an existing crate is cheap; creating a crate that does not
-# exist yet is documented at about one per 10 minutes after a small burst.
-# Pacing everything at the fast cadence 429s partway through a first-time
-# workspace publish, which is exactly the run we least want to babysit.
+# Pacing is REACTIVE, not pre-emptive, and the difference decides whether the
+# job finishes. crates.io allows a burst of new crates before it starts
+# throttling, so sleeping the full throttle interval after every creation pays
+# the worst-case cost even when we are nowhere near the limit: 16 creations at
+# ~10 minutes each is 165 minutes of pure sleep, which alone exceeds a sensible
+# job timeout before a single byte is uploaded.
 #
-# Override either when crates.io has granted a temporary limit increase.
-DELAY="${PUBLISH_DELAY_SECONDS:-15}"
-CREATE_DELAY="${PUBLISH_CREATE_DELAY_SECONDS:-620}"
-# 429 is throttling, not failure. Wait and retry rather than aborting a sequence
-# that cannot be rolled back.
-MAX_RETRIES="${PUBLISH_MAX_RETRIES:-6}"
+# So: publish immediately, and back off only when crates.io actually says 429.
+# Fast when we have headroom, patient exactly when we do not.
+DELAY="${PUBLISH_DELAY_SECONDS:-5}"
+# How long to wait after being throttled. crates.io documents new-crate creation
+# at roughly one per 10 minutes; 620s clears that with a margin.
+THROTTLE_BACKOFF="${PUBLISH_THROTTLE_BACKOFF_SECONDS:-620}"
+# Retries are the mechanism that gets a 16-crate first publish through, so this
+# has to be generous enough to cover every creation past the burst allowance.
+MAX_RETRIES="${PUBLISH_MAX_RETRIES:-20}"
 
 is_creation() {
   local needle="$1" c
@@ -291,7 +295,7 @@ published=0
 skipped=0
 echo "── Publishing to crates.io (IRREVERSIBLE) ──"
 echo "   ${#todo[@]} to publish, ${#creations[@]} of them new crates"
-echo "   pacing: ${DELAY}s between versions, ${CREATE_DELAY}s after creating a crate"
+echo "   pacing: ${DELAY}s between uploads, ${THROTTLE_BACKOFF}s backoff when throttled"
 echo
 for crate in $ORDER; do
   # `${arr[@]+...}` guards the empty-array expansion, which is an unbound-variable
@@ -303,11 +307,7 @@ for crate in $ORDER; do
   fi
 
   creating=0
-  pause="$DELAY"
-  if is_creation "$crate"; then
-    creating=1
-    pause="$CREATE_DELAY"
-  fi
+  is_creation "$crate" && creating=1
   echo "publish ${crate} ${VERSION}$([[ $creating -eq 1 ]] && echo ' (new crate)')"
 
   # `--no-verify`: the preflight job already ran a full verifying dry run over
@@ -323,9 +323,8 @@ for crate in $ORDER; do
     # Throttling is not failure. Back off and retry rather than abandoning a
     # sequence that cannot be rolled back.
     if grep -qiE '429|too many requests|rate limit' "$log" && [[ $attempt -lt $MAX_RETRIES ]]; then
-      wait_for="$CREATE_DELAY"
-      echo "  rate-limited by crates.io; waiting ${wait_for}s then retrying (${attempt}/${MAX_RETRIES})"
-      sleep "$wait_for"
+      echo "  rate-limited by crates.io; waiting ${THROTTLE_BACKOFF}s then retrying (${attempt}/${MAX_RETRIES})"
+      sleep "$THROTTLE_BACKOFF"
       attempt=$((attempt + 1))
       continue
     fi
@@ -339,7 +338,7 @@ for crate in $ORDER; do
   rm -f "$log"
 
   published=$((published + 1))
-  sleep "$pause"
+  sleep "$DELAY"
 done
 
 echo
