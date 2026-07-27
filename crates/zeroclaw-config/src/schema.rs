@@ -22518,13 +22518,39 @@ mod tests {
     /// `usize` cannot express.
     #[::core::prelude::v1::test]
     fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
-        let cfg = super::Config::default();
-        // Nothing configured — the honest answer is "unknown", not a number.
-        assert_eq!(cfg.configured_model_context_window("absent"), None);
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .model = Some("qwen3".to_string());
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        );
+
+        // A real referenced profile without a declaration is honestly
+        // unknown, while budget arithmetic retains its historical operand.
+        assert_eq!(cfg.configured_model_context_window("coder"), None);
         // Budget arithmetic still gets an operand, unchanged from before.
         assert_eq!(
-            cfg.effective_model_context_window("absent"),
+            cfg.effective_model_context_window("coder"),
             super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // Explicitly configuring the same numeric value remains distinguishable
+        // from the fallback.
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+        assert_eq!(
+            cfg.configured_model_context_window("coder"),
+            Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
         );
     }
 

@@ -930,6 +930,9 @@ cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しま
 cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
 cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン
+cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
+cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
