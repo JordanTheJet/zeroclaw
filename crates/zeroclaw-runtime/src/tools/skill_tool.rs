@@ -42,6 +42,10 @@ const SAFE_ENV_VARS: &[&str] = &[
 
 const MAX_TOOL_NAME_LEN: usize = 64;
 
+/// Reserved argument name carrying the host's approval verdict. A skill cannot
+/// use it for a template placeholder.
+const APPROVED_ARG: &str = "approved";
+
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
@@ -169,6 +173,9 @@ impl SkillShellTool {
         let mut required = Vec::new();
 
         for (name, description) in &self.args {
+            if name == APPROVED_ARG {
+                continue;
+            }
             properties.insert(
                 name.clone(),
                 serde_json::json!({
@@ -179,6 +186,19 @@ impl SkillShellTool {
             required.push(serde_json::Value::String(name.clone()));
         }
 
+        // Declaring this is what puts the decision in the host's hands: the
+        // runtime overwrites whatever the model sends with the approval gate's
+        // verdict. Optional, so a skill that never hits a gated command is
+        // unaffected. `approved` is therefore a reserved argument name.
+        properties.insert(
+            APPROVED_ARG.to_string(),
+            serde_json::json!({
+                "type": "boolean",
+                "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
+                "default": false
+            }),
+        );
+
         serde_json::json!({
             "type": "object",
             "properties": properties,
@@ -188,14 +208,22 @@ impl SkillShellTool {
 
     /// Substitute `{{arg_name}}` placeholders in the command template with
     /// the provided argument values. Unknown placeholders are left as-is.
+    ///
+    /// Driven by the *declared* arguments, so an extra key the model invents —
+    /// including the reserved `approved` — cannot reach the command string.
     fn substitute_args(&self, args: &serde_json::Value) -> String {
         let mut command = self.command_template.clone();
-        if let Some(obj) = args.as_object() {
-            for (key, value) in obj {
-                let placeholder = format!("{{{{{}}}}}", key);
-                let replacement = value.as_str().unwrap_or_default();
-                command = command.replace(&placeholder, replacement);
+        let Some(obj) = args.as_object() else {
+            return command;
+        };
+        for name in self.args.keys() {
+            if name == APPROVED_ARG {
+                continue;
             }
+            let Some(value) = obj.get(name).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            command = command.replace(&format!("{{{{{name}}}}}"), value);
         }
         command
     }
@@ -218,16 +246,20 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // `approved = true` GRANTS approval, it does not require it: the
-        // medium-risk prompt under `Supervised` is skipped for skill commands.
-        // The justification is that a skill's command template is operator-
-        // authored at install time rather than model-authored per call, so the
-        // approval was given when the skill was installed. Note the model still
-        // supplies the *arguments* substituted into that template, and skill
-        // tools are not covered by `is_runtime_approved_arg_tool`, so unlike
-        // `shell` this value is not host-owned. Narrowing it means teaching the
-        // approval gate about dynamically-named tools.
-        match self.security.validate_command_execution(&command, true) {
+        // `approved` GRANTS approval, it does not request it. The runtime
+        // overwrites it with the approval gate's verdict before this runs, so
+        // the value here is the host's, never the model's. This used to be
+        // hardcoded `true` on the theory that a skill's command template is
+        // operator-authored at install time — but skills load from the agent's
+        // own workspace, and on a surface with no approval manager (a delegated
+        // subagent) that let a `locked_down` agent run a medium-risk command
+        // through a skill that `shell` would have refused.
+        let approved = args
+            .get(APPROVED_ARG)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -544,6 +576,88 @@ mod tests {
         })
     }
 
+    /// Supervised, medium-risk gated: the posture where `shell` prompts.
+    fn supervised_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["mkdir".to_string()],
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn medium_risk_skill_tool() -> SkillTool {
+        SkillTool {
+            name: "make_dir".to_string(),
+            description: "Create a directory".to_string(),
+            kind: "shell".to_string(),
+            command: "mkdir {{dir}}".to_string(),
+            args: HashMap::from([("dir".to_string(), "directory to create".to_string())]),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_refuses_a_gated_command_without_host_approval() {
+        let tool = SkillShellTool::new("s", &medium_risk_skill_tool(), supervised_security());
+
+        let result = tool
+            .execute(serde_json::json!({"dir": "some-new-dir"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requires explicit approval"),
+            "an unapproved medium-risk command must be refused, as `shell` refuses it: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_runs_a_gated_command_once_the_host_approves() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..(*supervised_security()).clone()
+        });
+        let tool = SkillShellTool::new("s", &medium_risk_skill_tool(), security);
+
+        let result = tool
+            .execute(serde_json::json!({"dir": "some-new-dir", "approved": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "the host's approval must carry through: {:?}",
+            result.error
+        );
+        assert!(workspace.path().join("some-new-dir").is_dir());
+    }
+
+    #[test]
+    fn skill_shell_tool_does_not_substitute_undeclared_arguments() {
+        let mut st = medium_risk_skill_tool();
+        st.command = "mkdir {{dir}} {{approved}} {{injected}}".to_string();
+        let tool = SkillShellTool::new("s", &st, supervised_security());
+
+        let command = tool.substitute_args(&serde_json::json!({
+            "dir": "ok",
+            "approved": true,
+            "injected": "; rm -rf /",
+        }));
+
+        assert_eq!(command, "mkdir ok {{approved}} {{injected}}");
+    }
+
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
         let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
@@ -721,7 +835,17 @@ mod tests {
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].as_object().unwrap().is_empty());
+        // `approved` is always declared — it is how the runtime takes ownership
+        // of the approval decision — and is never required.
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["approved"]
+        );
+        assert_eq!(schema["properties"]["approved"]["type"], "boolean");
         assert!(schema["required"].as_array().unwrap().is_empty());
     }
 
