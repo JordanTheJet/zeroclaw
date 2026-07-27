@@ -18801,9 +18801,7 @@ impl Config {
                 profile.prompt_injection_mode,
                 Some(SkillsPromptInjectionMode::Full)
             ) {
-                let path = format!(
-                    "runtime_profiles.{profile_alias}.prompt_injection_mode"
-                );
+                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
                 warnings.push(crate::validation_warnings::ValidationWarning::new(
                     "skills_prompt_injection_mode_full_deprecated",
                     format!(
@@ -23671,8 +23669,7 @@ runtime_profile = "fast"
             .into_iter()
             .find(|warning| {
                 warning.code == "skills_prompt_injection_mode_full_deprecated"
-                    && warning.path
-                        == "runtime_profiles.legacy.prompt_injection_mode"
+                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
             })
             .expect("runtime-profile full should emit a deprecation warning");
 

@@ -1593,7 +1593,9 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     )
 }
 
-pub(crate) fn skills_prompt_mode_with_loader_fallback(
+/// Resolve compact skill prompting against the effective tool surface.
+/// Compact mode is only safe when `read_skill` is available for the turn.
+pub fn skills_prompt_mode_with_loader_fallback(
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     read_skill_available: bool,
 ) -> zeroclaw_config::schema::SkillsPromptInjectionMode {

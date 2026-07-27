@@ -2025,7 +2025,15 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
+fn refreshed_new_session_system_prompt(
+    ctx: &ChannelRuntimeContext,
+    read_skill_available: bool,
+) -> String {
+    let skills_prompt_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        read_skill_available,
+    );
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
         &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
@@ -2033,10 +2041,24 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
-        ctx.prompt_config
-            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        skills_prompt_mode,
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
+}
+
+fn read_skill_available_for_channel_turn(
+    model_provider: &dyn ModelProvider,
+    strict_tool_parsing: bool,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> bool {
+    (model_provider.supports_native_tools() || !strict_tool_parsing)
+        && tools_registry
+            .iter()
+            .any(|tool| tool.name() == "read_skill")
+        && !excluded_tools
+            .iter()
+            .any(|excluded| excluded == "read_skill")
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -4856,17 +4878,23 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let base_system_prompt = if had_prior_history {
-        ctx.system_prompt.as_str().to_string()
-    } else {
-        refreshed_new_session_system_prompt(ctx.as_ref())
-    };
     let per_turn_excluded_tools: &[String] =
         if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
             &[]
         } else {
             ctx.non_cli_excluded_tools.as_ref()
         };
+    let base_system_prompt = if had_prior_history {
+        ctx.system_prompt.as_str().to_string()
+    } else {
+        let read_skill_available = read_skill_available_for_channel_turn(
+            active_model_provider.as_ref(),
+            ctx.agent_cfg.resolved.strict_tool_parsing,
+            ctx.tools_registry.as_ref(),
+            per_turn_excluded_tools,
+        );
+        refreshed_new_session_system_prompt(ctx.as_ref(), read_skill_available)
+    };
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -19753,6 +19781,31 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_read_skill_availability_requires_callable_tool_protocol() {
+        let provider = HistoryCaptureModelProvider::default();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+
+        assert!(read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &["read_skill".to_string()],
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            true,
+            &tools_registry,
+            &[],
+        ));
+    }
+
+    #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -21949,7 +22002,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(vec![Box::new(NamedMockTool("read_skill"))]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
             model: Arc::new("test-model".to_string()),
@@ -21983,7 +22036,7 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(vec!["read_skill".to_string()]),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -22036,7 +22089,7 @@ BTC is currently around $65,000 based on latest tool output."#
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill after /new.\n",
+            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill on fresh sessions.\n",
         )
         .unwrap();
         let refreshed_skills =
@@ -22044,10 +22097,36 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(refreshed_skills.len(), 1);
         assert_eq!(refreshed_skills[0].name, "refresh-test");
         assert!(
-            refreshed_new_session_system_prompt(runtime_ctx.as_ref())
+            refreshed_new_session_system_prompt(runtime_ctx.as_ref(), false)
                 .contains("<name>refresh-test</name>"),
             "fresh-session prompt should pick up skills added after startup"
         );
+        assert!(
+            refreshed_new_session_system_prompt(runtime_ctx.as_ref(), false)
+                .contains("Expose this skill on fresh sessions."),
+            "fresh-session prompt should inline instructions when read_skill is unavailable"
+        );
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-fresh-sender".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-refresh".to_string(),
+                content: "first turn".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -22058,7 +22137,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 content: "/new".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
-                timestamp: 2,
+                timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
@@ -22101,7 +22180,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 content: "hello again".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
-                timestamp: 3,
+                timestamp: 4,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
@@ -22118,20 +22197,37 @@ BTC is currently around $65,000 based on latest tool output."#
                 .calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            assert_eq!(calls.len(), 2);
+            assert_eq!(calls.len(), 3);
             assert_eq!(calls[0][0].0, "system");
             assert_eq!(calls[1][0].0, "system");
+            assert_eq!(calls[2][0].0, "system");
             assert!(
                 !calls[0][0].1.contains("<name>refresh-test</name>"),
                 "pre-/new prompt should not advertise a skill that did not exist yet"
             );
             assert!(
                 calls[1][0].1.contains("<available_skills>"),
-                "post-/new prompt should contain the refreshed skills block"
+                "fresh-sender prompt should contain the refreshed skills block"
             );
             assert!(
                 calls[1][0].1.contains("<name>refresh-test</name>"),
+                "fresh-sender prompt should include skills discovered after startup"
+            );
+            assert!(
+                calls[1][0]
+                    .1
+                    .contains("Expose this skill on fresh sessions."),
+                "fresh-sender prompt should inline instructions without read_skill"
+            );
+            assert!(
+                calls[2][0].1.contains("<name>refresh-test</name>"),
                 "post-/new prompt should include skills discovered after the reset"
+            );
+            assert!(
+                calls[2][0]
+                    .1
+                    .contains("Expose this skill on fresh sessions."),
+                "post-/new prompt should inline instructions without read_skill"
             );
         }
 

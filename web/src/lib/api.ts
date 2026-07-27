@@ -442,7 +442,7 @@ export function getTuis(): Promise<TuiEntry[]> {
 export interface ValidationWarning {
   /** Stable machine-readable identifier (e.g. `'dangling_provider_fallback'`). */
   code: string;
-  /** Human-readable description suitable for direct display. */
+  /** English fallback for unknown warning codes; localize known codes before display. */
   message: string;
   /** Dotted property path the warning concerns (e.g. `'providers.fallback'`). */
   path: string;
