@@ -227,10 +227,14 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mode = crate::skills::skills_prompt_mode_with_loader_fallback(
+            ctx.skills_prompt_mode,
+            ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
+        );
         Ok(crate::skills::skills_to_prompt_with_mode(
             ctx.skills,
             ctx.workspace_dir,
-            ctx.skills_prompt_mode,
+            mode,
         ))
     }
 }
@@ -307,8 +311,10 @@ mod tests {
     use zeroclaw_api::tool::Tool;
 
     zeroclaw_api::mock_tool_attribution!(TestTool);
+    zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
 
     struct TestTool;
+    struct ReadSkillTestTool;
 
     #[async_trait]
     impl Tool for TestTool {
@@ -318,6 +324,32 @@ mod tests {
 
         fn description(&self) -> &str {
             "tool desc"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ReadSkillTestTool {
+        fn name(&self) -> &str {
+            "read_skill"
+        }
+
+        fn description(&self) -> &str {
+            "load skill instructions"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -460,10 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_renders_compact_for_coerced_global_full() {
-        // Global `full` is deprecated and coerced to Compact upstream, so the
-        // section receives Compact for the global path: instructions are not
-        // inlined, only tool metadata is rendered.
+    fn skills_section_includes_instructions_and_tools_in_full_mode() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -493,8 +522,7 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            // Coerced global path: the section receives Compact.
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -506,10 +534,7 @@ mod tests {
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
-        // Instructions are not inlined — they load on demand via `read_skill`.
-        assert!(output.contains("loaded on demand"));
-        assert!(!output.contains("<instructions>"));
-        assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
         assert!(output.contains("<name>deploy__release_checklist</name>"));
@@ -517,7 +542,7 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadSkillTestTool)];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -568,6 +593,40 @@ mod tests {
     }
 
     #[test]
+    fn skills_section_preserves_instructions_when_compact_loader_is_unavailable() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &skills,
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SkillsSection.build(&ctx).unwrap();
+        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(!output.contains("read_skill(name)"));
+    }
+
+    #[test]
     fn datetime_section_includes_date_and_offset_without_wall_clock_time() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
@@ -598,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_builder_escapes_skill_metadata() {
+    fn prompt_builder_inlines_and_escapes_skills() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
@@ -646,8 +705,9 @@ mod tests {
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        // Instructions are no longer inlined (loaded on demand), so the prompt
-        // body is not asserted here.
+        assert!(prompt.contains(
+            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
+        ));
     }
 
     #[test]

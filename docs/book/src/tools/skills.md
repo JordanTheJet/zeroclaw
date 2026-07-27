@@ -140,7 +140,7 @@ zeroclaw skills audit ./release-check
 
 </div>
 
-Install a skill from a local directory, Git URL, registry name, or ClawHub source:
+Install a skill from a local directory, Git URL, or registry name:
 
 <div class="os-tabs-src">
 
@@ -150,7 +150,18 @@ Install a skill from a local directory, Git URL, registry name, or ClawHub sourc
 zeroclaw skills install ./release-check --bundle ops
 zeroclaw skills install https://example.com/zeroclaw-release-check.git --bundle ops
 zeroclaw skills install release-check --agent default
-zeroclaw skills install clawhub:release-check --bundle ops
+```
+
+</div>
+
+Install one skill by name from a Git catalog repository (a repo whose skills live under `skills/<name>/`):
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install https://github.com/vercel-labs/skills --skill find-skills
 ```
 
 </div>
@@ -229,7 +240,7 @@ Community open-skills loading is opt-in via the `skills` config. When enabled, Z
 
 ## Advanced config
 
-The default prompt injection mode is `full`, which includes full skill instructions in the system prompt. Use `compact` to keep only compact metadata in context and load skill details on demand:
+The default prompt injection mode is `compact`, which keeps skill metadata in context and loads instructions on demand through `read_skill`. Explicit `full` mode remains supported during the deprecation window, including as a runtime-profile override, but is planned for removal in Schema V4.
 
 ## Autonomous skill creation
 

@@ -807,9 +807,13 @@ impl DelegateTool {
         {
             return (
                 type_key.to_string(),
-                cfg.api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone()),
+                if cfg.requires_openai_auth {
+                    cfg.api_key.clone()
+                } else {
+                    cfg.api_key
+                        .clone()
+                        .or_else(|| self.global_credential.clone())
+                },
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
@@ -2321,6 +2325,10 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
+        let mut resolved_agent_config = agent_config.clone();
+        resolved_agent_config.resolved = self.resolve_loop_runtime(agent_alias, agent_config);
+        let agent_config = &resolved_agent_config;
+
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2571,8 +2579,6 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
-        let mut prompt_agent_config = agent_config.clone();
-        prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2581,7 +2587,7 @@ impl DelegateTool {
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            &prompt_agent_config,
+            agent_config,
             model,
             &sub_tools,
             prompt_workspace,
@@ -2620,6 +2626,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -2633,6 +2640,12 @@ impl DelegateTool {
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
+                        // Full config so the delegated sub-agent's vision route
+                        // resolves the configured `vision_model_provider`'s alias
+                        // options (the `vision` override, endpoint URI, credentials),
+                        // exactly as the parent turn does. `None` only on the
+                        // configless test builder (`root_config` unset).
+                        config: self.root_config.as_deref(),
                         hooks: None,
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
@@ -2674,6 +2687,7 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -5491,10 +5505,15 @@ mod tests {
     }
 
     #[test]
-    fn enriched_prompt_honors_resolved_full_skill_mode() {
-        let mut config = AliasedAgentConfig::default();
-        config.resolved.prompt_injection_mode =
+    fn enriched_prompt_resolves_explicit_global_full_skill_mode() {
+        let mut root_config = Config::default();
+        root_config.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        root_config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let root_config = Arc::new(root_config);
+        let config = root_config.agents.get("alpha").unwrap().clone();
         let workspace = std::env::temp_dir();
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
@@ -5510,8 +5529,14 @@ mod tests {
             location: None,
         }];
 
-        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+        let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
+            .with_root_config(root_config)
             .with_workspace_dir(workspace.to_path_buf());
+        assert_eq!(
+            tool.resolve_loop_runtime("alpha", &config)
+                .prompt_injection_mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+        );
         let prompt = tool
             .build_enriched_system_prompt(
                 "alpha",
@@ -8120,6 +8145,100 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "target policy should have filtered out file_write, but got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_returns_none_credential() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: None,
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (provider_type, credential, model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(provider_type, "openai");
+        assert!(
+            credential.is_none(),
+            "OAuth target must not inherit global coordinator credential"
+        );
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_preserves_explicit_alias_key() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: Some("sk-codex-custom-gateway-key".to_string()),
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-codex-custom-gateway-key"),
+            "OAuth target with explicit api_key must preserve the alias key"
+        );
+    }
+
+    #[test]
+    fn resolve_brain_non_oauth_fallback_preserved() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut custom_map = HashMap::new();
+        custom_map.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: false,
+                api_key: None,
+                model: Some("llama3".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("custom".to_string(), custom_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("custom.local");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-ant-global-coordinator-key"),
+            "non-OAuth target without api_key must fall back to global credential"
         );
     }
 }

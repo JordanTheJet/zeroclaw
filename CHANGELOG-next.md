@@ -49,8 +49,10 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 - MCP gains resources-as-context, pinning, named-prompt rendering, and a policy-gated resource/prompt client surface (#8508, #8403).
 
 ### Gateway, Config & Skills
+- Skill prompt injection now defaults to compact metadata with on-demand instruction loading. Explicit `full` mode remains supported during its deprecation window; hard removal is deferred to Schema V4 (#8313).
 - The gateway adds default HTTP security response headers and agent-aware `/api/tools` listing with an agent-scoped tool picker (#8829, #8331).
 - Config adds independent delegate targets, a `local_small` runtime preset, and `x-required-by-transport` metadata for MCP servers (#8239, #8531, #8349).
+- The web config form renders a risk profile's four tool-permission lists (`allowed_tools`/`excluded_tools`/`auto_approve`/`always_ask`) as one authorization-and-approval grid that honors the profile's autonomy level, surfacing the approval settings as stored overrides under `full`/`readonly` where they no longer drive prompts (#8879).
 - Skills install/list/remove are now bundle-aware, surface security-audit-skipped skills, and support an opt-in bounded SKILL.md reflection for skill creation (#8335, #8699, #8261).
 - Observability adds a runtime OpenTelemetry content policy for LLM/tool I/O and a rotating log-persistence mode (#8567, #8307).
 - Per-turn output routing via `send_via` with voice-delivery fixes landed (#7361).
@@ -92,6 +94,7 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 ## Breaking Changes
 
 - **Rust toolchain floor**: the workspace MSRV is now Rust 1.96.1, with CI, containers, and documentation aligned to that version (#8801).
+- **Removed the built-in ClawHub skill-install source** (`zeroclaw skills install clawhub:<slug>` and `clawhub.ai` URLs). Install skills from a local path, a Git URL (optionally `<git-url> --skill <name>` to select one skill from a catalog repo), or a registry name instead. SkillForge's default discovery sources no longer include the never-implemented `clawhub` source (#8638).
 
 ## Contributors
 
