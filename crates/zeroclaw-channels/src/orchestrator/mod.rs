@@ -2025,8 +2025,29 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-fn refreshed_new_session_system_prompt(
+fn rendered_skills_prompt_mode(
+    prompt: &str,
+) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+    const SKILLS_HEADER: &str = "## Available Skills\n\n";
+    const SKILLS_END: &str = "</available_skills>";
+
+    let start = prompt.find(SKILLS_HEADER)?;
+    let rel_end = prompt[start..].find(SKILLS_END)?;
+    let section = &prompt[start..start + rel_end + SKILLS_END.len()];
+    let preamble = section.split_once("<available_skills>")?.0;
+
+    if preamble.contains("Skill summaries are preloaded below") {
+        Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
+    } else if preamble.contains("Skill instructions and tool metadata are preloaded below") {
+        Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full)
+    } else {
+        None
+    }
+}
+
+fn refreshed_skills_system_prompt(
     ctx: &ChannelRuntimeContext,
+    base_prompt: &str,
     read_skill_available: bool,
 ) -> String {
     let skills_prompt_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
@@ -2043,7 +2064,28 @@ fn refreshed_new_session_system_prompt(
         ctx.workspace_dir.as_ref(),
         skills_prompt_mode,
     );
-    replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
+    replace_available_skills_section(base_prompt, &refreshed_skills)
+}
+
+fn system_prompt_for_channel_turn(
+    ctx: &ChannelRuntimeContext,
+    base_prompt: &str,
+    refresh_skills: bool,
+    read_skill_available: bool,
+) -> String {
+    let desired_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        read_skill_available,
+    );
+    let cached_mode_changed = rendered_skills_prompt_mode(base_prompt)
+        .is_some_and(|cached_mode| cached_mode != desired_mode);
+
+    if refresh_skills || cached_mode_changed {
+        refreshed_skills_system_prompt(ctx, base_prompt, read_skill_available)
+    } else {
+        base_prompt.to_string()
+    }
 }
 
 fn read_skill_available_for_channel_turn(
@@ -2051,14 +2093,74 @@ fn read_skill_available_for_channel_turn(
     strict_tool_parsing: bool,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
+    system_prompt: &str,
 ) -> bool {
-    (model_provider.supports_native_tools() || !strict_tool_parsing)
+    let callable_protocol = model_provider.supports_native_tools()
+        || (!strict_tool_parsing && text_tool_prompt_advertises(system_prompt, "read_skill"));
+
+    callable_protocol
         && tools_registry
             .iter()
             .any(|tool| tool.name() == "read_skill")
         && !excluded_tools
             .iter()
             .any(|excluded| excluded == "read_skill")
+}
+
+fn text_tool_prompt_advertises(system_prompt: &str, tool_name: &str) -> bool {
+    const PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
+    const TOOLS_HEADER: &str = "### Available Tools\n\n";
+
+    let Some(protocol_start) = system_prompt.rfind(PROTOCOL_HEADER) else {
+        return false;
+    };
+    let protocol = &system_prompt[protocol_start + PROTOCOL_HEADER.len()..];
+    let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
+        return false;
+    };
+    let tools = &protocol[tools_start + TOOLS_HEADER.len()..];
+    let tools = tools
+        .split_once("\n## ")
+        .map_or(tools, |(tools, _next_section)| tools);
+    let expected_prefix = format!("**{tool_name}**:");
+
+    tools.lines().any(|line| line.starts_with(&expected_prefix))
+}
+
+fn refresh_channel_history_skills(
+    ctx: &ChannelRuntimeContext,
+    history: &mut [ChatMessage],
+    read_skill_available: bool,
+) {
+    let Some(system_message) = history
+        .first_mut()
+        .filter(|message| message.role == "system")
+    else {
+        return;
+    };
+    system_message.content = system_prompt_for_channel_turn(
+        ctx,
+        system_message.content.as_str(),
+        false,
+        read_skill_available,
+    );
+}
+
+fn effective_non_cli_tool_names<'a>(
+    tools_registry: &'a [Box<dyn Tool>],
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> HashSet<&'a str> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            risk_profile.level == AutonomyLevel::Full
+                || !risk_profile
+                    .excluded_tools
+                    .iter()
+                    .any(|excluded| excluded == *name)
+        })
+        .collect()
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -4884,17 +4986,19 @@ async fn process_channel_message_body(
         } else {
             ctx.non_cli_excluded_tools.as_ref()
         };
-    let base_system_prompt = if had_prior_history {
-        ctx.system_prompt.as_str().to_string()
-    } else {
-        let read_skill_available = read_skill_available_for_channel_turn(
-            active_model_provider.as_ref(),
-            ctx.agent_cfg.resolved.strict_tool_parsing,
-            ctx.tools_registry.as_ref(),
-            per_turn_excluded_tools,
-        );
-        refreshed_new_session_system_prompt(ctx.as_ref(), read_skill_available)
-    };
+    let read_skill_available = read_skill_available_for_channel_turn(
+        active_model_provider.as_ref(),
+        ctx.agent_cfg.resolved.strict_tool_parsing,
+        ctx.tools_registry.as_ref(),
+        per_turn_excluded_tools,
+        ctx.system_prompt.as_str(),
+    );
+    let base_system_prompt = system_prompt_for_channel_turn(
+        ctx.as_ref(),
+        ctx.system_prompt.as_str(),
+        !had_prior_history,
+        read_skill_available,
+    );
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -5547,6 +5651,21 @@ async fn process_channel_message_body(
                                 api_key: route.api_key.clone(),
                             },
                             &runtime_defaults,
+                        );
+
+                        let read_skill_available = read_skill_available_for_channel_turn(
+                            active_model_provider.as_ref(),
+                            ctx.agent_cfg.resolved.strict_tool_parsing,
+                            ctx.tools_registry.as_ref(),
+                            excluded_tools,
+                            history
+                                .first()
+                                .map_or("", |message| message.content.as_str()),
+                        );
+                        refresh_channel_history_skills(
+                            ctx.as_ref(),
+                            &mut history,
+                            read_skill_available,
                         );
 
                         continue;
@@ -10660,8 +10779,8 @@ pub async fn start_channels(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+        let effective_tool_names =
+            effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
@@ -19784,25 +19903,84 @@ BTC is currently around $65,000 based on latest tool output."#
     fn channel_read_skill_availability_requires_callable_tool_protocol() {
         let provider = HistoryCaptureModelProvider::default();
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let text_tool_prompt = "## Tool Use Protocol\n\n\
+            <tool_call></tool_call>\n\n\
+            ### Available Tools\n\n\
+            **read_skill**: Read a skill";
 
         assert!(read_skill_available_for_channel_turn(
             &provider,
             false,
             &tools_registry,
             &[],
+            text_tool_prompt,
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+            "",
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+            "## Workspace\n\nMentions ## Tool Use Protocol and **read_skill** in ordinary prose.",
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
             false,
             &tools_registry,
             &["read_skill".to_string()],
+            text_tool_prompt,
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
             true,
             &tools_registry,
             &[],
+            text_tool_prompt,
         ));
+    }
+
+    #[test]
+    fn rendered_skills_prompt_mode_ignores_skill_body_text() {
+        let prompt = "## Available Skills\n\n\
+            Skill instructions and tool metadata are preloaded below.\n\n\
+            <available_skills>\n\
+            <skill>Skill summaries are preloaded below to keep context compact.</skill>\n\
+            </available_skills>";
+
+        assert_eq!(
+            rendered_skills_prompt_mode(prompt),
+            Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full)
+        );
+    }
+
+    #[test]
+    fn effective_non_cli_tool_names_respects_exclusions() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("read_skill")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            excluded_tools: vec!["read_skill".to_string()],
+            ..Default::default()
+        };
+
+        let effective = effective_non_cli_tool_names(&tools_registry, &risk_profile);
+        assert!(!effective.contains("read_skill"));
+        assert!(effective.contains("file_read"));
+
+        let full_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            excluded_tools: vec!["read_skill".to_string()],
+            ..Default::default()
+        };
+        let effective_full = effective_non_cli_tool_names(&tools_registry, &full_profile);
+        assert!(effective_full.contains("read_skill"));
     }
 
     #[test]
@@ -22097,15 +22275,43 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(refreshed_skills.len(), 1);
         assert_eq!(refreshed_skills[0].name, "refresh-test");
         assert!(
-            refreshed_new_session_system_prompt(runtime_ctx.as_ref(), false)
-                .contains("<name>refresh-test</name>"),
+            refreshed_skills_system_prompt(
+                runtime_ctx.as_ref(),
+                runtime_ctx.system_prompt.as_str(),
+                false,
+            )
+            .contains("<name>refresh-test</name>"),
             "fresh-session prompt should pick up skills added after startup"
         );
         assert!(
-            refreshed_new_session_system_prompt(runtime_ctx.as_ref(), false)
-                .contains("Expose this skill on fresh sessions."),
+            refreshed_skills_system_prompt(
+                runtime_ctx.as_ref(),
+                runtime_ctx.system_prompt.as_str(),
+                false,
+            )
+            .contains("Expose this skill on fresh sessions."),
             "fresh-session prompt should inline instructions when read_skill is unavailable"
         );
+
+        let cached_compact_prompt = refreshed_skills_system_prompt(
+            runtime_ctx.as_ref(),
+            runtime_ctx.system_prompt.as_str(),
+            true,
+        );
+        assert!(cached_compact_prompt.contains("read_skill(name)"));
+        assert!(!cached_compact_prompt.contains("Expose this skill on fresh sessions."));
+        let mut provider_transition_history = vec![ChatMessage::system(cached_compact_prompt)];
+        refresh_channel_history_skills(
+            runtime_ctx.as_ref(),
+            &mut provider_transition_history,
+            false,
+        );
+        let provider_transition_prompt = &provider_transition_history[0].content;
+        assert!(
+            provider_transition_prompt.contains("Expose this skill on fresh sessions."),
+            "an established session must inline instructions when its active provider loses the loader protocol"
+        );
+        assert!(!provider_transition_prompt.contains("read_skill(name)"));
 
         process_channel_message(
             runtime_ctx.clone(),

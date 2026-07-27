@@ -432,10 +432,9 @@ export function getTuis(): Promise<TuiEntry[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * One non-fatal validation warning surfaced after a successful save —
- * config that loads and validates structurally but will fail at agent
- * runtime because of a logical inconsistency (e.g. `providers.fallback`
- * referencing a key not present in `providers.models`). Matches the
+ * One non-fatal validation warning surfaced after a successful save.
+ * Warnings may identify a runtime inconsistency, an inert setting, or a
+ * supported configuration that is being deprecated. Matches the
  * `tracing::warn!` signal the CLI shows on stderr; surfaced structured so
  * the dashboard can render it next to the offending field.
  */

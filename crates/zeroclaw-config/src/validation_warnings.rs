@@ -1,7 +1,7 @@
-//! Non-fatal validation warnings — config that loads and validates
-//! successfully (i.e. `Config::validate()` returns `Ok(())`) but will fail
-//! at agent runtime because of a logical inconsistency the schema can't
-//! enforce structurally.
+//! Non-fatal validation warnings for config that loads and validates
+//! successfully (i.e. `Config::validate()` returns `Ok(())`) but needs user
+//! attention. Warnings may identify a runtime inconsistency, an inert setting,
+//! or a supported configuration that is being deprecated.
 
 use serde::{Deserialize, Serialize};
 
