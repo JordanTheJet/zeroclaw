@@ -3379,11 +3379,38 @@ fn parse_exec_program(exec: &str) -> Option<String> {
     Some(token)
 }
 
-/// Read the `Exec` target from a desktop entry, but only when the entry
-/// deliberately identifies as ZeroClaw's, so an unrelated `.desktop` file is
-/// never launched. Only the `[Desktop Entry]` group is consulted, a
-/// `Hidden=true` ("masked") entry is ignored, and the `Exec` value is parsed
-/// with the desktop-entry quoting grammar (see [`parse_exec_program`]).
+/// True when a desktop entry's resolved `Exec` program is a ZeroClaw
+/// executable: its file name begins with "zeroclaw" (e.g. `zeroclaw-desktop` or
+/// `ZeroClaw-x86_64.AppImage`). Anchoring at the start binds the entry to a
+/// ZeroClaw target — so a deliberate ZeroClaw `Name` cannot be paired with an
+/// unrelated executable (`Exec=/tmp/evil`) or a lookalike (`not-zeroclaw-*`) to
+/// preempt the real app.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().starts_with("zeroclaw"))
+}
+
+/// True when a bare file name is a ZeroClaw AppImage: it begins with "zeroclaw"
+/// and ends with ".appimage" (case-insensitively). Anchoring at the start keeps
+/// a lookalike such as `not-zeroclaw-helper.AppImage` from qualifying in the
+/// unregistered-AppImage fallback scan.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_appimage_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.starts_with("zeroclaw") && lower.ends_with(".appimage")
+}
+
+/// Read the `Exec` target from a desktop entry, but only when the entry is a
+/// ZeroClaw application, so an unrelated `.desktop` file is never launched.
+/// Identity is a bounded combination, not a display name alone: the entry must
+/// be `Type=Application`, its `Name` must deliberately identify ZeroClaw (see
+/// [`is_zeroclaw_name`]), and its resolved `Exec` program must be a ZeroClaw
+/// executable (see [`is_zeroclaw_program`]). Only the `[Desktop Entry]` group is
+/// consulted, a `Hidden=true` ("masked") entry is ignored, and the `Exec` value
+/// is parsed with the desktop-entry quoting grammar (see [`parse_exec_program`]).
 ///
 /// Gated with the `desktop` command's `which` dependency (`agent-runtime`) on
 /// Linux, matching its sole caller and the desktop-entry tests.
@@ -3392,6 +3419,7 @@ fn zeroclaw_desktop_exec(contents: &str) -> Option<String> {
     let mut in_entry = false;
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
+    let mut entry_type: Option<String> = None;
     let mut hidden = false;
     for line in contents.lines() {
         let line = line.trim();
@@ -3409,14 +3437,31 @@ fn zeroclaw_desktop_exec(contents: &str) -> Option<String> {
         match key.trim() {
             "Name" if name.is_none() => name = Some(value.trim().to_string()),
             "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
+            "Type" if entry_type.is_none() => entry_type = Some(value.trim().to_string()),
             "Hidden" if value.trim().eq_ignore_ascii_case("true") => hidden = true,
             _ => {}
         }
     }
-    if hidden || !is_zeroclaw_name(&name?) {
+    if hidden {
         return None;
     }
-    parse_exec_program(&exec?)
+    // A launchable app entry only: `Type` must be `Application`, per the
+    // published `ZeroClaw.desktop` contract. A non-`Application` entry (e.g.
+    // `Link`/`Directory`) never resolves.
+    if !entry_type
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("Application"))
+    {
+        return None;
+    }
+    if !is_zeroclaw_name(&name?) {
+        return None;
+    }
+    let program = parse_exec_program(&exec?)?;
+    if !is_zeroclaw_program(&program) {
+        return None;
+    }
+    Some(program)
 }
 
 /// True when `path` is a regular file with an execute bit set.
@@ -3440,6 +3485,31 @@ fn resolve_executable(command: &str) -> Option<PathBuf> {
     which::which(command).ok()
 }
 
+/// Recursively collect `.desktop` entries under `root` (an `applications`
+/// directory) as `(desktop-file-id, path)` pairs. Per the Desktop Entry
+/// Specification the ID is the path relative to `root` with directory
+/// separators replaced by `-`, so a nested `kde/foo.desktop` has ID
+/// `kde-foo.desktop`. Deriving IDs recursively (rather than from top-level
+/// basenames only) is what lets a nested higher-precedence entry correctly
+/// mask the same ID in a lower-precedence directory.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn collect_desktop_entries(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_desktop_entries(root, &path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let id = rel.to_string_lossy().replace('/', "-");
+                out.push((id, path));
+            }
+        }
+    }
+}
+
 /// Scan `applications` subdirectories of the given XDG base dirs (already in
 /// precedence order) for a ZeroClaw desktop entry and return its executable
 /// `Exec` target. The first occurrence of a desktop-file ID wins and shadows the
@@ -3448,19 +3518,11 @@ fn resolve_executable(command: &str) -> Option<PathBuf> {
 fn discover_desktop_app(data_dirs: &[PathBuf]) -> Option<PathBuf> {
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for base in data_dirs {
-        let Ok(entries) = std::fs::read_dir(base.join("applications")) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("desktop"))
-            .collect();
-        files.sort(); // deterministic order within a directory
-        for path in files {
-            let Some(id) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
-                continue;
-            };
+        let root = base.join("applications");
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        collect_desktop_entries(&root, &root, &mut files);
+        files.sort(); // deterministic order by desktop-file ID within a directory
+        for (id, path) in files {
             if !seen_ids.insert(id) {
                 continue; // shadowed by a higher-precedence entry with the same ID
             }
@@ -3487,10 +3549,16 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
 
     // XDG application dirs in precedence order: $XDG_DATA_HOME first, then each
-    // $XDG_DATA_DIRS entry. Unset or empty falls back to the spec defaults.
+    // $XDG_DATA_DIRS entry. Unset or empty falls back to the spec defaults. Per
+    // the Base Directory Specification a relative value is invalid and must be
+    // ignored, so it is never searched from the process working directory.
     let mut data_dirs: Vec<PathBuf> = Vec::new();
-    match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        Some(v) => data_dirs.push(PathBuf::from(v)),
+    match std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(v) => data_dirs.push(v),
         None => {
             if let Some(home) = &home {
                 data_dirs.push(home.join(".local/share"));
@@ -3502,7 +3570,10 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
     for dir in extra.split(':').filter(|s| !s.is_empty()) {
-        data_dirs.push(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            data_dirs.push(path);
+        }
     }
 
     if let Some(target) = discover_desktop_app(&data_dirs) {
@@ -3521,9 +3592,8 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if name.contains("zeroclaw") && name.ends_with(".appimage") && is_executable(&path) {
+                    .unwrap_or_default();
+                if is_zeroclaw_appimage_name(name) && is_executable(&path) {
                     return Some(path);
                 }
             }
@@ -8350,7 +8420,8 @@ mod tests {
     fn zeroclaw_desktop_exec_keeps_quoted_path_with_spaces() {
         let entry = "[Desktop Entry]\n\
              Name=ZeroClaw\n\
-             Exec=\"/home/user/My Applications/ZeroClaw.AppImage\" %U\n";
+             Exec=\"/home/user/My Applications/ZeroClaw.AppImage\" %U\n\
+             Type=Application\n";
         assert_eq!(
             zeroclaw_desktop_exec(entry).as_deref(),
             Some("/home/user/My Applications/ZeroClaw.AppImage")
@@ -8362,7 +8433,8 @@ mod tests {
     fn zeroclaw_desktop_exec_keeps_backslash_escaped_space() {
         let entry = "[Desktop Entry]\n\
              Name=ZeroClaw\n\
-             Exec=/home/user/My\\ Apps/ZeroClaw.AppImage %U\n";
+             Exec=/home/user/My\\ Apps/ZeroClaw.AppImage %U\n\
+             Type=Application\n";
         assert_eq!(
             zeroclaw_desktop_exec(entry).as_deref(),
             Some("/home/user/My Apps/ZeroClaw.AppImage")
@@ -8374,13 +8446,14 @@ mod tests {
     fn zeroclaw_desktop_exec_strips_field_codes_and_quotes() {
         let entry = "[Desktop Entry]\n\
              Name=ZeroClaw Companion\n\
-             Exec=\"/opt/zeroclaw/zeroclaw-desktop\" %u\n";
+             Exec=\"/opt/zeroclaw/zeroclaw-desktop\" %u\n\
+             Type=Application\n";
         assert_eq!(
             zeroclaw_desktop_exec(entry).as_deref(),
             Some("/opt/zeroclaw/zeroclaw-desktop")
         );
         // A bare field code with no real command must not resolve.
-        let bad = "[Desktop Entry]\nName=ZeroClaw\nExec=%U\n";
+        let bad = "[Desktop Entry]\nName=ZeroClaw\nExec=%U\nType=Application\n";
         assert_eq!(zeroclaw_desktop_exec(bad), None);
     }
 
@@ -8433,7 +8506,10 @@ mod tests {
             std::fs::create_dir_all(&apps).unwrap();
             std::fs::write(
                 apps.join(id),
-                format!("[Desktop Entry]\nName=ZeroClaw\nExec={}\n", exec.display()),
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
             )
             .unwrap();
         }
@@ -8451,7 +8527,10 @@ mod tests {
         write_entry(low.path(), "ZeroClaw.desktop", &low_bin);
 
         let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
-        assert_eq!(discover_desktop_app(&dirs).as_deref(), Some(high_bin.as_path()));
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
 
         // A non-executable Exec target is skipped rather than returned.
         let broken = tempfile::tempdir().unwrap();
@@ -8459,6 +8538,93 @@ mod tests {
         std::fs::write(&non_exec, "not executable").unwrap();
         write_entry(broken.path(), "ZeroClaw.desktop", &non_exec);
         assert_eq!(discover_desktop_app(&[broken.path().to_path_buf()]), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_zeroclaw_name_with_unrelated_exec() {
+        // A ZeroClaw display name paired with an unrelated executable must not
+        // resolve: identity is Type + Name + a ZeroClaw-shaped Exec target, not
+        // the display name alone. A lexically earlier entry like this must not
+        // preempt the real app.
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Helper\n\
+             Exec=/tmp/unrelated %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_requires_application_type() {
+        // A non-Application entry never resolves, even with a ZeroClaw Name and
+        // a ZeroClaw executable.
+        let link = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             Type=Link\n";
+        assert_eq!(zeroclaw_desktop_exec(link), None);
+
+        // Missing Type is also rejected (the published entry always sets it).
+        let no_type = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n";
+        assert_eq!(zeroclaw_desktop_exec(no_type), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_appimage_name_anchors_identity() {
+        assert!(is_zeroclaw_appimage_name("ZeroClaw-x86_64.AppImage"));
+        assert!(is_zeroclaw_appimage_name("zeroclaw.appimage"));
+        // A lookalike whose name merely contains the substring must not qualify.
+        assert!(!is_zeroclaw_appimage_name("not-zeroclaw-helper.AppImage"));
+        assert!(!is_zeroclaw_appimage_name("ZeroClaw.txt"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_masks_nested_desktop_file_ids() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_nested_entry(dir: &Path, rel_id: &str, exec: &Path) {
+            let full = dir.join("applications").join(rel_id);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(
+                full,
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let high_bin = high.path().join("zeroclaw-high");
+        let low_bin = low.path().join("zeroclaw-low");
+        write_exec(&high_bin);
+        write_exec(&low_bin);
+
+        // Same nested desktop-file ID (`vendor/ZeroClaw.desktop` -> ID
+        // `vendor-ZeroClaw.desktop`) in both dirs: the higher-precedence entry
+        // must mask the lower one, which only works if IDs are derived
+        // recursively rather than from top-level basenames.
+        write_nested_entry(high.path(), "vendor/ZeroClaw.desktop", &high_bin);
+        write_nested_entry(low.path(), "vendor/ZeroClaw.desktop", &low_bin);
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
     }
 
     #[test]
