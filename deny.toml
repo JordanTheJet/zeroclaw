@@ -66,7 +66,11 @@ ignore = [
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained; tracking #8519" },
     # macro/font helpers unmaintained (transitive); tracking #8519.
     # RUSTSEC-2024-0370 (proc-macro-error) was dropped when zeroclaw-desktop
-    # (Tauri) was removed in PR #8544.
+    # (Tauri) was removed in PR #8544. Tauri is a workspace member again, so the
+    # crate is back in Cargo.lock and the advisory fires again. cargo-deny reads
+    # the lockfile rather than the resolved graph, so the entry is needed even
+    # though nothing in the workspace reaches it on a non-desktop target.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; transitive via zeroclaw-desktop; tracking #8519" },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper; tracking #8519" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive derive helper; tracking #8519" },
 ]
