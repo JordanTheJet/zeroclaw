@@ -189,3 +189,65 @@ fn cargo_cache_guard_parses_option_order_and_exact_values() {
         "dst alias and reordered locked mount must be found"
     );
 }
+
+/// Every workspace member's manifest must be staged into the container
+/// dependency-cache layer.
+///
+/// `cargo build` needs every member's `Cargo.toml` present to load the
+/// workspace, and the stage copies a fixed set of paths. The failure mode when
+/// one is missing is nasty: `COPY` still succeeds, because the glob matched the
+/// other manifests, and the build dies much later with "failed to load manifest
+/// for workspace member". That is what happened when a nested member was added
+/// under `crates/zeroclaw-plugins/tests/fixtures/` and the single-level glob
+/// silently skipped it, on master, unnoticed until a PR touched the Dockerfiles.
+#[test]
+fn container_dependency_stage_stages_every_workspace_member_manifest() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Table = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("read workspace Cargo.toml")
+        .parse()
+        .expect("workspace Cargo.toml is valid TOML");
+    let members: Vec<String> = manifest["workspace"]["members"]
+        .as_array()
+        .expect("[workspace] members is an array")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .filter(|m| *m != ".")
+        .map(str::to_owned)
+        .collect();
+
+    for dockerfile in ["Dockerfile", "Dockerfile.debian"] {
+        let text = fs::read_to_string(root.join(dockerfile))
+            .unwrap_or_else(|e| panic!("read {dockerfile}: {e}"));
+        let copied: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("COPY"))
+            .collect();
+
+        for member in &members {
+            // A member is covered either by an explicit path or by a glob whose
+            // single wildcard segment stands in for exactly one path segment.
+            let explicit = format!("{member}/Cargo.toml");
+            let depth = member.matches('/').count();
+            let covered = copied.iter().any(|line| {
+                if line.contains(&explicit) {
+                    return true;
+                }
+                line.split_whitespace().any(|tok| {
+                    tok.ends_with("/Cargo.toml")
+                        && tok.contains('*')
+                        && tok.matches('/').count() == depth + 1
+                        && member.starts_with(tok.split('/').next().unwrap_or("\0"))
+                })
+            });
+            assert!(
+                covered,
+                "{dockerfile} never stages `{explicit}`.\n\
+                 `cargo build` in that stage loads the whole workspace, so a missing member \
+                 manifest fails the build long after the COPY that should have caught it.\n\
+                 Add an explicit COPY line for it: a `crates/*/Cargo.toml` glob matches one \
+                 level only and will not pick up a nested member."
+            );
+        }
+    }
+}

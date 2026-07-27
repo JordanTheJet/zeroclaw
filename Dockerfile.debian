@@ -66,8 +66,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Copy every workspace-member manifest in one glob — adding or removing a crate
-# no longer requires editing this file.  --parents preserves the
+# Copy every workspace-member manifest. --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
 COPY --parents crates/*/Cargo.toml ./
 # Nested workspace members (e.g. plugin test fixtures) are not matched by the

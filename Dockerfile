@@ -77,14 +77,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Copy every workspace-member manifest in one glob — adding or removing a crate
-# no longer requires editing this file.  --parents preserves the
+# Copy every workspace-member manifest. --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
-# `**` rather than `*`: workspace members are not all one level under
-# crates/ (crates/zeroclaw-plugins/tests/fixtures/channel-fixture is a member
-# too). A single-level glob silently omits nested manifests, and cargo then
-# fails to load the workspace in this stage rather than at COPY time.
-COPY --parents crates/**/Cargo.toml ./
+#
+# Two lines, not one glob: workspace members are not all one level under
+# crates/. `crates/**/Cargo.toml` does NOT match deeper paths here -- it behaves
+# as a single level, matches the shallow manifests, and so COPY succeeds while
+# silently omitting the nested ones. The failure then surfaces much later as
+# cargo refusing to load the workspace, which is what made this hard to spot.
+#
+# tests/architecture/container_release.rs asserts every workspace member is
+# covered here, so adding a nested member fails a test rather than the release.
+COPY --parents crates/*/Cargo.toml ./
+COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
 # zeroclaw-macros is a proc-macro crate, compiled for the host even on a cross
 # build. If only a stub lib.rs is present during the pre-fetch, its host-cached
 # artifact is reused in the real build under the target-triple dir, leaving
