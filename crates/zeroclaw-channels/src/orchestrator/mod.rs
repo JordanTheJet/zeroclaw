@@ -11741,6 +11741,16 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    /// Upper bound for "this must not deadlock" waits in the assembly tests.
+    ///
+    /// These guards exist to fail a genuine hang, not to assert how fast
+    /// assembly is. `scripts/ci/parallel_runtime_test_gate.sh` runs the suite
+    /// at 16 threads; under that contention the previous budgets stopped being
+    /// deadlock guards and became scheduling assertions. Assembly is
+    /// sub-second when it is not hung, so 30s cannot be reached by ordinary
+    /// runner load.
+    const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
@@ -15606,7 +15616,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -15718,7 +15728,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let _assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -15733,7 +15743,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .expect("assemble must not hang");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + ASSEMBLY_HANG_GUARD;
         let mut assembly_event = None;
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
@@ -22242,7 +22252,8 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        process_channel_message(
+        // Keep all three futures heap-backed to fit the Windows test-thread stack.
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-before-new".to_string(),
@@ -22260,7 +22271,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         let skill_dir = workspace.path().join("skills").join("refresh-test");
@@ -22334,7 +22345,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-new-session".to_string(),
@@ -22352,7 +22363,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
@@ -22377,7 +22388,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-after-new".to_string(),
@@ -22395,7 +22406,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
