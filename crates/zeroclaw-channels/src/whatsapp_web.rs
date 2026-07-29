@@ -909,6 +909,7 @@ impl WhatsAppWebChannel {
                 passive_context,
                 explicitly_addressed: false,
                 conversation_scope,
+                references: Vec::new(),
             })
             .await
         {

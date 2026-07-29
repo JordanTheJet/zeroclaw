@@ -22925,6 +22925,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )
@@ -24672,6 +24673,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )
