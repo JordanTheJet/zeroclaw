@@ -203,7 +203,9 @@ schema matching the current values, update tool/channel guests to deserialize
 typed JSON rather than a string map, rebuild, and re-sign because the schema is
 signature-covered. Host integrations now inject `PluginConfigResolver` instead
 of an owned config map and pass only `ResolvedPluginConfig` to low-level guest
-calls.
+calls. [Migrating to typed config](./migrating-to-typed-config.md) is the
+step-by-step recipe, including the release decision to ship this enforcement
+without a compatibility shim.
 
 This is a strict pre-1.0 key format: legacy entries named only after a package
 or binding are not consulted. For an existing tool package, run `zeroclaw
