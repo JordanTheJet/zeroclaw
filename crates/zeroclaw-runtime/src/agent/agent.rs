@@ -4562,9 +4562,7 @@ mod tests {
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
                 .config(config)
                 .skills(skills)
-                .skills_prompt_mode(
-                    zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
-                )
+                .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
                 .workspace_dir(workspace.path().to_path_buf())
                 .build()
                 .expect("agent builder should succeed");
@@ -9465,9 +9463,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .config(agent_config)
             .skills(skills)
-            .skills_prompt_mode(
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
-            )
+            .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_provider_name("openai".to_string())
             .model_name("gpt-4o-mini".to_string())
