@@ -1165,17 +1165,20 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
+    // Command-name entries continue to match by basename, case-insensitively.
+    // Callers lowercase the basename before it reaches here, so folding only
+    // one side would leave an entry written as `Git` or `Docker` unable to
+    // match anything.
+    let allowed_lower = allowed.to_ascii_lowercase();
+    let base_lower = executable_base.to_ascii_lowercase();
+    if allowed_lower == base_lower {
         return true;
     }
 
+    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
+    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
     #[cfg(target_os = "windows")]
     {
-        let base_lower = executable_base.to_ascii_lowercase();
-        let allowed_lower = allowed.to_ascii_lowercase();
         for ext in &[".exe", ".cmd", ".bat"] {
             if base_lower == format!("{allowed_lower}{ext}") {
                 return true;
@@ -2907,6 +2910,34 @@ mod tests {
         assert!(p.is_command_allowed("kubectl get pods"));
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("git status"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_matches_command() {
+        // Callers lowercase the executable basename before the allowlist
+        // comparison, so an entry written with any uppercase could never match
+        // until both sides were folded.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("docker ps"));
+        // The invocation may also be capitalized; the basename is folded too.
+        assert!(p.is_command_allowed("GIT status"));
+        // Entries that are genuinely absent are still refused.
+        assert!(!p.is_command_allowed("kubectl get pods"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_does_not_widen_path_matching() {
+        // Path-like entries stay case-sensitive: on Unix, paths are.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/usr/bin/Antigravity"));
+        assert!(!p.is_command_allowed("/usr/bin/antigravity"));
     }
 
     #[test]
