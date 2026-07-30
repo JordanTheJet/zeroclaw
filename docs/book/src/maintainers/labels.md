@@ -201,7 +201,6 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:slack` | `slack.rs` |
 | `channel:telegram` | `telegram.rs` |
 | `channel:twitter` | `twitter.rs` |
-| `channel:wati` | `wati.rs` |
 | `channel:webhook` | `webhook.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
 | `channel:whatsapp` | `whatsapp.rs`, `whatsapp_storage.rs`, `whatsapp_web.rs` |

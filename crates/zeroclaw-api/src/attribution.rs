@@ -92,6 +92,8 @@ pub enum ChannelKind {
     Twitter,
     VoiceCall,
     VoiceWake,
+    /// Retained after the WATI channel was removed so historical
+    /// attribution records that name it still deserialize.
     Wati,
     #[strum(serialize = "wecom")]
     WeCom,

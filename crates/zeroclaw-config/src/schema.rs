@@ -42,7 +42,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
-    "channel.wati",
     "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
@@ -12945,10 +12944,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub linq: HashMap<String, LinqConfig>,
-    /// WATI WhatsApp Business API channel instances (`[channels.wati.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub wati: HashMap<String, WatiConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13161,12 +13156,6 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
-                kind: "wati",
-                name: "WATI",
-                desc: "WhatsApp via WATI Business API",
-                configured: !self.wati.is_empty(),
-            },
-            ChannelInfo {
                 kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
@@ -13335,7 +13324,6 @@ impl ChannelsConfig {
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
-            || self.wati.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -13370,7 +13358,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13382,7 +13370,6 @@ impl ChannelsConfig {
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
-            ("wati", !self.wati.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
@@ -13468,7 +13455,6 @@ impl Default for ChannelsConfig {
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -14751,57 +14737,6 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
-    }
-}
-
-/// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.wati"]
-pub struct WatiConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// WATI API token (Bearer auth).
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_token: String,
-    /// WATI API base URL (default: <https://live-mt-server.wati.io>).
-    #[tab(Advanced)]
-    #[serde(default = "default_wati_api_url")]
-    pub api_url: String,
-    /// Tenant ID for multi-channel setups (optional).
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-fn default_wati_api_url() -> String {
-    "https://live-mt-server.wati.io".to_string()
-}
-
-impl ChannelConfig for WatiConfig {
-    fn name() -> &'static str {
-        "WATI"
-    }
-    fn desc() -> &'static str {
-        "WhatsApp via WATI Business API"
     }
 }
 
@@ -25121,7 +25056,6 @@ auto_save = true
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
-                wati: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -26866,7 +26800,6 @@ allowed_users = ["@u:matrix.org"]
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -27388,7 +27321,6 @@ allowed_numbers = ["+1", "+2"]
                 },
             )]),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
