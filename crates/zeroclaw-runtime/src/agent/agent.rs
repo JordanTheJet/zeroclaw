@@ -1928,6 +1928,26 @@ impl Agent {
         Ok(())
     }
 
+    fn rebuild_streamed_system_prompt_for_active_provider(
+        &mut self,
+        loop_history: &mut [ChatMessage],
+    ) -> Result<()> {
+        let dispatcher = tool_dispatcher_for_provider(&self.config, self.model_provider.as_ref());
+        self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
+
+        let Some(ConversationMessage::Chat(persisted)) = self.history.first() else {
+            return Ok(());
+        };
+        let Some(active) = loop_history
+            .first_mut()
+            .filter(|message| message.role == "system")
+        else {
+            return Ok(());
+        };
+        active.content.clone_from(&persisted.content);
+        Ok(())
+    }
+
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
@@ -2875,6 +2895,17 @@ impl Agent {
                             new_model,
                         )
                     {
+                        if let Err(error) = self
+                            .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                        {
+                            let notice = self.trim_history(Some(&turn_id));
+                            forward_history_trim_notice(&event_tx, notice).await;
+                            return Err(StreamedTurnError {
+                                error,
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
@@ -4489,6 +4520,70 @@ mod tests {
                 !prompt.contains(XML_TOOLS_MARKER),
                 "prompt must be rebuilt without XML tool listing"
             );
+        }
+
+        #[test]
+        fn streamed_provider_switch_refreshes_active_loop_skills_prompt() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let (provider, _) = capturing_provider(false);
+            let config = zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    strict_tool_parsing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let skills = vec![crate::skills::Skill {
+                name: "deploy".into(),
+                description: "Release safely".into(),
+                description_localizations: Default::default(),
+                version: "1.0.0".into(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec!["Run smoke tests before deploy.".into()],
+                slash_options: Vec::new(),
+                location: None,
+            }];
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .config(config)
+                .skills(skills)
+                .skills_prompt_mode(
+                    zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+                )
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                "stale compact prompt",
+            ))];
+            let mut loop_history = vec![ChatMessage::system("stale compact prompt")];
+
+            agent
+                .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
+                .expect("streamed prompt rebuild should succeed");
+
+            assert!(
+                loop_history[0]
+                    .content
+                    .contains("Run smoke tests before deploy."),
+                "active loop history must receive the loader-safe inlined instructions"
+            );
+            assert!(!loop_history[0].content.contains("read_skill(name)"));
         }
 
         #[tokio::test]
@@ -9336,16 +9431,43 @@ mod tests {
                 ..zeroclaw_config::schema::Config::default()
             })),
         };
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            location: None,
+        }];
 
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "ollama".to_string(),
-                target_model: "llama3".to_string(),
-            })])
+            .tools(vec![
+                Box::new(ModelSwitchTriggerTool {
+                    target_provider: "ollama".to_string(),
+                    target_model: "llama3".to_string(),
+                }),
+                Box::new(NamedMockTool::new("read_skill")),
+            ])
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .skills(skills)
+            .skills_prompt_mode(
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            )
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_provider_name("openai".to_string())
             .model_name("gpt-4o-mini".to_string())
@@ -9377,6 +9499,20 @@ mod tests {
         assert_eq!(
             agent.model_name, "llama3",
             "turn_streamed must commit the switched model after the tool result"
+        );
+        let prompt = match agent.history.first() {
+            Some(ConversationMessage::Chat(message)) if message.role == "system" => {
+                &message.content
+            }
+            _ => panic!("history must retain the rebuilt system prompt"),
+        };
+        assert!(
+            prompt.contains("Run smoke tests before deploy."),
+            "strict non-native switch must inline instructions when read_skill is unavailable"
+        );
+        assert!(
+            !prompt.contains("read_skill(name)"),
+            "strict non-native switch must not retain compact loader instructions"
         );
 
         // The original provider is used for exactly the first call; the next
