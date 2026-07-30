@@ -9451,12 +9451,10 @@ mod tests {
 
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![
-                Box::new(ModelSwitchTriggerTool {
-                    target_provider: "ollama".to_string(),
-                    target_model: "llama3".to_string(),
-                }),
-            ])
+            .tools(vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "ollama".to_string(),
+                target_model: "llama3".to_string(),
+            })])
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
