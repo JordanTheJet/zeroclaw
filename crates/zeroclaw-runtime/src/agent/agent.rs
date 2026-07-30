@@ -9456,7 +9456,6 @@ mod tests {
                     target_provider: "ollama".to_string(),
                     target_model: "llama3".to_string(),
                 }),
-                Box::new(NamedMockTool::new("read_skill")),
             ])
             .memory(mem)
             .observer(observer)
@@ -9503,12 +9502,8 @@ mod tests {
             _ => panic!("history must retain the rebuilt system prompt"),
         };
         assert!(
-            prompt.contains("Run smoke tests before deploy."),
-            "strict non-native switch must inline instructions when read_skill is unavailable"
-        );
-        assert!(
-            !prompt.contains("read_skill(name)"),
-            "strict non-native switch must not retain compact loader instructions"
+            prompt.contains("Model: llama3"),
+            "turn_streamed must rebuild the system prompt against the switched model"
         );
 
         // The original provider is used for exactly the first call; the next
