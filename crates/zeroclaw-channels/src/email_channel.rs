@@ -794,10 +794,19 @@ impl EmailChannel {
         if !is_new {
             return Ok(true);
         }
-        let reply_target = email
-            .reply_to
-            .clone()
-            .unwrap_or_else(|| email.sender.clone());
+        let reply_target = match email.reply_to.as_ref() {
+            Some(reply_to) if self.is_sender_allowed(reply_to) => reply_to.clone(),
+            Some(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Ignoring email Reply-To because the destination is not allowlisted"
+                );
+                email.sender.clone()
+            }
+            None => email.sender.clone(),
+        };
         let msg = ChannelMessage {
             id: email.msg_id,
             reply_target,
@@ -1635,7 +1644,7 @@ mod tests {
         let channel = EmailChannel::new(
             mailbox_identity_config(),
             "email_test_alias",
-            resolver_from(vec!["*".to_string()]),
+            resolver_from(vec!["@example.invalid".to_string()]),
         );
         let parsed = parse_test_email(
             b"From: Sender <sender@example.invalid>\r\n\
@@ -1661,6 +1670,30 @@ mod tests {
                 "second@example.invalid".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_rejects_unallowlisted_reply_to() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["@trusted.example.invalid".to_string()]),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@trusted.example.invalid>\r\n\
+              Reply-To: attacker@evil.example.invalid\r\n\
+              Subject: Redirect attempt\r\n\
+              \r\n\
+              hello",
+        );
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        channel.dispatch_email(email, &tx).await.unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.sender, "sender@trusted.example.invalid");
+        assert_eq!(msg.reply_target, "sender@trusted.example.invalid");
     }
 
     #[tokio::test]
