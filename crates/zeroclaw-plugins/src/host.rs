@@ -433,8 +433,8 @@ fn admit_component(
         .wasm_path
         .as_deref()
         .map(|relative| {
-            let path = resolve_confined_wasm_path(plugin_dir, relative)?;
-            let bytes = read_stable_file(&path)?;
+            let confined = resolve_confined_wasm_path(plugin_dir, relative)?;
+            let bytes = read_stable_file(&confined)?;
             if let Some(expected) = manifest.wasm_sha256.as_deref() {
                 signature::verify_payload_digest(&bytes, expected)?;
             }
@@ -443,10 +443,23 @@ fn admit_component(
         .transpose()
 }
 
+/// A payload path that passed package confinement, carried together with the
+/// canonical package root it was anchored to and that root's directory identity
+/// at admission time. The stable read re-checks against these instead of
+/// re-resolving the path, so a later ancestor swap cannot redefine the target.
+pub(crate) struct ConfinedPayload {
+    root: PathBuf,
+    root_handle: same_file::Handle,
+    path: PathBuf,
+}
+
 /// Resolve a manifest's executable path without allowing traversal or symlink
 /// indirection outside the package. Every existing component is checked before
 /// canonicalization so an in-package symlink is rejected as well.
-fn resolve_confined_wasm_path(plugin_dir: &Path, relative: &str) -> Result<PathBuf, PluginError> {
+fn resolve_confined_wasm_path(
+    plugin_dir: &Path,
+    relative: &str,
+) -> Result<ConfinedPayload, PluginError> {
     let relative = Path::new(relative);
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
@@ -464,6 +477,7 @@ fn resolve_confined_wasm_path(plugin_dir: &Path, relative: &str) -> Result<PathB
     }
 
     let root = std::fs::canonicalize(plugin_dir)?;
+    let root_handle = same_file::Handle::from_path(&root)?;
     let mut candidate = root.clone();
     for component in relative.components() {
         if let Component::Normal(segment) = component {
@@ -497,39 +511,75 @@ fn resolve_confined_wasm_path(plugin_dir: &Path, relative: &str) -> Result<PathB
             relative.display()
         )));
     }
-    Ok(resolved)
+    Ok(ConfinedPayload {
+        root,
+        root_handle,
+        path: resolved,
+    })
 }
 
-/// Open the canonical payload once and confirm that the opened file object is
-/// still the object named by that path before returning its bytes.
-pub(crate) fn read_stable_file(path: &Path) -> Result<Vec<u8>, PluginError> {
-    let file_name = path.file_name().ok_or_else(|| {
+/// Read a payload that passed confinement, anchored to the package root that
+/// admitted it. The parent is never re-canonicalized: re-resolving it would let
+/// a renamed ancestor replaced by a symlink define its own expected location.
+/// Instead the admitted root must still be the same directory object, no
+/// segment beneath it may have become a symlink, and the opened file object
+/// must still be the one named by the root-anchored path.
+pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, PluginError> {
+    let ConfinedPayload {
+        root,
+        root_handle,
+        path,
+    } = confined;
+
+    let swapped = || {
         PluginError::InvalidManifest(format!(
-            "WASM payload path has no file name: {}",
+            "WASM payload path changed after confinement check: {}",
+            path.display()
+        ))
+    };
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        PluginError::InvalidManifest(format!(
+            "WASM payload escaped its package root {}: {}",
+            root.display(),
             path.display()
         ))
     })?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let expected = std::fs::canonicalize(parent)?.join(file_name);
-    let mut file = std::fs::File::open(&expected)?;
-    if !file.metadata()?.is_file() {
+
+    // Refuse to open anything that is not already a regular file, so a swapped
+    // ancestor cannot point the open at a fifo or device and stall admission.
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(PluginError::InvalidManifest(format!(
             "WASM payload is not a regular file: {}",
-            expected.display()
+            path.display()
         )));
     }
 
+    let mut file = std::fs::File::open(path)?;
     let opened = same_file::Handle::from_file(file.try_clone()?)?;
-    let resolved = std::fs::canonicalize(&expected)?;
-    let current = same_file::Handle::from_path(&resolved)?;
-    if resolved != expected || opened != current {
+
+    // Everything below runs after the open, so it describes the object actually
+    // held rather than whatever the path resolved to beforehand.
+    if same_file::Handle::from_path(root)? != *root_handle {
         return Err(PluginError::InvalidManifest(format!(
-            "WASM payload path changed after confinement check: {}",
-            expected.display()
+            "plugin package root changed after confinement check: {}",
+            root.display()
         )));
+    }
+
+    let mut prefix = root.clone();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(swapped());
+        };
+        prefix.push(segment);
+        if std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+            return Err(swapped());
+        }
+    }
+
+    if !file.metadata()?.is_file() || opened != same_file::Handle::from_path(path)? {
+        return Err(swapped());
     }
 
     let mut bytes = Vec::new();
@@ -1438,9 +1488,11 @@ minimum = 1
         use std::os::unix::fs::symlink;
 
         let root = tempdir().unwrap();
-        let payload = root.path().join("plugin.wasm");
+        let package = root.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let payload = package.join("plugin.wasm");
         std::fs::write(&payload, b"inside").unwrap();
-        let confined = std::fs::canonicalize(&payload).unwrap();
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
         let outside = root.path().join("outside.wasm");
         std::fs::write(&outside, b"outside").unwrap();
         std::fs::remove_file(&payload).unwrap();
@@ -1450,6 +1502,66 @@ minimum = 1
             read_stable_file(&confined),
             Err(PluginError::InvalidManifest(_))
         ));
+    }
+
+    /// The package directory itself is renamed away and replaced by a symlink
+    /// to attacker-controlled bytes after confinement resolved the payload.
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_package_root_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.wasm"), b"admitted component").unwrap();
+
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir_all(&attacker).unwrap();
+        std::fs::write(attacker.join("plugin.wasm"), b"attacker component").unwrap();
+
+        std::fs::rename(&package, root.path().join("plugins").join("pkg-moved")).unwrap();
+        symlink(&attacker, &package).unwrap();
+
+        let read = read_stable_file(&confined);
+        assert!(
+            !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
+            "package-root swap admitted attacker bytes"
+        );
+        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
+    }
+
+    /// An intermediate directory inside the package is renamed away and replaced
+    /// by a symlink to attacker-controlled bytes after confinement resolved the
+    /// payload.
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_intermediate_directory_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        let nested = package.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("plugin.wasm"), b"admitted component").unwrap();
+
+        let confined = resolve_confined_wasm_path(&package, "nested/plugin.wasm").unwrap();
+
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir_all(&attacker).unwrap();
+        std::fs::write(attacker.join("plugin.wasm"), b"attacker component").unwrap();
+
+        std::fs::rename(&nested, package.join("nested-moved")).unwrap();
+        symlink(&attacker, &nested).unwrap();
+
+        let read = read_stable_file(&confined);
+        assert!(
+            !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
+            "intermediate directory swap admitted attacker bytes"
+        );
+        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
     }
 
     #[test]
