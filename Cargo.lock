@@ -13947,6 +13947,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-tool-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-tools"
 version = "0.8.3"
 dependencies = [
