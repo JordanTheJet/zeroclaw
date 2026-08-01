@@ -1,162 +1,141 @@
-# ZeroClaw v0.8.3
+# ZeroClaw v0.8.4
 
-This release is a large consolidation cycle spanning **379 commits** from **56 contributors**, focused on the new Standard Operating Procedure (SOP) engine, a WebAssembly plugin host, a Git forge channel, and a broad round of runtime, provider, and security hardening. If you run ZeroClaw agents in production, the headline changes are the procedural-memory/SOP substrate, tighter context-budget accounting, and a wave of SSRF and secret-leak fixes. Desktop and quickstart flows also get meaningful polish.
+This release spans **271 commits** from **30 contributors**. Two things stand out. ZeroClaw is on crates.io again: `cargo install zeroclaw` works for the first time since the microkernel split, and the workspace publishes as eighteen libraries you can depend on directly. The rest of the cycle went into memory, which gained typed classification, reranking, auditing and content scanning, and into the SOP engine, which grew an approval broker with quorum and per-SOP admission control.
+
+If you run agents in production, the headline items are the memory pipeline's new safety boundaries (content is scanned at both write and recall), the SOP approval broker, and a Landlock fix that could previously restrict ZeroClaw itself.
 
 ## Highlights
 
-- **SOP (Standard Operating Procedure) engine** lands end to end — a daemon maintenance tick, typed step contracts, live step execution, cron/filesystem/calendar triggers, and an out-of-band approval plane.
-- **WebAssembly plugin host** (wasmtime component model) for tools, channels, and memory, with per-call execution limits, signature-policy enforcement, and registry search/install by name.
-- **Git forge channel** with GitHub and Gitea/Forgejo providers, plus a unified `git_forge` tool and SOP ingress.
-- **Self-contained desktop app** returns — the kernel now ships as a Tauri sidecar for a Quickstart-first companion experience.
-- **Cost & usage accounting** gains a task-attributed usage ledger, offline pricing catalog, and by-period / org-billed views in ZeroCode.
-- **Security hardening** across the board: multiple SSRF gaps closed, constant-time token comparison, signing-key leak prevention, path-traversal fixes, and dependency bumps clearing several RUSTSEC advisories.
+- **`cargo install zeroclaw` works.** The workspace publishes to crates.io as eighteen crates, with `zeroclaw` as the installable entry point.
+- **Scoop publishing is fixed and Homebrew moved to Homebrew Core's autobump**, so `scoop update zeroclaw` resolves the exact binary the release shipped.
+- **Memory grew a safety and quality pipeline**: typed classification, an opt-in retrieval cache, a gated rerank stage, an audit trail with observer fan-out, and content scanning at the write and recall boundaries.
+- **SOPs gained real approvals**: an approval broker with group membership and quorum at the gate chokepoint, per-SOP admission policy, and checkpoint edit/revise for deterministic pipelines.
+- **In-app upgrade from the web dashboard**, with auto-restart.
+- **Landlock no longer restricts ZeroClaw itself**, worth picking up if you run with Landlock enabled.
 
 ## What's New
 
-### SOP & Procedural Memory
-- A daemon SOP maintenance tick now drives live procedures, executing real steps, enforcing step scope/mode/routing/schemas at the engine boundary, and consuming CAS run claims (#8391, #8399, #8416, #8420, #8430, #8493, #8502, #8506).
-- Cron, filesystem, and calendar no-show triggers wire into the maintenance tick (#8400, #8461, #8419).
-- An out-of-band approval plane fails closed on timeout, with a priority-based gate fix, and deterministic capability steps now run through a registry that fails closed on driverless steps (#8304, #8724).
-- A procedural memory workshop and web visual authoring (experimental) with channel fan-in and a selectable agent were added (#8509, #8590).
+### Distribution
 
-### Plugins
-- A wasmtime component-model host now backs tool, channel, and memory plugins, with channel host bindings (`wasi:http`, inbound queue, config jail) and a registration API (#8368, #8551).
-- Plugins gain per-call execution limits and an FND-001 backend taxonomy, honor the configured signature policy when loading tools, and support registry search plus install-by-name (#8491, #8172, #8264).
+**crates.io.** The root package is now named `zeroclaw` (previously `zeroclawlabs`), so `cargo install zeroclaw --locked` installs the binary of the same name. Eighteen workspace crates publish, so downstream projects can depend on `zeroclaw-api`, `zeroclaw-plugins`, `zeroclaw-memory` and the rest directly rather than pinning a git revision.
 
-### Channels & Git Forge
-- New Git forge channel with a GitHub provider and SOP ingress, plus a Gitea/Forgejo provider (#8609, #8611).
-- Operators can now bind identities without the `/bind` code round-trip (#8707).
-- WhatsApp gains native location-pin support on both backends and passive group context; LINE gets a loading indicator, icon/nickname switching, and bind reply feedback (#8427, #8389, #7768).
-- Tool approvals can be routed to a distinct approver channel (#8231).
+**Scoop (Windows).** Scoop publishing is repaired (#9295). The manifest renders from the checked-in `dist/scoop/zeroclaw.json` and is pinned to the exact checksum of the published release asset, so `scoop update zeroclaw` resolves the same binary the release actually shipped. The publisher proves write access with a non-mutating `git push --dry-run`, and repeat publishes are idempotent.
 
-### Runtime & Memory
-- Unified memory-context injection is now keyed on `TurnOrigin` ingress provenance, and a durable memory store seam adds supersede/dedup/budget/policy-gate handling with embedding-identity persistence and automatic vector migration on change (#8619, #8570, #8623).
-- Metered provider seams (`ResolvedModelAccess::run_model_query`) now cover the model-query path and the max-iteration graceful summary (#8806, #8821).
-- Process RAM/CPU sampling landed on macOS, Windows, and FreeBSD via `sysinfo`, and a model-context-window bar was added to the ZeroCode TUI, gateway agent chat, and interactive CLI (#8802, #7946).
-- Goal task storage foundation and a configurable native runtime shell were added (#8685, #8311).
+**Homebrew (macOS / Linux).** The project's own Homebrew workflow has been removed (#9295). Homebrew Core's [autobump service](https://docs.brew.sh/Autobump) detects the stable GitHub release and opens the formula bump itself. Nothing changes for you as a user; if a bump looks stale, check Homebrew's autobump status rather than expecting a ZeroClaw workflow to have run.
 
-### ZeroCode (Desktop / TUI)
-- A TodoWrite tracker (RPC + ACP + durable persistence) and cron run history/trigger were added, along with a Cost tab with by-period and org-billed views (#8639, #7905, #8483).
-- ACP multiple-choice elicitation now uses `elicitation/create` when the client advertises form support, with single- and multi-select prompts rendered in the ZeroCode Code tab (#8338).
-- You can now choose a saved Code session on entry, switch agents in active sessions, and use ctrl-w word delete (#8922, #8477, #8774).
-- The self-contained desktop app is reintroduced as a Quickstart-first companion with a bundled kernel sidecar (#8565, #8708).
-- Quickstart supports subscription authentication modes and inline CLI subscription auth, while release workflows publish self-contained desktop installers for macOS, Linux, and Windows (#8980, #8981, #8709).
+**AUR.** The publisher dropped a brittle `ssh -T` probe and now treats a successful package clone as the authoritative authentication check (#9295).
 
-### Providers, Tools & Cost
-- Provider requests now thread `provider_timeout_secs` and `extra_headers` through the responses path (#8229).
-- A Bocha AI web-search provider was added, and `browser_open` now allows `http://` URLs and `allowed_private_hosts` opt-in (#8737, #8136, #8171).
-- Cost tracking gains a task-attributed usage ledger, offline pricing catalog, live-gateway price backfill for unpriced models, and cost/org snapshot plus windowed cost/query RPCs (#8686, #8380, #8233, #8482).
-- MCP gains resources-as-context, pinning, named-prompt rendering, and a policy-gated resource/prompt client surface (#8508, #8403).
+**Removed crates.** `aardvark-sys` (Total Phase USB adapter bindings) and `zeroclaw-robot-kit` left the workspace. `zeroclaw-hardware` is unaffected apart from losing the Aardvark transport; USB discovery, serial, UF2, Pico flashing and Raspberry Pi GPIO all remain.
 
-### Gateway, Config & Skills
-- The gateway adds default HTTP security response headers and agent-aware `/api/tools` listing with an agent-scoped tool picker (#8829, #8331).
-- Config adds independent delegate targets, a `local_small` runtime preset, and `x-required-by-transport` metadata for MCP servers (#8239, #8531, #8349).
-- The web config form renders a risk profile's four tool-permission lists (`allowed_tools`/`excluded_tools`/`auto_approve`/`always_ask`) as one authorization-and-approval grid that honors the profile's autonomy level, surfacing the approval settings as stored overrides under `full`/`readonly` where they no longer drive prompts (#8879).
-- Skills install/list/remove are now bundle-aware, surface security-audit-skipped skills, and support an opt-in bounded SKILL.md reflection for skill creation (#8335, #8699, #8261).
-- Observability adds a runtime OpenTelemetry content policy for LLM/tool I/O and a rotating log-persistence mode (#8567, #8307).
-- Per-turn output routing via `send_via` with voice-delivery fixes landed (#7361).
+### Memory
 
-### Install, Release & Supply Chain
-- Standard prebuilts remain on the lean supported channel set, correcting an unreleased broadening introduced after v0.8.2; target-specific Android and ARM exclusions are now resolved centrally, and `install.sh --full` remains available for the broader source-build surface (#9051, #8566).
-- Release automation adds CycloneDX SBOM generation, cosign signing, SLSA provenance, and self-contained desktop installers (#8158, #8404, #8277, #8709).
-- Release verification Markdown is escaped before it reaches GitHub workflow output (#9031).
+- Typed memory classification with gated typed-facts extraction (#8900)
+- Content scanned at both the write and recall boundaries (#8984)
+- A gated rerank stage in engine memory-context injection (#8895)
+- An opt-in retrieval cache decorator over agent memory (#8897)
+- A gated audit trail with observer fan-out (#8893)
+- Config semantics validation and a migration reindex hook (#8899)
 
-### Improvements
-- Tool assembly across the runtime (agent creation, independent delegates, `process_message`, and `loop_::run`) was routed through a single `ScopedToolRegistry` seam (#8711, #8744, #8701, #8700).
-- MCP prompt-section composition is now owned at the `ScopedAssembled` boundary, and the orchestrator turn routes back through `ResolvedAgentExecution::resolve` (#8812, #8629).
-- Performance: JSONL fsync moved off the async hot path, the web-search tag-strip regex is cached in a `LazyLock`, and the orchestrator notify channel is bounded with capped path/URL bodies (#8439, #8350, #8460).
-- Windows builds now statically link the MSVC CRT, and prebuilt Docker image variants were consolidated with an added arm64 target (#8604, #8485, #5187).
+### SOP engine
 
-### Documentation
-- SOP fan-in usage docs, an autolinked ACP elicitation RFD, and repaired SOP fan-in snippet links were added (#8521, #8498, #8595).
+- An approval broker with group membership and quorum over the gate chokepoint (#8880)
+- The exec slot is released on HITL approval, with a per-SOP admission policy (#8848)
+- Channel gate prompts with checkpoint edit and revise (#8979)
+- Fan-in ingress adapters centralized (#9205)
+
+### Channels
+
+- Mattermost WebSocket listener mode (#9141)
+- Channel-owned relink hooks behind `POST /api/channels/{channel}/relink` (#8734)
+- Structured login lifecycle events for QR pairing (#8622)
+- Poll-vote and interactive-reply events, plus `Channel::send_choice` (#6297)
+- Per-channel inbound debounce for Telegram (#8440)
+- WhatsApp Web persists linked identity into canonical `peer_groups` on connect (#8735)
+
+### Gateway and web
+
+- In-app upgrade with auto-restart from the web dashboard (#8173)
+- Channel readiness reports `authenticated` from channel-owned persisted-login probes (#8732)
+- ACP sessions select their agent via an `?agent=` query parameter (#9026), and ACP accepts `resource.blob` in prompts with `deliver_file` citation URIs (#9195)
+- LAN peer discovery hints (#8325)
+- Risk-profile tool permissions unified into one grid (#8879); skills link through to the editor (#8558)
+
+### Runtime, providers, and observability
+
+- Model fallback notices surface on direct-turn surfaces (#8684)
+- Memory and RAG spans nest under the turn trace (#8752)
+- New OpenAI slots default to `wire_api=responses` (#9021), and model context windows carry from the models.dev catalogue (#9347)
+- Web search classifies provider HTTP failures with a precise `search_status` (#8890)
+- Cron gained `shell_output_format` for raw stdout (#8438)
+- Quickstart recommends capability-safe runtime defaults (#8987)
+
+### zerocode
+
+- Active runtime context in the dashboard (#9011), agent rename flow (#7954), and searchable keybinding help (#9356)
+
+### Security
+
+- Landlock no longer restricts ZeroClaw itself (#9233)
+- The webhook channel refuses to start a listener without a configured secret (#8725)
+- Shell injection via a `workflow_dispatch` tag input is prevented in CI (#9165)
 
 ## Bug Fixes
 
-| Area | Fix |
+One hundred and forty-six fixes landed. By area:
+
+| Area | Fixes |
 |---|---|
-| Runtime | Enforce context budget against provider-reported tokens; enforce leading user-turn invariant before dispatch; strip orphaned `tool_use` on max-iterations exit (#8840, #8696, #7865) |
-| Runtime | Arc-share tool schemas to stop per-iteration clone churn; hot-reload log-persistence config; thread `agent_alias` into `agent_turn`'s ToolLoop (#8817, #8816, #8921) |
-| Providers | Guard SSE parsers against EOF-as-success truncation; omit `tool_choice`/empty tool-call content for empty tool lists; clean Anthropic tool schemas before native serialization (#8663, #8667, #8524, #7961) |
-| Providers | Distinguish missing vs expired OpenAI Codex credentials; prefer `chatgpt_account_id` claim in Codex JWT extraction; cool down rate-limited fallback entries (#8029, #8002, #8317) |
-| Security | Close SSRF gaps in Matrix marker URLs, text_browser, and skill_http userinfo; harden WeChat attachment path against traversal (#8657, #8635, #8658, #8628) |
-| Security | Constant-time `nodes.auth_token` comparison; reject empty bearer token; prevent signing-key leak via `VarError`; scan link/image destinations for credential patterns (#8824, #8727, #8591, #8906) |
-| Config | Protect runtime state files and real `config.toml` from agent self-modification; auto-materialize new map aliases in config patch (#8660, #8606, #8842) |
-| Channels | Localize channel runtime replies; use resolved agent config for `strict_tool_parsing`/`parallel_tools`; serialize per-sender session persistence to prevent races (#8769, #7836, #7847) |
-| ZeroCode | Fix intermittent `ask_user` failures under ACP elicitation; use runtime-profile `max_context_tokens` for context meter; strip markdown fences from code-block copy (#8773, #8872, #8777) |
-| Memory | Refresh embedder on config change; resolve dotted embedding provider refs; make `SqliteMemory: Clone` valid by sharing one embedder lock (#8625, #8152, #8868) |
-| Gateway | Propagate pairing DB errors instead of panic; advertise A2A cards on the runtime port; exclude env-overridden secrets from reload drift (#8466, #8538, #8704) |
-| Cost | Atomic ledger appends with concatenated-record recovery; observability CLI one-shot no longer loses telemetry/token totals on exit (#8412, #8146) |
-| Deps | Bump crossbeam-epoch (RUSTSEC-2026-0204), anyhow (RUSTSEC-2026-0190), and remove rag-pdf/ttf-parser (RUSTSEC-2026-0192) (#8783, #8500, #8547) |
-| Install | Prebuild dashboard for embedded web; exclude Tauri apps from `--full` app sweep; register `zerocode.exe` in the Scoop manifest (#8643, #8786, #8276) |
-| Tools | Pin `http_request` to vetted DNS addresses; cap calculator values array to prevent OOM; bound `browser_open` launcher waits (#7902, #8481, #8564) |
-| Tools | Stop `ask_user` hangs: prefer the originating conversation channel over HashMap order, fail fast when structured-only channels return no choice, and align RPC/ACP/WS `channel_name` with the registered back-channel key |
-| Tools | Route `escalate_to_human` to the conversation's channel via a new `channel` parameter, and fall back to `[escalation] alert_channels` when that channel cannot deliver — failing honestly when nothing delivers, instead of reporting a delivery that never happened |
-| Tools | Stop `poll` reporting "Poll created" when a structured-only channel cancelled the prompt and the text fallback could not be delivered (single- and multi-select) |
+| runtime | 15 |
+| channels | 15 |
+| zerocode | 13 |
+| config | 13 |
+| tests | 11 |
+| providers | 9 |
+| sop | 8 |
+| web, docs, ci | 5 each |
+| plugins | 4 |
+| release, memory, deps | 3 each |
+| everything else | the remainder |
+
+The Scoop, Homebrew and AUR packaging changes are described under [Distribution](#distribution).
 
 ## Breaking Changes
 
-- **Rust toolchain floor**: the workspace MSRV is now Rust 1.96.1, with CI, containers, and documentation aligned to that version (#8801).
-- **Removed the built-in ClawHub skill-install source** (`zeroclaw skills install clawhub:<slug>` and `clawhub.ai` URLs). Install skills from a local path, a Git URL (optionally `<git-url> --skill <name>` to select one skill from a catalog repo), or a registry name instead. SkillForge's default discovery sources no longer include the never-implemented `clawhub` source (#8638).
+- **Skills: the built-in ClawHub source is replaced by a `git-catalog --skill` selector** (#8638). Configurations relying on the implicit ClawHub source must move to an explicit git catalog with a `--skill` selector.
 
 ## Contributors
 
 @alexandme
 @Alix-007
-@alteckclub
+@amrrs
 @Audacity88
-@bheatwole
-@CedricConday
-@chengzhichao-xydt
-@ConYel
-@crh-code
-@databillm
+@bglusman
+@Darren2030
+@Diwak4r
 @drbparadise
-@dvgamerr
-@eugeneb50
-@FTDGRT
-@hanZeng-08
-@HonorVanEr
-@IftekharUddin
-@initiallyqq
-@jhheider
-@jokewithme110
 @JordanTheJet
-@Leon-SK668
-@Leuca
-@LiLan0125
+@jstar0
+@Lusitaniae
+@MannXo
 @mazhuima
-@mov-xound-glitch
 @Nillth
-@NiuBlibing
 @octo-patch
-@OmkumarSolanki
-@ozpool
+@palomyates516-alt
 @perlowja
-@Pick-cat
-@piiiico
-@Project516
-@rifuki
 @ryanlee486
-@SimianAstronaut7
 @singlerider
-@sonytricoire
-@Stealinglight
+@Stalesamy
 @Super-Cabbage
-@Taswen
-@theonlyhennygod
-@theredspoon
-@thunderjr
 @tidux
+@tomatotomata
 @tzy-17
-@vrurg
 @wangmiao0668000666
 @WeeLi-009
+@wm0018
 @xydt-juyaohui
 @yanchenko
-@yuxuan-7814
-@ZOOWH
-@zverozabr
+@yijunyu
 
-## Full Changelog
+---
 
-**Full diff:** https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.2...v0.8.3
+**Full diff:** https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.3...v0.8.4
