@@ -445,7 +445,7 @@ use zeroclaw_config::schema::{
     StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
     TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
     VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 /// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
@@ -1451,6 +1451,23 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
 // ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
 
+// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ───────────
+
+impl CompatFamilySpec for ZerorouterModelProviderConfig {
+    const DISPLAY: &'static str = "ZeroRouter";
+    // No hosted deployment exists yet: default to the router container's
+    // own default bind (ZEROROUTER_BIND=0.0.0.0:8080); remote routers are
+    // reached via base.uri. Must stay in lockstep with ZerorouterEndpoint
+    // in zeroclaw-config — see
+    // `zerorouter_default_url_matches_schema_endpoint`.
+    const DEFAULT_URL: &'static str = "http://localhost:8080/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    // ZeroRouter's GET /v1/models is unauthenticated and carries pricing
+    // (OpenRouter-shaped per-token decimal strings), so live pricing works
+    // before any key is configured.
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
+
 impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
     // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
@@ -1749,6 +1766,20 @@ mod tests {
         assert!(
             merge_extra_body(None, None).is_none(),
             "no extras must yield None so the caller skips extra_body"
+        );
+    }
+
+    #[test]
+    fn zerorouter_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+        assert_eq!(
+            <ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ZerorouterEndpoint::default().uri(),
+            "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
+        );
+        assert_eq!(
+            ZerorouterEndpoint::default().uri(),
+            "http://localhost:8080/v1"
         );
     }
 
