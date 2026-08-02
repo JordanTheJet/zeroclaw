@@ -102,6 +102,23 @@ otel_tool_io_max_chars = 1000        # per-field truncation limit
 - Default `off` is a privacy-first change from previous behavior (feature-gated but always-on when enabled).
 - The content policy is bound to the observer/config instance, not to the process. There is no process-global OTel content policy: each `OtelObserver` derives an immutable content config from `ObservabilityConfig` at construction and consults it at the OTel export boundary. Multiple observers in the same process keep independent policies: a later observer cannot override or silence an earlier one's privacy setting (no last-writer-wins, no cross-observer drift).
 
+### Turn-nested memory and RAG spans (`observability-otel`)
+
+`memory.recall`, `memory.store`, and `rag.retrieve` spans nest under the
+`gen_ai.agent.invoke` turn span whenever the operation runs inside an
+attributed agent turn, so a full turn (memory recall, autosave store,
+LLM calls, tool calls) renders as one trace in Langfuse/Tempo. The three
+events carry the same `channel` / `agent_alias` / `turn_id` triple as LLM
+and tool events, exposed as `zeroclaw.channel`, `gen_ai.agent.name`, and
+`zeroclaw.turn_id` span attributes.
+
+Memory operations outside a correlated turn keep producing root spans: the
+gateway REST memory store, and the `process_message` hardware-RAG
+retrieval, which runs before the turn bracket opens and therefore stays a
+root span carrying the matching `zeroclaw.turn_id` attribute (full nesting
+of that span is tracked in #8844). A `turn_id` that no longer matches a
+live turn also degrades to a root span rather than guessing a parent.
+
 ### LLM request payload capture (`log_llm_request_payload`)
 
 `log_llm_request_payload` controls whether the `llm_request` event records the
@@ -186,10 +203,7 @@ The dashboard's Logs page is the primary surface. Underneath:
 GET /api/logs
 ```
 
-Top-level filters (query params): `since_ts`, `until_ts`, `until_id`,
-`action`, `category`, `outcome`, `severity_min`, `trace_id`, `q`
-(substring across `message` + `attributes`), `hide_internal` (drops
-`event.category = "internal"`), `limit`.
+Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
 filter, the gateway validates the key against `is_attribution_field`
@@ -218,10 +232,7 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 
 </div>
 
-Pagination is reverse-cursor. The response includes
-`next_cursor: [timestamp, id] | null`; pass these back as `until_ts` +
-`until_id` to load older. `at_end: true` means the reader scanned the
-whole file for the current filter.
+Log pagination walks backward with a byte-offset cursor. While `at_end` is false, pass a non-null `next_cursor_line_offset` back as `until_line_offset` with the same non-cursor filters to load older events without re-reading newer bytes. Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that pagination walk. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an

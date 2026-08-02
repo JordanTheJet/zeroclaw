@@ -57,8 +57,6 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    /// Generate a self-signed CA cert + key pair.
-    /// Returns (cert_pem, key_pem, key_pair) so the key can be reused for signing.
     fn test_ca() -> (String, String, rcgen::KeyPair) {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
@@ -67,7 +65,6 @@ mod tests {
         (ca_cert.pem(), ca_key.serialize_pem(), ca_key)
     }
 
-    /// Generate a server certificate signed by the given CA.
     fn test_server_cert(ca_cert_pem: &str, ca_key: &rcgen::KeyPair) -> (String, String) {
         // Re-parse the CA cert for signing.
         let ca_key_clone = rcgen::KeyPair::from_pem(&ca_key.serialize_pem()).unwrap();

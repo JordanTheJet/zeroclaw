@@ -51,6 +51,7 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 ### Gateway, Config & Skills
 - The gateway adds default HTTP security response headers and agent-aware `/api/tools` listing with an agent-scoped tool picker (#8829, #8331).
 - Config adds independent delegate targets, a `local_small` runtime preset, and `x-required-by-transport` metadata for MCP servers (#8239, #8531, #8349).
+- The web config form renders a risk profile's four tool-permission lists (`allowed_tools`/`excluded_tools`/`auto_approve`/`always_ask`) as one authorization-and-approval grid that honors the profile's autonomy level, surfacing the approval settings as stored overrides under `full`/`readonly` where they no longer drive prompts (#8879).
 - Skills install/list/remove are now bundle-aware, surface security-audit-skipped skills, and support an opt-in bounded SKILL.md reflection for skill creation (#8335, #8699, #8261).
 - Observability adds a runtime OpenTelemetry content policy for LLM/tool I/O and a rotating log-persistence mode (#8567, #8307).
 - Per-turn output routing via `send_via` with voice-delivery fixes landed (#7361).
@@ -88,10 +89,14 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 | Deps | Bump crossbeam-epoch (RUSTSEC-2026-0204), anyhow (RUSTSEC-2026-0190), and remove rag-pdf/ttf-parser (RUSTSEC-2026-0192) (#8783, #8500, #8547) |
 | Install | Prebuild dashboard for embedded web; exclude Tauri apps from `--full` app sweep; register `zerocode.exe` in the Scoop manifest (#8643, #8786, #8276) |
 | Tools | Pin `http_request` to vetted DNS addresses; cap calculator values array to prevent OOM; bound `browser_open` launcher waits (#7902, #8481, #8564) |
+| Tools | Stop `ask_user` hangs: prefer the originating conversation channel over HashMap order, fail fast when structured-only channels return no choice, and align RPC/ACP/WS `channel_name` with the registered back-channel key |
+| Tools | Route `escalate_to_human` to the conversation's channel via a new `channel` parameter, and fall back to `[escalation] alert_channels` when that channel cannot deliver — failing honestly when nothing delivers, instead of reporting a delivery that never happened |
+| Tools | Stop `poll` reporting "Poll created" when a structured-only channel cancelled the prompt and the text fallback could not be delivered (single- and multi-select) |
 
 ## Breaking Changes
 
 - **Rust toolchain floor**: the workspace MSRV is now Rust 1.96.1, with CI, containers, and documentation aligned to that version (#8801).
+- **Removed the built-in ClawHub skill-install source** (`zeroclaw skills install clawhub:<slug>` and `clawhub.ai` URLs). Install skills from a local path, a Git URL (optionally `<git-url> --skill <name>` to select one skill from a catalog repo), or a registry name instead. SkillForge's default discovery sources no longer include the never-implemented `clawhub` source (#8638).
 
 ## Contributors
 
