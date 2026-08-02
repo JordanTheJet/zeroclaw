@@ -602,39 +602,45 @@ where
         let _ = sink.close().await;
     });
 
-    // Reader loop: demultiplex daemon -> client.
+    // Reader loop: demultiplex daemon -> client. Every delivery clones the
+    // conn's sender under the map lock, drops the guard, and hands off
+    // non-blocking (see `deliver_conn_event`), so one stalled client can never
+    // freeze delivery or teardown for the other conns on this node.
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(Message::Text(t)) => match Control::from_json(&t) {
                 Ok(Control::Opened { conn_id }) => {
-                    if let Some(tx) = conns.lock().await.get(&conn_id) {
-                        let _ = tx.send(ConnEvent::Opened).await;
-                    }
+                    deliver_conn_event(&conns, &to_daemon, conn_id, ConnEvent::Opened).await;
                 }
                 Ok(Control::Close { conn_id, reason }) => {
-                    if let Some(tx) = conns.lock().await.remove(&conn_id) {
-                        let _ = tx.send(ConnEvent::Close(reason)).await;
+                    let removed = conns.lock().await.remove(&conn_id);
+                    if let Some(tx) = removed {
+                        // Best effort: if the buffer is full, dropping `tx`
+                        // (the map held the last sender) closes the channel,
+                        // which tears the conn down just the same.
+                        let _ = tx.try_send(ConnEvent::Close(reason));
                     }
                 }
                 // Daemon -> client credit-window frames: route to the conn so the
                 // client task forwards them on (and the relay guard tracks them).
                 Ok(Control::Window { conn_id, credit }) => {
-                    if let Some(tx) = conns.lock().await.get(&conn_id) {
-                        let _ = tx.send(ConnEvent::Window(credit)).await;
-                    }
+                    deliver_conn_event(&conns, &to_daemon, conn_id, ConnEvent::Window(credit))
+                        .await;
                 }
                 Ok(Control::DataAck { conn_id, consumed }) => {
-                    if let Some(tx) = conns.lock().await.get(&conn_id) {
-                        let _ = tx.send(ConnEvent::Ack(consumed)).await;
-                    }
+                    deliver_conn_event(&conns, &to_daemon, conn_id, ConnEvent::Ack(consumed)).await;
                 }
                 _ => {}
             },
             Ok(Message::Binary(b)) => {
-                if let Some((conn_id, payload)) = decode_data(&b)
-                    && let Some(tx) = conns.lock().await.get(&conn_id)
-                {
-                    let _ = tx.send(ConnEvent::Data(payload.to_vec())).await;
+                if let Some((conn_id, payload)) = decode_data(&b) {
+                    deliver_conn_event(
+                        &conns,
+                        &to_daemon,
+                        conn_id,
+                        ConnEvent::Data(payload.to_vec()),
+                    )
+                    .await;
                 }
             }
             Ok(Message::Ping(p)) => {
@@ -653,11 +659,58 @@ where
             daemons.remove(&node_id);
         }
     }
-    for (_, tx) in conns.lock().await.drain() {
-        let _ = tx.send(ConnEvent::Close("daemon_gone".into())).await;
+    let drained: Vec<_> = conns.lock().await.drain().collect();
+    for (_, tx) in drained {
+        // Non-blocking: a stalled conn must not delay tearing down the rest;
+        // dropping the sender closes its channel regardless.
+        let _ = tx.try_send(ConnEvent::Close("daemon_gone".into()));
     }
     writer.abort();
     Ok(())
+}
+
+/// Deliver one demultiplexed daemon frame to a logical conn WITHOUT blocking
+/// the shared daemon reader (July 21 review, finding 3). The sender is cloned
+/// under the map lock and the guard dropped before delivery; delivery itself is
+/// non-blocking. The per-conn buffer absorbs bursts, and credit-window flow
+/// control keeps a well-behaved client inside it, so a full buffer means a
+/// stalled or misbehaving client: that ONE conn is torn down (map entry
+/// dropped, daemon notified) while every other conn on the node keeps flowing.
+async fn deliver_conn_event(
+    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    to_daemon: &mpsc::Sender<Message>,
+    conn_id: u64,
+    ev: ConnEvent,
+) {
+    let tx = {
+        let map = conns.lock().await;
+        match map.get(&conn_id) {
+            Some(tx) => tx.clone(),
+            None => return,
+        }
+    };
+    match tx.try_send(ev) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // The client task is gone; drop the stale map entry.
+            conns.lock().await.remove(&conn_id);
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Backpressured past its credit-sized buffer: close only this
+            // conn. Removing the entry drops the last sender, so the client
+            // task observes channel closure whenever it unwedges.
+            conns.lock().await.remove(&conn_id);
+            let _ = to_daemon
+                .send(Message::text(
+                    Control::Close {
+                        conn_id,
+                        reason: "client_backpressured".into(),
+                    }
+                    .to_json(),
+                ))
+                .await;
+        }
+    }
 }
 
 /// Client connection: route it to the daemon serving `node_id` and pipe `DATA`.
@@ -934,6 +987,46 @@ fn parse_control_text(text: &str) -> Option<Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backpressured_conn_is_closed_without_stalling_others() {
+        // July 21 review, finding 3: the shared daemon reader must never block
+        // on one conn's full buffer, and only the stalled conn may be closed.
+        let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (stalled_tx, mut stalled_rx) = mpsc::channel::<ConnEvent>(1);
+        let (healthy_tx, mut healthy_rx) = mpsc::channel::<ConnEvent>(1);
+        let (to_daemon, mut daemon_rx) = mpsc::channel::<Message>(8);
+        {
+            let mut map = conns.lock().await;
+            map.insert(1, stalled_tx);
+            map.insert(2, healthy_tx);
+            // Fill conn 1's buffer so the next delivery hits Full.
+            map.get(&1).unwrap().try_send(ConnEvent::Opened).unwrap();
+        }
+
+        deliver_conn_event(&conns, &to_daemon, 1, ConnEvent::Data(vec![1])).await;
+        // The stalled conn is torn down: gone from the map, daemon notified.
+        assert!(!conns.lock().await.contains_key(&1));
+        let msg = daemon_rx.recv().await.expect("daemon close notify");
+        let text = msg.into_text().expect("close notify is a text frame");
+        assert!(
+            text.contains("client_backpressured") && text.contains("\"conn_id\":1"),
+            "got: {text}"
+        );
+
+        // The healthy conn still receives: no cross-conn stall.
+        deliver_conn_event(&conns, &to_daemon, 2, ConnEvent::Data(vec![2])).await;
+        assert!(matches!(healthy_rx.recv().await, Some(ConnEvent::Data(p)) if p == vec![2]));
+
+        // The stalled conn's channel closes once drained: the buffered event,
+        // then None (its last sender was dropped with the map entry).
+        assert!(matches!(stalled_rx.recv().await, Some(ConnEvent::Opened)));
+        assert!(stalled_rx.recv().await.is_none());
+        // A delivery to the now-unknown conn id is a silent no-op.
+        deliver_conn_event(&conns, &to_daemon, 1, ConnEvent::Opened).await;
+        assert!(daemon_rx.try_recv().is_err());
+    }
 
     #[test]
     fn outer_cert_cn_routes_else_connect_frame() {

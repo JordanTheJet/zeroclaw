@@ -677,23 +677,26 @@ async fn serve_once(
                             // Credit-window frames from the client (forwarded by
                             // the relay): route to the conn's bridge task.
                             Ok(Control::Window { conn_id, credit }) => {
-                                if let Some(tx) = conns.lock().await.get(&conn_id) {
-                                    let _ = tx.send(ConnMsg::Window(credit)).await;
-                                }
+                                deliver_conn_msg(&conns, &to_relay, conn_id, ConnMsg::Window(credit))
+                                    .await;
                             }
                             Ok(Control::DataAck { conn_id, consumed }) => {
-                                if let Some(tx) = conns.lock().await.get(&conn_id) {
-                                    let _ = tx.send(ConnMsg::Ack(consumed)).await;
-                                }
+                                deliver_conn_msg(&conns, &to_relay, conn_id, ConnMsg::Ack(consumed))
+                                    .await;
                             }
                             _ => {}
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Binary(b)) => {
-                        if let Some((conn_id, payload)) = decode_data(&b)
-                            && let Some(tx) = conns.lock().await.get(&conn_id) {
-                                let _ = tx.send(ConnMsg::Data(payload.to_vec())).await;
-                            }
+                        if let Some((conn_id, payload)) = decode_data(&b) {
+                            deliver_conn_msg(
+                                &conns,
+                                &to_relay,
+                                conn_id,
+                                ConnMsg::Data(payload.to_vec()),
+                            )
+                            .await;
+                        }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(p)) => {
                         let _ = to_relay
@@ -816,6 +819,42 @@ async fn bridge_conn(
         }))
         .await;
     conns.lock().await.remove(&conn_id);
+}
+
+/// Route one relay frame to a logical conn's bridge task WITHOUT blocking the
+/// shared relay-link reader (mirror of the zerorelay-side fix; July 21 review,
+/// finding 3). Sender cloned under the lock, guard dropped, delivery
+/// non-blocking. A full per-conn buffer means that conn's loopback write side
+/// is wedged: tear down only that conn and tell the relay, keeping every other
+/// bridged conn (and Open/Close handling) live.
+async fn deliver_conn_msg(
+    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>,
+    to_relay: &mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    conn_id: u64,
+    msg: ConnMsg,
+) {
+    let tx = {
+        let map = conns.lock().await;
+        match map.get(&conn_id) {
+            Some(tx) => tx.clone(),
+            None => return,
+        }
+    };
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            conns.lock().await.remove(&conn_id);
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            conns.lock().await.remove(&conn_id);
+            let _ = to_relay
+                .send(tungstenite_text(&Control::Close {
+                    conn_id,
+                    reason: "conn_backpressured".into(),
+                }))
+                .await;
+        }
+    }
 }
 
 fn tungstenite_text(frame: &Control) -> tokio_tungstenite::tungstenite::Message {
