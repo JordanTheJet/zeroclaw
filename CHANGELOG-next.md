@@ -49,7 +49,6 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 - MCP gains resources-as-context, pinning, named-prompt rendering, and a policy-gated resource/prompt client surface (#8508, #8403).
 
 ### Gateway, Config & Skills
-- Skill prompt injection now defaults to compact metadata with on-demand instruction loading. Explicit `full` mode remains supported during its deprecation window; hard removal is deferred to Schema V4 (#8313).
 - The gateway adds default HTTP security response headers and agent-aware `/api/tools` listing with an agent-scoped tool picker (#8829, #8331).
 - Config adds independent delegate targets, a `local_small` runtime preset, and `x-required-by-transport` metadata for MCP servers (#8239, #8531, #8349).
 - The web config form renders a risk profile's four tool-permission lists (`allowed_tools`/`excluded_tools`/`auto_approve`/`always_ask`) as one authorization-and-approval grid that honors the profile's autonomy level, surfacing the approval settings as stored overrides under `full`/`readonly` where they no longer drive prompts (#8879).
