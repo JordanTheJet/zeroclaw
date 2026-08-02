@@ -178,10 +178,20 @@ impl CertLedger {
     /// the WSS verifier re-reads the file when its mtime changes. No-op for an
     /// in-memory ledger.
     pub fn materialize_revocations(&self) -> Result<()> {
-        let Some(path) = &self.revoked_path else {
+        let conn = self.conn.lock();
+        Self::materialize_on(&conn, self.revoked_path.as_deref())
+    }
+
+    /// Materialize the revocation file from `conn`'s current view. Taking the
+    /// connection explicitly lets [`CertLedger::mark_revoked`] pass its open
+    /// transaction, enforcing a pending revocation BEFORE committing it - a
+    /// failed file write then rolls the status flip back instead of leaving a
+    /// committed revoked row the verifier never sees.
+    fn materialize_on(conn: &Connection, revoked_path: Option<&Path>) -> Result<()> {
+        let Some(path) = revoked_path else {
             return Ok(());
         };
-        let revoked = self.revoked_fingerprints()?;
+        let revoked = Self::revoked_fingerprints_on(conn)?;
         let body = if revoked.is_empty() {
             String::new()
         } else {
@@ -271,31 +281,50 @@ impl CertLedger {
 
     /// Mark a cert revoked by fingerprint. Returns true if a row changed.
     /// Writes a `CertRevoked` audit event when a row was actually flipped.
+    ///
+    /// Ordering guarantee: the status flip and the materialized enforcement
+    /// file commit together or not at all. The file is rewritten from the
+    /// in-transaction view BEFORE the SQLite commit, so
+    /// - a materialization failure rolls the flip back: the ledger never
+    ///   reports a revocation the WSS verifier is not enforcing;
+    /// - a commit failure after the file write leaves the file over-enforcing
+    ///   until the next materialization (fail-closed, never fail-open).
     pub fn mark_revoked(&self, fingerprint: &str, actor: &str) -> Result<bool> {
-        let changed = {
-            let conn = self.conn.lock();
-            conn.execute(
-                "UPDATE issued_certs SET status = 'revoked'
-                     WHERE fingerprint = ?1 AND status != 'revoked'",
-                params![fingerprint],
-            )
-            .context("revoke cert")?
-        };
-        if changed > 0 {
-            let audit_entry = if let Some(mut entry) = self.lookup_by_fingerprint(fingerprint)? {
-                entry.actor = actor.to_string();
-                Some(entry)
-            } else {
-                None
-            };
-            // Materialize so the WSS verifier refuses this cert on the next
-            // connect (drives the A5 refusal from the real revoke action).
-            self.materialize_revocations()?;
-            if let Some(entry) = audit_entry {
-                self.audit_cert(AuditEventType::CertRevoked, &entry)?;
+        let audit_entry = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().context("begin revocation transaction")?;
+            let changed = tx
+                .execute(
+                    "UPDATE issued_certs SET status = 'revoked'
+                         WHERE fingerprint = ?1 AND status != 'revoked'",
+                    params![fingerprint],
+                )
+                .context("revoke cert")?;
+            if changed == 0 {
+                return Ok(false);
             }
+            let entry = tx
+                .query_row(
+                    "SELECT fingerprint, device_id, token_hash, not_before, not_after, status, actor, issued_at
+                         FROM issued_certs WHERE fingerprint = ?1",
+                    params![fingerprint],
+                    row_to_entry,
+                )
+                .optional()
+                .context("lookup revoked cert")?;
+            // Enforce BEFORE the ledger reports it (drives the A5 refusal from
+            // the real revoke action); failure here rolls the flip back.
+            Self::materialize_on(&tx, self.revoked_path.as_deref())?;
+            tx.commit().context("commit revocation")?;
+            entry.map(|mut e| {
+                e.actor = actor.to_string();
+                e
+            })
+        };
+        if let Some(entry) = audit_entry {
+            self.audit_cert(AuditEventType::CertRevoked, &entry)?;
         }
-        Ok(changed > 0)
+        Ok(true)
     }
 
     /// Revoke every active cert held by a device (e.g. a compromised device).
@@ -341,6 +370,12 @@ impl CertLedger {
     /// revocation check (and CRL materialization) consume.
     pub fn revoked_fingerprints(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock();
+        Self::revoked_fingerprints_on(&conn)
+    }
+
+    /// The revoked set as seen by `conn` - which may be an open transaction,
+    /// so [`CertLedger::mark_revoked`] can materialize a pending flip.
+    fn revoked_fingerprints_on(conn: &Connection) -> Result<Vec<String>> {
         let mut stmt = conn
             .prepare("SELECT fingerprint FROM issued_certs WHERE status = 'revoked'")
             .context("prepare revoked_fingerprints")?;
@@ -442,6 +477,39 @@ mod tests {
         assert!(!led.mark_revoked("fp1", "operator").unwrap());
         // Revoking an unknown fingerprint is a no-op.
         assert!(!led.mark_revoked("nope", "operator").unwrap());
+    }
+
+    #[test]
+    fn mark_revoked_rolls_back_when_materialization_fails() {
+        // Fault injection for the revocation atomicity contract: if the
+        // enforcement file cannot be written, the status flip must NOT commit.
+        // A revoked-in-SQLite row with a stale enforcement file would keep
+        // authenticating at the WSS handshake while `security list-client-certs`
+        // reports it revoked - exactly the split this ordering forbids.
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fpA", "dev1"), false).unwrap();
+
+        // Obstruct materialization: replace the enforcement file with a
+        // directory so the atomic rename over it fails.
+        let crl = revoked_list_path(dir.path());
+        std::fs::remove_file(&crl).unwrap();
+        std::fs::create_dir(&crl).unwrap();
+
+        let err = led.mark_revoked("fpA", "operator").unwrap_err().to_string();
+        assert!(err.contains("revocation list"), "got: {err}");
+        // Rolled back: the ledger does not report a revocation it could not
+        // enforce, and the revoked set stays empty.
+        assert_eq!(led.status_of("fpA").unwrap(), Some(CertStatus::Active));
+        assert!(!led.is_revoked("fpA").unwrap());
+        assert!(led.revoked_fingerprints().unwrap().is_empty());
+
+        // Clear the fault: the same revoke now commits AND enforces.
+        std::fs::remove_dir(&crl).unwrap();
+        assert!(led.mark_revoked("fpA", "operator").unwrap());
+        assert!(led.is_revoked("fpA").unwrap());
+        let body = std::fs::read_to_string(&crl).unwrap();
+        assert!(body.contains("fpA"), "enforcement file must carry the fp");
     }
 
     #[test]
