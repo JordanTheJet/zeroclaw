@@ -52,3 +52,16 @@ accept_rate_per_ip = 10.0
 # with `rate_limited`.
 connect_burst_per_node = 60
 connect_rate_per_node = 20.0
+
+[frontdoor]
+# Serve the browser enrollment frontdoor (HTML/JS) from this relay. DEFAULT OFF.
+#
+# TRUST IMPLICATION - read before enabling: a browser that enrolls through the
+# frontdoor runs enrollment JavaScript served by THIS relay. That code handles
+# the one-time pairing code, generates the key/CSR, and displays the SAS, so a
+# malicious or compromised relay could substitute code that leaks or misuses
+# them. Enabling the frontdoor therefore makes this relay a TRUSTED code origin
+# for those browsers during enrollment - a deliberate narrowing of the
+# blind-forwarder guarantee, which otherwise still holds for the RPC plane and
+# for zerocode/native enrollment (those never execute relay-served code).
+# enabled = false

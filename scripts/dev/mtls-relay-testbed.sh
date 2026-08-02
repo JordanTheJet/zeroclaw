@@ -234,7 +234,10 @@ case "$RELAY_PUBLIC_HOST" in
   ""|"127.0.0.1"|"localhost") ;;
   *) RELAY_TLS_SAN_ARGS+=(--tls-san "$RELAY_PUBLIC_HOST") ;;
 esac
+# --frontdoor: the browser-check leg drives the relay-served enrollment page,
+# which is opt-in (trusted-code-origin narrowing; see relay.example.toml).
 "$ZERORELAY" --bind "$RELAY_BIND:$RELAY_PORT" --registration-mode open \
+  --frontdoor \
   --tls-dir "$RELAY_TLS_DIR" \
   "${RELAY_TLS_SAN_ARGS[@]}" \
   > "$TB/relay.log" 2>&1 &

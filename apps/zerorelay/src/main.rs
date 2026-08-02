@@ -103,6 +103,12 @@ struct Cli {
     /// and on SIGUSR1. Read it back with `zerorelay status --file <path>`.
     #[arg(long)]
     status_file: Option<String>,
+
+    /// Serve the browser enrollment frontdoor (default off). Enabling makes this
+    /// relay a TRUSTED code origin for browsers that enroll through it - see
+    /// relay.example.toml [frontdoor] for the trust implications.
+    #[arg(long)]
+    frontdoor: bool,
 }
 
 /// A `relay.toml`: every value optional, CLI flags override. The `[admission]`
@@ -117,6 +123,17 @@ struct FileConfig {
     admission: AdmissionFile,
     #[serde(default)]
     limits: LimitsFile,
+    #[serde(default)]
+    frontdoor: FrontdoorFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontdoorFile {
+    /// Serve the browser enrollment frontdoor from this relay. OFF by default:
+    /// enabling makes this relay a trusted code origin for enrolling browsers
+    /// (see relay.example.toml for the trust implications).
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -351,6 +368,7 @@ async fn main() -> Result<()> {
         connect_burst_per_node: file.limits.connect_burst_per_node.unwrap_or(60),
         connect_rate_per_node: file.limits.connect_rate_per_node.unwrap_or(20.0),
         route_by_client_cert,
+        frontdoor_enabled: cli.frontdoor || file.frontdoor.enabled.unwrap_or(false),
     };
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -358,9 +376,21 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding relay on {bind}"))?;
     let addr = listener.local_addr()?;
     eprintln!(
-        "zerorelay listening on {addr} (outer TLS, mode: {:?})",
-        cfg.registration_mode
+        "zerorelay listening on {addr} (outer TLS, mode: {:?}, frontdoor: {})",
+        cfg.registration_mode,
+        if cfg.frontdoor_enabled { "on" } else { "off" }
     );
+    if cfg.frontdoor_enabled {
+        eprintln!(
+            "zerorelay WARNING: the browser frontdoor is enabled. Browsers that \
+             enroll through this relay run enrollment code SERVED BY THIS RELAY, \
+             so those browsers trust this relay (and anyone who can modify it) \
+             with their pairing code and key material during enrollment. The \
+             blind-forwarder guarantee still holds for the RPC plane and for \
+             zerocode/native enrollment. Disable [frontdoor] to withdraw that \
+             trust."
+        );
+    }
 
     let server = RelayServer::new(cfg);
     spawn_sighup_reloader(server.clone(), cli.config.clone(), overlay);

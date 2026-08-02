@@ -16,6 +16,7 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
     body.webui-active .webui { gap: 0; }
     body.webui-active .webui iframe { min-height: 100vh; height: 100vh; border: 0; border-radius: 0; }
     h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: 0; }
+    .trust-note { margin: 0; font-size: 12.5px; line-height: 1.5; color: #5b6472; }
     form { display: grid; gap: 12px; }
     label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
     input { box-sizing: border-box; width: 100%; height: 42px; border: 1px solid #c9cdd4; border-radius: 6px; padding: 0 12px; font: inherit; background: #fff; color: #17191c; }
@@ -42,6 +43,12 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
 <body>
   <main>
     <h1>ZeroClaw Relay</h1>
+    <p class="trust-note">This enrollment page is served by the relay operator.
+      Enrolling here means trusting that operator with this one-time pairing
+      step (the code and the keys it creates). Prefer the
+      <code>zerocode</code> CLI to enroll without trusting the relay; after
+      enrollment, all sessions are end-to-end encrypted past the relay either
+      way.</p>
     <form id="pair">
       <label>Server ID <input id="server-id" autocomplete="off" spellcheck="false" required></label>
       <label>Pairing Code <input id="pairing-code" autocomplete="one-time-code" inputmode="numeric" required></label>

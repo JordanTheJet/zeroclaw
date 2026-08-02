@@ -385,6 +385,39 @@ In relay-only mode (no `--connect`/`uri`), the inner WSS URL defaults to
 `wss://127.0.0.1:9781` because the inner mTLS terminates at the daemon's loopback
 listener; the relay address is only the TCP dial target.
 
+### 3d. Browser enrollment through the relay frontdoor (opt-in)
+
+The relay can serve a browser enrollment page (the "frontdoor"): open the relay
+URL, enter the server id and a pairing code, confirm the SAS, and the WebUI
+opens through the relay from a certificate stored in the browser.
+
+It is **off by default**, because it deliberately narrows the blind-forwarder
+guarantee for the browsers that use it:
+
+- A browser that enrolls via the frontdoor runs enrollment JavaScript **served
+  by the relay**. That code handles the one-time pairing code, generates the
+  key/CSR, and displays the SAS. A malicious or compromised relay could
+  substitute code that leaks or misuses them, and the SAS cannot catch that -
+  the same origin controls both the code and its display.
+- Enabling the frontdoor therefore makes the relay a **trusted code origin for
+  browser enrollment**. Enable it only when you operate the relay yourself or
+  trust its operator with that step.
+- The narrowing is bounded: the **RPC plane stays end-to-end mTLS** past the
+  relay in every mode, and **`zerocode`/native enrollment never executes
+  relay-served code** - use those (sections 1b/1c/3a) when the relay must stay
+  fully untrusted.
+
+```toml
+# relay.toml
+[frontdoor]
+enabled = true   # default false; read the trust note above first
+```
+
+When disabled, plain HTTP requests to the relay get a `404` and browsers cannot
+enroll through it; daemon registration, zerocode clients, and the tunneled RPC
+plane are unaffected. The enrollment page itself carries the same trust note,
+and `zerorelay` logs a warning at startup while the frontdoor is on.
+
 ---
 
 ## Configuration reference
@@ -452,12 +485,14 @@ listener; the relay address is only the TCP dial target.
 | `[limits].lease_ttl_secs` | `300` | Lease TTL advertised at registration |
 | `[limits].accept_burst_per_ip` / `accept_rate_per_ip` | `30` / `10.0` | Per-IP handshake token bucket |
 | `[limits].connect_burst_per_node` / `connect_rate_per_node` | `60` / `20.0` | Per-node connect token bucket |
+| `[frontdoor].enabled` | `false` | Serve the browser enrollment page (see 3d: makes the relay a trusted code origin for enrolling browsers) |
 
 ### zerorelay CLI (overrides `relay.toml`)
 
 `--config` `--bind` `--tls-cert` `--tls-key` `--tls-dir` `--tls-san` (repeatable)
 `--registration-mode` `--allow` (repeatable) `--deny` (repeatable) `--relay-token`
-`--max-conns-per-node` `--idle-timeout-secs` `--lease-ttl-secs` `--status-file`.
+`--max-conns-per-node` `--idle-timeout-secs` `--lease-ttl-secs` `--status-file`
+`--frontdoor` (opt-in; see 3d for the trust implications).
 Subcommands: `healthcheck [--addr 127.0.0.1:8443]`, `status --file <path>`.
 
 ### zerocode `[connection.wss]` and CLI

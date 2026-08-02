@@ -138,6 +138,13 @@ pub struct RelayConfig {
     /// Off by default (a client cert whose CN is not a node-id would misroute). The
     /// outer client-cert REQUIREMENT itself is configured on the TLS acceptor.
     pub route_by_client_cert: bool,
+    /// Serve the browser enrollment frontdoor (HTML/JS/worker) from this relay.
+    /// OFF by default: a relay that serves enrollment code is a TRUSTED code
+    /// origin for those browsers - it could substitute JS that leaks the
+    /// pairing code or key material - so enabling it is an explicit, documented
+    /// narrowing of the blind-forwarder guarantee (July 21 review, finding 1).
+    /// zerocode/native enrollment is relay-blind regardless of this knob.
+    pub frontdoor_enabled: bool,
 }
 
 impl RelayConfig {
@@ -167,6 +174,7 @@ impl Default for RelayConfig {
             connect_burst_per_node: 60,
             connect_rate_per_node: 20.0,
             route_by_client_cert: false,
+            frontdoor_enabled: false,
         }
     }
 }
@@ -290,6 +298,9 @@ struct Inner {
     connect_rate_per_node: f64,
     /// Outer-mTLS variant: read the target node-id from the client cert CN.
     route_by_client_cert: bool,
+    /// Serve the browser frontdoor over plain HTTP hits (opt-in; see
+    /// [`RelayConfig::frontdoor_enabled`]).
+    frontdoor_enabled: bool,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
@@ -338,6 +349,7 @@ impl RelayServer {
                 connect_burst_per_node: cfg.connect_burst_per_node,
                 connect_rate_per_node: cfg.connect_rate_per_node,
                 route_by_client_cert: cfg.route_by_client_cert,
+                frontdoor_enabled: cfg.frontdoor_enabled,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
@@ -402,7 +414,7 @@ impl RelayServer {
                 } else {
                     None
                 };
-                let ws = match frontdoor::accept_or_serve(tls).await {
+                let ws = match frontdoor::accept_or_serve(tls, inner.frontdoor_enabled).await {
                     Ok(frontdoor::Frontdoor::WebSocket(w)) => w,
                     Ok(frontdoor::Frontdoor::ServedHttp) => return,
                     Err(_) => return,

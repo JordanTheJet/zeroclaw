@@ -20,7 +20,7 @@ pub(crate) enum Frontdoor<S> {
     ServedHttp,
 }
 
-pub(crate) async fn accept_or_serve<S>(mut stream: S) -> Result<Frontdoor<S>>
+pub(crate) async fn accept_or_serve<S>(mut stream: S, serve_http: bool) -> Result<Frontdoor<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -38,6 +38,22 @@ where
                 .await
                 .context("relay websocket handshake")?;
             return Ok(Frontdoor::WebSocket(Box::new(ws)));
+        }
+
+        // Browser frontdoor: opt-in only. Serving enrollment code makes the
+        // relay a TRUSTED code origin for the browsers that use it (it could
+        // substitute the JS that handles the pairing code and key material),
+        // which is a deliberate, documented narrowing of the blind-forwarder
+        // guarantee. Operators who do not accept that trust keep this off and
+        // browsers get a plain 404; zerocode/native enrollment stays
+        // relay-blind either way.
+        if !serve_http {
+            let body = "frontdoor disabled: enroll with zerocode, or opt in via \
+                        [frontdoor] enabled = true (see relay.example.toml for \
+                        the trust implications)\n";
+            let response = http_response("404 Not Found", "text/plain; charset=utf-8", body);
+            stream.write_all(&response).await?;
+            break;
         }
 
         let response = response_for(&head);
@@ -392,6 +408,34 @@ mod tests {
     fn websocket_upgrade_is_detected() {
         let head = b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_websocket_upgrade(head));
+    }
+
+    #[tokio::test]
+    async fn disabled_frontdoor_serves_404_but_still_upgrades_websockets() {
+        // July 21 review, finding 1: serving enrollment code is opt-in. With
+        // the frontdoor off, a plain HTTP hit gets a 404 (no page, no app.js),
+        // while the WS path (daemon registration + tunneled clients) is
+        // untouched.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move { accept_or_serve(server, false).await });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 404 Not Found"), "got: {text}");
+        assert!(text.contains("frontdoor disabled"), "got: {text}");
+        assert!(!text.contains("ZeroClaw Relay"), "must not serve the page");
+        assert!(matches!(task.await.unwrap(), Ok(Frontdoor::ServedHttp)));
+
+        // WS upgrade with the frontdoor off still completes the handshake.
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let accept = tokio::spawn(async move { accept_or_serve(server_io, false).await });
+        let ws = tokio_tungstenite::client_async("ws://relay.test/relay", client_io).await;
+        assert!(ws.is_ok(), "WS upgrade must succeed with frontdoor off");
+        assert!(matches!(accept.await.unwrap(), Ok(Frontdoor::WebSocket(_))));
     }
 
     #[test]
