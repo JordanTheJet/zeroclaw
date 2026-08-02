@@ -822,8 +822,8 @@ async fn bridge_conn(
 }
 
 /// Route one relay frame to a logical conn's bridge task WITHOUT blocking the
-/// shared relay-link reader (mirror of the zerorelay-side fix; July 21 review,
-/// finding 3). Sender cloned under the lock, guard dropped, delivery
+/// shared relay-link reader (mirror of the zerorelay-side delivery rule).
+/// Sender cloned under the lock, guard dropped, delivery
 /// non-blocking. A full per-conn buffer means that conn's loopback write side
 /// is wedged: tear down only that conn and tell the relay, keeping every other
 /// bridged conn (and Open/Close handling) live.

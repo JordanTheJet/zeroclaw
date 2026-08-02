@@ -412,8 +412,8 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_frontdoor_serves_404_but_still_upgrades_websockets() {
-        // July 21 review, finding 1: serving enrollment code is opt-in. With
-        // the frontdoor off, a plain HTTP hit gets a 404 (no page, no app.js),
+        // Serving enrollment code is opt-in. With the frontdoor off, a
+        // plain HTTP hit gets a 404 (no page, no app.js),
         // while the WS path (daemon registration + tunneled clients) is
         // untouched.
         let (mut client, server) = tokio::io::duplex(4096);

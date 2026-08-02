@@ -142,7 +142,7 @@ pub struct RelayConfig {
     /// OFF by default: a relay that serves enrollment code is a TRUSTED code
     /// origin for those browsers - it could substitute JS that leaks the
     /// pairing code or key material - so enabling it is an explicit, documented
-    /// narrowing of the blind-forwarder guarantee (July 21 review, finding 1).
+    /// narrowing of the blind-forwarder guarantee.
     /// zerocode/native enrollment is relay-blind regardless of this knob.
     pub frontdoor_enabled: bool,
 }
@@ -682,7 +682,7 @@ where
 }
 
 /// Deliver one demultiplexed daemon frame to a logical conn WITHOUT blocking
-/// the shared daemon reader (July 21 review, finding 3). The sender is cloned
+/// the shared daemon reader. The sender is cloned
 /// under the map lock and the guard dropped before delivery; delivery itself is
 /// non-blocking. The per-conn buffer absorbs bursts, and credit-window flow
 /// control keeps a well-behaved client inside it, so a full buffer means a
@@ -735,20 +735,23 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (to_daemon, conns, metrics, connect_bucket) = {
+    let handle = {
         let daemons = inner.daemons.lock().await;
-        match daemons.get(&node_id) {
-            Some(h) => (
+        daemons.get(&node_id).map(|h| {
+            (
                 h.to_daemon.clone(),
                 h.conns.clone(),
                 h.metrics.clone(),
                 h.connect_bucket.clone(),
-            ),
-            None => {
-                let _ = send_control(&mut ws, &Control::error("no_such_node", node_id)).await;
-                return Ok(());
-            }
-        }
+            )
+        })
+    };
+    let Some((to_daemon, conns, metrics, connect_bucket)) = handle else {
+        // Reply AFTER the registry guard is released: this send awaits a
+        // peer-controlled sink, and a client that stops reading must stall
+        // only itself, never the relay-wide daemon registry.
+        let _ = send_control(&mut ws, &Control::error("no_such_node", node_id)).await;
+        return Ok(());
     };
 
     // Per-node client-connect rate cap (A6): a flood of Connects to one node-id
@@ -1002,8 +1005,8 @@ mod tests {
 
     #[tokio::test]
     async fn backpressured_conn_is_closed_without_stalling_others() {
-        // July 21 review, finding 3: the shared daemon reader must never block
-        // on one conn's full buffer, and only the stalled conn may be closed.
+        // The shared daemon reader must never block on one conn's full
+        // buffer, and only the stalled conn may be closed.
         let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (stalled_tx, mut stalled_rx) = mpsc::channel::<ConnEvent>(1);
