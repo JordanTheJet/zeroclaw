@@ -34,6 +34,11 @@ pub(crate) async fn gate_tool_approval(
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
+            // Host-computed from the arguments' effects by the tool itself;
+            // the model cannot author what the operator reads here.
+            host_summary: ctx
+                .tool_by_name(tool_name)
+                .and_then(|tool| tool.approval_summary(tool_args)),
         };
 
         // Interactive CLI: prompt the operator.
@@ -44,7 +49,10 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: request
+                        .host_summary
+                        .clone()
+                        .unwrap_or_else(|| crate::approval::summarize_args(&request.arguments)),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
