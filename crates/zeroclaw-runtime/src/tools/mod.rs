@@ -215,6 +215,10 @@ impl Tool for ArcToolRef {
         self.0.invocation_triggers()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.0.approval_requires_operator()
+    }
+
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.0.approval_summary(args)
     }
@@ -285,6 +289,10 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
     }
 
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
