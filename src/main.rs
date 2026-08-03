@@ -3482,6 +3482,14 @@ fn resolve_executable(command: &str) -> Option<PathBuf> {
     if candidate.is_absolute() {
         return is_executable(candidate).then(|| candidate.to_path_buf());
     }
+    // A relative value containing a path separator (e.g. `./zeroclaw-helper`) would be
+    // resolved by `which` against the current working directory, letting a desktop entry
+    // launch a binary from wherever `zeroclaw desktop` happened to run. Per the Desktop
+    // Entry spec `Exec` must be an absolute path or a bare executable name resolved on
+    // `PATH`, so reject any relative value that carries a separator.
+    if command.contains('/') {
+        return None;
+    }
     which::which(command).ok()
 }
 
@@ -3493,14 +3501,31 @@ fn resolve_executable(command: &str) -> Option<PathBuf> {
 /// basenames only) is what lets a nested higher-precedence entry correctly
 /// mask the same ID in a lower-precedence directory.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
-fn collect_desktop_entries(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+fn collect_desktop_entries(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) {
+    // Guard against directory cycles (e.g. a bind mount pointing back up the tree) by
+    // tracking canonical paths already scanned.
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(canonical) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            collect_desktop_entries(root, &path, out);
+        // `entry.file_type()` does not follow symlinks, so a directory symlink such as
+        // `applications/loop -> .` is not treated as a directory and is never recursed
+        // into — preventing an unbounded traversal.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_desktop_entries(root, &path, out, visited);
         } else if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
             if let Ok(rel) = path.strip_prefix(root) {
                 let id = rel.to_string_lossy().replace('/', "-");
@@ -3520,7 +3545,8 @@ fn discover_desktop_app(data_dirs: &[PathBuf]) -> Option<PathBuf> {
     for base in data_dirs {
         let root = base.join("applications");
         let mut files: Vec<(String, PathBuf)> = Vec::new();
-        collect_desktop_entries(&root, &root, &mut files);
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&root, &root, &mut files, &mut visited);
         files.sort(); // deterministic order by desktop-file ID within a directory
         for (id, path) in files {
             if !seen_ids.insert(id) {
@@ -8538,6 +8564,40 @@ mod tests {
         std::fs::write(&non_exec, "not executable").unwrap();
         write_entry(broken.path(), "ZeroClaw.desktop", &non_exec);
         assert_eq!(discover_desktop_app(&[broken.path().to_path_buf()]), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn resolve_executable_rejects_relative_path_with_separator() {
+        // A relative Exec value with a separator would be resolved by `which` against the
+        // current working directory, so it must be rejected rather than launched.
+        assert_eq!(resolve_executable("./zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("../bin/zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("sub/dir/zeroclaw-helper"), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn collect_desktop_entries_does_not_follow_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("ZeroClaw.desktop"),
+            "[Desktop Entry]\nName=ZeroClaw\nExec=/usr/bin/zeroclaw\nType=Application\n",
+        )
+        .unwrap();
+        // A directory symlink pointing back at its own parent would recurse forever if
+        // followed. The scan must treat it as a non-directory and terminate.
+        std::os::unix::fs::symlink(&apps, apps.join("loop")).unwrap();
+
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&apps, &apps, &mut out, &mut visited);
+
+        // Terminates (no infinite loop) and collects only the real entry.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "ZeroClaw.desktop");
     }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
