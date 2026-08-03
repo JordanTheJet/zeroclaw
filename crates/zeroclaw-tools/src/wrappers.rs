@@ -60,6 +60,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.invocation_triggers()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
     }
@@ -163,6 +167,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
     }
 
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
