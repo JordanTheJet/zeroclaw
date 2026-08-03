@@ -603,9 +603,11 @@ fn main_binary_name() -> &'static str {
 /// mirrors (currently: `zerocode` next to `zeroclaw`, plus the `web/dist`
 /// directory that's handled by the whole-directory swap above).
 #[cfg(windows)]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode.exe"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode.exe";
 #[cfg(not(windows))]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode";
+
+const KNOWN_COMPANION_FILES: &[&str] = &[ZEROCODE_BINARY_NAME];
 
 fn is_known_companion(name: &str) -> bool {
     KNOWN_COMPANION_FILES.contains(&name)
@@ -1918,7 +1920,7 @@ mod tests {
     #[test]
     fn unpack_tar_gz_writes_main_binary() {
         let fake_binary = b"#!/bin/sh\necho zeroclaw";
-        let gz_buf = make_tar_gz(&[("zeroclaw", fake_binary)]);
+        let gz_buf = make_tar_gz(&[(main_binary_name(), fake_binary)]);
 
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
@@ -1937,9 +1939,10 @@ mod tests {
         let zerocode = b"#!/bin/sh\necho zerocode";
         let index = b"<!doctype html><title>dash</title>";
         let asset = b"console.log('app')";
+        let companion_name = ZEROCODE_BINARY_NAME;
         let gz_buf = make_tar_gz(&[
-            ("zeroclaw", zeroclaw),
-            ("zerocode", zerocode),
+            (main_binary_name(), zeroclaw),
+            (companion_name, zerocode),
             ("web/dist/index.html", index),
             ("web/dist/assets/app.js", asset),
         ]);
@@ -1951,7 +1954,10 @@ mod tests {
 
         let binary = locate_main_binary(&staging).unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), zeroclaw);
-        assert_eq!(std::fs::read(staging.join("zerocode")).unwrap(), zerocode);
+        assert_eq!(
+            std::fs::read(staging.join(companion_name)).unwrap(),
+            zerocode
+        );
         assert_eq!(
             std::fs::read(staging.join("web").join("dist").join("index.html")).unwrap(),
             index
@@ -2275,22 +2281,23 @@ mod tests {
         // top-level files are covered by the sibling test below.
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
-        std::fs::write(bin_dir.join("zerocode"), b"old zerocode").unwrap();
+        std::fs::write(bin_dir.join(companion_name), b"old zerocode").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Main binary lives in the staged tree but must NOT be re-swapped here
         // (it was already handled by the transactional `swap_binary` path).
-        std::fs::write(staging.join("zeroclaw"), b"new zeroclaw").unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(main_binary_name()), b"new zeroclaw").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
 
         install_companion_artifacts(&staging, &exe, &[]).await;
 
         // zerocode swapped in.
-        let expected_zerocode = bin_dir.join("zerocode");
+        let expected_zerocode = bin_dir.join(companion_name);
         assert_eq!(std::fs::read(&expected_zerocode).unwrap(), b"new zerocode");
         // Main binary must be unchanged by the companion pass.
         assert_eq!(std::fs::read(&exe).unwrap(), b"zeroclaw");
@@ -2306,14 +2313,15 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_files() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Known companion — must be installed.
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // Unknown top-level file — must NOT be installed. This is the
         // defense-in-depth surface: a forged release cannot smuggle a
         // `zerodash`, `.bashrc`, `evil.so`, etc. next to `zeroclaw` just by
@@ -2324,7 +2332,7 @@ mod tests {
 
         // Known companion installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         // Unknown sibling NOT installed.
@@ -2343,13 +2351,14 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // An unknown directory (a future layout, a mispackaged release, …).
         std::fs::create_dir_all(staging.join("themes").join("dark")).unwrap();
         std::fs::write(staging.join("themes/dark/index.css"), b"body{}").unwrap();
@@ -2362,7 +2371,7 @@ mod tests {
 
         // Known artifacts installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         assert_eq!(
