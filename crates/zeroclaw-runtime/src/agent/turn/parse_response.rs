@@ -826,6 +826,7 @@ mod cost_usd_regression_tests {
             turn_id: "turn-cost-regression",
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let specs = IterationToolSpecs {

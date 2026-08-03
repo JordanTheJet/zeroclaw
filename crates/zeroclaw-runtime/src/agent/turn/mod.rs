@@ -1183,6 +1183,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         parent_agent_alias,
         serving_provider_name: None,
         serving_model: None,
+        tools: tools_registry,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the

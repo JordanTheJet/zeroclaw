@@ -23,9 +23,15 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::api_error::ConfigApiError;
-use zeroclaw_config::patch::{apply_patch_ops, parse_patch_ops};
+use zeroclaw_config::patch::{
+    PatchOp, apply_patch_ops, json_pointer_to_dotted, lookup_prop_field, parse_patch_ops,
+};
+use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 pub struct ConfigPatchTool {
@@ -56,6 +62,55 @@ impl ConfigPatchTool {
                 "config patch rejected — nothing was saved. {}",
                 Self::error_text(err)
             )),
+        }
+    }
+
+    /// An agent's resolved policy rendered for the operator, or a plain
+    /// explanation of why it can't be. Side-effect free: `from_profiles`
+    /// only computes — unlike `for_agent`, it creates no directories.
+    fn policy_summary_for(config: &Config, alias: &str) -> String {
+        match config.risk_profile_for_agent(alias) {
+            Some(risk) => SecurityPolicy::from_profiles(
+                risk,
+                config.runtime_profile_for_agent(alias),
+                &config.agent_workspace_dir(alias),
+            )
+            .prompt_summary(),
+            None => "(risk profile does not resolve — the agent cannot boot)".to_string(),
+        }
+    }
+
+    /// One line per op, with secret values redacted. Secrecy is checked
+    /// against both the current and the patched config so a value written
+    /// to a *newly created* secret path (dynamic per-alias credentials)
+    /// is masked too.
+    fn render_op(op: &PatchOp, before: &Config, after: &Config) -> String {
+        let dotted = json_pointer_to_dotted(&op.path);
+        let sensitive = [before, after].iter().any(|cfg| {
+            lookup_prop_field(cfg, &dotted)
+                .map(|info| info.is_secret || info.derived_from_secret)
+                .unwrap_or(false)
+        });
+        match op.op.as_str() {
+            "add" | "replace" | "test" => {
+                let value = if sensitive {
+                    "[redacted]".to_string()
+                } else {
+                    let raw = op
+                        .value
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "null".to_string());
+                    if raw.chars().count() > 80 {
+                        let head: String = raw.chars().take(77).collect();
+                        format!("{head}...")
+                    } else {
+                        raw
+                    }
+                };
+                format!("  {:<8} {dotted} = {value}", op.op)
+            }
+            _ => format!("  {:<8} {dotted}", op.op),
         }
     }
 }
@@ -108,6 +163,70 @@ impl Tool for ConfigPatchTool {
             },
             "required": ["ops"]
         })
+    }
+
+    /// The operator's approval prompt: what the ops are, and — the part the
+    /// raw JSON never shows — what they do to each agent's resolved
+    /// permissions. Everything here is computed from the ops against the
+    /// on-disk config; none of it is model text. Returns `None` when the
+    /// patch can't be previewed (unreadable config, ops that don't apply);
+    /// the generic argument summary shows instead, and execution will
+    /// refuse with the precise error.
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        let ops = parse_patch_ops(args.get("ops")?.clone()).ok()?;
+        let raw = std::fs::read_to_string(&self.config_path).ok()?;
+        let mut before: Config = toml::from_str(&raw).ok()?;
+        before.config_path = self.config_path.clone();
+        let mut after = before.clone();
+        apply_patch_ops(&mut after, &ops).ok()?;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "apply {} change(s) to config.toml:", ops.len());
+        for op in &ops {
+            let _ = writeln!(out, "{}", Self::render_op(op, &before, &after));
+        }
+
+        // Per-agent resolved-policy delta. Resolving per agent (not per
+        // edited path) catches indirect changes too: editing a shared
+        // `risk-profiles.*` entry re-renders every agent that references it.
+        let aliases: BTreeSet<&String> = before.agents.keys().chain(after.agents.keys()).collect();
+        let mut delta = String::new();
+        for alias in aliases {
+            let was = before
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&before, alias));
+            let now = after
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&after, alias));
+            if was == now {
+                continue;
+            }
+            let _ = writeln!(delta, "  agent `{alias}`:");
+            let _ = writeln!(
+                delta,
+                "    before:\n      {}",
+                was.as_deref()
+                    .unwrap_or("(agent does not exist)")
+                    .trim_end()
+                    .replace('\n', "\n      ")
+            );
+            let _ = writeln!(
+                delta,
+                "    after:\n      {}",
+                now.as_deref()
+                    .unwrap_or("(agent is removed)")
+                    .trim_end()
+                    .replace('\n', "\n      ")
+            );
+        }
+        if !delta.is_empty() {
+            let _ = writeln!(out, "\npermission changes if approved:");
+            out.push_str(&delta);
+        }
+        out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
+        Some(out)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -330,6 +449,118 @@ mod tests {
         assert!(
             !path.exists(),
             "the tool must never bring a config file into existence"
+        );
+    }
+
+    /// Build a config on disk with one agent on the `balanced` preset and the
+    /// `yolo` preset available to move to.
+    async fn config_with_balanced_agent(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            config_path: path.clone(),
+            ..Config::default()
+        };
+        for preset in ["balanced", "yolo"] {
+            config.risk_profiles.insert(
+                preset.to_string(),
+                (zeroclaw_config::presets::risk_preset(preset)
+                    .expect("preset exists")
+                    .values)(),
+            );
+        }
+        let ops = parse_patch_ops(serde_json::json!([
+            {"op": "add", "path": "/agents/helper/risk_profile", "value": "balanced"}
+        ]))
+        .expect("fixture ops parse");
+        apply_patch_ops(&mut config, &ops).expect("fixture agent applies");
+        config.save().await.expect("save initial config");
+        path
+    }
+
+    #[tokio::test]
+    async fn approval_summary_renders_the_permission_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config_with_balanced_agent(dir.path()).await;
+        let tool = ConfigPatchTool::new(path);
+
+        let summary = tool
+            .approval_summary(&serde_json::json!({
+                "ops": [{"op": "replace", "path": "/agents/helper/risk_profile", "value": "yolo"}]
+            }))
+            .expect("a previewable patch must produce a host summary");
+
+        assert!(
+            summary.contains("agents.helper.risk_profile"),
+            "the op itself is listed: {summary}"
+        );
+        assert!(
+            summary.contains("agent `helper`"),
+            "the affected agent is named: {summary}"
+        );
+        assert!(
+            summary.contains("Supervised") && summary.contains("Full"),
+            "the before/after resolved autonomy must both be visible — this \
+             is the line that tells the operator what they are authorizing: {summary}"
+        );
+        assert!(
+            summary.contains("reloads or restarts"),
+            "the summary states the change is not live until reload: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_summary_is_quiet_about_unaffected_policies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config_with_balanced_agent(dir.path()).await;
+        let tool = ConfigPatchTool::new(path);
+
+        let summary = tool
+            .approval_summary(&serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/host", "value": "127.0.0.2"}]
+            }))
+            .expect("summary");
+
+        assert!(
+            !summary.contains("permission changes"),
+            "a patch that moves no policy must not render a policy delta: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_summary_masks_secret_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = ConfigPatchTool::new(path);
+
+        let summary = tool
+            .approval_summary(&serde_json::json!({
+                "ops": [{"op": "add", "path": "/http_request/secrets/api_token", "value": "tok-123"}]
+            }))
+            .expect("summary");
+
+        assert!(
+            summary.contains("[redacted]"),
+            "secret paths render redacted: {summary}"
+        );
+        assert!(
+            !summary.contains("tok-123"),
+            "the secret value itself must never reach an approval prompt: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpreviewable_patch_yields_no_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = ConfigPatchTool::new(path);
+
+        let summary = tool.approval_summary(&serde_json::json!({
+            "ops": [{"op": "frobnicate", "path": "/gateway/host", "value": "x"}]
+        }));
+
+        assert!(
+            summary.is_none(),
+            "ops that will be refused fall back to the generic summary"
         );
     }
 
