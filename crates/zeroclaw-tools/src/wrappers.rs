@@ -53,6 +53,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.param_domains()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
     }
@@ -150,6 +154,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
     }
 
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {

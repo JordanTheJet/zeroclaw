@@ -210,6 +210,10 @@ impl Tool for ArcToolRef {
         self.0.spec()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.0.approval_requires_operator()
+    }
+
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.0.approval_summary(args)
     }
@@ -266,6 +270,10 @@ impl Tool for ArcDelegatingTool {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
     }
 
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {

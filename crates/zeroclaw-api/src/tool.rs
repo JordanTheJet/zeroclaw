@@ -342,6 +342,17 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// True when approving this tool is an operator-only act. Chat channels
+    /// that can normally answer approval prompts inline (e.g. a Telegram
+    /// keyboard) are then notified instead of asked: whoever holds the chat
+    /// account is not necessarily the operator, and for a tool that rewrites
+    /// config, "can message the agent" must not imply "can grant authority".
+    /// Authenticated operator surfaces (the terminal, a paired client) still
+    /// approve normally.
+    fn approval_requires_operator(&self) -> bool {
+        false
+    }
+
     /// Host-computed text for the operator's approval prompt. `None` (the
     /// default) falls back to the generic argument summary.
     ///
