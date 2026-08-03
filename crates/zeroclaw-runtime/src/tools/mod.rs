@@ -1,6 +1,7 @@
 //! Tool subsystem for agent-callable capabilities.
 
 pub mod attribution;
+pub mod config_patch;
 pub mod cron_add;
 pub(crate) mod cron_common;
 pub mod cron_list;
@@ -666,6 +667,13 @@ pub fn all_tools_with_runtime(
         Arc::new(SendMessageToPeerTool::new(
             Arc::new(root_config.clone()),
             agent_alias,
+        )),
+        // Registered unconditionally; who actually reaches it is a policy
+        // decision. The `locked_down` preset excludes it, `balanced` puts it
+        // in `always_ask`, and `yolo` (Full autonomy) auto-approves —
+        // consistent with yolo already being able to edit config via shell.
+        Arc::new(config_patch::ConfigPatchTool::new(
+            root_config.config_path.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
