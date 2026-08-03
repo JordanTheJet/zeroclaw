@@ -496,6 +496,7 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            tools: &[],
         };
 
         let specs = IterationToolSpecs {

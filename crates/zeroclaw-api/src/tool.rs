@@ -414,6 +414,19 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// Host-computed text for the operator's approval prompt. `None` (the
+    /// default) falls back to the generic argument summary.
+    ///
+    /// Implement this when the raw arguments don't tell the operator what
+    /// they are actually authorizing — e.g. a config patch whose real
+    /// meaning is the permission change it causes, not the JSON ops. The
+    /// returned text must be **computed by the tool from the arguments'
+    /// effects**, never echoed from a model-written field: this is the one
+    /// line of text the model must not be able to author.
+    fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
