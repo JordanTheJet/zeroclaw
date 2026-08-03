@@ -555,6 +555,37 @@ mod tests {
         );
     }
 
+    /// The tool's success output goes back to the model and into transcripts
+    /// and logs. Setting a secret must report `populated`, never the value —
+    /// the same contract the gateway and CLI results follow.
+    #[tokio::test]
+    async fn setting_a_secret_reports_populated_not_the_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = ConfigPatchTool::new(path);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "ops": [{"op": "add", "path": "/http_request/secrets/api_token", "value": "tok-456"}]
+            }))
+            .await
+            .expect("execute");
+
+        assert!(
+            result.success,
+            "secret set should succeed: {:?}",
+            result.error
+        );
+        let data = result.output.data().expect("structured output");
+        assert_eq!(data["results"][0]["populated"], true);
+        assert!(
+            !serde_json::to_string(&data)
+                .expect("serialize")
+                .contains("tok-456"),
+            "the secret value must not appear anywhere in the tool result: {data}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unpreviewable_patch_yields_no_summary() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -637,6 +637,7 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            tools: &[],
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(
