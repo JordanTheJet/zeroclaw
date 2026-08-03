@@ -438,6 +438,7 @@ mod tests {
             tools: &tools,
             serving_provider_name: None,
             serving_model: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         let outcome = gate_tool_approval(&ctx, "stub_tool", &serde_json::json!({"x": 1}), 0).await;
         (outcome, channel.asked.load(Ordering::SeqCst))

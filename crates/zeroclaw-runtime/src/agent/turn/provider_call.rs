@@ -1188,6 +1188,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -1290,6 +1291,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let outcome = call_provider(
@@ -1344,6 +1346,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let error = call_provider(
@@ -1479,6 +1482,7 @@ mod streaming_fallback_tests {
                 parent_agent_alias: None,
                 serving_provider_name: None,
                 serving_model: None,
+                tools: &[],
             };
 
             let outcome = call_provider(
@@ -1668,6 +1672,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let error = call_provider(
@@ -1738,6 +1743,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let outcome = call_provider(
@@ -1809,6 +1815,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let outcome = call_provider(
