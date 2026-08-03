@@ -165,6 +165,13 @@ impl Tool for ConfigPatchTool {
         })
     }
 
+    /// Rewriting config grants authority; only the operator grants
+    /// authority. A chat channel that can answer ordinary approval prompts
+    /// is notified about this tool, never asked.
+    fn approval_requires_operator(&self) -> bool {
+        true
+    }
+
     /// The operator's approval prompt: what the ops are, and — the part the
     /// raw JSON never shows — what they do to each agent's resolved
     /// permissions. Everything here is computed from the ops against the
