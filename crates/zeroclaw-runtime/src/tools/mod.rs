@@ -1829,6 +1829,61 @@ mod tests {
         );
     }
 
+    /// `config_patch` must be present in the *assembled* registry, and the
+    /// entry the turn loop actually holds — behind whatever delegation the
+    /// assembly wraps it in — must still answer `approval_requires_operator`.
+    /// The preset matrix in `zeroclaw-config` pins who may reach the tool;
+    /// this pins that the tool exists to be reached and that the operator-only
+    /// marker survives registration.
+    #[test]
+    fn config_patch_is_registered_and_keeps_its_operator_only_marker() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let tool = tools
+            .iter()
+            .find(|t| t.name() == "config_patch")
+            .expect("config_patch must be in the assembled registry");
+        assert!(
+            tool.approval_requires_operator(),
+            "the registered entry must keep the operator-only marker through \
+             the assembly's delegation, or the channel gate silently stops \
+             applying to the real instance"
+        );
+    }
+
     #[test]
     fn sop_tools_absent_when_engine_not_provided() {
         let tmp = TempDir::new().unwrap();
