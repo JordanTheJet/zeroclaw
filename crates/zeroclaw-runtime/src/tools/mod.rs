@@ -215,6 +215,10 @@ impl Tool for ArcToolRef {
         self.0.invocation_triggers()
     }
 
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.0.approval_summary(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -281,6 +285,10 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2220,6 +2228,58 @@ permissions = ["http_client"]
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 7);
+    }
+
+    /// The registry the turn loop holds is `Box<dyn Tool>` built through
+    /// `ArcDelegatingTool` (and `ArcToolRef` for elevation arcs). Either
+    /// delegator dropping `approval_summary` would silently downgrade the
+    /// operator's approval prompt to the generic argument dump.
+    #[test]
+    fn arc_delegators_forward_the_host_approval_summary() {
+        struct Summarizing;
+        impl ::zeroclaw_api::attribution::Attributable for Summarizing {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                "summarizing"
+            }
+        }
+        #[async_trait]
+        impl Tool for Summarizing {
+            fn name(&self) -> &str {
+                "summarizing"
+            }
+            fn description(&self) -> &str {
+                "test stub"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+                Some("computed by the host".into())
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+
+        let arc: Arc<dyn Tool> = Arc::new(Summarizing);
+        let boxed = boxed_registry_from_arcs(vec![arc.clone()]);
+        assert_eq!(
+            boxed[0].approval_summary(&serde_json::json!({})).as_deref(),
+            Some("computed by the host"),
+            "ArcDelegatingTool must forward approval_summary"
+        );
+        assert_eq!(
+            ArcToolRef(arc)
+                .approval_summary(&serde_json::json!({}))
+                .as_deref(),
+            Some("computed by the host"),
+            "ArcToolRef must forward approval_summary"
+        );
     }
 
     #[cfg(feature = "plugins-wasm")]

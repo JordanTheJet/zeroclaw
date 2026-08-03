@@ -19,6 +19,11 @@ use zeroclaw_config::schema::RiskProfileConfig;
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// Host-computed prompt text from `Tool::approval_summary`. When set,
+    /// approval surfaces show this instead of the generic argument summary.
+    /// Computed by the tool from the arguments' effects — never model text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_summary: Option<String>,
 }
 
 /// The user's response to an approval request.
@@ -260,14 +265,18 @@ impl ApprovalManager {
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
-    let summary = summarize_args(&request.arguments);
+    let summary = request
+        .host_summary
+        .clone()
+        .unwrap_or_else(|| summarize_args(&request.arguments));
     let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
     eprintln!(
         "{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
     );
-    eprintln!("   {summary}");
+    // Keep multi-line host summaries aligned under the tool name.
+    eprintln!("   {}", summary.replace('\n', "\n   "));
     eprint!(
         "{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
@@ -834,8 +843,13 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            host_summary: None,
         };
         let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("host_summary"),
+            "an absent host summary must not appear on the wire: {json}"
+        );
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
     }

@@ -445,6 +445,7 @@ mod payload_capture_tests {
             draft_reasoning,
             agent_alias: None,
             turn_id: "trace-req-test",
+            tools: &[],
         }
     }
 
