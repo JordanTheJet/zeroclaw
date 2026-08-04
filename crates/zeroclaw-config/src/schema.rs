@@ -14790,7 +14790,8 @@ pub struct WhatsAppConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
+    /// Can also be set with the alias-qualified generic environment override:
+    /// `ZEROCLAW_channels__whatsapp__<alias>__app_secret`.
     /// Only used in Cloud API mode.
     ///
     /// Required to receive webhooks. Inbound requests are signature-verified,
