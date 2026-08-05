@@ -5,7 +5,7 @@ fields are the serde surface of `PluginManifest` in
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `name` | yes | Unique canonical package slug and operator config key. Use 1–128 lowercase ASCII characters; start and end with `[a-z0-9]`, with only `[a-z0-9._-]` between. Discovery rejects invalid or duplicate names. |
+| `name` | yes | Unique canonical package slug and the package component of each derived instance config key. It is not itself an operator config key. Use 1–128 lowercase ASCII characters; start and end with `[a-z0-9]`, with only `[a-z0-9._-]` between. Discovery rejects invalid or duplicate names. |
 | `version` | yes | Version string, e.g. `0.1.0`. |
 | `description` | no | Human-readable description shown by `zeroclaw plugin list`. |
 | `author` | no | Author name or organization. |
@@ -23,7 +23,8 @@ attack surface you asked for and audit burden for whoever reviews your plugin.
 Operator values remain strings in `plugins.entries` and are encrypted when
 persisted, keyed by a versioned `zpi1_…` string derived from the host-owned
 package, capability, and binding identity (installation prints and seeds the
-package-name tool key): strings are stored as-is, booleans and numbers use JSON
+default tool binding's full-instance key): strings are stored as-is, booleans
+and numbers use JSON
 scalar text, and arrays and objects use JSON text. Before any guest code runs,
 the host materializes those strings to the package schema's types and validates
 the resulting object for tool and channel adapters. If `config_read` was
