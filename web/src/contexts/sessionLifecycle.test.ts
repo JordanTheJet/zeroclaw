@@ -376,6 +376,38 @@ for (const scenario of ['unknown', 'disabled'] as const) {
   });
 }
 
+test('selecting the active picker row closes the menu', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const trigger = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props.title === 'Conversations');
+  assert.ok(trigger);
+  await act(async () => { trigger.props.onClick(); });
+  await settle();
+  assert.equal(
+    mounted.renderer.root.findAllByType('button')
+      .find((button) => button.props.title === 'Conversations')?.props['aria-expanded'],
+    true,
+  );
+
+  const activeRow = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props.title !== 'Conversations' && nodeText(button).includes('First'));
+  assert.ok(activeRow);
+  await act(async () => { activeRow.props.onClick(); });
+
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.equal(
+    mounted.renderer.root.findAllByType('button')
+      .find((button) => button.props.title === 'Conversations')?.props['aria-expanded'],
+    false,
+  );
+  await unmount(mounted.renderer);
+});
+
 test('switch resets capability, hydrates the target, and ignores the old socket', async () => {
   const runtime = new FakeSessionRuntime();
   const bHydration = new Deferred<SessionMessagesResponse>();

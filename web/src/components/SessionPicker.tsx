@@ -166,8 +166,11 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   }, [startNewSession, closeMenu]);
 
   const handleSelect = useCallback((id: string) => {
-    if (goToSession(id)) closeMenu();
-  }, [goToSession, closeMenu]);
+    // Selecting the row already on screen is still a completed picker action.
+    // goToSession correctly reports false for that no-op, but the menu should
+    // dismiss just as it does after selecting a different conversation.
+    if (id === sessionId || goToSession(id)) closeMenu();
+  }, [sessionId, goToSession, closeMenu]);
 
   const commitRename = useCallback(async (id: string) => {
     const name = renameDraft.trim();
