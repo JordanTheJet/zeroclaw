@@ -220,7 +220,7 @@ export function AgentProvider({
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
-  const wsRef = useRef<SessionSocket | null>(null);
+  const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
   // it goes through reduceTurnFrame, which is exercised directly by the
   // frame-sequence regression suite.
@@ -232,6 +232,13 @@ export function AgentProvider({
   // Monotonic navigation ticket. Async destructive actions capture it so a
   // late completion for an old active conversation cannot move the new one.
   const sessionGenerationRef = useRef(0);
+  // Rebuild callbacks intentionally retain the dependency shape already on
+  // master. These mirrors still make their async work use the latest session
+  // and injected runtime after a conversation switch.
+  const activeSessionIdRef = useRef(sessionId);
+  const sessionRuntimeRef = useRef(sessionRuntime);
+  activeSessionIdRef.current = sessionId;
+  sessionRuntimeRef.current = sessionRuntime;
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -373,7 +380,8 @@ export function AgentProvider({
           ]);
         } else if (outcome?.kind === 'diagnostic') {
           // Clean completion with nothing at all — surface a one-off notice so
-          // the turn does not disappear. `skip` means tool cards are the record.
+          // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
+          // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -651,7 +659,7 @@ export function AgentProvider({
     const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
     attachSocketCallbacks(ws);
     ws.connect();
-    wsRef.current = ws;
+    wsRef.current = ws as WebSocketClient;
 
     return () => {
       ws.disconnect();
@@ -863,13 +871,16 @@ export function AgentProvider({
         oldWs.disconnect();
       }
 
-      const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
+      const ws = sessionRuntimeRef.current.createSocket({
+        agentAlias,
+        sessionId: activeSessionIdRef.current,
+      });
       // Point wsRef at the NEW client before connect(), so a synchronous
       // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
       // leaves a live, reconnect-capable socket in the ref instead of the old
       // intentionally-closed one — otherwise the page strands offline with no
       // reconnect path until reload.
-      wsRef.current = ws;
+      wsRef.current = ws as WebSocketClient;
       attachSocketCallbacks(ws);
       ws.connect();
     } catch (err) {
@@ -886,7 +897,7 @@ export function AgentProvider({
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, sessionId, foldTurnStream, sessionRuntime]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -916,7 +927,7 @@ export function AgentProvider({
   const clearAllMessages = useCallback(() => {
     resetTranscriptState();
 
-    const sid = sessionId;
+    const sid = activeSessionIdRef.current;
     // Socket identity at the moment of the clear. If it changes while the
     // delete is in flight, a session switch (or another rebuild) has taken over
     // and this closure must not resurrect a connection for the old session.
@@ -936,7 +947,7 @@ export function AgentProvider({
         // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
         // session persistence is disabled, or any transport failure, must not
         // block the local clear or the reconnect below.
-        await sessionRuntime.delete(sid);
+        await sessionRuntimeRef.current.delete(sid);
       } catch {
         // Persistence disabled or request failed — proceed with the reconnect
         // so the live in-memory context is reset regardless.
@@ -956,15 +967,18 @@ export function AgentProvider({
         oldWs.onMessage = null;
         oldWs.disconnect();
 
-        const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
+        const ws = sessionRuntimeRef.current.createSocket({
+          agentAlias,
+          sessionId: activeSessionIdRef.current,
+        });
         // Assign wsRef before connect() so a synchronous throw can't strand the
         // page on the old intentionally-closed socket (see switchModel).
-        wsRef.current = ws;
+        wsRef.current = ws as WebSocketClient;
         attachSocketCallbacks(ws);
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks, sessionId, resetTranscriptState, sessionRuntime]);
+  }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
 
   /**
    * Point this agent at `nextSessionId`. The socket effect tears down the old
