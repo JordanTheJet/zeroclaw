@@ -226,13 +226,16 @@ pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
 
     match ip {
         std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
-        std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
+        std::net::IpAddr::V6(v6) => {
+            v6 == EC2_IMDS_V6 || v6.to_ipv4_mapped().is_some_and(|v4| v4 == EC2_IMDS_V4)
+        }
     }
 }
 
 // ── resolved-address validation ───────────────────────────────────
-// Callers resolve the destination themselves and pass the answer here, so a
-// DNS answer cannot change classes between check and connect.
+// These helpers only classify the supplied answer. To prevent DNS rebinding,
+// callers must connect to the exact addresses they validated rather than
+// resolving the hostname again.
 
 /// Reject a resolution that contains any metadata or non-globally-routable
 /// address. This is the default post-resolution SSRF check.
@@ -333,6 +336,12 @@ mod tests {
         assert!(!is_non_global_v6(
             "::ffff:1.1.1.1".parse::<Ipv6Addr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn cloud_metadata_detection_normalizes_ipv4_mapped_ipv6() {
+        let mapped = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_cloud_metadata_ip(mapped));
     }
 
     #[test]
@@ -560,6 +569,18 @@ mod tests {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_mapped_metadata_even_for_private_opt_in() {
+        let ips = ["::ffff:169.254.169.254".parse().unwrap()];
         let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
             .unwrap_err()
             .to_string();
