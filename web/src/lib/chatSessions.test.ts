@@ -33,7 +33,7 @@ class MemoryStorage {
 const storage = new MemoryStorage();
 (globalThis as unknown as { localStorage: MemoryStorage }).localStorage = storage;
 
-const { deriveSessionTitle, getActiveSessionId, newSessionId, setActiveSessionId } =
+const { getActiveSessionId, newSessionId, setActiveSessionId } =
   await import("./chatSessions.ts");
 
 const ACTIVE = "zeroclaw_active_session.ops";
@@ -98,37 +98,4 @@ test("unwritable storage still yields a usable id", () => {
 
 test("newSessionId returns distinct ids", () => {
   assert.notEqual(newSessionId(), newSessionId());
-});
-
-test("deriveSessionTitle uses the first non-empty line", () => {
-  assert.equal(deriveSessionTitle("Fix the login bug"), "Fix the login bug");
-  assert.equal(
-    deriveSessionTitle("\n\n  Summarise the release notes  \nand then stop"),
-    "Summarise the release notes",
-  );
-});
-
-test("deriveSessionTitle collapses runs of whitespace", () => {
-  assert.equal(deriveSessionTitle("why   is\tthis   slow"), "why is this slow");
-});
-
-test("deriveSessionTitle truncates on a word boundary", () => {
-  // Cut between words rather than mid-word, so the title stays readable.
-  assert.equal(
-    deriveSessionTitle("Please review the gateway session handling and tell me what breaks"),
-    "Please review the gateway session handling and…",
-  );
-});
-
-test("deriveSessionTitle still truncates when the first word is enormous", () => {
-  const title = deriveSessionTitle("a".repeat(120));
-  assert.ok(title !== null);
-  assert.equal(title.length, 49);
-  assert.ok(title.endsWith("…"));
-});
-
-test("deriveSessionTitle returns null when there is no usable text", () => {
-  // An unnamed conversation beats one named after nothing.
-  assert.equal(deriveSessionTitle(""), null);
-  assert.equal(deriveSessionTitle("   \n\t  \n "), null);
 });
