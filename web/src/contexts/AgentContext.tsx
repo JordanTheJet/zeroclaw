@@ -980,6 +980,21 @@ export function AgentProvider({
     })();
   }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
 
+  const addLocalMessage = useCallback((content: string) => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content,
+        markdown: true,
+        timestamp: new Date(),
+        ephemeral: true,
+      },
+    ]);
+  }, []);
+
   /**
    * Point this agent at `nextSessionId`. The socket effect tears down the old
    * connection and reconnects with the new id, and the hydration effect pulls
@@ -1059,21 +1074,6 @@ export function AgentProvider({
     }
     await sessionRuntime.rename(targetSessionId, name);
   }, [sessionPersistence, sessionRuntime]);
-
-  const addLocalMessage = useCallback((content: string) => {
-    localMessageMutationVersionRef.current += 1;
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: generateUUID(),
-        role: 'agent',
-        content,
-        markdown: true,
-        timestamp: new Date(),
-        ephemeral: true,
-      },
-    ]);
-  }, []);
 
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {
