@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, MessagesSquare, Pencil, Plus, Trash2, X } from 'lucide-react';
 import { useAgent } from '@/contexts/AgentContext';
-import { getSessions, renameSession } from '@/lib/api';
+import { getSessions } from '@/lib/api';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
 
@@ -38,17 +38,17 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const {
     sessionId,
     sessionPersistence,
-    sessionsVersion,
     startNewSession,
     goToSession,
     removeSession,
+    renameConversation,
   } = useAgent();
 
   // With persistence off the gateway keeps no record of a conversation, so a
   // new one would strand the current transcript with nothing to switch back to.
   // Withhold the controls rather than lose it silently; "Clear all" remains the
   // way to reset context in that configuration.
-  const storesConversations = sessionPersistence !== false;
+  const storesConversations = sessionPersistence === true;
 
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState<SessionRow[]>([]);
@@ -112,14 +112,11 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     }
   }, [agentAlias, sessionId]);
 
-  // Load on mount, after every session switch, and whenever the provider
-  // invalidates the listing — notably when a conversation is auto-titled from
-  // its first message, so the trigger stops showing a slice of the raw id.
-  // Opening the menu reloads separately (see the trigger's onClick) to refresh
-  // message counts.
+  // Load on mount and after every session switch. Opening the menu reloads
+  // separately (see the trigger's onClick) to refresh names and message counts.
   useEffect(() => {
     void load();
-  }, [load, sessionsVersion]);
+  }, [load]);
 
   // Close on outside click, mirroring the model dropdown in the same header.
   useEffect(() => {
@@ -165,13 +162,11 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   }, [resetRowActions]);
 
   const handleNew = useCallback(() => {
-    startNewSession();
-    closeMenu();
+    if (startNewSession()) closeMenu();
   }, [startNewSession, closeMenu]);
 
   const handleSelect = useCallback((id: string) => {
-    goToSession(id);
-    closeMenu();
+    if (goToSession(id)) closeMenu();
   }, [goToSession, closeMenu]);
 
   const commitRename = useCallback(async (id: string) => {
@@ -181,7 +176,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       return;
     }
     try {
-      await renameSession(id, name);
+      await renameConversation(id, name);
       resetRowActions();
       await load();
     } catch {
@@ -190,7 +185,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       // silently dropping what the operator typed.
       setRenameFailed(true);
     }
-  }, [renameDraft, resetRowActions, load]);
+  }, [renameDraft, renameConversation, resetRowActions, load]);
 
   const handleDelete = useCallback(async (id: string) => {
     try {
@@ -364,7 +359,8 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                 <button
                   type="button"
                   onClick={() => handleSelect(row.id)}
-                  className="flex-1 min-w-0 text-left px-3 py-2"
+                  disabled={!isActive && !storesConversations}
+                  className="flex-1 min-w-0 text-left px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span
                     className={`block text-xs truncate ${isActive ? 'text-pc-accent' : 'text-pc-text'}`}

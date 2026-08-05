@@ -118,6 +118,7 @@ export function AgentChatInner({
     deleteMessage,
     clearAllMessages,
     startNewSession,
+    sessionId,
     hydrated,
     addLocalMessage,
     abortSession,
@@ -127,7 +128,8 @@ export function AgentChatInner({
     contextInputTokens,
   } = useAgent();
 
-  const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
+  const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
+  const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [input, setInput] = useState(draft);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
@@ -151,10 +153,12 @@ export function AgentChatInner({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Persist draft to in-memory store so it survives route changes
+  // AgentChatInner stays mounted while the selected conversation changes.
+  // Load that conversation's draft explicitly; useState's initializer only ran
+  // for the first session and cannot provide this synchronization by itself.
   useEffect(() => {
-    saveDraft(input);
-  }, [input, saveDraft]);
+    setInput(draft);
+  }, [draftKey, draft]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
@@ -207,7 +211,9 @@ export function AgentChatInner({
       // agent can hold several, "new" means what it says: start another one and
       // leave this one on the gateway (issue #7543).
       case 'new':
-        startNewSession();
+        if (!startNewSession()) {
+          addLocalMessage(t('agent.sessions_unavailable'));
+        }
         return true;
 
       case 'model': {
@@ -297,6 +303,7 @@ export function AgentChatInner({
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setInput(value);
+    saveDraft(value);
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
@@ -312,9 +319,11 @@ export function AgentChatInner({
   const applyCommandHint = useCallback((spec: CommandSpec) => {
     setShowCommandHint(false);
     const takesArgs = spec.usage.includes('[');
-    setInput(`/${spec.name}${takesArgs ? ' ' : ''}`);
+    const value = `/${spec.name}${takesArgs ? ' ' : ''}`;
+    setInput(value);
+    saveDraft(value);
     inputRef.current?.focus();
-  }, []);
+  }, [saveDraft]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
     ? matchCommands(input.slice(1))

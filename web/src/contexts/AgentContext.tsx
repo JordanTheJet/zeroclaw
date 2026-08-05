@@ -1,13 +1,34 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
-import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
+import type {
+  ApprovalDecision,
+  PendingApproval,
+  SessionMessagesResponse,
+  WsMessage,
+} from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
-import { deriveSessionTitle, getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
+import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { ApiError, getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession, renameSession } from '@/lib/api';
+import {
+  ApiError,
+  getProp,
+  putProp,
+  listProps,
+  getStatus,
+  getSessionMessages,
+  abortSession,
+  deleteSession,
+  renameSession,
+} from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
+import {
+  initialTurnStreamState,
+  reduceTurnFrame,
+  type TurnStreamFrame,
+  type TurnStreamState,
+} from '@/contexts/turnStream.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -42,7 +63,7 @@ export interface ChatMessage {
   notice?: boolean;
 }
 
-interface AgentContextValue {
+export interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
   connected: boolean;
@@ -72,14 +93,14 @@ interface AgentContextValue {
    * switch back to and session management is withheld.
    */
   sessionPersistence: boolean | null;
-  /** Changes when the session listing goes stale (auto-title, delete). */
-  sessionsVersion: number;
   /** Begin an additional conversation without discarding the current one. */
-  startNewSession: () => void;
+  startNewSession: () => boolean;
   /** Resume a stored conversation; its transcript is rehydrated. */
-  goToSession: (sessionId: string) => void;
+  goToSession: (sessionId: string) => boolean;
   /** Delete a stored conversation, moving off it when it is the active one. */
   removeSession: (sessionId: string) => Promise<void>;
+  /** Persist the operator's explicit conversation name. */
+  renameConversation: (sessionId: string, name: string) => Promise<void>;
   /**
    * Append a locally-generated info/system message to the transcript without
    * sending anything to the gateway. Used by web slash-command handlers
@@ -130,9 +151,43 @@ export interface AgentProviderProps {
    * connection, session ID, and chat history are all scoped to this alias. */
   agentAlias: string;
   children: React.ReactNode;
+  /** Narrow session boundary used by the headless lifecycle regression suite. */
+  sessionRuntime?: AgentSessionRuntime;
 }
 
-export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
+export interface SessionSocket {
+  onMessage: ((msg: WsMessage) => void) | null;
+  onOpen: (() => void) | null;
+  onClose: ((ev: CloseEvent) => void) | null;
+  onError: ((ev: Event) => void) | null;
+  connect(): void;
+  disconnect(): void;
+  readonly connected: boolean;
+  sendMessage(content: string): void;
+  sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
+}
+
+export interface AgentSessionRuntime {
+  createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
+  getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  delete(sessionId: string): Promise<{ deleted: boolean }>;
+  rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
+  mintId(): string;
+}
+
+const defaultSessionRuntime: AgentSessionRuntime = {
+  createSocket: (options) => new WebSocketClient(options),
+  getMessages: getSessionMessages,
+  delete: deleteSession,
+  rename: renameSession,
+  mintId: newSessionId,
+};
+
+export function AgentProvider({
+  agentAlias,
+  children,
+  sessionRuntime = defaultSessionRuntime,
+}: AgentProviderProps) {
   // The conversation this provider is showing. State, not a ref: switching it
   // is what re-runs hydration and rebuilds the socket, which is how one agent
   // serves several independent conversations (issue #7543).
@@ -151,10 +206,6 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   // conversation, so switching away from one strands it — the picker uses this
   // to withhold the controls that would do that.
   const [sessionPersistence, setSessionPersistence] = useState<boolean | null>(null);
-  // Bumped whenever this provider changes something the session listing shows,
-  // so the picker re-reads instead of displaying a name or count it has already
-  // invalidated.
-  const [sessionsVersion, setSessionsVersion] = useState(0);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
@@ -169,17 +220,18 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
-  const wsRef = useRef<WebSocketClient | null>(null);
-  const pendingContentRef = useRef('');
-  const pendingThinkingRef = useRef('');
-  const capturedThinkingRef = useRef('');
+  const wsRef = useRef<SessionSocket | null>(null);
+  // Canonical per-turn stream state. Every production transition that mutates
+  // it goes through reduceTurnFrame, which is exercised directly by the
+  // frame-sequence regression suite.
+  const turnStreamStateRef = useRef<TurnStreamState>(initialTurnStreamState());
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
-  // Conversation this provider has already auto-titled, so a name is derived
-  // once per conversation and never re-derived from a later message.
-  const autoTitledSessionRef = useRef<string | null>(null);
+  // Monotonic navigation ticket. Async destructive actions capture it so a
+  // late completion for an old active conversation cannot move the new one.
+  const sessionGenerationRef = useRef(0);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -195,9 +247,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     let cancelled = false;
 
+    // Session management is a capability, not an optimistic default. Every
+    // hydration starts unknown and only an affirmative gateway response opens
+    // the transition actions.
+    setSessionPersistence(null);
+    setHydratedSessionId(null);
+
     (async () => {
       try {
-        const res = await getSessionMessages(sid);
+        const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         setSessionPersistence(res.session_persistence);
         if (res.session_persistence) {
@@ -213,6 +271,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         }
       } catch {
         if (!cancelled) {
+          setSessionPersistence(null);
           setMessages((prev) => {
             if (prev.length > 0) return prev;
             const ls = loadChatHistory(sid);
@@ -227,7 +286,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [sessionId]);
+  }, [sessionId, sessionRuntime]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
@@ -255,6 +314,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => clearTimeout(id);
   }, [pendingApproval]);
 
+  const foldTurnStream = useCallback((frame: TurnStreamFrame) => {
+    const result = reduceTurnFrame(turnStreamStateRef.current, frame);
+    turnStreamStateRef.current = result.state;
+    return result;
+  }, []);
+
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
@@ -262,47 +327,62 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       case 'connected':
         break;
 
-      case 'thinking':
+      case 'thinking': {
         setTyping(true);
-        pendingThinkingRef.current += msg.content ?? '';
-        setStreamingThinking(pendingThinkingRef.current);
+        const { state } = foldTurnStream({ type: 'thinking', content: msg.content });
+        setStreamingThinking(state.pendingThinking);
         break;
+      }
 
-      case 'chunk':
+      case 'chunk': {
         setTyping(true);
-        pendingContentRef.current += msg.content ?? '';
-        setStreamingContent(pendingContentRef.current);
+        const { state } = foldTurnStream({ type: 'chunk', content: msg.content });
+        setStreamingContent(state.pendingContent);
         break;
+      }
 
       case 'chunk_reset':
         // Server signals that the authoritative done message follows.
         // Snapshot thinking before clearing display state.
-        capturedThinkingRef.current = pendingThinkingRef.current;
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
+        foldTurnStream({ type: 'chunk_reset' });
         setStreamingContent('');
         setStreamingThinking('');
         break;
 
       case 'message':
       case 'done': {
-        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-        // Skip whitespace-only content (e.g. models that emit "\n\n"
-        // alongside tool_calls) to avoid accumulating blank lines in the
-        // assistant bubble. Ref: #6702.
-        const content = raw_content.trim();
-        const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
-        if (content) {
+        const { completion: outcome } = foldTurnStream({
+          type: msg.type,
+          full_response: msg.full_response,
+          content: msg.content,
+        });
+        if (outcome?.kind === 'commit') {
+          // `commit` includes reasoning-only turns: empty content but present
+          // thinking, so the turn renders instead of vanishing silently.
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
             {
               id: generateUUID(),
               role: 'agent',
-              content,
-              thinking,
+              content: outcome.content,
+              thinking: outcome.thinking,
               markdown: true,
               timestamp: new Date(),
+            },
+          ]);
+        } else if (outcome?.kind === 'diagnostic') {
+          // Clean completion with nothing at all — surface a one-off notice so
+          // the turn does not disappear. `skip` means tool cards are the record.
+          localMessageMutationVersionRef.current += 1;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: t('agent.turn_no_output'),
+              timestamp: new Date(),
+              ephemeral: true,
             },
           ]);
         }
@@ -319,9 +399,6 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             setContextInputTokens(msg.input_tokens);
           }
         }
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
-        capturedThinkingRef.current = '';
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -329,6 +406,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_call': {
+        const { state } = foldTurnStream({
+          type: 'tool_call',
+          hasName: Boolean(msg.name),
+        });
         // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
         // bus with observability telemetry, whose `tool_call` frames have a
         // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
@@ -344,7 +425,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const argsKey = JSON.stringify(toolArgs ?? {});
-          if (pendingContentRef.current) {
+          if (state.pendingContent) {
             const isDuplicate = prev.some(
               (m) => m.toolCall
                 && m.toolCall.output === undefined
@@ -464,9 +545,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // Gateway sends this after a cancelled turn; the parked approval (if
         // any) is no longer valid because its request_id belongs to the old
         // turn. Clear so the banner does not linger across the abort.
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
-        capturedThinkingRef.current = '';
+        foldTurnStream({ type: 'aborted' });
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -492,17 +571,16 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
         setTyping(false);
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
+        foldTurnStream({ type: 'error' });
         setStreamingContent('');
         setStreamingThinking('');
         setPendingApproval(null);
         break;
     }
-  }, []);
+  }, [foldTurnStream]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
-  const attachSocketCallbacks = useCallback((ws: WebSocketClient) => {
+  const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
     const version = ++wsVersionRef.current;
 
     ws.onOpen = () => {
@@ -570,7 +648,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   // and re-runs on a session switch so the gateway seeds a fresh Agent from the
   // selected session's persisted history.
   useEffect(() => {
-    const ws = new WebSocketClient({ agentAlias, sessionId });
+    const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
     attachSocketCallbacks(ws);
     ws.connect();
     wsRef.current = ws;
@@ -587,7 +665,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         wsRef.current.disconnect();
       }
     };
-  }, [attachSocketCallbacks, agentAlias, sessionId]);
+  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -661,36 +739,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     try {
       wsRef.current.sendMessage(content);
 
-      // Name a conversation after its opening message. Without this every entry
-      // in the picker reads "Conversation 3f2a91b4", which says nothing about
-      // which one to resume. Only ever fires on an empty transcript, so a name
-      // the operator set by hand is never overwritten.
-      // The ref, not just the length check: two sends in one tick would both
-      // read length 0 from their render's closure and race two renames.
-      if (messages.length === 0 && autoTitledSessionRef.current !== sessionId) {
-        const title = deriveSessionTitle(content);
-        if (title) {
-          const titledSession = sessionId;
-          autoTitledSessionRef.current = titledSession;
-          void renameSession(titledSession, title)
-            .then(() => {
-              // Refresh the picker so the trigger stops showing the raw id.
-              setSessionsVersion((v) => v + 1);
-            })
-            .catch(() => {
-              // Cosmetic: an unnamed conversation is still fully usable, and
-              // the operator can rename it by hand. Release the guard so a
-              // later message can try again.
-              if (autoTitledSessionRef.current === titledSession) {
-                autoTitledSessionRef.current = null;
-              }
-            });
-        }
-      }
-
       setTyping(true);
-      pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
+      foldTurnStream({ type: 'turn_start' });
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,
@@ -705,7 +755,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     } catch {
       setError(t('agent.send_error'));
     }
-  }, [messages.length, sessionId]);
+  }, [foldTurnStream]);
 
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
@@ -770,9 +820,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       // Abort any in-flight streaming before rebuilding the connection.
-      pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
-      capturedThinkingRef.current = '';
+      foldTurnStream({ type: 'reset' });
       setStreamingContent('');
       setStreamingThinking('');
       setTyping(false);
@@ -815,7 +863,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.disconnect();
       }
 
-      const ws = new WebSocketClient({ agentAlias, sessionId });
+      const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
       // Point wsRef at the NEW client before connect(), so a synchronous
       // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
       // leaves a live, reconnect-capable socket in the ref instead of the old
@@ -838,7 +886,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, sessionId]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, sessionId, foldTurnStream, sessionRuntime]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -854,9 +902,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
-    pendingContentRef.current = '';
-    pendingThinkingRef.current = '';
-    capturedThinkingRef.current = '';
+    foldTurnStream({ type: 'reset' });
     setStreamingContent('');
     setStreamingThinking('');
     setTyping(false);
@@ -865,7 +911,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
     setContextInputTokens(null);
-  }, []);
+  }, [foldTurnStream]);
 
   const clearAllMessages = useCallback(() => {
     resetTranscriptState();
@@ -890,7 +936,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
         // session persistence is disabled, or any transport failure, must not
         // block the local clear or the reconnect below.
-        await deleteSession(sid);
+        await sessionRuntime.delete(sid);
       } catch {
         // Persistence disabled or request failed — proceed with the reconnect
         // so the live in-memory context is reset regardless.
@@ -910,7 +956,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.onMessage = null;
         oldWs.disconnect();
 
-        const ws = new WebSocketClient({ agentAlias, sessionId });
+        const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
         // Assign wsRef before connect() so a synchronous throw can't strand the
         // page on the old intentionally-closed socket (see switchModel).
         wsRef.current = ws;
@@ -918,7 +964,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks, sessionId, resetTranscriptState]);
+  }, [agentAlias, attachSocketCallbacks, sessionId, resetTranscriptState, sessionRuntime]);
 
   /**
    * Point this agent at `nextSessionId`. The socket effect tears down the old
@@ -929,8 +975,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
    * is going away regardless, and leaving it running would keep executing tools
    * against a session the operator has navigated away from.
    */
-  const goToSession = useCallback((nextSessionId: string) => {
-    if (nextSessionId === sessionId) return;
+  const goToSession = useCallback((nextSessionId: string): boolean => {
+    if (nextSessionId === sessionId) return false;
+    // Unknown is deliberately denied alongside false. A failed or in-flight
+    // hydration cannot prove there will be a persisted route back.
+    if (sessionPersistence !== true) return false;
 
     if (typing) {
       void abortSession(sessionId).catch(() => {
@@ -944,14 +993,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // `messages` is empty, and the mirror effect would write that empty
     // transcript over A's cache — the only copy when persistence is off.
     setHydratedSessionId(null);
+    setSessionPersistence(null);
+    sessionGenerationRef.current += 1;
     setActiveSessionId(agentAlias, nextSessionId);
     setSessionId(nextSessionId);
-  }, [agentAlias, resetTranscriptState, sessionId, typing]);
+    return true;
+  }, [agentAlias, resetTranscriptState, sessionId, sessionPersistence, typing]);
 
   /** Start an additional conversation, leaving the current one intact. */
-  const startNewSession = useCallback(() => {
-    goToSession(newSessionId());
-  }, [goToSession]);
+  const startNewSession = useCallback((): boolean => {
+    // Do not even mint an unreachable id until the shared transition gate is
+    // open. goToSession rechecks the capability before mutating state.
+    if (sessionPersistence !== true) return false;
+    return goToSession(sessionRuntime.mintId());
+  }, [goToSession, sessionPersistence, sessionRuntime]);
 
   /**
    * Drop a stored conversation. Deleting the one on screen leaves nothing to
@@ -959,8 +1014,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
    * transcript the gateway no longer has.
    */
   const removeSession = useCallback(async (targetSessionId: string) => {
+    if (sessionPersistence !== true) {
+      throw new Error('Session persistence is not available');
+    }
+    const activeAtStart = sessionId;
+    const generationAtStart = sessionGenerationRef.current;
     try {
-      await deleteSession(targetSessionId);
+      await sessionRuntime.delete(targetSessionId);
     } catch (err) {
       // 404 means the gateway has nothing stored for this conversation, which
       // is already the outcome the operator asked for. Anything else is a real
@@ -971,10 +1031,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // The browser cache is a second copy of the same transcript; a delete that
     // leaves it behind is not a delete.
     removeChatHistory(targetSessionId);
-    if (targetSessionId === sessionId) {
-      goToSession(newSessionId());
+    if (
+      targetSessionId === activeAtStart
+      && sessionGenerationRef.current === generationAtStart
+    ) {
+      goToSession(sessionRuntime.mintId());
     }
-  }, [goToSession, sessionId]);
+  }, [goToSession, sessionId, sessionPersistence, sessionRuntime]);
+
+  const renameConversation = useCallback(async (targetSessionId: string, name: string) => {
+    if (sessionPersistence !== true) {
+      throw new Error('Session persistence is not available');
+    }
+    await sessionRuntime.rename(targetSessionId, name);
+  }, [sessionPersistence, sessionRuntime]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1021,10 +1091,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     sessionId,
     hydrated: hydratedSessionId === sessionId,
     sessionPersistence,
-    sessionsVersion,
     startNewSession,
     goToSession,
     removeSession,
+    renameConversation,
     addLocalMessage,
     abortSession: async () => {
       // Clear local approval state immediately — the in-flight request_id
