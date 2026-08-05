@@ -3323,16 +3323,60 @@ fn is_zeroclaw_name(name: &str) -> bool {
     }
 }
 
+/// Reserved characters that the Desktop Entry Specification requires to be
+/// double-quoted in an `Exec` value. Encountering one outside quotes means the
+/// value is malformed, so parsing fails closed rather than launching a partially
+/// interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const EXEC_RESERVED_CHARS: &[char] = &[
+    '"', '`', '$', '\\', '>', '<', '~', '|', '&', ';', '*', '?', '#', '(', ')', '\'',
+];
+
+/// Apply the Desktop Entry Specification's general string-value unescape rules
+/// (`\s \n \t \r \\`) to the raw `Exec` value. The spec applies this layer
+/// *before* the `Exec` quoting rules, so e.g. a literal `$` in a quoted path is
+/// written `\\$`: the general layer turns `\\` into `\`, leaving `\$` for the
+/// quoting layer. Any other escape, or a dangling backslash, is malformed and
+/// fails closed (`None`).
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn unescape_desktop_value(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    loop {
+        // Manual iteration: an escape consumes the following char too, so a
+        // `for`/`while let` over the iterator would not compose here.
+        let Some(c) = chars.next() else {
+            break;
+        };
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => out.push(' '),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Parse the program token (first argument) from a desktop-entry `Exec=` value,
-/// per the Desktop Entry Specification quoting rules: reserved characters may be
-/// double-quoted, and inside a quoted string `"`, `` ` ``, `$` and `\` are
-/// backslash-escaped; outside quotes a backslash escapes the next character.
-/// This keeps a quoted path containing spaces intact. Field codes (`%f`, `%U`,
-/// …) are arguments, never the program, so a value whose program token is a
-/// field code (or empty) yields `None`.
+/// per the Desktop Entry Specification. The general string-unescape layer is
+/// applied first (see [`unescape_desktop_value`]), then the `Exec` quoting rules:
+/// reserved characters must be double-quoted, and inside a quoted string `"`,
+/// `` ` ``, `$` and `\` are backslash-escaped. A quoted path containing spaces is
+/// preserved. Parsing fails closed (`None`) on malformed input — an unterminated
+/// quote, a dangling or invalid escape, an unquoted reserved character, an `=`
+/// in the token, or a program token that is empty or a field code (`%f`, `%U`,
+/// …) — rather than launching a partially interpreted path.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 fn parse_exec_program(exec: &str) -> Option<String> {
-    let mut chars = exec.chars().peekable();
+    let unescaped = unescape_desktop_value(exec)?;
+    let mut chars = unescaped.chars().peekable();
     while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
         chars.next();
     }
@@ -3340,18 +3384,15 @@ fn parse_exec_program(exec: &str) -> Option<String> {
     match chars.peek() {
         Some('"') => {
             chars.next(); // consume opening quote
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' => break,
-                    '\\' => match chars.next() {
+            loop {
+                match chars.next() {
+                    None => return None, // unterminated quote
+                    Some('"') => break,  // closing quote
+                    Some('\\') => match chars.next() {
                         Some(esc @ ('"' | '`' | '$' | '\\')) => token.push(esc),
-                        Some(other) => {
-                            token.push('\\');
-                            token.push(other);
-                        }
-                        None => break,
+                        _ => return None, // invalid or dangling escape inside quotes
                     },
-                    _ => token.push(c),
+                    Some(c) => token.push(c),
                 }
             }
         }
@@ -3360,12 +3401,8 @@ fn parse_exec_program(exec: &str) -> Option<String> {
                 if c.is_whitespace() {
                     break;
                 }
-                if c == '\\' {
-                    chars.next();
-                    if let Some(next) = chars.next() {
-                        token.push(next);
-                    }
-                    continue;
+                if EXEC_RESERVED_CHARS.contains(&c) {
+                    return None; // a reserved character must be quoted
                 }
                 token.push(c);
                 chars.next();
@@ -3373,34 +3410,43 @@ fn parse_exec_program(exec: &str) -> Option<String> {
         }
         None => return None,
     }
-    if token.is_empty() || token.starts_with('%') {
+    if token.is_empty() || token.starts_with('%') || token.contains('=') {
         return None;
     }
     Some(token)
 }
 
-/// True when a desktop entry's resolved `Exec` program is a ZeroClaw
-/// executable: its file name begins with "zeroclaw" (e.g. `zeroclaw-desktop` or
-/// `ZeroClaw-x86_64.AppImage`). Anchoring at the start binds the entry to a
-/// ZeroClaw target — so a deliberate ZeroClaw `Name` cannot be paired with an
-/// unrelated executable (`Exec=/tmp/evil`) or a lookalike (`not-zeroclaw-*`) to
-/// preempt the real app.
+/// The published companion-app binary name (the `Exec` of `ZeroClaw.desktop` in
+/// the v0.8.3 Debian package). This is the single source of truth for the
+/// supported non-AppImage executable, so discovery cannot select a lookalike
+/// such as `zeroclaw-helper` or `zeroclaw-evil`.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const ZEROCLAW_DESKTOP_BIN: &str = "zeroclaw-desktop";
+
+/// True when a desktop entry's resolved `Exec` program is a supported ZeroClaw
+/// executable: either the exact published binary `zeroclaw-desktop`, or a
+/// ZeroClaw AppImage in the published `ZeroClaw-*.AppImage` form. It is bound to
+/// those forms — not to any `zeroclaw*` basename — so a deliberate ZeroClaw
+/// `Name` cannot be paired with a lookalike (`zeroclaw-helper`, `zeroclaw-evil`)
+/// to preempt the real app.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 fn is_zeroclaw_program(program: &str) -> bool {
-    Path::new(program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.to_ascii_lowercase().starts_with("zeroclaw"))
+    let Some(name) = Path::new(program).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == ZEROCLAW_DESKTOP_BIN || is_zeroclaw_appimage_name(name)
 }
 
-/// True when a bare file name is a ZeroClaw AppImage: it begins with "zeroclaw"
-/// and ends with ".appimage" (case-insensitively). Anchoring at the start keeps
-/// a lookalike such as `not-zeroclaw-helper.AppImage` from qualifying in the
-/// unregistered-AppImage fallback scan.
+/// True when a bare file name is a supported ZeroClaw AppImage in the published
+/// `ZeroClaw-*.AppImage` form: it begins with "zeroclaw-" (the separator is
+/// required) and ends with ".appimage", case-insensitively. Requiring the
+/// separator rejects lookalikes with no boundary such as `ZeroClawevil.AppImage`
+/// as well as `not-zeroclaw-helper.AppImage`.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 fn is_zeroclaw_appimage_name(file_name: &str) -> bool {
     let lower = file_name.to_ascii_lowercase();
-    lower.starts_with("zeroclaw") && lower.ends_with(".appimage")
+    lower.starts_with("zeroclaw-") && lower.ends_with(".appimage")
 }
 
 /// Read the `Exec` target from a desktop entry, but only when the entry is a
@@ -3526,11 +3572,11 @@ fn collect_desktop_entries(
         };
         if file_type.is_dir() {
             collect_desktop_entries(root, &path, out, visited);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
-            if let Ok(rel) = path.strip_prefix(root) {
-                let id = rel.to_string_lossy().replace('/', "-");
-                out.push((id, path));
-            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("desktop")
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            let id = rel.to_string_lossy().replace('/', "-");
+            out.push((id, path));
         }
     }
 }
@@ -3607,21 +3653,30 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     }
 
     // Fall back to scanning common AppImage locations for a ZeroClaw image that
-    // was made executable but never registered on PATH.
+    // was made executable but never registered on PATH. `read_dir` order is
+    // unspecified, so collect every match and pick deterministically: within
+    // a directory the lexicographically greatest file name (so a higher version
+    // like `ZeroClaw-2...` is preferred over `ZeroClaw-1...`); earlier
+    // directories in the list keep priority.
     if let Some(home) = &home {
         for dir in [home.join("Applications"), home.join(".local/bin")] {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                if is_zeroclaw_appimage_name(name) && is_executable(&path) {
-                    return Some(path);
-                }
+            let mut matches: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    is_zeroclaw_appimage_name(name) && is_executable(path)
+                })
+                .collect();
+            if !matches.is_empty() {
+                matches.sort();
+                return matches.pop();
             }
         }
     }
@@ -8446,24 +8501,68 @@ mod tests {
     fn zeroclaw_desktop_exec_keeps_quoted_path_with_spaces() {
         let entry = "[Desktop Entry]\n\
              Name=ZeroClaw\n\
-             Exec=\"/home/user/My Applications/ZeroClaw.AppImage\" %U\n\
+             Exec=\"/home/user/My Applications/ZeroClaw-x86_64.AppImage\" %U\n\
              Type=Application\n";
         assert_eq!(
             zeroclaw_desktop_exec(entry).as_deref(),
-            Some("/home/user/My Applications/ZeroClaw.AppImage")
+            Some("/home/user/My Applications/ZeroClaw-x86_64.AppImage")
         );
     }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]
-    fn zeroclaw_desktop_exec_keeps_backslash_escaped_space() {
-        let entry = "[Desktop Entry]\n\
+    fn zeroclaw_desktop_exec_rejects_unquoted_reserved_and_escaped_space() {
+        // Per the Desktop Entry spec a space (a reserved character) must be
+        // quoted; a backslash-escaped space outside quotes is malformed. The
+        // parser fails closed rather than launching a partially interpreted path.
+        let escaped_space = "[Desktop Entry]\n\
              Name=ZeroClaw\n\
-             Exec=/home/user/My\\ Apps/ZeroClaw.AppImage %U\n\
+             Exec=/home/user/My\\ Apps/zeroclaw-desktop %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(escaped_space), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_decodes_quoted_literal_dollar_and_backslash() {
+        // A literal `$` in a quoted path is written `\\$` (general unescape
+        // `\\`->`\`, then the Exec layer unescapes `\$`->`$`); a literal
+        // backslash is written `\\\\`.
+        let dollar = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/\\\\$dir/zeroclaw-desktop\" %U\n\
              Type=Application\n";
         assert_eq!(
-            zeroclaw_desktop_exec(entry).as_deref(),
-            Some("/home/user/My Apps/ZeroClaw.AppImage")
+            zeroclaw_desktop_exec(dollar).as_deref(),
+            Some("/opt/$dir/zeroclaw-desktop")
+        );
+        let backslash = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/a\\\\\\\\b/zeroclaw-desktop\"\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(backslash).as_deref(),
+            Some("/opt/a\\b/zeroclaw-desktop")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn parse_exec_program_fails_closed_on_malformed_input() {
+        // Unterminated quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop"), None);
+        // Dangling escape inside a quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw\\"), None);
+        // Dangling escape outside quotes (invalid general escape).
+        assert_eq!(parse_exec_program("/opt/zeroclaw\\"), None);
+        // A forbidden `=` in the executable token.
+        assert_eq!(parse_exec_program("/opt/a=b/zeroclaw-desktop"), None);
+        // Unquoted reserved character.
+        assert_eq!(parse_exec_program("/opt/$HOME/zeroclaw-desktop"), None);
+        // A valid bare token still parses.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U").as_deref(),
+            Some("zeroclaw-desktop")
         );
     }
 
@@ -8486,18 +8585,23 @@ mod tests {
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]
     fn zeroclaw_desktop_exec_honours_hidden_and_group_scope() {
-        // Hidden=true ("masked") entries are ignored.
+        // Otherwise a fully valid ZeroClaw Application entry — it resolves only
+        // because `Hidden=true` masks it, so the fixture actually exercises the
+        // Hidden rule rather than passing on some other missing field.
         let masked = "[Desktop Entry]\n\
+             Type=Application\n\
              Name=ZeroClaw\n\
              Exec=/opt/zeroclaw/zeroclaw-desktop\n\
              Hidden=true\n";
         assert_eq!(zeroclaw_desktop_exec(masked), None);
 
-        // Only the [Desktop Entry] group is consulted; a ZeroClaw name that
-        // appears in a Desktop Action group must not be treated as identity.
+        // Only the [Desktop Entry] group is consulted. The main group is an
+        // otherwise valid ZeroClaw Application with no Name of its own, so it
+        // resolves iff a `Name=ZeroClaw` from the Desktop Action group leaks in.
+        // It must not.
         let action_only = "[Desktop Entry]\n\
-             Name=Unrelated\n\
-             Exec=/usr/bin/other\n\
+             Type=Application\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
              [Desktop Action foo]\n\
              Name=ZeroClaw\n\
              Exec=/tmp/evil\n";
@@ -8543,8 +8647,9 @@ mod tests {
         let high = tempfile::tempdir().unwrap();
         let low = tempfile::tempdir().unwrap();
 
-        let high_bin = high.path().join("zeroclaw-high");
-        let low_bin = low.path().join("zeroclaw-low");
+        // Both are the supported `zeroclaw-desktop` binary, in separate dirs.
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
         write_exec(&high_bin);
         write_exec(&low_bin);
 
@@ -8560,10 +8665,95 @@ mod tests {
 
         // A non-executable Exec target is skipped rather than returned.
         let broken = tempfile::tempdir().unwrap();
-        let non_exec = broken.path().join("zeroclaw-broken");
+        let non_exec = broken.path().join("zeroclaw-desktop");
         std::fs::write(&non_exec, "not executable").unwrap();
         write_entry(broken.path(), "ZeroClaw.desktop", &non_exec);
         assert_eq!(discover_desktop_app(&[broken.path().to_path_buf()]), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_lookalike_ordered_before_real_app() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        // A lexically earlier entry (`000...`) with a ZeroClaw Name but a
+        // lookalike executable must not preempt the real companion app.
+        let lookalike = dir.path().join("zeroclaw-helper");
+        let real = dir.path().join("zeroclaw-desktop");
+        write_exec(&lookalike);
+        write_exec(&real);
+        std::fs::write(
+            apps.join("000-lookalike.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                lookalike.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_higher_precedence_hidden_masks_lower_valid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_entry(dir: &Path, body: &str) {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(apps.join("ZeroClaw.desktop"), body).unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&low_bin);
+
+        // A higher-precedence Hidden=true entry masks the same desktop-file ID in
+        // the lower directory, so the lower (valid) entry must not be launched.
+        write_entry(
+            high.path(),
+            "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec=/opt/zeroclaw/zeroclaw-desktop\nHidden=true\n",
+        );
+        write_entry(
+            low.path(),
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                low_bin.display()
+            ),
+        );
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(discover_desktop_app(&dirs), None);
     }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
@@ -8635,11 +8825,30 @@ mod tests {
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]
     fn is_zeroclaw_appimage_name_anchors_identity() {
+        // The published `ZeroClaw-*.AppImage` form (separator required).
         assert!(is_zeroclaw_appimage_name("ZeroClaw-x86_64.AppImage"));
-        assert!(is_zeroclaw_appimage_name("zeroclaw.appimage"));
+        assert!(is_zeroclaw_appimage_name("zeroclaw-aarch64.appimage"));
+        // A no-boundary lookalike must not qualify.
+        assert!(!is_zeroclaw_appimage_name("ZeroClawevil.AppImage"));
+        // Missing the separator (not a published form).
+        assert!(!is_zeroclaw_appimage_name("zeroclaw.appimage"));
         // A lookalike whose name merely contains the substring must not qualify.
         assert!(!is_zeroclaw_appimage_name("not-zeroclaw-helper.AppImage"));
         assert!(!is_zeroclaw_appimage_name("ZeroClaw.txt"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_program_binds_to_supported_names() {
+        // Exact published binary, or a published-form AppImage.
+        assert!(is_zeroclaw_program("/usr/bin/zeroclaw-desktop"));
+        assert!(is_zeroclaw_program(
+            "/home/user/Applications/ZeroClaw-x86_64.AppImage"
+        ));
+        // Lookalikes sharing the prefix are rejected.
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-helper"));
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-evil"));
+        assert!(!is_zeroclaw_program("/usr/bin/zeroclaw"));
     }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
@@ -8668,8 +8877,8 @@ mod tests {
 
         let high = tempfile::tempdir().unwrap();
         let low = tempfile::tempdir().unwrap();
-        let high_bin = high.path().join("zeroclaw-high");
-        let low_bin = low.path().join("zeroclaw-low");
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
         write_exec(&high_bin);
         write_exec(&low_bin);
 
