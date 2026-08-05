@@ -345,12 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn cgnat_and_reserved_v4_blocked() {
-        assert!(is_non_global_v4(Ipv4Addr::new(100, 64, 0, 1)));
-        assert!(is_non_global_v4(Ipv4Addr::new(240, 0, 0, 1)));
-    }
-
-    #[test]
     fn normalize_domain_strips_scheme_path_and_case() {
         let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
         assert_eq!(got, "docs.example.com");
@@ -614,5 +608,11 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn cgnat_and_reserved_v4_blocked() {
+        assert!(is_non_global_v4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_non_global_v4(Ipv4Addr::new(240, 0, 0, 1)));
     }
 }
