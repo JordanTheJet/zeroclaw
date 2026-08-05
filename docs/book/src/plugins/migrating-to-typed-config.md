@@ -125,7 +125,12 @@ for the signing flow.
 ## Operator steps
 
 Existing `[[plugins.entries]]` blocks named after a package or binding are not
-read. To move values onto the new key:
+read. The available migration path depends on the plugin capability.
+
+### Tool instances
+
+Install and info commands can derive a tool instance from the package's default
+tool binding. To move tool values onto the new key:
 
 1. Run `zeroclaw plugin info <package>` to print the full-instance key, which
    looks like `zpi1_...`.
@@ -136,7 +141,22 @@ read. To move values onto the new key:
 
 The key is a versioned, reversible encoding of the package, capability, and
 binding, which is why two packages can both use a binding named `main` without
-sharing credentials. Fresh installs seed and print the key automatically.
+sharing credentials. Fresh installs seed and print this tool key automatically.
+
+### Channel instances
+
+A channel key includes the configured channel alias. `zeroclaw plugin install`
+and `zeroclaw plugin info` know the package but do not own that alias, so they
+cannot derive, print, or seed a channel key and must not invent a package-level
+substitute. The alias-aware production path is tracked in
+[zeroclaw#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its
+accepted successor; it must derive, display, and seed
+`zpi1(package, channel, alias)` from the actual configured alias.
+
+Until that path lands, authors can prepare a channel manifest and guest for
+typed config, but must not mark a channel-only package migrated or publish it as
+compatible with this host contract. Operators do not yet have an automatic
+channel key path in this slice.
 
 ## Diagnosing a rejection
 
@@ -155,7 +175,10 @@ sharing credentials. Fresh installs seed and print the key automatically.
 Every package published in `zeroclaw-labs/zeroclaw-plugins` requests
 `config_read`, and none declared `config_schema` when this landed, so all of
 them need step 1 and step 5. Migration is tracked in that repository rather
-than here, since the packages version independently of the host.
+than here, since the packages version independently of the host. Tool packages
+can complete the operator-key step now. Channel-only packages must wait for the
+alias-aware key path above before the tracker marks or publishes them as
+migrated for this contract.
 
 ## Memory plugins
 

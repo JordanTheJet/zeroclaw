@@ -580,9 +580,14 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 Operator values currently enter through generic string-map storage: edit
 `[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
-has seeded its package-name binding entry. `zeroclaw plugin info <package>`
-prints the same key for migration and later edits. Schema-driven forms and
-inline field help are not implemented yet. The current surfaces are:
+has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
+the same tool key for migration and later edits. These automatic print and seed
+surfaces are tool-only. A channel key depends on its configured alias, which
+install and info do not own; the alias-aware production path in
+[#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its accepted
+successor, must derive, display, and seed that key before a channel-only package
+can complete this migration. Schema-driven forms and inline field help are not
+implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
   `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw

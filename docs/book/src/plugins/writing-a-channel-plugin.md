@@ -279,7 +279,12 @@ arrive as real arrays and objects. Because `api_token` is required, withholding
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
-isolated.
+isolated. The install and info commands cannot create this key because they do
+not own the configured channel alias; their automatic print and seed behavior
+is tool-only. Alias-aware channel key display and seeding is tracked in
+[#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its accepted
+successor. Prepare the manifest and guest now, but do not publish a channel-only
+package as migrated to typed config until that production path exists.
 
 ## Build and install
 
