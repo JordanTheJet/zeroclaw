@@ -534,6 +534,23 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
+/// What an inline-keyboard callback resolved to.
+///
+/// An inline keyboard is visible to every member of the chat it was posted
+/// in, so the tap that answers an approval prompt is authorized against the
+/// same allowlist the message paths use before the verdict is honored.
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalCallbackOutcome {
+    /// The callback payload was not an approval verdict.
+    NotApproval,
+    /// The tapping account is not on this channel's allowlist.
+    Unauthorized,
+    /// The verdict verb was not recognized.
+    UnknownAction,
+    /// The verdict was accepted and the pending approval resolved.
+    Resolved(zeroclaw_api::channel::ChannelApprovalResponse),
+}
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -1511,6 +1528,83 @@ impl TelegramChannel {
         I: IntoIterator<Item = &'a str>,
     {
         identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
+
+    /// The identities Telegram attributes to the account that tapped an
+    /// inline-keyboard button, in the same shape the message paths build.
+    fn callback_actor_identities(cb: &serde_json::Value) -> Vec<String> {
+        let mut identities = Vec::new();
+        let Some(from) = cb.get("from") else {
+            return identities;
+        };
+        if let Some(username) = from.get("username").and_then(serde_json::Value::as_str) {
+            let normalized = Self::normalize_identity(username);
+            if !normalized.is_empty() {
+                identities.push(normalized);
+            }
+        }
+        if let Some(id) = from.get("id").and_then(serde_json::Value::as_i64) {
+            identities.push(id.to_string());
+        }
+        identities
+    }
+
+    /// Whether the account that tapped the button may answer this channel's
+    /// approval prompts. A callback carrying no attributable account fails
+    /// closed, including under a wildcard allowlist.
+    fn is_callback_actor_allowed(&self, cb: &serde_json::Value) -> bool {
+        let identities = Self::callback_actor_identities(cb);
+        if identities.is_empty() {
+            return false;
+        }
+        self.is_any_user_allowed(identities.iter().map(String::as_str))
+    }
+
+    /// Authorize an inline-keyboard callback and, when it carries an approval
+    /// verdict from an allowed account, resolve the waiting approval.
+    async fn resolve_approval_callback(&self, cb: &serde_json::Value) -> ApprovalCallbackOutcome {
+        let cb_data = cb
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        let Some((approval_id, action)) = cb_data
+            .strip_prefix("approval:")
+            .and_then(|rest| rest.rsplit_once(':'))
+        else {
+            return ApprovalCallbackOutcome::NotApproval;
+        };
+
+        if !self.is_callback_actor_allowed(cb) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "approval callback from an account outside the channel allowlist"
+            );
+            return ApprovalCallbackOutcome::Unauthorized;
+        }
+
+        let response = match action {
+            "approve" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            "always" => zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+            "deny" => zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            other => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "other": other })),
+                    "Unknown approval callback action"
+                );
+                return ApprovalCallbackOutcome::UnknownAction;
+            }
+        };
+
+        if let Some(sender) = self.pending_approvals.lock().await.remove(approval_id) {
+            let _ = sender.send(response.clone());
+        }
+        ApprovalCallbackOutcome::Resolved(response)
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -3900,64 +3994,40 @@ Ensure only one `zeroclaw` process is using this bot token."
                             .get("id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
-                        let cb_data = cb
-                            .get("data")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
 
-                        if let Some(rest) = cb_data.strip_prefix("approval:")
-                            && let Some((approval_id, action)) = rest.rsplit_once(':')
-                        {
-                            let response = match action {
-                                "approve" => {
-                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
-                                }
-                                "always" => Some(
-                                    zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-                                ),
-                                "deny" => {
-                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
-                                }
-                                other => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(::serde_json::json!({"other": other})),
-                                        "Unknown approval callback action"
-                                    );
-                                    None
-                                }
-                            };
+                        let outcome = self.resolve_approval_callback(cb).await;
 
-                            if let Some(resp) = response
-                                && let Some(sender) =
-                                    self.pending_approvals.lock().await.remove(approval_id)
-                            {
-                                let _ = sender.send(resp);
-                            }
-
+                        if !matches!(outcome, ApprovalCallbackOutcome::NotApproval) {
                             // Answer the callback query to dismiss the spinner.
-                            let answer_text = match action {
-                                "approve" => format!(
+                            let answer_text = match outcome {
+                                ApprovalCallbackOutcome::Resolved(
+                                    zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+                                ) => format!(
                                     "✅ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-approved"
                                     )
                                 ),
-                                "always" => format!(
+                                ApprovalCallbackOutcome::Resolved(
+                                    zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+                                ) => format!(
                                     "✅✅ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-always-approved"
                                     )
                                 ),
-                                "deny" => format!(
+                                ApprovalCallbackOutcome::Resolved(
+                                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                                ) => format!(
                                     "❌ {}",
                                     i18n::get_required_cli_string(
                                         "channel-telegram-approval-ack-denied"
+                                    )
+                                ),
+                                ApprovalCallbackOutcome::Unauthorized => format!(
+                                    "⛔ {}",
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-approval-ack-unauthorized"
                                     )
                                 ),
                                 _ => format!(
@@ -8255,6 +8325,144 @@ mod tests {
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    fn approval_callback(from: Option<serde_json::Value>, data: &str) -> serde_json::Value {
+        let mut cb = serde_json::json!({ "id": "cb-1", "data": data });
+        if let Some(from) = from {
+            cb["from"] = from;
+        }
+        cb
+    }
+
+    fn channel_allowing(peers: Vec<String>) -> TelegramChannel {
+        let mention_only = false;
+        TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(move || peers.clone()),
+            mention_only,
+        )
+    }
+
+    #[test]
+    fn callback_actor_identities_carry_username_and_numeric_id() {
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 4242, "username": "@alice" })),
+            "approval:abc:approve",
+        );
+        assert_eq!(
+            TelegramChannel::callback_actor_identities(&cb),
+            vec!["alice".to_string(), "4242".to_string()]
+        );
+    }
+
+    #[test]
+    fn callback_actor_denied_when_from_is_absent() {
+        let ch = channel_allowing(vec!["*".into()]);
+        let cb = approval_callback(None, "approval:abc:approve");
+        assert!(
+            !ch.is_callback_actor_allowed(&cb),
+            "a callback without a `from` account must fail closed even under a wildcard allowlist"
+        );
+    }
+
+    #[test]
+    fn callback_actor_denied_when_not_on_allowlist() {
+        let ch = channel_allowing(vec!["alice".into()]);
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 9, "username": "eve" })),
+            "approval:abc:approve",
+        );
+        assert!(!ch.is_callback_actor_allowed(&cb));
+    }
+
+    #[test]
+    fn callback_actor_allowed_by_username_or_numeric_id() {
+        let by_name = channel_allowing(vec!["alice".into()]);
+        let by_id = channel_allowing(vec!["4242".into()]);
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 4242, "username": "alice" })),
+            "approval:abc:approve",
+        );
+        assert!(by_name.is_callback_actor_allowed(&cb));
+        assert!(by_id.is_callback_actor_allowed(&cb));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_tap_does_not_resolve_a_pending_approval() {
+        let ch = channel_allowing(vec!["alice".into()]);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc".to_string(), tx);
+
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 9, "username": "eve" })),
+            "approval:abc:approve",
+        );
+        let outcome = ch.resolve_approval_callback(&cb).await;
+
+        assert_eq!(outcome, ApprovalCallbackOutcome::Unauthorized);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unlisted tapper must not satisfy the approval gate"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.contains_key("abc"),
+            "the approval stays pending so the authorized operator can still decide it"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_tap_resolves_the_pending_approval() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = channel_allowing(vec!["alice".into()]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc".to_string(), tx);
+
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 4242, "username": "alice" })),
+            "approval:abc:always",
+        );
+        let outcome = ch.resolve_approval_callback(&cb).await;
+
+        assert_eq!(
+            outcome,
+            ApprovalCallbackOutcome::Resolved(ChannelApprovalResponse::AlwaysApprove)
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn unknown_action_from_an_allowed_actor_is_reported_not_resolved() {
+        let ch = channel_allowing(vec!["alice".into()]);
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 4242, "username": "alice" })),
+            "approval:abc:sudo",
+        );
+        assert_eq!(
+            ch.resolve_approval_callback(&cb).await,
+            ApprovalCallbackOutcome::UnknownAction
+        );
+    }
+
+    #[tokio::test]
+    async fn non_approval_callback_data_is_ignored_before_any_authz() {
+        let ch = channel_allowing(vec!["alice".into()]);
+        let cb = approval_callback(
+            Some(serde_json::json!({ "id": 9, "username": "eve" })),
+            "menu:open",
+        );
+        assert_eq!(
+            ch.resolve_approval_callback(&cb).await,
+            ApprovalCallbackOutcome::NotApproval
+        );
     }
 
     #[tokio::test]
