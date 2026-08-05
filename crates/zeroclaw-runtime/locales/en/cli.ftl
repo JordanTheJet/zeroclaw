@@ -1056,6 +1056,9 @@ cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
+cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
+cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
@@ -1068,9 +1071,6 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
-cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
-cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.

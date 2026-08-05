@@ -22513,6 +22513,32 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    #[::core::prelude::v1::test]
+    fn todotracker_config_defaults() {
+        let cfg = super::TodoTrackerConfig::default();
+        assert!(cfg.enabled);
+        assert!(!cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
+        assert_eq!(cfg.width, 32);
+        assert_eq!(cfg.max_height, 5);
+    }
+
+    #[::core::prelude::v1::test]
+    fn todotracker_config_parses_from_toml() {
+        let toml = r#"
+enabled = true
+enabled_at_start = true
+location = "bottom"
+width = 40
+max_height = 8
+"#;
+        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
+        assert_eq!(cfg.width, 40);
+        assert_eq!(cfg.max_height, 8);
+    }
+
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -22559,32 +22585,6 @@ mod tests {
         // Pinned so a change to the stub is a deliberate, reviewed edit — the
         // value is load-bearing for trim budgets on unconfigured profiles.
         assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_defaults() {
-        let cfg = super::TodoTrackerConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
-        assert_eq!(cfg.width, 32);
-        assert_eq!(cfg.max_height, 5);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_parses_from_toml() {
-        let toml = r#"
-enabled = true
-enabled_at_start = true
-location = "bottom"
-width = 40
-max_height = 8
-"#;
-        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
-        assert_eq!(cfg.width, 40);
-        assert_eq!(cfg.max_height, 8);
     }
 
     #[::core::prelude::v1::test]
