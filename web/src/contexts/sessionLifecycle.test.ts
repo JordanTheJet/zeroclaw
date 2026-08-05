@@ -57,7 +57,15 @@ Object.defineProperty(globalThis, 'navigator', {
   .IS_REACT_ACT_ENVIRONMENT = true;
 
 let listedSessions: Array<Record<string, unknown>> = [];
-globalThis.fetch = async (input) => {
+interface ConfigPutRequest {
+  path: string;
+  value: unknown;
+  comment?: string;
+}
+let configPutCalls: ConfigPutRequest[] = [];
+let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
+
+globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
     ? input
     : input instanceof URL
@@ -66,7 +74,12 @@ globalThis.fetch = async (input) => {
   let body: unknown;
   if (url.includes('/api/config/catalog')) body = { providers: [] };
   else if (url.includes('/api/status')) body = { model: 'test-model' };
-  else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
+  else if (url.includes('/api/config/prop') && init?.method === 'PUT') {
+    const request = JSON.parse(String(init.body)) as ConfigPutRequest;
+    configPutCalls.push(request);
+    if (configPutHandler) return configPutHandler(request);
+    body = { path: request.path, value: request.value };
+  } else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
   else if (url.includes('/api/config/list')) body = { entries: [] };
   else if (url.endsWith('/api/sessions')) body = { sessions: listedSessions };
   else return new Response('{"error":"not found"}', { status: 404 });
@@ -307,6 +320,8 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
 
 beforeEach(() => {
   storage.clear();
+  configPutCalls = [];
+  configPutHandler = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
@@ -391,6 +406,59 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   assert.equal(mounted.context().sessionPersistence, true);
   assert.equal(mounted.context().hydrated, true);
   assert.deepEqual(mounted.context().messages.map((message) => message.content), ['from B']);
+  await unmount(mounted.renderer);
+});
+
+test('a deferred model PUT rebuilds the latest selected session socket', async () => {
+  const runtime = new FakeSessionRuntime();
+  const configPut = new Deferred<Response>();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
+  configPutHandler = () => configPut.promise;
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  let pendingSwitch!: Promise<void>;
+  await act(async () => {
+    pendingSwitch = mounted.context().switchModel('kilo.new-model');
+    await Promise.resolve();
+  });
+  assert.deepEqual(configPutCalls, [{
+    path: 'agents.ops.model_provider',
+    value: 'kilo.new-model',
+  }]);
+  assert.equal(mounted.context().modelLoading, true);
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.equal(runtime.sockets[1]?.sessionId, 'B');
+  await openSocket(runtime, 1);
+  await settle();
+  // This socket was constructed before the config write committed, so merely
+  // opening it must not claim the model switch succeeded.
+  assert.equal(mounted.context().modelLoading, true);
+
+  await act(async () => {
+    configPut.resolve(new Response(JSON.stringify({
+      path: 'agents.ops.model_provider',
+      value: 'kilo.new-model',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    await pendingSwitch;
+  });
+  await settle();
+
+  assert.deepEqual(runtime.sockets.map((socket) => socket.sessionId), ['A', 'B', 'B']);
+  assert.ok(runtime.sockets[1]!.disconnectCalls > 0);
+  assert.equal(runtime.sockets[2]!.connectCalls, 1);
+  assert.equal(mounted.context().sessionId, 'B');
+  assert.equal(mounted.context().modelLoading, true);
+
+  await openSocket(runtime, 2);
+  assert.equal(mounted.context().modelLoading, false);
   await unmount(mounted.renderer);
 });
 

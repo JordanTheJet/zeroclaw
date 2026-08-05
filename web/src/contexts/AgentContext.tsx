@@ -226,6 +226,11 @@ export function AgentProvider({
   // frame-sequence regression suite.
   const turnStreamStateRef = useRef<TurnStreamState>(initialTurnStreamState());
   const pendingModelSwitchRef = useRef<string | null>(null);
+  // A session navigation can open another socket while the config PUT is in
+  // flight. Only an open that happens after the write committed proves the
+  // live Agent was constructed with the requested model.
+  const modelSwitchConfigCommittedRef = useRef(false);
+  const modelSwitchSocketRef = useRef<SessionSocket | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
@@ -597,8 +602,15 @@ export function AgentProvider({
       setConnected(true);
       setError(null);
 
-      // If we just reconnected after a model switch, apply the pending model now.
-      if (pendingModelSwitchRef.current) {
+      // If we just reconnected after a committed model switch, apply the
+      // pending model now. A session socket can open while the config write is
+      // still pending; that socket was constructed from the old config and
+      // must not settle the switch.
+      if (
+        pendingModelSwitchRef.current
+        && modelSwitchConfigCommittedRef.current
+        && modelSwitchSocketRef.current === ws
+      ) {
         if (switchTimeoutRef.current) {
           clearTimeout(switchTimeoutRef.current);
           switchTimeoutRef.current = null;
@@ -606,6 +618,8 @@ export function AgentProvider({
         setCurrentModel(pendingModelSwitchRef.current);
         setModelInfoVersion((v) => v + 1);
         pendingModelSwitchRef.current = null;
+        modelSwitchConfigCommittedRef.current = false;
+        modelSwitchSocketRef.current = null;
         setModelLoading(false);
       }
     };
@@ -619,12 +633,18 @@ export function AgentProvider({
       if (version !== wsVersionRef.current) return;
       setConnected(false);
 
-      if (pendingModelSwitchRef.current) {
+      if (
+        pendingModelSwitchRef.current
+        && modelSwitchConfigCommittedRef.current
+        && modelSwitchSocketRef.current === ws
+      ) {
         // We intentionally closed the old socket; non-normal codes mean the reconnect failed.
         if (ev.code !== 1000 && ev.code !== 1001) {
           setError(`${t('agent.connection_closed')} (code: ${ev.code}). ${t('agent.check_configuration')}.`);
         }
         pendingModelSwitchRef.current = null;
+        modelSwitchConfigCommittedRef.current = false;
+        modelSwitchSocketRef.current = null;
         if (switchTimeoutRef.current) {
           clearTimeout(switchTimeoutRef.current);
           switchTimeoutRef.current = null;
@@ -640,8 +660,14 @@ export function AgentProvider({
 
     ws.onError = () => {
       if (version !== wsVersionRef.current) return;
-      // During a model switch we let onClose deliver the final verdict.
-      if (!pendingModelSwitchRef.current) {
+      // During the post-write reconnect we let onClose deliver the final
+      // verdict. A socket failure during the config write is still an ordinary
+      // connection error and does not make the persisted write disappear.
+      if (
+        !pendingModelSwitchRef.current
+        || !modelSwitchConfigCommittedRef.current
+        || modelSwitchSocketRef.current !== ws
+      ) {
         setError(t('agent.connection_error'));
       }
     };
@@ -658,6 +684,13 @@ export function AgentProvider({
   // selected session's persisted history.
   useEffect(() => {
     const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
+    // A navigation after the config write creates an equally valid replacement
+    // to the one switchModel would build directly. Mark only sockets created
+    // after commit; a socket merely opening after commit may still have been
+    // constructed by the gateway from the old config.
+    if (pendingModelSwitchRef.current && modelSwitchConfigCommittedRef.current) {
+      modelSwitchSocketRef.current = ws;
+    }
     attachSocketCallbacks(ws);
     ws.connect();
     wsRef.current = ws as WebSocketClient;
@@ -770,9 +803,8 @@ export function AgentProvider({
     if (modelLoading) return; // debounce
     setModelLoading(true);
     pendingModelSwitchRef.current = model;
-    // Socket identity at the start of the switch, checked before the rebuild
-    // below so a concurrent session switch wins instead of being clobbered.
-    const wsAtSwitch = wsRef.current;
+    modelSwitchConfigCommittedRef.current = false;
+    modelSwitchSocketRef.current = null;
 
     // Watchdog so the UI can never get stuck on the loading spinner. It is
     // armed once per phase — for the config write, then again for the socket
@@ -793,6 +825,8 @@ export function AgentProvider({
         switchTimeoutRef.current = null;
         if (pendingModelSwitchRef.current === model) {
           pendingModelSwitchRef.current = null;
+          modelSwitchConfigCommittedRef.current = false;
+          modelSwitchSocketRef.current = null;
           setModelLoading(false);
           setError(t('agent.model_switch_timeout'));
         }
@@ -809,14 +843,16 @@ export function AgentProvider({
       // superseded this one) while the request was in flight. Bail before
       // touching the live socket so we never tear it down after giving up.
       if (pendingModelSwitchRef.current !== model) return;
+      modelSwitchConfigCommittedRef.current = true;
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
       // tools or persisting its response into the session after we switch.
-      if (typing) {
+      if (typingRef.current) {
+        const sessionToAbort = activeSessionIdRef.current;
         try {
           await Promise.race([
-            abortSession(sessionId),
+            abortSession(sessionToAbort),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error('abort-timeout')), 1_500),
             ),
@@ -833,6 +869,7 @@ export function AgentProvider({
       setStreamingContent('');
       setStreamingThinking('');
       setTyping(false);
+      typingRef.current = false;
       // The old socket's request_id no longer maps to anything on the server
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
@@ -842,22 +879,6 @@ export function AgentProvider({
       // one step no awaited promise covers. Bail first if the write phase
       // already timed out (or a newer switch superseded this one).
       if (pendingModelSwitchRef.current !== model) return;
-      // A session switch during the awaits above already rebuilt the socket for
-      // a different conversation; reconnecting here would bind the new model to
-      // the session the operator just left. The config write has landed, so the
-      // preference is stored and the live socket picks it up — settle the UI
-      // from the server rather than leaving the watchdog to report a timeout
-      // for a switch that did not actually fail.
-      if (wsRef.current !== wsAtSwitch) {
-        if (switchTimeoutRef.current) {
-          clearTimeout(switchTimeoutRef.current);
-          switchTimeoutRef.current = null;
-        }
-        pendingModelSwitchRef.current = null;
-        setModelLoading(false);
-        setModelInfoVersion((v) => v + 1);
-        return;
-      }
       armWatchdog();
 
       // Tear down the old socket and create a fresh one.
@@ -882,6 +903,7 @@ export function AgentProvider({
       // intentionally-closed one — otherwise the page strands offline with no
       // reconnect path until reload.
       wsRef.current = ws as WebSocketClient;
+      modelSwitchSocketRef.current = ws;
       attachSocketCallbacks(ws);
       ws.connect();
     } catch (err) {
@@ -895,6 +917,8 @@ export function AgentProvider({
         switchTimeoutRef.current = null;
       }
       pendingModelSwitchRef.current = null;
+      modelSwitchConfigCommittedRef.current = false;
+      modelSwitchSocketRef.current = null;
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
