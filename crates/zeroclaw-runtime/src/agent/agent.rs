@@ -4638,6 +4638,7 @@ mod tests {
                 tools: vec![],
                 prompts: vec!["Run smoke tests before deploy.".into()],
                 slash_options: Vec::new(),
+                always: false,
                 location: None,
             }];
             let mut agent = Agent::builder()
@@ -9534,6 +9535,7 @@ mod tests {
             tools: vec![],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 

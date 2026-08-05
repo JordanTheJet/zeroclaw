@@ -13198,6 +13198,7 @@ Let me check the result."#;
             tools: vec![],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: Some(workspace.path().join("skills/deploy/SKILL.md")),
         }];
 

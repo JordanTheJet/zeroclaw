@@ -5527,6 +5527,7 @@ mod tests {
             tools: vec![],
             prompts: vec!["Run <smoke> & release checks.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
