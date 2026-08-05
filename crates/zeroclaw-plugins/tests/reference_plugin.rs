@@ -291,7 +291,7 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
 }
 
 #[tokio::test]
-async fn reference_plugin_traps_when_fuel_exhausted() {
+async fn reference_plugin_rejects_work_past_fuel_budget() {
     let starved = PluginLimits {
         call_fuel: 1,
         max_memory_bytes: 256 * 1024 * 1024,
@@ -299,15 +299,21 @@ async fn reference_plugin_traps_when_fuel_exhausted() {
         max_instances: 64,
     };
     let (manifest, scope) = context([]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, starved)
-        .await
-        .expect("instantiate tool fixture");
-    let config = resolve_plugin_config(&manifest, &scope, None).expect("resolve empty config");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#, &config).await;
-    assert!(
-        result.is_err(),
-        "a 1-unit fuel budget must trap the call, got {result:?}"
-    );
+    match runtime::create_plugin(&fixture(), &scope, starved).await {
+        Ok(mut plugin) => {
+            let config =
+                resolve_plugin_config(&manifest, &scope, None).expect("resolve empty config");
+            let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#, &config).await;
+            assert!(
+                result.is_err(),
+                "a 1-unit fuel budget must trap execution, got {result:?}"
+            );
+        }
+        Err(error) => assert!(
+            error.to_string().contains("fuel"),
+            "an early failure must be fuel exhaustion, got {error:#}"
+        ),
+    }
 }
 
 #[tokio::test]
