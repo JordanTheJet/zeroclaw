@@ -470,6 +470,76 @@ test('a late active delete cannot replace a newer selected session', async () =>
   await unmount(mounted.renderer);
 });
 
+test('a deferred inactive delete replaces the target if it becomes active', async () => {
+  const runtime = new FakeSessionRuntime();
+  const deleteB = new Deferred<{ deleted: boolean }>();
+  const bHydration = new Deferred<SessionMessagesResponse>();
+  const cHydration = new Deferred<SessionMessagesResponse>();
+  runtime.mintedIds.push('C');
+  runtime.queueDelete('B', () => deleteB.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => bHydration.promise);
+  runtime.queueMessages('C', () => cHydration.promise);
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const pendingDelete = mounted.context().removeSession('B');
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.equal(mounted.context().sessionId, 'B');
+  assert.equal(mounted.context().sessionPersistence, null);
+
+  await act(async () => {
+    deleteB.resolve({ deleted: true });
+    await pendingDelete;
+  });
+  await settle();
+
+  assert.equal(mounted.context().sessionId, 'C');
+  assert.equal(mounted.context().sessionPersistence, null);
+  assert.equal(storage.getItem('zeroclaw_active_session.ops'), 'C');
+  assert.deepEqual(runtime.sockets.map((socket) => socket.sessionId), ['A', 'B', 'C']);
+  await unmount(mounted.renderer);
+});
+
+test('a deferred delete replaces its target after an A to B to A round trip', async () => {
+  const runtime = new FakeSessionRuntime();
+  const deleteA = new Deferred<{ deleted: boolean }>();
+  const secondAHydration = new Deferred<SessionMessagesResponse>();
+  const cHydration = new Deferred<SessionMessagesResponse>();
+  runtime.mintedIds.push('C');
+  runtime.queueDelete('A', () => deleteA.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
+  runtime.queueMessages('A', () => secondAHydration.promise);
+  runtime.queueMessages('C', () => cHydration.promise);
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const pendingDelete = mounted.context().removeSession('A');
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.equal(mounted.context().sessionPersistence, true);
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await settle();
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.equal(mounted.context().sessionPersistence, null);
+
+  await act(async () => {
+    deleteA.resolve({ deleted: true });
+    await pendingDelete;
+  });
+  await settle();
+
+  assert.equal(mounted.context().sessionId, 'C');
+  assert.equal(mounted.context().sessionPersistence, null);
+  assert.equal(storage.getItem('zeroclaw_active_session.ops'), 'C');
+  assert.deepEqual(runtime.sockets.map((socket) => socket.sessionId), ['A', 'B', 'A', 'C']);
+  await unmount(mounted.renderer);
+});
+
 test('composer drafts follow agent and session without crossing conversations', async () => {
   const runtime = new FakeSessionRuntime();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));

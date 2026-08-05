@@ -229,15 +229,16 @@ export function AgentProvider({
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
-  // Monotonic navigation ticket. Async destructive actions capture it so a
-  // late completion for an old active conversation cannot move the new one.
-  const sessionGenerationRef = useRef(0);
   // Rebuild callbacks intentionally retain the dependency shape already on
   // master. These mirrors still make their async work use the latest session
   // and injected runtime after a conversation switch.
   const activeSessionIdRef = useRef(sessionId);
+  const sessionPersistenceRef = useRef(sessionPersistence);
+  const typingRef = useRef(typing);
   const sessionRuntimeRef = useRef(sessionRuntime);
   activeSessionIdRef.current = sessionId;
+  sessionPersistenceRef.current = sessionPersistence;
+  typingRef.current = typing;
   sessionRuntimeRef.current = sessionRuntime;
 
   // Prime the model-provider catalog once so error formatting can resolve
@@ -1004,14 +1005,17 @@ export function AgentProvider({
    * is going away regardless, and leaving it running would keep executing tools
    * against a session the operator has navigated away from.
    */
-  const goToSession = useCallback((nextSessionId: string): boolean => {
-    if (nextSessionId === sessionId) return false;
+  const transitionToSession = useCallback((nextSessionId: string, force = false): boolean => {
+    const currentSessionId = activeSessionIdRef.current;
+    if (nextSessionId === currentSessionId) return false;
     // Unknown is deliberately denied alongside false. A failed or in-flight
-    // hydration cannot prove there will be a persisted route back.
-    if (sessionPersistence !== true) return false;
+    // hydration cannot prove there will be a persisted route back. The sole
+    // forced caller is a completed delete whose target is now active: that
+    // conversation no longer exists, so staying put is not a valid fallback.
+    if (!force && sessionPersistenceRef.current !== true) return false;
 
-    if (typing) {
-      void abortSession(sessionId).catch(() => {
+    if (typingRef.current) {
+      void abortSession(currentSessionId).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
     }
@@ -1023,19 +1027,28 @@ export function AgentProvider({
     // transcript over A's cache — the only copy when persistence is off.
     setHydratedSessionId(null);
     setSessionPersistence(null);
-    sessionGenerationRef.current += 1;
+    // Async delete/model operations consult these refs before React commits
+    // the state update. Move them with the transition so two completions in
+    // the same task cannot both act on the conversation we just left.
+    activeSessionIdRef.current = nextSessionId;
+    sessionPersistenceRef.current = null;
+    typingRef.current = false;
     setActiveSessionId(agentAlias, nextSessionId);
     setSessionId(nextSessionId);
     return true;
-  }, [agentAlias, resetTranscriptState, sessionId, sessionPersistence, typing]);
+  }, [agentAlias, resetTranscriptState]);
+
+  const goToSession = useCallback((nextSessionId: string): boolean => (
+    transitionToSession(nextSessionId)
+  ), [transitionToSession]);
 
   /** Start an additional conversation, leaving the current one intact. */
   const startNewSession = useCallback((): boolean => {
     // Do not even mint an unreachable id until the shared transition gate is
     // open. goToSession rechecks the capability before mutating state.
-    if (sessionPersistence !== true) return false;
-    return goToSession(sessionRuntime.mintId());
-  }, [goToSession, sessionPersistence, sessionRuntime]);
+    if (sessionPersistenceRef.current !== true) return false;
+    return transitionToSession(sessionRuntimeRef.current.mintId());
+  }, [transitionToSession]);
 
   /**
    * Drop a stored conversation. Deleting the one on screen leaves nothing to
@@ -1043,13 +1056,11 @@ export function AgentProvider({
    * transcript the gateway no longer has.
    */
   const removeSession = useCallback(async (targetSessionId: string) => {
-    if (sessionPersistence !== true) {
+    if (sessionPersistenceRef.current !== true) {
       throw new Error('Session persistence is not available');
     }
-    const activeAtStart = sessionId;
-    const generationAtStart = sessionGenerationRef.current;
     try {
-      await sessionRuntime.delete(targetSessionId);
+      await sessionRuntimeRef.current.delete(targetSessionId);
     } catch (err) {
       // 404 means the gateway has nothing stored for this conversation, which
       // is already the outcome the operator asked for. Anything else is a real
@@ -1060,13 +1071,15 @@ export function AgentProvider({
     // The browser cache is a second copy of the same transcript; a delete that
     // leaves it behind is not a delete.
     removeChatHistory(targetSessionId);
-    if (
-      targetSessionId === activeAtStart
-      && sessionGenerationRef.current === generationAtStart
-    ) {
-      goToSession(sessionRuntime.mintId());
+    // Decide at completion, not at invocation. The target may have become
+    // active while the request was in flight (B delete -> select B), or may
+    // have become active again (A -> B -> A). In either case the deleted
+    // conversation must be replaced even though its hydration capability is
+    // currently unknown. Conversely, A -> B must leave B alone.
+    if (targetSessionId === activeSessionIdRef.current) {
+      transitionToSession(sessionRuntimeRef.current.mintId(), true);
     }
-  }, [goToSession, sessionId, sessionPersistence, sessionRuntime]);
+  }, [transitionToSession]);
 
   const renameConversation = useCallback(async (targetSessionId: string, name: string) => {
     if (sessionPersistence !== true) {
