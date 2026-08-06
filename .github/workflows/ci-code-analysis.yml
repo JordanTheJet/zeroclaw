@@ -70,7 +70,8 @@ jobs:
                    semgrep scan --config auto ${baseline} --sarif --output semgrep.sarif"
       - name: Upload SARIF to code scanning
         if: always()
-        continue-on-error: true   # fork PRs run with a read-only token; don't fail the job on upload
+        # Fork PRs may have read-only tokens; trusted-event upload failures stay visible.
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         uses: github/codeql-action/upload-sarif@b0c4fd77f6c559021d78430ec4d0d169ae74a4eb # v3
         with:
           sarif_file: semgrep.sarif
