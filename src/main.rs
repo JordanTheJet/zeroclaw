@@ -2555,6 +2555,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
     // Route through the shared `create_map_key_checked` (not raw
     // `create_map_key`) so this CLI path inherits the reserved `default`
     // agent guard from the one place it's defined, rather than re-deriving
@@ -3593,6 +3606,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -4389,6 +4406,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.observability,
                             &current_config.data_dir,
                         );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -7682,6 +7704,27 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
+///
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -9514,6 +9557,39 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
         );
     }
 
