@@ -3341,13 +3341,10 @@ const EXEC_RESERVED_CHARS: &[char] = &[
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 fn unescape_desktop_value(raw: &str) -> Option<String> {
     let mut out = String::new();
+    // An escape consumes the following char too; the `while let` body advances
+    // the same iterator, so it can't be a `for` loop.
     let mut chars = raw.chars();
-    loop {
-        // Manual iteration: an escape consumes the following char too, so a
-        // `for`/`while let` over the iterator would not compose here.
-        let Some(c) = chars.next() else {
-            break;
-        };
+    while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
             continue;
@@ -3364,26 +3361,49 @@ fn unescape_desktop_value(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// Parse the program token (first argument) from a desktop-entry `Exec=` value,
-/// per the Desktop Entry Specification. The general string-unescape layer is
-/// applied first (see [`unescape_desktop_value`]), then the `Exec` quoting rules:
-/// reserved characters must be double-quoted, and inside a quoted string `"`,
-/// `` ` ``, `$` and `\` are backslash-escaped. A quoted path containing spaces is
-/// preserved. Parsing fails closed (`None`) on malformed input — an unterminated
-/// quote, a dangling or invalid escape, an unquoted reserved character, an `=`
-/// in the token, or a program token that is empty or a field code (`%f`, `%U`,
-/// …) — rather than launching a partially interpreted path.
+/// A `%X` token is a known desktop-entry field code (or `%%`, a literal percent).
+/// An unknown field code invalidates the whole `Exec` command line per the spec.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
-fn parse_exec_program(exec: &str) -> Option<String> {
-    let unescaped = unescape_desktop_value(exec)?;
-    let mut chars = unescaped.chars().peekable();
-    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-        chars.next();
-    }
-    let mut token = String::new();
-    match chars.peek() {
-        Some('"') => {
-            chars.next(); // consume opening quote
+fn is_known_field_code(token: &str) -> bool {
+    token == "%%"
+        || matches!(
+            token,
+            "%f" | "%F"
+                | "%u"
+                | "%U"
+                | "%i"
+                | "%c"
+                | "%k"
+                | "%d"
+                | "%D"
+                | "%n"
+                | "%N"
+                | "%v"
+                | "%m"
+        )
+}
+
+/// Tokenize a (general-unescaped) desktop-entry `Exec` value into its whitespace-
+/// separated arguments, applying the `Exec` quoting rules to each. Fails closed
+/// (`None`) on any malformed token: an unterminated quote, a dangling or invalid
+/// escape, a raw reserved character (`"`, `` ` ``, `$`, `\` unquoted or an
+/// unescaped `$`/`` ` `` inside quotes), or text directly adjacent to a closing
+/// quote (e.g. `"…"junk`). Validating the whole line — not just the first token —
+/// is what keeps a malformed entry from launching its first argument.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut token = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next(); // opening quote
             loop {
                 match chars.next() {
                     None => return None, // unterminated quote
@@ -3392,11 +3412,16 @@ fn parse_exec_program(exec: &str) -> Option<String> {
                         Some(esc @ ('"' | '`' | '$' | '\\')) => token.push(esc),
                         _ => return None, // invalid or dangling escape inside quotes
                     },
+                    // Reserved characters must be escaped inside quotes.
+                    Some('$' | '`') => return None,
                     Some(c) => token.push(c),
                 }
             }
-        }
-        Some(_) => {
+            // A closing quote must end the token; adjacent text is malformed.
+            if matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
+                return None;
+            }
+        } else {
             while let Some(&c) = chars.peek() {
                 if c.is_whitespace() {
                     break;
@@ -3408,12 +3433,36 @@ fn parse_exec_program(exec: &str) -> Option<String> {
                 chars.next();
             }
         }
-        None => return None,
+        tokens.push(token);
     }
-    if token.is_empty() || token.starts_with('%') || token.contains('=') {
+    Some(tokens)
+}
+
+/// Parse the program token (first argument) from a desktop-entry `Exec=` value,
+/// per the Desktop Entry Specification. The general string-unescape layer is
+/// applied first (see [`unescape_desktop_value`]), then the whole command line is
+/// tokenized with the `Exec` quoting rules (see [`tokenize_exec_line`]). Parsing
+/// fails closed (`None`) on malformed input anywhere on the line — an unterminated
+/// quote, a dangling/invalid escape, an unquoted reserved character, text adjacent
+/// to a closing quote, an unknown field code (e.g. `%Z`), an `=` in the program
+/// token, or a program token that is empty or itself a field code — rather than
+/// launching a partially interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn parse_exec_program(exec: &str) -> Option<String> {
+    let unescaped = unescape_desktop_value(exec)?;
+    let mut tokens = tokenize_exec_line(&unescaped)?.into_iter();
+    let program = tokens.next()?;
+    if program.is_empty() || program.starts_with('%') || program.contains('=') {
         return None;
     }
-    Some(token)
+    // Every remaining `%`-token must be a known field code; an unknown one
+    // invalidates the command line.
+    for token in tokens {
+        if token.starts_with('%') && !is_known_field_code(&token) {
+            return None;
+        }
+    }
+    Some(program)
 }
 
 /// The published companion-app binary name (the `Exec` of `ZeroClaw.desktop` in
@@ -8562,6 +8611,23 @@ mod tests {
         // A valid bare token still parses.
         assert_eq!(
             parse_exec_program("zeroclaw-desktop %U").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        // The WHOLE line is validated, not just the first token:
+        // an unknown field code invalidates it.
+        assert_eq!(parse_exec_program("zeroclaw-desktop %Z"), None);
+        // Text directly adjacent to a closing quote is malformed.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop\"junk"), None);
+        // A raw (unescaped) reserved character inside quotes is malformed.
+        assert_eq!(parse_exec_program("\"/opt/$HOME/zeroclaw-desktop\""), None);
+        assert_eq!(parse_exec_program("\"/opt/`x`/zeroclaw-desktop\""), None);
+        // Known field codes and extra plain args are accepted.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U --flag").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %%").as_deref(),
             Some("zeroclaw-desktop")
         );
     }
