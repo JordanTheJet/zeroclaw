@@ -48,15 +48,14 @@ jobs:
         with:
           fetch-depth: 0   # full history so diff-aware --baseline-commit can reach the PR base
       - name: Run Semgrep CE (diff-aware on PRs, full scan on push)
-        env:
-          # PR base commit -> report only findings the branch introduces. Empty on
-          # push, so master push does a full-tree scan that seeds the Security-tab baseline.
-          SEMGREP_BASELINE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           baseline=""
-          if [ -n "${SEMGREP_BASELINE:-}" ]; then
-            baseline="--baseline-commit ${SEMGREP_BASELINE}"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            # pull_request.base.sha can remain stale as master advances. Derive the
+            # actual PR boundary from the checked-out merge commit and current base ref.
+            baseline_commit="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
+            baseline="--baseline-commit ${baseline_commit}"
           fi
           # Digest-pinned image (same one the container: field used), run via docker so
           # the SARIF-upload JS action can run on the host runner afterwards (the semgrep
