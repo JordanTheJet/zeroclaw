@@ -621,6 +621,7 @@ pub async fn run(
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let mut status_reporter = crate::osc_status::StatusReporter::default();
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut help_overlay: Option<HelpOverlayState> = None;
     let mut reload_confirm = false;
@@ -786,6 +787,13 @@ pub async fn run(
         if let Some(t) = frame_theme {
             theme::set_active(t);
         }
+
+        // Report the chat pane's turn state as the terminal title, regardless
+        // of which mode is on screen: the point is to be visible from outside
+        // this window — a tab, a multiplexer status line — while the operator
+        // is looking somewhere else. Emitted before `term.draw` so the OSC
+        // write never lands inside a frame.
+        status_reporter.sync(chat_pane.turn_status(), chat_pane.selected_agent());
 
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active

@@ -2844,6 +2844,16 @@ impl Chat {
     /// The agent alias this pane is currently focused on, if any. Used to
     /// resolve a per-agent theme override while this pane is active. Returns
     /// `None` in the agent-picker phase, where no agent is yet chosen.
+    /// Current turn state, absent unless a chat session is active. Drives the
+    /// terminal title, which reports this pane's state to whatever is watching
+    /// from outside (multiplexer status line, terminal tab, workspace manager).
+    pub(crate) fn turn_status(&self) -> Option<&TurnStatus> {
+        match &self.phase {
+            ChatPhase::Active(s) => Some(&s.turn_status),
+            _ => None,
+        }
+    }
+
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         match &self.phase {
             ChatPhase::Active(s) => Some(s.agent_alias.as_str()),

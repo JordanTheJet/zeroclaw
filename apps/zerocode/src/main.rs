@@ -40,6 +40,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
 mod sop_pane;
