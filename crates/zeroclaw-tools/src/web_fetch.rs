@@ -2,6 +2,8 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -12,6 +14,30 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
+/// Size of *converted* text (bytes) above which a response is written to a
+/// file in the agent workspace instead of being returned inline.
+///
+/// At or below this, behaviour is unchanged: the body comes back in the tool
+/// result. Above it, half a megabyte of markdown in one tool result would
+/// flood the model's context and the old hard-truncation dropped the tail
+/// outright, so the full text is spilled to disk and the model is handed a
+/// path it can read or search with the workspace file tools.
+const SPILL_THRESHOLD_BYTES: usize = 50_000;
+
+/// Directory, relative to the workspace root, that oversized responses are
+/// spilled into. Kept as components rather than a `"tmp/web_fetch"` literal
+/// so the join is separator-correct on every platform.
+const SPILL_DIR_COMPONENTS: [&str; 2] = ["tmp", "web_fetch"];
+
+/// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
+///
+/// Unlike `http_request` (an API client returning raw responses), this tool:
+/// - Only supports GET
+/// - Follows redirects (up to 10)
+/// - Converts HTML to clean plain text via `nanohtml2text`
+/// - Passes through text/plain, text/markdown, and application/json as-is
+/// - Sets a descriptive User-Agent
+/// - Falls back to Firecrawl API when standard fetch fails (if enabled)
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -81,7 +107,7 @@ impl WebFetchTool {
     async fn read_response_text_limited(
         &self,
         response: reqwest::Response,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CappedBody> {
         let mut bytes_stream = response.bytes_stream();
         let hard_cap = if self.max_response_size == 0 {
             usize::MAX
@@ -89,15 +115,130 @@ impl WebFetchTool {
             self.max_response_size.saturating_add(1)
         };
         let mut bytes = Vec::new();
+        let mut cap_hit = false;
 
         while let Some(chunk_result) = bytes_stream.next().await {
             let chunk = chunk_result?;
             if append_chunk_with_cap(&mut bytes, &chunk, hard_cap) {
+                cap_hit = true;
                 break;
             }
         }
 
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(CappedBody {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            cap_hit,
+        })
+    }
+
+    /// Write an oversized converted body to a file inside the agent workspace
+    /// and return the short message that replaces it in the tool result.
+    ///
+    /// `None` means "no spill happened" — an unresolvable workspace, a
+    /// containment failure, or an I/O error. Callers fall back to the
+    /// pre-existing inline truncation, which is degraded but never wrong.
+    async fn spill_to_workspace(
+        &self,
+        url: &str,
+        text: &str,
+        extension: &str,
+        title: Option<&str>,
+        cap_hit: bool,
+    ) -> Option<String> {
+        match self.try_spill_to_workspace(url, text, extension).await {
+            Ok((relative_path, byte_count)) => Some(spill_message(
+                url,
+                title,
+                byte_count,
+                &relative_path,
+                cap_hit,
+            )),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "spill_to_workspace",
+                            "error": format!("{}", e),
+                        })),
+                    "web_fetch: could not spill oversized response to the workspace, \
+                     falling back to inline truncation"
+                );
+                None
+            }
+        }
+    }
+
+    /// Resolve the spill path, prove it is inside the workspace, and write.
+    ///
+    /// Returns the workspace-*relative* path (what `file_read` and
+    /// `content_search` expect) plus the byte count written.
+    async fn try_spill_to_workspace(
+        &self,
+        url: &str,
+        text: &str,
+        extension: &str,
+    ) -> anyhow::Result<(PathBuf, usize)> {
+        // The workspace root has exactly one source of truth in this
+        // codebase: `SecurityPolicy::workspace_dir`
+        // (crates/zeroclaw-config/src/policy.rs). It is the same field
+        // `SecurityPolicy::resolve_tool_path` and
+        // `SecurityPolicy::is_resolved_path_allowed` use to root `file_read`
+        // and `file_write`, and `WebFetchTool` already holds the policy. Do
+        // not introduce a second resolution path here (no env var, no
+        // `std::env::temp_dir()`, no constructor-threaded copy) — a divergent
+        // second answer is exactly the drift bug AGENTS.md bans.
+        let configured_root = self.security.workspace_dir.as_path();
+        if configured_root.as_os_str().is_empty() {
+            anyhow::bail!("workspace_dir is empty");
+        }
+        let root = tokio::fs::canonicalize(configured_root)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("workspace root is not resolvable: {e}")))?;
+
+        let mut spill_dir = root.clone();
+        for component in SPILL_DIR_COMPONENTS {
+            spill_dir.push(component);
+        }
+        tokio::fs::create_dir_all(&spill_dir)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("failed to create spill directory: {e}")))?;
+
+        // Re-resolve AFTER creation. `create_dir_all` follows symlinks, so a
+        // symlinked `tmp/` planted inside the workspace could otherwise land
+        // the write outside the sandbox. This is the containment guard: a
+        // spill that does not resolve under the workspace root is abandoned,
+        // never written.
+        let spill_dir = tokio::fs::canonicalize(&spill_dir)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("spill directory is not resolvable: {e}")))?;
+        if !spill_dir.starts_with(&root) {
+            anyhow::bail!(
+                "spill directory {} escapes the workspace root {}",
+                spill_dir.display(),
+                root.display()
+            );
+        }
+
+        let path = spill_dir.join(spill_file_name(url, text, extension));
+        // `spill_file_name` sanitizes to a single component, but prove it
+        // rather than trust it: a name that smuggled in a separator or `..`
+        // would re-parent the file out of the checked directory.
+        if path.parent() != Some(spill_dir.as_path()) {
+            anyhow::bail!("spill file name escaped the spill directory");
+        }
+
+        tokio::fs::write(&path, text)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("failed to write spill file: {e}")))?;
+
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|e| anyhow::Error::msg(format!("spill path is not workspace-relative: {e}")))?
+            .to_path_buf();
+
+        Ok((relative, text.len()))
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -279,7 +420,10 @@ impl WebFetchTool {
             };
         };
 
-        let body = match self.read_response_text_limited(response).await {
+        let CappedBody {
+            text: body,
+            cap_hit,
+        } = match self.read_response_text_limited(response).await {
             Ok(t) => t,
             Err(e) => {
                 return ToolResult {
@@ -290,11 +434,39 @@ impl WebFetchTool {
             }
         };
 
-        let text = if body_mode == "html" {
-            nanohtml2text::html2text(&body)
+        // Keep the raw HTML alive alongside the converted text so a `<title>`
+        // can be lifted from it *only* on the spill path — sub-threshold
+        // fetches pay nothing for it.
+        let (text, raw_html) = if body_mode == "html" {
+            (nanohtml2text::html2text(&body), Some(body))
         } else {
-            body
+            (body, None)
         };
+
+        // Above the threshold, hand back a file path instead of half a
+        // megabyte of text. The stream cap above remains the absolute guard
+        // on how much was read; this only changes how it is delivered.
+        if text.len() > SPILL_THRESHOLD_BYTES {
+            let title = raw_html.as_deref().and_then(extract_html_title);
+            if let Some(message) = self
+                .spill_to_workspace(
+                    url,
+                    &text,
+                    spill_extension(&content_type, body_mode),
+                    title.as_deref(),
+                    cap_hit,
+                )
+                .await
+            {
+                return ToolResult {
+                    success: true,
+                    output: message.into(),
+                    error: None,
+                };
+            }
+            // No usable workspace, or the write failed: fall through to the
+            // pre-existing inline truncation rather than losing the response.
+        }
 
         let output = self.truncate_response(&text);
 
@@ -467,6 +639,146 @@ impl Tool for WebFetchTool {
 }
 
 // ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
+
+/// Result of the size-capped streamed body read.
+///
+/// Per-call value, not stored state: `cap_hit` is knowable only here, at the
+/// moment the read stops, and nothing else in the codebase records it.
+struct CappedBody {
+    /// The bytes that were read, lossily decoded as UTF-8.
+    text: String,
+    /// True when the read stopped because `max_response_size` was reached,
+    /// i.e. the source body was larger than the cap and its tail was dropped.
+    cap_hit: bool,
+}
+
+/// File extension for a spilled body.
+///
+/// Derived from the content type the caller already classified — this is a
+/// pure mapping for naming only and does not affect which content types
+/// `web_fetch` accepts or how their bodies are processed.
+fn spill_extension(content_type: &str, body_mode: &str) -> &'static str {
+    if body_mode == "html" {
+        // HTML arrives converted to readable text, which reads as markdown.
+        return "md";
+    }
+    if content_type.contains("application/json") {
+        return "json";
+    }
+    if content_type.contains("text/markdown") {
+        return "md";
+    }
+    "txt"
+}
+
+/// Filename for a spilled response: sanitized URL host + a short hash of the
+/// converted text.
+///
+/// Deterministic — refetching a page whose content has not changed overwrites
+/// the same file rather than accumulating copies — and content-addressed, so
+/// a stale path can never serve content the model did not fetch.
+fn spill_file_name(url: &str, text: &str, extension: &str) -> String {
+    let host = extract_host(url)
+        .map(|h| sanitize_path_component(&h))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let digest = Sha256::digest(text.as_bytes());
+    let short_hash = hex::encode(&digest[..4]);
+    format!("{host}-{short_hash}.{extension}")
+}
+
+/// Reduce a host to a single safe filename component.
+///
+/// ASCII alphanumerics, `-` and `.` survive; everything else (including any
+/// path separator) becomes `-`. Leading and trailing dots are stripped so the
+/// result can never be `.`, `..`, or a hidden file, and the length is capped
+/// so host + hash + extension stays well inside filesystem name limits.
+fn sanitize_path_component(host: &str) -> String {
+    let mut sanitized: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Every char above is ASCII, so this byte index is always a char boundary.
+    sanitized.truncate(60);
+    let trimmed = sanitized.trim_matches('.');
+    if trimmed.is_empty() {
+        "unknown-host".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Cheap `<title>` extraction from raw HTML — a bounded substring scan, no
+/// regex compile and no parse. Only used on the spill path.
+fn extract_html_title(html: &str) -> Option<String> {
+    /// A page whose `<title>` is not in the first 64 KiB does not have one
+    /// worth paying for.
+    const SCAN_LIMIT: usize = 64 * 1024;
+
+    let mut end = html.len().min(SCAN_LIMIT);
+    while end > 0 && !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &html[..end];
+
+    // `to_ascii_lowercase` only maps A-Z, so it preserves byte length and
+    // byte indices line up with `head` exactly.
+    let lower = head.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let tag_end = open + lower[open..].find('>')?;
+    let close = tag_end + lower[tag_end..].find("</title>")?;
+    if close < tag_end + 1 {
+        return None;
+    }
+
+    let title = head[tag_end + 1..close]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.chars().take(120).collect())
+}
+
+/// The short message that replaces an oversized body in the tool result.
+///
+/// Names the source, the size, and the saved path, and points at the tools
+/// that can actually consume it (`file_read` for paging, `content_search` for
+/// searching), whose paths resolve relative to the workspace root.
+fn spill_message(
+    url: &str,
+    title: Option<&str>,
+    byte_count: usize,
+    relative_path: &Path,
+    cap_hit: bool,
+) -> String {
+    let path = relative_path.display();
+    let mut message = format!("Fetched {url}\n");
+    if let Some(title) = title {
+        message.push_str(&format!("Title: {title}\n"));
+    }
+    message.push_str(&format!(
+        "Size: {byte_count} bytes of converted text — too large to return inline, so the \
+         full text was written to a file in the agent workspace.\n\n\
+         Saved to: {path}\n\n\
+         Read it with the file_read tool (path=\"{path}\", using its offset and limit \
+         parameters to page through), or search it with the content_search tool \
+         (path=\"{path}\" plus a pattern). That path is relative to the workspace root.\n"
+    ));
+    if cap_hit {
+        message.push_str(
+            "\nNote: the response hit web_fetch's max_response_size stream cap, so the saved \
+             content is the truncated head of the page, not the whole page.\n",
+        );
+    }
+    message
+}
 
 fn validate_target_url(
     raw_url: &str,
@@ -1799,5 +2111,496 @@ mod tests {
     fn allowed_private_host_with_port() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5:8080/api").is_ok());
+    }
+
+    // ── Spill-to-workspace-file for oversized responses ───────────
+    //
+    // These drive `standard_fetch` through wiremock so the whole
+    // read → convert → spill path is exercised, and root the tool at a
+    // throwaway workspace so no test can write into the repo.
+
+    /// A tool whose `SecurityPolicy.workspace_dir` — the canonical
+    /// workspace root, same field `file_read`/`file_write` resolve
+    /// against — points at a throwaway directory.
+    fn spill_test_tool(workspace: &std::path::Path, max_response_size: usize) -> WebFetchTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            max_response_size,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    /// Serve `body` as `content_type` and run `standard_fetch` against it.
+    async fn fetch_body(tool: &WebFetchTool, body: &str, content_type: &str) -> ToolResult {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `set_body_raw` takes the content type explicitly. `set_body_string`
+        // + `insert_header("content-type", ...)` does NOT override it —
+        // the body helper's `text/plain` wins, which silently routes every
+        // such test down the plain-text branch.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body.as_bytes(), content_type))
+            .mount(&server)
+            .await;
+
+        // Bypass SSRF-guarded execute() — call standard_fetch directly so
+        // wiremock on 127.0.0.1 is reachable.
+        let url = format!("http://{}/page", server.address());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client");
+        tool.standard_fetch(&client, &url).await
+    }
+
+    /// Pins the pre-existing inline behaviour: a body comfortably under the
+    /// spill threshold is returned verbatim and nothing is written to disk.
+    #[tokio::test]
+    async fn body_below_spill_threshold_is_returned_inline() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "b".repeat(1_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            body,
+            "sub-threshold body must be returned inline, unchanged"
+        );
+        assert!(
+            !workspace.path().join("tmp").exists(),
+            "sub-threshold fetch must not create the spill directory"
+        );
+    }
+
+    /// Boundary: exactly `SPILL_THRESHOLD_BYTES` still returns inline.
+    /// Only *above* the threshold spills.
+    #[tokio::test]
+    async fn body_at_exact_spill_threshold_is_returned_inline() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "c".repeat(SPILL_THRESHOLD_BYTES);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str().len(),
+            SPILL_THRESHOLD_BYTES,
+            "a body of exactly the threshold must be returned inline"
+        );
+        assert!(
+            !workspace.path().join("tmp").exists(),
+            "threshold-sized fetch must not create the spill directory"
+        );
+    }
+
+    /// Pull the `Saved to: <path>` line out of a spill message.
+    fn saved_path(message: &str) -> &str {
+        message
+            .lines()
+            .find_map(|line| line.strip_prefix("Saved to: "))
+            .unwrap_or_else(|| panic!("no 'Saved to:' line in message:\n{message}"))
+            .trim()
+    }
+
+    #[tokio::test]
+    async fn body_above_spill_threshold_is_written_to_a_workspace_file() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "d".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        let message = result.output.as_str();
+
+        // The message replaces the body: short, and not the payload itself.
+        assert!(
+            message.len() < 1_000,
+            "spill message should be short, got {} bytes",
+            message.len()
+        );
+        assert!(
+            !message.contains(&"d".repeat(1_000)),
+            "spill message must not carry the body inline"
+        );
+        assert!(
+            message.contains("60000 bytes"),
+            "message must state the byte count, got:\n{message}"
+        );
+        assert!(
+            message.contains("file_read") && message.contains("content_search"),
+            "message must point at the workspace file tools, got:\n{message}"
+        );
+        assert!(
+            !message.contains("max_response_size"),
+            "no stream-cap note expected when the cap did not fire, got:\n{message}"
+        );
+
+        // The file holds the FULL converted text, with no truncation marker.
+        let relative = saved_path(message);
+        assert!(
+            relative.starts_with("tmp/web_fetch/") && relative.ends_with(".txt"),
+            "unexpected spill path: {relative}"
+        );
+        let written = std::fs::read_to_string(workspace.path().join(relative))
+            .expect("spill file must exist at the advertised path");
+        assert_eq!(
+            written, body,
+            "spill file must hold the full converted text"
+        );
+        assert!(
+            !written.contains("[Response truncated"),
+            "spilled file must not carry the inline truncation marker"
+        );
+    }
+
+    /// The load-bearing safety property: the write lands inside the workspace
+    /// root resolved from `SecurityPolicy::workspace_dir`, and nowhere else.
+    #[tokio::test]
+    async fn spilled_file_stays_inside_the_workspace_root() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "e".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+        let relative = saved_path(result.output.as_str());
+
+        let root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let written = workspace
+            .path()
+            .join(relative)
+            .canonicalize()
+            .expect("spill file must exist");
+
+        assert!(
+            written.starts_with(&root),
+            "spill file {} escaped workspace root {}",
+            written.display(),
+            root.display()
+        );
+        assert!(
+            !std::path::Path::new(relative).is_absolute(),
+            "advertised path must be workspace-relative, got {relative}"
+        );
+        assert!(
+            !relative.contains(".."),
+            "advertised path must not contain parent traversal, got {relative}"
+        );
+    }
+
+    /// The containment guard, exercised for real: a symlinked `tmp/` planted
+    /// inside the workspace points at an outside directory. `create_dir_all`
+    /// follows it, so the post-creation canonicalize + `starts_with` check is
+    /// the only thing standing between the fetch and a write outside the
+    /// sandbox. No page content may land outside the workspace root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_refuses_to_write_through_a_symlink_out_of_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("tmp"))
+            .expect("plant symlink");
+
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "i".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        // Falls back to the inline path rather than writing outside.
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            body,
+            "a blocked spill must fall back to the inline body"
+        );
+
+        // Nothing — no page content at all — may exist outside the workspace.
+        let escaped: Vec<_> = walk_files(outside.path());
+        assert!(
+            escaped.is_empty(),
+            "page content escaped the workspace to {escaped:?}"
+        );
+    }
+
+    /// Every regular file under `dir`, recursively.
+    #[cfg(unix)]
+    fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walk_files(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn spill_uses_markdown_extension_for_converted_html() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = format!(
+            "<html><head><title>  Big \n Page  </title></head><body><p>{}</p></body></html>",
+            "word ".repeat(15_000)
+        );
+
+        let result = fetch_body(&tool, &body, "text/html").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        let message = result.output.as_str();
+        let relative = saved_path(message);
+        assert!(
+            relative.ends_with(".md"),
+            "converted HTML must spill as .md, got {relative}"
+        );
+        // Title is lifted from the raw HTML and whitespace-collapsed.
+        assert!(
+            message.contains("Title: Big Page"),
+            "message must carry the page title, got:\n{message}"
+        );
+        // The file holds converted text, not the source markup.
+        let written = std::fs::read_to_string(workspace.path().join(relative)).expect("spill file");
+        assert!(
+            !written.contains("<p>"),
+            "spilled HTML must be stored converted, not raw"
+        );
+        assert!(written.contains("word"));
+    }
+
+    /// Stream-cap interaction: `max_response_size` stays the absolute guard,
+    /// and when it fires the message says the saved content is incomplete.
+    #[tokio::test]
+    async fn spill_message_flags_stream_cap_truncation() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        // Cap below the body size but above the spill threshold, so the read
+        // is cut short AND the surviving text still spills.
+        let tool = spill_test_tool(workspace.path(), 60_000);
+        let body = "f".repeat(80_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        let message = result.output.as_str();
+        assert!(
+            message.contains("max_response_size"),
+            "message must disclose the stream-cap truncation, got:\n{message}"
+        );
+
+        // The stream cap still bounds what was written: hard_cap is
+        // max_response_size + 1, so the file holds 60_001 bytes, not 80_000.
+        let written = std::fs::read_to_string(workspace.path().join(saved_path(message)))
+            .expect("spill file");
+        assert_eq!(
+            written.len(),
+            60_001,
+            "stream cap must still bound the spilled bytes"
+        );
+    }
+
+    /// A spilled result must not look like a JS-only page to the Firecrawl
+    /// heuristic — the message is short by design, and `FIRECRAWL_MIN_BODY_LEN`
+    /// is only 100 bytes.
+    #[tokio::test]
+    async fn spilled_result_does_not_trigger_firecrawl_fallback() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                ..FirecrawlConfig::default()
+            },
+            vec![],
+        )
+        .unwrap();
+
+        let result = fetch_body(&tool, &"g".repeat(60_000), "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(
+            result.output.as_str().len() > FIRECRAWL_MIN_BODY_LEN,
+            "spill message must stay above the Firecrawl short-body threshold"
+        );
+        assert!(
+            !tool.should_fallback_to_firecrawl(&result),
+            "a successful spill must not be mistaken for a JS-only page"
+        );
+    }
+
+    /// No resolvable workspace → the pre-existing inline behaviour, never a
+    /// write outside the sandbox and never a dropped response.
+    #[tokio::test]
+    async fn spill_falls_back_to_inline_when_workspace_is_unresolvable() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let missing = workspace.path().join("no-such-workspace");
+        let tool = spill_test_tool(&missing, 500_000);
+        let body = "h".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            body,
+            "with no workspace the body must come back inline, unchanged"
+        );
+        assert!(
+            !missing.exists(),
+            "an unresolvable workspace must not be created behind the operator's back"
+        );
+    }
+
+    // ── Spill filename ───────────────────────────────────────────
+
+    #[test]
+    fn spill_file_name_is_stable_for_the_same_host_and_content() {
+        let text = "same content";
+        let first = spill_file_name("https://example.com/a", text, "md");
+        let second = spill_file_name("https://example.com/a", text, "md");
+        assert_eq!(first, second, "same host + content must be deterministic");
+
+        // Path within the host does not change the name; only host + content do.
+        let other_path = spill_file_name("https://example.com/b", text, "md");
+        assert_eq!(first, other_path);
+
+        assert!(
+            first.starts_with("example.com-") && first.ends_with(".md"),
+            "unexpected name: {first}"
+        );
+    }
+
+    #[test]
+    fn spill_file_name_changes_with_content_and_host() {
+        let base = spill_file_name("https://example.com/a", "content one", "md");
+        assert_ne!(
+            base,
+            spill_file_name("https://example.com/a", "content two", "md"),
+            "different content must not overwrite a different page's file"
+        );
+        assert_ne!(
+            base,
+            spill_file_name("https://other.example.org/a", "content one", "md"),
+            "different host must produce a different file"
+        );
+    }
+
+    #[test]
+    fn spill_file_name_is_a_single_safe_component() {
+        // Ports are already stripped by extract_host; prove the sanitizer
+        // still yields one component with no separator or traversal.
+        for url in [
+            "https://example.com:8443/a",
+            "http://sub.example.co.uk/x?y=1",
+        ] {
+            let name = spill_file_name(url, "body", "txt");
+            assert!(!name.contains('/'), "{name} contains a separator");
+            assert!(!name.contains('\\'), "{name} contains a separator");
+            assert!(!name.contains(".."), "{name} contains traversal");
+            assert_eq!(
+                std::path::Path::new(&name).components().count(),
+                1,
+                "{name} is not a single path component"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_path_component_strips_separators_and_traversal() {
+        // Separators become `-`, so a traversal string collapses into one
+        // harmless filename component. `..` survives only as literal
+        // characters inside a name, never as a path component.
+        let hostile = sanitize_path_component("../../etc/passwd");
+        assert_eq!(hostile, "-..-etc-passwd");
+        assert_eq!(
+            std::path::Path::new(&hostile).components().count(),
+            1,
+            "sanitized host must be a single path component"
+        );
+        assert_eq!(
+            std::path::Path::new(&hostile).parent(),
+            Some(std::path::Path::new("")),
+            "sanitized host must not re-parent"
+        );
+
+        assert_eq!(sanitize_path_component(".."), "unknown-host");
+        assert_eq!(sanitize_path_component("."), "unknown-host");
+        assert_eq!(sanitize_path_component(""), "unknown-host");
+        assert_eq!(sanitize_path_component("a/b\\c"), "a-b-c");
+        assert_eq!(sanitize_path_component("exämple.com"), "ex-mple.com");
+        assert!(sanitize_path_component(&"a".repeat(200)).len() <= 60);
+    }
+
+    // ── Spill extension mapping ──────────────────────────────────
+
+    #[test]
+    fn spill_extension_maps_content_types() {
+        assert_eq!(spill_extension("text/html; charset=utf-8", "html"), "md");
+        assert_eq!(spill_extension("", "html"), "md");
+        assert_eq!(spill_extension("application/json", "plain"), "json");
+        assert_eq!(spill_extension("text/markdown", "plain"), "md");
+        assert_eq!(spill_extension("text/plain; charset=utf-8", "plain"), "txt");
+    }
+
+    // ── Title extraction ─────────────────────────────────────────
+
+    #[test]
+    fn extract_html_title_handles_case_whitespace_and_absence() {
+        assert_eq!(
+            extract_html_title("<HTML><HEAD><TITLE>  Hello \n World </TITLE>").as_deref(),
+            Some("Hello World")
+        );
+        assert_eq!(
+            extract_html_title("<title lang=\"en\">Attr Title</title>").as_deref(),
+            Some("Attr Title")
+        );
+        assert_eq!(extract_html_title("<html><body>no title</body>"), None);
+        assert_eq!(extract_html_title("<title>   </title>"), None);
+        assert_eq!(extract_html_title("<title>unclosed"), None);
+
+        // Multi-byte titles inside the scan window survive intact.
+        let near = format!("{}<title>Späte Seite</title>", "€".repeat(100));
+        assert_eq!(extract_html_title(&near).as_deref(), Some("Späte Seite"));
+
+        // Beyond the scan window the title is simply not found — and, the
+        // point of this case, the 64 KiB cut must not land mid-character and
+        // panic. "€" is 3 bytes, so byte 65536 is never a char boundary.
+        let far = format!("{}<title>Too Late</title>", "€".repeat(30_000));
+        assert_eq!(
+            extract_html_title(&far),
+            None,
+            "title past the scan limit is skipped, not a panic"
+        );
     }
 }
