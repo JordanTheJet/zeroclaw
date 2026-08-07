@@ -10,6 +10,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **Plugin and skill boundaries get substantially tighter:** typed instance configuration, scoped secrets, host-owned egress, bounded exports, path-traversal protection, and fail-closed skill HTTP execution now cover the main package and network trust boundaries (#9126, #9128, #9137, #9403, #9582, #10369, GHSA-93f6-34w8-5g98).
 - **Operator feedback improves across surfaces:** Matrix, Telegram, Slack, WhatsApp Web, SOP, MCP, logs, queued messages, and clipboard flows expose clearer progress and recovery behavior (#8443, #9822, #8985, #9385, #9476, #9196, #10057, #10096).
 - **Release portability improves:** routine builders move to Rust 1.98 while source compatibility remains at Rust 1.96, release tools use pinned binaries, MUSL and Alpine coverage expands, and the coordinated 23-crate workspace gains protected crates.io publication (#9527, #10122, #10174, #9286, #9514, #10158).
+- **Web research delegate:** search moves behind a bounded sub-agent. The main agent asks a question, the delegate searches and fetches with the configured `[web_search]` backend, and returns a distilled, source-cited summary instead of raw search-result text (#9824).
 
 ## What's New
 
