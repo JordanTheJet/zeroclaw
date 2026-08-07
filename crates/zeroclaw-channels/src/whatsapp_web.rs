@@ -1348,6 +1348,61 @@ impl WhatsAppWebChannel {
         Ok(removed)
     }
 
+    /// Channel-owned passkey hook: the challenge this session is currently
+    /// waiting on, if any.
+    ///
+    /// Resolves the same expanded path the run loop hands the authenticator,
+    /// so the endpoint and the waiting channel always agree on which files
+    /// they mean. Read-only; never creates anything.
+    pub fn pending_passkey_request(session_path: &str) -> std::io::Result<Option<String>> {
+        if session_path.is_empty() {
+            return Ok(None);
+        }
+        super::whatsapp_passkey::pending_request(&Self::expand_session_path(session_path))
+    }
+
+    /// Channel-owned passkey hook: hand a signed credential to the waiting
+    /// authenticator.
+    ///
+    /// The counterpart to [`Self::pending_passkey_request`], resolving the
+    /// same expanded path. An empty `session_path` cannot be waiting on
+    /// anything, so it reports no pending request rather than writing to a
+    /// relative path in the daemon's working directory.
+    pub fn submit_passkey_assertion(
+        session_path: &str,
+        body: Vec<u8>,
+    ) -> Result<(), super::whatsapp_passkey::StageError> {
+        if session_path.is_empty() {
+            return Err(super::whatsapp_passkey::StageError::NoPendingRequest);
+        }
+        super::whatsapp_passkey::stage_assertion(&Self::expand_session_path(session_path), body)
+    }
+
+    /// Channel-owned passkey hook: the fresh-link verification code currently
+    /// waiting for explicit operator acknowledgement, if any.
+    pub fn pending_passkey_confirmation(
+        session_path: &str,
+    ) -> std::io::Result<Option<super::whatsapp_passkey::PendingPasskeyConfirmation>> {
+        if session_path.is_empty() {
+            return Ok(None);
+        }
+        super::whatsapp_passkey::pending_confirmation(&Self::expand_session_path(session_path))
+    }
+
+    /// Channel-owned passkey hook: acknowledge the current fresh-link code.
+    pub fn submit_passkey_confirmation(
+        session_path: &str,
+        attempt_id: &str,
+    ) -> Result<(), super::whatsapp_passkey::ConfirmationStageError> {
+        if session_path.is_empty() {
+            return Err(super::whatsapp_passkey::ConfirmationStageError::NoPendingConfirmation);
+        }
+        super::whatsapp_passkey::stage_confirmation_ack(
+            &Self::expand_session_path(session_path),
+            attempt_id,
+        )
+    }
+
     /// Attempt to download and transcribe a WhatsApp voice note.
     /// Returns `None` if transcription is disabled, download fails, or
     /// transcription fails (all logged as warnings).

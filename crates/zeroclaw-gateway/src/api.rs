@@ -3,9 +3,10 @@
 
 use super::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
@@ -1363,6 +1364,430 @@ pub async fn handle_api_channel_relink(
             Json(serde_json::json!({
                 "channel": channel,
                 "error": format!("failed to clear persisted login: {e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Largest credential body the passkey endpoint will read.
+///
+/// A WebAuthn assertion is on the order of a kilobyte; this is generous
+/// enough that no real credential is refused while keeping an unauthenticated
+/// misfire or a pasted-wrong-file from being buffered.
+const PASSKEY_ASSERTION_MAX_BYTES: usize = 64 * 1024;
+
+/// Largest verification-code acknowledgement body accepted by the endpoint.
+const PASSKEY_CONFIRMATION_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(serde::Deserialize)]
+struct PasskeyConfirmationSubmission {
+    attempt_id: String,
+}
+
+/// Why a composite channel name has no passkey target.
+///
+/// Kept as a small value that each handler renders, rather than a prebuilt
+/// `Response`: an `axum` response is large enough that returning one in a
+/// `Result` trips `clippy::result_large_err`, and both handlers render these
+/// two cases identically anyway.
+enum PasskeyTargetError {
+    /// No `[channels.<type>.<alias>]` block matches the requested name.
+    Unknown,
+    /// The channel type has no QR-pairing session — so it can never see a
+    /// passkey gate — or its feature is not compiled into this binary.
+    Unsupported { channel_type: String },
+}
+
+impl PasskeyTargetError {
+    /// Render as the response to return verbatim. Both arms are explicit
+    /// no-ops: nothing was inspected and nothing was written.
+    fn render(self, channel: &str) -> Response {
+        match self {
+            Self::Unknown => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("unknown channel {channel} — use the composite name from GET /api/channels"),
+                })),
+            )
+                .into_response(),
+            Self::Unsupported { channel_type } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "channel": channel,
+                    "outcome": "unsupported",
+                    "error": format!(
+                        "channel type {channel_type} has no passkey ceremony (it does not use \
+                         QR-pairing sessions) or the feature is not compiled into this binary; \
+                         nothing was changed",
+                    ),
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Resolve a composite `<type>.<alias>` channel name to the alias and the
+/// typed QR-pairing key the passkey hooks dispatch on.
+fn resolve_passkey_channel(
+    config: &Config,
+    channel: &str,
+) -> Result<
+    (
+        ChannelAliasInfo,
+        zeroclaw_channels::listing::QrPairingChannel,
+    ),
+    PasskeyTargetError,
+> {
+    let info = config
+        .channels_by_alias()
+        .into_iter()
+        .find(|info| format!("{}.{}", info.channel_type, info.alias) == channel)
+        .ok_or(PasskeyTargetError::Unknown)?;
+
+    let compiled_key = compiled_readiness_key_for_alias(config, &info);
+    let qr_channel =
+        zeroclaw_channels::listing::qr_pairing_channel(compiled_key).ok_or_else(|| {
+            PasskeyTargetError::Unsupported {
+                channel_type: info.channel_type.clone(),
+            }
+        })?;
+
+    Ok((info, qr_channel))
+}
+
+/// GET /api/channels/{channel}/passkey — the passkey challenge a channel is
+/// currently blocked on, if any.
+///
+/// WhatsApp Web interrupts device linking to demand a WebAuthn assertion
+/// signed by a passkey registered to the account. Nothing on the host can
+/// produce one, so the channel publishes the server's challenge and waits;
+/// this endpoint serves that challenge to whoever is running the browser
+/// ceremony, and `POST` to the same path answers it. Dispatches to the
+/// channel-owned hook ([`zeroclaw_channels::login_passkey::pending`]); the
+/// gateway performs no file operations of its own and holds no knowledge of
+/// channel session layouts.
+///
+/// Responses (all authenticated via the standard bearer guard):
+///
+/// - `200` with `"outcome": "pending"` — the channel is waiting.
+///   `"options"` carries the server's WebAuthn request options for
+///   `navigator.credentials.get()`; `"options_raw"` appears instead on the
+///   rare payload that is not parseable JSON, so an operator is never
+///   blocked by a shape the gateway did not expect.
+/// - `200` with `"outcome": "idle"` — the channel is not waiting for one.
+///   The ordinary state: an assertion is demanded only during linking, and
+///   only when the server's phased rollout selects the account.
+/// - `409` with `"outcome": "unsupported"` — the channel type has no passkey
+///   ceremony or its feature is not compiled in. **Nothing was inspected.**
+/// - `404` — no `[channels.<type>.<alias>]` block matches `{channel}`.
+pub async fn handle_api_channel_passkey(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.read().clone();
+    let (info, qr_channel) = match resolve_passkey_channel(&config, &channel) {
+        Ok(resolved) => resolved,
+        Err(e) => return e.render(&channel),
+    };
+
+    match zeroclaw_channels::login_passkey::pending(qr_channel, &config, &info.alias) {
+        Ok(zeroclaw_channels::login_passkey::PasskeyState::Pending { options }) => {
+            let mut body = serde_json::json!({
+                "channel": channel,
+                "outcome": "assertion_pending",
+                "note": "sign these options with navigator.credentials.get() in a logged-in \
+                         web.whatsapp.com tab, then POST the resulting credential JSON back \
+                         to this same path",
+            });
+            match serde_json::from_str::<serde_json::Value>(&options) {
+                Ok(parsed) => body["options"] = parsed,
+                // Serve it anyway rather than failing the operator's one-shot
+                // ceremony over a shape the library did not promise.
+                Err(_) => body["options_raw"] = serde_json::Value::String(options),
+            }
+            Json(body).into_response()
+        }
+        Ok(zeroclaw_channels::login_passkey::PasskeyState::ConfirmationPending {
+            attempt_id,
+            code,
+        }) => Json(serde_json::json!({
+            "channel": channel,
+            "outcome": "confirmation_pending",
+            "attempt_id": attempt_id,
+            "code": code,
+            "note": format!(
+                "compare this code with the primary phone, then POST the attempt_id \
+                 to /api/channels/{channel}/passkey/confirm"
+            ),
+        }))
+        .into_response(),
+        Ok(zeroclaw_channels::login_passkey::PasskeyState::Idle) => Json(serde_json::json!({
+            "channel": channel,
+            "outcome": "idle",
+            "note": "no passkey assertion is being waited for; one is demanded only while linking",
+        }))
+        .into_response(),
+        Ok(zeroclaw_channels::login_passkey::PasskeyState::NotApplicable) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "unsupported",
+                "error": format!(
+                    "channel type {} has no passkey ceremony; nothing was inspected",
+                    info.channel_type
+                ),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!("failed to read the pending passkey request: {e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/channels/{channel}/passkey — answer the pending challenge.
+///
+/// The body is the JSON `navigator.credentials.get()` returned, forwarded to
+/// the channel byte-for-byte: the server verifies a signature over exactly
+/// those bytes, so the gateway never reshapes them. Dispatches to the
+/// channel-owned hook ([`zeroclaw_channels::login_passkey::submit`]).
+///
+/// This is the same handoff as saving the credential to the file beside the
+/// session database, with two differences that matter to an operator: the
+/// caller does not need to know the session layout, and a payload that could
+/// never satisfy the server is rejected here, while they are still watching,
+/// rather than failing inside the run loop minutes later.
+///
+/// Responses (all authenticated via the standard bearer guard):
+///
+/// - `200` with `"outcome": "accepted"` — handed to the waiting channel,
+///   which resumes linking within a second.
+/// - `400` — the payload cannot satisfy the server (`"error"` names why).
+///   The challenge stays open, so a corrected credential can be posted.
+/// - `409` with `"outcome": "no_pending_request"` — nothing is waiting.
+///   **Nothing was written:** the channel discards any assertion predating
+///   its challenge, so accepting one would report a success that did not
+///   happen.
+/// - `409` with `"outcome": "unsupported"` — as for `GET`.
+/// - `413` — body larger than 64 KiB.
+/// - `404` — no `[channels.<type>.<alias>]` block matches `{channel}`.
+pub async fn handle_api_channel_passkey_submit(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.len() > PASSKEY_ASSERTION_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!(
+                    "credential body is {} bytes; a WebAuthn assertion is about a kilobyte \
+                     and this endpoint accepts at most {PASSKEY_ASSERTION_MAX_BYTES}",
+                    body.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    let config = state.config.read().clone();
+    let (info, qr_channel) = match resolve_passkey_channel(&config, &channel) {
+        Ok(resolved) => resolved,
+        Err(e) => return e.render(&channel),
+    };
+
+    let submitted_bytes = body.len();
+    match zeroclaw_channels::login_passkey::submit(qr_channel, &config, &info.alias, body.to_vec())
+    {
+        Ok(()) => {
+            // Size only — the credential itself never reaches the log.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"channel": channel, "bytes": submitted_bytes})
+                    ),
+                "passkey assertion accepted for a linking channel"
+            );
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "accepted",
+                "note": "the channel picks this up within a second and resumes linking",
+            }))
+            .into_response()
+        }
+        Err(zeroclaw_channels::login_passkey::SubmitError::NoPendingRequest) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "no_pending_request",
+                "error": "this channel is not waiting for a passkey assertion; nothing was written",
+                "note": "GET this path to check for a pending challenge before answering it",
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::SubmitError::Invalid(reason)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "invalid",
+                "error": reason,
+                "note": "the pending challenge is unchanged; post a corrected credential",
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::SubmitError::NotApplicable) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "unsupported",
+                "error": format!(
+                    "channel type {} has no passkey ceremony; nothing was written",
+                    info.channel_type
+                ),
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::SubmitError::Io(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!("failed to hand the assertion to the channel: {e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/channels/{channel}/passkey/confirm — acknowledge the fresh-link
+/// verification code currently displayed on the primary phone.
+///
+/// The body is `{ "attempt_id": "..." }`, copied from `GET` on the parent
+/// passkey endpoint. The attempt id makes a delayed or replayed request fail
+/// closed instead of confirming a later ceremony whose short display code may
+/// happen to repeat.
+pub async fn handle_api_channel_passkey_confirm(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.len() > PASSKEY_CONFIRMATION_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!(
+                    "confirmation body is {} bytes; this endpoint accepts at most \
+                     {PASSKEY_CONFIRMATION_MAX_BYTES}",
+                    body.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    let submission: PasskeyConfirmationSubmission = match serde_json::from_slice(&body) {
+        Ok(submission) => submission,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "channel": channel,
+                    "outcome": "invalid",
+                    "error": format!("invalid confirmation JSON: {error}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if submission.attempt_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "invalid",
+                "error": "attempt_id cannot be empty",
+            })),
+        )
+            .into_response();
+    }
+
+    let config = state.config.read().clone();
+    let (info, qr_channel) = match resolve_passkey_channel(&config, &channel) {
+        Ok(resolved) => resolved,
+        Err(e) => return e.render(&channel),
+    };
+
+    match zeroclaw_channels::login_passkey::confirm(
+        qr_channel,
+        &config,
+        &info.alias,
+        &submission.attempt_id,
+    ) {
+        Ok(()) => Json(serde_json::json!({
+            "channel": channel,
+            "outcome": "accepted",
+            "note": "the channel will finish the fresh passkey link",
+        }))
+        .into_response(),
+        Err(zeroclaw_channels::login_passkey::ConfirmError::NoPendingConfirmation) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "no_pending_confirmation",
+                "error": "this channel is not waiting for passkey-code confirmation; nothing was written",
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::ConfirmError::AttemptMismatch) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "attempt_mismatch",
+                "error": "attempt_id does not match the current passkey confirmation",
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::ConfirmError::NotApplicable) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "unsupported",
+                "error": format!(
+                    "channel type {} has no passkey ceremony; nothing was written",
+                    info.channel_type
+                ),
+            })),
+        )
+            .into_response(),
+        Err(zeroclaw_channels::login_passkey::ConfirmError::Io(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!("failed to hand confirmation to the channel: {error}"),
             })),
         )
             .into_response(),
@@ -2973,6 +3398,339 @@ pub(crate) mod tests {
             State(state),
             Path("telegram.default".to_string()),
             HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The JSON shape `navigator.credentials.get()` returns. `Y3JlZA` is
+    /// base64url for `cred`; the endpoint recovers the credential id from it.
+    #[cfg(feature = "whatsapp-web")]
+    fn browser_credential() -> &'static str {
+        r#"{"id":"Y3JlZA","rawId":"Y3JlZA","type":"public-key","response":{"clientDataJSON":"eyJ0IjoxfQ","authenticatorData":"YXV0aA","signature":"c2ln","userHandle":null}}"#
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn config_with_whatsapp_session(
+        session_path: &std::path::Path,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.whatsapp.insert(
+            "spare".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some(session_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_passkey_serves_the_challenge_then_accepts_the_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("spare.db");
+        let session = session_path.to_string_lossy().into_owned();
+        let config = config_with_whatsapp_session(&session_path);
+
+        // Nothing is waiting yet: the ordinary state.
+        let response = handle_api_channel_passkey(
+            State(test_state(config.clone())),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["outcome"], "idle");
+
+        // The run loop publishes a challenge beside the session database.
+        let options = r#"{"challenge":"AQID","rpId":"web.whatsapp.com"}"#;
+        std::fs::write(
+            zeroclaw_channels::whatsapp_passkey::request_path(&session),
+            options,
+        )
+        .unwrap();
+
+        let response = handle_api_channel_passkey(
+            State(test_state(config.clone())),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "assertion_pending");
+        assert_eq!(
+            json["options"]["challenge"], "AQID",
+            "the browser ceremony consumes these options directly"
+        );
+        assert_eq!(json["options"]["rpId"], "web.whatsapp.com");
+
+        let response = handle_api_channel_passkey_submit(
+            State(test_state(config)),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(browser_credential().as_bytes()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["outcome"], "accepted");
+
+        assert_eq!(
+            std::fs::read_to_string(zeroclaw_channels::whatsapp_passkey::assertion_path(
+                &session
+            ))
+            .unwrap(),
+            browser_credential(),
+            "the credential must reach the waiting authenticator byte-for-byte"
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_passkey_submit_without_a_challenge_is_conflict_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("spare.db");
+        let session = session_path.to_string_lossy().into_owned();
+
+        let response = handle_api_channel_passkey_submit(
+            State(test_state(config_with_whatsapp_session(&session_path))),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(browser_credential().as_bytes()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["outcome"],
+            "no_pending_request"
+        );
+        assert!(
+            !std::path::Path::new(&zeroclaw_channels::whatsapp_passkey::assertion_path(
+                &session
+            ))
+            .exists(),
+            "an unrequested assertion must not be staged; the channel would discard it \
+             and the operator would believe they had answered"
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_passkey_serves_and_accepts_fresh_link_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("spare.db");
+        let session = session_path.to_string_lossy().into_owned();
+        let config = config_with_whatsapp_session(&session_path);
+        let prompt = zeroclaw_channels::whatsapp_passkey::PendingPasskeyConfirmation {
+            attempt_id: "current-attempt".to_string(),
+            code: "ABCD-EFGH".to_string(),
+        };
+        std::fs::write(
+            zeroclaw_channels::whatsapp_passkey::confirmation_path(&session),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+
+        let response = handle_api_channel_passkey(
+            State(test_state(config.clone())),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "confirmation_pending");
+        assert_eq!(json["attempt_id"], "current-attempt");
+        assert_eq!(json["code"], "ABCD-EFGH");
+
+        let response = handle_api_channel_passkey_confirm(
+            State(test_state(config.clone())),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"attempt_id":"older-attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["outcome"], "attempt_mismatch");
+
+        let response = handle_api_channel_passkey_confirm(
+            State(test_state(config)),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"attempt_id":"current-attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["outcome"], "accepted");
+
+        let ack: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(zeroclaw_channels::whatsapp_passkey::confirmation_ack_path(
+                &session,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ack["attempt_id"], "current-attempt");
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_passkey_rejects_an_unusable_payload_and_keeps_the_challenge() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("spare.db");
+        let session = session_path.to_string_lossy().into_owned();
+        let request_file = zeroclaw_channels::whatsapp_passkey::request_path(&session);
+        std::fs::write(&request_file, r#"{"challenge":"AQID"}"#).unwrap();
+
+        // A credential with no signature can never satisfy the server, and
+        // saying so now beats an opaque rejection from WhatsApp later.
+        let response = handle_api_channel_passkey_submit(
+            State(test_state(config_with_whatsapp_session(&session_path))),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"rawId":"Y3JlZA","response":{}}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "invalid");
+        assert!(
+            json["error"]
+                .as_str()
+                .expect("error string")
+                .contains("signature"),
+            "the error must name the missing field, not just say no"
+        );
+        assert!(
+            std::path::Path::new(&request_file).exists(),
+            "a rejected submission must leave the challenge open to retry"
+        );
+        assert!(
+            !std::path::Path::new(&zeroclaw_channels::whatsapp_passkey::assertion_path(
+                &session
+            ))
+            .exists()
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_passkey_refuses_an_oversized_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("spare.db");
+
+        let response = handle_api_channel_passkey_submit(
+            State(test_state(config_with_whatsapp_session(&session_path))),
+            Path("whatsapp.spare".to_string()),
+            HeaderMap::new(),
+            Bytes::from(vec![b'x'; PASSKEY_ASSERTION_MAX_BYTES + 1]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn api_channel_passkey_unsupported_channel_is_explicit_conflict_noop() {
+        let config = config_with_telegram("default");
+
+        let response = handle_api_channel_passkey(
+            State(test_state(config.clone())),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response_json(response).await["outcome"], "unsupported");
+
+        let response = handle_api_channel_passkey_submit(
+            State(test_state(config.clone())),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "unsupported");
+        assert!(
+            json["error"]
+                .as_str()
+                .expect("error string")
+                .contains("nothing was changed")
+        );
+
+        let response = handle_api_channel_passkey_confirm(
+            State(test_state(config)),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"attempt_id":"attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response_json(response).await["outcome"], "unsupported");
+    }
+
+    #[tokio::test]
+    async fn api_channel_passkey_unknown_channel_is_not_found() {
+        let response = handle_api_channel_passkey(
+            State(test_state(zeroclaw_config::schema::Config::default())),
+            Path("whatsapp.ghost".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_channel_passkey_requires_bearer_auth_when_pairing_enabled() {
+        let state = AppState {
+            pairing: Arc::new(PairingGuard::new(true, &[])),
+            ..test_state(config_with_telegram("default"))
+        };
+
+        let response = handle_api_channel_passkey(
+            State(state.clone()),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The write path must be guarded too — it is the one that stages a
+        // credential for a channel to act on.
+        let response = handle_api_channel_passkey_submit(
+            State(state.clone()),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = handle_api_channel_passkey_confirm(
+            State(state),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"attempt_id":"attempt"}"#),
         )
         .await
         .into_response();

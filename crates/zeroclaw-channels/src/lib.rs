@@ -12,6 +12,7 @@ pub mod allowlist;
 pub(crate) mod identity_persist;
 pub mod listing;
 pub mod login_events;
+pub mod login_passkey;
 pub mod login_probe;
 pub mod login_relink;
 pub mod orchestrator;

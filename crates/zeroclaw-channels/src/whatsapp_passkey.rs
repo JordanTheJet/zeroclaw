@@ -31,8 +31,12 @@
 //! reachable only from inside the channel's own run loop — the gateway's
 //! `login_relink` hook is disk-only by design and never touches a running
 //! channel. Keeping the seam on disk avoids inventing cross-crate plumbing
-//! for a rare event, and leaves an HTTP endpoint a trivial future addition:
-//! it would write the same file.
+//! for a rare event.
+//!
+//! The gateway passkey endpoint ([`crate::login_passkey`]) is a caller of the
+//! same seam rather than a second one. It serves the pending state and stages
+//! operator responses through the helpers in this module, so HTTP and manual
+//! handoffs are indistinguishable to the run loop.
 //!
 //! The assertion is a one-time signature over the server's challenge and
 //! carries no private key. The acknowledgement carries only a random attempt
@@ -148,6 +152,122 @@ async fn publish_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
     drop(file);
 
     tokio::fs::rename(&tmp, path).await
+}
+
+/// Synchronous counterpart of [`publish_private`] for blocking gateway hooks.
+fn publish_private_sync(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let staging = format!("{path}.partial");
+    // Removing first makes `create_new` both recoverable after a crash and
+    // symlink-safe: a planted link is unlinked rather than followed.
+    let _ = std::fs::remove_file(&staging);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&staging)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(&staging, path).map_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        error
+    })
+}
+
+/// Why an operator-supplied assertion could not be staged.
+#[derive(Debug)]
+pub enum StageError {
+    /// No challenge is currently published for this session.
+    NoPendingRequest,
+    /// The payload cannot satisfy the server; carries the specific reason.
+    Invalid(String),
+    /// The assertion could not be written to disk.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for StageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPendingRequest => write!(
+                f,
+                "no passkey assertion is currently being waited for on this session"
+            ),
+            Self::Invalid(reason) => write!(f, "{reason}"),
+            Self::Io(error) => write!(f, "could not write the assertion: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StageError {}
+
+/// Why a verification-code acknowledgement could not be staged.
+#[derive(Debug)]
+pub enum ConfirmationStageError {
+    /// No fresh-link code is currently waiting for operator confirmation.
+    NoPendingConfirmation,
+    /// The acknowledgement belongs to a different ceremony attempt.
+    AttemptMismatch,
+    /// The acknowledgement could not be written to disk.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ConfirmationStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPendingConfirmation => {
+                write!(f, "no passkey verification code is currently waiting")
+            }
+            Self::AttemptMismatch => write!(f, "confirmation attempt_id does not match"),
+            Self::Io(error) => write!(f, "could not write the confirmation: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfirmationStageError {}
+
+/// The assertion challenge currently published for `session_path`, if any.
+pub fn pending_request(session_path: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(request_path(session_path)) {
+        Ok(options) => Ok(Some(options)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Validate and atomically stage a browser assertion for the waiting channel.
+pub fn stage_assertion(session_path: &str, body: Vec<u8>) -> Result<(), StageError> {
+    if !std::path::Path::new(&request_path(session_path)).exists() {
+        return Err(StageError::NoPendingRequest);
+    }
+
+    parse_assertion(body.clone()).map_err(|e| StageError::Invalid(e.to_string()))?;
+    publish_private_sync(&assertion_path(session_path), &body).map_err(StageError::Io)
+}
+
+/// Atomically stage an acknowledgement for the current fresh-link code.
+pub fn stage_confirmation_ack(
+    session_path: &str,
+    attempt_id: &str,
+) -> Result<(), ConfirmationStageError> {
+    let pending = pending_confirmation(session_path)
+        .map_err(ConfirmationStageError::Io)?
+        .ok_or(ConfirmationStageError::NoPendingConfirmation)?;
+    if pending.attempt_id != attempt_id {
+        return Err(ConfirmationStageError::AttemptMismatch);
+    }
+
+    let body = serde_json::to_vec(&serde_json::json!({ "attempt_id": attempt_id }))
+        .map_err(|e| ConfirmationStageError::Io(std::io::Error::other(e)))?;
+    publish_private_sync(&confirmation_ack_path(session_path), &body)
+        .map_err(ConfirmationStageError::Io)
 }
 
 /// Read the pending verification-code prompt for `session_path`, if any.
@@ -596,6 +716,63 @@ mod tests {
         publish_private(&target, b"fresh").await.unwrap();
 
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"fresh".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assertion_staging_does_not_follow_a_planted_partial_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().to_string();
+        std::fs::write(request_path(&session), r#"{"challenge":"AQID"}"#).unwrap();
+
+        let target = tmp.path().join("must-not-change");
+        std::fs::write(&target, b"original").unwrap();
+        symlink(&target, format!("{}.partial", assertion_path(&session))).unwrap();
+
+        let raw_id = BASE64_URL_SAFE_NO_PAD.encode(b"cred");
+        stage_assertion(&session, credential_json(&raw_id, "c2ln")).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert!(std::path::Path::new(&assertion_path(&session)).is_file());
+    }
+
+    #[test]
+    fn confirmation_acknowledgement_is_bound_to_the_pending_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().to_string();
+        let prompt = PendingPasskeyConfirmation {
+            attempt_id: "current-attempt".to_string(),
+            code: "ABCD-EFGH".to_string(),
+        };
+        std::fs::write(
+            confirmation_path(&session),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            stage_confirmation_ack(&session, "older-attempt"),
+            Err(ConfirmationStageError::AttemptMismatch)
+        ));
+        assert!(!std::path::Path::new(&confirmation_ack_path(&session)).exists());
+
+        stage_confirmation_ack(&session, "current-attempt").unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(confirmation_ack_path(&session)).unwrap())
+                .unwrap();
+        assert_eq!(ack["attempt_id"], "current-attempt");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(confirmation_ack_path(&session))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[tokio::test]
