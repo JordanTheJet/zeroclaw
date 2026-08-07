@@ -63,11 +63,24 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
+  // Only the newest listing may commit. An active delete issues two overlapping
+  // loads — handleDelete's trailing reload, plus the one the sessionId change
+  // fires when the pane is moved off the deleted conversation. The first still
+  // holds the pre-delete `sessionId` in its closure, so if it resolves last its
+  // result (which no longer contains that conversation) falls into the
+  // "surface the active conversation" branch below and re-synthesizes the row
+  // that was just deleted. Selecting that ghost reconnects to a session the
+  // gateway no longer has, minting a fresh empty one.
+  const loadGenerationRef = useRef(0);
+
   const load = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
+    const superseded = () => generation !== loadGenerationRef.current;
     setLoading(true);
     setLoadFailed(false);
     try {
       const all = await getSessions();
+      if (superseded()) return;
       const mine = all
         // Gateway web-chat sessions only, keyed on the storage prefix rather
         // than merely "has no channel": the TUI's chat pane stores sessions as
@@ -105,10 +118,12 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       }
       setRows(mine);
     } catch {
+      if (superseded()) return;
       setLoadFailed(true);
       setRows([{ id: sessionId, messageCount: 0, lastActivity: null, persisted: false }]);
     } finally {
-      setLoading(false);
+      // A superseded load must not clear the spinner a newer one is still owed.
+      if (!superseded()) setLoading(false);
     }
   }, [agentAlias, sessionId]);
 

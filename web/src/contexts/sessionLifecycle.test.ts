@@ -57,6 +57,8 @@ Object.defineProperty(globalThis, 'navigator', {
   .IS_REACT_ACT_ENVIRONMENT = true;
 
 let listedSessions: Array<Record<string, unknown>> = [];
+type SessionsResponder = () => Promise<Array<Record<string, unknown>>>;
+let sessionsResponder: SessionsResponder | null = null;
 interface ConfigPutRequest {
   path: string;
   value: unknown;
@@ -81,7 +83,11 @@ globalThis.fetch = async (input, init) => {
     body = { path: request.path, value: request.value };
   } else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
   else if (url.includes('/api/config/list')) body = { entries: [] };
-  else if (url.endsWith('/api/sessions')) body = { sessions: listedSessions };
+  else if (url.endsWith('/api/sessions')) {
+    // `sessionsResponder` lets a test control when each listing resolves, so
+    // out-of-order list responses can be reproduced deterministically.
+    body = { sessions: sessionsResponder ? await sessionsResponder() : listedSessions };
+  }
   else return new Response('{"error":"not found"}', { status: 404 });
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -322,6 +328,7 @@ beforeEach(() => {
   storage.clear();
   configPutCalls = [];
   configPutHandler = null;
+  sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
@@ -513,6 +520,69 @@ test('manual rename is the only name write when the first message is sent', asyn
     await pendingRename;
   });
   assert.equal(runtime.renameCalls.length, 1);
+  await unmount(mounted.renderer);
+});
+
+test('a listing that lands after an active delete cannot resurrect the deleted row', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.mintedIds.push('C');
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('C', () => Promise.resolve(messagesResponse('C', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const buttons = () => mounted.renderer.root.findAllByType('button');
+  const trigger = buttons().find((button) => button.props.title === 'Conversations');
+  assert.ok(trigger);
+  await act(async () => { trigger.props.onClick(); });
+  await settle();
+
+  // Hold the listing open so it settles only after the delete has moved the
+  // pane onto a new conversation. Both loads an active delete issues (the
+  // trailing reload, and the one the sessionId change fires) observe this
+  // post-delete server state, in which A no longer exists.
+  const pending: Array<Deferred<Array<Record<string, unknown>>>> = [];
+  sessionsResponder = () => {
+    const deferred = new Deferred<Array<Record<string, unknown>>>();
+    pending.push(deferred);
+    return deferred.promise;
+  };
+  const afterDelete = listedSessions.filter((s) => s.session_id !== 'A');
+
+  const deleteA = buttons().find((button) => button.props['aria-label'] === 'Delete conversation: First');
+  assert.ok(deleteA);
+  await act(async () => { deleteA.props.onClick(); });
+  const confirm = buttons().find((button) => nodeText(button) === 'Delete');
+  assert.ok(confirm);
+  await act(async () => { void confirm.props.onClick(); });
+  await settle();
+
+  assert.equal(mounted.context().sessionId, 'C');
+  assert.ok(pending.length >= 1, 'the delete must trigger a list refresh');
+
+  await act(async () => {
+    for (const deferred of pending) deferred.resolve(afterDelete);
+    await Promise.resolve();
+  });
+  await settle();
+
+  const rendered = buttons().map((button) => nodeText(button)).join('|');
+  assert.equal(
+    rendered.includes('First'),
+    false,
+    `the deleted conversation must not return under its old name: ${rendered}`,
+  );
+  assert.equal(
+    rendered.includes('Conversation A'),
+    false,
+    `the deleted conversation must not be re-synthesized as the active row: ${rendered}`,
+  );
+  // The surviving conversation and the freshly minted active one are both shown.
+  assert.ok(rendered.includes('Second'), `surviving conversation missing: ${rendered}`);
+  assert.ok(rendered.includes('Conversation C'), `new active conversation missing: ${rendered}`);
+  assert.equal(runtime.deleteCalls.filter((id) => id === 'A').length, 1);
+
   await unmount(mounted.renderer);
 });
 
