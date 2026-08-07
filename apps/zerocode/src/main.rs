@@ -583,6 +583,9 @@ fn install_panic_hook() {
 /// handlers. Errors are intentionally ignored — we're already crashing.
 fn force_restore_terminal() {
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
+        // Terminal status outlives the process, so it has to be handed back
+        // here too — otherwise a crash leaves the tab reading as busy.
+        crate::osc_status::release();
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),

@@ -63,9 +63,11 @@ pub(crate) fn title_for(status: &TurnStatus, agent: Option<&str>) -> String {
 /// what an agent turn is. `4` (warning) marks a turn that has stopped and wants
 /// the operator — distinct from `2` (error), which would claim the turn failed.
 /// `0` clears the indicator so a finished pane stops showing as busy.
+pub(crate) const PROGRESS_CLEARED: &str = "0;0";
+
 pub(crate) fn progress_for(status: &TurnStatus) -> &'static str {
     match status {
-        TurnStatus::Idle => "0;0",
+        TurnStatus::Idle => PROGRESS_CLEARED,
         TurnStatus::WaitingForApproval => "4;0",
         _ => "3;0",
     }
@@ -131,6 +133,19 @@ fn emit_title(title: &str) {
 
 fn emit_progress(payload: &str) {
     write_progress(&mut std::io::stdout(), payload);
+}
+
+/// Hand the terminal's status back on the way out.
+///
+/// Both channels are terminal state, not screen content, so they outlive the
+/// process that set them: leaving the alternate screen does not undo them. A
+/// zerocode killed mid-turn would otherwise leave `⏳` in the tab and a busy
+/// indicator in the taskbar for as long as that terminal lives. Clearing
+/// progress and blanking the title returns both to whatever the shell sets
+/// next. Safe to call more than once, and from a panic or signal handler.
+pub(crate) fn release() {
+    emit_progress(PROGRESS_CLEARED);
+    emit_title("");
 }
 
 #[cfg(test)]
@@ -249,6 +264,16 @@ mod tests {
         let mut out = Vec::new();
         write_progress(&mut out, progress_for(&TurnStatus::Idle));
         assert_eq!(out, b"\x1b]9;4;0;0\x07");
+    }
+
+    /// Teardown must clear progress and blank the title. Without it a process
+    /// killed mid-turn leaves the tab reading as busy for the terminal's life.
+    #[test]
+    fn release_clears_both_channels() {
+        let mut out = Vec::new();
+        write_progress(&mut out, PROGRESS_CLEARED);
+        write_title(&mut out, "");
+        assert_eq!(out, b"\x1b]9;4;0;0\x07\x1b]2;\x07");
     }
 
     /// A BEL inside the alias would terminate the OSC string early and leave

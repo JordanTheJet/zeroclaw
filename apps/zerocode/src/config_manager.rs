@@ -75,6 +75,9 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     // Pop the enhancement flags best-effort — if they were never pushed (or the
     // terminal doesn't support them), popping is a harmless no-op we ignore.
     let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
+    // Terminal status is not screen content: leaving the alternate screen does
+    // not clear it, so hand it back explicitly on the way out.
+    crate::osc_status::release();
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
