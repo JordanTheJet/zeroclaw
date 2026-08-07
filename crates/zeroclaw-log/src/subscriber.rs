@@ -11,6 +11,7 @@ use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::event::ZeroclawAttribution;
 use crate::layer::LogCaptureLayer;
@@ -32,6 +33,17 @@ use crate::layer::LogCaptureLayer;
 ///
 /// Both axes are fixed for the process lifetime — the global subscriber
 /// is installed once and cannot be reconfigured without a restart.
+///
+/// Both axes cover dependencies that log through the `log` crate rather
+/// than `tracing`, because installation goes through
+/// [`SubscriberInitExt::init`], which also installs the `LogTracer`
+/// bridge. That bridge is what makes those records visible at all: it
+/// converts them into `tracing` events *before* either filter runs.
+/// Without it they are dropped at the `log` facade and no filter or
+/// `RUST_LOG` value can recover them. This is not theoretical — every
+/// record from `whatsapp-rust` (300+ sites, all `log::*`, targets like
+/// `Client/PairCode`) was silently discarded until the bridge was added,
+/// which meant failures inside that library produced no diagnostics.
 ///
 /// Panics on subscriber install failure — the daemon cannot operate
 /// without logging.
@@ -73,7 +85,15 @@ pub fn install_global_subscriber(
         .with(LogCaptureLayer.with_filter(recording_filter))
         .with(fmt_layer);
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // `init()` rather than `set_global_default`: it installs the same
+    // subscriber AND the `LogTracer` bridge that routes `log` records into
+    // tracing. `set_global_default` installs only the subscriber, so
+    // `log`-emitting dependencies stay invisible however the filters are set.
+    // Enabling the `tracing-log` feature alone does not help — it makes the
+    // bridge available, not installed.
+    subscriber
+        .try_init()
+        .expect("setting default subscriber failed");
 }
 
 /// Test-only helper: install a minimal global subscriber that routes
