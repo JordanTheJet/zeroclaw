@@ -24,7 +24,7 @@ pub enum TurnStatus {
 
 impl TurnStatus {
     /// Verb (no parens, no dots) — `None` for states that render without dots.
-    fn verb(&self) -> Option<String> {
+    pub(crate) fn verb(&self) -> Option<String> {
         match self {
             TurnStatus::Idle => None,
             TurnStatus::Working => Some("working".into()),
