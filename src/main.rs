@@ -3406,14 +3406,14 @@ fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
             chars.next(); // opening quote
             loop {
                 match chars.next() {
-                    None => return None, // unterminated quote
-                    Some('"') => break,  // closing quote
+                    Some('"') => break, // closing quote
                     Some('\\') => match chars.next() {
                         Some(esc @ ('"' | '`' | '$' | '\\')) => token.push(esc),
                         _ => return None, // invalid or dangling escape inside quotes
                     },
-                    // Reserved characters must be escaped inside quotes.
-                    Some('$' | '`') => return None,
+                    // An unterminated quote, or an unescaped reserved character
+                    // (`$`/`` ` ``) inside quotes: fail closed.
+                    None | Some('$' | '`') => return None,
                     Some(c) => token.push(c),
                 }
             }
