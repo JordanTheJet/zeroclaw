@@ -11,10 +11,11 @@ use crate::helpers::domain_guard;
 /// (lynx, links, w3m). Ideal for headless/SSH environments where graphical
 /// browsers are unavailable.
 ///
-/// The selected external browser owns its transport and resolves DNS again;
-/// unlike `web_fetch`, this tool cannot pin the preflight answer. The resolved
-/// address checks are defense in depth, not a DNS-rebinding boundary. Prefer
-/// `web_fetch` for attacker-controlled URLs.
+/// The selected external browser owns its transport, resolves DNS again, and
+/// follows redirects without ZeroClaw revalidating each destination. Unlike
+/// `web_fetch`, this tool cannot pin the preflight answer. The resolved-address
+/// checks are defense in depth, not a DNS-rebinding or redirect boundary.
+/// Prefer `web_fetch` for attacker-controlled URLs.
 pub struct TextBrowserTool {
     security: Arc<SecurityPolicy>,
     preferred_browser: Option<String>,
@@ -228,7 +229,8 @@ impl Tool for TextBrowserTool {
         "Render a web page as plain text using a text-based browser (lynx, links, or w3m). \
          Ideal for headless/SSH environments without a graphical browser. \
          Auto-detects available browser or uses a configured preference. \
-         For untrusted URLs, prefer web_fetch because external browsers cannot pin DNS."
+         For untrusted URLs, prefer web_fetch because external browsers can re-resolve DNS and \
+         follow redirects to unvalidated hosts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

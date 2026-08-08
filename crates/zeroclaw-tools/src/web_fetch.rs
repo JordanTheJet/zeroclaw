@@ -2,11 +2,14 @@ use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::FirecrawlConfig;
+use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig};
 
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
@@ -112,8 +115,12 @@ impl WebFetchTool {
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
-    fn should_fallback_to_firecrawl(&self, result: &ToolResult) -> bool {
-        if !self.firecrawl.enabled {
+    fn should_fallback_to_firecrawl(
+        &self,
+        result: &ToolResult,
+        redirect_policy_rejected: bool,
+    ) -> bool {
+        if !self.firecrawl.enabled || redirect_policy_rejected {
             return false;
         }
         // Fallback on failure (HTTP error, network error, etc.)
@@ -327,7 +334,7 @@ impl Tool for WebFetchTool {
         "Fetch a web page and return its content as clean plain text. \
          HTML pages are automatically converted to readable text. \
          JSON and plain text responses are returned as-is. \
-         Only GET requests; follows redirects. \
+         Only GET requests; follows same-host redirects and rejects cross-host redirects. \
          Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
          Security: allowlist-only domains, no local/private hosts."
     }
@@ -368,6 +375,19 @@ impl Tool for WebFetchTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
+        let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
+        if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "web_fetch requires direct transport so validated DNS answers remain pinned; \
+                     exclude tool.web_fetch from proxy.services or disable the runtime proxy"
+                        .into(),
+                ),
+            });
+        }
+
         let target = match self.resolve_target(url) {
             Ok(v) => v,
             Err(e) => {
@@ -397,8 +417,11 @@ impl Tool for WebFetchTool {
         let blocked_domains = self.blocked_domains.clone();
         let allowed_private_hosts = self.allowed_private_hosts.clone();
         let pinned_host = target.host.clone();
+        let redirect_policy_rejected = Arc::new(AtomicBool::new(false));
+        let rejected_by_policy = Arc::clone(&redirect_policy_rejected);
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
+                rejected_by_policy.store(true, Ordering::Relaxed);
                 return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
             }
 
@@ -409,6 +432,7 @@ impl Tool for WebFetchTool {
                 &blocked_domains,
                 &allowed_private_hosts,
             ) {
+                rejected_by_policy.store(true, Ordering::Relaxed);
                 return attempt.error(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!("Blocked redirect target: {err}"),
@@ -419,12 +443,11 @@ impl Tool for WebFetchTool {
         });
 
         let builder = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(redirect_policy)
             .user_agent("ZeroClaw/0.1 (web_fetch)");
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
         let builder = pin_resolved_host(builder, &target);
         let client = match builder.build() {
             Ok(c) => c,
@@ -441,7 +464,10 @@ impl Tool for WebFetchTool {
 
         // If standard fetch succeeded well enough, return it directly.
         // Otherwise, try Firecrawl fallback if enabled.
-        if self.should_fallback_to_firecrawl(&standard_result) {
+        if self.should_fallback_to_firecrawl(
+            &standard_result,
+            redirect_policy_rejected.load(Ordering::Relaxed),
+        ) {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -518,6 +544,10 @@ fn pin_resolved_host(
     }
 }
 
+fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
+    config.has_any_proxy_url() && config.should_apply_to_service("tool.web_fetch")
+}
+
 fn validate_redirect_target(
     raw_url: &str,
     pinned_host: &str,
@@ -561,9 +591,14 @@ fn resolve_target_url(
         },
     )?;
     let host = extract_host(&url)?;
+    let mut canonical_url = reqwest::Url::parse(&url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+    canonical_url
+        .set_host(Some(&host))
+        .map_err(|_| anyhow::Error::msg("URL must include a valid host"))?;
 
     Ok(ResolvedWebFetchTarget {
-        url,
+        url: canonical_url.to_string(),
         host,
         resolved_addrs: resolved_addrs.unwrap_or_default(),
     })
@@ -1080,6 +1115,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolved_target_canonicalizes_trailing_dot_before_dns_pinning() {
+        let target = resolve_target_url(
+            "http://dns-rebinding.invalid.:8080/path?x=1",
+            &["*".to_string()],
+            &[],
+            &[],
+            "web_fetch",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&target.url).unwrap();
+
+        assert_eq!(target.host, "dns-rebinding.invalid");
+        assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+        assert_eq!(parsed.port(), Some(8080));
+        assert_eq!(parsed.path(), "/path");
+        assert_eq!(parsed.query(), Some("x=1"));
+    }
+
+    #[test]
+    fn runtime_proxy_conflicts_with_dns_pinning_only_when_it_applies() {
+        let global_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
+
+        let other_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["provider.openai".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(!proxy_conflicts_with_dns_pinning(&other_service_proxy));
+        assert!(!proxy_conflicts_with_dns_pinning(&ProxyConfig::default()));
+    }
+
     // ── Security policy ──────────────────────────────────────────
 
     #[tokio::test]
@@ -1204,7 +1278,7 @@ mod tests {
         // (b) result does NOT trip should_fallback_to_firecrawl — proves
         // the regression (1-byte short body) is locked out.
         assert!(
-            !tool.should_fallback_to_firecrawl(&standard_result),
+            !tool.should_fallback_to_firecrawl(&standard_result, false),
             "500-byte body under zero limit must not trigger Firecrawl fallback"
         );
     }
@@ -1403,7 +1477,22 @@ mod tests {
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
-        assert!(!tool.should_fallback_to_firecrawl(&result));
+        assert!(!tool.should_fallback_to_firecrawl(&result, false));
+    }
+
+    #[test]
+    fn redirect_policy_rejection_never_falls_back_to_firecrawl() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some("Blocked redirect target".into()),
+        };
+
+        assert!(!tool.should_fallback_to_firecrawl(&result, true));
     }
 
     #[test]
@@ -1417,7 +1506,7 @@ mod tests {
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        assert!(tool.should_fallback_to_firecrawl(&result, false));
     }
 
     #[test]
@@ -1431,7 +1520,7 @@ mod tests {
             output: ToolOutput::default(),
             error: None,
         };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        assert!(tool.should_fallback_to_firecrawl(&result, false));
     }
 
     #[test]
@@ -1445,7 +1534,7 @@ mod tests {
             output: "Loading...".into(), // < 100 chars, JS-only page
             error: None,
         };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        assert!(tool.should_fallback_to_firecrawl(&result, false));
     }
 
     #[test]
@@ -1459,7 +1548,7 @@ mod tests {
             output: "A".repeat(200).into(), // well above 100 chars
             error: None,
         };
-        assert!(!tool.should_fallback_to_firecrawl(&result));
+        assert!(!tool.should_fallback_to_firecrawl(&result, false));
     }
 
     // ── Firecrawl response parsing ──────────────────────────────────
@@ -1526,7 +1615,7 @@ mod tests {
             error: None,
         };
         assert!(
-            tool.should_fallback_to_firecrawl(&result),
+            tool.should_fallback_to_firecrawl(&result, false),
             "99-char body (below threshold) should trigger fallback"
         );
     }
@@ -1543,7 +1632,7 @@ mod tests {
             error: None,
         };
         assert!(
-            !tool.should_fallback_to_firecrawl(&result),
+            !tool.should_fallback_to_firecrawl(&result, false),
             "100-char body (at threshold) should NOT trigger fallback"
         );
     }
@@ -1626,7 +1715,7 @@ mod tests {
 
         // standard_fetch should fail with 403
         assert!(!standard_result.success);
-        assert!(tool.should_fallback_to_firecrawl(&standard_result));
+        assert!(tool.should_fallback_to_firecrawl(&standard_result, false));
 
         // Firecrawl fallback should also fail (missing API key)
         let firecrawl_result = Box::pin(tool.fetch_via_firecrawl(&url)).await;
@@ -1715,7 +1804,7 @@ mod tests {
         let standard_result = tool.standard_fetch(&client, &url).await;
 
         // Standard fetch returns short body, should trigger fallback
-        assert!(tool.should_fallback_to_firecrawl(&standard_result));
+        assert!(tool.should_fallback_to_firecrawl(&standard_result, false));
 
         // Firecrawl fallback should succeed with rich content
         let result = Box::pin(tool.fetch_via_firecrawl(&url)).await.unwrap();

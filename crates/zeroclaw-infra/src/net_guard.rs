@@ -190,7 +190,7 @@ pub fn is_private_or_local_host(host: &str) -> bool {
 /// [iana-v4]: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
 #[must_use]
 pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
+    let [a, b, c, d] = v4.octets();
     a == 0 // 0.0.0.0/8 ("This network")
         || v4.is_loopback()
         || v4.is_private()
@@ -199,7 +199,8 @@ pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_multicast()
         || (a == 100 && (64..=127).contains(&b)) // RFC 6598 shared address space
         || a >= 240 // Reserved
-        || (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24, 192.0.2.0/24
+        || (a == 192 && b == 0 && c == 0 && !matches!(d, 9 | 10))
+        || (a == 192 && b == 0 && c == 2) // Documentation (192.0.2.0/24)
         || (a == 192 && b == 88 && c == 99) // Deprecated 6to4 relay anycast
         || (a == 198 && b == 51 && c == 100) // Documentation (198.51.100.0/24)
         || (a == 203 && b == 0 && c == 113) // Documentation (203.0.113.0/24)
@@ -274,6 +275,24 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     }
 }
 
+fn metadata_embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = embedded_ipv4(v6) {
+        return Some(v4);
+    }
+
+    match v6.segments() {
+        // Deprecated IPv4-compatible form ::a.b.c.d.
+        [0, 0, 0, 0, 0, 0, high, low]
+        // 6to4 embeds the effective IPv4 next hop after 2002::/16.
+        | [0x2002, high, low, _, _, _, _, _] => {
+            let [a, b] = high.to_be_bytes();
+            let [c, d] = low.to_be_bytes();
+            Some(std::net::Ipv4Addr::new(a, b, c, d))
+        }
+        _ => None,
+    }
+}
+
 /// True when `ip` is a known cloud instance-metadata service address.
 ///
 /// The classifier covers the entire IPv4 link-local range used by instance,
@@ -299,7 +318,7 @@ pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
             let segments = v6.segments();
             (segments[..4] == [0xfd00, 0x0ec2, 0, 0])
                 || v6 == GCP_METADATA_V6
-                || embedded_ipv4(v6)
+                || metadata_embedded_ipv4(v6)
                     .is_some_and(|v4| is_cloud_metadata_ip(std::net::IpAddr::V4(v4)))
         }
     }
@@ -433,6 +452,8 @@ mod tests {
             "0.0.0.1",
             "0.255.255.255",
             "100.64.0.1",
+            "192.0.0.8",
+            "192.0.0.11",
             "192.88.99.1",
             "198.19.255.255",
             "240.0.0.1",
@@ -441,7 +462,14 @@ mod tests {
             assert!(is_non_global_v4(address), "{address} must be blocked");
         }
 
-        for address in ["1.0.0.0", "100.128.0.0", "192.88.98.255", "192.88.100.0"] {
+        for address in [
+            "1.0.0.0",
+            "100.128.0.0",
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.88.98.255",
+            "192.88.100.0",
+        ] {
             let address = address.parse::<Ipv4Addr>().unwrap();
             assert!(!is_non_global_v4(address), "{address} must be allowed");
         }
@@ -521,6 +549,8 @@ mod tests {
             "64:ff9b::169.254.169.254",
             "64:ff9b::168.63.129.16",
             "64:ff9b::100.100.100.200",
+            "::169.254.169.254",
+            "2002:a9fe:a9fe::",
             "fd00:ec2::",
             "fd00:ec2::23",
             "fd00:ec2::254",
@@ -545,6 +575,8 @@ mod tests {
             "fd00:ec2:0:1::",
             "fd20:ce::253",
             "fd20:ce::255",
+            "::169.253.169.254",
+            "2002:a9fd:a9fe::",
         ] {
             let address = address.parse().unwrap();
             assert!(
@@ -830,6 +862,8 @@ mod tests {
             "::ffff:168.63.129.16",
             "64:ff9b::100.100.100.200",
             "64:ff9b::168.63.129.16",
+            "::169.254.169.254",
+            "2002:a9fe:a9fe::",
             "fd00:ec2::23",
             "fd20:ce::254",
         ] {

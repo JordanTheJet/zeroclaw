@@ -7533,6 +7533,8 @@ fn default_allowed_domains_star() -> Vec<String> {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
 /// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
+/// Same-host redirects are followed; cross-host redirects are rejected so the
+/// validated DNS answers remain pinned to the request transport.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_fetch"]
@@ -7546,14 +7548,17 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
-    /// Exact and subdomain matches are supported. Listing a host skips the
-    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
-    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
-    /// wildcard permits any literal private/local host and lets a name already in
-    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// Private/internal hosts allowed to relax the public-address SSRF check
+    /// (e.g. `["192.168.1.10", "internal.local"]`). Exact and subdomain matches
+    /// are supported. Every target still resolves locally, and known cloud
+    /// metadata/platform addresses remain blocked. A *literal* private/local host
+    /// (IP literal, localhost, .local) listed here also bypasses `allowed_domains`.
+    /// The `*` wildcard permits any literal private/local host and lets a name
+    /// already in `allowed_domains` resolve to a private IP, but it does NOT widen
     /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
+    /// `web_fetch` requires direct transport for DNS pinning: environment proxy
+    /// discovery is disabled, and requests fail when the runtime proxy applies.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -7716,8 +7721,11 @@ pub struct TextBrowserConfig {
     /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
     /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
     /// Known metadata and host-platform addresses remain blocked after resolution.
-    /// The external browser re-resolves DNS and cannot consume the checked answer;
-    /// prefer `web_fetch` when URLs or DNS are attacker-controlled.
+    /// The external browser re-resolves DNS and follows redirects without
+    /// revalidation, so these checks are not a DNS-rebinding or redirect boundary.
+    /// Local preflight resolution still applies under this opt-in, which may reject
+    /// names available only through a browser or proxy. Prefer `web_fetch` when
+    /// URLs or DNS are attacker-controlled.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
