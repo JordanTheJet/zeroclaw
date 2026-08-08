@@ -7565,9 +7565,11 @@ pub struct WebFetchConfig {
     /// already in `allowed_domains` resolve to a private IP, but it does NOT widen
     /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
-    /// `web_fetch` requires direct transport for DNS pinning: environment proxy
-    /// discovery is disabled, and requests fail when the runtime proxy applies.
-    /// Use `proxy.scope = "services"` without `tool.*` to proxy other traffic.
+    /// The standard `web_fetch` request requires direct transport for DNS pinning:
+    /// environment proxy discovery is disabled, and requests fail when the runtime
+    /// proxy applies. The optional Firecrawl API fallback uses normal environment
+    /// proxy discovery because that separate API request has no locally validated
+    /// DNS pin. Use `proxy.scope = "services"` without `tool.*` to proxy other traffic.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -9270,11 +9272,12 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-/// `web_fetch` and `http_request` are always direct so their locally validated
-/// DNS answers can be pinned: they bypass environment proxies and reject a
-/// runtime proxy scope that applies to `tool.web_fetch` or `tool.http_request`.
-/// To proxy other traffic, use `services` scope without those selectors or
-/// `tool.*`.
+/// The standard `web_fetch` request and every `http_request` request are direct
+/// so their locally validated DNS answers can be pinned: they bypass environment
+/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
+/// `tool.http_request`. The optional Firecrawl API fallback uses normal environment
+/// proxy discovery. To proxy other traffic, use `services` scope without those
+/// selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -18824,6 +18827,10 @@ impl Config {
                      can fix them via /config or `zeroclaw config set`"
                 );
             }
+            // Publish the effective post-decryption, post-env-override proxy
+            // configuration before any runtime client or tool is constructed.
+            // Interactive proxy_config updates use the same live state.
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         } else {
@@ -18861,6 +18868,7 @@ impl Config {
                      booting anyway so you can fix them via /config"
                 );
             }
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
@@ -28475,6 +28483,38 @@ wire_api = "ws"
             custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
             "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
         );
+    }
+
+    #[test]
+    async fn load_or_init_seeds_runtime_proxy_from_config_file() {
+        let _env_guard = env_override_lock().await;
+        let config_dir = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", config_dir.path());
+        fs::write(
+            config_dir.path().join("config.toml"),
+            r#"
+schema_version = 3
+
+[proxy]
+enabled = true
+http_proxy = "http://boot-proxy.example:3128"
+scope = "zeroclaw"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+        let runtime = runtime_proxy_config();
+
+        assert_eq!(loaded.proxy.http_proxy, runtime.http_proxy);
+        assert!(runtime.enabled);
+        assert_eq!(
+            runtime.http_proxy.as_deref(),
+            Some("http://boot-proxy.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     #[test]

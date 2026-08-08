@@ -148,8 +148,19 @@ impl HttpRequestTool {
         let private_resolution_allowed = self.allow_private_hosts
             || domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
+        let canonical_url = if host.parse::<IpAddr>().is_ok() {
+            url.to_string()
+        } else {
+            let mut parsed = reqwest::Url::parse(url)
+                .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+            parsed
+                .set_host(Some(&host))
+                .map_err(|_| anyhow::Error::msg("URL contains an invalid host"))?;
+            parsed.to_string()
+        };
+
         Ok(HttpRequestUrlPolicy {
-            url: url.to_string(),
+            url: canonical_url,
             host,
             port,
             private_resolution_allowed,
@@ -533,6 +544,13 @@ impl Tool for HttpRequestTool {
 
         let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
         if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"service": "tool.http_request"})),
+                "http_request: configured runtime proxy rejected to preserve validated DNS pin"
+            );
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1618,6 +1636,34 @@ api_token = "Bearer from-secret"
             called.get(),
             "allowed public host must still pass DNS SSRF validation"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_request_target_canonicalizes_trailing_dot_before_dns_pinning() {
+        let tool = test_tool(vec!["example.com"]);
+
+        let target = tool
+            .validate_request_target_with_resolver(
+                "https://api.example.com./v1?x=1",
+                |host, port| {
+                    assert_eq!(host, "api.example.com");
+                    assert_eq!(port, 443);
+                    async {
+                        Ok(vec![SocketAddr::new(
+                            IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                            443,
+                        )])
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let parsed = reqwest::Url::parse(&target.url).unwrap();
+
+        assert_eq!(target.host, "api.example.com");
+        assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+        assert_eq!(parsed.path(), "/v1");
+        assert_eq!(parsed.query(), Some("x=1"));
     }
 
     #[tokio::test]

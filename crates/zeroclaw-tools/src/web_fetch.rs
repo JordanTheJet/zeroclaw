@@ -158,7 +158,6 @@ impl WebFetchTool {
         let endpoint = format!("{}/scrape", self.firecrawl.api_url.trim_end_matches('/'));
 
         let client = reqwest::Client::builder()
-            .no_proxy()
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| {
@@ -381,6 +380,13 @@ impl Tool for WebFetchTool {
 
         let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
         if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"service": "tool.web_fetch"})),
+                "web_fetch: configured runtime proxy rejected to preserve validated DNS pin"
+            );
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

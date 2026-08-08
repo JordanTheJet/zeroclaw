@@ -1,8 +1,7 @@
 //! Network-safety primitives shared across crates that must reject SSRF and
 //! local/private targets. Lives in `zeroclaw-infra` so both the tool layer
-//! (`zeroclaw-tools` domain guard) and the plugin host (`zeroclaw-plugins`
-//! `wasi:http` egress) read one implementation without a tool-to-plugin
-//! dependency.
+//! (`zeroclaw-tools` domain guard) and its `zeroclaw-channels` consumers read
+//! one implementation.
 //!
 //! Everything here operates on plain data — host strings, IP addresses, and
 //! pattern lists — so no consumer needs a tool-specific or config-specific
