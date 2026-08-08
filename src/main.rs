@@ -5790,7 +5790,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     .await
                 {
                     // Best-effort decoration: the patch itself is saved.
-                    eprintln!("warning: failed to write op comments to config.toml: {err}");
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-config-patch-comment-write-failed",
+                            &[("error", &err.to_string())],
+                            &format!("warning: failed to write op comments to config.toml: {err}"),
+                        )
+                    );
                 }
 
                 if json {
