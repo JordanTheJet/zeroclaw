@@ -7483,12 +7483,18 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
-    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
-    /// Default: false (deny private hosts for SSRF protection).
+    /// Allow requests to private/LAN hosts (RFC 1918, loopback, `.local`).
+    /// Default: false (deny private hosts for SSRF protection). Regardless of
+    /// this setting, all of `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba
+    /// `100.100.100.200`, AWS `fd00:ec2::/64`, GCP `fd20:ce::254`, and their
+    /// recognized IPv4-embedded forms remain blocked.
     #[serde(default)]
     pub allow_private_hosts: bool,
-    /// Private/internal hosts explicitly allowed to bypass SSRF protection.
-    /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
+    /// Private/internal hosts explicitly allowed to relax the public-address check.
+    /// Exact and subdomain matches are supported; `*` permits private/local hosts
+    /// except the unconditional metadata/platform exclusions: `169.254.0.0/16`,
+    /// `168.63.129.16`, `100.100.100.200`, `fd00:ec2::/64`, `fd20:ce::254`, and
+    /// their recognized IPv4-embedded forms.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Named authorization secrets for `auth_secret` requests.
@@ -7719,9 +7725,11 @@ pub struct TextBrowserConfig {
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
     /// Private/internal hosts allowed to relax the public-address SSRF check.
-    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
-    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
-    /// Known metadata and host-platform addresses remain blocked after resolution.
+    /// Exact and subdomain matches are supported; `["*"]` permits private/local
+    /// hosts (RFC 1918, loopback, `.local`). Default: empty (deny). All of
+    /// `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS
+    /// `fd00:ec2::/64`, GCP `fd20:ce::254`, and their recognized IPv4-embedded
+    /// forms remain blocked after resolution regardless of this opt-in.
     /// The external browser re-resolves DNS and follows redirects without
     /// revalidation, so these checks are not a DNS-rebinding or redirect boundary.
     /// Local preflight resolution still applies under this opt-in, which may reject
