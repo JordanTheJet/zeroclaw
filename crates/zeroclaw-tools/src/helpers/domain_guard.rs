@@ -1,8 +1,8 @@
 //! Shared domain/URL validation and allowlist helpers.
 //!
 //! The primitives themselves live in [`zeroclaw_infra::net_guard`] so the tool
-//! layer and the plugin host read one implementation without a tool-to-plugin
-//! dependency. This module is the tool-layer facade: it keeps the
+//! implementations and `zeroclaw-channels` read one implementation. This
+//! module is the tool-layer facade: it keeps the
 //! `crate::helpers::domain_guard::*` paths the tools and `zeroclaw-channels`
 //! already use, and it is where a tool-specific or config-specific wrapper
 //! would go if one were ever needed. Unit coverage for the primitives lives

@@ -10,6 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::ProxyConfig;
+
+const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
+     proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy";
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -352,11 +356,10 @@ impl HttpRequestTool {
             self.timeout_secs
         };
         let builder = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let builder = if target.host.parse::<IpAddr>().is_ok() {
             builder
         } else {
@@ -528,6 +531,15 @@ impl Tool for HttpRequestTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
+        let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
+        if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(HTTP_REQUEST_PROXY_PINNING_ERROR.into()),
+            });
+        }
+
         let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
@@ -632,6 +644,10 @@ impl Tool for HttpRequestTool {
             }),
         }
     }
+}
+
+fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
+    config.has_any_proxy_url() && config.should_apply_to_service("tool.http_request")
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -1387,6 +1403,38 @@ api_token = "Bearer from-secret"
         // The actual Policy::none() enforcement is in execute_request's client builder.
         let tool = test_tool(vec!["example.com"]);
         assert_eq!(tool.name(), "http_request");
+    }
+
+    #[test]
+    fn runtime_proxy_conflicts_with_dns_pinning_only_when_it_applies() {
+        let global_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Zeroclaw,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.http_request"));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.*"));
+
+        let exact_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["tool.http_request".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&exact_service_proxy));
+
+        let other_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["provider.openai".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(!proxy_conflicts_with_dns_pinning(&other_service_proxy));
+        assert!(!proxy_conflicts_with_dns_pinning(&ProxyConfig::default()));
     }
 
     #[test]

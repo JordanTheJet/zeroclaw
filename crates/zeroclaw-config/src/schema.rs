@@ -7466,7 +7466,9 @@ impl Default for BrowserConfig {
 ///
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts, which is the default). If `allowed_domains` is empty, all
-/// requests are rejected.
+/// requests are rejected. Requests use direct transport so locally validated DNS
+/// answers remain pinned: environment proxies are bypassed, and execution is
+/// rejected when the runtime proxy scope applies to `tool.http_request`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http_request"]
@@ -9268,10 +9270,11 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-/// `web_fetch` is always direct so its locally validated DNS answers can be
-/// pinned: it bypasses environment proxies and rejects a runtime proxy scope
-/// that applies to `tool.web_fetch`. To proxy other traffic, use `services`
-/// scope without the `tool.*` selector.
+/// `web_fetch` and `http_request` are always direct so their locally validated
+/// DNS answers can be pinned: they bypass environment proxies and reject a
+/// runtime proxy scope that applies to `tool.web_fetch` or `tool.http_request`.
+/// To proxy other traffic, use `services` scope without those selectors or
+/// `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]

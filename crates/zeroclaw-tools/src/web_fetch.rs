@@ -729,7 +729,9 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
-    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+    // `Url::host_str()` serializes IPv6 literals with brackets, so parsing the
+    // returned string directly would never recognize them.
+    if host.starts_with('[') {
         anyhow::bail!("IPv6 hosts are not supported in web_fetch");
     }
 
@@ -1164,6 +1166,12 @@ mod tests {
 
         assert_eq!(target.host, "xn--exmple-cua.com");
         assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+    }
+
+    #[test]
+    fn extract_host_rejects_bracketed_ipv6_with_policy_error() {
+        let err = extract_host("http://[::1]/").unwrap_err().to_string();
+        assert_eq!(err, "IPv6 hosts are not supported in web_fetch");
     }
 
     #[test]
