@@ -158,6 +158,7 @@ impl WebFetchTool {
         let endpoint = format!("{}/scrape", self.firecrawl.api_url.trim_end_matches('/'));
 
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| {
