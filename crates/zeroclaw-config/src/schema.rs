@@ -121,6 +121,11 @@ pub struct Config {
     /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
+    /// Retired WATI config section roots detected before migration and typed
+    /// deserialization erase them. Never serialized; the CLI surfaces each
+    /// path on stderr so an operator cannot miss the retired channel.
+    #[serde(skip)]
+    pub retired_wati_config_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -17718,6 +17723,7 @@ impl Default for Config {
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -18847,7 +18853,8 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            for path in Self::retired_wati_config_sections(&contents) {
+            let retired_wati_config_sections = Self::retired_wati_config_sections(&contents);
+            for path in &retired_wati_config_sections {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -18899,6 +18906,7 @@ impl Config {
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
+            config.retired_wati_config_sections = retired_wati_config_sections;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -25737,6 +25745,7 @@ auto_save = true
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -26722,6 +26731,7 @@ default_temperature = 0.7
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -29517,6 +29527,11 @@ api_token = "legacy-placeholder-token"
                     .iter()
                     .all(|entry| entry.channel_type != "wati"),
                 "retired WATI config must not re-enable a live channel"
+            );
+            assert_eq!(
+                config.retired_wati_config_sections,
+                vec![expected_path.to_string()],
+                "load-time diagnostics must preserve the retired section path"
             );
             assert!(
                 logs.contains("Retired WATI channel config section"),
