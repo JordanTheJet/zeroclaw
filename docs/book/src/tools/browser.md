@@ -46,8 +46,8 @@ The `[browser]` section gates two separate tools:
 
 | Config key | Default | Registers |
 |---|---|---|
-| `browser.enabled` | `true` | `browser_open` — hand a URL to the system browser. No scraping, no page interaction |
-| `browser.automation_enabled` | `false` | `browser` — the full Chrome/Chromium automation tool documented on this page (navigate, click, type, read page content) |
+| `browser.enabled` | `true` | `browser_open`: hand a URL to the system browser. No scraping, no page interaction |
+| `browser.automation_enabled` | `false` | `browser`: the full Chrome/Chromium automation tool documented on this page (navigate, click, type, read page content) |
 
 Automation drives a browser that may already be logged into your accounts, so it is
 **opt-in**: turn it on explicitly, and only for agents that need it. It is also not on
