@@ -690,6 +690,7 @@ pub fn all_tools_with_runtime(
         // consistent with yolo already being able to edit config via shell.
         Arc::new(config_patch::ConfigPatchTool::new(
             root_config.config_path.clone(),
+            security.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
