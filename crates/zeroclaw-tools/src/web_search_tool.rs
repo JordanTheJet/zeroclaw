@@ -253,7 +253,7 @@ impl WebSearchTool {
             .collect();
 
         if link_matches.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let count = link_matches.len().min(self.max_results);
@@ -281,10 +281,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via DuckDuckGo)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "DuckDuckGo"), blocks))
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
@@ -467,7 +464,7 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let mut blocks: Vec<Vec<String>> = Vec::new();
@@ -489,10 +486,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via Tavily)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "Tavily"), blocks))
     }
 
     /// Resolve the Jina AI API key from the boot-time snapshot, falling back
@@ -618,7 +612,7 @@ impl WebSearchTool {
         })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let mut blocks: Vec<Vec<String>> = Vec::new();
@@ -644,10 +638,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via Jina AI)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "Jina AI"), blocks))
     }
 
     fn resolve_bocha_api_key(&self) -> anyhow::Result<String> {
@@ -769,7 +760,13 @@ impl WebSearchTool {
                 .get("msg")
                 .and_then(|m| m.as_str())
                 .unwrap_or("(no message)");
-            anyhow::bail!("Bocha AI search returned error (code {code}): {msg}");
+            // This returns before the capped success path, so `msg` is the one
+            // piece of provider-controlled text that would otherwise reach the
+            // model unbounded.
+            anyhow::bail!(
+                "Bocha AI search returned error (code {code}): {}",
+                cap_provider_error(msg)
+            );
         }
 
         let results = json
@@ -789,7 +786,7 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let mut blocks: Vec<Vec<String>> = Vec::new();
@@ -837,10 +834,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via Bocha)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "Bocha"), blocks))
     }
 
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
@@ -860,7 +854,7 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let mut blocks: Vec<Vec<String>> = Vec::new();
@@ -883,10 +877,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via Brave)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "Brave"), blocks))
     }
 
     /// Resolve the SearXNG instance URL from the boot-time config or by
@@ -947,15 +938,7 @@ impl WebSearchTool {
                         .with_attrs(::serde_json::json!({"search_provider": "searxng"})),
                     "web_search: SearXNG instance URL not configured"
                 );
-                // No code reads a `SEARXNG_INSTANCE_URL` env var; the only
-                // env surface is the generic `ZEROCLAW_<path>` override
-                // grammar (`.` -> `__`) implemented in
-                // `zeroclaw-config::env_overrides`.
-                anyhow::Error::msg(
-                    "SearXNG instance URL not configured. Set [web_search] searxng_instance_url \
-                     in config.toml, or override it with the \
-                     ZEROCLAW_web_search__searxng_instance_url environment variable.",
-                )
+                anyhow::Error::msg(SEARXNG_NOT_CONFIGURED_MESSAGE.as_str())
             })
     }
 
@@ -1010,7 +993,7 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
         let mut blocks: Vec<Vec<String>> = Vec::new();
@@ -1030,10 +1013,7 @@ impl WebSearchTool {
             blocks.push(block);
         }
 
-        Ok(render_results(
-            format!("Search results for: {} (via SearXNG)", query),
-            blocks,
-        ))
+        Ok(render_results(results_header(query, "SearXNG"), blocks))
     }
 }
 
@@ -1057,9 +1037,25 @@ const MAX_RESULT_CONTENT_CHARS: usize = 500;
 /// trimming happened can never itself be trimmed away.
 const MAX_TOTAL_OUTPUT_CHARS: usize = 16_000;
 
+/// Maximum characters of the caller-supplied query echoed back into rendered
+/// output or a "no results" reply. The query is model-controlled and
+/// unbounded, so echoing it verbatim lets one oversized query consume — or on
+/// the "no results" path, entirely escape — the total output budget.
+const MAX_QUERY_ECHO_CHARS: usize = 200;
+
+/// Maximum characters of a provider-supplied error message quoted back to the
+/// model. Business-error text is as provider-controlled as result content, and
+/// it returns before the rendering caps rather than through them.
+const MAX_PROVIDER_ERROR_CHARS: usize = 500;
+
+/// Fluent key for the note appended when [`MAX_TOTAL_OUTPUT_CHARS`] forced
+/// results to be dropped or the output to be cut.
+const TRUNCATED_RESULTS_NOTE_KEY: &str = "tool-web-search-tool-note-truncated-results";
+
 /// Appended when [`MAX_TOTAL_OUTPUT_CHARS`] forced results to be dropped or
 /// the output to be cut, so the model knows the list it sees is partial.
-const TRUNCATED_RESULTS_NOTE: &str = "(further results omitted)";
+static TRUNCATED_RESULTS_NOTE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(TRUNCATED_RESULTS_NOTE_KEY));
 
 /// Cap one provider-supplied body string, appending a visible `...` marker
 /// when text was dropped.
@@ -1068,6 +1064,35 @@ const TRUNCATED_RESULTS_NOTE: &str = "(further results omitted)";
 /// never split mid-codepoint.
 fn cap_result_content(text: &str) -> String {
     truncate_with_ellipsis(text, MAX_RESULT_CONTENT_CHARS)
+}
+
+/// Cap the caller's query before it is echoed back to the model.
+fn cap_query_echo(query: &str) -> String {
+    truncate_with_ellipsis(query, MAX_QUERY_ECHO_CHARS)
+}
+
+/// Cap a provider-supplied error message before it is quoted back to the
+/// model.
+fn cap_provider_error(message: &str) -> String {
+    truncate_with_ellipsis(message, MAX_PROVIDER_ERROR_CHARS)
+}
+
+/// Header line for a rendered result list. Shared so the echoed query is
+/// bounded — and the wording stays identical — across all six providers.
+fn results_header(query: &str, provider: &str) -> String {
+    format!(
+        "Search results for: {} (via {provider})",
+        cap_query_echo(query)
+    )
+}
+
+/// The reply every provider returns when a search matched nothing.
+///
+/// One shared function rather than six copies: this path returns before
+/// [`render_results`], so it is the only place the echoed query is bounded at
+/// all, and a per-provider copy would be a per-provider chance to forget.
+fn no_results_message(query: &str) -> String {
+    format!("No results found for: {}", cap_query_echo(query))
 }
 
 /// Render a header line plus one line-block per result, bounded by
@@ -1106,7 +1131,7 @@ fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
 
     if trimmed {
         out.push('\n');
-        out.push_str(TRUNCATED_RESULTS_NOTE);
+        out.push_str(TRUNCATED_RESULTS_NOTE.as_str());
     }
 
     out
@@ -1254,11 +1279,24 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
+/// Fluent key for the unconfigured-SearXNG guidance.
+const SEARXNG_NOT_CONFIGURED_KEY: &str = "tool-web-search-tool-error-searxng-not-configured";
+
+/// Names only surfaces that exist: no code reads a `SEARXNG_INSTANCE_URL` env
+/// var, so the env route is the generic `ZEROCLAW_<path>` override grammar
+/// (`.` -> `__`) implemented in `zeroclaw-config::env_overrides`.
+static SEARXNG_NOT_CONFIGURED_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(SEARXNG_NOT_CONFIGURED_KEY));
+
+/// Fluent key for the DuckDuckGo block guidance.
+const DUCKDUCKGO_BLOCK_MESSAGE_KEY: &str = "tool-web-search-tool-error-duckduckgo-blocked";
+
 /// Addressed to the model, not to a human operator: this text is returned as a
 /// tool error and the model is the only reader. Retrying or rephrasing is the
 /// default instinct and the worst possible response — it deepens the block — so
 /// the message names the recoveries explicitly instead of describing the fault.
-const DUCKDUCKGO_BLOCK_MESSAGE: &str = "DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.";
+static DUCKDUCKGO_BLOCK_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(DUCKDUCKGO_BLOCK_MESSAGE_KEY));
 
 fn duckduckgo_block_message(
     status: reqwest::StatusCode,
@@ -1266,7 +1304,7 @@ fn duckduckgo_block_message(
     html_contains_block: bool,
 ) -> Option<&'static str> {
     if status == reqwest::StatusCode::FORBIDDEN || final_url_is_block || html_contains_block {
-        Some(DUCKDUCKGO_BLOCK_MESSAGE)
+        Some(DUCKDUCKGO_BLOCK_MESSAGE.as_str())
     } else {
         None
     }
@@ -1472,7 +1510,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::FORBIDDEN, false, false)
             .expect("403 responses should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo is rate-limiting"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1481,7 +1519,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::OK, true, false)
             .expect("verification redirects should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo is rate-limiting"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1490,7 +1528,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, true)
             .expect("verification form HTML should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo is rate-limiting"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1612,7 +1650,7 @@ mod tests {
             .await
             .expect_err("403 should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo is rate-limiting"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1673,7 +1711,7 @@ mod tests {
             .await
             .expect_err("verification redirects should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo is rate-limiting"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1698,7 +1736,7 @@ mod tests {
             .await
             .expect_err("verification HTML should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo is rate-limiting"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1727,7 +1765,7 @@ mod tests {
             .await
             .expect_err("anomaly-modal page should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo is rate-limiting"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1879,7 +1917,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("SearXNG instance URL not configured")
+                .contains(SEARXNG_NOT_CONFIGURED_MESSAGE.as_str())
         );
     }
 
@@ -2882,7 +2920,7 @@ mod tests {
         );
 
         assert_eq!(rendered, "header\n1. a\n2. b");
-        assert!(!rendered.contains(TRUNCATED_RESULTS_NOTE));
+        assert!(!rendered.contains(TRUNCATED_RESULTS_NOTE.as_str()));
     }
 
     #[test]
@@ -2896,11 +2934,12 @@ mod tests {
         let rendered = render_results("header".to_string(), blocks);
 
         assert!(
-            rendered.ends_with(TRUNCATED_RESULTS_NOTE),
+            rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()),
             "omission note must be the last thing the model reads"
         );
         assert!(
-            rendered.chars().count() <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.len() + 1,
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 1,
             "total output must stay within the budget plus the note"
         );
         assert!(rendered.contains("\n1. "), "first result must survive");
@@ -2935,10 +2974,11 @@ mod tests {
             )]],
         );
 
-        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE));
+        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()));
         assert!(rendered.starts_with("header\n1. x"));
         assert!(
-            rendered.chars().count() <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.len() + 4,
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 4,
             "hard cap must bound even a single oversized result: {}",
             rendered.chars().count()
         );
@@ -2964,9 +3004,10 @@ mod tests {
             .parse_brave_results(&serde_json::json!({"web": {"results": results}}), "q")
             .unwrap();
 
-        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE));
+        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()));
         assert!(
-            rendered.chars().count() <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.len() + 4
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 4
         );
         assert!(rendered.contains("via Brave"), "header must survive");
 
@@ -2987,14 +3028,222 @@ mod tests {
         );
     }
 
+    // ── Echoed-input bounds ──────────────────────────────────────────────
+
+    /// Build every provider's empty-result reply for one query.
+    fn empty_result_replies(query: &str) -> Vec<(&'static str, String)> {
+        let tool = |provider: &str| WebSearchTool::new(provider.to_string(), None, None, 5, 15);
+
+        vec![
+            (
+                "duckduckgo",
+                tool("duckduckgo")
+                    .parse_duckduckgo_results("<html><body>nothing</body></html>", query)
+                    .unwrap(),
+            ),
+            (
+                "brave",
+                tool("brave")
+                    .parse_brave_results(&serde_json::json!({"web": {"results": []}}), query)
+                    .unwrap(),
+            ),
+            (
+                "tavily",
+                tool("tavily")
+                    .parse_tavily_results(&serde_json::json!({"results": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "searxng",
+                tool("searxng")
+                    .parse_searxng_results(&serde_json::json!({"results": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "jina",
+                tool("jina")
+                    .parse_jina_results(&serde_json::json!({"data": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "bocha",
+                tool("bocha")
+                    .parse_bocha_results(
+                        &serde_json::json!({"code": 200, "data": {"webPages": {"value": []}}}),
+                        query,
+                    )
+                    .unwrap(),
+            ),
+        ]
+    }
+
+    /// The empty-result reply echoes the caller's query, which is
+    /// model-controlled and unbounded. It returns before `render_results`, so
+    /// nothing else bounds it: without its own cap a huge query walks straight
+    /// past the advertised total cap on every provider.
+    #[test]
+    fn empty_result_replies_bound_the_echoed_query() {
+        // Multibyte on purpose: the cut must count characters, not bytes.
+        let query = "漢".repeat(MAX_QUERY_ECHO_CHARS + 5_000);
+        let prefix_chars = "No results found for: ".chars().count();
+
+        for (provider, rendered) in empty_result_replies(&query) {
+            assert!(
+                !rendered.contains(&query),
+                "{provider} echoed the whole query"
+            );
+            assert!(
+                rendered.chars().count() <= prefix_chars + MAX_QUERY_ECHO_CHARS + 3,
+                "{provider} exceeded the query-echo budget: {} chars",
+                rendered.chars().count()
+            );
+            assert_eq!(
+                rendered.chars().filter(|c| *c == '漢').count(),
+                MAX_QUERY_ECHO_CHARS,
+                "{provider} must keep whole characters up to the cap"
+            );
+            assert!(
+                !rendered.contains('\u{FFFD}'),
+                "{provider} split a codepoint"
+            );
+        }
+    }
+
+    /// A short query must still round-trip verbatim: the bound may only touch
+    /// output that actually exceeds it.
+    #[test]
+    fn empty_result_replies_leave_short_queries_verbatim() {
+        for (provider, rendered) in empty_result_replies("rust ownership") {
+            assert_eq!(
+                rendered, "No results found for: rust ownership",
+                "{provider} changed the reply for an under-cap query"
+            );
+        }
+    }
+
+    /// The success path echoes the query in its header too. `render_results`
+    /// keeps the total cap by hard-cutting the whole output, so an oversized
+    /// query technically stays inside the budget — but it does so by evicting
+    /// every result. Bounding the echo keeps the results.
+    #[test]
+    fn rendered_header_bounds_the_echoed_query() {
+        let query = "漢".repeat(MAX_QUERY_ECHO_CHARS + 5_000);
+        let tool = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
+
+        let rendered = tool
+            .parse_brave_results(
+                &serde_json::json!({"web": {"results": [
+                    {"title": "T", "url": "https://example.com", "description": "short"}
+                ]}}),
+                &query,
+            )
+            .unwrap();
+
+        assert!(!rendered.contains(&query), "header echoed the whole query");
+        assert_eq!(
+            rendered.chars().filter(|c| *c == '漢').count(),
+            MAX_QUERY_ECHO_CHARS
+        );
+        assert!(
+            rendered.contains("1. T"),
+            "the query echo must not crowd out the results: {rendered}"
+        );
+        assert!(!rendered.contains(TRUNCATED_RESULTS_NOTE.as_str()));
+    }
+
+    /// Bocha reports business failures as a 200 with a non-200 `code` and a
+    /// provider-controlled `msg`. That message returns before the capped
+    /// success path, so it needs its own bound.
+    #[test]
+    fn bocha_business_error_bounds_the_provider_message() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        // Multibyte on purpose, same reason as the query echo.
+        let msg = "é".repeat(MAX_PROVIDER_ERROR_CHARS + 20_000);
+        let prefix_chars = "Bocha AI search returned error (code 403): "
+            .chars()
+            .count();
+
+        let err = tool
+            .parse_bocha_results(&serde_json::json!({"code": 403, "msg": msg}), "q")
+            .expect_err("a non-200 code must be reported as an error")
+            .to_string();
+
+        assert!(
+            err.contains("code 403"),
+            "error semantics must be preserved: {err}"
+        );
+        assert!(!err.contains(&msg), "the whole provider message leaked");
+        assert!(
+            err.chars().count() <= prefix_chars + MAX_PROVIDER_ERROR_CHARS + 3,
+            "provider error exceeded its budget: {} chars",
+            err.chars().count()
+        );
+        assert_eq!(
+            err.chars().filter(|c| *c == 'é').count(),
+            MAX_PROVIDER_ERROR_CHARS,
+            "must keep whole characters up to the cap"
+        );
+        assert!(!err.contains('\u{FFFD}'), "split a codepoint");
+    }
+
+    /// A short provider message must survive verbatim.
+    #[test]
+    fn bocha_business_error_leaves_short_messages_verbatim() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+
+        let err = tool
+            .parse_bocha_results(
+                &serde_json::json!({"code": 401, "msg": "invalid api key"}),
+                "q",
+            )
+            .expect_err("a non-200 code must be reported as an error")
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Bocha AI search returned error (code 401): invalid api key"
+        );
+    }
+
     // ── Message texts ────────────────────────────────────────────────────
+
+    /// Runtime tool text is contractually Fluent-backed, not inline literals.
+    /// Pin each message to its key: a key that is missing from the catalog
+    /// resolves to the `{key}` placeholder, so an unregistered key fails here
+    /// instead of shipping a brace-wrapped identifier to the model.
+    #[test]
+    fn user_facing_strings_resolve_through_the_tool_catalog() {
+        for (key, resolved) in [
+            (
+                DUCKDUCKGO_BLOCK_MESSAGE_KEY,
+                DUCKDUCKGO_BLOCK_MESSAGE.as_str(),
+            ),
+            (
+                SEARXNG_NOT_CONFIGURED_KEY,
+                SEARXNG_NOT_CONFIGURED_MESSAGE.as_str(),
+            ),
+            (TRUNCATED_RESULTS_NOTE_KEY, TRUNCATED_RESULTS_NOTE.as_str()),
+        ] {
+            let catalog = crate::i18n::get_required_tool_string(key);
+            assert_ne!(
+                catalog,
+                format!("{{{key}}}"),
+                "{key} is missing from the tool Fluent catalog"
+            );
+            assert!(!catalog.is_empty(), "{key} resolved to an empty string");
+            assert_eq!(
+                resolved, catalog,
+                "{key} must be read from the catalog, not inlined"
+            );
+        }
+    }
 
     /// The block message is read by the model, not a human. It must forbid the
     /// retry-and-rephrase reflex (which deepens the block) and name concrete
     /// recoveries.
     #[test]
     fn duckduckgo_block_message_instructs_the_model() {
-        let message = DUCKDUCKGO_BLOCK_MESSAGE;
+        let message = DUCKDUCKGO_BLOCK_MESSAGE.as_str();
 
         assert!(message.contains("rate-limiting"));
         assert!(
