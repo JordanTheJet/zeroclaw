@@ -7559,6 +7559,7 @@ pub struct WebFetchConfig {
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
     /// `web_fetch` requires direct transport for DNS pinning: environment proxy
     /// discovery is disabled, and requests fail when the runtime proxy applies.
+    /// Use `proxy.scope = "services"` without `tool.*` to proxy other traffic.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -9259,6 +9260,10 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
+/// `web_fetch` is always direct so its locally validated DNS answers can be
+/// pinned: it bypasses environment proxies and rejects a runtime proxy scope
+/// that applies to `tool.web_fetch`. To proxy other traffic, use `services`
+/// scope without the `tool.*` selector.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]

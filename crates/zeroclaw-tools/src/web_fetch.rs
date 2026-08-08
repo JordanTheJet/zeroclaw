@@ -15,6 +15,9 @@ use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig};
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
+const WEB_FETCH_PROXY_PINNING_ERROR: &str = "web_fetch requires direct transport so validated DNS answers remain pinned; set \
+     proxy.scope = \"services\" and omit tool.* from proxy.services, or disable the proxy";
+
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -380,11 +383,7 @@ impl Tool for WebFetchTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    "web_fetch requires direct transport so validated DNS answers remain pinned; \
-                     exclude tool.web_fetch from proxy.services or disable the runtime proxy"
-                        .into(),
-                ),
+                error: Some(WEB_FETCH_PROXY_PINNING_ERROR.into()),
             });
         }
 
@@ -555,8 +554,9 @@ fn validate_redirect_target(
     blocked_domains: &[String],
     allowed_private_hosts: &[String],
 ) -> anyhow::Result<()> {
-    let redirect_host = extract_host(raw_url)?;
-    if redirect_host != pinned_host {
+    let redirect_url = reqwest::Url::parse(raw_url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+    if redirect_url.host_str() != Some(pinned_host) {
         anyhow::bail!("Cross-host redirects are blocked so DNS validation remains pinned");
     }
 
@@ -578,6 +578,7 @@ fn resolve_target_url(
     allowed_private_hosts: &[String],
     tool_name: &str,
 ) -> anyhow::Result<ResolvedWebFetchTarget> {
+    let mut resolved_host = None;
     let mut resolved_addrs = None;
     let url = validate_target_url_with_dns_check(
         raw_url,
@@ -586,11 +587,12 @@ fn resolve_target_url(
         allowed_private_hosts,
         tool_name,
         |host, allow_private| {
+            resolved_host = Some(host.to_string());
             resolved_addrs = Some(resolve_validated_host(host, allow_private)?);
             Ok(())
         },
     )?;
-    let host = extract_host(&url)?;
+    let host = resolved_host.ok_or_else(|| anyhow::Error::msg("URL must include a valid host"))?;
     let mut canonical_url = reqwest::Url::parse(&url)
         .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
     canonical_url
@@ -697,50 +699,40 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"url": url})),
-                "web_fetch: non-http(s) URL rejected"
-            );
-            anyhow::Error::msg("Only http:// and https:// URLs are allowed")
-        })?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url, "error": format!("{e}")})),
+            "web_fetch: invalid URL"
+        );
+        anyhow::Error::msg(format!("Invalid URL format: {e}"))
+    })?;
 
-    let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
+    if !matches!(parsed.scheme(), "http" | "https") {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({"url": url})),
-            "web_fetch: invalid URL"
+            "web_fetch: non-http(s) URL rejected"
         );
-        anyhow::Error::msg("Invalid URL")
-    })?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
     }
 
-    if authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("URL userinfo is not allowed");
     }
 
-    if authority.starts_with('[') {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
         anyhow::bail!("IPv6 hosts are not supported in web_fetch");
     }
 
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
 
     if host.is_empty() {
         anyhow::bail!("URL must include a valid host");
@@ -832,10 +824,14 @@ fn validate_resolved_ips_for_ssrf(
         domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
     } else {
         domain_guard::validate_resolved_ips_are_public(host, ips).map_err(|err| {
-            anyhow::Error::msg(format!(
-                "{err}. To allow hosts that resolve to private/internal IPs, add '{host}' \
-                 (or \"*\") to web_fetch.allowed_private_hosts in config.toml"
-            ))
+            if ips.is_empty() || ips.iter().any(|ip| domain_guard::is_cloud_metadata_ip(*ip)) {
+                err
+            } else {
+                anyhow::Error::msg(format!(
+                    "{err}. To allow hosts that resolve to private/internal IPs, add '{host}' \
+                     (or \"*\") to web_fetch.allowed_private_hosts in config.toml"
+                ))
+            }
         })
     }
 }
@@ -1116,6 +1112,25 @@ mod tests {
     }
 
     #[test]
+    fn redirect_target_rejects_trailing_dot_variant_of_pinned_host() {
+        let allowed = vec!["*".to_string()];
+        let err = validate_redirect_target(
+            "https://initial.example./page",
+            "initial.example",
+            &allowed,
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("Cross-host redirects"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn resolved_target_canonicalizes_trailing_dot_before_dns_pinning() {
         let target = resolve_target_url(
             "http://dns-rebinding.invalid.:8080/path?x=1",
@@ -1135,13 +1150,32 @@ mod tests {
     }
 
     #[test]
+    fn resolved_target_uses_canonical_idn_host_for_validation_and_pinning() {
+        let target = resolve_target_url(
+            "https://exämple.com/path",
+            &["*".to_string()],
+            &[],
+            &[],
+            "web_fetch",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&target.url).unwrap();
+
+        assert_eq!(target.host, "xn--exmple-cua.com");
+        assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+    }
+
+    #[test]
     fn runtime_proxy_conflicts_with_dns_pinning_only_when_it_applies() {
         let global_proxy = ProxyConfig {
             enabled: true,
             http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Zeroclaw,
             ..ProxyConfig::default()
         };
         assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
+        assert!(WEB_FETCH_PROXY_PINNING_ERROR.contains("proxy.scope = \"services\""));
+        assert!(WEB_FETCH_PROXY_PINNING_ERROR.contains("omit tool.*"));
 
         let other_service_proxy = ProxyConfig {
             enabled: true,
@@ -1383,6 +1417,23 @@ mod tests {
         assert!(
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_denial_does_not_suggest_ineffective_private_opt_in() {
+        let ips = vec!["169.254.169.254".parse().unwrap()];
+        let err = validate_resolved_ips_for_ssrf("metadata.example", false, &ips)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("allowed_private_hosts"),
+            "unexpected hint: {err}"
         );
     }
 
