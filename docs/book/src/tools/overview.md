@@ -134,7 +134,11 @@ Nested execution surfaces cannot grant operator approval. Bounded and
 independent agentic delegates therefore do not receive operator-only tools, and
 `execute_pipeline` refuses to admit them as child steps even when
 `pipeline.allowed_tools` names them explicitly. The same rule applies to skill
-aliases and other wrappers around an operator-only target.
+aliases and other wrappers around an operator-only target. Spawned subagents,
+cron jobs, heartbeat turns, and other non-interactive one-shot agent runs omit
+operator-only tools whenever the resolved profile would still require a prompt.
+Explicit per-tool auto-approval and a `full` profile remain standing operator
+grants; `readonly` still refuses writes at the tool's execution boundary.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
