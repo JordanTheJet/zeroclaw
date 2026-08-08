@@ -195,10 +195,14 @@ impl ProxyConfigTool {
             output: serde_json::to_string_pretty(&json!({
                 "supported_service_keys": ProxyConfig::supported_service_keys(),
                 "supported_selectors": ProxyConfig::supported_service_selectors(),
+                "dns_pinned_tool_constraints": {
+                    "tool.http_request": "Cannot be proxied: selecting this key makes http_request fail closed so its validated DNS answer remains pinned.",
+                    "tool.web_fetch": "Cannot be proxied and has no exact service key; selecting tool.* makes the standard web_fetch request fail closed."
+                },
                 "usage_example": {
                     "action": "set",
                     "scope": "services",
-                    "services": ["model_provider.openai", "tool.http_request", "channel.telegram"]
+                    "services": ["model_provider.openai", "tool.browser", "channel.telegram"]
                 }
             }))?
             .into(),
@@ -537,6 +541,21 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("model_provider.openai"));
         assert!(result.output.contains("tool.http_request"));
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["dns_pinned_tool_constraints"]["tool.http_request"],
+            "Cannot be proxied: selecting this key makes http_request fail closed so its validated DNS answer remains pinned."
+        );
+        assert!(
+            output["dns_pinned_tool_constraints"]["tool.web_fetch"]
+                .as_str()
+                .unwrap()
+                .contains("tool.*")
+        );
+        assert_eq!(
+            output["usage_example"]["services"],
+            json!(["model_provider.openai", "tool.browser", "channel.telegram"])
+        );
     }
 
     #[tokio::test]

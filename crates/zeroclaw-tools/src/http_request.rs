@@ -124,11 +124,16 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
-        if host
-            .parse::<IpAddr>()
-            .is_ok_and(domain_guard::is_cloud_metadata_ip)
-        {
-            anyhow::bail!("Blocked cloud metadata host: {host}");
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if domain_guard::is_known_cloud_metadata_endpoint(ip) {
+                anyhow::bail!("Blocked cloud metadata host: {host}");
+            }
+            if domain_guard::is_cloud_metadata_ip(ip) {
+                anyhow::bail!(
+                    "Blocked link-local host: {host}; 169.254.0.0/16 is blocked unconditionally \
+                     because cloud metadata services are hosted in that range"
+                );
+            }
         }
         let port = extract_port(url)?;
 
@@ -1842,6 +1847,19 @@ api_token = "Bearer from-secret"
             .to_string();
 
         assert!(err.contains("metadata"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn apipa_literal_is_blocked_with_link_local_diagnostic() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        let err = tool
+            .validate_url("http://169.254.12.7/status")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("link-local host"), "unexpected error: {err}");
+        assert!(err.contains("blocked unconditionally"));
+        assert!(!err.contains("cloud metadata host"));
     }
 
     // ── IPv6 end-to-end coverage ──────────────────────────────

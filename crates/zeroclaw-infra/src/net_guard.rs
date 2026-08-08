@@ -324,6 +324,47 @@ pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// True when `ip` is a provider-documented metadata endpoint, rather than
+/// another address in the metadata-sensitive IPv4 link-local range.
+///
+/// [`is_cloud_metadata_ip`] intentionally blocks all of `169.254.0.0/16`.
+/// This narrower classifier exists only so diagnostics can distinguish known
+/// metadata endpoints from ordinary APIPA/link-local addresses without
+/// weakening that unconditional block. Recognized IPv4-embedded forms receive
+/// the same classification as their effective IPv4 destination.
+#[must_use]
+pub fn is_known_cloud_metadata_endpoint(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            matches!(
+                v4.octets(),
+                [169, 254, 169, 254] | [169, 254, 170, 2] | [169, 254, 170, 23]
+            ) || v4 == ALIBABA_METADATA_V4
+                || v4 == AZURE_PLATFORM_V4
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            (segments[..4] == [0xfd00, 0x0ec2, 0, 0])
+                || v6 == GCP_METADATA_V6
+                || metadata_embedded_ipv4(v6)
+                    .is_some_and(|v4| is_known_cloud_metadata_endpoint(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
+    if is_known_cloud_metadata_endpoint(ip) {
+        anyhow::Error::msg(format!(
+            "Blocked host '{host}' resolved to cloud metadata address {ip}"
+        ))
+    } else {
+        anyhow::Error::msg(format!(
+            "Blocked host '{host}' resolved to link-local address {ip}; this range is blocked \
+             unconditionally because cloud metadata services are hosted in 169.254.0.0/16"
+        ))
+    }
+}
+
 // ── resolved-address validation ───────────────────────────────────
 // These helpers only classify the supplied answer. To prevent DNS rebinding,
 // callers must connect to the exact addresses they validated rather than
@@ -353,7 +394,7 @@ pub fn validate_resolved_ips_are_public(
 
     for ip in ips {
         if is_cloud_metadata_ip(*ip) {
-            anyhow::bail!("Blocked host '{host}' resolved to cloud metadata address {ip}");
+            return Err(metadata_block_error(host, *ip));
         }
 
         let non_global = match ip {
@@ -394,7 +435,7 @@ pub fn validate_resolved_ips_exclude_metadata(
 
     for ip in ips {
         if is_cloud_metadata_ip(*ip) {
-            anyhow::bail!("Blocked host '{host}' resolved to cloud metadata address {ip}");
+            return Err(metadata_block_error(host, *ip));
         }
     }
 
@@ -582,6 +623,46 @@ mod tests {
             assert!(
                 !is_cloud_metadata_ip(address),
                 "neighboring non-metadata address {address} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn known_metadata_endpoint_detection_excludes_plain_apipa() {
+        for address in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "100.100.100.200",
+            "168.63.129.16",
+            "::ffff:169.254.169.254",
+            "64:ff9b::169.254.170.2",
+            "::169.254.170.23",
+            "2002:a9fe:a9fe::",
+            "fd00:ec2::23",
+            "fd20:ce::254",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(
+                is_known_cloud_metadata_endpoint(address),
+                "known endpoint {address} must use metadata diagnostics"
+            );
+        }
+
+        for address in [
+            "169.254.0.1",
+            "169.254.12.7",
+            "169.254.255.254",
+            "::ffff:169.254.12.7",
+            "64:ff9b::169.254.12.7",
+            "::169.254.12.7",
+            "2002:a9fe:0c07::",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(is_cloud_metadata_ip(address));
+            assert!(
+                !is_known_cloud_metadata_endpoint(address),
+                "plain link-local address {address} must use APIPA diagnostics"
             );
         }
     }
@@ -841,6 +922,23 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_resolved_ips_labels_plain_apipa_as_link_local() {
+        for validate in [
+            validate_resolved_ips_are_public as fn(&str, &[std::net::IpAddr]) -> anyhow::Result<()>,
+            validate_resolved_ips_exclude_metadata,
+        ] {
+            let ips = ["169.254.12.7".parse().unwrap()];
+            let err = validate("printer.local", &ips).unwrap_err().to_string();
+            assert!(
+                err.contains("link-local address"),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains("blocked unconditionally"));
+            assert!(!err.contains("cloud metadata address"));
+        }
     }
 
     #[test]

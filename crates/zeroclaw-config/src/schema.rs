@@ -19003,6 +19003,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_dns_pinned_proxy_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
         // warning when the more specific cross-provider diagnostic already
@@ -19028,6 +19029,47 @@ impl Config {
             }
         }
         warnings
+    }
+
+    fn collect_dns_pinned_proxy_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.proxy.enabled || !self.proxy.has_any_proxy_url() {
+            return;
+        }
+
+        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
+            ProxyScope::Services => (
+                self.proxy.should_apply_to_service("tool.http_request"),
+                self.proxy.should_apply_to_service("tool.web_fetch"),
+            ),
+        };
+        if !http_request_blocked && !web_fetch_blocked {
+            return;
+        }
+
+        let affected = match (http_request_blocked, web_fetch_blocked) {
+            (true, true) => "http_request and web_fetch",
+            (true, false) => "http_request",
+            (false, true) => "web_fetch",
+            (false, false) => unreachable!(),
+        };
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "proxy_conflicts_with_dns_pinned_tools",
+            format!(
+                "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
+                 those calls will fail instead of using an unpinned proxy connection. Use \
+                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
+                 proxy.services; tool.* also selects web_fetch."
+            ),
+            if self.proxy.scope == ProxyScope::Services {
+                "proxy.services"
+            } else {
+                "proxy.scope"
+            },
+        ));
     }
 
     /// Surface sqlite semantic/hybrid search with no effective embedder. The
@@ -29444,6 +29486,69 @@ api_token = "tok"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
+    }
+
+    #[test]
+    async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
+        let proxy_url = Some("http://proxy.example:3128".to_string());
+
+        for scope in [ProxyScope::Environment, ProxyScope::Zeroclaw] {
+            let config = Config {
+                proxy: ProxyConfig {
+                    enabled: true,
+                    http_proxy: proxy_url.clone(),
+                    scope,
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            };
+            let warning = config
+                .collect_warnings()
+                .into_iter()
+                .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+                .expect("broad proxy scopes must warn about DNS-pinned tools");
+            assert_eq!(warning.path, "proxy.scope");
+            assert!(warning.message.contains("http_request and web_fetch"));
+            assert!(warning.message.contains("proxy.scope = \"services\""));
+        }
+
+        let services_config = |services: Vec<&str>| Config {
+            proxy: ProxyConfig {
+                enabled: true,
+                http_proxy: proxy_url.clone(),
+                scope: ProxyScope::Services,
+                services: services.into_iter().map(ToOwned::to_owned).collect(),
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let http_warning = services_config(vec!["tool.http_request"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the explicit http_request selector must warn");
+        assert_eq!(http_warning.path, "proxy.services");
+        assert!(http_warning.message.contains("tool calls (http_request)"));
+        assert!(!http_warning.message.contains("tool calls (web_fetch)"));
+
+        let wildcard_warning = services_config(vec!["tool.*"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the tool wildcard must warn");
+        assert!(
+            wildcard_warning
+                .message
+                .contains("http_request and web_fetch")
+        );
+
+        assert!(
+            services_config(vec!["model_provider.openai"])
+                .collect_warnings()
+                .iter()
+                .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
     }
 
     #[test]
