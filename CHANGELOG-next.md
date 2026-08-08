@@ -16,7 +16,7 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ### Web and Search
 
-- **`web_research` replaces raw `web_search_tool` in the default registry** (#9824): the raw tool now lives inside the delegate's scope (search + `web_fetch` only, bounded turns and wall clock, mandatory Sources section) and is auto-approved in its place. **Migration:** agents that need the raw tool back add `web_search_tool` to `allowed_tools`; `[web_search]` provider/key config is unchanged.
+- **`web_research` replaces raw `web_search_tool` in the default registry** (#9824): the raw tool now lives inside the delegate's scope (search + `web_fetch` only, bounded turns and wall clock, mandatory Sources section) and is auto-approved in its place. The delegate's nested tools are scoped by the active profile's denylist and bounded by the same wall clock, its model calls bill against the shared spend budget, and its `Sources:` list is rebuilt from pages actually retrieved. **Migration:** agents that need the raw tool back add `web_search_tool` to `allowed_tools`; `[web_search]` provider/key config is unchanged.
 
 ### Memory and Retrieval
 

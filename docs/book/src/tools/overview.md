@@ -70,8 +70,31 @@ and holds the keys; it configures the *backend*, not the surface. Setting
 
 The sub-agent's scope is deliberately narrow — search and `web_fetch` only, no
 shell and no write tools — and every run is capped on two axes: at most 8 tool
-calls and a hard wall-clock ceiling. Hitting either returns a best-effort
-partial briefing with whatever sources were gathered, rather than an error.
+calls and a hard wall-clock ceiling that bounds nested tool calls as well as
+model calls. Hitting either returns a best-effort partial briefing, marked
+`[partial: outcome=...]`, with whatever sources were gathered, rather than an
+error.
+
+Three further properties are worth knowing:
+
+- **The denylist reaches inside.** `excluded_tools` applies to the sub-agent's
+  scope exactly as it applies to a registered tool, so excluding `web_fetch` or
+  `web_search_tool` degrades a research run to fetch-only, search-only, or a
+  refusal. Approving a `web_research` call covers the read-only searches and
+  fetches inside it; they do not prompt separately.
+- **Delegation is metered.** The sub-agent's model calls are checked against
+  the shared spend budget before each request and recorded against it after,
+  so a research run cannot spend past a limit that would have stopped the main
+  agent loop.
+- **`Sources:` means retrieved.** The list is rebuilt from pages the run
+  actually fetched successfully. A URL the model cites that was not retrieved
+  is listed separately under `Model-cited (unverified):` rather than being
+  silently kept or dropped.
+
+Both scoped tools are read-only, so `web_research` is available at the
+`readonly` autonomy level — which is what keeps [web search permitted in
+`readonly`](../security/autonomy.md) now that the raw tool is scoped behind the
+delegate.
 
 ### Getting the raw tool back
 
