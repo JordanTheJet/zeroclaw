@@ -9,14 +9,15 @@ use std::sync::{
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig};
+use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig, ProxyScope};
 
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
 const WEB_FETCH_PROXY_PINNING_ERROR: &str = "web_fetch requires direct transport so validated DNS answers remain pinned; set \
-     proxy.scope = \"services\" and omit tool.* from proxy.services, or disable the proxy";
+     proxy.scope = \"services\" and omit tool.* from proxy.services, or disable the proxy; \
+     proxy.scope = \"environment\" is incompatible with the pinned standard fetch";
 
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
@@ -69,14 +70,23 @@ impl WebFetchTool {
         )
     }
 
-    fn resolve_target(&self, raw_url: &str) -> anyhow::Result<ResolvedWebFetchTarget> {
-        resolve_target_url(
-            raw_url,
-            &self.allowed_domains,
-            &self.blocked_domains,
-            &self.allowed_private_hosts,
-            "web_fetch",
-        )
+    async fn resolve_target(&self, raw_url: &str) -> anyhow::Result<ResolvedWebFetchTarget> {
+        let raw_url = raw_url.to_string();
+        let allowed_domains = self.allowed_domains.clone();
+        let blocked_domains = self.blocked_domains.clone();
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
+
+        tokio::task::spawn_blocking(move || {
+            resolve_target_url(
+                &raw_url,
+                &allowed_domains,
+                &blocked_domains,
+                &allowed_private_hosts,
+                "web_fetch",
+            )
+        })
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("web_fetch DNS validation task failed: {e}")))?
     }
 
     fn truncate_response(&self, text: &str) -> String {
@@ -394,7 +404,18 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let target = match self.resolve_target(url) {
+        let ignored_environment_proxy = zeroclaw_config::schema::environment_proxy_for_url(url);
+        if let Some(variable) = ignored_environment_proxy {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"proxy_variable": variable})),
+                "web_fetch: standard fetch ignores environment proxy to preserve validated DNS pin"
+            );
+        }
+
+        let target = match self.resolve_target(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -466,7 +487,17 @@ impl Tool for WebFetchTool {
             }
         };
 
-        let standard_result = self.standard_fetch(&client, &url).await;
+        let mut standard_result = self.standard_fetch(&client, &url).await;
+        if let Some(variable) = ignored_environment_proxy
+            && !standard_result.success
+        {
+            let note =
+                format!("{variable} was intentionally ignored by the DNS-pinned standard fetch");
+            standard_result.error = Some(match standard_result.error.take() {
+                Some(error) => format!("{error}; {note}"),
+                None => note,
+            });
+        }
 
         // If standard fetch succeeded well enough, return it directly.
         // Otherwise, try Firecrawl fallback if enabled.
@@ -551,7 +582,8 @@ fn pin_resolved_host(
 }
 
 fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
-    config.has_any_proxy_url() && config.should_apply_to_service("tool.web_fetch")
+    (config.enabled && config.scope == ProxyScope::Environment)
+        || (config.has_any_proxy_url() && config.should_apply_to_service("tool.web_fetch"))
 }
 
 fn validate_redirect_target(
@@ -1191,6 +1223,15 @@ mod tests {
         assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
         assert!(WEB_FETCH_PROXY_PINNING_ERROR.contains("proxy.scope = \"services\""));
         assert!(WEB_FETCH_PROXY_PINNING_ERROR.contains("omit tool.*"));
+
+        let environment_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&environment_proxy));
+        assert!(WEB_FETCH_PROXY_PINNING_ERROR.contains("environment"));
 
         let other_service_proxy = ProxyConfig {
             enabled: true,

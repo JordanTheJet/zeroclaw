@@ -7467,8 +7467,10 @@ impl Default for BrowserConfig {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts, which is the default). If `allowed_domains` is empty, all
 /// requests are rejected. Requests use direct transport so locally validated DNS
-/// answers remain pinned: environment proxies are bypassed, and execution is
-/// rejected when the runtime proxy scope applies to `tool.http_request`.
+/// answers remain pinned: an enabled `environment` proxy scope or runtime proxy
+/// that applies to `tool.http_request` is rejected. A process environment proxy
+/// outside that managed scope is warned and ignored; connection failures name
+/// the ignored variable.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http_request"]
@@ -7566,10 +7568,12 @@ pub struct WebFetchConfig {
     /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
     /// The standard `web_fetch` request requires direct transport for DNS pinning:
-    /// environment proxy discovery is disabled, and requests fail when the runtime
-    /// proxy applies. The optional Firecrawl API fallback uses normal environment
-    /// proxy discovery because that separate API request has no locally validated
-    /// DNS pin. Use `proxy.scope = "services"` without `tool.*` to proxy other traffic.
+    /// environment proxy discovery is disabled, and an enabled `environment` scope
+    /// or runtime proxy applying to the tool is rejected. A process environment proxy
+    /// outside that managed scope is warned and ignored for the standard request.
+    /// The optional Firecrawl API fallback uses normal environment proxy discovery
+    /// because that separate API request has no locally validated DNS pin. Use
+    /// `proxy.scope = "services"` without `tool.*` to proxy other traffic.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -9275,9 +9279,10 @@ pub enum ProxyScope {
 /// The standard `web_fetch` request and every `http_request` request are direct
 /// so their locally validated DNS answers can be pinned: they bypass environment
 /// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
-/// `tool.http_request`. The optional Firecrawl API fallback uses normal environment
-/// proxy discovery. To proxy other traffic, use `services` scope without those
-/// selectors or `tool.*`.
+/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
+/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
+/// normal environment proxy discovery. To proxy other traffic, use `services` scope
+/// without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -9729,6 +9734,112 @@ fn clear_proxy_env_pair(key: &str) {
     unsafe {
         std::env::remove_var(key);
         std::env::remove_var(key.to_ascii_lowercase());
+    }
+}
+
+/// Return the process proxy variable that reqwest would use for `raw_url`,
+/// excluding destinations covered by `NO_PROXY`/`no_proxy`.
+///
+/// DNS-pinned callers use this to surface an intentional environment-proxy
+/// bypass instead of silently changing the operator's egress path.
+pub fn environment_proxy_for_url(raw_url: &str) -> Option<&'static str> {
+    environment_proxy_for_url_with(raw_url, |key| std::env::var(key).ok())
+}
+
+fn environment_proxy_for_url_with(
+    raw_url: &str,
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Option<&'static str> {
+    fn first_nonempty(
+        read_env: &mut impl FnMut(&str) -> Option<String>,
+        keys: &[&'static str],
+    ) -> Option<&'static str> {
+        keys.iter().copied().find(|key| {
+            read_env(key)
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+
+    let parsed = reqwest::Url::parse(raw_url).ok()?;
+    let scheme_keys: &[&str] = match parsed.scheme() {
+        "http" => &["HTTP_PROXY", "http_proxy"],
+        "https" => &["HTTPS_PROXY", "https_proxy"],
+        _ => return None,
+    };
+    let proxy_var = first_nonempty(&mut read_env, scheme_keys)
+        .or_else(|| first_nonempty(&mut read_env, &["ALL_PROXY", "all_proxy"]))?;
+    let host = parsed.host_str()?;
+    let no_proxy = read_env("NO_PROXY")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| read_env("no_proxy").filter(|value| !value.trim().is_empty()));
+
+    if no_proxy
+        .as_deref()
+        .is_some_and(|entries| no_proxy_matches_host(entries, host))
+    {
+        None
+    } else {
+        Some(proxy_var)
+    }
+}
+
+fn no_proxy_matches_host(entries: &str, host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+
+    entries.split(',').map(str::trim).any(|entry| {
+        if entry == "*" {
+            return true;
+        }
+        let entry = entry.trim_end_matches('.');
+        if entry.is_empty() {
+            return false;
+        }
+
+        if let Some(host_ip) = host_ip
+            && let Some((network, prefix)) = entry.split_once('/')
+            && let (Ok(network), Ok(prefix)) =
+                (network.parse::<std::net::IpAddr>(), prefix.parse::<u32>())
+        {
+            return ip_in_prefix(host_ip, network, prefix);
+        }
+
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>() {
+            return host_ip == Some(entry_ip);
+        }
+
+        let domain = entry.trim_start_matches('.').to_ascii_lowercase();
+        host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn ip_in_prefix(host: std::net::IpAddr, network: std::net::IpAddr, prefix: u32) -> bool {
+    match (host, network) {
+        (std::net::IpAddr::V4(host), std::net::IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(host) & mask == u32::from(network) & mask
+        }
+        (std::net::IpAddr::V6(host), std::net::IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(host) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
 }
 
@@ -29453,7 +29564,40 @@ api_token = "tok"
     }
 
     #[test]
+    async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
+        let values = HashMap::from([
+            ("HTTP_PROXY", "http://http-proxy.example:3128"),
+            ("HTTPS_PROXY", "http://https-proxy.example:3128"),
+            ("ALL_PROXY", "socks5://all-proxy.example:1080"),
+            ("NO_PROXY", "example.com,10.0.0.0/8,2001:db8::/32,localhost"),
+        ]);
+        let read = |key: &str| values.get(key).map(ToString::to_string);
+
+        assert_eq!(
+            environment_proxy_for_url_with("https://public.invalid/", read),
+            Some("HTTPS_PROXY")
+        );
+        assert_eq!(
+            environment_proxy_for_url_with("http://public.invalid/", read),
+            Some("HTTP_PROXY")
+        );
+        for bypassed in [
+            "https://api.example.com/",
+            "http://10.2.3.4/",
+            "https://[2001:db8::1]/",
+            "http://localhost/",
+        ] {
+            assert_eq!(
+                environment_proxy_for_url_with(bypassed, read),
+                None,
+                "NO_PROXY should bypass {bypassed}"
+            );
+        }
+    }
+
+    #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -29475,6 +29619,7 @@ api_token = "tok"
 
     #[test]
     async fn proxy_reload_applies_new_config_through_rwlock() {
+        let _env_guard = env_override_lock().await;
         set_runtime_proxy_config(ProxyConfig {
             enabled: true,
             http_proxy: Some("http://boot.example:3128".to_string()),
@@ -29501,6 +29646,7 @@ api_token = "tok"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()

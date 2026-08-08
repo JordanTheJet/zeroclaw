@@ -58,8 +58,13 @@ impl TextBrowserTool {
         })
     }
 
+    #[cfg(test)]
     fn validate_url(&self, url: &str) -> anyhow::Result<String> {
-        self.validate_url_with_dns_check(url, validate_resolved_host_is_public)
+        validate_text_browser_url(
+            url,
+            &self.allowed_private_hosts,
+            validate_resolved_host_is_public,
+        )
     }
 
     /// Internal entry that accepts a pluggable DNS validator. Mirrors
@@ -67,58 +72,28 @@ impl TextBrowserTool {
     /// drive the resolved-IP SSRF gate without depending on real DNS. The
     /// boolean passed to the validator relaxes the public-address requirement,
     /// but never the metadata-address exclusion.
+    #[cfg(test)]
     fn validate_url_with_dns_check(
         &self,
         url: &str,
         validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
-        let url = url.trim();
+        validate_text_browser_url(url, &self.allowed_private_hosts, validate_dns)
+    }
 
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
+    async fn validate_url_for_execute(&self, url: &str) -> anyhow::Result<String> {
+        let url = url.to_string();
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
 
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
-
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            anyhow::bail!("URL userinfo is not allowed");
-        }
-
-        let host_str = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
-
-        let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
-        let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
-        let (host, display_host) = if is_ipv6 {
-            let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
-            (bare.clone(), format!("[{bare}]"))
-        } else {
-            let h = host_str.to_lowercase();
-            (h.clone(), h)
-        };
-
-        // SSRF gate: deny by default for private/local hosts unless the operator
-        // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
-        let private_host = domain_guard::is_private_or_local_host(&host);
-        let host_allowed = domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
-
-        if private_host && !host_allowed {
-            anyhow::bail!("Blocked local/private host: {display_host}");
-        }
-
-        validate_dns(&host, host_allowed)?;
-
-        Ok(url.to_string())
+        tokio::task::spawn_blocking(move || {
+            validate_text_browser_url(
+                &url,
+                &allowed_private_hosts,
+                validate_resolved_host_is_public,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("text_browser DNS validation task failed: {e}")))?
     }
 
     fn truncate_response(&self, text: &str) -> String {
@@ -219,6 +194,60 @@ impl TextBrowserTool {
     }
 }
 
+fn validate_text_browser_url(
+    url: &str,
+    allowed_private_hosts: &[String],
+    validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    let url = url.trim();
+
+    if url.is_empty() {
+        anyhow::bail!("URL cannot be empty");
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        anyhow::bail!("URL cannot contain whitespace");
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    let host_str = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
+
+    let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
+    let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
+    let (host, display_host) = if is_ipv6 {
+        let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
+        (bare.clone(), format!("[{bare}]"))
+    } else {
+        let h = host_str.to_lowercase();
+        (h.clone(), h)
+    };
+
+    // SSRF gate: deny by default for private/local hosts unless the operator
+    // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
+    let private_host = domain_guard::is_private_or_local_host(&host);
+    let host_allowed = domain_guard::host_matches_allowlist(&host, allowed_private_hosts);
+
+    if private_host && !host_allowed {
+        anyhow::bail!("Blocked local/private host: {display_host}");
+    }
+
+    validate_dns(&host, host_allowed)?;
+
+    Ok(url.to_string())
+}
+
 #[async_trait]
 impl Tool for TextBrowserTool {
     fn name(&self) -> &str {
@@ -294,7 +323,7 @@ impl Tool for TextBrowserTool {
 
         // Keep the unavoidable validation-to-use window as short as possible:
         // resolve the executable before performing the final DNS preflight.
-        let url = match self.validate_url(url) {
+        let url = match self.validate_url_for_execute(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {

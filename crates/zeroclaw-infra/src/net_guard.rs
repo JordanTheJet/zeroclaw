@@ -147,13 +147,14 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 
 /// True when `host` is loopback, private, link-local, a documentation/
 /// benchmark range, or one of the `localhost` / `*.local` name forms. Accepts
-/// bracketed IPv6 (`[::1]`) and is case-insensitive.
+/// bracketed IPv6 (`[::1]`), ignores DNS root-label dots, and is case-insensitive.
 #[must_use]
 pub fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
+    let canonical = host.trim_end_matches('.');
+    let bare = canonical
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
+        .unwrap_or(canonical)
         .to_ascii_lowercase();
 
     if &bare == "localhost" || bare.ends_with(".localhost") {
@@ -695,6 +696,10 @@ mod tests {
         assert!(is_private_or_local_host("[::1]"));
         assert!(is_private_or_local_host("fe80::1"));
         assert!(is_private_or_local_host("fc00::1"));
+        assert!(is_private_or_local_host("localhost."));
+        assert!(is_private_or_local_host("printer.local."));
+        assert!(is_private_or_local_host("127.0.0.1."));
+        assert!(is_private_or_local_host("192.168.1.1.."));
     }
 
     #[test]

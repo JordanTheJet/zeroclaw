@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::ProxyConfig;
+use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
 
 const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
-     proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy";
+     proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
+     proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -558,6 +559,17 @@ impl Tool for HttpRequestTool {
             });
         }
 
+        let ignored_environment_proxy = zeroclaw_config::schema::environment_proxy_for_url(url);
+        if let Some(variable) = ignored_environment_proxy {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"proxy_variable": variable})),
+                "http_request: environment proxy ignored to preserve validated DNS pin"
+            );
+        }
+
         let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
@@ -655,17 +667,26 @@ impl Tool for HttpRequestTool {
                     },
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
+            Err(e) => {
+                let mut error = format!("HTTP request failed: {e}");
+                if let Some(variable) = ignored_environment_proxy {
+                    error.push_str(&format!(
+                        "; {variable} was intentionally ignored by the DNS-pinned request"
+                    ));
+                }
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                })
+            }
         }
     }
 }
 
 fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
-    config.has_any_proxy_url() && config.should_apply_to_service("tool.http_request")
+    (config.enabled && config.scope == ProxyScope::Environment)
+        || (config.has_any_proxy_url() && config.should_apply_to_service("tool.http_request"))
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -1434,6 +1455,15 @@ api_token = "Bearer from-secret"
         assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
         assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.http_request"));
         assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.*"));
+
+        let environment_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&environment_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("environment"));
 
         let exact_service_proxy = ProxyConfig {
             enabled: true,
