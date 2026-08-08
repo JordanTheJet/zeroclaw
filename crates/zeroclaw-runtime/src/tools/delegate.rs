@@ -2570,6 +2570,10 @@ impl DelegateTool {
                     .filter(|tool| tool.name() != Self::NAME)
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                    // Bounded delegates have no approval manager or operator-facing
+                    // channel. Exclude tools whose prompt can only be answered by an
+                    // operator instead of silently running them with `approval: None`.
+                    .filter(|tool| !tool.approval_requires_operator())
                     .map(|tool| {
                         target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
                             Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
@@ -2769,6 +2773,14 @@ impl Tool for ToolArcRef {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
     }
 
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
@@ -8110,6 +8122,50 @@ command = "echo hi"
     }
 
     #[tokio::test]
+    async fn bounded_delegate_excludes_config_patch_without_an_operator_surface() {
+        let tmp = TempDir::new().unwrap();
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["config_patch".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                crate::tools::config_patch::ConfigPatchTool::new(tmp.path().join("config.toml")),
+            )])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["config_patch".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "config_patch must not be advertised to a bounded delegate: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "an operator-only config_patch reached a bounded delegate with no approval surface: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn delegate_parent_none_unrestricted_passes_target_policy() {
         let config = agentic_agent_config();
         let parent_security = Arc::new(SecurityPolicy {
@@ -8294,6 +8350,14 @@ mod tool_arc_ref_spec_tests {
             }
         }
 
+        fn approval_requires_operator(&self) -> bool {
+            true
+        }
+
+        fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+            Some("computed by the host".to_string())
+        }
+
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
@@ -8318,6 +8382,15 @@ mod tool_arc_ref_spec_tests {
             Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
             "ToolArcRef must forward spec() so the inner Arc-shared schema \
              survives; the trait default deep-clones it every call"
+        );
+        assert!(
+            wrapped.approval_requires_operator(),
+            "ToolArcRef must preserve the inner tool's operator-only marker"
+        );
+        assert_eq!(
+            wrapped.approval_summary(&serde_json::json!({})).as_deref(),
+            Some("computed by the host"),
+            "ToolArcRef must preserve host-computed approval text"
         );
     }
 }

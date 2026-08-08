@@ -38,6 +38,7 @@ Always registered alongside the built-ins:
 
 | Tool | Notes |
 |---|---|
+| `config_patch` | Apply validated JSON Patch operations to `config.toml`. Writes are disk-only until reload or restart. See [Config authoring](#config-authoring) for its approval rules. |
 | `cron_*` | Manage scheduled jobs: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs` |
 | `schedule` | Shell-only one-shot/recurring scheduling |
 | `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
@@ -104,6 +105,28 @@ The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating li
 - The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them.
 
 If you need finer-grained gating, drop the profile's `level` to `read_only` or `supervised` and rely on the per-profile `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
+
+### Config authoring
+
+`config_patch` gives an agent a typed config-writing path without exposing raw
+file writes. Before an approval, the host renders the proposed operations and
+their resolved-policy effects; secret values are redacted. A successful call
+writes `config.toml`, but the running daemon keeps its current configuration
+until the operator reloads or restarts it. See [Config lifecycle](../architecture/config-lifecycle.md#saved-vs-applied).
+
+The built-in risk presets treat this capability deliberately:
+
+- `locked_down` excludes it.
+- `balanced` pins it in `always_ask`. Only the local terminal or an authenticated
+  paired client is an operator approval surface; chat channels cannot approve it.
+- `yolo` auto-approves it, consistent with that profile already granting raw
+  shell and file-write access.
+
+Custom risk profiles do not inherit the `balanced` pin. Add `config_patch` to
+`always_ask` when config authoring must stay operator-approved, especially when
+the profile has a broad `auto_approve` rule. Bounded delegates never receive
+operator-only tools because their nested tool loop has no operator approval
+surface.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
