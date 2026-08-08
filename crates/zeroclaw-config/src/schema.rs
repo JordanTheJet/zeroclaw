@@ -19035,7 +19035,10 @@ impl Config {
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
-        if !self.proxy.enabled || !self.proxy.has_any_proxy_url() {
+        if !self.proxy.enabled {
+            return;
+        }
+        if self.proxy.scope != ProxyScope::Environment && !self.proxy.has_any_proxy_url() {
             return;
         }
 
@@ -29492,11 +29495,15 @@ api_token = "tok"
     async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
         let proxy_url = Some("http://proxy.example:3128".to_string());
 
-        for scope in [ProxyScope::Environment, ProxyScope::Zeroclaw] {
+        for (scope, http_proxy) in [
+            (ProxyScope::Environment, None),
+            (ProxyScope::Environment, proxy_url.clone()),
+            (ProxyScope::Zeroclaw, proxy_url.clone()),
+        ] {
             let config = Config {
                 proxy: ProxyConfig {
                     enabled: true,
-                    http_proxy: proxy_url.clone(),
+                    http_proxy,
                     scope,
                     ..ProxyConfig::default()
                 },

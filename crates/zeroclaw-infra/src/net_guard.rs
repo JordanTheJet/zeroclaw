@@ -190,7 +190,7 @@ pub fn is_private_or_local_host(host: &str) -> bool {
 /// [iana-v4]: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
 #[must_use]
 pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, d] = v4.octets();
+    let [a, b, c, _] = v4.octets();
     a == 0 // 0.0.0.0/8 ("This network")
         || v4.is_loopback()
         || v4.is_private()
@@ -199,7 +199,10 @@ pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.is_multicast()
         || (a == 100 && (64..=127).contains(&b)) // RFC 6598 shared address space
         || a >= 240 // Reserved
-        || (a == 192 && b == 0 && c == 0 && !matches!(d, 9 | 10))
+        // PCP (192.0.0.9) and TURN (192.0.0.10) anycast are globally routed
+        // but terminate on local-network infrastructure, so the SSRF boundary
+        // conservatively keeps the entire protocol-assignment block closed.
+        || (a == 192 && b == 0 && c == 0)
         || (a == 192 && b == 0 && c == 2) // Documentation (192.0.2.0/24)
         || (a == 192 && b == 88 && c == 99) // Deprecated 6to4 relay anycast
         || (a == 198 && b == 51 && c == 100) // Documentation (198.51.100.0/24)
@@ -494,6 +497,8 @@ mod tests {
             "0.255.255.255",
             "100.64.0.1",
             "192.0.0.8",
+            "192.0.0.9",
+            "192.0.0.10",
             "192.0.0.11",
             "192.88.99.1",
             "198.19.255.255",
@@ -503,14 +508,7 @@ mod tests {
             assert!(is_non_global_v4(address), "{address} must be blocked");
         }
 
-        for address in [
-            "1.0.0.0",
-            "100.128.0.0",
-            "192.0.0.9",
-            "192.0.0.10",
-            "192.88.98.255",
-            "192.88.100.0",
-        ] {
+        for address in ["1.0.0.0", "100.128.0.0", "192.88.98.255", "192.88.100.0"] {
             let address = address.parse::<Ipv4Addr>().unwrap();
             assert!(!is_non_global_v4(address), "{address} must be allowed");
         }
