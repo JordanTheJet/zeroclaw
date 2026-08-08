@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -28,6 +28,30 @@ const SPILL_THRESHOLD_BYTES: usize = 50_000;
 /// spilled into. Kept as components rather than a `"tmp/web_fetch"` literal
 /// so the join is separator-correct on every platform.
 const SPILL_DIR_COMPONENTS: [&str; 2] = ["tmp", "web_fetch"];
+
+/// Longest single line, in bytes, a spilled file may contain.
+///
+/// `file_read` pages by line and `content_search` reports by line, so a body
+/// that is one enormous line — minified JSON, or an HTML-to-text conversion
+/// that never emitted a break — is unpageable: the first page is the whole
+/// file, which is exactly what spilling was meant to avoid. Any line longer
+/// than this is split at a UTF-8 character boundary before the write. The
+/// budget is a compromise: small enough that a page of lines is a useful slice
+/// of the document, large enough that ordinary prose paragraphs and formatted
+/// JSON lines are never touched.
+const SPILL_MAX_LINE_BYTES: usize = 4_000;
+
+/// The tool whose permission decides whether `web_fetch` may spill to disk.
+///
+/// Spilling is a durable filesystem write, but `web_fetch` is auto-approved by
+/// default and is not classified as a writing tool, so nothing upstream asks
+/// the operator about it. Rather than mint a second answer to "may this agent
+/// write files" — the drift AGENTS.md bans — the spill defers to the policy's
+/// existing answer for `file_write` via `SecurityPolicy::is_tool_allowed`,
+/// which resolves the profile's `allowed_tools`/`excluded_tools` exactly as
+/// the agent loop does when it decides whether to offer `file_write` at all.
+/// A profile that denies file writes gets the inline truncation instead.
+const SPILL_WRITE_TOOL: &str = "file_write";
 
 /// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
 ///
@@ -131,27 +155,65 @@ impl WebFetchTool {
         })
     }
 
+    /// Turn fetched content into the tool result, whatever fetched it.
+    ///
+    /// This is the single delivery point for both the standard fetch and the
+    /// Firecrawl fallback, so an oversized body spills from either source
+    /// under identical rules. Below the threshold, or when spilling is not
+    /// permitted or does not succeed, the pre-existing inline behaviour —
+    /// `truncate_response` over the raw converted text — applies unchanged.
+    async fn deliver(&self, url: &str, content: FetchedContent) -> ToolResult {
+        if content.text.len() > SPILL_THRESHOLD_BYTES
+            && let Some(message) = self.spill_to_workspace(url, &content).await
+        {
+            return ToolResult {
+                success: true,
+                output: message.into(),
+                error: None,
+            };
+        }
+
+        ToolResult {
+            success: true,
+            output: self.truncate_response(&content.text).into(),
+            error: None,
+        }
+    }
+
     /// Write an oversized converted body to a file inside the agent workspace
     /// and return the short message that replaces it in the tool result.
     ///
-    /// `None` means "no spill happened" — an unresolvable workspace, a
-    /// containment failure, or an I/O error. Callers fall back to the
-    /// pre-existing inline truncation, which is degraded but never wrong.
-    async fn spill_to_workspace(
-        &self,
-        url: &str,
-        text: &str,
-        extension: &str,
-        title: Option<&str>,
-        cap_hit: bool,
-    ) -> Option<String> {
-        match self.try_spill_to_workspace(url, text, extension).await {
-            Ok((relative_path, byte_count)) => Some(spill_message(
+    /// `None` means "no spill happened" — writes not permitted by policy, an
+    /// unresolvable workspace, a destination that is not ours to write, or an
+    /// I/O error. Callers fall back to the pre-existing inline truncation,
+    /// which is degraded but never wrong.
+    async fn spill_to_workspace(&self, url: &str, content: &FetchedContent) -> Option<String> {
+        // A spill is a durable filesystem write performed by a tool the
+        // operator auto-approved as a fetch. Ask the policy the same question
+        // the agent loop asks before offering `file_write`, and stay inline
+        // when the answer is no.
+        if !self.security.is_tool_allowed(SPILL_WRITE_TOOL) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "spill_to_workspace",
+                        "gate": SPILL_WRITE_TOOL,
+                    })),
+                "web_fetch: security policy does not permit file writes, returning the \
+                 oversized response inline instead of spilling it"
+            );
+            return None;
+        }
+
+        match self.try_spill_to_workspace(url, content).await {
+            Ok((relative_path, format)) => Some(spill_message(
                 url,
-                title,
-                byte_count,
+                content.title.as_deref(),
+                content.text.len(),
                 &relative_path,
-                cap_hit,
+                content.cap_hit,
+                &format,
             )),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -170,16 +232,15 @@ impl WebFetchTool {
         }
     }
 
-    /// Resolve the spill path, prove it is inside the workspace, and write.
+    /// Reshape the body, name it after its own bytes, and write it.
     ///
     /// Returns the workspace-*relative* path (what `file_read` and
-    /// `content_search` expect) plus the byte count written.
+    /// `content_search` expect) plus how the body was reshaped.
     async fn try_spill_to_workspace(
         &self,
         url: &str,
-        text: &str,
-        extension: &str,
-    ) -> anyhow::Result<(PathBuf, usize)> {
+        content: &FetchedContent,
+    ) -> anyhow::Result<(PathBuf, SpillFormat)> {
         // The workspace root has exactly one source of truth in this
         // codebase: `SecurityPolicy::workspace_dir`
         // (crates/zeroclaw-config/src/policy.rs). It is the same field
@@ -189,76 +250,65 @@ impl WebFetchTool {
         // not introduce a second resolution path here (no env var, no
         // `std::env::temp_dir()`, no constructor-threaded copy) — a divergent
         // second answer is exactly the drift bug AGENTS.md bans.
-        let configured_root = self.security.workspace_dir.as_path();
-        if configured_root.as_os_str().is_empty() {
+        let workspace = self.security.workspace_dir.clone();
+        if workspace.as_os_str().is_empty() {
             anyhow::bail!("workspace_dir is empty");
         }
-        let root = tokio::fs::canonicalize(configured_root)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("workspace root is not resolvable: {e}")))?;
 
-        let mut spill_dir = root.clone();
-        for component in SPILL_DIR_COMPONENTS {
-            spill_dir.push(component);
-        }
-        tokio::fs::create_dir_all(&spill_dir)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("failed to create spill directory: {e}")))?;
+        let (body, format) = prepare_spill_body(&content.text, content.extension);
+        let file_name = spill_file_name(url, &body, content.extension);
 
-        // Re-resolve AFTER creation. `create_dir_all` follows symlinks, so a
-        // symlinked `tmp/` planted inside the workspace could otherwise land
-        // the write outside the sandbox. This is the containment guard: a
-        // spill that does not resolve under the workspace root is abandoned,
-        // never written.
-        let spill_dir = tokio::fs::canonicalize(&spill_dir)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("spill directory is not resolvable: {e}")))?;
-        if !spill_dir.starts_with(&root) {
-            anyhow::bail!(
-                "spill directory {} escapes the workspace root {}",
-                spill_dir.display(),
-                root.display()
-            );
-        }
-
-        let path = spill_dir.join(spill_file_name(url, text, extension));
         // `spill_file_name` sanitizes to a single component, but prove it
-        // rather than trust it: a name that smuggled in a separator or `..`
-        // would re-parent the file out of the checked directory.
-        if path.parent() != Some(spill_dir.as_path()) {
-            anyhow::bail!("spill file name escaped the spill directory");
+        // rather than trust it. The write below is confined to a directory
+        // handle regardless, so this is the second line of defence, not the
+        // first.
+        let mut components = Path::new(&file_name).components();
+        let single_normal_component = matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none()
+            && !file_name.contains(['/', '\\']);
+        if !single_normal_component {
+            anyhow::bail!("spill file name is not a single path component");
         }
 
-        tokio::fs::write(&path, text)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("failed to write spill file: {e}")))?;
+        let mut relative = PathBuf::new();
+        for component in SPILL_DIR_COMPONENTS {
+            relative.push(component);
+        }
+        relative.push(&file_name);
 
-        let relative = path
-            .strip_prefix(&root)
-            .map_err(|e| anyhow::Error::msg(format!("spill path is not workspace-relative: {e}")))?
-            .to_path_buf();
+        // Blocking filesystem work off the async runtime. The handle-bound
+        // write is synchronous by nature: its safety comes from never
+        // re-resolving a pathname, which an async open/write pair cannot offer.
+        let workspace_for_write = workspace.clone();
+        let body_for_write = body;
+        tokio::task::spawn_blocking(move || {
+            write_spill_file(&workspace_for_write, &file_name, &body_for_write)
+        })
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("spill write task did not complete: {e}")))??;
 
-        Ok((relative, text.len()))
+        Ok((relative, format))
     }
 
-    /// Whether the standard fetch result should trigger a Firecrawl fallback.
-    fn should_fallback_to_firecrawl(&self, result: &ToolResult) -> bool {
+    /// Whether a fetch attempt should trigger a Firecrawl fallback.
+    ///
+    /// Judged on the converted text as fetched, before any spill or
+    /// truncation, so how a body is *delivered* can never be mistaken for how
+    /// much of it there was.
+    fn should_fallback_to_firecrawl(&self, attempt: &FetchAttempt) -> bool {
         if !self.firecrawl.enabled {
             return false;
         }
-        // Fallback on failure (HTTP error, network error, etc.)
-        if !result.success {
-            return true;
+        match attempt {
+            // Fallback on failure (HTTP error, network error, etc.)
+            FetchAttempt::Failure(_) => true,
+            // Fallback on empty or very short body (JS-only pages)
+            FetchAttempt::Content(content) => content.text.trim().len() < FIRECRAWL_MIN_BODY_LEN,
         }
-        // Fallback on empty or very short body (JS-only pages)
-        if result.output.trim().len() < FIRECRAWL_MIN_BODY_LEN {
-            return true;
-        }
-        false
     }
 
     /// Fetch content via the Firecrawl API.
-    async fn fetch_via_firecrawl(&self, url: &str) -> anyhow::Result<ToolResult> {
+    async fn fetch_via_firecrawl(&self, url: &str) -> anyhow::Result<FetchAttempt> {
         let api_key = std::env::var(&self.firecrawl.api_key_env).map_err(|_| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -320,15 +370,11 @@ impl WebFetchTool {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Firecrawl API error: HTTP {} - {}",
-                    status.as_u16(),
-                    error_body
-                )),
-            });
+            return Ok(FetchAttempt::failure(format!(
+                "Firecrawl API error: HTTP {} - {}",
+                status.as_u16(),
+                error_body
+            )));
         }
 
         let resp_json: serde_json::Value = response.json().await.map_err(|e| {
@@ -352,46 +398,39 @@ impl WebFetchTool {
             .unwrap_or("");
 
         if markdown.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("Firecrawl returned empty markdown content".into()),
-            });
+            return Ok(FetchAttempt::failure(
+                "Firecrawl returned empty markdown content".to_string(),
+            ));
         }
 
-        let output = self.truncate_response(markdown);
-
-        Ok(ToolResult {
-            success: true,
-            output: output.into(),
-            error: None,
-        })
+        // Handed back unshaped: delivery decides inline-vs-spill for Firecrawl
+        // markdown on exactly the same terms as a standard fetch. Firecrawl
+        // reads a parsed JSON field rather than the size-capped stream, so
+        // `max_response_size` never cut it short.
+        Ok(FetchAttempt::Content(FetchedContent {
+            text: markdown.to_string(),
+            extension: "md",
+            title: None,
+            cap_hit: false,
+        }))
     }
 
     /// Perform the standard HTTP GET fetch and convert to text.
-    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> ToolResult {
+    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> FetchAttempt {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
-                return ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("HTTP request failed: {e}")),
-                };
+                return FetchAttempt::failure(format!("HTTP request failed: {e}"));
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            return ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "HTTP {} {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown")
-                )),
-            };
+            return FetchAttempt::failure(format!(
+                "HTTP {} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown")
+            ));
         }
 
         // Determine content type for processing strategy
@@ -410,14 +449,10 @@ impl WebFetchTool {
         {
             "plain"
         } else {
-            return ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Unsupported content type: {content_type}. \
-                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
-                )),
-            };
+            return FetchAttempt::failure(format!(
+                "Unsupported content type: {content_type}. \
+                 web_fetch supports text/html, text/plain, text/markdown, and application/json."
+            ));
         };
 
         let CappedBody {
@@ -426,55 +461,35 @@ impl WebFetchTool {
         } = match self.read_response_text_limited(response).await {
             Ok(t) => t,
             Err(e) => {
-                return ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                };
+                return FetchAttempt::failure(format!("Failed to read response body: {e}"));
             }
         };
 
         // Keep the raw HTML alive alongside the converted text so a `<title>`
-        // can be lifted from it *only* on the spill path — sub-threshold
-        // fetches pay nothing for it.
+        // can be lifted from it *only* when the body is large enough to spill —
+        // sub-threshold fetches pay nothing for it, and the raw markup is
+        // dropped here rather than carried through fallback orchestration.
         let (text, raw_html) = if body_mode == "html" {
             (nanohtml2text::html2text(&body), Some(body))
         } else {
             (body, None)
         };
+        let title = if text.len() > SPILL_THRESHOLD_BYTES {
+            raw_html.as_deref().and_then(extract_html_title)
+        } else {
+            None
+        };
 
-        // Above the threshold, hand back a file path instead of half a
-        // megabyte of text. The stream cap above remains the absolute guard
-        // on how much was read; this only changes how it is delivered.
-        if text.len() > SPILL_THRESHOLD_BYTES {
-            let title = raw_html.as_deref().and_then(extract_html_title);
-            if let Some(message) = self
-                .spill_to_workspace(
-                    url,
-                    &text,
-                    spill_extension(&content_type, body_mode),
-                    title.as_deref(),
-                    cap_hit,
-                )
-                .await
-            {
-                return ToolResult {
-                    success: true,
-                    output: message.into(),
-                    error: None,
-                };
-            }
-            // No usable workspace, or the write failed: fall through to the
-            // pre-existing inline truncation rather than losing the response.
-        }
-
-        let output = self.truncate_response(&text);
-
-        ToolResult {
-            success: true,
-            output: output.into(),
-            error: None,
-        }
+        // Handed back unshaped. The stream cap above remains the absolute
+        // guard on how much was read; whether this comes back inline or as a
+        // spilled file is decided once, in `deliver`, after any Firecrawl
+        // fallback has had its say.
+        FetchAttempt::Content(FetchedContent {
+            text,
+            extension: spill_extension(&content_type, body_mode),
+            title,
+            cap_hit,
+        })
     }
 }
 
@@ -490,6 +505,9 @@ impl Tool for WebFetchTool {
          JSON and plain text responses are returned as-is. \
          Only GET requests; follows redirects. \
          Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
+         Oversized responses are saved to a file in the agent workspace and the \
+         path is returned instead of the text, when the security policy permits \
+         file writes. \
          Security: allowlist-only domains, no local/private hosts."
     }
 
@@ -595,32 +613,31 @@ impl Tool for WebFetchTool {
             }
         };
 
-        let standard_result = self.standard_fetch(&client, &url).await;
+        let standard_attempt = self.standard_fetch(&client, &url).await;
 
-        // If standard fetch succeeded well enough, return it directly.
+        // If standard fetch succeeded well enough, use it directly.
         // Otherwise, try Firecrawl fallback if enabled.
-        if self.should_fallback_to_firecrawl(&standard_result) {
+        let attempt = if self.should_fallback_to_firecrawl(&standard_attempt) {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"url": url})),
-                "web_fetch: standard fetch insufficient for , attempting Firecrawl fallback"
+                "web_fetch: standard fetch insufficient, attempting Firecrawl fallback"
             );
             match Box::pin(self.fetch_via_firecrawl(&url)).await {
-                Ok(firecrawl_result) if firecrawl_result.success => {
-                    return Ok(firecrawl_result);
-                }
-                Ok(firecrawl_result) => {
+                Ok(content @ FetchAttempt::Content(_)) => content,
+                Ok(FetchAttempt::Failure(firecrawl_failure)) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         &format!(
                             "web_fetch: Firecrawl fallback also failed: {:?}",
-                            firecrawl_result.error
+                            firecrawl_failure.error
                         )
                     );
                     // Return original standard result if Firecrawl also failed
+                    standard_attempt
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -630,11 +647,20 @@ impl Tool for WebFetchTool {
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "web_fetch: Firecrawl fallback error"
                     );
+                    standard_attempt
                 }
             }
-        }
+        } else {
+            standard_attempt
+        };
 
-        Ok(standard_result)
+        // One delivery point for both sources: whichever attempt won, an
+        // oversized body spills under the same rules and a small one comes
+        // back inline.
+        match attempt {
+            FetchAttempt::Content(content) => Ok(self.deliver(&url, content).await),
+            FetchAttempt::Failure(failure) => Ok(failure),
+        }
     }
 }
 
@@ -650,6 +676,195 @@ struct CappedBody {
     /// True when the read stopped because `max_response_size` was reached,
     /// i.e. the source body was larger than the cap and its tail was dropped.
     cap_hit: bool,
+}
+
+/// Content one fetch attempt produced, before the inline-vs-spill decision.
+///
+/// Per-attempt value, not stored state: it lives only between a fetch and the
+/// single delivery step, and exists so the standard fetch and the Firecrawl
+/// fallback hand back the same shape and are delivered by the same code.
+#[derive(Debug)]
+struct FetchedContent {
+    /// Converted text exactly as fetched — neither truncated nor reshaped.
+    text: String,
+    /// File extension a spilled copy would carry.
+    extension: &'static str,
+    /// Page title, when one could be lifted from the source markup. Only
+    /// populated when the body is large enough that a spill could use it.
+    title: Option<String>,
+    /// True when `max_response_size` cut the read short, so `text` is the
+    /// head of the source rather than all of it.
+    cap_hit: bool,
+}
+
+/// Outcome of one fetch attempt.
+#[derive(Debug)]
+enum FetchAttempt {
+    /// Content to deliver.
+    Content(FetchedContent),
+    /// A failed attempt, already shaped as the result to hand back.
+    Failure(ToolResult),
+}
+
+impl FetchAttempt {
+    fn failure(error: String) -> Self {
+        FetchAttempt::Failure(ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(error),
+        })
+    }
+}
+
+/// How a spilled body was reshaped before it was written.
+///
+/// Reported to the model so it knows the saved file is not byte-for-byte what
+/// the server served — line numbers and offsets refer to the reshaped form.
+#[derive(Default)]
+struct SpillFormat {
+    /// JSON that parsed and was re-emitted indented.
+    pretty_printed: bool,
+    /// At least one line exceeded [`SPILL_MAX_LINE_BYTES`] and was split.
+    wrapped: bool,
+}
+
+/// Reshape a body for spilling so the workspace file tools can navigate it.
+///
+/// Two transforms, both aimed at the same problem — `file_read` pages by line,
+/// so a one-line file cannot be paged. JSON that parses is re-emitted indented;
+/// then any line still over [`SPILL_MAX_LINE_BYTES`] is hard-wrapped. JSON that
+/// does not parse is left alone rather than guessed at.
+///
+/// This runs only on the spill path. The inline result is never reshaped.
+fn prepare_spill_body(text: &str, extension: &str) -> (String, SpillFormat) {
+    let mut format = SpillFormat::default();
+
+    let pretty = if extension == "json" {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+    } else {
+        None
+    };
+    let mut body = match pretty {
+        Some(pretty) => {
+            format.pretty_printed = true;
+            pretty
+        }
+        None => text.to_string(),
+    };
+
+    if let Some(wrapped) = hard_wrap_long_lines(&body) {
+        body = wrapped;
+        format.wrapped = true;
+    }
+
+    (body, format)
+}
+
+/// Split every line longer than [`SPILL_MAX_LINE_BYTES`] at a UTF-8 character
+/// boundary, or `None` when no line was over budget.
+///
+/// `None` rather than an unchanged copy so the caller can report whether the
+/// saved file actually differs from the fetched text.
+fn hard_wrap_long_lines(text: &str) -> Option<String> {
+    if !text
+        .split('\n')
+        .any(|line| line.len() > SPILL_MAX_LINE_BYTES)
+    {
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len() + text.len() / SPILL_MAX_LINE_BYTES + 1);
+    // `split('\n')` round-trips exactly when rejoined with '\n', including a
+    // trailing newline (which yields a final empty segment).
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        while rest.len() > SPILL_MAX_LINE_BYTES {
+            // Walk back to the nearest character boundary. No UTF-8 character
+            // is wider than 4 bytes, so one always exists just inside the
+            // budget; the fallback only guards a hypothetical budget narrower
+            // than a single character, and terminates the loop rather than
+            // splitting mid-character.
+            let cut = (1..=SPILL_MAX_LINE_BYTES)
+                .rev()
+                .find(|&i| rest.is_char_boundary(i))
+                .unwrap_or(rest.len());
+            let (head, tail) = rest.split_at(cut);
+            out.push_str(head);
+            out.push('\n');
+            rest = tail;
+        }
+        out.push_str(rest);
+    }
+
+    Some(out)
+}
+
+/// Write `body` as `file_name` under `<workspace>/tmp/web_fetch/` without ever
+/// following a symlink, and without ever re-resolving a pathname.
+///
+/// Mirrors the hardened write in [`crate::embedded_resource`]: every operation
+/// goes through a [`cap_std::fs::Dir`] handle opened once on the workspace root
+/// and narrowed one component at a time, so a directory or symlink swapped in
+/// at any component after the handle is opened cannot redirect the write out of
+/// the workspace — closing a check/act window that a post-write `canonicalize`
+/// could only detect after the bytes had already landed.
+///
+/// The file itself is opened `create_new`, which refuses rather than follows
+/// whatever is already sitting at the destination. Because `file_name` is the
+/// full digest of `body`, a *regular* file already at that name holds exactly
+/// these bytes, so it is reused as-is; a symlink, directory, or special file is
+/// not ours to write and the spill is abandoned so the caller falls back to
+/// returning the response inline.
+fn write_spill_file(workspace_dir: &Path, file_name: &str, body: &str) -> anyhow::Result<()> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::{Dir, OpenOptions};
+    use std::io::Write;
+
+    let mut dir = Dir::open_ambient_dir(workspace_dir, ambient_authority())
+        .map_err(|e| anyhow::Error::msg(format!("workspace root is not openable: {e}")))?;
+
+    for component in SPILL_DIR_COMPONENTS {
+        // `create_dir_all` and `open_dir` both resolve within the handle, but a
+        // symlink that stays inside the workspace would still relocate the
+        // spill somewhere the operator did not ask for. Refuse it outright.
+        if dir
+            .symlink_metadata(component)
+            .is_ok_and(|meta| meta.is_symlink())
+        {
+            anyhow::bail!("spill directory component '{component}' is a symlink");
+        }
+        dir.create_dir_all(component)
+            .map_err(|e| anyhow::Error::msg(format!("failed to create spill directory: {e}")))?;
+        dir = dir
+            .open_dir(component)
+            .map_err(|e| anyhow::Error::msg(format!("failed to open spill directory: {e}")))?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    match dir.open_with(file_name, &options) {
+        Ok(mut file) => file
+            .write_all(body.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| anyhow::Error::msg(format!("failed to write spill file: {e}"))),
+        Err(e) => {
+            if dir
+                .symlink_metadata(file_name)
+                .is_ok_and(|meta| meta.is_file())
+            {
+                // Content-addressed: this exact name means these exact bytes.
+                return Ok(());
+            }
+            Err(anyhow::Error::msg(format!(
+                "refusing to write spill file: {e}"
+            )))
+        }
+    }
 }
 
 /// File extension for a spilled body.
@@ -671,19 +886,25 @@ fn spill_extension(content_type: &str, body_mode: &str) -> &'static str {
     "txt"
 }
 
-/// Filename for a spilled response: sanitized URL host + a short hash of the
-/// converted text.
+/// Filename for a spilled response: sanitized URL host + the full SHA-256 of
+/// the bytes that will be written.
 ///
-/// Deterministic — refetching a page whose content has not changed overwrites
-/// the same file rather than accumulating copies — and content-addressed, so
-/// a stale path can never serve content the model did not fetch.
-fn spill_file_name(url: &str, text: &str, extension: &str) -> String {
+/// The identity is the *whole* 256-bit digest, never a prefix: a 32-bit prefix
+/// is cheap to collide, which would let one chosen body be served from another
+/// body's path. The host is a legibility prefix only and carries no identity.
+///
+/// Two properties follow, and both are load-bearing. Deterministic: refetching
+/// unchanged content resolves to the same file instead of accumulating copies.
+/// Content-addressed over the *written* bytes, not the fetched ones: a file
+/// already present at this name holds exactly this body, which is what lets the
+/// no-follow `create_new` write in [`write_spill_file`] treat "already exists"
+/// as success rather than overwriting anything.
+fn spill_file_name(url: &str, body: &str, extension: &str) -> String {
     let host = extract_host(url)
         .map(|h| sanitize_path_component(&h))
         .unwrap_or_else(|_| "unknown-host".to_string());
-    let digest = Sha256::digest(text.as_bytes());
-    let short_hash = hex::encode(&digest[..4]);
-    format!("{host}-{short_hash}.{extension}")
+    let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+    format!("{host}-{digest}.{extension}")
 }
 
 /// Reduce a host to a single safe filename component.
@@ -757,6 +978,7 @@ fn spill_message(
     byte_count: usize,
     relative_path: &Path,
     cap_hit: bool,
+    format: &SpillFormat,
 ) -> String {
     let path = relative_path.display();
     let mut message = format!("Fetched {url}\n");
@@ -771,6 +993,18 @@ fn spill_message(
          parameters to page through), or search it with the content_search tool \
          (path=\"{path}\" plus a pattern). That path is relative to the workspace root.\n"
     ));
+    if format.pretty_printed {
+        message.push_str(
+            "\nNote: the response was valid JSON and was saved pretty-printed, so the file is \
+             indented rather than byte-identical to what the server served.\n",
+        );
+    }
+    if format.wrapped {
+        message.push_str(&format!(
+            "\nNote: lines longer than {SPILL_MAX_LINE_BYTES} bytes were hard-wrapped so the file \
+             can be paged by line. Line breaks that the source did not contain were added.\n"
+        ));
+    }
     if cap_hit {
         message.push_str(
             "\nNote: the response hit web_fetch's max_response_size stream cap, so the saved \
@@ -1098,6 +1332,40 @@ mod tests {
         .unwrap()
     }
 
+    // ── Fetch-attempt helpers ────────────────────────────────────
+    //
+    // `standard_fetch` and `fetch_via_firecrawl` hand back a `FetchAttempt`
+    // (content as fetched) rather than a finished `ToolResult`, so delivery —
+    // inline or spilled — happens once, after fallback orchestration.
+
+    /// The converted text of a successful attempt.
+    fn attempt_text(attempt: &FetchAttempt) -> &str {
+        match attempt {
+            FetchAttempt::Content(content) => &content.text,
+            FetchAttempt::Failure(result) => {
+                panic!("expected fetched content, got failure: {:?}", result.error)
+            }
+        }
+    }
+
+    /// The error message of a failed attempt.
+    fn attempt_error(attempt: &FetchAttempt) -> &str {
+        match attempt {
+            FetchAttempt::Failure(result) => result.error.as_deref().unwrap_or_default(),
+            FetchAttempt::Content(_) => panic!("expected a failed attempt, got content"),
+        }
+    }
+
+    /// An attempt carrying `text` as plain-text content.
+    fn text_attempt(text: &str) -> FetchAttempt {
+        FetchAttempt::Content(FetchedContent {
+            text: text.to_string(),
+            extension: "txt",
+            title: None,
+            cap_hit: false,
+        })
+    }
+
     // ── Name and schema ──────────────────────────────────────────
 
     #[test]
@@ -1381,34 +1649,37 @@ mod tests {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("reqwest client");
-        let standard_result = tool.standard_fetch(&client, &url).await;
+        let standard_attempt = tool.standard_fetch(&client, &url).await;
 
         // (a) standard result IS the full body — proves streamed read did
         // not stop after 1 byte under the zero-limit path.
-        assert!(
-            standard_result.success,
-            "standard_fetch must succeed, got error={:?}",
-            standard_result.error
-        );
         assert_eq!(
-            standard_result.output.len(),
+            attempt_text(&standard_attempt).len(),
             body.len(),
             "streamed body length under zero-limit must equal full body"
         );
         assert_eq!(
-            standard_result.output, body,
+            attempt_text(&standard_attempt),
+            body,
             "streamed body content must equal full body"
-        );
-        assert!(
-            !standard_result.output.contains("[Response truncated"),
-            "must not append truncation marker under zero limit"
         );
 
         // (b) result does NOT trip should_fallback_to_firecrawl — proves
         // the regression (1-byte short body) is locked out.
         assert!(
-            !tool.should_fallback_to_firecrawl(&standard_result),
+            !tool.should_fallback_to_firecrawl(&standard_attempt),
             "500-byte body under zero limit must not trigger Firecrawl fallback"
+        );
+
+        // (c) delivered inline with no truncation marker under the zero limit.
+        let FetchAttempt::Content(content) = standard_attempt else {
+            panic!("expected fetched content");
+        };
+        let delivered = tool.deliver(&url, content).await;
+        assert!(delivered.success, "error={:?}", delivered.error);
+        assert!(
+            !delivered.output.contains("[Response truncated"),
+            "must not append truncation marker under zero limit"
         );
     }
 
@@ -1556,12 +1827,8 @@ mod tests {
     #[test]
     fn fallback_disabled_when_firecrawl_not_enabled() {
         let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
-        let result = ToolResult {
-            success: false,
-            output: ToolOutput::default(),
-            error: Some("HTTP 403 Forbidden".into()),
-        };
-        assert!(!tool.should_fallback_to_firecrawl(&result));
+        let attempt = FetchAttempt::failure("HTTP 403 Forbidden".into());
+        assert!(!tool.should_fallback_to_firecrawl(&attempt));
     }
 
     #[test]
@@ -1570,12 +1837,8 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: false,
-            output: ToolOutput::default(),
-            error: Some("HTTP 403 Forbidden".into()),
-        };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        let attempt = FetchAttempt::failure("HTTP 403 Forbidden".into());
+        assert!(tool.should_fallback_to_firecrawl(&attempt));
     }
 
     #[test]
@@ -1584,12 +1847,7 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: true,
-            output: ToolOutput::default(),
-            error: None,
-        };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        assert!(tool.should_fallback_to_firecrawl(&text_attempt("")));
     }
 
     #[test]
@@ -1598,12 +1856,8 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: true,
-            output: "Loading...".into(), // < 100 chars, JS-only page
-            error: None,
-        };
-        assert!(tool.should_fallback_to_firecrawl(&result));
+        // < 100 chars, JS-only page
+        assert!(tool.should_fallback_to_firecrawl(&text_attempt("Loading...")));
     }
 
     #[test]
@@ -1612,12 +1866,8 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: true,
-            output: "A".repeat(200).into(), // well above 100 chars
-            error: None,
-        };
-        assert!(!tool.should_fallback_to_firecrawl(&result));
+        // well above 100 chars
+        assert!(!tool.should_fallback_to_firecrawl(&text_attempt(&"A".repeat(200))));
     }
 
     // ── Firecrawl response parsing ──────────────────────────────────
@@ -1678,13 +1928,8 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: true,
-            output: "A".repeat(99).into(),
-            error: None,
-        };
         assert!(
-            tool.should_fallback_to_firecrawl(&result),
+            tool.should_fallback_to_firecrawl(&text_attempt(&"A".repeat(99))),
             "99-char body (below threshold) should trigger fallback"
         );
     }
@@ -1695,13 +1940,8 @@ mod tests {
             enabled: true,
             ..FirecrawlConfig::default()
         });
-        let result = ToolResult {
-            success: true,
-            output: "A".repeat(100).into(),
-            error: None,
-        };
         assert!(
-            !tool.should_fallback_to_firecrawl(&result),
+            !tool.should_fallback_to_firecrawl(&text_attempt(&"A".repeat(100))),
             "100-char body (at threshold) should NOT trigger fallback"
         );
     }
@@ -1780,28 +2020,27 @@ mod tests {
             .unwrap();
 
         let url = format!("http://{addr}/page");
-        let standard_result = tool.standard_fetch(&client, &url).await;
+        let standard_attempt = tool.standard_fetch(&client, &url).await;
 
         // standard_fetch should fail with 403
-        assert!(!standard_result.success);
-        assert!(tool.should_fallback_to_firecrawl(&standard_result));
+        assert!(matches!(standard_attempt, FetchAttempt::Failure(_)));
+        assert!(tool.should_fallback_to_firecrawl(&standard_attempt));
 
         // Firecrawl fallback should also fail (missing API key)
         let firecrawl_result = Box::pin(tool.fetch_via_firecrawl(&url)).await;
         assert!(
-            firecrawl_result.is_err() || !firecrawl_result.as_ref().unwrap().success,
+            match &firecrawl_result {
+                Err(_) => true,
+                Ok(attempt) => matches!(attempt, FetchAttempt::Failure(_)),
+            },
             "Expected Firecrawl fallback to fail without API key"
         );
 
         // The orchestration should return the original 403 error
+        let error = attempt_error(&standard_attempt);
         assert!(
-            standard_result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("403"),
-            "Expected original HTTP 403 error, got: {:?}",
-            standard_result.error
+            error.contains("403"),
+            "Expected original HTTP 403 error, got: {error}"
         );
     }
 
@@ -1870,19 +2109,17 @@ mod tests {
             .unwrap();
 
         let url = format!("http://{standard_addr}/page");
-        let standard_result = tool.standard_fetch(&client, &url).await;
+        let standard_attempt = tool.standard_fetch(&client, &url).await;
 
         // Standard fetch returns short body, should trigger fallback
-        assert!(tool.should_fallback_to_firecrawl(&standard_result));
+        assert!(tool.should_fallback_to_firecrawl(&standard_attempt));
 
         // Firecrawl fallback should succeed with rich content
-        let result = Box::pin(tool.fetch_via_firecrawl(&url)).await.unwrap();
-
-        assert!(result.success, "Expected successful Firecrawl fallback");
+        let attempt = Box::pin(tool.fetch_via_firecrawl(&url)).await.unwrap();
+        let text = attempt_text(&attempt);
         assert!(
-            result.output.contains("Real Content"),
-            "Expected Firecrawl markdown content, got: {}",
-            result.output
+            text.contains("Real Content"),
+            "Expected Firecrawl markdown content, got: {text}"
         );
 
         // Clean up env var
@@ -2156,13 +2393,17 @@ mod tests {
             .await;
 
         // Bypass SSRF-guarded execute() — call standard_fetch directly so
-        // wiremock on 127.0.0.1 is reachable.
+        // wiremock on 127.0.0.1 is reachable, then run the same delivery step
+        // execute() runs, which is where inline-vs-spill is decided.
         let url = format!("http://{}/page", server.address());
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client");
-        tool.standard_fetch(&client, &url).await
+        match tool.standard_fetch(&client, &url).await {
+            FetchAttempt::Content(content) => tool.deliver(&url, content).await,
+            FetchAttempt::Failure(result) => result,
+        }
     }
 
     /// Pins the pre-existing inline behaviour: a body comfortably under the
@@ -2209,13 +2450,24 @@ mod tests {
         );
     }
 
-    /// Pull the `Saved to: <path>` line out of a spill message.
-    fn saved_path(message: &str) -> &str {
-        message
+    /// Pull the `Saved to: <path>` line out of a spill message, with separators
+    /// normalized to `/`.
+    ///
+    /// The message renders the path with `Path::display()`, which uses the
+    /// platform separator — backslashes on Windows. Comparing components rather
+    /// than the raw string keeps these assertions meaningful on every platform,
+    /// and `/`-joined paths still `join()` correctly on Windows.
+    fn saved_path(message: &str) -> String {
+        let raw = message
             .lines()
             .find_map(|line| line.strip_prefix("Saved to: "))
             .unwrap_or_else(|| panic!("no 'Saved to:' line in message:\n{message}"))
-            .trim()
+            .trim();
+        std::path::Path::new(raw)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     #[tokio::test]
@@ -2258,11 +2510,21 @@ mod tests {
             relative.starts_with("tmp/web_fetch/") && relative.ends_with(".txt"),
             "unexpected spill path: {relative}"
         );
-        let written = std::fs::read_to_string(workspace.path().join(relative))
+        let written = std::fs::read_to_string(workspace.path().join(&relative))
             .expect("spill file must exist at the advertised path");
+        // A 60 KB single-line body is hard-wrapped on the way out (see
+        // SPILL_MAX_LINE_BYTES), so the file differs from the body only by the
+        // inserted line breaks — no character of the response is lost.
         assert_eq!(
-            written, body,
+            written.replace('\n', ""),
+            body,
             "spill file must hold the full converted text"
+        );
+        assert!(
+            written
+                .lines()
+                .all(|line| line.len() <= SPILL_MAX_LINE_BYTES),
+            "spilled file must not contain an unpageable line"
         );
         assert!(
             !written.contains("[Response truncated"),
@@ -2287,7 +2549,7 @@ mod tests {
             .expect("canonical workspace");
         let written = workspace
             .path()
-            .join(relative)
+            .join(&relative)
             .canonicalize()
             .expect("spill file must exist");
 
@@ -2298,7 +2560,7 @@ mod tests {
             root.display()
         );
         assert!(
-            !std::path::Path::new(relative).is_absolute(),
+            !std::path::Path::new(&relative).is_absolute(),
             "advertised path must be workspace-relative, got {relative}"
         );
         assert!(
@@ -2338,6 +2600,87 @@ mod tests {
         assert!(
             escaped.is_empty(),
             "page content escaped the workspace to {escaped:?}"
+        );
+    }
+
+    /// The directory guard, isolated from the sandbox handle.
+    ///
+    /// The handle rejects a symlink whose target is absolute or climbs out of
+    /// the workspace, so those cases prove nothing about this guard. A
+    /// *relative* `tmp -> decoy-dir` link resolves entirely inside the
+    /// workspace and the handle follows it happily — only the explicit
+    /// `is_symlink` refusal stops the spill being quietly relocated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_refuses_a_spill_directory_symlinked_inside_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let decoy = workspace.path().join("decoy-dir");
+        std::fs::create_dir(&decoy).expect("decoy dir");
+        // Relative target, sibling of the link: stays inside the sandbox.
+        std::os::unix::fs::symlink("decoy-dir", workspace.path().join("tmp"))
+            .expect("plant symlink");
+
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "r".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            body,
+            "a refused spill must fall back to the inline body"
+        );
+        let relocated = walk_files(&decoy);
+        assert!(
+            relocated.is_empty(),
+            "spill was relocated through the symlink to {relocated:?}"
+        );
+    }
+
+    /// The leaf guard, isolated from the sandbox handle.
+    ///
+    /// Same reasoning as the directory case: the handle already refuses an
+    /// absolute or escaping link target, so only a *relative* link to a
+    /// sibling inside the spill directory tests `create_new` itself. Without
+    /// it the write would follow the link and land on the decoy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_abandons_a_leaf_symlink_pointing_inside_the_spill_directory() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "s".repeat(60_000);
+
+        // Spill once to learn the content-addressed destination.
+        let first = fetch_body(&tool, &body, "text/plain").await;
+        let relative = saved_path(first.output.as_str());
+        let destination = workspace.path().join(&relative);
+        std::fs::remove_file(&destination).expect("clear the spilled file");
+
+        let decoy = destination
+            .parent()
+            .expect("spill directory")
+            .join("decoy.txt");
+        std::os::unix::fs::symlink("decoy.txt", &destination).expect("plant leaf symlink");
+
+        let second = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(second.success, "error={:?}", second.error);
+        assert_eq!(
+            second.output.as_str(),
+            body,
+            "a refused spill must fall back to the inline body"
+        );
+        assert!(
+            !decoy.exists(),
+            "wrote through the symlink to {}",
+            decoy.display()
+        );
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .expect("destination must still exist")
+                .is_symlink(),
+            "the planted symlink must be left untouched, not overwritten"
         );
     }
 
@@ -2383,7 +2726,8 @@ mod tests {
             "message must carry the page title, got:\n{message}"
         );
         // The file holds converted text, not the source markup.
-        let written = std::fs::read_to_string(workspace.path().join(relative)).expect("spill file");
+        let written =
+            std::fs::read_to_string(workspace.path().join(&relative)).expect("spill file");
         assert!(
             !written.contains("<p>"),
             "spilled HTML must be stored converted, not raw"
@@ -2411,21 +2755,25 @@ mod tests {
         );
 
         // The stream cap still bounds what was written: hard_cap is
-        // max_response_size + 1, so the file holds 60_001 bytes, not 80_000.
+        // max_response_size + 1, so the file holds 60_001 bytes of response
+        // (plus the line breaks hard-wrapping inserted), not 80_000.
         let written = std::fs::read_to_string(workspace.path().join(saved_path(message)))
             .expect("spill file");
         assert_eq!(
-            written.len(),
+            written.replace('\n', "").len(),
             60_001,
             "stream cap must still bound the spilled bytes"
         );
     }
 
-    /// A spilled result must not look like a JS-only page to the Firecrawl
-    /// heuristic — the message is short by design, and `FIRECRAWL_MIN_BODY_LEN`
-    /// is only 100 bytes.
+    /// A spill must never be mistaken for a JS-only page. The structural
+    /// guarantee is that the Firecrawl heuristic reads the converted text as
+    /// fetched, before delivery — so how large the *message* is cannot matter.
     #[tokio::test]
-    async fn spilled_result_does_not_trigger_firecrawl_fallback() {
+    async fn spilling_cannot_trigger_a_firecrawl_fallback() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
         let workspace = tempfile::tempdir().expect("tempdir");
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -2446,16 +2794,37 @@ mod tests {
         )
         .unwrap();
 
-        let result = fetch_body(&tool, &"g".repeat(60_000), "text/plain").await;
+        let body = "g".repeat(60_000);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body.as_bytes(), "text/plain"))
+            .mount(&server)
+            .await;
+        let url = format!("http://{}/page", server.address());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client");
 
+        // The fallback decision sees the full 60 KB, not the short message the
+        // model eventually receives.
+        let attempt = tool.standard_fetch(&client, &url).await;
+        assert_eq!(attempt_text(&attempt).len(), 60_000);
+        assert!(
+            !tool.should_fallback_to_firecrawl(&attempt),
+            "a large body must never be mistaken for a JS-only page"
+        );
+
+        // Only afterwards is it spilled, and the message is short by design.
+        let FetchAttempt::Content(content) = attempt else {
+            panic!("expected fetched content");
+        };
+        let result = tool.deliver(&url, content).await;
         assert!(result.success, "error={:?}", result.error);
         assert!(
-            result.output.as_str().len() > FIRECRAWL_MIN_BODY_LEN,
-            "spill message must stay above the Firecrawl short-body threshold"
-        );
-        assert!(
-            !tool.should_fallback_to_firecrawl(&result),
-            "a successful spill must not be mistaken for a JS-only page"
+            result.output.as_str().contains("Saved to: "),
+            "expected a spill message, got:\n{}",
+            result.output.as_str()
         );
     }
 
@@ -2482,6 +2851,451 @@ mod tests {
         );
     }
 
+    // ── Leaf-symlink refusal ─────────────────────────────────────
+
+    /// The containment check covers the spill *directory*; this covers the
+    /// spill *file*. A symlink pre-planted at the exact destination filename
+    /// must be refused, not followed — otherwise a single planted link turns
+    /// an auto-approved fetch into an arbitrary out-of-workspace overwrite.
+    ///
+    /// The destination is content-addressed, so fetching the same body twice
+    /// targets the same name: spill once to learn the path, plant a symlink
+    /// there, then fetch again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_abandons_a_symlink_planted_at_the_destination_file() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "j".repeat(60_000);
+
+        let first = fetch_body(&tool, &body, "text/plain").await;
+        let relative = saved_path(first.output.as_str());
+        let destination = workspace.path().join(&relative);
+        std::fs::remove_file(&destination).expect("clear the spilled file");
+
+        let target = outside.path().join("stolen.txt");
+        std::os::unix::fs::symlink(&target, &destination).expect("plant leaf symlink");
+
+        let second = fetch_body(&tool, &body, "text/plain").await;
+
+        // Abandoned, so the response comes back inline rather than being lost.
+        assert!(second.success, "error={:?}", second.error);
+        assert_eq!(
+            second.output.as_str(),
+            body,
+            "a refused spill must fall back to the inline body"
+        );
+
+        // Nothing was written through the link.
+        assert!(
+            !target.exists(),
+            "wrote through the planted symlink to {}",
+            target.display()
+        );
+        let escaped = walk_files(outside.path());
+        assert!(
+            escaped.is_empty(),
+            "page content escaped the workspace to {escaped:?}"
+        );
+
+        // And the link itself was left alone, not replaced by a regular file.
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .expect("destination must still exist")
+                .is_symlink(),
+            "the planted symlink must be left untouched, not overwritten"
+        );
+    }
+
+    /// The other side of `create_new`: an existing *regular* file at a
+    /// content-addressed name already holds exactly these bytes, so the spill
+    /// reuses it instead of failing or rewriting it.
+    #[tokio::test]
+    async fn identical_content_reuses_the_existing_spill_file() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "m".repeat(60_000);
+
+        let first = fetch_body(&tool, &body, "text/plain").await;
+        let first_path = saved_path(first.output.as_str());
+        let second = fetch_body(&tool, &body, "text/plain").await;
+        let second_path = saved_path(second.output.as_str());
+
+        assert_eq!(
+            first_path, second_path,
+            "identical content must resolve to the same file"
+        );
+
+        let mut spill_dir = workspace.path().to_path_buf();
+        for component in SPILL_DIR_COMPONENTS {
+            spill_dir.push(component);
+        }
+        let files = walk_spill_files(&spill_dir);
+        assert_eq!(files.len(), 1, "refetching must not accumulate copies");
+
+        let written = std::fs::read_to_string(workspace.path().join(&second_path))
+            .expect("spill file must still exist");
+        assert_eq!(
+            written.replace('\n', ""),
+            body,
+            "the reused file must still hold the full response"
+        );
+    }
+
+    /// Every regular file directly under `dir`.
+    fn walk_spill_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries.flatten().map(|entry| entry.path()).collect()
+    }
+
+    // ── Write-policy gate ────────────────────────────────────────
+
+    /// Spilling is a durable filesystem write performed by a tool the operator
+    /// auto-approved as a fetch. A profile that denies `file_write` must not
+    /// get one by way of `web_fetch`.
+    fn spill_tool_with_policy(
+        workspace: &std::path::Path,
+        max_response_size: usize,
+        allowed_tools: Option<Vec<String>>,
+        excluded_tools: Option<Vec<String>>,
+    ) -> WebFetchTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.to_path_buf(),
+            allowed_tools,
+            excluded_tools,
+            ..SecurityPolicy::default()
+        });
+        WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            max_response_size,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn spill_is_skipped_when_file_write_is_excluded() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_tool_with_policy(
+            workspace.path(),
+            500_000,
+            None,
+            Some(vec!["file_write".into()]),
+        );
+        let body = "n".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(
+            result.output.as_str(),
+            body,
+            "a policy that denies file writes must get the body inline"
+        );
+        assert!(
+            !workspace.path().join("tmp").exists(),
+            "no spill directory may be created when writes are denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn spill_is_skipped_when_file_write_is_outside_the_allowlist() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        // An allowlist that admits web_fetch but not file_write.
+        //
+        // The response cap must sit ABOVE the spill threshold: it bounds the
+        // streamed read, so a cap below the threshold would leave the text too
+        // small to spill and this test would pass without the gate ever being
+        // consulted. Above it, the text is large enough to spill AND large
+        // enough for the cap to truncate, so both halves are observable.
+        const CAP: usize = SPILL_THRESHOLD_BYTES + 5_000;
+        let tool = spill_tool_with_policy(
+            workspace.path(),
+            CAP,
+            Some(vec!["web_fetch".into(), "file_read".into()]),
+            None,
+        );
+        let body = "p".repeat(200_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        let output = result.output.as_str();
+        assert!(
+            output.contains("[Response truncated"),
+            "must fall back to the pre-existing inline truncation, got:\n{output}"
+        );
+        assert!(
+            !output.contains("Saved to: "),
+            "must not report a saved file, got:\n{output}"
+        );
+        assert!(
+            !workspace.path().join("tmp").exists(),
+            "no spill directory may be created when writes are denied"
+        );
+    }
+
+    /// The gate reads the policy, so a profile that permits `file_write`
+    /// still spills. Without this the test above would pass even if spilling
+    /// were broken outright.
+    #[tokio::test]
+    async fn spill_happens_when_file_write_is_permitted() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_tool_with_policy(
+            workspace.path(),
+            500_000,
+            Some(vec!["web_fetch".into(), "file_write".into()]),
+            None,
+        );
+        let body = "q".repeat(60_000);
+
+        let result = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(
+            result.output.as_str().contains("Saved to: "),
+            "an allowlist containing file_write must still spill, got:\n{}",
+            result.output.as_str()
+        );
+    }
+
+    // ── Spill body reshaping ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn json_spill_is_pretty_printed_and_paged_by_line() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+
+        // Minified JSON on a single line, comfortably over the threshold.
+        let value = json!({
+            "items": (0..2_000)
+                .map(|i| json!({"id": i, "name": format!("item-{i}"), "tag": "xyzzy"}))
+                .collect::<Vec<_>>()
+        });
+        let body = serde_json::to_string(&value).expect("minified json");
+        assert!(body.len() > SPILL_THRESHOLD_BYTES);
+        assert_eq!(body.lines().count(), 1, "source must be one line");
+
+        let result = fetch_body(&tool, &body, "application/json").await;
+
+        assert!(result.success, "error={:?}", result.error);
+        let message = result.output.as_str();
+        let relative = saved_path(message);
+        assert!(relative.ends_with(".json"), "unexpected path: {relative}");
+        assert!(
+            message.contains("pretty-printed"),
+            "message must disclose the reformat, got:\n{message}"
+        );
+
+        let written =
+            std::fs::read_to_string(workspace.path().join(&relative)).expect("spill file");
+
+        // Pageable: many lines, none over budget.
+        assert!(
+            written.lines().count() > 1_000,
+            "pretty-printed JSON must be many lines, got {}",
+            written.lines().count()
+        );
+        assert!(
+            written
+                .lines()
+                .all(|line| line.len() <= SPILL_MAX_LINE_BYTES),
+            "no line may exceed the wrap budget"
+        );
+
+        // And it is still the same document, not a lossy reformat.
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&written).expect("saved JSON must still parse");
+        assert_eq!(
+            reparsed, value,
+            "pretty-printing must preserve the document"
+        );
+    }
+
+    #[test]
+    fn prepare_spill_body_pretty_prints_only_parseable_json() {
+        let (body, format) = prepare_spill_body(r#"{"a":1,"b":[2,3]}"#, "json");
+        assert!(format.pretty_printed);
+        assert!(!format.wrapped);
+        assert!(body.lines().count() > 1, "expected indented output: {body}");
+
+        // Same bytes, but not typed as JSON: left exactly as fetched.
+        let (body, format) = prepare_spill_body(r#"{"a":1,"b":[2,3]}"#, "md");
+        assert_eq!(body, r#"{"a":1,"b":[2,3]}"#);
+        assert!(!format.pretty_printed);
+
+        // Typed as JSON but not parseable: left alone rather than guessed at.
+        let (body, format) = prepare_spill_body("{not json", "json");
+        assert_eq!(body, "{not json");
+        assert!(!format.pretty_printed);
+    }
+
+    #[test]
+    fn hard_wrap_leaves_short_lines_untouched() {
+        assert!(hard_wrap_long_lines("short\nlines\nonly").is_none());
+        // Exactly at the budget is not over it.
+        let exact = "a".repeat(SPILL_MAX_LINE_BYTES);
+        assert!(hard_wrap_long_lines(&exact).is_none());
+        // One byte over is.
+        let over = "a".repeat(SPILL_MAX_LINE_BYTES + 1);
+        assert_eq!(
+            hard_wrap_long_lines(&over).as_deref(),
+            Some(format!("{}\na", "a".repeat(SPILL_MAX_LINE_BYTES)).as_str())
+        );
+    }
+
+    #[test]
+    fn hard_wrap_splits_only_at_character_boundaries() {
+        // "€" is 3 bytes, so 4000 is never a boundary — a naive byte split
+        // here would panic or corrupt the text.
+        let line = "€".repeat(5_000);
+        let wrapped = hard_wrap_long_lines(&line).expect("must wrap");
+
+        assert!(
+            wrapped.lines().all(|l| l.len() <= SPILL_MAX_LINE_BYTES),
+            "no line may exceed the wrap budget"
+        );
+        assert_eq!(
+            wrapped.replace('\n', ""),
+            line,
+            "wrapping must not lose or alter a single character"
+        );
+        for l in wrapped.lines() {
+            assert_eq!(
+                l.len() % 3,
+                0,
+                "split landed mid-character: {} bytes",
+                l.len()
+            );
+        }
+    }
+
+    #[test]
+    fn hard_wrap_preserves_existing_line_structure() {
+        let text = format!("head\n{}\ntail\n", "z".repeat(SPILL_MAX_LINE_BYTES + 10));
+        let wrapped = hard_wrap_long_lines(&text).expect("must wrap");
+
+        assert!(wrapped.starts_with("head\n"));
+        assert!(
+            wrapped.ends_with("\ntail\n"),
+            "trailing newline must survive"
+        );
+        assert_eq!(
+            wrapped.replace('\n', ""),
+            text.replace('\n', ""),
+            "wrapping must only add line breaks"
+        );
+    }
+
+    // ── Firecrawl delivery ───────────────────────────────────────
+
+    /// Firecrawl content is delivered through the same step as a standard
+    /// fetch, so an oversized fallback result spills instead of being
+    /// hard-truncated and losing its tail.
+    #[tokio::test]
+    async fn firecrawl_content_above_the_threshold_is_spilled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let markdown = format!(
+            "# Big Page\n\n{}",
+            "long firecrawl paragraph. ".repeat(3_000)
+        );
+        assert!(markdown.len() > SPILL_THRESHOLD_BYTES);
+
+        let firecrawl_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scrape"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"markdown": markdown}
+            })))
+            .mount(&firecrawl_server)
+            .await;
+
+        // SAFETY: test-only, and the variable name is unique to this test.
+        unsafe { std::env::set_var("FIRECRAWL_SPILL_TEST_KEY", "test-key-12345") };
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_SPILL_TEST_KEY".into(),
+                api_url: format!("http://{}", firecrawl_server.address()),
+                ..FirecrawlConfig::default()
+            },
+            vec![],
+        )
+        .unwrap();
+
+        let url = "https://example.com/page";
+        let attempt = Box::pin(tool.fetch_via_firecrawl(url))
+            .await
+            .expect("firecrawl call");
+        let FetchAttempt::Content(content) = attempt else {
+            panic!("expected firecrawl content");
+        };
+        let result = tool.deliver(url, content).await;
+
+        // SAFETY: test-only, and the variable name is unique to this test.
+        unsafe { std::env::remove_var("FIRECRAWL_SPILL_TEST_KEY") };
+
+        assert!(result.success, "error={:?}", result.error);
+        let message = result.output.as_str();
+        assert!(
+            !message.contains("[Response truncated"),
+            "Firecrawl content must spill, not hard-truncate, got:\n{message}"
+        );
+
+        // Markdown, saved under the same directory, holding the whole thing.
+        let relative = saved_path(message);
+        assert!(
+            relative.starts_with("tmp/web_fetch/") && relative.ends_with(".md"),
+            "unexpected Firecrawl spill path: {relative}"
+        );
+        let written =
+            std::fs::read_to_string(workspace.path().join(&relative)).expect("spill file");
+        assert_eq!(
+            written.replace('\n', ""),
+            markdown.replace('\n', ""),
+            "the spilled file must hold the full Firecrawl markdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn firecrawl_content_below_the_threshold_stays_inline() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
+        let content = FetchedContent {
+            text: "# Small\n\nA short page.".to_string(),
+            extension: "md",
+            title: None,
+            cap_hit: false,
+        };
+
+        let result = tool.deliver("https://example.com/page", content).await;
+
+        assert!(result.success, "error={:?}", result.error);
+        assert_eq!(result.output.as_str(), "# Small\n\nA short page.");
+    }
+
     // ── Spill filename ───────────────────────────────────────────
 
     #[test]
@@ -2498,6 +3312,33 @@ mod tests {
         assert!(
             first.starts_with("example.com-") && first.ends_with(".md"),
             "unexpected name: {first}"
+        );
+    }
+
+    /// The identity is the FULL SHA-256, not a prefix. A 32-bit prefix is
+    /// cheap to collide, which would let one chosen body be served from
+    /// another body's path.
+    #[test]
+    fn spill_file_name_carries_the_full_sha256_digest() {
+        let body = "content";
+        let name = spill_file_name("https://example.com/a", body, "md");
+
+        let digest = name
+            .strip_prefix("example.com-")
+            .and_then(|rest| rest.strip_suffix(".md"))
+            .unwrap_or_else(|| panic!("unexpected name shape: {name}"));
+
+        assert_eq!(digest.len(), 64, "digest must be the full 256-bit hash");
+        assert!(
+            digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "digest must be lowercase hex, got {digest}"
+        );
+        assert_eq!(
+            digest,
+            format!("{:x}", Sha256::digest(body.as_bytes())),
+            "digest must be the SHA-256 of the written body"
         );
     }
 
