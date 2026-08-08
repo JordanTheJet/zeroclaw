@@ -22,6 +22,5 @@ pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 // Crate-internal: these keep the visibility they had before the primitives
 // moved to zeroclaw-infra, so the tool crate's public surface is unchanged.
 pub(crate) use zeroclaw_infra::net_guard::{
-    is_cloud_metadata_ip, is_non_global_v4, is_non_global_v6, validate_resolved_ips_are_public,
-    validate_resolved_ips_exclude_metadata,
+    is_cloud_metadata_ip, validate_resolved_ips_are_public, validate_resolved_ips_exclude_metadata,
 };

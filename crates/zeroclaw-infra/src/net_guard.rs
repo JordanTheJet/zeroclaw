@@ -201,8 +201,8 @@ pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
         || a >= 240 // Reserved
         || (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24, 192.0.2.0/24
         || (a == 192 && b == 88 && c == 99) // Deprecated 6to4 relay anycast
-        || (a == 198 && b == 51) // Documentation (198.51.100.0/24)
-        || (a == 203 && b == 0) // Documentation (203.0.113.0/24)
+        || (a == 198 && b == 51 && c == 100) // Documentation (198.51.100.0/24)
+        || (a == 203 && b == 0 && c == 113) // Documentation (203.0.113.0/24)
         || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
 }
 
@@ -238,6 +238,8 @@ pub fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
     }
 
     let ietf_protocol_assignments = segs[0] == 0x2001 && segs[1] < 0x0200;
+    // IANA marks these exact anycast assignments globally reachable. Keep
+    // them distinct from the enclosing non-global 2001::/23 allocation.
     let globally_reachable_ietf_exception = matches!(
         u128::from_be_bytes(v6.octets()),
         0x2001_0001_0000_0000_0000_0000_0000_0001..=0x2001_0001_0000_0000_0000_0000_0000_0003
@@ -251,15 +253,10 @@ pub fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] == 0x3fff && (segs[1] & 0xf000) == 0) // Documentation (3fff::/20)
 }
 
-const KNOWN_METADATA_V4: [std::net::Ipv4Addr; 2] = [
-    std::net::Ipv4Addr::new(169, 254, 169, 254), // AWS, Azure, GCP, OCI, and others
-    std::net::Ipv4Addr::new(100, 100, 100, 200), // Alibaba ECS
-];
-
-const KNOWN_METADATA_V6: [std::net::Ipv6Addr; 2] = [
-    std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254), // AWS
-    std::net::Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254), // GCP
-];
+const ALIBABA_METADATA_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 200);
+const AZURE_PLATFORM_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(168, 63, 129, 16);
+const GCP_METADATA_V6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
 
 fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped() {
@@ -279,11 +276,13 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 
 /// True when `ip` is a known cloud instance-metadata service address.
 ///
-/// The list covers the common IPv4 endpoint, Alibaba ECS IPv4, AWS IPv6, and
-/// Google Compute Engine IPv6, including IPv4-mapped and RFC 6052 well-known
-/// NAT64 forms of the IPv4 endpoints. Metadata services can also use private
-/// DNS names or provider-specific addresses, so callers must not treat this
-/// finite address list as provider discovery.
+/// The classifier covers the entire IPv4 link-local range used by instance,
+/// task, and pod metadata services; the AWS `fd00:ec2::/64` service range;
+/// Google Compute Engine IPv6; Alibaba ECS IPv4; and Azure's host-local
+/// WireServer address. IPv4-mapped and RFC 6052 well-known NAT64 forms receive
+/// the same classification. Metadata services can also use private DNS names
+/// or provider-specific addresses, so callers must not treat these ranges as
+/// provider discovery.
 ///
 /// Known metadata addresses are refused unconditionally by both
 /// [`validate_resolved_ips_are_public`] and
@@ -292,10 +291,16 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 #[must_use]
 pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => KNOWN_METADATA_V4.contains(&v4),
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            (a == 169 && b == 254) || v4 == ALIBABA_METADATA_V4 || v4 == AZURE_PLATFORM_V4
+        }
         std::net::IpAddr::V6(v6) => {
-            KNOWN_METADATA_V6.contains(&v6)
-                || embedded_ipv4(v6).is_some_and(|v4| KNOWN_METADATA_V4.contains(&v4))
+            let segments = v6.segments();
+            (segments[..4] == [0xfd00, 0x0ec2, 0, 0])
+                || v6 == GCP_METADATA_V6
+                || embedded_ipv4(v6)
+                    .is_some_and(|v4| is_cloud_metadata_ip(std::net::IpAddr::V4(v4)))
         }
     }
 }
@@ -440,6 +445,26 @@ mod tests {
             let address = address.parse::<Ipv4Addr>().unwrap();
             assert!(!is_non_global_v4(address), "{address} must be allowed");
         }
+
+        for address in [
+            "198.51.100.0",
+            "198.51.100.255",
+            "203.0.113.0",
+            "203.0.113.255",
+        ] {
+            let address = address.parse::<Ipv4Addr>().unwrap();
+            assert!(is_non_global_v4(address), "{address} must be blocked");
+        }
+
+        for address in [
+            "198.51.99.255",
+            "198.51.101.0",
+            "203.0.112.255",
+            "203.0.114.0",
+        ] {
+            let address = address.parse::<Ipv4Addr>().unwrap();
+            assert!(!is_non_global_v4(address), "{address} must be allowed");
+        }
     }
 
     #[test]
@@ -483,19 +508,48 @@ mod tests {
     #[test]
     fn cloud_metadata_detection_covers_known_provider_and_embedded_addresses() {
         for address in [
+            "169.254.0.0",
             "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.255.255",
             "100.100.100.200",
+            "168.63.129.16",
             "::ffff:169.254.169.254",
+            "::ffff:168.63.129.16",
             "::ffff:100.100.100.200",
             "64:ff9b::169.254.169.254",
+            "64:ff9b::168.63.129.16",
             "64:ff9b::100.100.100.200",
+            "fd00:ec2::",
+            "fd00:ec2::23",
             "fd00:ec2::254",
+            "fd00:ec2:0:0:ffff:ffff:ffff:ffff",
             "fd20:ce::254",
         ] {
             let address = address.parse().unwrap();
             assert!(
                 is_cloud_metadata_ip(address),
                 "known metadata endpoint {address} must be blocked"
+            );
+        }
+
+        for address in [
+            "169.253.255.255",
+            "169.255.0.0",
+            "100.100.100.199",
+            "100.100.100.201",
+            "168.63.129.15",
+            "168.63.129.17",
+            "fd00:ec1:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fd00:ec2:0:1::",
+            "fd20:ce::253",
+            "fd20:ce::255",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(
+                !is_cloud_metadata_ip(address),
+                "neighboring non-metadata address {address} must not match"
             );
         }
     }
@@ -766,11 +820,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_resolved_ips_blocks_non_aws_metadata_even_for_private_opt_in() {
+    fn validate_resolved_ips_blocks_provider_metadata_even_for_private_opt_in() {
         for address in [
+            "169.254.170.2",
+            "169.254.170.23",
             "100.100.100.200",
+            "168.63.129.16",
             "::ffff:100.100.100.200",
+            "::ffff:168.63.129.16",
             "64:ff9b::100.100.100.200",
+            "64:ff9b::168.63.129.16",
+            "fd00:ec2::23",
             "fd20:ce::254",
         ] {
             let ips = [address.parse().unwrap()];

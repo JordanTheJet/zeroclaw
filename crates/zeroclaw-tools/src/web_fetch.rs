@@ -52,8 +52,19 @@ impl WebFetchTool {
         })
     }
 
+    #[cfg(test)]
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
         validate_target_url(
+            raw_url,
+            &self.allowed_domains,
+            &self.blocked_domains,
+            &self.allowed_private_hosts,
+            "web_fetch",
+        )
+    }
+
+    fn resolve_target(&self, raw_url: &str) -> anyhow::Result<ResolvedWebFetchTarget> {
+        resolve_target_url(
             raw_url,
             &self.allowed_domains,
             &self.blocked_domains,
@@ -357,7 +368,7 @@ impl Tool for WebFetchTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        let url = match self.validate_url(url) {
+        let target = match self.resolve_target(url) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -367,6 +378,7 @@ impl Tool for WebFetchTool {
                 });
             }
         };
+        let url = target.url.clone();
 
         // Build client: follow redirects, set timeout, set User-Agent
         let timeout_secs = if self.timeout_secs == 0 {
@@ -384,17 +396,18 @@ impl Tool for WebFetchTool {
         let allowed_domains = self.allowed_domains.clone();
         let blocked_domains = self.blocked_domains.clone();
         let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let pinned_host = target.host.clone();
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
             }
 
-            if let Err(err) = validate_target_url(
+            if let Err(err) = validate_redirect_target(
                 attempt.url().as_str(),
+                &pinned_host,
                 &allowed_domains,
                 &blocked_domains,
                 &allowed_private_hosts,
-                "web_fetch",
             ) {
                 return attempt.error(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -412,6 +425,7 @@ impl Tool for WebFetchTool {
             .user_agent("ZeroClaw/0.1 (web_fetch)");
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+        let builder = pin_resolved_host(builder, &target);
         let client = match builder.build() {
             Ok(c) => c,
             Err(e) => {
@@ -468,6 +482,7 @@ impl Tool for WebFetchTool {
 
 // ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
 
+#[cfg(test)]
 fn validate_target_url(
     raw_url: &str,
     allowed_domains: &[String],
@@ -481,8 +496,77 @@ fn validate_target_url(
         blocked_domains,
         allowed_private_hosts,
         tool_name,
-        validate_resolved_host_is_public,
+        validate_resolved_host,
     )
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedWebFetchTarget {
+    url: String,
+    host: String,
+    resolved_addrs: Vec<std::net::SocketAddr>,
+}
+
+fn pin_resolved_host(
+    builder: reqwest::ClientBuilder,
+    target: &ResolvedWebFetchTarget,
+) -> reqwest::ClientBuilder {
+    if target.host.parse::<std::net::IpAddr>().is_ok() {
+        builder
+    } else {
+        builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
+    }
+}
+
+fn validate_redirect_target(
+    raw_url: &str,
+    pinned_host: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    allowed_private_hosts: &[String],
+) -> anyhow::Result<()> {
+    let redirect_host = extract_host(raw_url)?;
+    if redirect_host != pinned_host {
+        anyhow::bail!("Cross-host redirects are blocked so DNS validation remains pinned");
+    }
+
+    validate_target_url_with_dns_check(
+        raw_url,
+        allowed_domains,
+        blocked_domains,
+        allowed_private_hosts,
+        "web_fetch",
+        |_, _| Ok(()),
+    )?;
+    Ok(())
+}
+
+fn resolve_target_url(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    allowed_private_hosts: &[String],
+    tool_name: &str,
+) -> anyhow::Result<ResolvedWebFetchTarget> {
+    let mut resolved_addrs = None;
+    let url = validate_target_url_with_dns_check(
+        raw_url,
+        allowed_domains,
+        blocked_domains,
+        allowed_private_hosts,
+        tool_name,
+        |host, allow_private| {
+            resolved_addrs = Some(resolve_validated_host(host, allow_private)?);
+            Ok(())
+        },
+    )?;
+    let host = extract_host(&url)?;
+
+    Ok(ResolvedWebFetchTarget {
+        url,
+        host,
+        resolved_addrs: resolved_addrs.unwrap_or_default(),
+    })
 }
 
 fn validate_target_url_with_dns_check(
@@ -491,7 +575,7 @@ fn validate_target_url_with_dns_check(
     blocked_domains: &[String],
     allowed_private_hosts: &[String],
     tool_name: &str,
-    validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+    validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let url = raw_url.trim();
 
@@ -555,12 +639,9 @@ fn validate_target_url_with_dns_check(
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    // Skip the resolved-IP public check only when the host is covered by the
-    // private allowlist (explicit OR "*"). This is what lets a domain that
-    // resolves to a private IP through under allowed_private_hosts = ["*"].
-    if !private_tolerated {
-        validate_dns(&host)?;
-    }
+    // Private opt-in relaxes only the public-address requirement. DNS still
+    // resolves and the metadata exclusion remains unconditional.
+    validate_dns(&host, private_tolerated)?;
 
     Ok(url.to_string())
 }
@@ -662,10 +743,13 @@ fn private_allowlist_match(host: &str, allowed_private_hosts: &[String]) -> Priv
 }
 
 #[cfg(not(test))]
-fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+fn resolve_validated_host(
+    host: &str,
+    allow_private: bool,
+) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
 
-    let ips = (host, 0)
+    let addrs = (host, 0)
         .to_socket_addrs()
         .map_err(|e| {
             ::zeroclaw_log::record!(
@@ -680,38 +764,45 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
             );
             anyhow::Error::msg(format!("Failed to resolve host '{host}': {e}"))
         })?
-        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+    let ips = addrs
+        .iter()
+        .map(std::net::SocketAddr::ip)
         .collect::<Vec<_>>();
 
-    validate_resolved_ips_are_public(host, &ips)
+    validate_resolved_ips_for_ssrf(host, allow_private, &ips)?;
+    Ok(addrs)
 }
 
 #[cfg(test)]
-fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
-    // DNS checks are covered by validate_resolved_ips_are_public unit tests.
-    Ok(())
+fn resolve_validated_host(
+    _host: &str,
+    _allow_private: bool,
+) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    // Resolver behavior is injected by unit tests that exercise the policy.
+    Ok(Vec::new())
 }
 
-fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> anyhow::Result<()> {
-    if ips.is_empty() {
-        anyhow::bail!("Failed to resolve host '{host}'");
-    }
+#[cfg(test)]
+fn validate_resolved_host(host: &str, allow_private: bool) -> anyhow::Result<()> {
+    resolve_validated_host(host, allow_private).map(|_| ())
+}
 
-    for ip in ips {
-        let non_global = match ip {
-            std::net::IpAddr::V4(v4) => domain_guard::is_non_global_v4(*v4),
-            std::net::IpAddr::V6(v6) => domain_guard::is_non_global_v6(*v6),
-        };
-        if non_global {
-            anyhow::bail!(
-                "Blocked host '{host}' resolved to non-global address {ip}. \
-                 To allow hosts that resolve to private/internal IPs, add '{host}' \
+fn validate_resolved_ips_for_ssrf(
+    host: &str,
+    allow_private: bool,
+    ips: &[std::net::IpAddr],
+) -> anyhow::Result<()> {
+    if allow_private {
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+    } else {
+        domain_guard::validate_resolved_ips_are_public(host, ips).map_err(|err| {
+            anyhow::Error::msg(format!(
+                "{err}. To allow hosts that resolve to private/internal IPs, add '{host}' \
                  (or \"*\") to web_fetch.allowed_private_hosts in config.toml"
-            );
-        }
+            ))
+        })
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -971,6 +1062,24 @@ mod tests {
         assert!(err.contains("blocked_domains"));
     }
 
+    #[test]
+    fn redirect_target_cannot_escape_the_pinned_host() {
+        let allowed = vec!["*".to_string()];
+        let err = validate_redirect_target(
+            "https://other.example/page",
+            "initial.example",
+            &allowed,
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Cross-host redirects"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── Security policy ──────────────────────────────────────────
 
     #[tokio::test]
@@ -1167,7 +1276,7 @@ mod tests {
     #[test]
     fn resolved_private_ip_is_rejected() {
         let ips = vec!["127.0.0.1".parse().unwrap()];
-        let err = validate_resolved_ips_are_public("example.com", &ips)
+        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips)
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1179,7 +1288,7 @@ mod tests {
             "93.184.216.34".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
         ];
-        let err = validate_resolved_ips_are_public("example.com", &ips)
+        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips)
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1188,7 +1297,52 @@ mod tests {
     #[test]
     fn resolved_public_ips_are_allowed() {
         let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
-        assert!(validate_resolved_ips_are_public("example.com", &ips).is_ok());
+        assert!(validate_resolved_ips_for_ssrf("example.com", false, &ips).is_ok());
+    }
+
+    #[test]
+    fn private_opt_in_still_rejects_metadata_resolution() {
+        let ips = vec!["169.254.170.23".parse().unwrap()];
+        let err = validate_resolved_ips_for_ssrf("internal.example", true, &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_client_uses_the_validated_address_without_second_dns_lookup() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let target = ResolvedWebFetchTarget {
+            url: format!("http://dns-rebinding.invalid:{}/", address.port()),
+            host: "dns-rebinding.invalid".to_string(),
+            resolved_addrs: vec![std::net::SocketAddr::new(address.ip(), 0)],
+        };
+        let client = pin_resolved_host(
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none()),
+            &target,
+        )
+        .build()
+        .unwrap();
+
+        let response = client.get(&target.url).send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        server.await.unwrap();
     }
 
     // ── Firecrawl config parsing ────────────────────────────────────
@@ -1587,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn allowed_private_domain_skips_dns_public_check() {
+    fn allowed_private_domain_still_runs_metadata_check() {
         let allowed_domains = vec!["*".to_string()];
         let blocked_domains = vec![];
         let allowed_private_hosts = vec!["local.internal".to_string()];
@@ -1598,8 +1752,10 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| {
-                panic!("DNS public-host validation should be skipped");
+            |host, allow_private| {
+                assert_eq!(host, "local.internal");
+                assert!(allow_private);
+                Ok(())
             },
         );
 
@@ -1613,8 +1769,8 @@ mod tests {
     fn private_wildcard_allows_domain_resolving_to_private_ip() {
         // allowed_private_hosts = ["*"] must permit a
         // regular domain that resolves to a private/internal IP, as long as the
-        // name itself passes allowed_domains. The DNS public check must be
-        // skipped (closure panics if reached).
+        // name itself passes allowed_domains. Resolution still runs in the
+        // metadata-only mode.
         let allowed_domains = vec!["example.com".to_string()];
         let blocked_domains = vec![];
         let allowed_private_hosts = vec!["*".to_string()];
@@ -1625,7 +1781,11 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| panic!("DNS public-host validation should be skipped under private wildcard"),
+            |host, allow_private| {
+                assert_eq!(host, "internal.example.com");
+                assert!(allow_private);
+                Ok(())
+            },
         );
 
         assert!(
@@ -1650,7 +1810,11 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| panic!("DNS public-host validation should be skipped for a literal private IP"),
+            |host, allow_private| {
+                assert_eq!(host, "10.0.0.1");
+                assert!(allow_private);
+                Ok(())
+            },
         );
 
         assert!(
@@ -1673,7 +1837,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::Ok(()),
+            |_, _| anyhow::Ok(()),
         )
         .unwrap_err()
         .to_string();
@@ -1695,7 +1859,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::Ok(()),
+            |_, _| anyhow::Ok(()),
         )
         .unwrap_err()
         .to_string();
@@ -1715,9 +1879,10 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |host| {
-                validate_resolved_ips_are_public(
+            |host, allow_private| {
+                validate_resolved_ips_for_ssrf(
                     host,
+                    allow_private,
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                         192, 168, 1, 5,
                     ))],
@@ -1745,7 +1910,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::Ok(()),
+            |_, _| anyhow::Ok(()),
         )
         .unwrap_err()
         .to_string();
@@ -1765,7 +1930,7 @@ mod tests {
             &blocked_domains,
             &allowed_private_hosts,
             "web_fetch",
-            |_| anyhow::bail!("blocklist should run before DNS validation"),
+            |_, _| anyhow::bail!("blocklist should run before DNS validation"),
         )
         .unwrap_err()
         .to_string();

@@ -7712,11 +7712,12 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
-    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Private/internal hosts allowed to relax the public-address SSRF check.
     /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
     /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
-    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
-    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    /// Known metadata and host-platform addresses remain blocked after resolution.
+    /// The external browser re-resolves DNS and cannot consume the checked answer;
+    /// prefer `web_fetch` when URLs or DNS are attacker-controlled.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
