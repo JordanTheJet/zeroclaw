@@ -7461,8 +7461,8 @@ impl Default for BrowserComputerUseConfig {
 #[integration(
     category = "ToolsAutomation",
     display_name = "Browser",
-    description = "Chrome/Chromium control",
-    status_field = "enabled"
+    description = "Open URLs and control Chrome/Chromium",
+    status_method = "integration_active"
 )]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
@@ -7525,6 +7525,20 @@ fn default_browser_backend() -> String {
 
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
+}
+
+impl BrowserConfig {
+    /// Status source for the `#[integration(status_method = ...)]`
+    /// descriptor: the "Browser" integration is Active when the runtime
+    /// registers *either* of the tools this section gates — `browser_open`
+    /// (`enabled`) or the full `browser` automation tool
+    /// (`automation_enabled`). Reading only one flag would misreport half
+    /// the combinations: a default config would claim Chrome/Chromium
+    /// control that is not registered, and an automation-only config would
+    /// report Available while automation is live.
+    pub fn integration_active(&self) -> bool {
+        self.enabled || self.automation_enabled
+    }
 }
 
 impl Default for BrowserConfig {
@@ -28782,6 +28796,57 @@ automation_enabled = true
         let parsed = parse_test_config(raw);
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.automation_enabled);
+    }
+
+    /// The operator-visible integration status must follow both gates. One
+    /// flag alone misreports two of the four combinations: a default config
+    /// would advertise Chrome/Chromium control that is not registered, and
+    /// an automation-only config would read as inactive while automation is
+    /// live.
+    #[test]
+    async fn browser_integration_descriptor_tracks_both_flags() {
+        for (enabled, automation_enabled, expected_active) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let b = BrowserConfig {
+                enabled,
+                automation_enabled,
+                ..BrowserConfig::default()
+            };
+            assert_eq!(
+                b.integration_active(),
+                expected_active,
+                "integration_active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+            assert_eq!(
+                b.integration_descriptor().active,
+                expected_active,
+                "descriptor.active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
+    }
+
+    /// The descriptor copy names both surfaces this section gates, so an
+    /// Active "Browser" row is not read as automation-only.
+    #[test]
+    async fn browser_integration_descriptor_description_covers_both_tools() {
+        let descriptor = BrowserConfig::default().integration_descriptor();
+        assert_eq!(descriptor.display_name, "Browser");
+        assert!(
+            descriptor.description.contains("Open URLs"),
+            "description must mention opening URLs: {:?}",
+            descriptor.description
+        );
+        assert!(
+            descriptor.description.contains("Chrome/Chromium"),
+            "description must mention browser control: {:?}",
+            descriptor.description
+        );
     }
 
     async fn env_override_lock() -> MutexGuard<'static, ()> {
