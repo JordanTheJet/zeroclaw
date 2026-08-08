@@ -621,7 +621,6 @@ pub async fn run(
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
-    let mut status_reporter = crate::osc_status::StatusReporter::default();
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut help_overlay: Option<HelpOverlayState> = None;
     let mut reload_confirm = false;
@@ -788,12 +787,21 @@ pub async fn run(
             theme::set_active(t);
         }
 
-        // Report the chat pane's turn state as the terminal title, regardless
-        // of which mode is on screen: the point is to be visible from outside
-        // this window — a tab, a multiplexer status line — while the operator
-        // is looking somewhere else. Emitted before `term.draw` so the OSC
-        // write never lands inside a frame.
-        status_reporter.sync(chat_pane.turn_status(), chat_pane.selected_agent());
+        // Both panes host an agent and either may be mid-turn, so keep both
+        // current regardless of which one is on screen — a hidden pane's agent
+        // goes on working and its approvals still arrive.
+        chat_pane.poll();
+        acp_pane.poll();
+
+        // Report whichever pane most wants the operator, not whichever is
+        // visible: the terminal status exists to be read from outside this
+        // window, so it has to answer "does anything here need me?". Emitted
+        // before `term.draw` so the OSC write never lands inside a frame.
+        let (status, agent) = crate::osc_status::most_urgent([
+            (chat_pane.turn_status(), chat_pane.selected_agent()),
+            (acp_pane.turn_status(), acp_pane.selected_agent()),
+        ]);
+        crate::osc_status::sync(status, agent);
 
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
