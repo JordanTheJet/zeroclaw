@@ -27,7 +27,7 @@ A minimal build ships with:
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
 | `web_research` | Research a question on the live web and return a written briefing ending in a `Sources:` list. A bounded sub-agent decomposes the question, searches, reads the pages worth reading, and distills the result, so raw search output never enters the main conversation. Registered whenever `[web_search] enabled = true`. Parameters: `question` (required), `url` (optional starting page) |
-| `web_search_tool` | Raw web search. **Not registered by default** — it is scoped inside `web_research` (see below). Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
+| `web_search_tool` | Raw web search. **Not registered by default**; it is scoped inside `web_research` (see below). Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -60,16 +60,16 @@ as a raw search tool. The main agent asks a question; a bounded sub-agent runs
 search → fetch → distill against whatever backend `[web_search]` configures, and
 returns a summary with a mandatory `Sources:` list.
 
-The point is context hygiene: raw search-engine result text — titles, blurbs,
-SEO noise, and every URL on the results page — no longer lands in the primary
+The point is context hygiene: raw search-engine result text (titles, blurbs,
+SEO noise, and every URL on the results page) no longer lands in the primary
 context window. Only the distilled briefing does.
 
 Your `[web_search]` configuration is unchanged. It still selects the provider
 and holds the keys; it configures the *backend*, not the surface. Setting
 `[web_search] enabled = true` now registers `web_research`.
 
-The sub-agent's scope is deliberately narrow — search and `web_fetch` only, no
-shell and no write tools — and every run is capped on two axes: at most 8 tool
+The sub-agent's scope is deliberately narrow: search and `web_fetch` only, no
+shell and no write tools. Every run is capped on two axes: at most 8 tool
 calls and a hard wall-clock ceiling that bounds nested tool calls as well as
 model calls. Hitting either returns a best-effort partial briefing, marked
 `[partial: outcome=...]`, with whatever sources were gathered, rather than an
@@ -92,7 +92,7 @@ Three further properties are worth knowing:
   silently kept or dropped.
 
 Both scoped tools are read-only, so `web_research` is available at the
-`readonly` autonomy level — which is what keeps [web search permitted in
+`readonly` autonomy level, which is what keeps [web search permitted in
 `readonly`](../security/autonomy.md) now that the raw tool is scoped behind the
 delegate.
 
@@ -109,7 +109,7 @@ auto_approve = ["web_search_tool", "web_research", "file_read"]
 
 Naming `web_search_tool` in `allowed_tools` puts it back in the main registry
 alongside `web_research`. Note that an `allowed_tools` list is an allowlist for
-*everything* — listing only these three tools restricts the agent to them.
+*everything*; listing only these three tools restricts the agent to them.
 
 ## Extension protocols
 
