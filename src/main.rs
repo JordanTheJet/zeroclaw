@@ -7535,7 +7535,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                     .await
                 {
                     // Best-effort decoration: the patch itself is saved.
-                    eprintln!("warning: failed to write op comments to config.toml: {err}");
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-config-patch-comment-write-failed",
+                            &[("error", &err.to_string())],
+                            &format!("warning: failed to write op comments to config.toml: {err}"),
+                        )
+                    );
                 }
 
                 if json {
