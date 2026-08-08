@@ -209,7 +209,18 @@ fn base64url_no_pad(data: &[u8]) -> String {
 /// Apply auth to a request builder (usable from spawned tasks without `&self`).
 /// When `credential` is `None` (e.g. local LLM servers that require no API key),
 /// the request is returned unchanged -- no auth header is added.
-fn apply_auth_to_request(
+///
+/// Within the OpenAI-compatible family builder this is where a stored
+/// credential becomes an outbound header, and the requests built here --
+/// chat, model listing, and context-window discovery
+/// ([`crate::fetch_context_window`]) -- share it. That is what keeps a family
+/// whose credential must be transformed before it is usable
+/// (`AuthStyle::ZhipuJwt` mints a short-lived JWT from the stored `id.secret`)
+/// from having one of those paths transform it while another sends it raw.
+///
+/// Scoped deliberately: providers implemented outside this module (Anthropic,
+/// Gemini, Bedrock, …) authenticate their own way and make no claim here.
+pub(crate) fn apply_auth_to_request(
     req: reqwest::RequestBuilder,
     style: &AuthStyle,
     credential: Option<&str>,
