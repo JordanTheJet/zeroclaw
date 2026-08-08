@@ -1296,18 +1296,20 @@ target = "config_patch"
             "the SKILL.toml fixture must load; dropped={dropped:?}"
         );
 
-        let config_patch: Arc<dyn Tool> = Arc::new(
-            crate::tools::config_patch::ConfigPatchTool::new(tmp.path().join("config.toml")),
-        );
-        let resolution = vec![Arc::clone(&config_patch)];
-        let mut registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::ArcToolRef(
-            Arc::clone(&config_patch),
-        ))];
         let policy = Arc::new(SecurityPolicy {
             excluded_tools: Some(vec!["config_patch".to_string()]),
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
+        let config_patch: Arc<dyn Tool> =
+            Arc::new(crate::tools::config_patch::ConfigPatchTool::new(
+                tmp.path().join("config.toml"),
+                Arc::clone(&policy),
+            ));
+        let resolution = vec![Arc::clone(&config_patch)];
+        let mut registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::ArcToolRef(
+            Arc::clone(&config_patch),
+        ))];
         crate::agent::loop_::apply_policy_tool_filter(&mut registry, Some(&policy), None);
         crate::tools::register_skill_tools_with_context(
             &mut registry,

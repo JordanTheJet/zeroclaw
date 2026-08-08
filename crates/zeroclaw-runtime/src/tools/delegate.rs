@@ -7537,7 +7537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_delegate_excludes_config_patch_with_empty_always_ask() {
+    async fn independent_delegate_excludes_direct_and_pipeline_config_patch_routes() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
@@ -7549,6 +7549,8 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = vec!["config_patch".to_string()];
         config.risk_profiles.insert(
             "caller".to_string(),
             RiskProfileConfig {
@@ -7594,6 +7596,9 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
+        config.save().await.expect("save valid config fixture");
+        let config_path = config.config_path.clone();
+        let before = std::fs::read(&config_path).expect("read config before pipeline attempt");
         let config = Arc::new(config);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -7620,6 +7625,47 @@ mod tests {
         assert!(
             !tool_names.contains(&"config_patch"),
             "the real operator-only ConfigPatchTool must not enter an approval-free independent loop"
+        );
+        assert!(
+            tool_names.contains(&"execute_pipeline"),
+            "the regression must exercise the independent delegate's real pipeline route"
+        );
+
+        let pipeline = tools
+            .iter()
+            .find(|tool| tool.name() == "execute_pipeline")
+            .expect("pipeline is present");
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [{
+                    "tool": "config_patch",
+                    "args": {
+                        "ops": [{
+                            "op": "replace",
+                            "path": "/gateway/host",
+                            "value": "127.0.0.2"
+                        }]
+                    }
+                }]
+            }))
+            .await
+            .expect("pipeline returns a tool result");
+        assert!(
+            !result.success,
+            "the pipeline must reject its operator-only config_patch child"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Unknown tool 'config_patch'")),
+            "pipeline refusal should identify the unavailable child: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config after pipeline attempt"),
+            before,
+            "an independent delegate pipeline attempt must leave config.toml byte-identical"
         );
     }
 
@@ -8220,7 +8266,10 @@ command = "echo hi"
             .with_runtime_profiles(agentic_runtime_profiles(10))
             .with_risk_profiles(agentic_risk_profiles(vec!["config_patch".to_string()]))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
-                crate::tools::config_patch::ConfigPatchTool::new(tmp.path().join("config.toml")),
+                crate::tools::config_patch::ConfigPatchTool::new(
+                    tmp.path().join("config.toml"),
+                    test_security(),
+                ),
             )])));
 
         let model_provider = ToolListInspector {

@@ -20,6 +20,7 @@
 //!   the ops themselves.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -31,16 +32,20 @@ use zeroclaw_config::api_error::ConfigApiError;
 use zeroclaw_config::patch::{
     PatchOp, apply_patch_ops, json_pointer_to_dotted, lookup_prop_field, parse_patch_ops,
 };
-use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_config::schema::Config;
 
 pub struct ConfigPatchTool {
     config_path: PathBuf,
+    security: Arc<SecurityPolicy>,
 }
 
 impl ConfigPatchTool {
-    pub fn new(config_path: PathBuf) -> Self {
-        Self { config_path }
+    pub fn new(config_path: PathBuf, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            config_path,
+            security,
+        }
     }
 
     /// One human-readable line for a structured patch error. Same rendering
@@ -250,6 +255,18 @@ impl Tool for ConfigPatchTool {
             Err(err) => return Ok(Self::refuse(&err)),
         };
 
+        // Approval and operation policy are separate boundaries. In
+        // particular, ReadOnly approval managers intentionally do not prompt
+        // because mutating tools must refuse at execution. Keep that refusal
+        // inside the tool as well as in registry policy so direct and nested
+        // dispatch cannot turn config authoring into an unmetered write.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, self.name())
+        {
+            return Ok(ToolResult::err(error));
+        }
+
         // Fresh read of the on-disk state, not the boot-time snapshot: the
         // operator may have edited config since this process started, and a
         // stale base would resurrect overwritten values. By the time an agent
@@ -350,11 +367,15 @@ mod tests {
         toml::from_str(&raw).expect("saved config parses")
     }
 
+    fn config_patch_tool(path: PathBuf) -> ConfigPatchTool {
+        ConfigPatchTool::new(path, Arc::new(SecurityPolicy::default()))
+    }
+
     #[tokio::test]
     async fn applies_a_replace_and_persists_it_to_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
             .execute(serde_json::json!({
@@ -375,11 +396,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_policy_refuses_a_valid_patch_without_touching_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read(&path).expect("read before");
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(SecurityPolicy {
+                autonomy: zeroclaw_config::autonomy::AutonomyLevel::ReadOnly,
+                ..SecurityPolicy::default()
+            }),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/host", "value": "127.0.0.2"}]
+            }))
+            .await
+            .expect("execute");
+
+        assert!(!result.success, "read-only config patch must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("read-only mode")),
+            "the refusal must name the active operation boundary: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read after"),
+            before,
+            "read-only execution must leave config.toml byte-identical"
+        );
+    }
+
+    #[tokio::test]
     async fn an_invalid_op_is_refused_and_the_file_does_not_move() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let before = std::fs::read_to_string(&path).expect("read before");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
             .execute(serde_json::json!({
@@ -406,7 +463,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let before = std::fs::read_to_string(&path).expect("read before");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
             .execute(serde_json::json!({
@@ -431,7 +488,7 @@ mod tests {
     async fn missing_ops_parameter_is_a_clean_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let result = tool.execute(serde_json::json!({})).await.expect("execute");
 
@@ -443,7 +500,7 @@ mod tests {
     async fn a_missing_config_file_is_reported_not_created() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
             .execute(serde_json::json!({
@@ -488,7 +545,7 @@ mod tests {
     async fn approval_summary_renders_the_permission_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_with_balanced_agent(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -519,7 +576,7 @@ mod tests {
     async fn approval_summary_is_quiet_about_unaffected_policies() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_with_balanced_agent(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -537,7 +594,7 @@ mod tests {
     async fn approval_summary_masks_secret_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -562,7 +619,7 @@ mod tests {
     async fn setting_a_secret_reports_populated_not_the_value() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let result = tool
             .execute(serde_json::json!({
@@ -590,7 +647,7 @@ mod tests {
     async fn an_unpreviewable_patch_yields_no_summary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool.approval_summary(&serde_json::json!({
             "ops": [{"op": "frobnicate", "path": "/gateway/host", "value": "x"}]
@@ -605,7 +662,7 @@ mod tests {
     #[test]
     fn schema_offers_no_free_text_narration_field() {
         let dir = std::env::temp_dir();
-        let tool = ConfigPatchTool::new(dir.join("config.toml"));
+        let tool = config_patch_tool(dir.join("config.toml"));
         let schema = tool.parameters_schema();
         let props = schema["properties"].as_object().expect("properties");
         assert_eq!(

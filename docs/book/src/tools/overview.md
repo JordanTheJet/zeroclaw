@@ -122,11 +122,19 @@ The built-in risk presets treat this capability deliberately:
 - `yolo` auto-approves it, consistent with that profile already granting raw
   shell and file-write access.
 
-Custom risk profiles do not inherit the `balanced` pin. Add `config_patch` to
-`always_ask` when config authoring must stay operator-approved, especially when
-the profile has a broad `auto_approve` rule. Bounded delegates never receive
-operator-only tools because their nested tool loop has no operator approval
-surface.
+Custom risk profiles do not inherit the `balanced` pin. For a `supervised`
+profile, add `config_patch` to `always_ask` when config authoring must stay
+operator-approved, especially when the profile has a broad `auto_approve` rule.
+In `readonly`, `config_patch` refuses at its execution boundary and leaves the
+file unchanged; `always_ask` cannot promote a read-only profile into one that
+can write. In `full`, the profile is the operator's standing grant and no tool
+approval prompt is shown.
+
+Nested execution surfaces cannot grant operator approval. Bounded and
+independent agentic delegates therefore do not receive operator-only tools, and
+`execute_pipeline` refuses to admit them as child steps even when
+`pipeline.allowed_tools` names them explicitly. The same rule applies to skill
+aliases and other wrappers around an operator-only target.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
