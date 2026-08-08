@@ -181,53 +181,121 @@ pub fn is_private_or_local_host(host: &str) -> bool {
 
 /// True when an IPv4 address is not globally routable (loopback, RFC 1918,
 /// link-local, CGNAT, documentation, benchmarking, reserved, multicast).
+///
+/// The classification follows the
+/// [IANA IPv4 Special-Purpose Address Registry][iana-v4]. Deprecated
+/// translation space is rejected conservatively even where the registry no
+/// longer assigns a global-reachability value.
+///
+/// [iana-v4]: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
 #[must_use]
 pub fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
     let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
+    a == 0 // 0.0.0.0/8 ("This network")
+        || v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
-        || v4.is_unspecified()
         || v4.is_broadcast()
         || v4.is_multicast()
         || (a == 100 && (64..=127).contains(&b)) // RFC 6598 shared address space
         || a >= 240 // Reserved
         || (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24, 192.0.2.0/24
+        || (a == 192 && b == 88 && c == 99) // Deprecated 6to4 relay anycast
         || (a == 198 && b == 51) // Documentation (198.51.100.0/24)
         || (a == 203 && b == 0) // Documentation (203.0.113.0/24)
         || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
 }
 
 /// True when an IPv6 address is not globally routable (loopback, ULA,
-/// link-local, documentation, multicast, or an IPv4-mapped non-global v4).
+/// link-local, site-local, documentation, multicast, unallocated/reserved,
+/// or an IPv4-embedded non-global v4).
+///
+/// IANA currently allocates [global IPv6 unicast addresses][iana-v6-space]
+/// from `2000::/3`.
+/// This classifier additionally handles the globally reachable NAT64
+/// well-known prefix and the more-specific exceptions in the
+/// [IANA IPv6 Special-Purpose Address Registry][iana-v6-special]. Everything
+/// else defaults closed.
+///
+/// [iana-v6-space]: https://www.iana.org/assignments/ipv6-address-space/ipv6-address-space.xhtml
+/// [iana-v6-special]: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
 #[must_use]
 pub fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
     let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00 // Unique-local (fc00::/7)
-        || (segs[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
+
+    // IPv4-mapped addresses and the NAT64 well-known /96 reach the embedded
+    // IPv4 destination, so classify that effective destination rather than
+    // accepting an encoded private address or rejecting an encoded public one.
+    if let Some(v4) = embedded_ipv4(v6) {
+        return is_non_global_v4(v4);
+    }
+
+    // IANA currently assigns global IPv6 unicast space only from 2000::/3.
+    // The one globally reachable special prefix outside it (64:ff9b::/96) was
+    // handled as an IPv4-embedded address above.
+    if (segs[0] & 0xe000) != 0x2000 {
+        return true;
+    }
+
+    let ietf_protocol_assignments = segs[0] == 0x2001 && segs[1] < 0x0200;
+    let globally_reachable_ietf_exception = matches!(
+        u128::from_be_bytes(v6.octets()),
+        0x2001_0001_0000_0000_0000_0000_0000_0001..=0x2001_0001_0000_0000_0000_0000_0000_0003
+    ) || segs[0] == 0x2001 && segs[1] == 0x0003
+        || segs[0] == 0x2001 && segs[1] == 0x0004 && segs[2] == 0x0112
+        || segs[0] == 0x2001 && (0x0020..=0x003f).contains(&segs[1]);
+
+    (ietf_protocol_assignments && !globally_reachable_ietf_exception)
+        || segs[0] == 0x2002 // 6to4: global reachability is not guaranteed
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+        || (segs[0] == 0x3fff && (segs[1] & 0xf000) == 0) // Documentation (3fff::/20)
 }
 
-/// True when `ip` is a cloud instance-metadata service address.
+const KNOWN_METADATA_V4: [std::net::Ipv4Addr; 2] = [
+    std::net::Ipv4Addr::new(169, 254, 169, 254), // AWS, Azure, GCP, OCI, and others
+    std::net::Ipv4Addr::new(100, 100, 100, 200), // Alibaba ECS
+];
+
+const KNOWN_METADATA_V6: [std::net::Ipv6Addr; 2] = [
+    std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254), // AWS
+    std::net::Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254), // GCP
+];
+
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+
+    match v6.segments() {
+        // RFC 6052 well-known prefix 64:ff9b::/96.
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => {
+            let [a, b] = high.to_be_bytes();
+            let [c, d] = low.to_be_bytes();
+            Some(std::net::Ipv4Addr::new(a, b, c, d))
+        }
+        _ => None,
+    }
+}
+
+/// True when `ip` is a known cloud instance-metadata service address.
 ///
-/// Metadata addresses are refused unconditionally by both
+/// The list covers the common IPv4 endpoint, Alibaba ECS IPv4, AWS IPv6, and
+/// Google Compute Engine IPv6, including IPv4-mapped and RFC 6052 well-known
+/// NAT64 forms of the IPv4 endpoints. Metadata services can also use private
+/// DNS names or provider-specific addresses, so callers must not treat this
+/// finite address list as provider discovery.
+///
+/// Known metadata addresses are refused unconditionally by both
 /// [`validate_resolved_ips_are_public`] and
 /// [`validate_resolved_ips_exclude_metadata`], so an operator opt-in for
 /// private destinations never re-opens them.
 #[must_use]
 pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
-    const EC2_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
-    const EC2_IMDS_V6: std::net::Ipv6Addr =
-        std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
-
     match ip {
-        std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
+        std::net::IpAddr::V4(v4) => KNOWN_METADATA_V4.contains(&v4),
         std::net::IpAddr::V6(v6) => {
-            v6 == EC2_IMDS_V6 || v6.to_ipv4_mapped().is_some_and(|v4| v4 == EC2_IMDS_V4)
+            KNOWN_METADATA_V6.contains(&v6)
+                || embedded_ipv4(v6).is_some_and(|v4| KNOWN_METADATA_V4.contains(&v4))
         }
     }
 }
@@ -240,10 +308,17 @@ pub fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
 /// Reject a resolution that contains any metadata or non-globally-routable
 /// address. This is the default post-resolution SSRF check.
 ///
+/// # DNS pinning
+///
+/// This function validates only the supplied DNS answer. After it succeeds,
+/// the caller must connect to one of these exact validated addresses and must
+/// not resolve `host` again; otherwise DNS rebinding can replace the checked
+/// destination.
+///
 /// # Errors
 ///
-/// Returns an error when `ips` is empty, contains a cloud metadata address,
-/// or contains any non-globally-routable address.
+/// Returns an error when `ips` is empty, contains a known cloud metadata
+/// address, or contains any non-globally-routable address.
 pub fn validate_resolved_ips_are_public(
     host: &str,
     ips: &[std::net::IpAddr],
@@ -269,13 +344,22 @@ pub fn validate_resolved_ips_are_public(
     Ok(())
 }
 
-/// Reject a resolution that contains a metadata address, but permit private
-/// and loopback addresses. For callers that carry an explicit operator
-/// opt-in for private destinations; metadata stays blocked regardless.
+/// Reject a resolution that contains a known metadata address, but permit
+/// other private and loopback addresses. For callers that carry an explicit
+/// operator opt-in for private destinations; the known metadata endpoints
+/// remain blocked regardless.
+///
+/// # DNS pinning
+///
+/// This function validates only the supplied DNS answer. After it succeeds,
+/// the caller must connect to one of these exact validated addresses and must
+/// not resolve `host` again; otherwise DNS rebinding can replace the checked
+/// destination.
 ///
 /// # Errors
 ///
-/// Returns an error when `ips` is empty or contains a cloud metadata address.
+/// Returns an error when `ips` is empty or contains a known cloud metadata
+/// address.
 pub fn validate_resolved_ips_exclude_metadata(
     host: &str,
     ips: &[std::net::IpAddr],
@@ -339,9 +423,81 @@ mod tests {
     }
 
     #[test]
-    fn cloud_metadata_detection_normalizes_ipv4_mapped_ipv6() {
-        let mapped = "::ffff:169.254.169.254".parse().unwrap();
-        assert!(is_cloud_metadata_ip(mapped));
+    fn ipv4_special_purpose_boundaries_follow_registry() {
+        for address in [
+            "0.0.0.1",
+            "0.255.255.255",
+            "100.64.0.1",
+            "192.88.99.1",
+            "198.19.255.255",
+            "240.0.0.1",
+        ] {
+            let address = address.parse::<Ipv4Addr>().unwrap();
+            assert!(is_non_global_v4(address), "{address} must be blocked");
+        }
+
+        for address in ["1.0.0.0", "100.128.0.0", "192.88.98.255", "192.88.100.0"] {
+            let address = address.parse::<Ipv4Addr>().unwrap();
+            assert!(!is_non_global_v4(address), "{address} must be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_special_purpose_and_reserved_ranges_follow_registry() {
+        for address in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "4000::1",
+            "5f00::1",
+            "fec0::1",
+        ] {
+            let address = address.parse::<Ipv6Addr>().unwrap();
+            assert!(is_non_global_v6(address), "{address} must be blocked");
+        }
+
+        for address in [
+            "64:ff9b::1.1.1.1",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2606:4700:4700::1111",
+            "2620:4f:8000::1",
+        ] {
+            let address = address.parse::<Ipv6Addr>().unwrap();
+            assert!(!is_non_global_v6(address), "{address} must be allowed");
+        }
+    }
+
+    #[test]
+    fn cloud_metadata_detection_covers_known_provider_and_embedded_addresses() {
+        for address in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "::ffff:169.254.169.254",
+            "::ffff:100.100.100.200",
+            "64:ff9b::169.254.169.254",
+            "64:ff9b::100.100.100.200",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(
+                is_cloud_metadata_ip(address),
+                "known metadata endpoint {address} must be blocked"
+            );
+        }
     }
 
     #[test]
@@ -559,6 +715,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_resolved_ips_blocks_all_audited_non_global_classes() {
+        for address in [
+            "0.0.0.1",
+            "192.88.99.1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:2::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+            "fec0::1",
+        ] {
+            let ips = [address.parse().unwrap()];
+            let err = validate_resolved_ips_are_public("example.test", &ips)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("non-global address"),
+                "{address} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_resolved_ips_blocks_metadata_even_for_private_opt_in() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
@@ -582,6 +763,25 @@ mod tests {
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_non_aws_metadata_even_for_private_opt_in() {
+        for address in [
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+            "64:ff9b::100.100.100.200",
+            "fd20:ce::254",
+        ] {
+            let ips = [address.parse().unwrap()];
+            let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address"),
+                "{address} produced unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
