@@ -927,13 +927,23 @@ impl Chat {
 
     // ── Drawing ──────────────────────────────────────────────────
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    /// Advance pane state from whatever has arrived since the last tick.
+    ///
+    /// Separate from `draw` because a hidden pane still has to keep up: its
+    /// agent goes on working, approvals still arrive, and anything derived from
+    /// this state — the terminal status, the sidebar — would otherwise freeze
+    /// at whatever was true when the operator switched away.
+    pub(crate) fn poll(&mut self) {
         self.drain_notifications();
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.maybe_refresh_git_branch();
+    }
+
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.poll();
 
         match &mut self.phase {
             ChatPhase::PickAgent {
@@ -6808,6 +6818,10 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
+    // The editor owned the terminal and may have set its own title, so the
+    // cached view of it is no longer true. Without this the next sync dedupes
+    // against a value the terminal no longer shows and never corrects it.
+    crate::osc_status::invalidate();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,

@@ -94,6 +94,14 @@ impl Acp {
         self.inner.ctx_tokens()
     }
 
+    pub(crate) fn poll(&mut self) {
+        self.inner.poll();
+    }
+
+    pub(crate) fn turn_status(&self) -> Option<&crate::turn_status::TurnStatus> {
+        self.inner.turn_status()
+    }
+
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
     }
