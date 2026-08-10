@@ -24,6 +24,11 @@ const ANTHROPIC_PROVIDER: &str = "anthropic";
 const GEMINI_PROVIDER: &str = "gemini";
 const XAI_PROVIDER: &str = "xai";
 const ZEROROUTER_PROVIDER: &str = "zerorouter";
+/// Profile-metadata key naming the ZeroRouter that minted the stored key.
+/// ZeroRouter is a family of independent, operator-run routers, so this is
+/// the profile's identity, not a decoration: it is written at login and
+/// checked on every credential read.
+pub const ZEROROUTER_ISSUER_METADATA_KEY: &str = "issuer";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
@@ -197,6 +202,88 @@ impl AuthService {
         };
 
         Ok(credential.filter(|t| !t.trim().is_empty()))
+    }
+
+    /// Bearer token for a ZeroRouter request, bound to the router that
+    /// minted it.
+    ///
+    /// The generic [`Self::get_provider_bearer_token`] path is wrong for
+    /// this family: ZeroRouter aliases can point at unrelated, independently
+    /// operated routers, and every keyless alias resolves the same
+    /// family-wide active profile. A key minted by router A is worthless on
+    /// router B and must never be offered to it, so selection is by issuer —
+    /// `request_base_url` names the destination, and only a profile whose
+    /// recorded issuer matches that origin can answer. Anything else fails
+    /// closed.
+    pub async fn get_zerorouter_bearer_token(
+        &self,
+        request_base_url: &str,
+        profile_override: Option<&str>,
+    ) -> Result<Option<String>> {
+        let want_issuer = zerorouter_device::issuer_from_provider_uri(request_base_url);
+        let data = self.store.load().await?;
+
+        if let Some(requested) = profile_override {
+            let profile = select_profile_id(&data, ZEROROUTER_PROVIDER, Some(requested))
+                .and_then(|profile_id| data.profiles.get(&profile_id));
+            let Some(profile) = profile else {
+                return Err(zerorouter_binding_error(
+                    &want_issuer,
+                    &zerorouter_bound_issuers(&data),
+                    Some(requested),
+                ));
+            };
+            return match zerorouter_profile_token(profile, &want_issuer) {
+                Some(token) => Ok(Some(token)),
+                None => Err(zerorouter_binding_error(
+                    &want_issuer,
+                    &zerorouter_bound_issuers(&data),
+                    Some(requested),
+                )),
+            };
+        }
+
+        // The active (or default) profile is preferred, exactly as for every
+        // other family — but only when it belongs to this router.
+        if let Some(profile_id) = select_profile_id(&data, ZEROROUTER_PROVIDER, None)
+            && let Some(token) = data
+                .profiles
+                .get(&profile_id)
+                .and_then(|profile| zerorouter_profile_token(profile, &want_issuer))
+        {
+            return Ok(Some(token));
+        }
+
+        // Otherwise the profile that is bound to this router, if one exists.
+        // `profiles` is a `BTreeMap`, so ties resolve deterministically; a
+        // tie means two profiles hold keys for the same destination, which
+        // is not a cross-router leak.
+        if let Some(token) = data
+            .profiles
+            .values()
+            .filter(|profile| profile.model_provider == ZEROROUTER_PROVIDER)
+            .find_map(|profile| zerorouter_profile_token(profile, &want_issuer))
+        {
+            return Ok(Some(token));
+        }
+
+        let has_any_profile = data
+            .profiles
+            .values()
+            .any(|profile| profile.model_provider == ZEROROUTER_PROVIDER);
+        if !has_any_profile {
+            // No ZeroRouter login at all: indistinguishable from any other
+            // unconfigured provider, so the caller decides what to do.
+            return Ok(None);
+        }
+        // A profile exists but none answers for this destination — including
+        // a profile carrying no issuer at all, whose provenance cannot be
+        // established. Refuse rather than fall back to the family-wide key.
+        Err(zerorouter_binding_error(
+            &want_issuer,
+            &zerorouter_bound_issuers(&data),
+            None,
+        ))
     }
 
     pub async fn get_valid_openai_access_token(
@@ -675,6 +762,78 @@ fn resolve_requested_profile_id(model_provider: &str, requested: &str) -> String
     } else {
         profile_id(model_provider, requested)
     }
+}
+
+/// The token a ZeroRouter profile carries, but only when that profile is
+/// bound to `want_issuer`. `None` covers every fail-closed case: a profile
+/// minted by a different router, a profile with no issuer recorded at all
+/// (so its provenance cannot be established), and a profile holding no
+/// usable token.
+fn zerorouter_profile_token(profile: &AuthProfile, want_issuer: &str) -> Option<String> {
+    let bound_issuer = profile.metadata.get(ZEROROUTER_ISSUER_METADATA_KEY)?;
+    if !zerorouter_device::issuers_match(bound_issuer, want_issuer) {
+        return None;
+    }
+    profile
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Distinct routers that stored ZeroRouter profiles were minted against.
+/// These are operator-configured URLs, not remote text, so they are safe to
+/// name back to the operator in an error.
+fn zerorouter_bound_issuers(data: &AuthProfilesData) -> Vec<String> {
+    let mut issuers: Vec<String> = data
+        .profiles
+        .values()
+        .filter(|profile| profile.model_provider == ZEROROUTER_PROVIDER)
+        .filter_map(|profile| {
+            profile
+                .metadata
+                .get(ZEROROUTER_ISSUER_METADATA_KEY)
+                .cloned()
+        })
+        .collect();
+    issuers.sort();
+    issuers.dedup();
+    issuers
+}
+
+fn zerorouter_binding_error(
+    want_issuer: &str,
+    bound_issuers: &[String],
+    requested_profile: Option<&str>,
+) -> anyhow::Error {
+    let known = if bound_issuers.is_empty() {
+        "no router".to_string()
+    } else {
+        bound_issuers.join(", ")
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model_provider": ZEROROUTER_PROVIDER,
+                "request_issuer": want_issuer,
+                "bound_issuers": bound_issuers,
+                "requested_profile": requested_profile,
+                "reason": "zerorouter_issuer_binding_mismatch",
+            })),
+        "auth: stored ZeroRouter key is not bound to the request's router"
+    );
+    let scope = requested_profile
+        .map(|profile| format!(" (profile {profile})"))
+        .unwrap_or_default();
+    anyhow::Error::msg(format!(
+        "No stored ZeroRouter key is bound to {want_issuer}{scope}. ZeroRouter keys are minted \
+         per router and are not interchangeable; the stored keys belong to {known}. Run \
+         `zeroclaw auth login --model-provider zerorouter --profile <alias>` against \
+         {want_issuer}, or set `api_key` on that alias."
+    ))
 }
 
 pub fn select_profile_id(
@@ -1571,26 +1730,63 @@ impl AuthProviderFlow for AnthropicFlow {}
 pub struct ZerorouterFlow;
 
 impl ZerorouterFlow {
-    /// The issuer is the operator's own router: the first configured
-    /// `providers.models.zerorouter` slot's `uri` (aliases in sorted order
-    /// for determinism), else the family default. The `/v1` API suffix is
-    /// stripped — discovery lives at the router root.
-    fn resolve_issuer(config: &Config) -> String {
-        let mut aliases: Vec<&String> = config.providers.models.zerorouter.keys().collect();
-        aliases.sort();
-        let uri = aliases
-            .first()
-            .and_then(|alias| {
-                config.providers.models.zerorouter[*alias]
-                    .base
-                    .uri
-                    .as_deref()
-            })
-            .unwrap_or_else(|| {
+    /// The router this login binds to. The minted key is only valid on the
+    /// router that minted it, so the choice has to be unambiguous rather
+    /// than merely deterministic: picking the alphabetically first alias
+    /// would silently bind the key to a router the operator never named.
+    ///
+    /// `profile` doubles as the alias key, the same convention
+    /// [`GeminiFlow::alias_creds`] uses. One configured alias implies
+    /// itself, no configured alias means the family default, and two or more
+    /// require the operator to say which. The `/v1` API suffix is stripped —
+    /// discovery lives at the router root.
+    fn resolve_issuer(config: &Config, profile: &str) -> Result<String> {
+        let aliases = &config.providers.models.zerorouter;
+        let issuer_of = |alias: &str| {
+            let uri = aliases
+                .get(alias)
+                .and_then(|entry| entry.base.uri.as_deref())
+                .unwrap_or_else(|| {
+                    use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+                    ZerorouterEndpoint::default().uri()
+                });
+            crate::auth::zerorouter_device::issuer_from_provider_uri(uri)
+        };
+        if aliases.contains_key(profile) {
+            return Ok(issuer_of(profile));
+        }
+        let mut names: Vec<&str> = aliases.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        match names.as_slice() {
+            [] => {
                 use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
-                ZerorouterEndpoint::default().uri()
-            });
-        crate::auth::zerorouter_device::issuer_from_provider_uri(uri)
+                Ok(crate::auth::zerorouter_device::issuer_from_provider_uri(
+                    ZerorouterEndpoint::default().uri(),
+                ))
+            }
+            [only] => Ok(issuer_of(only)),
+            _ => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": ZEROROUTER_PROVIDER,
+                            "profile": profile,
+                            "aliases": names,
+                            "reason": "zerorouter_ambiguous_issuer",
+                        })),
+                    "auth: ZeroRouter login cannot pick a router on its own"
+                );
+                anyhow::bail!(
+                    "ZeroRouter login is ambiguous: {} aliases are configured ({}). The minted \
+                     key is only valid on the router that mints it, so re-run with `--profile \
+                     <alias>` naming the router to log into.",
+                    names.len(),
+                    names.join(", "),
+                )
+            }
+        }
     }
 }
 
@@ -1613,9 +1809,12 @@ impl AuthProviderFlow for ZerorouterFlow {
         // is a portal redirect, not a CLI-usable OAuth endpoint, so the
         // browser-PKCE arm the other providers fall back to cannot exist
         // here. The --device-code flag is accepted and redundant.
-        let issuer = Self::resolve_issuer(ctx.config);
+        let issuer = Self::resolve_issuer(ctx.config, profile)?;
+        // `ctx.client` follows redirects; this flow's origin pinning only
+        // holds on a client that refuses them.
+        let client = crate::auth::zerorouter_device::device_flow_client()?;
         let discovery =
-            crate::auth::zerorouter_device::fetch_device_discovery(ctx.client, &issuer).await?;
+            crate::auth::zerorouter_device::fetch_device_discovery(&client, &issuer).await?;
         // ZeroRouter's key_name extension: label the minted key with this
         // machine's hostname so the portal list reads as an inventory.
         let key_name = hostname::get()
@@ -1623,8 +1822,15 @@ impl AuthProviderFlow for ZerorouterFlow {
             .and_then(|name| name.into_string().ok())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "zeroclaw".to_string());
+        // The label leaves this machine, so it is disclosed before it is
+        // sent rather than after.
+        println!("Requesting a ZeroRouter key from {issuer}.");
+        println!(
+            "The router will store this key under the label \"{key_name}\" (this machine's \
+             hostname) and show it in the portal's key list."
+        );
         let device = crate::auth::zerorouter_device::start_device_flow(
-            ctx.client,
+            &client,
             &issuer,
             &discovery.device_authorization_endpoint,
             &key_name,
@@ -1637,16 +1843,19 @@ impl AuthProviderFlow for ZerorouterFlow {
             println!("Fast link: {uri_complete}");
         }
         let key = crate::auth::zerorouter_device::poll_device_key(
-            ctx.client,
+            &client,
+            &issuer,
             &discovery.token_endpoint,
             &device,
         )
         .await?;
         // The access_token IS a freshly minted permanent `zcr_` API key —
         // a Token-kind profile, deliberately not a TokenSet: there is no
-        // refresh arm and nothing to expire.
+        // refresh arm and nothing to expire. The issuer is the profile's
+        // identity, not a note: credential consumption refuses to hand this
+        // key to any other router.
         let mut metadata = std::collections::HashMap::new();
-        metadata.insert("issuer".to_string(), issuer.clone());
+        metadata.insert(ZEROROUTER_ISSUER_METADATA_KEY.to_string(), issuer.clone());
         metadata.insert("key_name".to_string(), key_name);
         ctx.auth_service
             .store_model_provider_token(ZEROROUTER_PROVIDER, profile, &key, metadata, true)
@@ -1947,6 +2156,164 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Store a ZeroRouter device-flow profile exactly as
+    /// [`ZerorouterFlow::login`] does: a Token-kind profile carrying the
+    /// issuer that minted it.
+    async fn store_zerorouter_key(auth: &AuthService, profile: &str, issuer: &str, key: &str) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ZEROROUTER_ISSUER_METADATA_KEY.to_string(),
+            issuer.to_string(),
+        );
+        auth.store_model_provider_token(ZEROROUTER_PROVIDER, profile, key, metadata, true)
+            .await
+            .expect("store zerorouter key");
+    }
+
+    fn config_with_zerorouter_aliases(aliases: &[(&str, &str)]) -> Config {
+        use zeroclaw_config::schema::{ModelProviderConfig, ZerorouterModelProviderConfig};
+        let mut config = Config::default();
+        for (alias, uri) in aliases {
+            config.providers.models.zerorouter.insert(
+                (*alias).to_string(),
+                ZerorouterModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: Some((*uri).to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn zerorouter_key_is_never_offered_to_another_router() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        // Router A mints a key; it also becomes the family-wide active
+        // profile, which is exactly how the leak used to happen.
+        store_zerorouter_key(
+            &auth,
+            "router-a",
+            "https://router-a.example.com",
+            "zcr_key_for_a",
+        )
+        .await;
+
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://router-a.example.com/v1", None)
+                .await
+                .expect("router A's own request resolves its key")
+                .as_deref(),
+            Some("zcr_key_for_a"),
+        );
+
+        let error = auth
+            .get_zerorouter_bearer_token("https://router-b.example.com/v1", None)
+            .await
+            .expect_err("router A's key must not authenticate router B");
+        assert!(
+            !error.to_string().contains("zcr_key_for_a"),
+            "the key leaked into the error text: {error}"
+        );
+
+        // A second login binds its own profile; each router keeps answering
+        // with its own key and only its own key.
+        store_zerorouter_key(
+            &auth,
+            "router-b",
+            "https://router-b.example.com",
+            "zcr_key_for_b",
+        )
+        .await;
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://router-b.example.com/v1", None)
+                .await
+                .expect("router B resolves its own key")
+                .as_deref(),
+            Some("zcr_key_for_b"),
+        );
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://router-a.example.com/v1", None)
+                .await
+                .expect("router A still resolves its own key")
+                .as_deref(),
+            Some("zcr_key_for_a"),
+            "the newer login became the active profile and must not displace A's binding",
+        );
+    }
+
+    #[tokio::test]
+    async fn zerorouter_profile_without_an_issuer_binding_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            ZEROROUTER_PROVIDER,
+            "unbound",
+            "zcr_unbound_key",
+            HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store unbound key");
+
+        let error = auth
+            .get_zerorouter_bearer_token("https://router-a.example.com/v1", None)
+            .await
+            .expect_err("a profile with no recorded router must not answer for one");
+        assert!(!error.to_string().contains("zcr_unbound_key"));
+    }
+
+    #[tokio::test]
+    async fn zerorouter_with_no_login_reports_no_credential_rather_than_failing() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://router-a.example.com/v1", None)
+                .await
+                .expect("an unconfigured provider is not an error"),
+            None,
+        );
+    }
+
+    #[test]
+    fn zerorouter_login_refuses_to_guess_between_configured_routers() {
+        let config = config_with_zerorouter_aliases(&[
+            ("alpha", "https://router-a.example.com/v1"),
+            ("beta", "https://router-b.example.com/v1"),
+        ]);
+        // Alphabetically first used to win silently.
+        let error = ZerorouterFlow::resolve_issuer(&config, "default")
+            .expect_err("two routers cannot be disambiguated by sort order");
+        let message = error.to_string();
+        assert!(
+            message.contains("alpha") && message.contains("beta"),
+            "{message}"
+        );
+
+        // Naming the alias resolves it, and binds to that router only.
+        assert_eq!(
+            ZerorouterFlow::resolve_issuer(&config, "beta").expect("named alias resolves"),
+            "https://router-b.example.com",
+        );
+    }
+
+    #[test]
+    fn zerorouter_login_implies_the_only_configured_router() {
+        let config = config_with_zerorouter_aliases(&[("solo", "https://router-a.example.com/v1")]);
+        assert_eq!(
+            ZerorouterFlow::resolve_issuer(&config, "default").expect("one alias is unambiguous"),
+            "https://router-a.example.com",
+        );
+
+        let empty = config_with_zerorouter_aliases(&[]);
+        assert_eq!(
+            ZerorouterFlow::resolve_issuer(&empty, "default").expect("family default applies"),
+            "http://localhost:8080",
+        );
+    }
 
     #[test]
     fn normalize_provider_aliases() {

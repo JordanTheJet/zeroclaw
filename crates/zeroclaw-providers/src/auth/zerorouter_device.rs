@@ -9,7 +9,9 @@
 //! stay on the issuer's own origin (scheme + host + port). HTTPS is
 //! required except for loopback issuers, so the self-hosted default
 //! (`http://localhost:8080`) works while a spoofed discovery document
-//! cannot redirect the poll off-box over plain HTTP.
+//! cannot redirect the poll off-box over plain HTTP. That origin pinning
+//! only holds if no HTTP redirect is followed, so this flow uses its own
+//! client that refuses them ([`device_flow_client`]).
 //!
 //! The "access token" this flow yields is not an OAuth token: ZeroRouter
 //! mints a fresh `zcr_` API key at claim time (the plaintext never rests in
@@ -18,6 +20,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use reqwest::redirect::Policy;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,19 @@ pub const ZEROROUTER_DEVICE_CLIENT_ID: &str = "zeroclaw";
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// RFC 8628 default poll interval when the router does not name one.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// Ceiling on the authorization lifetime the router is allowed to advertise.
+/// `expires_in` is server-controlled, so it is clamped rather than trusted:
+/// an oversized value would otherwise overflow `Instant + Duration` (a
+/// panic) or keep the CLI polling far past any plausible approval window.
+const MAX_DEVICE_LIFETIME_SECS: u64 = 30 * 60;
+/// Ceiling on the poll interval, including `slow_down` back-off. Also
+/// server-controlled, so it is clamped for the same reason.
+const MAX_POLL_INTERVAL_SECS: u64 = 60;
+/// Ceiling on how much remote text is copied into a CLI error.
+const MAX_REMOTE_DETAIL_CHARS: usize = 200;
+/// Timeout for the one-shot discovery and device-start requests. Polling
+/// gets a tighter, lifetime-derived bound of its own.
+const SETUP_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ZerorouterDeviceStart {
@@ -117,6 +133,86 @@ pub fn require_issuer_origin(issuer: &str, endpoint: &str, label: &str) -> Resul
     Ok(endpoint.to_string())
 }
 
+/// True when two ZeroRouter URLs name the same origin: scheme, host, and
+/// effective port. This is the comparison that binds a stored key to the
+/// router that minted it — the profile records its issuer at login, and
+/// credential consumption checks that record against the request's own
+/// base URL. Unparseable inputs fall back to a normalized string compare
+/// so an operator typo cannot silently widen the match.
+pub fn issuers_match(left: &str, right: &str) -> bool {
+    let (Ok(left_url), Ok(right_url)) = (
+        reqwest::Url::parse(left.trim()),
+        reqwest::Url::parse(right.trim()),
+    ) else {
+        return left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/');
+    };
+    left_url.scheme() == right_url.scheme()
+        && left_url
+            .host_str()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(right_url.host_str().unwrap_or_default())
+        && left_url.port_or_known_default() == right_url.port_or_known_default()
+}
+
+/// HTTP client for the device flow. It refuses every redirect:
+/// [`require_issuer_origin`] pins the URL this process dials, but a
+/// followed 307/308 preserves the POST body, so a same-origin endpoint
+/// could hand `key_name` or `device_code` to a host the origin check never
+/// saw. No hop is followed, so there is no hop to re-validate.
+pub fn device_flow_client() -> Result<Client> {
+    Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(SETUP_REQUEST_TIMEOUT_SECS))
+        .build()
+        .context("Failed to build the ZeroRouter device-flow HTTP client")
+}
+
+/// Refuse a 3xx rather than reporting it as a generic failure, so the
+/// operator learns the router tried to move the request off its own origin.
+/// The `Location` value is remote text and is deliberately not echoed.
+fn reject_redirect(status: reqwest::StatusCode, issuer: &str, label: &str) -> Result<()> {
+    if status.is_redirection() {
+        anyhow::bail!(
+            "ZeroRouter {label} answered with a redirect ({status}); this flow does not follow \
+             redirects, so nothing left the issuer's origin ({issuer})"
+        );
+    }
+    Ok(())
+}
+
+/// Remote text — an OAuth `error_description`, an error body — is untrusted
+/// and lands in a terminal. Drop control characters (which carry ANSI escape
+/// sequences and line breaks) and cap the length so a hostile router cannot
+/// repaint or flood the console.
+fn sanitize_remote_detail(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .take(MAX_REMOTE_DETAIL_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "<no detail>".to_string();
+    }
+    if raw.chars().count() > MAX_REMOTE_DETAIL_CHARS {
+        return format!("{trimmed} (truncated)");
+    }
+    trimmed.to_string()
+}
+
+/// How long this authorization may run, clamped to `max_lifetime`. Uses no
+/// unchecked arithmetic: `expires_in` is server-controlled and
+/// `Duration::from_secs(u64::MAX)` added to an `Instant` panics.
+fn device_lifetime(expires_in: u64, max_lifetime: Duration) -> Duration {
+    Duration::from_secs(expires_in.max(1)).min(max_lifetime)
+}
+
+/// Poll spacing, clamped at both ends. Also server-controlled.
+fn poll_interval(interval: u64) -> Duration {
+    Duration::from_secs(interval.clamp(1, MAX_POLL_INTERVAL_SECS))
+}
+
 pub async fn fetch_device_discovery(
     client: &Client,
     issuer: &str,
@@ -137,10 +233,14 @@ pub async fn fetch_device_discovery(
         .send()
         .await
         .context("Failed to fetch ZeroRouter OAuth discovery")?;
+    reject_redirect(response.status(), issuer, "discovery document")?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("ZeroRouter OAuth discovery failed ({status}): {body}");
+        anyhow::bail!(
+            "ZeroRouter OAuth discovery failed ({status}): {}",
+            sanitize_remote_detail(&body)
+        );
     }
     let parsed: DiscoveryResponse = response
         .json()
@@ -188,10 +288,14 @@ pub async fn start_device_flow(
         .send()
         .await
         .context("Failed to start ZeroRouter device-code flow")?;
+    reject_redirect(response.status(), issuer, "device authorization endpoint")?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("ZeroRouter device-code start failed ({status}): {body}");
+        anyhow::bail!(
+            "ZeroRouter device-code start failed ({status}): {}",
+            sanitize_remote_detail(&body)
+        );
     }
     let parsed: DeviceCodeResponse = response
         .json()
@@ -217,18 +321,55 @@ pub async fn start_device_flow(
 }
 
 /// Poll until approval. The returned string IS the minted `zcr_` API key.
+/// The advertised lifetime is capped at [`MAX_DEVICE_LIFETIME_SECS`].
 pub async fn poll_device_key(
     client: &Client,
+    issuer: &str,
     token_endpoint: &str,
     device: &ZerorouterDeviceStart,
 ) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(device.expires_in.max(1));
-    let mut interval = Duration::from_secs(device.interval.max(1));
+    poll_device_key_within(
+        client,
+        issuer,
+        token_endpoint,
+        device,
+        Duration::from_secs(MAX_DEVICE_LIFETIME_SECS),
+    )
+    .await
+}
+
+/// The polling loop with its lifetime ceiling supplied by the caller;
+/// [`poll_device_key`] is the production entry point and passes
+/// [`MAX_DEVICE_LIFETIME_SECS`]. Splitting the ceiling out keeps it a value
+/// rather than a hard-coded constant inside the loop, so the bound itself is
+/// exercisable rather than merely asserted.
+///
+/// The deadline is a bound on the whole loop, not just on the decision to
+/// sleep: it is re-derived before each sleep and again before each request,
+/// and it caps that request's own timeout. A router that stalls a response
+/// therefore cannot hold the CLI past the lifetime it advertised.
+pub(crate) async fn poll_device_key_within(
+    client: &Client,
+    issuer: &str,
+    token_endpoint: &str,
+    device: &ZerorouterDeviceStart,
+    max_lifetime: Duration,
+) -> Result<String> {
+    let deadline = Instant::now()
+        .checked_add(device_lifetime(device.expires_in, max_lifetime))
+        .context("ZeroRouter device authorization lifetime is not representable")?;
+    let mut interval = poll_interval(device.interval);
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             anyhow::bail!("ZeroRouter device authorization expired before approval");
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(interval.min(remaining)).await;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("ZeroRouter device authorization expired before approval");
+        }
 
         let form = [
             ("grant_type", DEVICE_CODE_GRANT_TYPE),
@@ -238,9 +379,11 @@ pub async fn poll_device_key(
         let response = client
             .post(token_endpoint)
             .form(&form)
+            .timeout(remaining)
             .send()
             .await
             .context("Failed to poll ZeroRouter device token endpoint")?;
+        reject_redirect(response.status(), issuer, "token endpoint")?;
 
         if response.status().is_success() {
             let parsed: TokenResponse = response
@@ -253,21 +396,31 @@ pub async fn poll_device_key(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let Ok(error) = serde_json::from_str::<OAuthErrorResponse>(&body) else {
-            anyhow::bail!("ZeroRouter device token poll failed ({status}): {body}");
+            anyhow::bail!(
+                "ZeroRouter device token poll failed ({status}): {}",
+                sanitize_remote_detail(&body)
+            );
         };
         match error.error.as_str() {
             "authorization_pending" => {}
             // RFC 8628 §3.5: back off by 5 seconds on slow_down.
-            "slow_down" => interval += Duration::from_secs(5),
+            "slow_down" => {
+                interval = interval
+                    .saturating_add(Duration::from_secs(5))
+                    .min(Duration::from_secs(MAX_POLL_INTERVAL_SECS));
+            }
             "access_denied" => anyhow::bail!("ZeroRouter device authorization was denied"),
             "expired_token" => {
                 anyhow::bail!("ZeroRouter device authorization expired before approval")
             }
+            // Every remaining arm reflects router-supplied text, so both the
+            // code and its description are sanitized and capped first.
             other => anyhow::bail!(
-                "ZeroRouter device token poll failed ({status}): {other}{}",
+                "ZeroRouter device token poll failed ({status}): {}{}",
+                sanitize_remote_detail(other),
                 error
                     .error_description
-                    .map(|detail| format!(" — {detail}"))
+                    .map(|detail| format!(" — {}", sanitize_remote_detail(&detail)))
                     .unwrap_or_default()
             ),
         }
@@ -277,6 +430,362 @@ pub async fn poll_device_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A host the flow must never reach. Counts connections and keeps every
+    /// body it was handed, so a test can assert on both.
+    #[derive(Default)]
+    struct OffOriginProbe {
+        hits: AtomicUsize,
+        bodies: Mutex<Vec<String>>,
+    }
+
+    async fn record_off_origin_request(
+        State(probe): State<Arc<OffOriginProbe>>,
+        body: String,
+    ) -> impl IntoResponse {
+        probe.hits.fetch_add(1, Ordering::SeqCst);
+        probe
+            .bodies
+            .lock()
+            .expect("off-origin probe bodies")
+            .push(body);
+        StatusCode::OK
+    }
+
+    async fn spawn_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        // Loopback, so the flow's HTTPS requirement does not apply — this is
+        // the self-hosted shape the origin check is written for.
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A same-origin endpoint that answers with a 307 to `target`: the exact
+    /// shape that preserves a POST body across hosts.
+    fn redirecting_router(path: &str, target: String) -> Router {
+        Router::new().route(
+            path,
+            post(move || {
+                let target = target.clone();
+                async move { (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]) }
+            }),
+        )
+    }
+
+    fn device_start(device_code: &str, expires_in: u64, interval: u64) -> ZerorouterDeviceStart {
+        ZerorouterDeviceStart {
+            device_code: device_code.to_string(),
+            user_code: "USER-CODE".to_string(),
+            verification_uri: "http://127.0.0.1/verify".to_string(),
+            verification_uri_complete: None,
+            expires_in,
+            interval,
+        }
+    }
+
+    #[tokio::test]
+    async fn off_origin_redirect_never_receives_the_device_start_body() {
+        let probe = Arc::new(OffOriginProbe::default());
+        let (off_origin, off_origin_server) = spawn_test_server(
+            Router::new()
+                .route("/auth/device/code", post(record_off_origin_request))
+                .with_state(Arc::clone(&probe)),
+        )
+        .await;
+        let (issuer, issuer_server) = spawn_test_server(redirecting_router(
+            "/auth/device/code",
+            format!("{off_origin}/auth/device/code"),
+        ))
+        .await;
+
+        let client = device_flow_client().expect("device-flow client");
+        let error = start_device_flow(
+            &client,
+            &issuer,
+            &format!("{issuer}/auth/device/code"),
+            "secret-machine-label",
+        )
+        .await
+        .expect_err("an off-origin redirect must not be followed");
+
+        assert_eq!(
+            probe.hits.load(Ordering::SeqCst),
+            0,
+            "the off-origin host was connected to despite the redirect being refused"
+        );
+        assert!(
+            probe
+                .bodies
+                .lock()
+                .expect("off-origin probe bodies")
+                .is_empty(),
+            "the off-origin host received a request body"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("redirect"),
+            "the refusal should name the redirect: {message}"
+        );
+        assert!(
+            !message.contains("secret-machine-label"),
+            "the key label must not be echoed back into the error: {message}"
+        );
+
+        issuer_server.abort();
+        off_origin_server.abort();
+    }
+
+    #[tokio::test]
+    async fn off_origin_redirect_never_receives_the_token_poll_body() {
+        let probe = Arc::new(OffOriginProbe::default());
+        let (off_origin, off_origin_server) = spawn_test_server(
+            Router::new()
+                .route("/token", post(record_off_origin_request))
+                .with_state(Arc::clone(&probe)),
+        )
+        .await;
+        let (issuer, issuer_server) =
+            spawn_test_server(redirecting_router("/token", format!("{off_origin}/token"))).await;
+
+        let client = device_flow_client().expect("device-flow client");
+        let device = device_start("secret-device-code", 60, 1);
+        let error = poll_device_key_within(
+            &client,
+            &issuer,
+            &format!("{issuer}/token"),
+            &device,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("an off-origin redirect must not be followed");
+
+        assert_eq!(
+            probe.hits.load(Ordering::SeqCst),
+            0,
+            "the off-origin host was connected to despite the redirect being refused"
+        );
+        assert!(
+            probe
+                .bodies
+                .lock()
+                .expect("off-origin probe bodies")
+                .is_empty(),
+            "the off-origin host received the device_code"
+        );
+        assert!(
+            !error.to_string().contains("secret-device-code"),
+            "the device code must not be echoed back into the error: {error}"
+        );
+
+        issuer_server.abort();
+        off_origin_server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_expires_in_terminates_instead_of_panicking() {
+        let (issuer, server) = spawn_test_server(Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "authorization_pending"})),
+                )
+            }),
+        ))
+        .await;
+
+        let client = device_flow_client().expect("device-flow client");
+        // The old code computed `Instant::now() + Duration::from_secs(expires_in)`,
+        // which panics for a value this size.
+        let device = device_start("device-code", u64::MAX, 1);
+        let error = poll_device_key_within(
+            &client,
+            &issuer,
+            &format!("{issuer}/token"),
+            &device,
+            Duration::from_millis(1500),
+        )
+        .await
+        .expect_err("an oversized lifetime must end the poll, not extend it");
+
+        assert!(
+            error.to_string().contains("expired"),
+            "expected a lifetime-expiry error, got: {error}"
+        );
+
+        server.abort();
+    }
+
+    /// The lifetime bounds the requests, not just the sleeps: once the
+    /// sleep lands on the deadline, no further poll may be issued. With a
+    /// 3s lifetime and a 1s interval there is room for polls at ~1s and
+    /// ~2s; the sleep that ends at ~3s must produce an expiry instead of a
+    /// third poll.
+    #[tokio::test]
+    async fn no_poll_is_issued_once_the_lifetime_is_spent() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (issuer, server) = spawn_test_server(
+            Router::new()
+                .route(
+                    "/token",
+                    post(|State(polls): State<Arc<AtomicUsize>>| async move {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": "authorization_pending"})),
+                        )
+                    }),
+                )
+                .with_state(Arc::clone(&polls)),
+        )
+        .await;
+
+        let client = device_flow_client().expect("device-flow client");
+        let device = device_start("device-code", 3600, 1);
+        let error = poll_device_key_within(
+            &client,
+            &issuer,
+            &format!("{issuer}/token"),
+            &device,
+            Duration::from_secs(3),
+        )
+        .await
+        .expect_err("the authorization must expire");
+
+        assert!(
+            error.to_string().contains("expired"),
+            "expected a lifetime-expiry error, got: {error}"
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) <= 2,
+            "a poll was issued after the authorization lifetime ran out ({} polls in 3s at a \
+             1s interval)",
+            polls.load(Ordering::SeqCst)
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_token_endpoint_cannot_outlive_the_authorization() {
+        let (issuer, server) = spawn_test_server(Router::new().route(
+            "/token",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                StatusCode::OK
+            }),
+        ))
+        .await;
+
+        let client = device_flow_client().expect("device-flow client");
+        let device = device_start("device-code", 3600, 1);
+        let started = Instant::now();
+        let error = poll_device_key_within(
+            &client,
+            &issuer,
+            &format!("{issuer}/token"),
+            &device,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a stalled token endpoint must not hang the login");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the poll outlived the 2s authorization by far too much: {elapsed:?} ({error})"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn device_lifetime_clamps_a_hostile_expires_in() {
+        let cap = Duration::from_secs(MAX_DEVICE_LIFETIME_SECS);
+        assert_eq!(device_lifetime(u64::MAX, cap), cap);
+        assert_eq!(device_lifetime(0, cap), Duration::from_secs(1));
+        assert_eq!(device_lifetime(60, cap), Duration::from_secs(60));
+        // The clamped value must stay addable to an Instant; the unclamped
+        // one is exactly what used to panic.
+        assert!(
+            Instant::now()
+                .checked_add(device_lifetime(u64::MAX, cap))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn poll_interval_is_clamped_at_both_ends() {
+        assert_eq!(poll_interval(0), Duration::from_secs(1));
+        assert_eq!(poll_interval(5), Duration::from_secs(5));
+        assert_eq!(
+            poll_interval(u64::MAX),
+            Duration::from_secs(MAX_POLL_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn remote_detail_is_stripped_and_capped() {
+        let escape = "\u{1b}[2Jwiped\nthe screen";
+        let cleaned = sanitize_remote_detail(escape);
+        assert!(
+            !cleaned.contains('\u{1b}'),
+            "ANSI escape survived: {cleaned}"
+        );
+        assert!(!cleaned.contains('\n'), "newline survived: {cleaned}");
+        assert!(cleaned.contains("wiped"));
+
+        let flood = "a".repeat(MAX_REMOTE_DETAIL_CHARS * 4);
+        let capped = sanitize_remote_detail(&flood);
+        assert!(
+            capped.chars().count() <= MAX_REMOTE_DETAIL_CHARS + " (truncated)".len(),
+            "detail was not capped: {} chars",
+            capped.chars().count()
+        );
+
+        assert_eq!(sanitize_remote_detail("   "), "<no detail>");
+    }
+
+    #[test]
+    fn issuers_match_compares_origins_not_strings() {
+        assert!(issuers_match(
+            "https://router.example.com",
+            "https://router.example.com/"
+        ));
+        assert!(issuers_match(
+            "https://Router.Example.com",
+            "https://router.example.com"
+        ));
+        assert!(issuers_match(
+            "https://router.example.com:443",
+            "https://router.example.com"
+        ));
+        assert!(!issuers_match(
+            "https://router-a.example.com",
+            "https://router-b.example.com"
+        ));
+        assert!(!issuers_match(
+            "http://localhost:8080",
+            "http://localhost:9090"
+        ));
+        assert!(!issuers_match(
+            "http://router.example.com",
+            "https://router.example.com"
+        ));
+    }
 
     #[test]
     fn issuer_derivation_strips_the_api_suffix() {
