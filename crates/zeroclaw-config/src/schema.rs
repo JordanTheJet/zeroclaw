@@ -16297,6 +16297,15 @@ pub struct SecurityConfig {
     /// The default is correct for deployments that run no NAT64 translator and
     /// for those that use only the well-known `64:ff9b::/96` prefix, which is
     /// classified without configuration.
+    ///
+    /// Declared prefixes may overlap, and an address inside several of them
+    /// decodes to a *different* IPv4 destination under each. Validation is
+    /// conservative: an address is accepted only when every declared
+    /// translation it matches lands somewhere acceptable, so a nested prefix
+    /// that decodes an address to a private or metadata destination denies it
+    /// even when a broader prefix decodes the same address globally. If that
+    /// refuses destinations you consider legitimate, narrow the declared
+    /// prefixes to the translations actually deployed.
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 

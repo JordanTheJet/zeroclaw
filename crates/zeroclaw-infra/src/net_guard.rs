@@ -537,15 +537,33 @@ pub fn parse_nat64_prefixes(prefixes: &[String], label: &str) -> anyhow::Result<
     Ok(parsed)
 }
 
-/// Decode `v6` under the first configured prefix that contains it, returning
-/// that prefix alongside the embedded IPv4 address.
-fn network_specific_embedded_ipv4(
+/// Decode `v6` under **every** configured prefix that contains it, yielding
+/// each such prefix alongside the IPv4 address it embeds.
+///
+/// Configured prefixes may overlap: a prefix is a CIDR range, so a declared
+/// `/96` can nest inside a declared `/32`, and one IPv6 address then sits in
+/// both. The two prefixes decode different octets, so they translate that one
+/// address to two *different* IPv4 destinations — for example
+/// `2001:67c:5db8:d822:1234:5678:a9fe:a9fe` decodes through `2001:67c::/32` to
+/// the global `93.184.216.34`, but through
+/// `2001:67c:5db8:d822:1234:5678::/96` to the metadata address
+/// `169.254.169.254`.
+///
+/// Both destinations are reachable, because the operator declared both
+/// translations. Stopping at the first containing prefix would therefore let
+/// the broader declaration vouch for an address that a more-specific
+/// declaration carries somewhere denied, so callers must evaluate every pair
+/// this yields and reject the address when *any* translation is denied.
+///
+/// Yields in the order the prefixes are supplied. For zero or one matching
+/// prefix this is exactly the single decode that prefix produces.
+fn network_specific_embedded_ipv4s(
     v6: std::net::Ipv6Addr,
     nat64_prefixes: &[Nat64Prefix],
-) -> Option<(Nat64Prefix, std::net::Ipv4Addr)> {
+) -> impl Iterator<Item = (Nat64Prefix, std::net::Ipv4Addr)> + '_ {
     nat64_prefixes
         .iter()
-        .find_map(|prefix| prefix.embedded_ipv4(v6).map(|v4| (*prefix, v4)))
+        .filter_map(move |prefix| prefix.embedded_ipv4(v6).map(|v4| (*prefix, v4)))
 }
 
 fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
@@ -594,10 +612,13 @@ fn nat64_metadata_block_error(
 /// Reject a resolution that contains any metadata or non-globally-routable
 /// address. This is the default post-resolution SSRF check.
 ///
-/// An IPv6 answer inside one of `nat64_prefixes` is classified twice: once as
-/// the literal address, and once as the IPv4 address the local translator
-/// would deliver it to. Both must be globally routable and neither may be a
-/// metadata address.
+/// An IPv6 answer inside one of `nat64_prefixes` is classified as the literal
+/// address, and again as the IPv4 address the local translator would deliver
+/// it to. All of those must be globally routable and none may be a metadata
+/// address. When configured prefixes overlap, an answer can sit inside several
+/// of them and decode to a *different* IPv4 destination under each; every such
+/// destination is reachable, so the answer is rejected when any one of them is
+/// denied rather than accepted on the first that happens to be acceptable.
 ///
 /// # DNS pinning
 ///
@@ -625,17 +646,20 @@ pub fn validate_resolved_ips_are_public(
             return Err(metadata_block_error(host, *ip));
         }
 
-        if let std::net::IpAddr::V6(v6) = ip
-            && let Some((prefix, embedded)) = network_specific_embedded_ipv4(*v6, nat64_prefixes)
-        {
-            if is_cloud_metadata_ip(std::net::IpAddr::V4(embedded)) {
-                return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
-            }
-            if is_non_global_v4(embedded) {
-                anyhow::bail!(
-                    "Blocked host '{host}' resolved to {v6}, which the configured NAT64 prefix \
-                     {prefix} translates to non-global address {embedded}"
-                );
+        if let std::net::IpAddr::V6(v6) = ip {
+            // Overlapping prefixes translate one address to several different
+            // destinations. Every one of them is reachable, so the address is
+            // accepted only when all of them are acceptable.
+            for (prefix, embedded) in network_specific_embedded_ipv4s(*v6, nat64_prefixes) {
+                if is_cloud_metadata_ip(std::net::IpAddr::V4(embedded)) {
+                    return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
+                }
+                if is_non_global_v4(embedded) {
+                    anyhow::bail!(
+                        "Blocked host '{host}' resolved to {v6}, which the configured NAT64 prefix \
+                         {prefix} translates to non-global address {embedded}"
+                    );
+                }
             }
         }
 
@@ -658,7 +682,9 @@ pub fn validate_resolved_ips_are_public(
 ///
 /// The private opt-in never extends to metadata addresses, so an IPv6 answer
 /// inside one of `nat64_prefixes` is rejected when the IPv4 address it embeds
-/// is a metadata address.
+/// is a metadata address. Overlapping prefixes decode one answer to several
+/// destinations; the answer is rejected when any of them is a metadata
+/// address.
 ///
 /// # DNS pinning
 ///
@@ -685,11 +711,15 @@ pub fn validate_resolved_ips_exclude_metadata(
             return Err(metadata_block_error(host, *ip));
         }
 
-        if let std::net::IpAddr::V6(v6) = ip
-            && let Some((prefix, embedded)) = network_specific_embedded_ipv4(*v6, nat64_prefixes)
-            && is_cloud_metadata_ip(std::net::IpAddr::V4(embedded))
-        {
-            return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
+        if let std::net::IpAddr::V6(v6) = ip {
+            // As in `validate_resolved_ips_are_public`: overlapping prefixes
+            // each declare a reachable translation, so any one of them
+            // reaching metadata refuses the address.
+            for (prefix, embedded) in network_specific_embedded_ipv4s(*v6, nat64_prefixes) {
+                if is_cloud_metadata_ip(std::net::IpAddr::V4(embedded)) {
+                    return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
+                }
+            }
         }
     }
 
@@ -1314,8 +1344,38 @@ mod tests {
     const GLOBAL_NAT64_96: &str = "2001:67c:2b0:db32:0:1::/96";
     const GLOBAL_NAT64_64: &str = "2001:67c:2b0:db32::/64";
 
+    /// A broad prefix and two more-specific prefixes nested inside it. One
+    /// IPv6 address can sit in the broad prefix and in one of the /96s at the
+    /// same time, and the two translations decode to different IPv4
+    /// destinations, so an address is only safe when *every* configured
+    /// translation that could carry it decodes to an acceptable destination.
+    const OVERLAP_BROAD_32: &str = "2001:67c::/32";
+    /// Nested in [`OVERLAP_BROAD_32`]; positioned so the broad prefix decodes
+    /// the shared address globally.
+    const OVERLAP_SPECIFIC_96: &str = "2001:67c:5db8:d822:1234:5678::/96";
+    /// Nested in [`OVERLAP_BROAD_32`]; positioned so the broad prefix decodes
+    /// the shared address to metadata instead.
+    const OVERLAP_MIRROR_SPECIFIC_96: &str = "2001:67c:a9fe:a9fe:1234:5678::/96";
+
     fn nat64(prefix: &str) -> Vec<Nat64Prefix> {
         parse_nat64_prefixes(&[prefix.to_string()], "test.nat64_prefixes").unwrap()
+    }
+
+    /// Build a prefix list in exactly the order given, bypassing the sort in
+    /// [`parse_nat64_prefixes`]. Both validators take a plain slice, so their
+    /// contract must not depend on the order the caller supplies; the overlap
+    /// regressions assert both orders to pin that.
+    fn nat64_in_order(prefixes: &[&str]) -> Vec<Nat64Prefix> {
+        prefixes
+            .iter()
+            .map(|entry| Nat64Prefix::parse(entry).unwrap())
+            .collect()
+    }
+
+    /// Every ordering of an overlapping pair, so a regression cannot pass by
+    /// happening to inspect the denied prefix first.
+    fn both_orders(a: &str, b: &str) -> [Vec<Nat64Prefix>; 2] {
+        [nat64_in_order(&[a, b]), nat64_in_order(&[b, a])]
     }
 
     fn ip(address: &str) -> std::net::IpAddr {
@@ -1623,6 +1683,151 @@ mod tests {
         assert!(
             validate_resolved_ips_are_public("cdn.test", &ips, &nat64(GLOBAL_NAT64_96)).is_ok()
         );
+    }
+
+    #[test]
+    fn overlapping_prefixes_are_sorted_broad_first_by_the_config_parser() {
+        // The premise the overlap regressions rest on: the canonical parsed
+        // list is sorted by network then prefix length, so the broad prefix is
+        // inspected first. Any check that stopped at the first containing
+        // prefix would therefore decide on the broad translation and never see
+        // the more-specific one the operator also declared.
+        let parsed = parse_nat64_prefixes(
+            &[
+                OVERLAP_SPECIFIC_96.to_string(),
+                OVERLAP_BROAD_32.to_string(),
+            ],
+            "test.nat64_prefixes",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string(), "2001:67c::/32");
+        assert_eq!(parsed[0].prefix_len(), 32);
+        assert_eq!(parsed[1].prefix_len(), 96);
+    }
+
+    #[test]
+    fn overlapping_prefixes_reject_when_a_specific_translation_is_metadata() {
+        // The reviewer's example. 2001:67c:5db8:d822:1234:5678:a9fe:a9fe is
+        // inside both configured prefixes: the /32 decodes it to the global
+        // 93.184.216.34, while the /96 decodes it to 169.254.169.254. The
+        // deployment declared both translations, so the metadata one is
+        // reachable and the address must be refused by both validators.
+        let address = "2001:67c:5db8:d822:1234:5678:a9fe:a9fe";
+        let ips = [ip(address)];
+
+        // The raw address is unremarkable: only the configured translation
+        // makes it dangerous.
+        assert!(!is_non_global_v6(address.parse::<Ipv6Addr>().unwrap()));
+        assert!(!is_cloud_metadata_ip(ips[0]));
+
+        for prefixes in both_orders(OVERLAP_BROAD_32, OVERLAP_SPECIFIC_96) {
+            let order: Vec<String> = prefixes.iter().map(ToString::to_string).collect();
+
+            let err = validate_resolved_ips_are_public("attacker.test", &ips, &prefixes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "are_public with prefixes {order:?} produced unexpected error: {err}"
+            );
+            assert!(
+                err.contains(OVERLAP_SPECIFIC_96),
+                "error must name the prefix whose translation was denied: {err}"
+            );
+
+            let err = validate_resolved_ips_exclude_metadata("attacker.test", &ips, &prefixes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "exclude_metadata with prefixes {order:?} produced unexpected error: {err}"
+            );
+            assert!(
+                err.contains(OVERLAP_SPECIFIC_96),
+                "error must name the prefix whose translation was denied: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_prefixes_reject_when_a_specific_translation_is_private() {
+        // Same overlap shape, but the more-specific translation reaches RFC
+        // 1918 space rather than metadata. Only the public validator refuses
+        // private destinations, so this case is asserted there alone.
+        let ips = [ip("2001:67c:5db8:d822:1234:5678:a00:1")];
+
+        for prefixes in both_orders(OVERLAP_BROAD_32, OVERLAP_SPECIFIC_96) {
+            let order: Vec<String> = prefixes.iter().map(ToString::to_string).collect();
+            let err = validate_resolved_ips_are_public("attacker.test", &ips, &prefixes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("non-global address 10.0.0.1"),
+                "are_public with prefixes {order:?} produced unexpected error: {err}"
+            );
+            assert!(
+                err.contains(OVERLAP_SPECIFIC_96),
+                "error must name the prefix whose translation was denied: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_prefixes_reject_when_the_broad_translation_is_denied() {
+        // The mirror of the reviewer's example: here the *specific* /96
+        // decodes 2001:67c:a9fe:a9fe:1234:5678:5db8:d822 to the global
+        // 93.184.216.34 while the broad /32 decodes it to 169.254.169.254.
+        // Rejection must not depend on which of the two overlapping prefixes
+        // carries the denied translation, nor on the order they are supplied.
+        let ips = [ip("2001:67c:a9fe:a9fe:1234:5678:5db8:d822")];
+        assert!(!is_cloud_metadata_ip(ips[0]));
+
+        for prefixes in both_orders(OVERLAP_BROAD_32, OVERLAP_MIRROR_SPECIFIC_96) {
+            let order: Vec<String> = prefixes.iter().map(ToString::to_string).collect();
+
+            for (validator, err) in [
+                (
+                    "are_public",
+                    validate_resolved_ips_are_public("attacker.test", &ips, &prefixes),
+                ),
+                (
+                    "exclude_metadata",
+                    validate_resolved_ips_exclude_metadata("attacker.test", &ips, &prefixes),
+                ),
+            ] {
+                let err = err.unwrap_err().to_string();
+                assert!(
+                    err.contains("cloud metadata address 169.254.169.254"),
+                    "{validator} with prefixes {order:?} produced unexpected error: {err}"
+                );
+                assert!(
+                    err.contains(OVERLAP_BROAD_32),
+                    "error must name the prefix whose translation was denied: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_prefixes_accept_when_every_translation_is_global() {
+        // Evaluating every matching prefix must not turn into blanket refusal
+        // of overlapping configurations: 2001:67c:5db8:d822:1234:5678:5db8:d822
+        // decodes to 93.184.216.34 under both prefixes, so both validators
+        // accept it.
+        let ips = [ip("2001:67c:5db8:d822:1234:5678:5db8:d822")];
+
+        for prefixes in both_orders(OVERLAP_BROAD_32, OVERLAP_SPECIFIC_96) {
+            let order: Vec<String> = prefixes.iter().map(ToString::to_string).collect();
+            assert!(
+                validate_resolved_ips_are_public("cdn.test", &ips, &prefixes).is_ok(),
+                "are_public must accept a doubly-global translation, prefixes {order:?}"
+            );
+            assert!(
+                validate_resolved_ips_exclude_metadata("cdn.test", &ips, &prefixes).is_ok(),
+                "exclude_metadata must accept a doubly-global translation, prefixes {order:?}"
+            );
+        }
     }
 
     #[test]
