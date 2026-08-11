@@ -16,8 +16,19 @@
 //! - [`host_matches_allowlist`]: match a request host against those entries.
 //! - [`is_cloud_metadata_ip`], [`is_private_or_local_host`], [`is_non_global_v4`],
 //!   [`is_non_global_v6`]: address-class classification.
+//! - [`Nat64Prefix`] / [`parse_nat64_prefixes`]: the operator-declared,
+//!   network-specific RFC 6052 NAT64 prefixes deployed on this host's network.
 //! - [`validate_resolved_ips_are_public`] /
 //!   [`validate_resolved_ips_exclude_metadata`]: post-resolution SSRF checks.
+//!
+//! # NAT64 and the validation boundary
+//!
+//! The address-class predicates are deliberately prefix-unaware: they know only
+//! the address forms that are the same on every network (IPv4-mapped, the
+//! deprecated IPv4-compatible form, 6to4, and the RFC 6052 *well-known* prefix
+//! `64:ff9b::/96`). A *network-specific* NAT64 prefix is chosen per deployment
+//! and cannot be inferred from an address, so it is supplied by the caller and
+//! consulted by the validators, which are the actual egress boundary.
 
 // ── allowlist normalization ───────────────────────────────────────
 // Operator-authored entries may be written as bare hosts, bracketed IPv6,
@@ -355,6 +366,188 @@ pub fn is_known_cloud_metadata_endpoint(ip: std::net::IpAddr) -> bool {
     }
 }
 
+// ── network-specific NAT64 prefixes (RFC 6052) ────────────────────
+// A NAT64 translator rewrites an IPv6 destination inside its configured
+// prefix to the IPv4 address embedded in that destination. The prefix is a
+// deployment choice, so an attacker who controls a hostname's DNS answer can
+// return an apparently-global IPv6 address that the local translator delivers
+// to `10.0.0.1` or `169.254.169.254`. Nothing in the address itself reveals
+// this, so operators declare the prefixes their network actually runs and the
+// validators classify the embedded destination as well as the raw address.
+
+/// The six prefix lengths RFC 6052 §2.2 defines for IPv4-embedded IPv6
+/// addresses. No other length is a valid NAT64 prefix.
+const RFC6052_PREFIX_LENGTHS: [u8; 6] = [32, 40, 48, 56, 64, 96];
+
+/// One operator-declared, network-specific NAT64 prefix.
+///
+/// Construct with [`Nat64Prefix::parse`] (or [`parse_nat64_prefixes`] for a
+/// whole configured list); there is no other constructor, so a value of this
+/// type is always one of the six RFC 6052 §2.2 prefix lengths with no bits set
+/// beyond that length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Nat64Prefix {
+    network: std::net::Ipv6Addr,
+    len: u8,
+}
+
+impl std::fmt::Display for Nat64Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.len)
+    }
+}
+
+impl Nat64Prefix {
+    /// Parse one `<ipv6>/<len>` entry, for example `"2001:db8:122:344::/96"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the problem when the entry has no `/`, does
+    /// not parse as an IPv6 address, uses a prefix length outside
+    /// RFC 6052 §2.2's `/32`, `/40`, `/48`, `/56`, `/64`, `/96`, or sets any
+    /// bit beyond the prefix length.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            anyhow::bail!("NAT64 prefix is empty");
+        }
+
+        let (address, length) = entry
+            .split_once('/')
+            .ok_or_else(|| anyhow::Error::msg("missing '/<prefix-length>'"))?;
+
+        let network = address
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|e| anyhow::Error::msg(format!("'{address}' is not an IPv6 address: {e}")))?;
+        let len = length
+            .parse::<u8>()
+            .map_err(|e| anyhow::Error::msg(format!("'{length}' is not a prefix length: {e}")))?;
+
+        if !RFC6052_PREFIX_LENGTHS.contains(&len) {
+            anyhow::bail!(
+                "prefix length /{len} is not one of the RFC 6052 lengths /32, /40, /48, /56, /64, /96"
+            );
+        }
+
+        // `len` is at most 96 here, so the shift is always in range.
+        let host_bits = u128::MAX >> len;
+        if u128::from_be_bytes(network.octets()) & host_bits != 0 {
+            anyhow::bail!("address '{address}' sets bits beyond /{len}");
+        }
+
+        Ok(Self { network, len })
+    }
+
+    /// The prefix length in bits.
+    #[must_use]
+    pub const fn prefix_len(&self) -> u8 {
+        self.len
+    }
+
+    /// The prefix network address, with all bits beyond [`Self::prefix_len`]
+    /// zero.
+    #[must_use]
+    pub const fn network(&self) -> std::net::Ipv6Addr {
+        self.network
+    }
+
+    /// Decode the IPv4 address `v6` embeds under this prefix, or `None` when
+    /// `v6` is not inside the prefix.
+    ///
+    /// The layouts are RFC 6052 §2.2's: the embedded IPv4 octets follow the
+    /// prefix and skip octet 8, the "u" octet, for every length below `/96`.
+    ///
+    /// # The u-octet is decoded regardless of its value
+    ///
+    /// RFC 6052 requires a *translator* to set octet 8 to zero, and §3.1 says
+    /// an address whose u-octet is non-zero is not a valid IPv4-embedded
+    /// address. This decoder deliberately ignores that rule, because here the
+    /// address comes from a DNS answer the attacker writes, not from a
+    /// translator. Requiring `u == 0` would classify
+    /// `<prefix>:ff:a:0:100::`-style answers as opaque IPv6 while a permissive
+    /// translator still delivered them to the embedded IPv4 destination — a
+    /// bypass. Decoding unconditionally can only over-approximate what the
+    /// translator reaches, which is the safe direction for a deny boundary.
+    #[must_use]
+    pub fn embedded_ipv4(&self, v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+        // `len` is at most 96, so the shift is always in range.
+        let prefix_mask = !(u128::MAX >> self.len);
+        if u128::from_be_bytes(v6.octets()) & prefix_mask
+            != u128::from_be_bytes(self.network.octets())
+        {
+            return None;
+        }
+
+        let o = v6.octets();
+        let embedded = match self.len {
+            32 => [o[4], o[5], o[6], o[7]],
+            40 => [o[5], o[6], o[7], o[9]],
+            48 => [o[6], o[7], o[9], o[10]],
+            56 => [o[7], o[9], o[10], o[11]],
+            64 => [o[9], o[10], o[11], o[12]],
+            96 => [o[12], o[13], o[14], o[15]],
+            // Unreachable: `parse` is the only constructor and restricts `len`
+            // to RFC6052_PREFIX_LENGTHS. Returning `None` keeps the guard
+            // total instead of panicking if that ever stops holding.
+            _ => return None,
+        };
+        Some(std::net::Ipv4Addr::from(embedded))
+    }
+}
+
+/// Parse a whole operator-authored NAT64 prefix list, sorted and deduplicated.
+///
+/// `label` names the configuration surface in the error message so the
+/// operator can find the offending entry (for example
+/// `"security.nat64_prefixes"`).
+///
+/// # Errors
+///
+/// Returns an error naming every rejected entry, with the reason it was
+/// rejected, when one or more entries fail [`Nat64Prefix::parse`].
+///
+/// A malformed list is never silently reduced to its well-formed subset. One
+/// bad entry rejects the whole list so that a typo fails the caller closed
+/// instead of quietly narrowing the validation boundary — a list that parsed
+/// to "no prefixes" would look exactly like a deployment that runs no NAT64
+/// translator, and would disable network-specific classification without any
+/// signal.
+pub fn parse_nat64_prefixes(prefixes: &[String], label: &str) -> anyhow::Result<Vec<Nat64Prefix>> {
+    let mut parsed = Vec::with_capacity(prefixes.len());
+    let mut rejected = Vec::new();
+
+    for entry in prefixes {
+        match Nat64Prefix::parse(entry) {
+            Ok(prefix) => parsed.push(prefix),
+            Err(err) => rejected.push(format!("'{entry}' ({err})")),
+        }
+    }
+
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid {label} entry(s): [{}]. Each entry must be an RFC 6052 NAT64 prefix written \
+             as <ipv6>/<length> with a length of 32, 40, 48, 56, 64, or 96 and no bits set beyond \
+             it, for example \"2001:db8:122:344::/96\".",
+            rejected.join(", ")
+        );
+    }
+
+    parsed.sort_unstable();
+    parsed.dedup();
+    Ok(parsed)
+}
+
+/// Decode `v6` under the first configured prefix that contains it, returning
+/// that prefix alongside the embedded IPv4 address.
+fn network_specific_embedded_ipv4(
+    v6: std::net::Ipv6Addr,
+    nat64_prefixes: &[Nat64Prefix],
+) -> Option<(Nat64Prefix, std::net::Ipv4Addr)> {
+    nat64_prefixes
+        .iter()
+        .find_map(|prefix| prefix.embedded_ipv4(v6).map(|v4| (*prefix, v4)))
+}
+
 fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
     if is_known_cloud_metadata_endpoint(ip) {
         anyhow::Error::msg(format!(
@@ -368,13 +561,43 @@ fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
     }
 }
 
+fn nat64_metadata_block_error(
+    host: &str,
+    resolved: std::net::Ipv6Addr,
+    prefix: Nat64Prefix,
+    embedded: std::net::Ipv4Addr,
+) -> anyhow::Error {
+    if is_known_cloud_metadata_endpoint(std::net::IpAddr::V4(embedded)) {
+        anyhow::Error::msg(format!(
+            "Blocked host '{host}' resolved to {resolved}, which the configured NAT64 prefix \
+             {prefix} translates to cloud metadata address {embedded}"
+        ))
+    } else {
+        anyhow::Error::msg(format!(
+            "Blocked host '{host}' resolved to {resolved}, which the configured NAT64 prefix \
+             {prefix} translates to link-local address {embedded}; this range is blocked \
+             unconditionally because cloud metadata services are hosted in 169.254.0.0/16"
+        ))
+    }
+}
+
 // ── resolved-address validation ───────────────────────────────────
 // These helpers only classify the supplied answer. To prevent DNS rebinding,
 // callers must connect to the exact addresses they validated rather than
 // resolving the hostname again.
+//
+// Both validators take the deployment's network-specific NAT64 prefixes
+// (see [`Nat64Prefix`]). Pass an empty slice when the host runs no NAT64
+// translator, or only the well-known `64:ff9b::/96` prefix, which the
+// address-class predicates already decode.
 
 /// Reject a resolution that contains any metadata or non-globally-routable
 /// address. This is the default post-resolution SSRF check.
+///
+/// An IPv6 answer inside one of `nat64_prefixes` is classified twice: once as
+/// the literal address, and once as the IPv4 address the local translator
+/// would deliver it to. Both must be globally routable and neither may be a
+/// metadata address.
 ///
 /// # DNS pinning
 ///
@@ -386,10 +609,12 @@ fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
 /// # Errors
 ///
 /// Returns an error when `ips` is empty, contains a known cloud metadata
-/// address, or contains any non-globally-routable address.
+/// address, or contains any non-globally-routable address — including one
+/// reached through a configured NAT64 prefix.
 pub fn validate_resolved_ips_are_public(
     host: &str,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[Nat64Prefix],
 ) -> anyhow::Result<()> {
     if ips.is_empty() {
         anyhow::bail!("Failed to resolve host '{host}'");
@@ -398,6 +623,20 @@ pub fn validate_resolved_ips_are_public(
     for ip in ips {
         if is_cloud_metadata_ip(*ip) {
             return Err(metadata_block_error(host, *ip));
+        }
+
+        if let std::net::IpAddr::V6(v6) = ip
+            && let Some((prefix, embedded)) = network_specific_embedded_ipv4(*v6, nat64_prefixes)
+        {
+            if is_cloud_metadata_ip(std::net::IpAddr::V4(embedded)) {
+                return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
+            }
+            if is_non_global_v4(embedded) {
+                anyhow::bail!(
+                    "Blocked host '{host}' resolved to {v6}, which the configured NAT64 prefix \
+                     {prefix} translates to non-global address {embedded}"
+                );
+            }
         }
 
         let non_global = match ip {
@@ -417,6 +656,10 @@ pub fn validate_resolved_ips_are_public(
 /// operator opt-in for private destinations; the known metadata endpoints
 /// remain blocked regardless.
 ///
+/// The private opt-in never extends to metadata addresses, so an IPv6 answer
+/// inside one of `nat64_prefixes` is rejected when the IPv4 address it embeds
+/// is a metadata address.
+///
 /// # DNS pinning
 ///
 /// This function validates only the supplied DNS answer. After it succeeds,
@@ -427,10 +670,11 @@ pub fn validate_resolved_ips_are_public(
 /// # Errors
 ///
 /// Returns an error when `ips` is empty or contains a known cloud metadata
-/// address.
+/// address — including one reached through a configured NAT64 prefix.
 pub fn validate_resolved_ips_exclude_metadata(
     host: &str,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[Nat64Prefix],
 ) -> anyhow::Result<()> {
     if ips.is_empty() {
         anyhow::bail!("Failed to resolve host '{host}'");
@@ -439,6 +683,13 @@ pub fn validate_resolved_ips_exclude_metadata(
     for ip in ips {
         if is_cloud_metadata_ip(*ip) {
             return Err(metadata_block_error(host, *ip));
+        }
+
+        if let std::net::IpAddr::V6(v6) = ip
+            && let Some((prefix, embedded)) = network_specific_embedded_ipv4(*v6, nat64_prefixes)
+            && is_cloud_metadata_ip(std::net::IpAddr::V4(embedded))
+        {
+            return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
         }
     }
 
@@ -874,7 +1125,7 @@ mod tests {
     #[test]
     fn validate_resolved_ips_blocks_private_resolution() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))];
-        let err = validate_resolved_ips_are_public("example.com", &ips)
+        let err = validate_resolved_ips_are_public("example.com", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -898,7 +1149,7 @@ mod tests {
             "fec0::1",
         ] {
             let ips = [address.parse().unwrap()];
-            let err = validate_resolved_ips_are_public("example.test", &ips)
+            let err = validate_resolved_ips_are_public("example.test", &ips, &[])
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -913,7 +1164,7 @@ mod tests {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
-        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -925,11 +1176,14 @@ mod tests {
     #[test]
     fn validate_resolved_ips_labels_plain_apipa_as_link_local() {
         for validate in [
-            validate_resolved_ips_are_public as fn(&str, &[std::net::IpAddr]) -> anyhow::Result<()>,
+            validate_resolved_ips_are_public
+                as fn(&str, &[std::net::IpAddr], &[Nat64Prefix]) -> anyhow::Result<()>,
             validate_resolved_ips_exclude_metadata,
         ] {
             let ips = ["169.254.12.7".parse().unwrap()];
-            let err = validate("printer.local", &ips).unwrap_err().to_string();
+            let err = validate("printer.local", &ips, &[])
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("link-local address"),
                 "unexpected error: {err}"
@@ -942,7 +1196,7 @@ mod tests {
     #[test]
     fn validate_resolved_ips_blocks_mapped_metadata_even_for_private_opt_in() {
         let ips = ["::ffff:169.254.169.254".parse().unwrap()];
-        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -968,7 +1222,7 @@ mod tests {
             "fd20:ce::254",
         ] {
             let ips = [address.parse().unwrap()];
-            let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips, &[])
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -981,7 +1235,7 @@ mod tests {
     #[test]
     fn validate_resolved_ips_blocks_ec2_ipv6_metadata_even_for_private_opt_in() {
         let ips = ["fd00:ec2::254".parse().unwrap()];
-        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -995,7 +1249,7 @@ mod tests {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
-        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+        let err = validate_resolved_ips_are_public("metadata.test", &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -1031,5 +1285,355 @@ mod tests {
         // RFC 2544 benchmarking range (198.18.0.0/15)
         assert!(is_non_global_v4(Ipv4Addr::new(198, 18, 0, 1)));
         assert!(is_non_global_v4(Ipv4Addr::new(198, 19, 255, 255)));
+    }
+
+    // ── network-specific NAT64 prefixes (RFC 6052) ────────────────
+
+    /// RFC 6052 §2.4's own worked example: 192.0.2.33 encoded under one
+    /// prefix of each defined length. Decoding each back to 192.0.2.33 is the
+    /// conformance test for the octet layouts in [`Nat64Prefix::embedded_ipv4`].
+    const RFC6052_SECTION_2_4_VECTORS: [(&str, &str); 6] = [
+        ("2001:db8::/32", "2001:db8:c000:221::"),
+        ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+        ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+        ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+        ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100::"),
+        ("2001:db8:122:344::/96", "2001:db8:122:344::c000:221"),
+    ];
+
+    /// The prefix the reviewer named for the private/metadata regressions.
+    /// Lives in the IPv6 documentation range, so `is_non_global_v6` already
+    /// rejects it for the *public* validator; it exercises the metadata
+    /// validator, where no non-global classification runs.
+    const DOC_NAT64_96: &str = "2001:db8:122:344::/96";
+
+    /// A globally-classified NAT64 prefix, the shape a real deployment uses.
+    /// Needed for the public-validator regressions: under a documentation
+    /// prefix that validator rejects for an unrelated reason, so a regression
+    /// written there would pass with the NAT64 decode removed.
+    const GLOBAL_NAT64_96: &str = "2001:67c:2b0:db32:0:1::/96";
+    const GLOBAL_NAT64_64: &str = "2001:67c:2b0:db32::/64";
+
+    fn nat64(prefix: &str) -> Vec<Nat64Prefix> {
+        parse_nat64_prefixes(&[prefix.to_string()], "test.nat64_prefixes").unwrap()
+    }
+
+    fn ip(address: &str) -> std::net::IpAddr {
+        address.parse().unwrap()
+    }
+
+    #[test]
+    fn nat64_prefix_decodes_rfc6052_section_2_4_vectors() {
+        let expected = Ipv4Addr::new(192, 0, 2, 33);
+        for (prefix, encoded) in RFC6052_SECTION_2_4_VECTORS {
+            let parsed = Nat64Prefix::parse(prefix).unwrap();
+            let address = encoded.parse::<Ipv6Addr>().unwrap();
+            assert_eq!(
+                parsed.embedded_ipv4(address),
+                Some(expected),
+                "RFC 6052 §2.4 vector {encoded} under {prefix} must decode to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_prefix_parse_accepts_every_rfc6052_length() {
+        for (prefix, _) in RFC6052_SECTION_2_4_VECTORS {
+            let parsed = Nat64Prefix::parse(prefix).unwrap();
+            assert_eq!(parsed.to_string(), prefix);
+        }
+        let parsed = Nat64Prefix::parse("  2001:db8:122:344::/96  ").unwrap();
+        assert_eq!(parsed.prefix_len(), 96);
+        assert_eq!(
+            parsed.network(),
+            "2001:db8:122:344::".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn nat64_prefix_parse_rejects_lengths_outside_rfc6052() {
+        for prefix in [
+            "2001:db8::/0",
+            "2001:db8::/24",
+            "2001:db8::/33",
+            "2001:db8::/47",
+            "2001:db8::/72",
+            "2001:db8::/80",
+            "2001:db8::/97",
+            "2001:db8::/128",
+            "2001:db8::/255",
+        ] {
+            let err = Nat64Prefix::parse(prefix).unwrap_err().to_string();
+            assert!(
+                err.contains("RFC 6052 lengths") || err.contains("not a prefix length"),
+                "{prefix} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_prefix_parse_rejects_bits_beyond_the_prefix_length() {
+        for prefix in [
+            "2001:db8:c000::/32",
+            "2001:db8:1c0::/40",
+            "2001:db8:122:c000::/48",
+            "2001:db8:122:3c0::/56",
+            "2001:db8:122:344:c0::/64",
+            "2001:db8:122:344::c000:221/96",
+        ] {
+            let err = Nat64Prefix::parse(prefix).unwrap_err().to_string();
+            assert!(
+                err.contains("sets bits beyond"),
+                "{prefix} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_prefix_parse_rejects_malformed_entries() {
+        for prefix in [
+            "",
+            "   ",
+            "2001:db8:122:344::",
+            "/96",
+            "not-an-address/96",
+            "10.0.0.0/96",
+            "2001:db8:122:344::/",
+            "2001:db8:122:344::/ninety-six",
+            "2001:db8:122:344::/96/96",
+            "[2001:db8:122:344::]/96",
+        ] {
+            assert!(
+                Nat64Prefix::parse(prefix).is_err(),
+                "malformed entry {prefix:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_nat64_prefixes_rejects_the_whole_list_when_any_entry_is_malformed() {
+        // Regression for the sibling-PR bug where a filter_map silently
+        // dropped malformed entries: one typo emptied the list and disabled
+        // network-specific NAT64 classification with no signal. Malformed
+        // configuration must fail closed, never degrade.
+        let err = parse_nat64_prefixes(
+            &[
+                "2001:db8:122:344::/96".to_string(),
+                "2001:db8::/33".to_string(),
+            ],
+            "security.nat64_prefixes",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("Invalid security.nat64_prefixes entry"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("2001:db8::/33"),
+            "error must name the rejected entry: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_nat64_prefixes_accepts_empty_and_deduplicates() {
+        assert!(
+            parse_nat64_prefixes(&[], "security.nat64_prefixes")
+                .unwrap()
+                .is_empty()
+        );
+
+        let parsed = parse_nat64_prefixes(
+            &[
+                "2001:db8:122:344::/96".to_string(),
+                "2001:db8:122:344::/96".to_string(),
+                "2001:db8::/32".to_string(),
+            ],
+            "security.nat64_prefixes",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn nat64_prefix_decode_ignores_the_u_octet_value() {
+        // RFC 6052 tells translators to zero octet 8, but the DNS answer is
+        // attacker-authored, not translator-authored. Requiring u == 0 would
+        // let a non-zero u-octet slip past classification while a permissive
+        // translator still delivered the packet to the embedded IPv4.
+        let prefix = Nat64Prefix::parse(GLOBAL_NAT64_64).unwrap();
+        let expected = Ipv4Addr::new(10, 0, 0, 1);
+
+        let zero_u = "2001:67c:2b0:db32:a:0:100:0".parse::<Ipv6Addr>().unwrap();
+        assert_eq!(prefix.embedded_ipv4(zero_u), Some(expected));
+
+        for nonzero_u in [
+            "2001:67c:2b0:db32:ff0a:0:100:0",
+            "2001:67c:2b0:db32:100a:0:100:0",
+            "2001:67c:2b0:db32:10a:0:100:0",
+        ] {
+            let address = nonzero_u.parse::<Ipv6Addr>().unwrap();
+            assert_eq!(
+                prefix.embedded_ipv4(address),
+                Some(expected),
+                "{nonzero_u} must decode to {expected} regardless of the u-octet"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_prefix_does_not_decode_addresses_outside_the_prefix() {
+        let prefix = Nat64Prefix::parse(GLOBAL_NAT64_96).unwrap();
+        for outside in [
+            "2001:67c:2b0:db33:0:1:a00:1",
+            "2001:67c:2b0:db32:0:2:a00:1",
+            "2606:4700:4700::1111",
+            "64:ff9b::10.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            let address = outside.parse::<Ipv6Addr>().unwrap();
+            assert_eq!(
+                prefix.embedded_ipv4(address),
+                None,
+                "{outside} is outside {prefix} and must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_prefixes_do_not_change_prefix_unaware_classification() {
+        // The predicates stay pure: only the validators consult the prefixes.
+        let inside = "2001:67c:2b0:db32:0:1:a00:1".parse::<Ipv6Addr>().unwrap();
+        assert!(!is_non_global_v6(inside));
+        assert!(!is_cloud_metadata_ip(std::net::IpAddr::V6(inside)));
+
+        let metadata = "2001:67c:2b0:db32:0:1:a9fe:a9fe"
+            .parse::<Ipv6Addr>()
+            .unwrap();
+        assert!(!is_cloud_metadata_ip(std::net::IpAddr::V6(metadata)));
+    }
+
+    #[test]
+    fn validate_resolved_ips_are_public_blocks_private_v4_behind_network_specific_prefix() {
+        // The attack: an attacker-controlled name resolves to an
+        // apparently-global IPv6 address that the deployment's NAT64
+        // translator delivers to 10.0.0.1.
+        for (prefix, address) in [
+            (GLOBAL_NAT64_96, "2001:67c:2b0:db32:0:1:a00:1"),
+            (GLOBAL_NAT64_64, "2001:67c:2b0:db32:a:0:100:0"),
+        ] {
+            let ips = [ip(address)];
+            let err = validate_resolved_ips_are_public("attacker.test", &ips, &nat64(prefix))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("non-global address 10.0.0.1"),
+                "{address} under {prefix} produced unexpected error: {err}"
+            );
+            assert!(err.contains(prefix), "error must name the prefix: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_resolved_ips_are_public_blocks_metadata_v4_behind_network_specific_prefix() {
+        let ips = [ip("2001:67c:2b0:db32:0:1:a9fe:a9fe")];
+        let err = validate_resolved_ips_are_public("attacker.test", &ips, &nat64(GLOBAL_NAT64_96))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address 169.254.169.254"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_exclude_metadata_blocks_metadata_v4_behind_network_specific_prefix() {
+        // The private opt-in never re-opens metadata, so this holds under the
+        // reviewer's documentation-range prefix too: this validator runs no
+        // non-global classification that could mask the NAT64 decode.
+        for prefix in [DOC_NAT64_96, GLOBAL_NAT64_96] {
+            let address = if prefix == DOC_NAT64_96 {
+                "2001:db8:122:344::a9fe:a9fe"
+            } else {
+                "2001:67c:2b0:db32:0:1:a9fe:a9fe"
+            };
+            let ips = [ip(address)];
+            let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips, &nat64(prefix))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "{address} under {prefix} produced unexpected error: {err}"
+            );
+            assert!(err.contains(prefix), "error must name the prefix: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_resolved_ips_exclude_metadata_blocks_plain_link_local_behind_prefix() {
+        let ips = [ip("2001:67c:2b0:db32:0:1:a9fe:c07")];
+        let err =
+            validate_resolved_ips_exclude_metadata("printer.test", &ips, &nat64(GLOBAL_NAT64_96))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("link-local address 169.254.12.7"), "{err}");
+        assert!(err.contains("blocked unconditionally"), "{err}");
+        assert!(!err.contains("cloud metadata address"), "{err}");
+    }
+
+    #[test]
+    fn network_specific_nat64_addresses_pass_when_no_prefix_is_configured() {
+        // Honest boundary documentation: without the operator declaring the
+        // prefix, nothing in these addresses marks them as NAT64, and both
+        // validators accept them. This is the hole the config key closes, and
+        // the reason the key exists at all.
+        let private_behind_global_prefix = [ip("2001:67c:2b0:db32:0:1:a00:1")];
+        assert!(
+            validate_resolved_ips_are_public("attacker.test", &private_behind_global_prefix, &[])
+                .is_ok()
+        );
+        assert!(
+            validate_resolved_ips_exclude_metadata(
+                "attacker.test",
+                &private_behind_global_prefix,
+                &[]
+            )
+            .is_ok()
+        );
+
+        let metadata_behind_doc_prefix = [ip("2001:db8:122:344::a9fe:a9fe")];
+        assert!(
+            validate_resolved_ips_exclude_metadata(
+                "metadata.test",
+                &metadata_behind_doc_prefix,
+                &[]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_are_public_allows_global_v4_behind_network_specific_prefix() {
+        // 93.184.216.34 is a genuinely global IPv4. RFC 6052's own example
+        // address, 192.0.2.33, is documentation space and non-global, so it
+        // cannot be used to show an accepted destination.
+        assert!(!is_non_global_v4(Ipv4Addr::new(93, 184, 216, 34)));
+        let ips = [ip("2001:67c:2b0:db32:0:1:5db8:d822")];
+        assert!(
+            validate_resolved_ips_are_public("cdn.test", &ips, &nat64(GLOBAL_NAT64_96)).is_ok()
+        );
+    }
+
+    #[test]
+    fn configured_prefix_does_not_relax_the_well_known_prefix_or_raw_classification() {
+        let prefixes = nat64(GLOBAL_NAT64_96);
+        for address in ["64:ff9b::10.0.0.1", "::ffff:169.254.169.254", "2001:db8::1"] {
+            let ips = [ip(address)];
+            assert!(
+                validate_resolved_ips_are_public("example.test", &ips, &prefixes).is_err(),
+                "{address} must stay blocked with a network-specific prefix configured"
+            );
+        }
     }
 }

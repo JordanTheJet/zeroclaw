@@ -25,6 +25,10 @@ pub struct HttpRequestTool {
     timeout_secs: u64,
     allow_private_hosts: bool,
     allowed_private_hosts: Vec<String>,
+    /// Network-specific NAT64 prefixes this deployment's translator serves.
+    /// Snapshotted at construction like `allowed_domains`; an IPv6 answer
+    /// inside one of them is classified by the IPv4 address it embeds.
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
     config_path: Option<PathBuf>,
     secrets_encrypt: bool,
 }
@@ -51,6 +55,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -65,6 +70,10 @@ impl HttpRequestTool {
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
             )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
             config_path: None,
             secrets_encrypt: false,
         })
@@ -76,6 +85,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
         config_path: PathBuf,
         secrets_encrypt: bool,
     ) -> anyhow::Result<Self> {
@@ -91,6 +101,10 @@ impl HttpRequestTool {
             allowed_private_hosts: domain_guard::normalize_allowed_domains(
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
+            )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
             )?,
             config_path: Some(config_path),
             secrets_encrypt,
@@ -203,6 +217,7 @@ impl HttpRequestTool {
                 .iter()
                 .map(|addr| addr.ip())
                 .collect::<Vec<_>>(),
+            &self.nat64_prefixes,
         )?;
 
         Ok(ValidatedHttpRequestTarget {
@@ -768,11 +783,12 @@ fn validate_resolved_ips_for_ssrf(
     host: &str,
     private_resolution_allowed: bool,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<()> {
     if private_resolution_allowed {
-        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips, nat64_prefixes)
     } else {
-        domain_guard::validate_resolved_ips_are_public(host, ips)
+        domain_guard::validate_resolved_ips_are_public(host, ips, nat64_prefixes)
     }
 }
 
@@ -801,6 +817,35 @@ mod tests {
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<&str>,
     ) -> HttpRequestTool {
+        test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            Vec::new(),
+        )
+    }
+
+    fn test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> HttpRequestTool {
+        try_test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            nat64_prefixes,
+        )
+        .unwrap()
+    }
+
+    fn try_test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> anyhow::Result<HttpRequestTool> {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -815,8 +860,8 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            nat64_prefixes.into_iter().map(String::from).collect(),
         )
-        .unwrap()
     }
 
     fn test_tool_with_auth_config(config_path: PathBuf, secrets_encrypt: bool) -> HttpRequestTool {
@@ -830,6 +875,7 @@ mod tests {
             1_000_000,
             30,
             false,
+            Vec::new(),
             Vec::new(),
             config_path,
             secrets_encrypt,
@@ -911,6 +957,7 @@ api_token = "Bearer from-disk"
             1_000_000,
             30,
             false,
+            Vec::new(),
             Vec::new(),
             config_path,
             false,
@@ -1018,6 +1065,7 @@ api_token = "{encrypted}"
             30,
             false,
             Vec::new(),
+            Vec::new(),
             config_path,
             true,
         )
@@ -1118,6 +1166,7 @@ api_token = "Bearer from-secret"
             1_000_000,
             5,
             true,
+            Vec::new(),
             Vec::new(),
             config_path,
             false,
@@ -1245,8 +1294,16 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new()).unwrap();
+        let tool = HttpRequestTool::new(
+            security,
+            vec![],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -1286,6 +1343,7 @@ api_token = "Bearer from-secret"
             30,
             false,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let result = tool
@@ -1312,6 +1370,7 @@ api_token = "Bearer from-secret"
             30,
             false,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let text = "hello world this is long";
@@ -1329,6 +1388,7 @@ api_token = "Bearer from-secret"
             30,
             false,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let text = "a".repeat(10_000_000);
@@ -1343,6 +1403,7 @@ api_token = "Bearer from-secret"
             5,
             30,
             false,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -1807,7 +1868,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_blocked_by_default() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1820,7 +1881,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_allowed_with_private_carveout() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips).is_ok());
+        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips, &[]).is_ok());
     }
 
     #[test]
@@ -1828,7 +1889,7 @@ api_token = "Bearer from-secret"
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
-        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips)
+        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1918,6 +1979,7 @@ api_token = "Bearer from-secret"
             5,         // timeout_secs
             true,      // allow_private_hosts
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -1939,5 +2001,104 @@ api_token = "Bearer from-secret"
             Ok(Err(_)) => {} // validation/network error — acceptable
             Err(_) => {}    // timeout — IPv6 connectivity may be unavailable
         }
+    }
+
+    /// A globally-classified NAT64 prefix, the shape a real deployment uses.
+    /// The IPv6 documentation range is itself non-global, so a documentation
+    /// prefix would be rejected for an unrelated reason and prove nothing
+    /// about the NAT64 decode.
+    const TEST_NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+    /// `TEST_NAT64_PREFIX` with 10.0.0.1 embedded per RFC 6052 §2.2.
+    const NAT64_PRIVATE_V4: &str = "2001:67c:2b0:db32:0:1:a00:1";
+    /// `TEST_NAT64_PREFIX` with 169.254.169.254 embedded.
+    const NAT64_METADATA_V4: &str = "2001:67c:2b0:db32:0:1:a9fe:a9fe";
+
+    async fn resolve_target_to(
+        tool: &HttpRequestTool,
+        address: &str,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget> {
+        let ip = address.parse::<IpAddr>().unwrap();
+        tool.validate_request_target_with_resolver(
+            "https://attacker.example.com/",
+            move |_host, port| async move { Ok(vec![SocketAddr::new(ip, port)]) },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_private_v4() {
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let err = resolve_target_to(&tool, NAT64_PRIVATE_V4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address 10.0.0.1"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(TEST_NAT64_PREFIX),
+            "error must name the configured prefix: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_metadata_v4() {
+        // The private opt-in never re-opens metadata, so this holds on both
+        // sides of the allow_private_hosts branch.
+        for allow_private in [false, true] {
+            let tool =
+                test_tool_with_nat64(vec!["*"], allow_private, vec![], vec![TEST_NAT64_PREFIX]);
+            let err = resolve_target_to(&tool, NAT64_METADATA_V4)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "allow_private_hosts={allow_private} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nat64_embedded_private_v4_is_reachable_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64, so with
+        // no prefix configured the tool dials it. This is exactly the hole
+        // `security.nat64_prefixes` closes.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![]);
+        let target = resolve_target_to(&tool, NAT64_PRIVATE_V4).await.unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_still_allows_embedded_global_v4() {
+        // 93.184.216.34 embedded under the same prefix; 192.0.2.33 from
+        // RFC 6052's own example is documentation space and non-global, so it
+        // cannot stand in for an accepted destination.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let target = resolve_target_to(&tool, "2001:67c:2b0:db32:0:1:5db8:d822")
+            .await
+            .unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[test]
+    fn malformed_nat64_prefix_fails_tool_construction() {
+        // Fail closed: a typo must refuse to build the tool rather than
+        // silently leaving the network-specific check disabled.
+        let err = try_test_tool_with_nat64(
+            vec!["example.com"],
+            false,
+            vec![],
+            vec![TEST_NAT64_PREFIX, "2001:db8::/33"],
+        )
+        .err()
+        .expect("malformed nat64 prefix must fail construction")
+        .to_string();
+        assert!(
+            err.contains("security.nat64_prefixes"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("2001:db8::/33"), "unexpected error: {err}");
     }
 }

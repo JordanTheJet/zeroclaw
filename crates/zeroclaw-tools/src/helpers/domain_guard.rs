@@ -18,6 +18,15 @@ pub use zeroclaw_infra::net_guard::{
 /// Handles both IPv4 and IPv6, as well as `localhost` and `.local` domains.
 pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 
+/// Operator-declared, network-specific RFC 6052 NAT64 prefixes, and the
+/// parser that turns the configured strings into them.
+///
+/// Public because the tools that hold a prefix list name the type in their
+/// constructor signatures. Malformed input rejects the whole list, so a tool
+/// that cannot parse its configuration fails construction rather than running
+/// with a silently narrowed egress boundary.
+pub use zeroclaw_infra::net_guard::{Nat64Prefix, parse_nat64_prefixes};
+
 // ── address classification and resolved-address validation ────────
 // Crate-internal: these keep the visibility they had before the primitives
 // moved to zeroclaw-infra, so the tool crate's public surface is unchanged.

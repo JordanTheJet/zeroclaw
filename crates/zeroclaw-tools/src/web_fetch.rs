@@ -24,6 +24,10 @@ pub struct WebFetchTool {
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
     allowed_private_hosts: Vec<String>,
+    /// Network-specific NAT64 prefixes this deployment's translator serves.
+    /// Snapshotted at construction like `allowed_domains`; an IPv6 answer
+    /// inside one of them is classified by the IPv4 address it embeds.
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
     max_response_size: usize,
     timeout_secs: u64,
     firecrawl: FirecrawlConfig,
@@ -38,6 +42,7 @@ impl WebFetchTool {
         timeout_secs: u64,
         firecrawl: FirecrawlConfig,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -52,6 +57,10 @@ impl WebFetchTool {
             allowed_private_hosts: domain_guard::normalize_allowed_domains(
                 allowed_private_hosts,
                 "web_fetch.allowed_private_hosts",
+            )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
             )?,
             max_response_size,
             timeout_secs,
@@ -75,6 +84,7 @@ impl WebFetchTool {
         let allowed_domains = self.allowed_domains.clone();
         let blocked_domains = self.blocked_domains.clone();
         let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let nat64_prefixes = self.nat64_prefixes.clone();
 
         tokio::task::spawn_blocking(move || {
             resolve_target_url(
@@ -82,6 +92,7 @@ impl WebFetchTool {
                 &allowed_domains,
                 &blocked_domains,
                 &allowed_private_hosts,
+                &nat64_prefixes,
                 "web_fetch",
             )
         })
@@ -615,6 +626,7 @@ fn resolve_target_url(
     allowed_domains: &[String],
     blocked_domains: &[String],
     allowed_private_hosts: &[String],
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
     tool_name: &str,
 ) -> anyhow::Result<ResolvedWebFetchTarget> {
     let mut resolved_host = None;
@@ -627,7 +639,7 @@ fn resolve_target_url(
         tool_name,
         |host, allow_private| {
             resolved_host = Some(host.to_string());
-            resolved_addrs = Some(resolve_validated_host(host, allow_private)?);
+            resolved_addrs = Some(resolve_validated_host(host, allow_private, nat64_prefixes)?);
             Ok(())
         },
     )?;
@@ -814,6 +826,7 @@ fn private_allowlist_match(host: &str, allowed_private_hosts: &[String]) -> Priv
 fn resolve_validated_host(
     host: &str,
     allow_private: bool,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
 
@@ -838,7 +851,7 @@ fn resolve_validated_host(
         .map(std::net::SocketAddr::ip)
         .collect::<Vec<_>>();
 
-    validate_resolved_ips_for_ssrf(host, allow_private, &ips)?;
+    validate_resolved_ips_for_ssrf(host, allow_private, &ips, nat64_prefixes)?;
     Ok(addrs)
 }
 
@@ -846,6 +859,7 @@ fn resolve_validated_host(
 fn resolve_validated_host(
     _host: &str,
     _allow_private: bool,
+    _nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     // Resolver behavior is injected by unit tests that exercise the policy.
     Ok(Vec::new())
@@ -853,18 +867,19 @@ fn resolve_validated_host(
 
 #[cfg(test)]
 fn validate_resolved_host(host: &str, allow_private: bool) -> anyhow::Result<()> {
-    resolve_validated_host(host, allow_private).map(|_| ())
+    resolve_validated_host(host, allow_private, &[]).map(|_| ())
 }
 
 fn validate_resolved_ips_for_ssrf(
     host: &str,
     allow_private: bool,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<()> {
     if allow_private {
-        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips, nat64_prefixes)
     } else {
-        domain_guard::validate_resolved_ips_are_public(host, ips).map_err(|err| {
+        domain_guard::validate_resolved_ips_are_public(host, ips, nat64_prefixes).map_err(|err| {
             if ips.is_empty() || ips.iter().any(|ip| domain_guard::is_cloud_metadata_ip(*ip)) {
                 err
             } else {
@@ -904,6 +919,7 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            vec![],
         )
         .unwrap()
     }
@@ -928,6 +944,7 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            vec![],
         )
         .unwrap()
     }
@@ -944,6 +961,7 @@ mod tests {
             500_000,
             30,
             firecrawl,
+            vec![],
             vec![],
         )
         .unwrap()
@@ -1044,6 +1062,7 @@ mod tests {
             500_000,
             30,
             FirecrawlConfig::default(),
+            vec![],
             vec![],
         )
         .unwrap();
@@ -1178,6 +1197,7 @@ mod tests {
             &["*".to_string()],
             &[],
             &[],
+            &[],
             "web_fetch",
         )
         .unwrap();
@@ -1195,6 +1215,7 @@ mod tests {
         let target = resolve_target_url(
             "https://exämple.com/path",
             &["*".to_string()],
+            &[],
             &[],
             &[],
             "web_fetch",
@@ -1260,6 +1281,7 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            vec![],
         )
         .unwrap();
         let result = tool
@@ -1290,6 +1312,7 @@ mod tests {
             0, // unlimited
             30,
             FirecrawlConfig::default(),
+            vec![],
             vec![],
         )
         .unwrap();
@@ -1331,6 +1354,7 @@ mod tests {
                 enabled: true,
                 ..FirecrawlConfig::default()
             },
+            vec![],
             vec![],
         )
         .unwrap();
@@ -1382,6 +1406,7 @@ mod tests {
             10,
             30,
             FirecrawlConfig::default(),
+            vec![],
             vec![],
         )
         .unwrap();
@@ -1440,7 +1465,7 @@ mod tests {
     #[test]
     fn resolved_private_ip_is_rejected() {
         let ips = vec!["127.0.0.1".parse().unwrap()];
-        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1452,7 +1477,7 @@ mod tests {
             "93.184.216.34".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
         ];
-        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("example.com", false, &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-global address"));
@@ -1461,13 +1486,13 @@ mod tests {
     #[test]
     fn resolved_public_ips_are_allowed() {
         let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
-        assert!(validate_resolved_ips_for_ssrf("example.com", false, &ips).is_ok());
+        assert!(validate_resolved_ips_for_ssrf("example.com", false, &ips, &[]).is_ok());
     }
 
     #[test]
     fn private_opt_in_still_rejects_metadata_resolution() {
         let ips = vec!["169.254.170.23".parse().unwrap()];
-        let err = validate_resolved_ips_for_ssrf("internal.example", true, &ips)
+        let err = validate_resolved_ips_for_ssrf("internal.example", true, &ips, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -1479,7 +1504,7 @@ mod tests {
     #[test]
     fn metadata_denial_does_not_suggest_ineffective_private_opt_in() {
         let ips = vec!["169.254.169.254".parse().unwrap()];
-        let err = validate_resolved_ips_for_ssrf("metadata.example", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("metadata.example", false, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1807,6 +1832,7 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
+            vec![],
         )
         .unwrap();
 
@@ -1896,6 +1922,7 @@ mod tests {
                 api_url: format!("http://{firecrawl_addr}"),
                 ..FirecrawlConfig::default()
             },
+            vec![],
             vec![],
         )
         .unwrap();
@@ -2082,6 +2109,7 @@ mod tests {
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                         192, 168, 1, 5,
                     ))],
+                    &[],
                 )
             },
         )
@@ -2160,5 +2188,83 @@ mod tests {
     fn allowed_private_host_with_port() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5:8080/api").is_ok());
+    }
+
+    // ── network-specific NAT64 prefixes ──────────────────────────
+
+    /// A globally-classified NAT64 prefix. The IPv6 documentation range is
+    /// itself non-global, so a documentation prefix would be rejected for an
+    /// unrelated reason and prove nothing about the NAT64 decode.
+    const TEST_NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+
+    fn nat64(prefix: &str) -> Vec<domain_guard::Nat64Prefix> {
+        domain_guard::parse_nat64_prefixes(&[prefix.to_string()], "security.nat64_prefixes")
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_nat64_prefix_rejects_embedded_private_v4() {
+        let ips = vec!["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()];
+        let err = validate_resolved_ips_for_ssrf(
+            "attacker.example",
+            false,
+            &ips,
+            &nat64(TEST_NAT64_PREFIX),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("non-global address 10.0.0.1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn configured_nat64_prefix_rejects_embedded_metadata_v4_under_private_opt_in() {
+        let ips = vec!["2001:67c:2b0:db32:0:1:a9fe:a9fe".parse().unwrap()];
+        let err = validate_resolved_ips_for_ssrf(
+            "attacker.example",
+            true,
+            &ips,
+            &nat64(TEST_NAT64_PREFIX),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cloud metadata address 169.254.169.254"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_addresses_pass_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64.
+        let private = vec!["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()];
+        assert!(validate_resolved_ips_for_ssrf("attacker.example", false, &private, &[]).is_ok());
+        let metadata = vec!["2001:67c:2b0:db32:0:1:a9fe:a9fe".parse().unwrap()];
+        assert!(validate_resolved_ips_for_ssrf("attacker.example", true, &metadata, &[]).is_ok());
+    }
+
+    #[test]
+    fn malformed_nat64_prefix_fails_tool_construction() {
+        let security = Arc::new(SecurityPolicy::default());
+        let err = WebFetchTool::new(
+            security,
+            vec!["example.com".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+            vec![TEST_NAT64_PREFIX.to_string(), "2001:db8::/33".into()],
+        )
+        .err()
+        .expect("malformed nat64 prefix must fail construction")
+        .to_string();
+        assert!(
+            err.contains("security.nat64_prefixes"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("2001:db8::/33"), "unexpected error: {err}");
     }
 }
