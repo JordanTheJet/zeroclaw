@@ -11,6 +11,7 @@ use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
 };
 use crate::component::{
     PluginState, PluginStoreSpec, call_plugin, call_store, engine, load_component, wt,
+    wt_instantiate,
 };
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
@@ -81,7 +82,7 @@ impl WasmMemory {
         let linker = linker()?;
         crate::component::ensure_http_coherent(&store, false)?;
         let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-            wt(
+            wt_instantiate(
                 MemoryPlugin::instantiate_async(store, &component, &linker).await,
                 "failed to instantiate memory plugin",
             )

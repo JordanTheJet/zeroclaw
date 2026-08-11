@@ -19,14 +19,12 @@ the plugin host compiled in to run it.
 > **The release binary is not that binary.** The prebuilt binaries the
 > installer ships do not include the plugin host (`zeroclaw plugin …` is an
 > unrecognized subcommand), and `plugins-wasm` is not in the crate's default
-> feature set. Build the host side from source, and note the backend
-> features do **not** imply the umbrella: `--features plugins-wasm-cranelift`
-> alone builds cleanly and still produces a plugin-less binary, because the
-> runtime integration is gated on `plugins-wasm` itself. The working
-> invocation is:
+> feature set. Build the host side from source with an execution backend;
+> every backend feature carries the `plugins-wasm` umbrella itself, so one
+> flag is enough:
 >
 > ```bash
-> cargo build --release --features plugins-wasm,plugins-wasm-cranelift
+> cargo build --release --features plugins-wasm-cranelift
 > ```
 >
 > The [protocol page](../developing/plugin-protocol.md#build-features)
@@ -316,6 +314,36 @@ For this plugin: `name` and `version` matching what `plugin-info` reports,
 `config_read`. Add `http_client` only if your tool makes outbound HTTP calls.
 The tool adapter implements `wasi:http`, but links it only after that grant is
 validated; without both adapter support and the grant there is no HTTP surface.
+
+The matching manifest contract for the typed `RedactConfig` is:
+
+```toml
+name = "my-redact-plugin"
+version = "0.1.0"
+wasm_path = "my_redact_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.replacement]
+type = "string"
+minLength = 1
+
+[config_schema.properties.redact_emails]
+type = "boolean"
+
+[config_schema.properties.patterns]
+type = "array"
+items = { type = "string" }
+```
+
+These properties are optional, matching the guest's defaults. For a credential
+that must exist, add its name to `required` in `[config_schema]`; a denied grant
+or missing value will then prevent the component from starting.
 
 ### Tools that call the network
 

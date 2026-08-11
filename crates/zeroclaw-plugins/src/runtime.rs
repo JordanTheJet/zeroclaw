@@ -6,7 +6,7 @@ use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
     PluginState, PluginStoreSpec, call_plugin, call_store, call_tool_execute, engine,
-    load_component, wt,
+    load_component, wt, wt_instantiate,
 };
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
@@ -91,7 +91,7 @@ pub async fn create_plugin(
     };
     crate::component::ensure_http_coherent(&store, http)?;
     let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-        wt(
+        wt_instantiate(
             ToolPlugin::instantiate_async(store, &component, linker).await,
             "failed to instantiate tool plugin",
         )
