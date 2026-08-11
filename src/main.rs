@@ -3591,6 +3591,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
     }
+    for section in &config.retired_wati_config_sections {
+        let fallback = format!(
+            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-retired-wati",
+                &[("section", section)],
+                &fallback,
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     // Must follow the trace sink init above, or the record has no destination.
