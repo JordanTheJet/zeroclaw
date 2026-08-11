@@ -53,6 +53,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+socket2 = "0.6"
 
 # Error handling
 anyhow = "1.0"
@@ -102,7 +103,6 @@ channel-email = ["zeroclaw-channels/channel-email"]
 channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
-channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
