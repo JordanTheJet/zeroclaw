@@ -74,18 +74,6 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
 }
 
-/// Populate all channel-driven tool handles from the registered factory.
-/// Returns the number of channels seeded.
-///
-/// Parameter order matches the return tuple of `all_tools_with_runtime`:
-/// Seed all channel-driven tool handles from the registered channel map factory.
-/// Returns the number of channels seeded. Parameters match the return order of
-/// `all_tools_with_runtime`:
-///   ask_user_handle = `Option<PerToolChannelHandle>`
-///   channel_room_handle = `Option<PerToolChannelHandle>`
-///   reaction_handle = `PerToolChannelHandle` (NOT Option)
-///   poll_handle = `Option<PerToolChannelHandle>`
-///   escalate_handle = `Option<PerToolChannelHandle>`
 pub(crate) fn seed_channel_handles(
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
     channel_room_handle: &Option<tools::PerToolChannelHandle>,
@@ -121,12 +109,6 @@ pub(crate) fn seed_channel_handles(
     count
 }
 
-/// Snapshot the live `channel_key → Arc<dyn Channel>` map from the injected
-/// channel-map factory as a [`tools::PerToolChannelHandle`], for channel-less
-/// turn paths (`process_message`) that must reach a live approver channel to
-/// honor a risk profile's cross-channel `approval_route`. Returns `None` when no
-/// factory is registered (e.g. CLI/tests) or no channels are live — callers then
-/// keep today's channel-less behavior (the gate auto-denies gated tools).
 pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     let factory = CHANNEL_MAP_FN.get()?;
     let map = factory();
@@ -135,6 +117,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
 }
+use crate::agent::TurnMeta;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -148,7 +131,6 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
@@ -176,13 +158,6 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
-/// Maximum bytes of an interactive stdin line accepted by the
-/// ZeroClaw REPL. Caps the per-line allocation so a pipe of
-/// `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS; the
-/// line is truncated to this size and the user is warned. Matches
-/// the size class of the gateway HTTP body cap (64 KiB) and the
-/// largest per-message cap in the channel orchestrator (4 KiB notify
-/// detail × 128-deep queue = 512 KiB).
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -198,13 +173,6 @@ pub(crate) enum CappedLine {
     Eof,
 }
 
-/// Read a single line from `reader` bounded at `cap` bytes. Returns
-/// the line with the trailing `\n` stripped (lossily decoded, since
-/// PTY transport can split multi-byte characters at frame boundaries)
-/// or [`CappedLine::Truncated`] when the cap was hit. When truncated,
-/// the rest of the physical line is drained using a fixed-size scratch
-/// buffer so the next call starts at the next line and no unbounded
-/// allocation occurs (Audacity88 review #8463).
 pub(crate) fn read_capped_line<R: std::io::BufRead>(
     reader: R,
     cap: usize,
@@ -235,11 +203,6 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
     Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
 }
 
-/// Discard bytes from `reader` until the next `\n` or EOF, using only
-/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
-/// that `read_until(..., &mut Vec::new())` would incur on an oversized
-/// physical line, and it stops exactly at the newline so the next line
-/// is not consumed.
 fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
     loop {
         let buf = reader.fill_buf()?;
@@ -255,32 +218,6 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
     }
 }
 
-/// Global model switch request state - used for runtime model switching via model_switch tool.
-/// This is set by the model_switch tool and checked by the agent loop.
-#[allow(clippy::type_complexity)]
-static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(None)));
-
-/// Get the global model switch request state
-pub fn get_model_switch_state() -> ModelSwitchCallback {
-    Arc::clone(&MODEL_SWITCH_REQUEST)
-}
-
-/// Clear any pending model switch request
-pub fn clear_model_switch_request() {
-    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
-        let mut guard = guard;
-        *guard = None;
-    }
-}
-
-/// Process-wide serialization lock for tests that read or write the global
-/// `MODEL_SWITCH_REQUEST`. Because the request is a process-wide singleton,
-/// tests across modules (the `model_switch` tool and `Agent::turn_streamed`)
-/// must hold this lock so they don't race each other on it.
-#[cfg(test)]
-pub(crate) static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
         None => pattern == name,
@@ -294,24 +231,6 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// Drop tools from `tools` that fail either gate.
-///
-/// 1. The parent agent's `SecurityPolicy.allowed_tools` allowlist plus
-///    `SecurityPolicy.excluded_tools` denylist, evaluated via
-///    `SecurityPolicy::is_tool_allowed`.
-/// 2. The caller-supplied `caller_allowed` filter (the existing
-///    `agent::run`-level `allowed_tools` parameter).
-///
-/// A tool survives only when BOTH gates admit its name. `None` on
-/// either gate is unrestricted for that gate alone. The helper itself is
-/// category-agnostic - it filters whatever names are in `tools`. In
-/// production, however, the categories are gated at different layers:
-/// built-in tools flow through this filter, MCP tools through their
-/// `ToolAccessPolicy`, and skill tools through the `is_tool_excluded`
-/// denylist gate applied at skill registration (`register_skill_tools*`) -
-/// skill tools are deliberately NOT subject to the `allowed_tools`
-/// allowlist (they are granted via skill config; see
-/// `SecurityPolicy::is_tool_excluded`).
 pub fn apply_policy_tool_filter(
     tools: &mut Vec<Box<dyn Tool>>,
     policy: Option<&zeroclaw_config::policy::SecurityPolicy>,
@@ -369,7 +288,7 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
 /// and would otherwise clobber any earlier-pushed pinned content. Centralizing
 /// the append keeps both `run()` and `process_message()` consistent and pins
 /// the ordering invariant in one testable place. No-op for an empty section.
-pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+pub fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
     if pinned_section.is_empty() {
         return;
     }
@@ -396,18 +315,6 @@ pub fn register_eager_mcp_tool_if_allowed(
     true
 }
 
-/// Activate every deferred MCP stub matched by a `mode = "always"`
-/// `tool_filter_groups` pattern, honoring the MCP access policy (the denylist
-/// always wins over `always` mode). Returns the pre-activated names so the
-/// caller can exclude them from the deferred-tools prompt section — a live
-/// tool must not be advertised as "NOT yet loaded". `dynamic` groups never
-/// pre-activate — they stay `tool_search`-driven.
-///
-/// Called from `ScopedToolRegistry::assemble` (the one tool-assembly seam)
-/// after the [`crate::tools::ActivatedToolSet`] is created and before
-/// `ToolSearchTool::new` consumes the stub set, so every entry path assembled
-/// through the seam sees `always` tools live on the very first turn without
-/// burning a `tool_search` round-trip (#6699).
 pub(crate) fn preactivate_always_filter_groups(
     deferred: &crate::tools::DeferredMcpToolSet,
     activated: &Arc<Mutex<crate::tools::ActivatedToolSet>>,
@@ -466,21 +373,6 @@ pub(crate) fn preactivate_always_filter_groups(
     activated_names
 }
 
-/// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
-///
-/// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
-/// - Only MCP-origin tools — names present in `mcp_tool_names`, the set the
-///   assembly seam collected from the MCP registry — are subject to filtering.
-///   Classification is by origin, never by name shape: skill tools share the
-///   `<x>__<y>` naming convention (`{skill}__{tool}`), so built-ins AND skill
-///   tools always pass through (#6699). Known limitation: a skill whose
-///   composed name exactly equals an MCP registry name is indistinguishable
-///   downstream because spec filtering is name-keyed.
-/// - When `groups` is empty, all tools pass through (backward compatible default).
-/// - An MCP tool is included if at least one group matches it:
-///   - `always` group: included unconditionally if any pattern matches the tool name.
-///   - `dynamic` group: included if any pattern matches AND the user message contains
-///     at least one keyword (case-insensitive substring).
 pub fn filter_tool_specs_for_turn(
     tool_specs: Vec<crate::tools::ToolSpec>,
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
@@ -504,11 +396,6 @@ pub fn filter_tool_specs_for_turn(
         .collect()
 }
 
-/// Name-only core of [`filter_tool_specs_for_turn`]: whether an MCP tool is
-/// included by at least one active group. Operating on names alone lets
-/// per-turn exclusion computation skip building `ToolSpec`s entirely — specs
-/// carry the full parameter schema, which is exactly the per-turn clone
-/// churn #8642 removes. `msg_lower` must already be lowercased.
 fn mcp_tool_included_for_turn(
     name: &str,
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
@@ -531,11 +418,6 @@ fn mcp_tool_included_for_turn(
     })
 }
 
-/// Filters a tool spec list by an optional capability allowlist.
-///
-/// When `allowed` is `None`, all specs pass through unchanged.
-/// When `allowed` is `Some(list)`, only specs whose name appears in the list
-/// are retained. Unknown names in the allowlist are silently ignored.
 pub fn filter_by_allowed_tools(
     specs: Vec<crate::tools::ToolSpec>,
     allowed: Option<&[String]>,
@@ -584,15 +466,7 @@ where
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
 }
 
-/// Computes the list of MCP tool names that should be excluded for a given turn
-/// based on `tool_filter_groups` and the user message.
-///
-/// Only MCP-origin tools (members of `mcp_tool_names`) are candidates; skill
-/// tools share the `<x>__<y>` name shape and must never appear in the result.
-/// Returns an empty `Vec` when `groups` is empty (no filtering) or when
-/// `mcp_tool_names` is empty (MCP disabled, unconfigured, or failed — nothing
-/// is MCP-origin, so the groups are inert by construction).
-fn compute_excluded_mcp_tools(
+pub(crate) fn compute_excluded_mcp_tools(
     tools_registry: &[Box<dyn Tool>],
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
@@ -623,7 +497,7 @@ pub fn native_tool_specs_present_for_turn(
     }
 
     // Name-only presence check mirroring `build_iteration_tool_specs`'s
-    // filtering, without assembling any specs (#8642): tools are present if
+    // filtering, without assembling any specs tools are present if
     // the registry or the activated deferred set has a non-excluded name.
     let is_excluded = |name: &str| excluded_tools.iter().any(|ex| ex == name);
     if tools_registry.iter().any(|tool| !is_excluded(tool.name())) {
@@ -641,15 +515,6 @@ pub fn native_tool_specs_present_for_turn(
     Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
-/// Elide inlined base64 image data URIs from message content before export.
-/// Keeps `[IMAGE:<path>]` / `[IMAGE:https://…]` markers; replaces only
-/// `[IMAGE:data:…]` payloads (hundreds of KB of base64) with a short placeholder.
-/// (base64 and the data-URI body never contain `]`, so bounding on `]` is safe.)
-///
-/// Only `[IMAGE:data:…]` markers currently carry inline data URIs; other media
-/// markers (`[PHOTO:]`/`[VIDEO:]`/`[DOCUMENT:]`/`[FILE:]`/`[VOICE:]`/`[AUDIO:]`)
-/// carry paths/URLs, not inline bytes (verified against
-/// `prepare_messages_for_provider`). Extend this regex if that ever changes.
 static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[IMAGE:data:[^\]]*\]").unwrap());
 
@@ -659,32 +524,12 @@ fn elide_image_data(content: &str) -> String {
         .into_owned()
 }
 
-/// Best-effort sanitize message content for trace export: elide image bytes, then
-/// run BOTH credential scrubbers. `scrub_secret_patterns` (prefix-based: sk-/ghp_/
-/// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
-/// alone covers free-form content. Residual secrets/PII may remain — this is
-/// disclosed in the PR/docs, not eliminated.
 pub(crate) fn scrub_for_export(content: &str) -> String {
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
         &elide_image_data(content),
     ))
 }
 
-/// Capture and sanitize the prompt/completion content for one `llm.call` so the
-/// OTel exporter can emit the GenAI message-content attributes.
-///
-/// Returns `None` unless the `observability-otel` feature is active, so non-OTel
-/// builds pay no cloning/scrubbing cost. The system message is split into
-/// `system_instructions`; the rest become `input`. Every string passes through
-/// [`scrub_for_export`] (image elision + dual credential scrub).
-///
-/// This function does NOT consult any OTel content policy — it only constructs
-/// a credential-scrubbed snapshot when the `observability-otel` feature is
-/// enabled. Whether that snapshot is actually exported (and at what privacy
-/// level: `off` / `redacted` / `full`) is decided by the owning
-/// `OtelObserver`'s instance content config at the OTel export boundary, not
-/// here. Keeping the policy out of the capture path avoids process-global
-/// mutable state and the cross-observer drift it caused.
 pub(crate) fn capture_llm_messages(
     messages: &[ChatMessage],
     output_text: Option<&str>,
@@ -732,7 +577,7 @@ pub(crate) fn capture_llm_messages(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_system_prompt_for_turn(
+pub(crate) fn build_system_prompt_for_turn(
     agent_workspace: &std::path::Path,
     model_name: &str,
     tool_descs: &[(&str, &str)],
@@ -808,19 +653,6 @@ fn build_system_prompt_for_turn(
     Ok(system_prompt)
 }
 
-/// Build a `query_summary` field for memory observability events from a raw
-/// user query.
-///
-/// Applies [`scrub_credentials`] first, then truncates to ≤200 content
-/// chars via [`truncate_with_ellipsis`] (which appends a 3-char `...`
-/// ellipsis when truncation occurred, so summaries are ≤203 chars total).
-/// The order matters: `scrub_credentials` may insert placeholder
-/// substrings, so truncating first risks chopping a half-token.
-///
-/// Returns `None` for empty input so observers can distinguish "no query
-/// recorded" from "empty query string". Always call this helper at memory
-/// emit sites — never inline the scrub-then-truncate pattern, since that
-/// invites drift where one site accidentally skips the scrubber.
 pub fn make_query_summary(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
@@ -830,7 +662,6 @@ pub fn make_query_summary(raw: &str) -> Option<String> {
 
 pub use zeroclaw_api::TOOL_CHOICE_OVERRIDE;
 
-/// Convert a tool registry to OpenAI function-calling format for native tool support.
 #[cfg(test)]
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry
@@ -860,6 +691,7 @@ fn build_hardware_context(
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
+    turn: TurnMeta<'_>,
 ) -> String {
     if rag.is_empty() || boards.is_empty() {
         return String::new();
@@ -881,6 +713,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -915,9 +750,12 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// `(channel, agent_alias, turn_id)` correlation triple that observer
 /// consumers (Prometheus, OTel, the gateway `/api/events` stream) rely on for
 /// per-agent attribution. `None` opts out for callers without a resolved
-/// alias (tests, benches).
+/// alias (tests, benches). `turn_id` follows the same pattern: `Some` reuses
+/// a caller-minted id so pre-turn events (the `process_message` RAG
+/// retrieval) join the bracket; `None` self-mints.
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
+    config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -943,8 +781,82 @@ pub async fn agent_turn(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<String> {
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    agent_turn_with_sop_reassembly(
+        config,
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        approval,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        strict_tool_parsing,
+        parallel_tools,
+        max_tool_result_chars,
+        context_token_budget,
+        channel,
+        origin,
+        memory,
+        agent_alias,
+        turn_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_turn_with_sop_reassembly(
+    config: Option<&zeroclaw_config::schema::Config>,
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    silent: bool,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    approval: Option<&ApprovalManager>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    channel: Option<&dyn Channel>,
+    origin: TurnOrigin,
+    memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
+    agent_alias: Option<&str>,
+    turn_id: Option<&str>,
+    sop_reassembly: Option<SopStepReassembly<'_>>,
+) -> Result<String> {
+    let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    #[cfg(test)]
+    if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+        .lock()
+        .expect("agent-turn reassembly test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(sop_reassembly.is_some());
+    }
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
     // messages) surface turn lifecycle events to observers — mirroring the
@@ -960,6 +872,7 @@ pub async fn agent_turn(
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
+        sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -973,6 +886,7 @@ pub async fn agent_turn(
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 hooks: None,
                 activated_tools,
                 model_switch_callback,
@@ -1003,11 +917,12 @@ pub async fn agent_turn(
         new_messages_out: None,
         image_cache: None,
         // Origin and the per-turn memory half are threaded from the entry
-        // point; source/transport/trust stay phase-1 placeholders. Real
-        // per-transport stamping is PR C (RFC #6971 §4).
+        // point; source/transport/trust stay phase-1 placeholders until
+        // per-transport stamping lands.
         memory,
         ingress: IngressContext::from_origin(origin),
         agent_alias,
+        parent_agent_alias: None,
         turn_id: &turn_id,
     })
     .await;
@@ -1050,9 +965,10 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution, ResolvedIo,
+    ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop,
+    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
+    run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1132,54 +1048,27 @@ pub fn apply_text_tool_prompt_policy(
     expose_text_tool_protocol
 }
 
-// ── CLI Entrypoint ───────────────────────────────────────────────────────
-// Wires up all subsystems (observer, runtime, security, memory, tools,
-// model_provider, hardware RAG, peripherals) and enters either single-shot or
-// interactive REPL mode. The interactive loop manages history compaction
-// and hard trimming to keep the context window bounded.
-
-/// Optional per-call overrides for [`run`].
-///
-/// SubAgent spawn paths use this to inject the validated child policy
-/// returned from [`SecurityPolicy::ensure_no_escalation_beyond`] (and,
-/// once caller-supplied allowlist narrowing lands, the
-/// validated agent-scoped memory wrapper). Without this hook the run
-/// path rebuilds both surfaces from config, so the validator's
-/// guarantees never reach the agent loop. `None` on either field
-/// preserves the from-config behavior — the same shape as a fresh
-/// interactive launch.
 #[derive(Default)]
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
     pub memory: Option<Arc<dyn Memory>>,
-    /// `true` when the run is a SubAgent invocation. SubAgents must not
-    /// spawn further subagents (depth-1 cap). The agent loop reads this
-    /// when constructing the `spawn_subagent` tool so the depth-cap
-    /// refusal fires at the tool, not after a child run is already
-    /// underway. Default `false` keeps top-level / cron-launched /
-    /// CLI-launched agents at depth 0.
     pub is_subagent: bool,
     /// Spawn-site opt-out of the engine's memory-context injection (e.g. a
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
-    /// Spawn-site request for a fully memory-free run: the loop binds a
-    /// `NoneMemory` backend (no recall, no store, no governance) and drops the
-    /// persistent memory tools from the registry, so the model can neither read
-    /// nor write memory for this run. Set by cron jobs with
-    /// `uses_memory = false`; `suppress_memory_inject` alone only stops the
-    /// context preamble and would still hand the model a live backend and
-    /// working memory tools. Default `false`.
     pub memory_free: bool,
+    /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
+    /// worker constructs this once at worker start and shares it across
+    /// every tick so that stdio MCP children live for the daemon's
+    /// lifetime rather than being orphaned and re-spawned per
+    /// `agent::run` call. When `Some`, the loop MUST use this
+    /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
+    /// itself. `None` preserves the legacy per-call connect path
+    /// (CLI / one-shot), which is correct for callers that have no
+    /// cross-turn reuse contract.
+    pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
-/// Build the dotted provider ref (`"openai.qwertfoozp"`) from the agent's
-/// configured `model_provider` field. Returns `None` when the agent has no
-/// `model_provider` set or when the ref does not resolve to a known alias.
-///
-/// Using the full dotted ref (rather than just the family type) ensures the
-/// alias-aware factory path is taken, so config fields such as
-/// `requires_openai_auth` reach `dispatch_family_factory` instead of being
-/// silently dropped.
 fn agent_provider_composite(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -1217,15 +1106,14 @@ type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
 static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
-/// config when `provider_name` is a dotted `<family>.<alias>` reference.
-/// Falls back to `fallback` (the agent's configured provider) for bare family
-/// names or when the alias isn't found.
-///
-/// This prevents `-p openai.shartgpt` (OAuth, no key) from inheriting the
-/// agent's current provider key (e.g. an xai key), which would trigger the
-/// API key prefix-mismatch preflight and block providers that authenticate
-/// via OAuth rather than an explicit API key.
+#[cfg(test)]
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+#[cfg(test)]
+static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
+    Mutex<Option<AgentTurnSopReassemblyTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
+
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
     provider_name: &str,
@@ -1308,11 +1196,6 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
-        // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
-        // exporter's background interval fires. Hold a FlushGuard for the rest of
-        // this body so every return path — including `?` errors — pushes buffered
-        // telemetry before the runtime is torn down. Daemon/cron/subagent callers
-        // pass `interactive = false` and skip this; they rely on periodic export.
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
         if interactive
             && matches!(
@@ -1344,20 +1227,7 @@ pub async fn run(
             .map(|(ty, alias, cfg)| (ty, alias.to_string(), cfg.clone()));
         let agent_model_provider = agent_provider_resolved.as_ref().map(|(_, _, cfg)| cfg);
 
-        // ── Memory (the brain) ────────────────────────────────────────
-        // Per-agent memory: the inner backend is the install-wide store
-        // (or, for Markdown agents, the agent's own dir composed with
-        // peer dirs); the wrapper stamps every store with the bound
-        // agent's UUID and filters every recall by the resolved
-        // `read_memory_from` allowlist. When the caller supplies a
-        // pre-built memory handle (SubAgent narrowing path), use that
-        // instead so the validator's allowlist subset reaches the loop.
         let mem: Arc<dyn Memory> = if memory_free {
-            // A memory-free run (cron `uses_memory = false`) binds an explicit
-            // no-op backend so recall, store, and governance are inert even
-            // though the loop wiring is unchanged. The persistent memory tools
-            // are also dropped below (`exclude_memory`), so the model has no
-            // path back into a real store for this run.
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
             match overrides.memory {
@@ -1401,13 +1271,19 @@ pub async fn run(
             (None, None)
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (CLI agent run). No channel map is wired on this
+        // path, so the approval route adapter is the no-op (log-only); the daemon
+        // path injects a real channel-delivering adapter.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -1455,8 +1331,15 @@ pub async fn run(
             // cannot read or write memory even though the registry is otherwise
             // built identically.
             exclude_memory: memory_free,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // Honor the daemon worker's pre-built shared registry so stdio
+            // MCP children live for the daemon's lifetime, not per
+            // `agent::run` call. CLI/one-shot callers leave
+            // `mcp_registry` at its default (`None`) and the seam
+            // falls back to the per-call `connect_all`.
+            mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
         })
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
@@ -1537,12 +1420,20 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+        let agent_runtime_options = match agent_provider_resolved.as_ref() {
             Some((ty, alias, _)) => {
                 zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
             }
             None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
         };
+        // Resolve every alias-owned option, including vision, through the shared
+        // provider-ref resolver. This keeps a --provider override isolated from
+        // the agent alias without a second capability-specific lookup.
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &provider_name,
+            &agent_runtime_options,
+        );
 
         // Resolve api_key and uri from the actual provider being constructed.
         // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
@@ -1562,15 +1453,14 @@ pub async fn run(
                 &provider_runtime_options,
             )?;
 
-        let model_switch_callback = get_model_switch_state();
-
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: provider_name.to_string(),
-            model: model_name.to_string(),
-            channel: Some(channel_name.to_string()),
-            agent_alias: Some(agent_alias.to_string()),
-            turn_id: Some(turn_id.clone()),
-        });
+        let mut turn_guard = crate::observability::AgentTurnGuard::start(
+            observer.as_ref(),
+            provider_name.to_string(),
+            model_name.to_string(),
+            Some(channel_name.to_string()),
+            Some(agent_alias.to_string()),
+            Some(turn_id.clone()),
+        );
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
         let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -1637,9 +1527,9 @@ pub async fn run(
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-        ));
+                "read_skill",
+                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+            ));
         }
         tool_descs.push((
         "cron_add",
@@ -1795,8 +1685,6 @@ pub async fn run(
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
-        let start = Instant::now();
-
         let mut final_output = String::new();
 
         // Save the base system prompt before any thinking modifications so
@@ -1911,6 +1799,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: Some(agent_alias.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 });
             }
 
@@ -1922,7 +1813,19 @@ pub async fn run(
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
-                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                    build_hardware_context(
+                        r,
+                        &*observer,
+                        &effective_msg,
+                        &board_names,
+                        rag_limit,
+                        TurnMeta {
+                            parent_agent_alias: None,
+                            agent_alias: Some(agent_alias),
+                            turn_id: &turn_id,
+                            channel_name,
+                        },
+                    )
                 })
                 .unwrap_or_default();
             let context = hw_context;
@@ -1993,9 +1896,10 @@ pub async fn run(
                                         silent: false,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
+                                        config: Some(&config),
                                         hooks: None,
                                         activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: Some(model_switch_callback.clone()),
+                                        model_switch_callback: None,
                                         receipt_generator: None,
                                     },
                                     ResolvedRuntimeKnobs {
@@ -2026,20 +1930,24 @@ pub async fn run(
                                 image_cache: None,
                                 // Origin is threaded from the entry point;
                                 // source/transport/trust stay phase-1
-                                // placeholders (real stamping is RFC #6971 §4).
+                                // placeholders until per-transport stamping.
                                 memory: Some(crate::agent::memory_inject::TurnMemory {
                                     handle: mem.as_ref(),
                                     query: effective_msg.clone(),
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                        min_relevance_score: config.memory.min_relevance_score,
-                                        ..Default::default()
-                                    },
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                        &config.memory,
+                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                    ),
                                 }),
                                 ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
+                                parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                    config: &config,
+                                }),
                             }),
                         ),
                     )
@@ -2092,15 +2000,7 @@ pub async fn run(
                             provider_name = new_model_provider;
                             model_name = new_model;
 
-                            clear_model_switch_request();
-
-                            observer.record_event(&ObserverEvent::AgentStart {
-                                model_provider: provider_name.to_string(),
-                                model: model_name.to_string(),
-                                channel: Some(channel_name.to_string()),
-                                agent_alias: Some(agent_alias.to_string()),
-                                turn_id: Some(turn_id.clone()),
-                            });
+                            turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
                             continue;
                         }
@@ -2122,12 +2022,6 @@ pub async fn run(
                     // internally when the provider call or its output is
                     // unusable. Default path stays the deterministic generator.
                     let creation_result = if config.skills.skill_creation.reflection_enabled {
-                        // The reflection path makes one post-turn provider call.
-                        // Scope it under TOOL_LOOP_COST_TRACKING_CONTEXT with the
-                        // same `cost_tracking_context` as the parent turn (whose
-                        // scope has already exited here) so the call is budget-
-                        // enforced and its usage is recorded against the same cost
-                        // tracker as the main loop and the skill-review fork below.
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
@@ -2191,18 +2085,6 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            // Background skill review fork — post-turn, opt-in
-            // (`skills.skill-improvement.enabled`, default false). Runs a forked
-            // agent with a restricted toolset (skills_list, skill_view,
-            // skill_manage) over a snapshot of the conversation and decides
-            // whether to patch SKILL.md, add a support file, or do nothing.
-            //
-            // Scoped under TOOL_LOOP_COST_TRACKING_CONTEXT with the same
-            // `cost_tracking_context` as the parent turn, so the fork's provider
-            // calls are recorded against — and bounded by — the same cost
-            // tracker and budget (the scope wrapping the parent turn's
-            // `run_tool_call_loop` has already exited by this point).
-            // See `crate::skills::review::maybe_run_skill_review`.
             if config.skills.skill_improvement.enabled {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
@@ -2215,6 +2097,7 @@ pub async fn run(
                     .scope(
                         cost_tracking_context.clone(),
                         crate::skills::review::maybe_run_skill_review(
+                            Some(&config),
                             review_workspace,
                             review_config,
                             config.skills.allow_scripts,
@@ -2252,11 +2135,6 @@ pub async fn run(
                 print!("> ");
                 let _ = std::io::stdout().flush();
 
-                // Read raw bytes to avoid UTF-8 validation errors when PTY
-                // transport splits multi-byte characters at frame boundaries
-                // (e.g. CJK input with spaces over kubectl exec / SSH).
-                // Capped at MAX_INTERACTIVE_INPUT_BYTES so a pipe of
-                // `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS.
                 let input = {
                     let stdin = std::io::stdin().lock();
                     match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
@@ -2439,6 +2317,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
+                        channel: Some(channel_name.to_string()),
+                        agent_alias: Some(agent_alias.to_string()),
+                        turn_id: Some(turn_id.clone()),
                     });
                 }
 
@@ -2456,6 +2337,12 @@ pub async fn run(
                             &effective_input,
                             &board_names,
                             rag_limit,
+                            TurnMeta {
+                                parent_agent_alias: None,
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
+                                channel_name,
+                            },
                         )
                     })
                     .unwrap_or_default();
@@ -2481,6 +2368,7 @@ pub async fn run(
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
+                            StreamDelta::Lifecycle(_) => {}
                             StreamDelta::Status(text) => {
                                 if is_tty {
                                     let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
@@ -2553,11 +2441,10 @@ pub async fn run(
                                             silent: true,
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
+                                            config: Some(&config),
                                             hooks: None,
                                             activated_tools: activated_handle.as_ref(),
-                                            model_switch_callback: Some(
-                                                model_switch_callback.clone(),
-                                            ),
+                                            model_switch_callback: None,
                                             receipt_generator: None,
                                         },
                                         ResolvedRuntimeKnobs {
@@ -2592,20 +2479,24 @@ pub async fn run(
                                     image_cache: None,
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
-                                    // placeholders (real stamping is RFC #6971 §4).
+                                    // placeholders until per-transport stamping.
                                     memory: Some(crate::agent::memory_inject::TurnMemory {
                                         handle: mem.as_ref(),
                                         query: effective_input.clone(),
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                            min_relevance_score: config.memory.min_relevance_score,
-                                            ..Default::default()
-                                        },
+                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &config.memory,
+                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        ),
                                     }),
                                     ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
+                                    parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                        config: &config,
+                                    }),
                                 }),
                             ),
                         )
@@ -2660,15 +2551,8 @@ pub async fn run(
                                 provider_name = new_model_provider;
                                 model_name = new_model;
 
-                                clear_model_switch_request();
-
-                                observer.record_event(&ObserverEvent::AgentStart {
-                                    model_provider: provider_name.to_string(),
-                                    model: model_name.to_string(),
-                                    channel: Some(channel_name.to_string()),
-                                    agent_alias: Some(agent_alias.to_string()),
-                                    turn_id: Some(turn_id.clone()),
-                                });
+                                turn_guard
+                                    .set_model_route(provider_name.clone(), model_name.clone());
 
                                 continue;
                             }
@@ -2685,22 +2569,6 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                // Context overflow recovery: trim to 90% of the model's true
-                                // input capacity, not the runtime trimming budget. After an
-                                // overflow we must fit the provider's real tokenizer, so the
-                                // model window — not the operator's lower max_context_tokens
-                                // — is the correct target. The 10% headroom absorbs (a) the
-                                // under-count from estimate_history_tokens (~4 chars/token;
-                                // history.rs:285), which is what trim_to_recent_turns measures
-                                // against, and (b) room for the assistant reply plus the next
-                                // user turn, so the retried request lands inside the window
-                                // instead of re-overflowing at the same boundary. This CLI
-                                // outer-recovery site is a defense-in-depth fallback behind
-                                // the in-loop recovery at turn/context_recovery.rs:85 (which
-                                // uses its own tokens_now*2/3 heuristic); the two are
-                                // intentionally different — the in-loop path drops
-                                // aggressively before retry, this outer path lands the retry
-                                // inside the window with margin. See the note2.md 🟡 warning.
                                 let recovery_budget = eff_model_context_window * 9 / 10;
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
@@ -2742,12 +2610,6 @@ pub async fn run(
                                     continue;
                                 }
                                 history = result.history;
-                                // When the system prompt + inlined tool
-                                // definitions alone meet or exceed the budget,
-                                // the single remaining turn can never fit;
-                                // surface the actionable root cause + remedy
-                                // rather than a generic "cannot trim" warning
-                                // (#5808).
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
                                 let context_token_budget =
@@ -2833,12 +2695,6 @@ pub async fn run(
                 // Display context usage for this turn.
                 if let Some(ref ctx) = cost_tracking_context {
                     let usage = ctx.snapshot_turn_usage();
-                    // Use last_input_tokens (absolute provider-reported prompt size)
-                    // instead of accumulated input_tokens. last_input_tokens is the
-                    // accurate "context window fill" measure because the LLM's
-                    // usage.input_tokens already includes the full prompt
-                    // (history + tools + system). Accumulating across rounds
-                    // double-counts the shared history.
                     let effective_input_tokens = usage.last_input_tokens;
                     if effective_input_tokens > 0 || usage.output_tokens > 0 {
                         let max_ctx = eff_model_context_window as u64;
@@ -2892,14 +2748,6 @@ pub async fn run(
             }
         }
 
-        let duration = start.elapsed();
-        // Populate aggregate token usage from the cost-tracking context that
-        // scoped every `run_tool_call_loop` call above — mirroring the streamed
-        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
-        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
-        // reads the context's own accumulator, which holds the session-wide
-        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
-        // even though usage was tracked.
         let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
             let usage = ctx.snapshot_turn_usage();
             (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
@@ -2909,16 +2757,9 @@ pub async fn run(
                 },
             )
         });
-        observer.record_event(&ObserverEvent::AgentEnd {
-            model_provider: provider_name.to_string(),
-            model: model_name.to_string(),
-            duration,
-            tokens_used,
-            cost_usd: None,
-            channel: Some(channel_name.to_string()),
-            agent_alias: Some(agent_alias.to_string()),
-            turn_id: Some(turn_id),
-        });
+        turn_guard.set_model_route(provider_name.clone(), model_name.clone());
+        turn_guard.set_usage(tokens_used, None);
+        turn_guard.finish();
 
         Ok(final_output)
     };
@@ -3030,13 +2871,19 @@ pub async fn process_message(
             (None, None)
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (process_message CLI agent). No channel map is
+        // wired here, so the approval route adapter is the no-op (log-only); the
+        // daemon path injects a real channel-delivering adapter.
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -3068,14 +2915,6 @@ pub async fn process_message(
             None,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-        // Route the per-agent tool registry through the one gated seam - the same
-        // seam run() uses. This UNIFIES process_message's built-in filter with every
-        // other construction path: `assemble` applies the plain policy filter
-        // (allowed_tools + excluded_tools), replacing filter_channel_builtin_tools,
-        // which admitted the canonical read-only defaults past allowed_tools at
-        // non-Full autonomy. Only process_message (i.e. gateway live chat and peer
-        // delegation) had that admit; the real channels already use the plain filter.
-        // See the PR body for the hardening rationale.
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
             agent_alias,
@@ -3087,8 +2926,16 @@ pub async fn process_message(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            // `process_message` is the channel/orchestrator live-chat path;
+            // it has no cross-turn reuse contract, so the per-call
+            // `connect_all` path inside `assemble` is the correct choice.
+            // The daemon heartbeat worker — the only caller that has a
+            // reuse contract — passes its own `mcp_registry` through
+            // `agent::run` (`AgentRunOverrides::mcp_registry`).
+            mcp_registry: None,
         })
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
@@ -3247,20 +3094,6 @@ pub async fn process_message(
         ));
         }
 
-        // ── Compute final effective tool set BEFORE prompt construction ──
-        // This ensures the system prompt, tool instructions, and channel target
-        // injection all reflect the same policy-filtered tool set that will be
-        // used at execution time. Without this, the prompt could advertise
-        // tools (and their target identifiers) that the execution denylist
-        // would block — a control boundary violation.
-        //
-        // We strip the leading `/think:<level>` directive before filtering
-        // so the prompt-construction and request-execution paths see the
-        // same user-message shape. Otherwise a `tool_filter_groups` dynamic
-        // keyword that happens to appear inside `/think:high` (or the
-        // directive token itself — `"think"`, `"high"`, `"max"`, …) would
-        // make the prompt advertise tools the request then excludes, or
-        // vice versa. Issue #8054 Surface 4.
         let effective_message_for_filter =
             crate::agent::thinking::strip_thinking_directive(message);
         let mut excluded_tools = compute_excluded_mcp_tools(
@@ -3389,11 +3222,28 @@ pub async fn process_message(
         // origin (agent::memory_inject); recall is scoped to this entry's
         // session_id. Hardware RAG stays site-built; the engine prepends the
         // memory block above it.
+        // Pre-mint the turn id so the pre-turn RAG retrieval and the
+        // agent_turn bracket share one correlation id. The RAG span stays a
+        // root span (it runs before AgentStart) but carries the matching
+        // zeroclaw.turn_id attribute; nesting it is a tracked follow-up.
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {
-                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    effective_msg_ref,
+                    &board_names,
+                    rag_limit,
+                    TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: Some(agent_alias),
+                        turn_id: &turn_id,
+                        channel_name: "daemon",
+                    },
+                )
             })
             .unwrap_or_default();
         let context = hw_context;
@@ -3421,15 +3271,6 @@ pub async fn process_message(
             }
         }
 
-        // ── Cross-channel HITL on the channel-less path ───────────────────
-        // process_message (gateway chat/webhook dispatch, agent-to-agent peer
-        // messages) runs with no originating channel, so a gated tool can only
-        // reach a human through the profile's `approval_route`. When one is set
-        // and a live channel registry is available, hand the turn a route-only
-        // approval bridge: it asks the named approver alone, bounded by
-        // `timeout_secs` and fail-closed by default. Absent a route (or with no
-        // live channels) this stays `None` and the gate keeps today's
-        // non-interactive auto-deny.
         let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
             live_channel_registry().map(|handles| {
                 crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
@@ -3442,7 +3283,8 @@ pub async fn process_message(
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
-                agent_turn(
+                agent_turn_with_sop_reassembly(
+                    Some(&config),
                     model_provider.as_ref(),
                     &mut history,
                     &tools_registry,
@@ -3474,12 +3316,14 @@ pub async fn process_message(
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                            min_relevance_score: config.memory.min_relevance_score,
-                            ..Default::default()
-                        },
+                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &config.memory,
+                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        ),
                     }),
                     Some(agent_alias),
+                    Some(&turn_id),
+                    Some(SopStepReassembly { config: &config }),
                 ),
             )
             .await
@@ -3497,6 +3341,7 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
@@ -3805,35 +3650,6 @@ mod tests {
         assert_eq!(est, 10_004);
     }
 
-    // ── shared_budget tests ───────────────────────────────────────
-
-    #[test]
-    fn shared_budget_decrement_logic() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let budget = Arc::new(AtomicUsize::new(3));
-
-        // Simulate 3 iterations decrementing
-        for i in 0..3 {
-            let remaining = budget.load(Ordering::Relaxed);
-            assert!(remaining > 0, "Budget should be >0 at iteration {i}");
-            budget.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Budget should now be 0
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn shared_budget_none_has_no_effect() {
-        // When shared_budget is None, the check is simply skipped
-        let budget: Option<Arc<std::sync::atomic::AtomicUsize>> = None;
-        assert!(budget.is_none());
-    }
-
-    // ── existing tests ────────────────────────────────────────────
-
     #[test]
     fn interactive_session_state_round_trips_history() {
         let dir = tempdir().unwrap();
@@ -3940,10 +3756,6 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #5813: a persisted session whose assistant
-    /// (tool_use) was lost to compaction must self-heal on load so the next
-    /// API call doesn't fail with "unexpected tool_use_id found in tool_result
-    /// blocks".
     #[test]
     fn load_interactive_session_heals_orphaned_tool_result() {
         let dir = tempdir().unwrap();
@@ -4009,7 +3821,8 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4022,6 +3835,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4051,7 +3865,8 @@ mod tests {
             .unwrap()
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4064,6 +3879,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4099,7 +3915,8 @@ mod tests {
         })
         .join();
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4112,6 +3929,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4132,7 +3950,8 @@ mod tests {
         let observer = NoopObserver;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4145,6 +3964,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4186,7 +4006,8 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4199,6 +4020,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4606,7 +4428,7 @@ mod tests {
         Text(String),
         TextChunks(Vec<String>),
         /// Emit a single text delta with associated reasoning content. Used by
-        /// regression tests for issue #6059 (DeepSeek V4 thinking-mode replay).
+        /// regression tests for(DeepSeek V4 thinking-mode replay).
         TextWithReasoning {
             text: String,
             reasoning: String,
@@ -4952,6 +4774,185 @@ mod tests {
         }
     }
 
+    /// A channel that always answers `Deny`, with a configurable provenance.
+    ///
+    /// This is the exact ambiguity the gate has to resolve: an operator tapping
+    /// "Deny" and a channel synthesizing a deny because nobody answered are
+    /// indistinguishable on the wire — both are `Some(Deny)` with no decider.
+    /// Only [`ApprovalSource`] separates them.
+    struct SourcedDenyChannel {
+        source: ::zeroclaw_api::channel::ApprovalSource,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SourcedDenyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "sourced-deny-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for SourcedDenyChannel {
+        fn name(&self) -> &str {
+            "sourced-deny-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<::zeroclaw_api::channel::AttributedApprovalResponse>> {
+            Ok(Some(
+                ::zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    self.source,
+                ),
+            ))
+        }
+    }
+
+    /// Drive one denied tool call through the gate and return the
+    /// `[Tool results]` text the MODEL would see.
+    async fn tool_results_for_denying_channel(
+        source: ::zeroclaw_api::channel::ApprovalSource,
+    ) -> String {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let write_call = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"a.txt","content":"x"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let channel = SourcedDenyChannel { source };
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("write a file"),
+        ];
+        let observer = NoopObserver;
+
+        let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await;
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "a denied tool must not execute"
+        );
+
+        history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present")
+            .content
+            .clone()
+    }
+
+    /// The gate-level half of the contract: an OPERATOR's deny still reads as a
+    /// user decision. Without this the fix could "pass" by never saying
+    /// "Denied by user." at all, which would lose real information.
+    #[tokio::test]
+    async fn operator_sourced_deny_is_still_reported_as_a_user_denial() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+        assert!(
+            content.contains("Denied by user."),
+            "an operator's deny is a real user decision and must say so: {content}"
+        );
+    }
+
+    /// The other half: a channel-synthesized deny reaching the gate with
+    /// runtime provenance must NOT be reported as a user's decision, even
+    /// though it is byte-identical to one on the `ChannelApprovalResponse` wire.
+    #[tokio::test]
+    async fn runtime_sourced_deny_is_not_reported_as_a_user_denial() {
+        for source in [
+            ::zeroclaw_api::channel::ApprovalSource::TimedOut,
+            ::zeroclaw_api::channel::ApprovalSource::Unreachable,
+            ::zeroclaw_api::channel::ApprovalSource::Unavailable,
+        ] {
+            let content = tool_results_for_denying_channel(source).await;
+            assert!(
+                !content.contains("Denied by user."),
+                "{source:?} is a runtime denial, not a user's: {content}"
+            );
+            assert!(
+                content.contains("no operator decision was available"),
+                "{source:?} should state that no operator decided: {content}"
+            );
+        }
+    }
+
     struct CredentialOutputTool;
 
     #[async_trait]
@@ -5179,10 +5180,6 @@ mod tests {
         }
     }
 
-    /// A **user-supplied** image on a non-vision provider with no configured
-    /// `vision_model_provider` must surface a structured capability error
-    /// (channels render it back to the user) — we never silently ignore an
-    /// image the user actually sent.
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5198,6 +5195,8 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5210,6 +5209,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5236,8 +5236,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5272,6 +5272,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5284,6 +5286,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5310,8 +5313,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5335,16 +5338,6 @@ mod tests {
         assert!(!requests[0][0].content.contains(&oversized_payload));
     }
 
-    /// Regression: a non-vision provider must not be permanently poisoned by an
-    /// image marker left in history from an EARLIER turn. The capability error
-    /// is scoped to the image the user *just* sent (see
-    /// `run_tool_call_loop_returns_structured_error_for_non_vision_provider`);
-    /// a carried-over marker degrades to text-only so the next plain-text turn
-    /// succeeds instead of re-failing forever. Reproduces the reported bug where
-    /// one image to a non-vision provider made every subsequent text turn fail
-    /// (the RPC/streaming path persists the user message into the long-lived
-    /// session history before the loop runs, so a failed image turn leaves its
-    /// marker behind).
     #[tokio::test]
     async fn run_tool_call_loop_degrades_carried_over_image_on_non_vision_provider() {
         let model_provider = RecordingModelProvider::new();
@@ -5363,6 +5356,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5375,6 +5370,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5401,8 +5397,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5449,6 +5445,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5461,6 +5459,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5487,8 +5486,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5501,12 +5500,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A **tool-result** image marker (e.g. from `image_info`/`screenshot`)
-    /// on a non-vision provider with no `vision_model_provider` must NOT abort
-    /// the turn. The user did not send an image, so the loop degrades
-    /// gracefully: markers are stripped and the text-only provider is still
-    /// called so the conversation continues (and any accompanying
-    /// text/metadata survives).
     #[tokio::test]
     async fn run_tool_call_loop_degrades_tool_result_image_for_non_vision_provider() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5526,6 +5519,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5538,6 +5533,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5564,8 +5560,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5579,9 +5575,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_model_provider` is set but the model_provider factory cannot resolve
-    /// the name, a descriptive error should be returned (not the generic
-    /// capability error).
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_creation_failure() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5603,6 +5596,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5615,6 +5610,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5641,8 +5637,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5660,8 +5656,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// Messages without image markers should use the default model_provider even
-    /// when `vision_model_provider` is configured.
     #[tokio::test]
     async fn run_tool_call_loop_no_images_uses_default_provider() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5680,6 +5674,8 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5692,6 +5688,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5718,8 +5715,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5731,12 +5728,6 @@ mod tests {
         assert_eq!(result, "hello world");
     }
 
-    /// Behavior-identical guard (RFC #6971 phase 1): the always-on ingress
-    /// policy layer must not change a turn's output. A plain turn with the
-    /// `IngressContext::sub_turn()` envelope, and the same turn with a fully
-    /// external/untrusted channel envelope, both disposition to `Loop` under
-    /// the default policy and must produce the identical final answer the
-    /// engine produced before the layer existed.
     #[tokio::test]
     async fn run_tool_call_loop_ingress_default_loop_is_behavior_identical() {
         async fn run_with(ctx: IngressContext) -> String {
@@ -5748,6 +5739,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -5760,6 +5753,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -5918,12 +5912,6 @@ mod tests {
         }
     }
 
-    /// The unified memory-context injection wiring contract at the engine:
-    /// with a `TurnMemory` on the `ToolLoop`, a user-facing origin injects
-    /// the preamble into the trailing user message before the provider sees
-    /// it and emits exactly one `MemoryRecall` event; a `SubTurn` origin
-    /// injects nothing and emits nothing; a failing backend leaves the turn
-    /// intact and reports `success: false`.
     #[tokio::test]
     async fn run_tool_call_loop_memory_injection_keys_on_origin() {
         async fn run_case(
@@ -5937,6 +5925,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -5949,6 +5939,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -6035,8 +6026,6 @@ mod tests {
         assert!(!recalls[0].1, "recall event must report failure");
     }
 
-    /// When `vision_model_provider` is set but `vision_model` is not, the default
-    /// model should be used as fallback for the vision model_provider.
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6061,6 +6050,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6073,6 +6064,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6099,8 +6091,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6118,8 +6110,6 @@ mod tests {
         );
     }
 
-    /// Empty `[IMAGE:]` markers (which are preserved as literal text by the
-    /// parser) should not trigger vision model_provider routing.
     #[tokio::test]
     async fn run_tool_call_loop_empty_image_markers_use_default_provider() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6137,6 +6127,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6149,6 +6141,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6175,8 +6168,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6188,8 +6181,6 @@ mod tests {
         assert_eq!(result, "handled");
     }
 
-    /// Multiple image markers should still trigger vision routing when
-    /// vision_model_provider is configured.
     #[tokio::test]
     async fn run_tool_call_loop_multiple_images_trigger_vision_routing() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6212,6 +6203,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6224,6 +6217,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6250,8 +6244,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6371,6 +6365,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6383,6 +6379,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6409,8 +6406,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6491,6 +6488,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -6507,6 +6506,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6519,6 +6520,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6633,6 +6635,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
@@ -6663,6 +6667,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6675,6 +6681,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6730,9 +6737,6 @@ mod tests {
         assert_eq!(run.step_results[0].output, "step recovered");
     }
 
-    /// Regression: a native provider emitting multiple parallel tool calls
-    /// in one turn must yield one role=tool message per call, each keyed to
-    /// its own tool_call_id and output.
     #[tokio::test]
     async fn run_tool_call_loop_native_emits_tool_message_per_parallel_call() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6781,6 +6785,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6793,6 +6799,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6819,8 +6826,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6913,9 +6920,6 @@ mod tests {
         }
     }
 
-    // A parallel sibling that finished before the cancellation already emitted
-    // its real terminal ToolResult; the cancel cleanup must not emit a second,
-    // interrupted result for that same tool_call_id (#7778 regression).
     #[tokio::test]
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6954,6 +6958,8 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6966,6 +6972,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6992,8 +6999,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7060,6 +7067,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7072,6 +7081,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7098,8 +7108,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7150,6 +7160,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7162,6 +7174,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7188,8 +7201,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7232,6 +7245,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7244,6 +7259,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7270,8 +7286,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7322,6 +7338,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7334,6 +7352,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7360,8 +7379,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7415,6 +7434,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7427,6 +7448,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7453,8 +7475,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7513,6 +7535,8 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7525,6 +7549,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7551,8 +7576,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7572,6 +7597,122 @@ mod tests {
             .expect("tool results message should be present");
         assert!(tool_results.content.contains("hello"));
         assert!(!tool_results.content.contains("Denied by user."));
+    }
+
+    /// An auto-denial in a non-interactive run must not claim a user denied it.
+    ///
+    /// With no channel able to answer, the gate denies on the runtime's own authority. Reporting
+    /// that as "Denied by user." is false and actively misleading: it sends the model looking for
+    /// an operator decision that never happened, and hides the real remedy, which is the agent's
+    /// `auto_approve` policy.
+    #[tokio::test]
+    async fn run_tool_call_loop_reports_unanswerable_approval_without_blaming_the_user() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let write_call = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"a.txt","content":"x"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_mgr = ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("write a file"),
+        ];
+        let observer = NoopObserver;
+
+        let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await;
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        assert!(
+            !tool_results.content.contains("Denied by user."),
+            "an unanswerable approval must not be attributed to a user: {}",
+            tool_results.content
+        );
+        assert!(
+            tool_results.content.contains("requires approval")
+                && tool_results
+                    .content
+                    .contains("no operator decision was available"),
+            "the denial should state the outcome and that no operator decided: {}",
+            tool_results.content
+        );
+        // The model must not be told how to switch its own approval policy off.
+        // `auto_approve` bypasses operator approval for the named tool and
+        // `level = "full"` removes approval gates for every tool while dropping
+        // workspace-only confinement, so naming either here hands the model an
+        // argument for expanding its own privileges in response to an approval
+        // channel simply being unavailable. Operators get that guidance from the
+        // WARN record's `operator_hint` instead.
+        for leak in ["auto_approve", "level = \"full\"", "risk profile"] {
+            assert!(
+                !tool_results.content.contains(leak),
+                "model-visible denial must not prescribe a policy bypass ({leak}): {}",
+                tool_results.content
+            );
+        }
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "a denied tool must not execute"
+        );
     }
 
     #[tokio::test]
@@ -7608,6 +7749,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7620,6 +7763,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7703,6 +7847,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7715,6 +7861,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7803,6 +7950,8 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7815,6 +7964,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7893,6 +8043,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7905,6 +8057,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7931,8 +8084,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7961,9 +8114,6 @@ mod tests {
         );
     }
 
-    /// Identical-prompt calls to re-entrant agent tools (spawn_subagent /
-    /// delegate) must both run even with no config exemption — fan-out is
-    /// intentional, not a duplicate to collapse.
     #[tokio::test]
     async fn run_tool_call_loop_reentrant_agent_tools_are_dedup_exempt_by_default() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -7990,6 +8140,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8002,6 +8154,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8028,8 +8181,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8086,6 +8239,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8098,6 +8253,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8124,8 +8280,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8168,6 +8324,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8180,6 +8338,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8206,8 +8365,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8254,6 +8413,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8266,6 +8427,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8292,8 +8454,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8335,6 +8497,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8347,6 +8511,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8373,8 +8538,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8414,6 +8579,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8426,6 +8593,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8452,8 +8620,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8496,6 +8664,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8508,6 +8678,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -8534,8 +8705,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8575,6 +8746,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8587,6 +8760,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8613,8 +8787,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8653,6 +8827,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8665,6 +8841,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8691,8 +8868,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8723,6 +8900,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8735,6 +8914,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8761,8 +8941,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8794,6 +8974,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8806,6 +8988,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8832,8 +9015,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8865,6 +9048,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8877,6 +9062,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8903,8 +9089,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8938,6 +9124,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8950,6 +9138,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8976,8 +9165,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9016,6 +9205,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9028,6 +9219,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9054,8 +9246,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9106,6 +9298,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9118,6 +9312,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9144,8 +9339,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9179,6 +9374,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9191,6 +9388,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9217,8 +9415,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9255,6 +9453,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9267,6 +9467,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9293,8 +9494,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9329,6 +9530,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9341,6 +9544,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9367,8 +9571,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9404,6 +9608,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9416,6 +9622,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9442,8 +9649,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9536,6 +9743,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9548,6 +9757,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9574,8 +9784,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9619,6 +9829,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9631,6 +9843,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9657,8 +9870,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9706,6 +9919,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9718,6 +9933,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9744,8 +9960,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9816,6 +10032,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9828,6 +10046,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9854,8 +10073,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9891,6 +10110,7 @@ This is an example, not an invocation."#;
             deltas.iter().all(|delta| match delta {
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
+                StreamDelta::Lifecycle(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9931,6 +10151,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9943,6 +10165,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9969,8 +10192,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9982,7 +10205,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10020,6 +10243,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10032,6 +10257,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10058,8 +10284,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -10071,7 +10297,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10120,6 +10346,8 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -10132,6 +10360,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11000,6 +11229,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11012,6 +11243,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11038,8 +11270,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -11051,7 +11283,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11102,6 +11334,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11114,6 +11348,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11203,6 +11438,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11215,6 +11452,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11304,6 +11542,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11316,6 +11556,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11460,6 +11701,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
@@ -11472,6 +11715,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -11498,8 +11742,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -11511,7 +11755,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11570,6 +11814,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11595,6 +11840,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11641,6 +11887,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11666,6 +11913,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11740,10 +11988,6 @@ This is an example, not an invocation."#;
         }
     }
 
-    /// When `max_tool_result_chars` is set to a non-zero value, `agent_turn`
-    /// should forward it to `run_tool_call_loop`, which truncates oversized
-    /// tool results. This test verifies the old hardcoded-0 bug (where
-    /// trimming was silently disabled) does not regress.
     #[test]
     fn agent_turn_forwards_max_tool_result_chars_to_truncate_tool_result() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -11773,6 +12017,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11798,6 +12043,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -11823,8 +12069,6 @@ This is an example, not an invocation."#;
         });
     }
 
-    /// Control test: when `max_tool_result_chars = 0` (disabled), the full
-    /// tool result must be preserved in history without truncation.
     #[test]
     fn agent_turn_with_zero_budget_preserves_full_tool_result() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -11854,6 +12098,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11879,6 +12124,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -12400,7 +12646,7 @@ This is an example, not an invocation."#;
 
     // ─────────────────────────────────────────────────────────────────────
     // TG4 (inline): parse_tool_calls robustness — malformed/edge-case inputs
-    // Prevents: Pattern 4 issues #746, #418, #777, #848
+    // Prevents: Pattern 4 issues
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -12538,7 +12784,7 @@ Let me check the result."#;
 
     #[test]
     fn scrub_credentials_multibyte_chars_no_panic() {
-        // Regression test for #3024: byte index 4 is not a char boundary
+        // byte index 4 is not a char boundary
         // when the captured value contains multi-byte UTF-8 characters.
         // The regex only matches quoted values for non-ASCII content, since
         // capture group 4 is restricted to [a-zA-Z0-9_\-\.].
@@ -12629,10 +12875,6 @@ Let me check the result."#;
         assert_eq!(history[1].content, "recent");
     }
 
-    /// When `build_system_prompt_with_mode` is called with
-    /// `native_tool_specs_present = true`, the output must contain ZERO XML
-    /// protocol artifacts and must not inject the duplicate non-native tools
-    /// summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
@@ -12903,6 +13145,87 @@ Let me check the result."#;
     }
 
     #[test]
+    fn compact_text_prompt_advertises_read_skill_and_omits_inlined_instructions() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        // A non-native provider exercises the text tool-use protocol path where
+        // compact skill loading must advertise `read_skill` explicitly.
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        assert!(!zeroclaw_providers::ModelProvider::supports_native_tools(
+            &provider
+        ));
+
+        // Compact mode registers `read_skill`; model it in the registry here.
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "read_skill",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        // The prompt-visible description survives registry filtering because
+        // the compact-mode registry advertises the same tool.
+        let tool_descs: Vec<(&str, &str)> = vec![(
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        )];
+
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: Some(workspace.path().join("skills/deploy/SKILL.md")),
+        }];
+
+        let risk_profile = RiskProfileConfig::default();
+
+        let system_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &skills,
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Compact,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("compact-mode text prompt should build");
+
+        // Skills section is compact: on-demand loading, no inlined instructions.
+        assert!(
+            system_prompt.contains("read_skill(name)"),
+            "compact skills section must instruct on-demand loading via read_skill"
+        );
+        assert!(
+            !system_prompt.contains("Run smoke tests before deploy."),
+            "compact mode must not inline skill instructions"
+        );
+
+        // The prompt-visible text tool list advertises the compact loader.
+        assert!(
+            system_prompt.contains("**read_skill**"),
+            "non-native compact text protocol must advertise read_skill"
+        );
+    }
+
+    #[test]
     fn non_native_system_prompt_with_no_tools_contains_zero_tool_protocol() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
 
@@ -13123,16 +13446,6 @@ Let me check the result."#;
         assert!(parsed.get("reasoning_content").is_none());
     }
 
-    /// Regression test for issue #6059 — DeepSeek V4 thinking-mode tool-call
-    /// replay rejected with `400` because the assistant's prior
-    /// `reasoning_content` was missing from the next request.
-    ///
-    /// Before the fix, the streaming consumer dropped reasoning chunks on the
-    /// floor (`chunk.delta.is_empty()` short-circuit + hardcoded
-    /// `reasoning_content: None` on the synthesized `ChatResponse`). After
-    /// the fix, reasoning deltas accumulate into `StreamedChatOutcome` and
-    /// surface on the response so the agent's history layer can persist them
-    /// and replay them on subsequent turns.
     #[tokio::test]
     async fn consume_provider_streaming_response_captures_reasoning_content() {
         let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
@@ -13287,13 +13600,6 @@ Let me check the result."#;
         assert!(glob_match("*", ""));
     }
 
-    // ── filter_tool_specs_for_turn tests ──────────────────────────────────────
-    //
-    // Fixtures use REAL MCP naming: `<server>__<tool>` (mcp_client.rs mints
-    // `format!("{server}__{tool}")`). The pre-#6699 tests used synthetic
-    // `mcp_*` names that satisfied the broken `starts_with("mcp_")` gate,
-    // which is exactly how the no-op shipped unnoticed.
-
     fn make_spec(name: &str) -> crate::tools::ToolSpec {
         crate::tools::ToolSpec::new(name.to_string(), String::new(), serde_json::json!({}))
     }
@@ -13349,7 +13655,7 @@ Let me check the result."#;
     fn filter_tool_specs_group_matching_nothing_excludes_all_mcp_tools() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        // The formerly-broken case (#6699): the old prefix gate passed every
+        // The formerly-broken case the old prefix gate passed every
         // real `<server>__<tool>` name unfiltered. A group set matching none
         // of them must now hide ALL MCP-origin tools while built-ins survive.
         let specs = vec![
@@ -13397,11 +13703,6 @@ Let me check the result."#;
     fn filter_tool_specs_capability_tools_remain_excludable() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        // `mcp_resources` / `mcp_prompts` are the MCP capability tools — the
-        // ONLY names the old `starts_with("mcp_")` gate ever matched. They are
-        // registry-derived, so the seam classifies them MCP-origin and a
-        // non-matching group set keeps excluding them (pins the one behavior
-        // the pre-#6699 gate actually had).
         let specs = vec![make_spec("mcp_resources"), make_spec("files__list")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Always,
@@ -13557,12 +13858,6 @@ Let me check the result."#;
     fn compute_excluded_mcp_tools_deferred_stub_registry_baseline() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        // Deferred-mode baseline pin: the candidate pool is `tools_registry`
-        // (eager tools), NOT the deferred stubs or the ActivatedToolSet. With
-        // only built-ins registered, nothing is excluded even though the
-        // origin set names deferred stubs. Per-turn filtering of *activated*
-        // deferred tools is named follow-up scope on #6699, not silently
-        // claimed here.
         let tools_registry = counting_registry(&["shell_exec", "tool_search"]);
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Always,
@@ -13751,19 +14046,6 @@ Let me check the result."#;
         assert_eq!(tokens, 23);
     }
 
-    /// Regression for the 🟡 note2.md warning: the CLI outer-recovery trim
-    /// at loop_.rs:~2557 must target *below* the model window, not the full
-    /// window. Trimming to the raw `eff_model_context_window` leaves zero
-    /// headroom: the request that just failed already exceeded the
-    /// provider's real tokenizer, and `trim_to_recent_turns` measures via
-    /// `estimate_history_tokens` (~4 chars/token; history.rs:285), which
-    /// under-counts. The retry would re-overflow at the same boundary.
-    ///
-    /// The fix trims to `eff_model_context_window * 9 / 10` (10% headroom:
-    /// absorbs the heuristic's under-count plus room for the assistant
-    /// reply + next user turn). This test pins that property by feeding a
-    /// history whose estimate *equals* the window — full-window trimming
-    /// would no-op and the retry would fail; the 90% budget forces a trim.
     #[test]
     fn cli_outer_recovery_trims_below_model_window_with_headroom() {
         use crate::agent::history_trim::trim_to_recent_turns;
@@ -13771,11 +14053,6 @@ Let me check the result."#;
         let model_context_window: usize = 32_000;
         let recovery_budget = model_context_window * 9 / 10; // 28_800
 
-        // Build a history whose estimate_history_tokens *exceeds* the
-        // window so a full-window budget would not trim and the retry
-        // would re-overflow, but the 90% budget must trim. 4000 chars per
-        // message ≈ 1004 estimated tokens; 32 user turns + 32 assistant
-        // replies + 1 system ≈ 65 messages × ~1004 = ~65_260 tokens.
         let big = "x".repeat(4000);
         let mut history = vec![ChatMessage::system("sys")];
         for i in 0..32 {
@@ -13832,6 +14109,8 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13844,6 +14123,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -13870,8 +14150,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -13890,6 +14170,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::Lifecycle(_) => "",
             })
             .collect();
 
@@ -14007,6 +14288,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -14019,6 +14302,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -14045,8 +14329,8 @@ Let me check the result."#;
                     steering: None,
                     new_messages_out: None,
                     image_cache: None,
-                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                    // stamping is PR C (RFC #6971 §4).
+                    // Phase 1: stamp Internal/Trusted. Per-transport
+                    // stamping lands in a later phase.
                     memory: None,
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
@@ -14066,6 +14350,129 @@ Let me check the result."#;
         assert!(summary.session_cost_usd > 0.0);
     }
 
+    /// The local budget gate rejects the turn before any provider request is
+    /// made, so the user must not be told the agent is waiting on a model.
+    /// `WaitingOnModel` is announced by `announce_llm_request`, which must run
+    /// after `enforce_tool_loop_budget`, never before it.
+    #[tokio::test]
+    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use crate::agent::turn::events::StreamDelta;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+        use zeroclaw_api::channel::ProgressEvent;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        // If the gate were bypassed this provider would answer, so a passing
+        // assertion cannot be explained by the provider simply not replying.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.01,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        // Put the tracker over its daily limit before the turn starts.
+        tracker
+            .record_usage(zeroclaw_config::cost::TokenUsage {
+                model: "mock-model".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                total_tokens: 2,
+                cost_usd: 5.0,
+                pricing_available: true,
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()));
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &[],
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: Some(delta_tx),
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
+                }),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an exhausted budget must reject the turn, got {result:?}"
+        );
+        let mut lifecycle = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let StreamDelta::Lifecycle(event) = delta {
+                lifecycle.push(event);
+            }
+        }
+        assert!(
+            !lifecycle.contains(&ProgressEvent::WaitingOnModel),
+            "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
+        );
+    }
+
     #[tokio::test]
     async fn tool_loop_normalizes_non_leading_system_messages_before_provider_request() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -14081,6 +14488,8 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -14093,6 +14502,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -14119,8 +14529,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -14194,6 +14604,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -14206,6 +14618,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -14232,8 +14645,8 @@ Let me check the result."#;
                     steering: None,
                     new_messages_out: None,
                     image_cache: None,
-                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                    // stamping is PR C (RFC #6971 §4).
+                    // Phase 1: stamp Internal/Trusted. Per-transport
+                    // stamping lands in a later phase.
                     memory: None,
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
@@ -14273,6 +14686,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -14285,6 +14700,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -14311,8 +14727,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC #6971 §4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -14359,6 +14775,8 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -14371,6 +14789,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 1,
                 hooks: None,
                 excluded_tools: &[],
@@ -14441,13 +14860,6 @@ Let me check the result."#;
             "trim record must inherit agent_alias from the agent attribution span, got: {value}"
         );
     }
-    //
-    // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
-    // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
-    // has exited, so `agent::loop_::run` re-scopes it under the SAME
-    // `cost_tracking_context` as the parent turn. These tests pin that wiring:
-    // the fork's provider calls must be recorded against — and bounded by — the
-    // same tracker/budget as the parent.
 
     fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
         use std::collections::HashMap;
@@ -14514,6 +14926,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -14598,6 +15011,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -14705,13 +15119,6 @@ Let me check the result."#;
         assert_eq!(summary.total_tokens, 920);
         assert!(summary.session_cost_usd > 0.0);
     }
-
-    // ── apply_policy_tool_filter coverage ─────────────────────
-    //
-    // The dispatch-site filter must consult both the parent agent's
-    // SecurityPolicy.allowed_tools / .excluded_tools AND the
-    // caller-supplied allowed_tools list, with both gates composing
-    // by intersection. A tool name absent from either falls out.
 
     use zeroclaw_api::tool::Tool as TestTool;
     use zeroclaw_config::policy::SecurityPolicy as TestPolicy;
@@ -14954,19 +15361,6 @@ Let me check the result."#;
         );
     }
 
-    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
-    /// the MCP `<server>__<tool>` auto-admit exception must apply only to
-    /// the risk-profile gate. A caller-supplied per-run `allowed_tools`
-    /// list (cron job, narrowed delegate invocation, …) must still narrow
-    /// the visible set strictly, even when the risk-profile auto-admit
-    /// would otherwise pass an MCP name.
-    ///
-    /// Concrete scenario from the review: a cron job narrows
-    /// `allowed_tools = ["cron_add"]`. The risk profile is broader and
-    /// includes `cron_add` (so the cron tool itself survives both gates),
-    /// but the risk-profile MCP exception would happily admit
-    /// `filesystem__write_file` — the caller list does not include it,
-    /// so eager MCP registration must reject it.
     #[test]
     fn eager_mcp_policy_caller_per_run_list_does_not_leak_mcp_auto_admit() {
         // Risk profile is permissive enough that the MCP auto-admit
@@ -14998,11 +15392,6 @@ Let me check the result."#;
         );
     }
 
-    /// Same scenario as above, but proving the deferred (`tool_search`)
-    /// path also honors the per-run narrowing. `mcp_allowed_tool_count`
-    /// is what guards the `tool_search` registration: if it returns 0
-    /// the deferred-MCP `tool_search` tool is not even added to the
-    /// agent's tool list, so the LLM cannot ask for the MCP wrapper.
     #[test]
     fn deferred_mcp_caller_per_run_list_does_not_leak_mcp_auto_admit() {
         let policy = TestPolicy {
@@ -15066,11 +15455,6 @@ Let me check the result."#;
 
     #[test]
     fn pinned_section_survives_deferred_loading_reassignment() {
-        // Regression for the loop_.rs clobber bug (PR #8508 review): the
-        // pinned-resources block must reach the prompt even under
-        // `deferred_loading = true`, where the deferred branch reassigns
-        // `deferred_section` with `=`. The fix appends pins AFTER that branch
-        // via `append_pinned_mcp_section`; this test pins that ordering.
         let pinned = "## Pinned MCP Resources\n\n\
             <mcp-resource server=\"docs\" uri=\"docs__file:///handbook.md\" \
             mime=\"text/plain\" trust=\"untrusted-external\">\nhandbook body\n</mcp-resource>\n";
@@ -15309,15 +15693,75 @@ Let me check the result."#;
         );
     }
 
-    /// Characterization of the unified `process_message` built-in filter
-    /// (replaces the deleted `filter_channel_builtin_tools` safe-defaults tests,
-    /// #6959). `process_message` now routes its real eager registry through
-    /// `ScopedToolRegistry::assemble` with `caller_allowed: None` - the plain
-    /// `allowed_tools`/`excluded_tools` policy filter. At non-Full autonomy a
-    /// canonical read-only default (`web_search_tool`) that is NOT in a
-    /// restrictive `allowed_tools` is now DROPPED, where the removed admit
-    /// retained it. This positively pins the narrowing this path lands: on the
-    /// gateway-chat and peer paths `allowed_tools` is honored strictly.
+    #[tokio::test]
+    async fn process_message_provides_sop_reassembly_to_agent_turn() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("process-message-reassembly-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "process-message-reassembly-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |has_reassembly| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push(has_reassembly);
+            }));
+        }
+
+        let result = super::process_message(
+            config,
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        assert!(
+            seen.iter().any(|has_reassembly| *has_reassembly),
+            "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
+             observed {seen:?}; process_message result: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let config = zeroclaw_config::schema::Config::default();
@@ -15381,8 +15825,10 @@ Let me check the result."#;
                 connect_mcp: false,   // exercise the filter without MCP fixtures
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
+                mcp_registry: None,
             },
         )
         .await;
@@ -15425,18 +15871,6 @@ Let me check the result."#;
         expected_alias: Option<&str>,
         expected_channel: Option<&str>,
     ) {
-        // Regression guard for PR #7771: every lifecycle observer event that
-        // carries the `(channel, agent_alias, turn_id)` correlation triple
-        // MUST populate all three. These six variants back OTel parent-child
-        // span linkage and per-agent attribution; a `None` in any field
-        // silently breaks trace correlation. The original `run()` entry point
-        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
-        // `turn_id: None` because it recorded events outside the turn engine.
-        //
-        // This checks each event individually (no skipping
-        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
-        // than only checking consistency among the non-`None` subset — a
-        // single `None` field is a failure, not something to be filtered out.
         let mut turn_ids: Vec<String> = Vec::new();
         for event in events {
             let (variant, channel, agent_alias, turn_id) = match event {
@@ -15558,6 +15992,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -15570,6 +16006,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 10,
                 hooks: None,
                 excluded_tools: &[],
@@ -15633,6 +16070,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None,
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15658,6 +16096,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("agent_turn should complete");
@@ -15684,6 +16123,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None, // config: configless test
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15709,6 +16149,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("turn should succeed");
@@ -15740,6 +16181,646 @@ Let me check the result."#;
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
     }
 
+    /// When the caller pre-mints a turn id (`process_message` does, so its
+    /// pre-turn RAG retrieval correlates with the turn), `agent_turn` must
+    /// bracket the turn with that id instead of minting its own.
+    #[tokio::test]
+    async fn agent_turn_uses_the_pre_minted_turn_id_on_its_bracket() {
+        // Harness mirrors agent_turn_brackets_turn_with_agent_start_and_agent_end.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            None, // config
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            capturing.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false, // parallel_tools
+            0,     // max_tool_result_chars: disabled for test
+            0,     // context_token_budget: disabled for test
+            None,  // channel
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+            Some("pre-minted-turn"),
+        )
+        .await
+        .expect("turn should succeed");
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .expect("agent_turn must emit AgentStart")
+        {
+            ObserverEvent::AgentStart { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("pre-minted-turn"));
+            }
+            _ => unreachable!(),
+        }
+
+        // The bracket and the inner engine events must also agree on the
+        // full (channel, agent_alias, turn_id) triple with the pre-minted id.
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `run()` (the CLI/daemon direct-turn entry point) was the last
+    /// production site that open-coded its own `AgentStart`/`AgentEnd`
+    /// instead of going through `AgentTurnGuard` like every other entry
+    /// point (`agent_turn`, `Agent::turn`/`turn_streamed`, the
+    /// orchestrator's `process_channel_message`). Between the open-coded
+    /// events sat roughly a dozen exit paths (`?`, early `return`) where
+    /// `AgentStart` fired but `AgentEnd` never did, leaving observers
+    /// permanently unbalanced. `run()` builds its own observer and model
+    /// provider internally with no injection seam, so these tests drive it
+    /// end to end: a real `Config`, the real tool registry, and a local
+    /// HTTP server standing in for the model. Event capture leans on the
+    /// process-wide broadcast hook the gateway uses to fan events out to
+    /// `/api/events` (`observability::set_scoped_broadcast_hook`);
+    /// `observability::HOOK_TEST_LOCK` serializes against
+    /// `observability::mod`'s own hook tests so neither steals the other's
+    /// events off the single global hook slot.
+    // `config.providers.models.ollama.*` dispatches through the OpenAI-
+    // compatible wire (`OllamaModelProviderConfig::create_provider` builds an
+    // `OpenAiCompatibleModelProvider` labeled "Ollama"), so the scripted
+    // response is OpenAI's `choices[0].message.content` shape at
+    // `/v1/chat/completions`, not the native `/api/chat` shape.
+    async fn respond_with_done() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "choices": [{"message": {"content": "done"}}]
+        }))
+    }
+
+    fn lifecycle_events_for_alias(events: &[ObserverEvent], alias: &str) -> (usize, usize) {
+        let starts = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentEnd { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .count();
+        (starts, ends)
+    }
+
+    /// The target alias's own `AgentStart`/`AgentEnd` events, in capture order.
+    ///
+    /// The `run()` lifecycle tests install a *process-wide* broadcast hook, so
+    /// the raw capture can interleave events emitted by other agents —
+    /// including other tests executing concurrently under the parallel runtime
+    /// gate. Ordering assertions (first is `AgentStart`, last is `AgentEnd`)
+    /// must therefore scope to the target alias before inspecting the ends of
+    /// the sequence; asserting on the raw stream's `first()`/`last()` is a
+    /// cross-talk flake.
+    fn alias_lifecycle_sequence<'a>(
+        events: &'a [ObserverEvent],
+        alias: &str,
+    ) -> Vec<&'a ObserverEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        | ObserverEvent::AgentEnd { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .collect()
+    }
+
+    /// Regression guard for the parallel-gate flake: the `run()` lifecycle tests
+    /// capture through a process-wide hook, so unrelated observer traffic (e.g. a
+    /// concurrent runtime test) can land at the head or tail of the raw stream.
+    /// `alias_lifecycle_sequence` must scope ordering to the target alias so
+    /// foreign `AgentStart`/`AgentEnd` events cannot invalidate the first/last
+    /// assertions. This is deterministic (no scheduling dependence), unlike the
+    /// intermittent CI failure it guards against.
+    #[test]
+    fn alias_lifecycle_sequence_scopes_out_foreign_observer_traffic() {
+        fn start(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+        fn end(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(0),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+
+        // Foreign events bracket the target's own pair on both ends — exactly
+        // the interleaving that made the raw first()/last() assertions flake.
+        let events = vec![
+            end("other-agent"), // foreign AgentEnd at the head
+            start("target-agent"),
+            start("other-agent"),
+            end("target-agent"),
+            start("other-agent"), // foreign AgentStart at the tail
+        ];
+
+        // Counts stay scoped to the target alias (unchanged behavior).
+        assert_eq!(lifecycle_events_for_alias(&events, "target-agent"), (1, 1));
+
+        // The raw stream's ends are foreign, so the old unscoped assertions
+        // would fail here — which is the bug.
+        assert!(!matches!(
+            events.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(!matches!(
+            events.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+
+        // The alias-scoped sequence is exactly [AgentStart, AgentEnd] regardless
+        // of the foreign cross-talk.
+        let lifecycle = alias_lifecycle_sequence(&events, "target-agent");
+        assert!(matches!(
+            lifecycle.as_slice(),
+            [
+                ObserverEvent::AgentStart { .. },
+                ObserverEvent::AgentEnd { .. }
+            ]
+        ));
+        assert!(matches!(
+            lifecycle.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(matches!(
+            lifecycle.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+    }
+
+    /// A `Config::default()` rooted under a fresh temp dir instead of the
+    /// real `$HOME/.zeroclaw`. `Config::default()` points `data_dir` (the
+    /// sqlite memory db, `{data_dir}/memory/brain.db`) and `config_path`
+    /// (whose parent `install_root_dir()` backs `agent_workspace_dir`, i.e.
+    /// `{install_root}/agents/<alias>/workspace`) at the real home
+    /// directory, so a `run()`-driving test that doesn't override them
+    /// creates/writes real files on every dev and CI machine and, under the
+    /// crate's parallel test gate, has every such test contend on the same
+    /// `brain.db`. The returned `TempDir` must be kept alive for the
+    /// duration of the test — it deletes the directory on drop.
+    fn isolated_run_test_config() -> (tempfile::TempDir, Config) {
+        let tmp = tempdir().expect("temp dir for isolated run() test config should create");
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_brackets_successful_turn_with_agent_start_and_agent_end() {
+        use axum::{Router, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new().route("/v1/chat/completions", post(respond_with_done));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-lifecycle-success-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "run-lifecycle-success-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-success-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+        server.abort();
+
+        let output = result.expect("run() should complete the scripted turn");
+        assert_eq!(output, "done");
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-success-agent");
+        assert_eq!(starts, 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends, 1, "exactly one AgentEnd, got {events:?}");
+        // Scope ordering to the target agent: the process-wide hook can capture
+        // unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-success-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// The core regression this fix addresses: before it, a model-call
+    /// failure inside `run()` propagated out through `?` while the
+    /// open-coded `AgentStart` had already fired, so `AgentEnd` never did.
+    /// With `AgentTurnGuard` in place, `Drop` closes the bracket on this
+    /// early-return path too.
+    #[tokio::test]
+    async fn run_still_closes_the_bracket_when_the_model_call_fails() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        // Bind an ephemeral port and immediately drop the listener: any
+        // connection attempt against it fails fast and deterministically
+        // (connection refused) without depending on a hardcoded "probably
+        // unused" port number.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener should bind");
+            listener.local_addr().expect("listener should have address")
+        };
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-lifecycle-error-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "run-lifecycle-error-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-error-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+
+        assert!(
+            result.is_err(),
+            "run() should surface the model provider's connection failure, got {result:?}"
+        );
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-error-agent");
+        assert_eq!(
+            starts, 1,
+            "exactly one AgentStart even on the error path, got {events:?}"
+        );
+        assert_eq!(
+            ends, 1,
+            "AgentEnd must still fire via Drop on the early-return error path \
+             (the regression this fix closes), got {events:?}"
+        );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-error-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd even on the \
+             error path, got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// An in-loop model switch (the real `model_switch` tool, driven exactly
+    /// as production traffic would) must still close the bracket with
+    /// exactly one balanced pair, attributed to the switched-TO route — the
+    /// second open-coded `AgentStart` this fix replaced with
+    /// `turn_guard.set_model_route(..)` would have shown up here as two
+    /// `AgentStart`s for one `AgentEnd`.
+    #[tokio::test]
+    async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
+
+        // First response: a native tool call requesting a switch to
+        // `ollama.switched`. Second response (only reachable once the
+        // switched-to provider is actually in use): plain "done".
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn respond_switch_then_done(
+            State(calls): State<CallCount>,
+        ) -> Json<serde_json::Value> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-switch-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched\",\"model\":\"switched-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                }))
+            }
+        }
+
+        let calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(respond_switch_then_done))
+            .with_state(calls);
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        for alias in ["default", "switched"] {
+            config.providers.models.ollama.insert(
+                alias.to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(format!("run-lifecycle-switch-{alias}-model")),
+                        timeout_secs: Some(5),
+                        uri: Some(format!("http://{addr}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "run-lifecycle-switch-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+
+        let result = super::run(
+            config,
+            "run-lifecycle-switch-agent",
+            Some("please switch models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        drop(hook_guard);
+        server.abort();
+
+        let output = result.expect("run() should complete after the model switch");
+        assert_eq!(output, "done");
+
+        let events = capturing.events.lock();
+        let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-switch-agent");
+        assert_eq!(
+            starts, 1,
+            "a model switch must not open a second bracket, got {events:?}"
+        );
+        assert_eq!(
+            ends, 1,
+            "a model switch must still close with exactly one AgentEnd, got {events:?}"
+        );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-switch-agent");
+        assert!(
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+        assert!(
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
+        );
+
+        let end_route = events
+            .iter()
+            .find_map(|e| match e {
+                ObserverEvent::AgentEnd {
+                    agent_alias,
+                    model_provider,
+                    model,
+                    ..
+                } if agent_alias.as_deref() == Some("run-lifecycle-switch-agent") => {
+                    Some((model_provider.clone(), model.clone()))
+                }
+                _ => None,
+            })
+            .expect("AgentEnd for the switch agent should be present");
+        assert_eq!(
+            end_route,
+            ("ollama.switched".to_string(), "switched-model".to_string()),
+            "AgentEnd must be attributed to the switched-TO route (set_model_route), \
+             not the original one, got {events:?}"
+        );
+    }
+
+    /// `build_hardware_context` must forward the caller's TurnMeta onto the
+    /// RagRetrieve event it emits. Prior review flagged that RagRetrieve
+    /// correlation had no executing assertion anywhere.
+    #[test]
+    fn build_hardware_context_forwards_turn_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("datasheets");
+        std::fs::create_dir_all(&base).unwrap();
+        let content = r#"# Test Board
+## Pin Aliases
+red_led: 13
+## GPIO
+Pin 13: LED
+"#;
+        std::fs::write(base.join("test-board.md"), content).unwrap();
+        let rag = crate::rag::HardwareRag::load(tmp.path(), "datasheets").unwrap();
+        let boards = vec!["test-board".to_string()];
+        let observer = CapturingObserver::default();
+
+        let _ = build_hardware_context(
+            &rag,
+            &observer,
+            "led",
+            &boards,
+            5,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("coder"),
+                turn_id: "turn-7",
+                channel_name: "daemon",
+            },
+        );
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::RagRetrieve { .. }))
+            .expect("build_hardware_context must emit RagRetrieve")
+        {
+            ObserverEvent::RagRetrieve {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]
     /// when the input is under the cap. EOF with no bytes returns
     /// [`CappedLine::Eof`]. Regression guard for the happy path.
@@ -15766,10 +16847,6 @@ Let me check the result."#;
         }
     }
 
-    /// `read_capped_line` returns [`CappedLine::Truncated`] for a line
-    /// that exceeds the cap, regardless of whether a trailing newline is
-    /// present. This is the property that prevents a
-    /// `head -c 10G | zeroclaw chat` pipe from blowing up RSS.
     #[test]
     fn read_capped_line_truncates_at_cap() {
         let cap = 64usize;
@@ -15790,10 +16867,6 @@ Let me check the result."#;
         ));
     }
 
-    /// `read_capped_line` correctly handles a cap that lands mid-UTF-8
-    /// codepoint. The important invariant is that the call does not panic
-    /// and reports [`CappedLine::Truncated`] instead of returning a
-    /// partial, invalid string.
     #[test]
     fn read_capped_line_truncates_inside_multibyte_chars_safely() {
         // "🦀" is 4 bytes; cap of 5 will land mid-codepoint.
@@ -15806,10 +16879,6 @@ Let me check the result."#;
         ));
     }
 
-    /// `read_capped_line` returns the full input unchanged when the
-    /// input is exactly the cap. This pins the off-by-one boundary:
-    /// the +1 headroom in the `take(cap + 1)` wrapper means a buffer
-    /// that fills exactly to `cap` bytes is NOT considered truncated.
     #[test]
     fn read_capped_line_at_exact_cap_is_not_truncated() {
         let cap = 8usize;
@@ -15822,10 +16891,6 @@ Let me check the result."#;
         }
     }
 
-    /// Regression for #8463 (Audacity88 review): after truncating an
-    /// oversized line, the rest of the line is drained so the next call
-    /// starts at the next line instead of chunking the same oversized
-    /// line into repeated prompts.
     #[test]
     fn read_capped_line_drains_truncated_line_remainder() {
         let cap = 8usize;
@@ -15852,8 +16917,6 @@ Let me check the result."#;
         }
     }
 
-    /// After truncation, the next line is still readable even when it
-    /// is close to the cap (boundary condition on the drain).
     #[test]
     fn read_capped_line_drain_does_not_eat_next_line() {
         let cap = 8usize;
@@ -15884,10 +16947,6 @@ Let me check the result."#;
         }
     }
 
-    /// Regression for #8463: the bounded drain must not allocate an
-    /// unbounded buffer. We verify this indirectly by ensuring that a
-    /// line much larger than the cap is discarded and the next line is
-    /// still readable.
     #[test]
     fn read_capped_line_bounded_drain_preserves_next_line() {
         let cap = 64usize;

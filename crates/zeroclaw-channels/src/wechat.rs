@@ -1,8 +1,4 @@
 //! WeChat personal iLink Bot channel.
-//!
-//! Note: the iLink consent screen ("Connect X to Weixin") shows the bot name
-//! from the iLink developer portal, not from ZeroClaw config. Users who
-//! register their own iLink bot will see their own name there.
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
@@ -45,6 +41,12 @@ const MAX_QR_REFRESH: u32 = 3;
 const QR_SCAN_TIMEOUT: Duration = Duration::from_secs(480);
 
 const WECHAT_BIND_COMMAND: &str = "/bind";
+
+/// State-dir file holding the persisted bot token / account identity.
+/// Single source of truth for every reader, writer, and the relink purge.
+const ACCOUNT_FILE: &str = "account.json";
+/// State-dir file holding the persisted sync cursor and context tokens.
+const SYNC_FILE: &str = "sync.json";
 
 /// iLink Bot message types.
 const MESSAGE_TYPE_BOT: u32 = 2;
@@ -438,6 +440,33 @@ fn https_base_url(
     Ok(url)
 }
 
+/// Interpret an iLink `sendmessage` response body, returning a description
+/// of the failure when the API reported one.
+///
+/// The iLink API reports send failures as HTTP 200 with a non-zero
+/// `ret`/`errcode` in the JSON body — the same envelope the getUpdates
+/// sync loop parses. Checking only the HTTP status treats those failures
+/// (e.g. an expired or missing `context_token`) as success, so the message
+/// is silently dropped.
+///
+/// An empty or non-JSON 2xx body carries no envelope to inspect and is
+/// treated as success, preserving the pre-check behavior for those shapes.
+fn sendmessage_body_error(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(body) else {
+        return None;
+    };
+    let ret = data.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+    let errcode = data.get("errcode").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ret == 0 && errcode == 0 {
+        return None;
+    }
+    let errmsg = data.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
+    Some(format!("ret={ret}, errcode={errcode}, errmsg={errmsg:?}"))
+}
+
 /// WeChat iLink Bot channel — long-polls the iLink Bot API for updates.
 pub struct WeChatChannel {
     /// Bot token obtained via QR-code login; `None` until first login.
@@ -454,9 +483,6 @@ pub struct WeChatChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests; `Some` in the
-    /// long-running daemon, wired via `.with_persistence(config)`. RwLock so
-    /// concurrent peer reads from sibling channels don't serialize.
     persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
@@ -776,7 +802,7 @@ impl WeChatChannel {
 
     /// Read `account.json` from a state directory, if present and parseable.
     fn read_account_data(state_dir: &Path) -> Option<AccountData> {
-        let data = std::fs::read_to_string(state_dir.join("account.json")).ok()?;
+        let data = std::fs::read_to_string(state_dir.join(ACCOUNT_FILE)).ok()?;
         serde_json::from_str::<AccountData>(&data).ok()
     }
 
@@ -788,6 +814,32 @@ impl WeChatChannel {
         Self::read_account_data(state_dir)
             .and_then(|account| account.token)
             .is_some_and(|token| !token.is_empty())
+    }
+
+    /// Channel-owned relink hook: delete the persisted login state so the
+    /// next channel start finds no session and begins a fresh QR pairing.
+    ///
+    /// Removes exactly the files this module persists — [`ACCOUNT_FILE`]
+    /// (the bot token, i.e. the credential) and [`SYNC_FILE`] (the sync
+    /// cursor, which belongs to the replaced session) — and never the
+    /// directory itself. Returns the paths actually removed; an already
+    /// absent file is not an error, so relinking an unpaired channel is a
+    /// safe no-op that returns an empty list.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// in-memory token until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_login(state_dir: &Path) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for file in [ACCOUNT_FILE, SYNC_FILE] {
+            let path = state_dir.join(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
     }
 
     /// Load persisted token and cursor from state_dir.
@@ -808,7 +860,7 @@ impl WeChatChannel {
             }
         }
 
-        let sync_path = self.state_dir.join("sync.json");
+        let sync_path = self.state_dir.join(SYNC_FILE);
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
         {
@@ -850,7 +902,7 @@ impl WeChatChannel {
             user_id: user_id.map(String::from),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        let path = self.state_dir.join("account.json");
+        let path = self.state_dir.join(ACCOUNT_FILE);
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -889,7 +941,7 @@ impl WeChatChannel {
             get_updates_buf: self.cursor.lock().clone(),
             context_tokens: self.context_tokens.lock().clone(),
         };
-        let path = self.state_dir.join("sync.json");
+        let path = self.state_dir.join(SYNC_FILE);
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -977,18 +1029,6 @@ impl WeChatChannel {
         )
     }
 
-    /// Resolve `candidate` (already lexically inside `workspace_dir`) to its
-    /// real on-disk path and verify that the canonical target still lives
-    /// under the canonical workspace. Closes the symlink-escape hole that a
-    /// purely-lexical `resolve_under` leaves open: a workspace entry such as
-    /// `outside -> /etc` would otherwise pass lexical containment and let an
-    /// incoming marker like `[DOCUMENT:/workspace/outside/passwd]` read
-    /// `/etc/passwd` once `tokio::fs::read` follows the link.
-    ///
-    /// When `candidate` does not exist (and therefore cannot be canonicalized),
-    /// the lexical result is returned unchanged: a non-existent path cannot
-    /// resolve through a symlink. The lexical check is the safety net for
-    /// non-existent targets.
     fn canonicalize_within_workspace(
         candidate: &Path,
         workspace_dir: &Path,
@@ -1593,13 +1633,16 @@ impl WeChatChannel {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
                 let max = MAX_QR_REFRESH.to_string();
-                anyhow::bail!(
-                    "{}",
-                    wechat_cli_string_with_args(
-                        "cli-wechat-qr-expired-giving-up",
-                        &[("max", &max)],
-                    )
+                let reason = wechat_cli_string_with_args(
+                    "cli-wechat-qr-expired-giving-up",
+                    &[("max", &max)],
                 );
+                crate::login_events::LoginEvent::Failed { reason: &reason }.emit(
+                    self.name(),
+                    &self.alias,
+                    "WeChat QR login gave up after repeated expiry",
+                );
+                anyhow::bail!("{reason}");
             }
 
             // Fetch QR code
@@ -1656,6 +1699,17 @@ impl WeChatChannel {
             } else {
                 qrcode_img_url
             };
+            crate::login_events::LoginEvent::Qr {
+                payload: qr_payload,
+                image_url: (!qrcode_img_url.is_empty()).then_some(qrcode_img_url),
+                attempt: Some(qr_refresh_count),
+                max_attempts: Some(MAX_QR_REFRESH),
+            }
+            .emit(
+                self.name(),
+                &self.alias,
+                "WeChat login QR code ready (scan with the WeChat app)",
+            );
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
                 Err(err) => {
@@ -1746,6 +1800,11 @@ impl WeChatChannel {
                     "scaned" => {
                         if !scanned_printed {
                             println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
+                            crate::login_events::LoginEvent::Scanned.emit(
+                                self.name(),
+                                &self.alias,
+                                "WeChat QR code scanned — waiting for in-app confirmation",
+                            );
                             scanned_printed = true;
                         }
                     }
@@ -1753,6 +1812,15 @@ impl WeChatChannel {
                         println!(
                             "  {}",
                             wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
+                        crate::login_events::LoginEvent::Expired {
+                            attempt: qr_refresh_count,
+                            max_attempts: MAX_QR_REFRESH,
+                        }
+                        .emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login QR code expired",
                         );
                         break; // Will loop back and get a new QR code
                     }
@@ -1783,6 +1851,11 @@ impl WeChatChannel {
                             .map(String::from);
 
                         println!("  {}", wechat_cli_string("cli-wechat-connected"));
+                        crate::login_events::LoginEvent::Connected.emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login confirmed — channel connected",
+                        );
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
@@ -1880,6 +1953,16 @@ impl WeChatChannel {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
             anyhow::bail!("sendMessage failed ({status}): {err}");
+        }
+
+        // The API reports failures as HTTP 200 with a non-zero ret/errcode
+        // in the body; a status check alone silently drops the message.
+        let body = resp
+            .text()
+            .await
+            .context("failed to read sendMessage response body")?;
+        if let Some(err) = sendmessage_body_error(&body) {
+            anyhow::bail!("sendMessage failed ({err})");
         }
 
         Ok(())
@@ -2455,7 +2538,6 @@ impl Channel for WeChatChannel {
 
     async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
         // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
-        //
         // Current behavior: Return draft_id without sending placeholder.
         // The final response will be sent in finalize_draft().
         let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
@@ -2513,6 +2595,123 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_wechat_channel_for_api(api_base_url: String, state_dir: &Path) -> WeChatChannel {
+        let mut channel = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            None,
+            None,
+            Some(state_dir.to_path_buf()),
+        )
+        .unwrap();
+        channel.api_base_url = api_base_url;
+        *channel.bot_token.write().unwrap() = Some("test-token".into());
+        channel
+    }
+
+    #[tokio::test]
+    async fn send_text_reports_2xx_error_envelope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ret": -1,
+                "errcode": 301,
+                "errmsg": "context token expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(server.uri(), state.path());
+        let err = channel
+            .send_text("recipient", "hello", None)
+            .await
+            .expect_err("a 2xx iLink error envelope must fail the send");
+
+        let message = err.to_string();
+        assert!(message.contains("sendMessage failed"), "{message}");
+        assert!(message.contains("errcode=301"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_text_propagates_2xx_body_read_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(format!("http://{address}"), state.path());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            channel.send_text("recipient", "hello", None),
+        )
+        .await
+        .expect("the local truncated-body request must complete")
+        .expect_err("a truncated 2xx response body must fail the send");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the local truncated-body server must complete")
+            .unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("failed to read sendMessage response body"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn sendmessage_body_error_flags_nonzero_ret() {
+        let err = sendmessage_body_error(r#"{"ret":-1,"errmsg":"context token expired"}"#)
+            .expect("non-zero ret must be reported as an error");
+        assert!(err.contains("ret=-1"), "ret code missing from error: {err}");
+        assert!(
+            err.contains("context token expired"),
+            "errmsg missing from error: {err}"
+        );
+    }
+
+    #[test]
+    fn sendmessage_body_error_flags_nonzero_errcode() {
+        let err = sendmessage_body_error(r#"{"ret":0,"errcode":301,"errmsg":"session expired"}"#)
+            .expect("non-zero errcode must be reported as an error");
+        assert!(err.contains("errcode=301"), "errcode missing: {err}");
+    }
+
+    #[test]
+    fn sendmessage_body_error_accepts_success_envelope() {
+        assert_eq!(
+            sendmessage_body_error(r#"{"ret":0,"errcode":0,"errmsg":""}"#),
+            None
+        );
+        // Fields absent entirely also means success (defaults are 0).
+        assert_eq!(sendmessage_body_error(r#"{"msg_id":"abc"}"#), None);
+    }
+
+    #[test]
+    fn sendmessage_body_error_preserves_legacy_success_for_empty_or_non_json() {
+        // An empty 2xx body was success before this check existed; keep it so.
+        assert_eq!(sendmessage_body_error(""), None);
+        assert_eq!(sendmessage_body_error("   "), None);
+        // A non-JSON 2xx body has no envelope to inspect; do not invent failures.
+        assert_eq!(sendmessage_body_error("OK"), None);
+    }
+
     #[test]
     fn wechat_channel_name() {
         let ch = WeChatChannel::new(
@@ -2543,6 +2742,25 @@ mod tests {
         )
         .unwrap();
         assert!(WeChatChannel::has_persisted_login(dir));
+    }
+
+    #[test]
+    fn clear_persisted_login_removes_state_files_and_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("account.json"), r#"{"token": "tok_persisted"}"#).unwrap();
+        std::fs::write(dir.join("sync.json"), r#"{"get_updates_buf": "cursor"}"#).unwrap();
+
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!dir.join("account.json").exists());
+        assert!(!dir.join("sync.json").exists());
+        assert!(!WeChatChannel::has_persisted_login(dir));
+        assert!(dir.exists(), "the state directory itself must survive");
+
+        // Relinking an already unpaired channel is a safe no-op.
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert!(removed.is_empty());
     }
 
     #[test]
@@ -2875,12 +3093,6 @@ mod tests {
     // lexical-only containment path is still exercised by the
     // other tests in this module.
     fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
-        // Workspace contains `outside -> /tmp/.../outside-target`, where the
-        // target dir lives outside the workspace. Lexical normalization
-        // (which `resolve_under` does) is not enough — the symlink must be
-        // resolved and the canonical target must be re-checked against the
-        // canonical workspace, otherwise `[DOCUMENT:outside/file.txt]` would
-        // read the file the symlink points at.
         let temp = tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2964,11 +3176,6 @@ mod tests {
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
 
-        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
-        // official @tencent-weixin/openclaw-weixin client (base64-decode then
-        // hex-decode back to 16 bytes). Encoding raw bytes directly is
-        // undecryptable by the client ("image expired"), so it must NOT equal
-        // base64(raw) and must round-trip through the same parser.
         let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
         assert_ne!(outbound, base64_key);
         assert_eq!(parse_aes_key(&outbound).unwrap(), raw);

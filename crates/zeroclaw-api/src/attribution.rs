@@ -1,17 +1,3 @@
-//! Alias-bound attribution surface used by every emission in the
-//! workspace. Each "thing" that participates in an event (channel,
-//! agent, tool, cron job, model provider, memory backend, peer group,
-//! skill bundle, MCP bundle, session) implements [`Attributable`].
-//! Entry points open `attribution_span!(thing)` once at the start of
-//! their work; the `LogCaptureLayer` in `zeroclaw-log` walks the span
-//! scope and fills the typed attribution slots automatically.
-//!
-//! Adding a new variant: extend the relevant `Kind` enum (the variant
-//! name's snake_case form is the canonical `<type>` string via
-//! `strum::IntoStaticStr`), and — only if a new role family is needed —
-//! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
-//! / [`Role::default_category`] match arms. No call-site changes.
-
 use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 
 /// Trait every alias-bound "thing" implements once next to its struct.
@@ -497,5 +483,40 @@ mod tests {
                 .is_none()
         );
         assert_eq!(Role::System.attribution_field(), Some("system_alias"));
+    }
+
+    #[test]
+    fn role_family_str_returns_stable_tags() {
+        assert_eq!(Role::Agent.family_str(), "agent");
+        assert_eq!(Role::Swarm.family_str(), "swarm");
+        assert_eq!(Role::Channel(ChannelKind::Discord).family_str(), "channel");
+        assert_eq!(Role::Tool(ToolKind::Shell).family_str(), "tool");
+        assert_eq!(Role::Cron(CronKind::Interval).family_str(), "cron");
+        assert_eq!(
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic)).family_str(),
+            "provider.model"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tts(TtsProviderKind::ElevenLabs)).family_str(),
+            "provider.tts"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Transcription(
+                TranscriptionProviderKind::Whisper
+            ))
+            .family_str(),
+            "provider.transcription"
+        );
+        assert_eq!(
+            Role::Provider(ProviderKind::Tunnel(TunnelProviderKind::Ngrok)).family_str(),
+            "provider.tunnel"
+        );
+        assert_eq!(Role::Memory(MemoryKind::Sqlite).family_str(), "memory");
+        assert_eq!(Role::PeerGroup.family_str(), "peer_group");
+        assert_eq!(Role::Skill.family_str(), "skill");
+        assert_eq!(Role::Mcp.family_str(), "mcp");
+        assert_eq!(Role::Sop.family_str(), "sop");
+        assert_eq!(Role::Session.family_str(), "session");
+        assert_eq!(Role::System.family_str(), "system");
     }
 }

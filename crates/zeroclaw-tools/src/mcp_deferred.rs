@@ -1,10 +1,4 @@
 //! Deferred MCP tool loading — stubs and activated-tool tracking.
-//!
-//! When `mcp.deferred_loading` is enabled, MCP tool schemas are NOT eagerly
-//! included in the LLM context window. Instead, only lightweight stubs (name +
-//! description) are exposed in the system prompt. The LLM must call the built-in
-//! `tool_search` tool to fetch full schemas, which moves them into the
-//! [`ActivatedToolSet`] for the current conversation.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,6 +6,7 @@ use std::sync::Arc;
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
 use crate::mcp_tool::McpToolWrapper;
+use crate::tool_search::ToolAccessPolicy;
 use zeroclaw_api::tool::{Tool, ToolSpec};
 
 // ── DeferredMcpToolStub ──────────────────────────────────────────────────
@@ -89,6 +84,26 @@ impl DeferredMcpToolSet {
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.stubs.is_empty()
+    }
+
+    /// Return a copy of this set with stubs whose `prefixed_name` is
+    /// not allowed by `policy` removed. `policy == None` is a no-op
+    /// (the set is returned unchanged) — this matches the
+    /// `if let Some(policy) = ...` pattern at every production
+    /// call site. Centralizes the per-stub filter logic so the
+    /// prompt-side claim and the `ToolSearchTool` constructor see
+    /// exactly the same tool set.
+    pub fn filter_by_policy(&self, policy: Option<&ToolAccessPolicy>) -> Self {
+        let filtered_stubs: Vec<DeferredMcpToolStub> = self
+            .stubs
+            .iter()
+            .filter(|stub| policy.is_none_or(|p| p.is_tool_allowed(&stub.prefixed_name)))
+            .cloned()
+            .collect();
+        Self {
+            stubs: filtered_stubs,
+            registry: Arc::clone(&self.registry),
+        }
     }
 
     /// Look up stubs by exact name. Used for `select:name1,name2` queries.
@@ -180,11 +195,6 @@ impl ActivatedToolSet {
         self.tools.get(name).cloned()
     }
 
-    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
-    ///
-    /// Some model_providers occasionally strip the `<server>__` prefix when calling a
-    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
-    /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(tool) = self.get(name) {
             return Some(tool);
@@ -242,12 +252,6 @@ pub fn build_deferred_tools_section_filtered(
     build_deferred_tools_section_excluding(deferred, policy, &HashSet::new())
 }
 
-/// Like [`build_deferred_tools_section_filtered`], but omits stubs whose
-/// prefixed name is in `exclude`. Used for tools pre-activated at assembly
-/// time via `tool_filter_groups` `mode = "always"` (#6699): those are live
-/// from the first turn, and listing them under "NOT yet loaded / you MUST
-/// first call `tool_search`" would instruct the model to burn the exact
-/// round-trip pre-activation exists to remove.
 pub fn build_deferred_tools_section_excluding(
     deferred: &DeferredMcpToolSet,
     policy: Option<&crate::tool_search::ToolAccessPolicy>,
@@ -648,5 +652,61 @@ mod tests {
         let results = set.search("config database", 10);
         assert!(!results.is_empty());
         assert_eq!(results[0].prefixed_name, "server_b__read_config");
+    }
+
+    #[test]
+    fn filter_by_policy_none_returns_unchanged() {
+        // The centralized filter helper must be a no-op when no
+        // policy is set (the common case for callers that do not
+        // configure a `ToolAccessPolicy`).
+        let stubs = vec![
+            make_stub("fs__read_file", "Read a file"),
+            make_stub("git__status", "Git status"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs: stubs.clone(),
+            registry: std::sync::Arc::new(empty_registry()),
+        };
+        let filtered = set.filter_by_policy(None);
+        assert_eq!(filtered.stubs.len(), stubs.len());
+    }
+
+    #[test]
+    fn filter_by_policy_denied_removes_stubs() {
+        // A policy that denies a tool by name must drop that stub
+        // from the filtered set. The stub registry is irrelevant to
+        // the policy decision (it is the named filter), so an empty
+        // registry is fine.
+        let stubs = vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(empty_registry()),
+        };
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+        let filtered = set.filter_by_policy(Some(&policy));
+        let names: Vec<&str> = filtered
+            .stubs
+            .iter()
+            .map(|s| s.prefixed_name.as_str())
+            .collect();
+        assert!(names.contains(&"srv__visible"));
+        assert!(!names.contains(&"srv__hidden"));
+    }
+
+    /// Build an empty [`McpRegistry`] for tests that exercise the
+    /// stub set independently of any backing MCP server. The
+    /// `filter_by_policy` helper does not consult the registry, so
+    /// an empty one is sufficient.
+    fn empty_registry() -> McpRegistry {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(McpRegistry::connect_all(&[]))
+            .unwrap()
     }
 }

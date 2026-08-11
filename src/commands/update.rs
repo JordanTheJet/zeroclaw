@@ -115,7 +115,6 @@ pub struct UpdateInfo {
 }
 
 /// Check for available updates without downloading.
-///
 /// If `target_version` is `Some`, fetch that specific release tag instead of latest.
 pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -177,11 +176,6 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     })
 }
 
-/// Run the full 6-phase update pipeline.
-///
-/// If `target_version` is `Some`, fetch that specific version instead of latest.
-/// When `force` is set, install the target even if it is not newer than the
-/// current version (reinstall, or downgrade/pin to a specific `--version`).
 pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
@@ -303,7 +297,7 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
             // companion, the `web/dist` dashboard bundle, …). Best-effort:
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
-            install_companion_artifacts(&staging, &current_exe).await;
+            install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
             println!("{}", update_success_message(&update_info.latest_version));
             println!("{}", prebuilt_channel_note_message());
             Ok(())
@@ -385,11 +379,6 @@ fn is_installable_release_asset(name: &str, target: &str) -> bool {
     false
 }
 
-/// Return the exact Rust target triple for the current platform.
-///
-/// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
-/// shorter `aarch64-unknown-linux`) prevents substring matches from
-/// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
 fn current_target_triple() -> Option<&'static str> {
     target_triple_for(
         std::env::consts::OS,
@@ -614,9 +603,11 @@ fn main_binary_name() -> &'static str {
 /// mirrors (currently: `zerocode` next to `zeroclaw`, plus the `web/dist`
 /// directory that's handled by the whole-directory swap above).
 #[cfg(windows)]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode.exe"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode.exe";
 #[cfg(not(windows))]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode";
+
+const KNOWN_COMPANION_FILES: &[&str] = &[ZEROCODE_BINARY_NAME];
 
 fn is_known_companion(name: &str) -> bool {
     KNOWN_COMPANION_FILES.contains(&name)
@@ -738,12 +729,6 @@ async fn validate_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the binary header and verify its architecture matches the host.
-///
-/// On Linux/FreeBSD this reads the ELF header, on macOS the Mach-O header, and
-/// on Windows the PE/COFF header. If the binary is for a different architecture,
-/// returns a descriptive error instead of the opaque "Exec format error
-/// (os error 8)" (Unix) or its Windows equivalent.
 async fn check_binary_arch(path: &Path) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
@@ -778,12 +763,6 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Detect the CPU architecture from an ELF, Mach-O, or PE binary header.
-///
-/// Returns `None` when the container format or its machine type is not
-/// recognized, so callers treat "can't tell" as "skip the check" rather than a
-/// mismatch (returning a placeholder string here would make a known host arch
-/// compare unequal and falsely report an architecture mismatch).
 fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
     // ELF magic: 0x7f 'E' 'L' 'F'
     if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
@@ -848,11 +827,6 @@ fn host_architecture() -> Option<&'static str> {
     }
 }
 
-/// Verify the directory containing the executable is writable, so the update
-/// fails fast with an actionable message instead of downloading a binary and
-/// only then erroring during backup or swap. System-wide installs (e.g.
-/// `/usr/local/bin`, `/usr/bin`, or `Program Files`) typically require elevated
-/// privileges.
 async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
     let dir = exe
         .parent()
@@ -870,20 +844,6 @@ async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
     }
 }
 
-/// Replace the running executable at `target` with the freshly downloaded
-/// binary at `new`.
-///
-/// The mechanism differs by platform because each OS treats the file backing a
-/// running process differently:
-///
-/// * Unix — the kernel keeps the inode alive while the process runs, so the old
-///   path can be unlinked and the new binary copied into the now-free path
-///   (this avoids `ETXTBSY`).
-/// * Windows — the OS locks the image of a running process and refuses to delete
-///   it, but it *does* allow renaming. So the running exe is moved aside to a
-///   `.old` sidecar and the new binary is copied into the original path. The
-///   sidecar usually cannot be removed until the old process exits, so its
-///   deletion is best-effort and any leftover is swept on the next update run.
 #[cfg(not(windows))]
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
     tokio::fs::remove_file(target)
@@ -1034,12 +994,16 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 /// Best-effort by design — the `zeroclaw` binary has already been swapped and
 /// smoke-tested. A failure here (e.g. an unwritable data directory) is logged
 /// and swallowed rather than failing or rolling back an otherwise-good update.
-async fn install_companion_artifacts(staging: &Path, current_exe: &Path) {
+async fn install_companion_artifacts(
+    staging: &Path,
+    current_exe: &Path,
+    host_candidates: &[PathBuf],
+) {
     // 1. Dashboard bundle, if present: swap the whole `web/dist` directory so a
     //    stale file removed in a release is *gone*, not orphaned in place.
     let staged_web_dist = staging.join("web").join("dist");
     if staged_web_dist.is_dir() {
-        match install_web_dist(&staged_web_dist, current_exe).await {
+        match install_web_dist(&staged_web_dist, current_exe, host_candidates).await {
             Ok(target) => ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1255,8 +1219,12 @@ async fn swap_file(new: &Path, target: &Path) -> Result<()> {
 ///   have open handles), but `remove_dir_all` of the sidelined tree fails as
 ///   long as any file inside is held open. The leftover `.<name>.update-old-*`
 ///   directory is cleaned up by `sweep_update_residue` on the next update.
-async fn install_web_dist(staged_dist: &Path, current_exe: &Path) -> Result<PathBuf> {
-    let target = resolve_web_dist_target(current_exe);
+async fn install_web_dist(
+    staged_dist: &Path,
+    current_exe: &Path,
+    host_candidates: &[PathBuf],
+) -> Result<PathBuf> {
+    let target = resolve_web_dist_target(current_exe, host_candidates);
     let parent = target
         .parent()
         .context("web dashboard target has no parent")?;
@@ -1324,32 +1292,27 @@ async fn install_web_dist(staged_dist: &Path, current_exe: &Path) -> Result<Path
 /// gateway's dashboard auto-detection ([`crates/zeroclaw-gateway/src/lib.rs`])
 /// and `install.sh`:
 ///   1. existing `web/dist` next to the running binary (dev / packaged), or
-///   2. Docker layout `/zeroclaw-data/web/dist`, or
-///   3. system package layout `/usr/share/zeroclawlabs/web/dist`, or
-///   4. platform data dir `…/zeroclaw/web/dist` (prebuilt installer), or
-///   5. **fallback**: `web/dist` next to the running binary, even if it does
+///   2. one of `host_candidates` (Docker / system-package / platform data-dir
+///      layouts — see [`host_dashboard_candidates`]), or
+///   3. **fallback**: `web/dist` next to the running binary, even if it does
 ///      not yet exist — write *somewhere* so a fresh install gets a dashboard.
+///
+/// `host_candidates` is a parameter so unit tests can scope it to `&[]` and
+/// run hermetically against a tempdir binary, regardless of whether the host
+/// already has a dashboard installed (which would otherwise divert the target).
+/// Production callers pass [`host_dashboard_candidates`].
 ///
 /// The custom-config path (`gateway.web_dist_dir`) is intentionally ignored;
 /// reading the config here would couple this command to gateway internals and
 /// the operator can always re-run with `--force` after fixing the layout.
-fn resolve_web_dist_target(current_exe: &Path) -> PathBuf {
+fn resolve_web_dist_target(current_exe: &Path, host_candidates: &[PathBuf]) -> PathBuf {
     let binary_adjacent = current_exe.parent().map(|p| p.join("web").join("dist"));
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(ref p) = binary_adjacent {
         candidates.push(p.clone());
     }
-    candidates.push(PathBuf::from("/zeroclaw-data/web/dist"));
-    candidates.push(PathBuf::from("/usr/share/zeroclawlabs/web/dist"));
-    if let Some(base) = directories::BaseDirs::new() {
-        candidates.push(
-            base.data_local_dir()
-                .join("zeroclaw")
-                .join("web")
-                .join("dist"),
-        );
-    }
+    candidates.extend_from_slice(host_candidates);
     for c in &candidates {
         if c.join("index.html").is_file() {
             return c.clone();
@@ -1357,6 +1320,28 @@ fn resolve_web_dist_target(current_exe: &Path) -> PathBuf {
     }
     // Fallback: write next to the binary even if nothing existed yet.
     binary_adjacent.unwrap_or_else(|| PathBuf::from("web/dist"))
+}
+
+/// Absolute dashboard install locations outside the binary's own tree, in
+/// precedence order: the Docker layout, the system package layout, and the
+/// prebuilt-installer platform data dir. Extracted from
+/// [`resolve_web_dist_target`] so unit tests can run the resolver hermetically
+/// against a tempdir binary without consulting the real host layout — which
+/// may already hold a ZeroClaw dashboard and so divert the install target.
+fn host_dashboard_candidates() -> Vec<PathBuf> {
+    let mut c = vec![
+        PathBuf::from("/zeroclaw-data/web/dist"),
+        PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+    ];
+    if let Some(base) = directories::BaseDirs::new() {
+        c.push(
+            base.data_local_dir()
+                .join("zeroclaw")
+                .join("web")
+                .join("dist"),
+        );
+    }
+    c
 }
 
 /// Recursively copy `src` into `dst`. Used as the cross-filesystem fallback
@@ -1935,7 +1920,7 @@ mod tests {
     #[test]
     fn unpack_tar_gz_writes_main_binary() {
         let fake_binary = b"#!/bin/sh\necho zeroclaw";
-        let gz_buf = make_tar_gz(&[("zeroclaw", fake_binary)]);
+        let gz_buf = make_tar_gz(&[(main_binary_name(), fake_binary)]);
 
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
@@ -1954,9 +1939,10 @@ mod tests {
         let zerocode = b"#!/bin/sh\necho zerocode";
         let index = b"<!doctype html><title>dash</title>";
         let asset = b"console.log('app')";
+        let companion_name = ZEROCODE_BINARY_NAME;
         let gz_buf = make_tar_gz(&[
-            ("zeroclaw", zeroclaw),
-            ("zerocode", zerocode),
+            (main_binary_name(), zeroclaw),
+            (companion_name, zerocode),
             ("web/dist/index.html", index),
             ("web/dist/assets/app.js", asset),
         ]);
@@ -1968,7 +1954,10 @@ mod tests {
 
         let binary = locate_main_binary(&staging).unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), zeroclaw);
-        assert_eq!(std::fs::read(staging.join("zerocode")).unwrap(), zerocode);
+        assert_eq!(
+            std::fs::read(staging.join(companion_name)).unwrap(),
+            zerocode
+        );
         assert_eq!(
             std::fs::read(staging.join("web").join("dist").join("index.html")).unwrap(),
             index
@@ -2044,7 +2033,7 @@ mod tests {
         zip_buf
     }
 
-    /// Regression: #7509 — verify the zip unpacker writes the zeroclaw.exe
+    /// Regression: verify the zip unpacker writes the zeroclaw.exe
     /// binary bytes from a minimal Windows ZIP release asset.
     #[test]
     fn unpack_zip_writes_zeroclaw_exe() {
@@ -2185,7 +2174,7 @@ mod tests {
         std::fs::write(bin_dir.join("web/dist/index.html"), b"<html>").unwrap();
         let exe = bin_dir.join("zeroclaw");
 
-        let target = resolve_web_dist_target(&exe);
+        let target = resolve_web_dist_target(&exe, &[]);
         assert_eq!(target, bin_dir.join("web").join("dist"));
     }
 
@@ -2197,12 +2186,37 @@ mod tests {
         let exe = tmp.path().join("bin").join("zeroclaw");
         std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
 
-        let target = resolve_web_dist_target(&exe);
+        let target = resolve_web_dist_target(&exe, &[]);
         // Fallback either lands on the binary-adjacent dir or on the platform
         // data dir, depending on whether `/usr/share/zeroclawlabs/web/dist`
         // happens to exist on the runner. Both are acceptable; what matters is
         // it does not error.
         assert!(target.ends_with("web/dist"));
+    }
+
+    #[test]
+    fn resolve_web_dist_target_ignores_host_dashboard_when_candidates_empty() {
+        // A host that already has a dashboard installed must not divert the
+        // resolver off the binary-adjacent target when the caller scopes host
+        // candidates to none — the hermetic surface the unit tests rely on.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("zeroclaw");
+
+        // Stands in for the platform data dir on a host with an install.
+        let host_dashboard = tmp.path().join("host-install").join("web").join("dist");
+        std::fs::create_dir_all(&host_dashboard).unwrap();
+        std::fs::write(host_dashboard.join("index.html"), b"host").unwrap();
+
+        // With the host candidate injected, the scan still honors it.
+        let diverted = resolve_web_dist_target(&exe, std::slice::from_ref(&host_dashboard));
+        assert_eq!(diverted, host_dashboard);
+
+        // With no host candidates, the host dashboard is ignored and the
+        // resolver falls back to the binary-adjacent path.
+        let hermetic = resolve_web_dist_target(&exe, &[]);
+        assert_eq!(hermetic, bin_dir.join("web").join("dist"));
     }
 
     #[tokio::test]
@@ -2227,7 +2241,7 @@ mod tests {
         std::fs::write(staged_dist.join("index.html"), b"NEW INDEX").unwrap();
         std::fs::write(staged_dist.join("brand-new.txt"), b"fresh").unwrap();
 
-        let installed = install_web_dist(&staged_dist, &exe).await.unwrap();
+        let installed = install_web_dist(&staged_dist, &exe, &[]).await.unwrap();
         // Installs adjacent because old_dist already contains index.html.
         assert_eq!(installed, old_dist);
         assert_eq!(
@@ -2267,22 +2281,23 @@ mod tests {
         // top-level files are covered by the sibling test below.
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
-        std::fs::write(bin_dir.join("zerocode"), b"old zerocode").unwrap();
+        std::fs::write(bin_dir.join(companion_name), b"old zerocode").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Main binary lives in the staged tree but must NOT be re-swapped here
         // (it was already handled by the transactional `swap_binary` path).
-        std::fs::write(staging.join("zeroclaw"), b"new zeroclaw").unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(main_binary_name()), b"new zeroclaw").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // zerocode swapped in.
-        let expected_zerocode = bin_dir.join("zerocode");
+        let expected_zerocode = bin_dir.join(companion_name);
         assert_eq!(std::fs::read(&expected_zerocode).unwrap(), b"new zerocode");
         // Main binary must be unchanged by the companion pass.
         assert_eq!(std::fs::read(&exe).unwrap(), b"zeroclaw");
@@ -2298,25 +2313,26 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_files() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Known companion — must be installed.
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // Unknown top-level file — must NOT be installed. This is the
         // defense-in-depth surface: a forged release cannot smuggle a
         // `zerodash`, `.bashrc`, `evil.so`, etc. next to `zeroclaw` just by
         // naming it in its own archive.
         std::fs::write(staging.join("zerodash"), b"unknown artifact").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // Known companion installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         // Unknown sibling NOT installed.
@@ -2335,13 +2351,14 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // An unknown directory (a future layout, a mispackaged release, …).
         std::fs::create_dir_all(staging.join("themes").join("dark")).unwrap();
         std::fs::write(staging.join("themes/dark/index.css"), b"body{}").unwrap();
@@ -2350,11 +2367,11 @@ mod tests {
         std::fs::create_dir_all(staging.join("web").join("dist")).unwrap();
         std::fs::write(staging.join("web/dist/index.html"), b"NEW INDEX").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // Known artifacts installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         assert_eq!(
@@ -2437,7 +2454,7 @@ mod tests {
         std::fs::create_dir_all(&staged_dist).unwrap();
         std::fs::write(staged_dist.join("index.html"), b"NEW").unwrap();
 
-        let installed = install_web_dist(&staged_dist, &exe).await.unwrap();
+        let installed = install_web_dist(&staged_dist, &exe, &[]).await.unwrap();
 
         assert_eq!(std::fs::read(installed.join("index.html")).unwrap(), b"NEW");
         // Previous-run sidelined directory must be swept.

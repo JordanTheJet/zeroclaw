@@ -1,34 +1,47 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::OpenCodeCliConfig;
+
+use crate::coding_cli::{
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
+    add_safe_env,
+};
 
 /// Environment variables safe to pass through to the `opencode` subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the OpenCode CLI (`opencode run`).
-///
-/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to OpenCode, which has its own
-/// agent loop with file editing and shell tools.
-///
-/// Authentication uses the `opencode` binary's own session by default. No API
-/// key is needed unless `env_passthrough` includes provider-specific keys.
 pub struct OpenCodeCliTool {
     security: Arc<SecurityPolicy>,
     config: OpenCodeCliConfig,
+    executor: Arc<dyn CodingCliExecutor>,
 }
 
 impl OpenCodeCliTool {
+    /// Construct a standalone tool that executes directly on the host.
+    ///
+    /// Runtime registries should use `new_with_executor` so the configured
+    /// runtime and sandbox own process execution.
     pub fn new(security: Arc<SecurityPolicy>, config: OpenCodeCliConfig) -> Self {
-        Self { security, config }
+        Self::new_with_executor(security, config, DirectCodingCliExecutor::shared())
+    }
+
+    /// Construct the tool with an injected process executor.
+    pub fn new_with_executor(
+        security: Arc<SecurityPolicy>,
+        config: OpenCodeCliConfig,
+        executor: Arc<dyn CodingCliExecutor>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            executor,
+        }
     }
 }
 
@@ -93,11 +106,6 @@ impl Tool for OpenCodeCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            // Resolve relative working_directory against workspace_dir, NOT
-            // the daemon's current working directory. This prevents the bug
-            // where an external coding tool's relative working_directory
-            // would silently resolve to a path outside the workspace when
-            // the daemon cwd differs from workspace_dir.
             let wd_path = if wd_path.is_relative() {
                 self.security.workspace_dir.join(&wd_path)
             } else {
@@ -147,36 +155,13 @@ impl Tool for OpenCodeCliTool {
         };
 
         // Build CLI command
-        let mut cmd = Command::new("opencode");
+        let mut cmd = CodingCliCommand::new("opencode", work_dir.clone(), self.config.timeout_secs);
         cmd.arg("run").arg(prompt);
 
-        // Environment: clear everything, pass only safe vars + configured passthrough.
-        cmd.env_clear();
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-        for var in &self.config.env_passthrough {
-            let trimmed = var.trim();
-            if !trimmed.is_empty()
-                && let Ok(val) = std::env::var(trimmed)
-            {
-                cmd.env(trimmed, val);
-            }
-        }
+        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
 
-        cmd.current_dir(&work_dir);
-        // Execute with timeout — use kill_on_drop(true) so the child process
-        // is automatically killed when the future is dropped on timeout,
-        // preventing zombie processes.
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        cmd.kill_on_drop(true);
-
-        let result = tokio::time::timeout(timeout, cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
+        match self.executor.output(cmd).await {
+            Ok(output) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -200,7 +185,7 @@ impl Tool for OpenCodeCliTool {
                     },
                 })
             }
-            Ok(Err(e)) => {
+            Err(CodingCliExecutionError::Io(e)) => {
                 let err_msg = e.to_string();
                 let msg = if err_msg.contains("No such file or directory")
                     || err_msg.contains("not found")
@@ -216,18 +201,19 @@ impl Tool for OpenCodeCliTool {
                     error: Some(msg),
                 })
             }
-            Err(_) => {
-                // Timeout — kill_on_drop(true) ensures the child is killed
-                // when the future is dropped.
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "OpenCode CLI timed out after {}s and was killed",
-                        self.config.timeout_secs
-                    )),
-                })
-            }
+            Err(CodingCliExecutionError::Timeout) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "OpenCode CLI timed out after {}s and was killed",
+                    self.config.timeout_secs
+                )),
+            }),
+            Err(CodingCliExecutionError::Prepare(e)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to prepare opencode execution: {e}")),
+            }),
         }
     }
 }
@@ -315,11 +301,20 @@ mod tests {
 
     #[tokio::test]
     async fn opencode_cli_rejects_path_outside_workspace() {
-        let tool = OpenCodeCliTool::new(test_security(AutonomyLevel::Full), test_config());
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
+        let tool = OpenCodeCliTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            test_config(),
+        );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

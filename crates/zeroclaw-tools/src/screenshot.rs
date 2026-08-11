@@ -503,7 +503,6 @@ async fn copy_capture_to_reservation(
 }
 
 /// Tool for capturing screenshots using platform-native commands.
-///
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
 pub struct ScreenshotTool {

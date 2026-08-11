@@ -1,23 +1,4 @@
 //! Architecture gate: forbid duplicate-state patterns across the codebase.
-//!
-//! See `AGENTS.md` → "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH". This test
-//! catches the patterns most likely to drift back into the codebase: peer
-//! authorization caches on channel handles, snapshot copies of Config
-//! fields, and other "I'll just store a copy here" mistakes.
-//!
-//! The test scans Rust source under `crates/zeroclaw-channels/src/` for
-//! field declarations whose name + type combination indicates a cached
-//! copy of state that already lives in `Config`. New violations fail the
-//! workspace test suite (CI gate) — no human review needed.
-//!
-//! If you genuinely need a field that resembles one of these patterns,
-//! either:
-//!   1. The data IS its source of truth here (channel-local state that
-//!      nothing else owns) — add an exception with a `// SOT: ...`
-//!      comment on the same line. The detector treats `// SOT:` as an
-//!      explicit declaration that you have considered the rule.
-//!   2. Refactor to resolve from `Config` on demand. That's the V3 model
-//!      and what every new channel impl must do.
 
 use std::fs;
 use std::path::Path;
@@ -87,7 +68,7 @@ fn no_channel_handle_caches_peer_authorization_state() {
 
 fn workspace_root() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` for the workspace's top-level crate (the
-    // `zeroclawlabs` binary) — that's where `cargo test` invokes from.
+    // `zeroclaw` binary) — that's where `cargo test` invokes from.
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     here.to_path_buf()
 }

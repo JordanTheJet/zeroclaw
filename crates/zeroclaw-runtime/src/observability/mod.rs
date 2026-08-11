@@ -174,11 +174,6 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     });
 }
 
-/// Guard returned by [`set_scoped_broadcast_hook`].
-///
-/// Dropping the guard removes the hook it installed, but only if a later caller
-/// has not already replaced the process-wide hook. If multiple scoped hooks are
-/// live at once, dropping the newest hook restores the previous still-live hook.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub struct BroadcastHookGuard {
     scoped_id: u64,
@@ -370,12 +365,6 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
             {
-                // Derive the per-observer content policy once, at the observer
-                // construction boundary. `ObservabilityConfig` remains the source
-                // of truth; this immutable snapshot is owned by the `OtelObserver`
-                // and consulted at the OTel export boundary. There is no
-                // process-global mutable content policy, so concurrently live
-                // observers with different policies never drift into each other.
                 let content_config = OtelContentConfig::from_observability_config(config);
 
                 match OtelObserver::new(
@@ -432,6 +421,16 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         ObservabilityBackend::None => Box::new(NoopObserver),
     }
 }
+
+/// Serializes tests (in this module and elsewhere in the crate, e.g. the
+/// `agent::loop_` lifecycle-bracket tests that drive `run()` end to end)
+/// that install the process-wide broadcast hook, so concurrent test runs
+/// don't observe each other's installations. A `tokio::sync::Mutex` (not
+/// `parking_lot`) so async tests can hold the guard across the `.await` on
+/// `run()` without tripping `clippy::await_holding_lock`; plain `#[test]`s
+/// use [`tokio::sync::Mutex::blocking_lock`].
+#[cfg(test)]
+pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -544,7 +543,6 @@ mod tests {
         assert_eq!(create_observer(&bad).name(), "noop");
     }
 
-    use parking_lot::Mutex as PlMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test observer that counts events, metrics, and flushes, used to
@@ -579,13 +577,9 @@ mod tests {
         }
     }
 
-    /// Serialize tests that touch the process-wide broadcast hook so they
-    /// don't observe each other's installations.
-    static HOOK_TEST_LOCK: PlMutex<()> = PlMutex::new(());
-
     #[test]
     fn broadcast_hook_receives_events_from_factory_observer() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -610,7 +604,7 @@ mod tests {
 
     #[test]
     fn broadcast_hook_does_not_receive_metrics() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -633,7 +627,7 @@ mod tests {
 
     #[test]
     fn broadcast_hook_unset_means_only_primary_runs() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
@@ -649,7 +643,7 @@ mod tests {
 
     #[test]
     fn scoped_broadcast_hook_guard_clears_installed_hook_on_drop() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -672,7 +666,7 @@ mod tests {
 
     #[test]
     fn scoped_broadcast_hook_guard_preserves_replacement_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let old_hook = Arc::new(CountingObserver::default());
@@ -697,7 +691,7 @@ mod tests {
 
     #[test]
     fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let old_hook = Arc::new(CountingObserver::default());
@@ -730,7 +724,7 @@ mod tests {
 
     #[test]
     fn factory_observer_downcasts_through_tee() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
