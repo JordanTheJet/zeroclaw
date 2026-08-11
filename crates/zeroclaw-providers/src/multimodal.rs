@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
@@ -110,6 +111,161 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
+/// Why a candidate image reference cannot be sent as an inline base64 image
+/// block.
+///
+/// Deliberately a small copy type rather than a [`MultimodalError`]: the
+/// checker below runs over the whole replayed conversation on every turn, and
+/// an owned error would allocate for every rejected reference on that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageDataUriRejection {
+    /// Not a `data:` URI at all — a filesystem path, an `http(s)` URL, or prose.
+    NotADataUri,
+    /// A `data:` URI whose header does not declare `;base64`.
+    NotBase64Encoded,
+    /// Media type outside [`ALLOWED_IMAGE_MIME_TYPES`].
+    UnsupportedMediaType,
+    /// Payload is empty or is not canonical padded base64.
+    MalformedBase64,
+    /// Encoded payload exceeds the caller's per-image ceiling.
+    TooLarge,
+}
+
+impl std::fmt::Display for ImageDataUriRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NotADataUri => "not a base64 data URI",
+            Self::NotBase64Encoded => "data URI is not base64-encoded",
+            Self::UnsupportedMediaType => "unsupported image media type",
+            Self::MalformedBase64 => "malformed base64 payload",
+            Self::TooLarge => "image payload exceeds the per-image ceiling",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Splits a `data:` image reference into its media type and base64 payload,
+/// checking the structure without decoding it.
+///
+/// Both halves of the returned pair borrow from `candidate`; a caller that
+/// needs an owned lowercase media type allocates it once when it builds its
+/// wire block. `encoded_ceiling` is measured on the **encoded** payload
+/// length, unlike `max_bytes` elsewhere in this module, which counts decoded
+/// bytes.
+///
+/// This performs no decoding, no filesystem access and no network I/O on
+/// purpose. Provider adapters call it while converting an entire replayed
+/// history on every turn, so decoding here would mean re-decoding and
+/// re-encoding every image in the conversation once per turn.
+///
+/// It splits and structurally checks. It does not claim the payload decodes to
+/// a real image — nothing short of an image decoder can claim that.
+pub(crate) fn split_base64_image_data_uri(
+    candidate: &str,
+    encoded_ceiling: usize,
+) -> Result<(&str, &str), ImageDataUriRejection> {
+    let rest = candidate
+        .strip_prefix("data:")
+        .ok_or(ImageDataUriRejection::NotADataUri)?;
+    let Some(comma) = rest.find(',') else {
+        return Err(ImageDataUriRejection::NotADataUri);
+    };
+
+    let header = &rest[..comma];
+    let payload = rest[comma + 1..].trim();
+
+    // Matched case-sensitively, exactly as `normalize_data_uri` does, but on a
+    // whole parameter rather than a substring. `contains(";base64")` also
+    // accepted `;base64foo`, which the Anthropic adapter's residual sweep
+    // declines to sweep because it requires an exact `base64` parameter — so
+    // such a header fell between the two and left raw base64 in a text position.
+    // The parameter may sit anywhere in the list, which is what the sweep allows.
+    if !header
+        .split(';')
+        .skip(1)
+        .any(|parameter| parameter == "base64")
+    {
+        return Err(ImageDataUriRejection::NotBase64Encoded);
+    }
+
+    let media_type = header.split(';').next().unwrap_or_default().trim();
+    if !ALLOWED_IMAGE_MIME_TYPES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(media_type))
+    {
+        return Err(ImageDataUriRejection::UnsupportedMediaType);
+    }
+
+    // Checked before the character scan so an oversized payload costs one
+    // comparison rather than a full pass.
+    if payload.len() > encoded_ceiling {
+        return Err(ImageDataUriRejection::TooLarge);
+    }
+
+    if !is_canonical_base64_payload(payload) {
+        return Err(ImageDataUriRejection::MalformedBase64);
+    }
+
+    Ok((media_type, payload))
+}
+
+/// True when `payload` is canonical padded base64 in the standard alphabet:
+/// non-empty, a multiple of four characters, at most two trailing `=`, and the
+/// padding bits of the final quartet zero.
+///
+/// The final-quartet check is what stops a payload like `AB==` — correct
+/// length, legal characters — from passing here and then failing a strict
+/// decoder on the provider's side.
+fn is_canonical_base64_payload(payload: &str) -> bool {
+    if payload.is_empty() || !payload.len().is_multiple_of(4) {
+        return false;
+    }
+
+    let bytes = payload.as_bytes();
+    let pad = bytes.iter().rev().take_while(|b| **b == b'=').count();
+    if pad > 2 {
+        return false;
+    }
+
+    let body = &bytes[..bytes.len() - pad];
+    if !body.iter().all(|b| is_standard_base64_char(*b)) {
+        return false;
+    }
+
+    // `len % 4 == 0` and non-empty means `len >= 4`, so with `pad <= 2` the
+    // body always has at least the two characters indexed below.
+    match pad {
+        // `xyz=` carries 18 bits of payload in 24 bits of encoding: the last
+        // character must have its low two bits clear.
+        1 => matches!(
+            body[body.len() - 1],
+            b'A' | b'E'
+                | b'I'
+                | b'M'
+                | b'Q'
+                | b'U'
+                | b'Y'
+                | b'c'
+                | b'g'
+                | b'k'
+                | b'o'
+                | b's'
+                | b'w'
+                | b'0'
+                | b'4'
+                | b'8'
+        ),
+        // `xy==` carries 12 bits: the last character must have its low four
+        // bits clear.
+        2 => matches!(body[body.len() - 1], b'A' | b'Q' | b'g' | b'w'),
+        _ => true,
+    }
+}
+
+fn is_standard_base64_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
 fn is_loadable_image_reference(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("http://")
@@ -170,6 +326,17 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         out.push(ch);
     }
     out.trim().to_string()
+}
+
+/// True when `content` holds an image marker, terminated or not.
+///
+/// This is how a provider adapter tells *residue of this crate's own marker
+/// normalization* from a data URI the author wrote deliberately. An
+/// unterminated marker is copied through by [`parse_image_markers`] verbatim,
+/// prefix included, so the prefix is present in both the input and the cleaned
+/// output whenever residue is possible.
+pub(crate) fn carries_image_marker(content: &str) -> bool {
+    content.contains(IMAGE_MARKER_PREFIX)
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
@@ -250,12 +417,128 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .unwrap_or(0)
 }
 
+/// Media-marker kinds this module recognizes. `IMAGE` is the only kind
+/// resolved into provider content parts; [`AUDIO_MARKER_KINDS`] is the strict
+/// subset degraded when a loadable payload would otherwise reach the model as
+/// literal text. Both marker regexes below derive their kind alternation from
+/// these consts so the strip-all and strip-audio paths cannot drift apart on
+/// which kinds exist. The channel grammar (`ATTACHMENT_KINDS` in
+/// `crates/zeroclaw-channels/src/util.rs`) recognizes these same kinds plus
+/// `LOCATION`, which carries coordinates rather than a file reference and has
+/// no provider-side handling; the two lists live in different crates
+/// deliberately (providers cannot depend on channels).
+const MEDIA_MARKER_KINDS: &[&str] = &[
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "VOICE", "AUDIO",
+];
+
+/// Marker kinds whose loadable payload must not stay model-visible. No
+/// provider resolves audio into content parts, and an audio path is not
+/// otherwise actionable by the model: asked what it hears, a model handed a
+/// bare path tends to fabricate having played the file. Every other kind in
+/// [`MEDIA_MARKER_KINDS`] keeps its payload — `IMAGE` is resolved for vision
+/// downstream, and `PHOTO`/`DOCUMENT`/`FILE`/`VIDEO` paths stay actionable
+/// (file tools read them, and the channel delivery contract has the model
+/// copy them into outbound reply markers), so stripping those would break
+/// document and file delivery.
+const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
-            .unwrap()
+        regex::Regex::new(&format!(
+            r"(?i)\[(?:{}):[^\]]*\]",
+            MEDIA_MARKER_KINDS.join("|")
+        ))
+        .unwrap()
     });
     RE.replace_all(text, "[media attachment]").into_owned()
+}
+
+/// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
+/// payload for the loadable-reference check.
+static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?i)\[(?:{}):([^\]]*)\]",
+        AUDIO_MARKER_KINDS.join("|")
+    ))
+    .unwrap()
+});
+
+/// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
+/// *loadable* reference (absolute path, `http(s)://` URL, or `data:` URI) with
+/// the same `[media attachment]` placeholder the degrade path uses, returning
+/// the rewritten text and the number of markers replaced.
+///
+/// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
+/// prose (`[AUDIO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
+/// are harmless and must survive — mirroring how [`parse_image_markers`]
+/// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
+/// also cleans a marker embedded in a native tool-result JSON blob
+/// (`{"content":"…[AUDIO:/clip.wav]…"}`): `[media attachment]` contains no
+/// JSON-special characters, so the surrounding object stays valid.
+fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
+    let mut stripped = 0usize;
+    let out = AUDIO_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let payload = collapse_wrapped_marker(&caps[1]);
+        if !payload.is_empty() && is_loadable_image_reference(&payload) {
+            stripped += 1;
+            "[media attachment]".to_string()
+        } else {
+            // Preserve placeholder/prose markers verbatim.
+            caps[0].to_string()
+        }
+    });
+    (out.into_owned(), stripped)
+}
+
+/// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
+/// across every message in `messages`, logging one degradation warning when
+/// any are removed. Returns the input borrowed when no candidate marker is
+/// present (the common, allocation-free path) or an owned rebuilt vector
+/// otherwise.
+///
+/// This is the shared seam keeping a raw audio path out of provider payloads,
+/// whichever route the history takes:
+/// - the main iteration prep ([`prepare_messages_for_provider`], via
+///   `prepare_messages_inner`), and
+/// - one-shot queries that dispatch history directly without full prep (the
+///   max-iteration graceful summary and the other `run_model_query` callers).
+///
+/// Non-audio media markers pass through untouched; see `AUDIO_MARKER_KINDS`
+/// for why the split falls where it does.
+pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|m| AUDIO_MARKER_RE.is_match(&m.content))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut stripped = 0usize;
+    let rebuilt: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            let (content, n) = strip_unplayable_audio_markers(&m.content);
+            stripped += n;
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "markers_stripped": stripped,
+                })),
+            "multimodal: stripped unplayable audio marker(s) (AUDIO/VOICE); no provider resolves audio into content parts, so a raw path/URL was replaced with a placeholder instead of being sent to the model as text"
+        );
+    }
+
+    Cow::Owned(rebuilt)
 }
 
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
@@ -273,7 +556,7 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
+pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
     message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
 }
 
@@ -430,6 +713,16 @@ async fn prepare_messages_inner(
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<PreparedMessages> {
+    // Strip loadable audio markers before any provider sees the history. Left
+    // in place, an audio path reaches the model as literal text and fails
+    // silently — the model typically hallucinates having played the file,
+    // which is worse than an explicit degradation. `[IMAGE:...]` markers are
+    // handled by the normalization below; other media kinds keep their
+    // payloads for delivery. The shared seam borrows the input untouched when
+    // no audio marker is present, so the common hot path stays allocation-free.
+    let sanitized = sanitize_audio_markers(messages);
+    let messages: &[ChatMessage] = &sanitized;
+
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
@@ -1177,6 +1470,152 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// Canonical 1x1 PNG payload: 68 characters, a multiple of four, standard
+    /// alphabet, no padding. Every accept case below uses it.
+    const CANONICAL_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGMAAQAABQAB";
+
+    const TEN_MB: usize = 10 * 1024 * 1024;
+
+    // Every test in this block fails to compile before the change: the
+    // splitter and its rejection enum did not exist.
+
+    #[test]
+    fn split_data_uri_accepts_canonical_payload() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let (media_type, payload) =
+            split_base64_image_data_uri(&uri, TEN_MB).expect("canonical PNG data URI accepted");
+        assert_eq!(media_type, "image/png");
+        assert_eq!(payload, CANONICAL_PNG_B64);
+    }
+
+    #[test]
+    fn split_data_uri_accepts_uppercase_media_type_and_extra_parameters() {
+        // The allowlist comparison is case-insensitive, and the header may
+        // carry parameters before `;base64`.
+        let uri = format!("data:IMAGE/PNG;charset=binary;base64,{CANONICAL_PNG_B64}");
+        let (media_type, payload) =
+            split_base64_image_data_uri(&uri, TEN_MB).expect("upper-case media type accepted");
+        // Returned verbatim — the caller lowercases it once when it builds a
+        // wire block.
+        assert_eq!(media_type, "IMAGE/PNG");
+        assert_eq!(payload, CANONICAL_PNG_B64);
+    }
+
+    #[test]
+    fn split_data_uri_accepts_every_allowlisted_media_type() {
+        for mime in ALLOWED_IMAGE_MIME_TYPES {
+            let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
+            let (media_type, _) = split_base64_image_data_uri(&uri, TEN_MB)
+                .unwrap_or_else(|reason| panic!("{mime} rejected: {reason}"));
+            assert_eq!(media_type, *mime);
+        }
+    }
+
+    #[test]
+    fn split_data_uri_accepts_well_formed_padding() {
+        // `AA==` has its final-quartet padding bits clear; so does `AAA=`.
+        let two_pad = split_base64_image_data_uri("data:image/png;base64,AA==", TEN_MB);
+        assert_eq!(two_pad.map(|(_, payload)| payload), Ok("AA=="));
+        let one_pad = split_base64_image_data_uri("data:image/png;base64,AAA=", TEN_MB);
+        assert_eq!(one_pad.map(|(_, payload)| payload), Ok("AAA="));
+    }
+
+    #[test]
+    fn split_data_uri_rejects_non_data_uris() {
+        for candidate in [
+            "/tmp/screenshot.png",
+            r"C:\Users\leo\shot.png",
+            "http://example.com/a.png",
+            "https://example.com/a.png",
+            // A `data:` prefix with no comma has no payload to split.
+            "data:image/png;base64",
+        ] {
+            assert_eq!(
+                split_base64_image_data_uri(candidate, TEN_MB),
+                Err(ImageDataUriRejection::NotADataUri),
+                "expected {candidate} to be rejected as a non-data URI"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_missing_base64_declaration() {
+        // Matched case-sensitively, as `normalize_data_uri` already does.
+        assert_eq!(
+            split_base64_image_data_uri("data:image/png,AAAA", TEN_MB),
+            Err(ImageDataUriRejection::NotBase64Encoded)
+        );
+        assert_eq!(
+            split_base64_image_data_uri("data:image/png;BASE64,AAAA", TEN_MB),
+            Err(ImageDataUriRejection::NotBase64Encoded)
+        );
+    }
+
+    #[test]
+    fn split_data_uri_rejects_media_types_outside_the_allowlist() {
+        for mime in ["image/svg+xml", "image/bmp", "application/pdf", ""] {
+            let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
+            assert_eq!(
+                split_base64_image_data_uri(&uri, TEN_MB),
+                Err(ImageDataUriRejection::UnsupportedMediaType),
+                "expected {mime} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_malformed_base64() {
+        for payload in [
+            // Empty payload.
+            "",
+            // Not a multiple of four. Preparation always emits canonical
+            // padded base64, so a payload this shape cannot be a real image
+            // and Anthropic's decoder would reject it.
+            "iVBORw0KGgo",
+            "/9j/4AAQSkZJRgABAQEAYABgAAD",
+            // Characters outside the standard alphabet.
+            "AAA-",
+            "AA=A",
+            // More than two padding characters.
+            "AB==CD==",
+            // Final-quartet padding bits set: both fail a strict decoder even
+            // though the length and alphabet are fine.
+            "AB==",
+            "AAB=",
+        ] {
+            let uri = format!("data:image/png;base64,{payload}");
+            assert_eq!(
+                split_base64_image_data_uri(&uri, TEN_MB),
+                Err(ImageDataUriRejection::MalformedBase64),
+                "expected payload {payload:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_payloads_over_the_ceiling() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        assert_eq!(
+            split_base64_image_data_uri(&uri, CANONICAL_PNG_B64.len() - 1),
+            Err(ImageDataUriRejection::TooLarge)
+        );
+        // Exactly at the ceiling is accepted.
+        assert!(split_base64_image_data_uri(&uri, CANONICAL_PNG_B64.len()).is_ok());
+    }
+
+    #[test]
+    fn split_data_uri_rejections_carry_a_short_reason() {
+        assert_eq!(
+            ImageDataUriRejection::TooLarge.to_string(),
+            "image payload exceeds the per-image ceiling"
+        );
+        assert_eq!(
+            ImageDataUriRejection::MalformedBase64.to_string(),
+            "malformed base64 payload"
+        );
+    }
+
     #[test]
     fn strip_media_markers_replaces_image_local_path() {
         let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
@@ -1224,6 +1663,162 @@ mod tests {
             strip_media_markers(input),
             "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
         );
+    }
+
+    // ── loadable audio markers degrade; other media kinds keep their paths ──
+
+    #[test]
+    fn strip_unplayable_audio_markers_replaces_loadable_audio_path() {
+        let (out, n) = strip_unplayable_audio_markers("hear this [AUDIO:/tmp/clip.wav] now");
+        assert_eq!(out, "hear this [media attachment] now");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_degrades_audio_kinds_only() {
+        // The delivery contract: DOCUMENT/FILE/VIDEO/PHOTO paths stay
+        // model-visible so the agent can hand them to file tools or copy them
+        // into outbound reply markers; only the audio kinds degrade.
+        let input = "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
+        let (out, n) = strip_unplayable_audio_markers(input);
+        assert_eq!(
+            out,
+            "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [media attachment] [media attachment]"
+        );
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn audio_marker_kinds_is_subset_of_media_marker_kinds() {
+        for kind in AUDIO_MARKER_KINDS {
+            assert!(
+                MEDIA_MARKER_KINDS.contains(kind),
+                "audio kind {kind} missing from the full marker vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_leaves_image_marker_untouched() {
+        // `[IMAGE:...]` is handled by `parse_image_markers`; the audio
+        // stripper must never touch it (that would drop a resolvable image).
+        let (out, n) = strip_unplayable_audio_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
+        assert_eq!(out, "[IMAGE:/a.png] and [media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_preserves_non_loadable_payloads() {
+        // Placeholders, prose, a bare filename, and the no-transcription
+        // `[Audio: attached]` note are harmless literal text — keep them.
+        for input in [
+            "[AUDIO:...]",
+            "[VOICE:<clip>]",
+            "[Audio: attached]",
+            "[AUDIO:example.wav]",
+        ] {
+            let (out, n) = strip_unplayable_audio_markers(input);
+            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
+            assert_eq!(
+                n, 0,
+                "non-loadable marker must not count as stripped: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_is_case_insensitive() {
+        let (out, n) = strip_unplayable_audio_markers("[Audio:/tmp/clip.wav]");
+        assert_eq!(out, "[media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_handles_data_uri_and_url() {
+        let (out, n) = strip_unplayable_audio_markers(
+            "[VOICE:data:audio/ogg;base64,AAAA] and [AUDIO:https://x/y.mp3]",
+        );
+        assert_eq!(out, "[media attachment] and [media attachment]");
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_result_audio_marker() {
+        // The reported failure: a tool result surfaces an audio path. With no
+        // images in history, prep must still strip the marker so the raw
+        // filesystem path never reaches the provider as literal text.
+        let history = vec![
+            ChatMessage::user("call the tool and tell me what you hear"),
+            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let tool_msg = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives prep");
+        assert!(
+            !tool_msg.content.contains("/tmp/clip.wav"),
+            "raw audio path must not reach the provider: {}",
+            tool_msg.content
+        );
+        assert!(tool_msg.content.contains("[media attachment]"));
+        assert!(!prepared.contains_images);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_document_marker_for_delivery() {
+        // A tool result that surfaces a document path must reach the provider
+        // intact: the agent copies that path into an outbound reply marker to
+        // deliver the file, and file tools read it on request. Only the audio
+        // kinds degrade.
+        let history = vec![
+            ChatMessage::user("send me the report"),
+            ChatMessage::tool(
+                "[DOCUMENT:/workspace/report.pdf] generated, and [AUDIO:/tmp/note.wav]",
+            ),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let tool_msg = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives prep");
+        assert!(
+            tool_msg
+                .content
+                .contains("[DOCUMENT:/workspace/report.pdf]"),
+            "document path must stay model-visible for delivery: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("/tmp/note.wav"),
+            "audio path alongside it must still degrade: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_audio_but_keeps_image_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}] and hear [AUDIO:/tmp/clip.wav]",
+            path.display()
+        ))];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let content = &prepared.messages[0].content;
+        assert!(
+            !content.contains("/tmp/clip.wav"),
+            "audio path must be stripped: {content}"
+        );
+        assert!(content.contains("[media attachment]"));
+        // The image marker is still normalized to a data URI alongside it.
+        assert!(prepared.contains_images, "image still inlined: {content}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod allowlist;
 #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
 pub(crate) mod identity_persist;
 pub mod listing;
+pub mod login_events;
 pub mod login_probe;
 pub mod login_relink;
 pub mod orchestrator;
@@ -87,8 +88,6 @@ pub mod twitter;
 pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
-#[cfg(feature = "channel-wati")]
-pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
 #[cfg(feature = "channel-wechat")]

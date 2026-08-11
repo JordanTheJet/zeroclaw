@@ -1,12 +1,12 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
-//! plumbing the daemon uses for bidirectional calls.
+//! Uses local JSON-RPC transport types so `zerocode` stays an RPC-only surface.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -17,7 +17,9 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
-const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
+const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -65,6 +67,7 @@ pub mod method {
     pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
+    pub const CONFIG_RENAME_MAP_KEY: &str = "config/map-key-rename";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
     pub const CONFIG_SECTIONS: &str = "config/sections";
     pub const CONFIG_CATALOG_MODELS: &str = "config/catalog-models";
@@ -118,6 +121,7 @@ pub mod method {
     pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
     pub const SOPS_RUN: &str = "sops/run";
+    pub const SOPS_RUNS: &str = "sops/runs";
     pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
@@ -252,6 +256,13 @@ pub enum SessionUpdate {
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
     },
+    /// Older complete turns were removed from structured session history.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: u64,
+        kept_turns: u64,
+        reason: String,
+    },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
     /// or a failure; the daemon-composed `content` carries the attributed
@@ -323,6 +334,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+        }),
+        "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
+            session_id: sid,
+            dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            kept_turns: params.get("kept_turns")?.as_u64()?,
+            reason: params.get("reason")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -427,14 +444,78 @@ impl fmt::Display for DaemonVersionMismatch {
 
 impl std::error::Error for DaemonVersionMismatch {}
 
+/// The transport connected, but the daemon did not finish the ACP handshake.
 #[derive(Debug)]
-struct InitializeResponse {
-    server_version: String,
-    tui_id: Option<String>,
-    tui_sig: Option<String>,
+pub struct DaemonInitializeTimeout {
+    timeout: Duration,
 }
 
-fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+impl DaemonInitializeTimeout {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout.as_secs()
+    }
+}
+
+impl fmt::Display for DaemonInitializeTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "daemon did not complete initialization within {}s",
+            self.timeout_seconds()
+        )
+    }
+}
+
+impl std::error::Error for DaemonInitializeTimeout {}
+
+#[derive(Debug)]
+pub(crate) struct InitializeResponse {
+    server_version: String,
+    server_pid: Option<u32>,
+    tui_id: Option<String>,
+    tui_sig: Option<String>,
+    pub(crate) commands: Vec<crate::wire::CommandDescriptor>,
+}
+
+/// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
+/// share the current package and protocol versions but omit `commands`.
+///
+/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// RPC catalogue existed. New daemons remain authoritative, including when
+/// they explicitly advertise an empty catalogue.
+fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
+    vec![
+        crate::wire::CommandDescriptor {
+            id: "help".into(),
+            name: "help".into(),
+            aliases: Vec::new(),
+        },
+        crate::wire::CommandDescriptor {
+            id: "new".into(),
+            name: "new".into(),
+            aliases: vec!["new-session".into()],
+        },
+        crate::wire::CommandDescriptor {
+            id: "model".into(),
+            name: "model".into(),
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn parse_initialize_commands(resp: &Value) -> Result<Vec<crate::wire::CommandDescriptor>> {
+    match resp.get("commands") {
+        Some(commands) => serde_json::from_value(commands.clone())
+            .context("invalid command descriptors in initialize response"),
+        None => Ok(legacy_tui_command_descriptors()),
+    }
+}
+
+pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
     let server_version = resp
         .get("server_version")
         .and_then(Value::as_str)
@@ -446,12 +527,32 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
 
     Ok(InitializeResponse {
         server_version,
+        server_pid: resp
+            .get("server_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
         tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
         tui_sig: resp
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
+        commands: parse_initialize_commands(resp)?,
     })
+}
+
+async fn request_initialize(
+    rpc: &RpcOutbound,
+    init_params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    match tokio::time::timeout(timeout, rpc.request(method::INITIALIZE, init_params)).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(anyhow::Error::msg(format!(
+            "initialize: {} ({})",
+            e.message, e.code
+        ))),
+        Err(_) => Err(DaemonInitializeTimeout::new(timeout).into()),
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────
@@ -515,6 +616,8 @@ pub struct RpcClient {
     _read_task: tokio::task::JoinHandle<()>,
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
+    /// OS process ID reported by the daemon during initialize.
+    pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
     /// Broadcast channel for server-initiated requests that expect a
     /// response (today: `elicitation/create`). The Chat widget for the
@@ -528,6 +631,9 @@ pub struct RpcClient {
     pub tui_sig: Option<String>,
     /// Transport protocol of this connection.
     transport: Transport,
+    /// Shared TUI command metadata received from the daemon's canonical
+    /// command catalogue during initialization.
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 impl RpcClient {
@@ -628,14 +734,11 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -646,7 +749,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -656,12 +758,14 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Local,
+            commands: init.commands,
         })
     }
 
@@ -779,14 +883,11 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -797,7 +898,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -807,12 +907,14 @@ impl RpcClient {
             _read_task: read_task,
             _router_task: router_task,
             server_version: init.server_version,
+            server_pid: init.server_pid,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Wss,
+            commands: init.commands,
         })
     }
 
@@ -1058,6 +1160,20 @@ impl RpcClient {
         Ok(())
     }
 
+    pub async fn config_map_key_rename(
+        &self,
+        path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<ConfigRenameMapKeyResult> {
+        self.call_with_timeout(
+            method::CONFIG_RENAME_MAP_KEY,
+            serde_json::json!({ "path": path, "from": from, "to": to }),
+            CONFIG_RENAME_TIMEOUT,
+        )
+        .await
+    }
+
     pub async fn config_templates(&self) -> Result<Vec<ConfigTemplateEntry>> {
         let result: ConfigTemplatesResult = self
             .call(method::CONFIG_TEMPLATES, serde_json::json!({}))
@@ -1269,6 +1385,23 @@ impl RpcClient {
             .ok_or_else(|| anyhow::Error::msg("sops/run: response missing run_id"))
     }
 
+    /// List run summaries, optionally filtered to one SOP by name. The
+    /// daemon returns `{ "runs": [SopRunSummary...] }`; rows that fail to
+    /// deserialize are impossible by construction (every view field
+    /// defaults), so a newer daemon cannot break this surface.
+    // Staged for the SOP pane status-icon surface; no pane consumer yet.
+    #[allow(dead_code)]
+    pub async fn sops_runs(&self, sop: Option<&str>) -> Result<Vec<SopRunSummaryView>> {
+        let value: Value = self
+            .call(method::SOPS_RUNS, serde_json::json!({ "sop": sop }))
+            .await?;
+        let runs = value
+            .get("runs")
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg("sops/runs: response missing runs"))?;
+        serde_json::from_value(runs).map_err(Into::into)
+    }
+
     pub async fn sops_save(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_SAVE, serde_json::json!({ "sop": sop }))
             .await
@@ -1447,7 +1580,12 @@ impl RpcClient {
     }
 
     pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
-        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+        self.call_with_timeout(
+            method::DOCTOR_RUN,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
@@ -1588,6 +1726,10 @@ impl RpcClient {
         self.tui_sig.as_deref()
     }
 
+    pub fn commands(&self) -> &[crate::wire::CommandDescriptor] {
+        &self.commands
+    }
+
     /// List all connected TUI sessions from the daemon registry.
     pub async fn tui_list(&self) -> Result<TuiListResult> {
         self.call(method::TUI_LIST, serde_json::json!({})).await
@@ -1622,12 +1764,14 @@ impl RpcClient {
             _read_task: tokio::spawn(async {}),
             _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
+            server_pid: None,
             notifications_bcast: notif_tx,
             inbound_requests_bcast: inbound_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
             transport: Transport::Local,
+            commands: Vec::new(),
         }
     }
 
@@ -1658,14 +1802,60 @@ mod initialize_version_tests {
     fn initialize_response_accepts_matching_server_version() {
         let parsed = parse_initialize_response(&json!({
             "server_version": env!("CARGO_PKG_VERSION"),
+            "server_pid": 42,
             "tui_id": "tui_1",
             "tui_sig": "sig_1"
         }))
         .unwrap();
 
         assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.server_pid, Some(42));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+        assert_eq!(parsed.commands, legacy_tui_command_descriptors());
+    }
+
+    #[test]
+    fn initialize_response_parses_command_descriptors() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [{
+                "id": "new",
+                "name": "new",
+                "aliases": ["new-session"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parsed.commands,
+            vec![crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn initialize_response_preserves_present_empty_command_catalogue() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        }))
+        .unwrap();
+
+        assert!(parsed.commands.is_empty());
+    }
+
+    #[test]
+    fn initialize_response_allows_missing_server_pid_for_compatibility() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_pid, None);
     }
 
     #[test]
@@ -1692,6 +1882,28 @@ mod initialize_version_tests {
 
         assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(mismatch.server_version(), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod initialize_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_request_times_out_when_transport_never_responds() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = RpcOutbound::new(writer_tx);
+        let receiver = tokio::spawn(async move {
+            writer_rx.recv().await.expect("initialize request");
+            std::future::pending::<()>().await;
+        });
+
+        let err = request_initialize(&rpc, serde_json::json!({}), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
+        receiver.abort();
     }
 }
 
@@ -1738,6 +1950,14 @@ pub struct LocalesFetchResult {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigMapKeysResult {
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigRenameMapKeyResult {
+    pub renamed: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1860,6 +2080,12 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Keeps this skill's instructions inlined in the system prompt even in
+    /// compact skill-prompt mode. Not editable from this TUI mirror, but must
+    /// be carried through the load→edit→save round-trip so editing a skill
+    /// here doesn't silently reset it to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1883,6 +2109,34 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+#[cfg(test)]
+mod skill_frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn always_true_survives_deserialize_then_serialize_round_trip() {
+        let value = serde_json::json!({
+            "name": "security-policy",
+            "description": "Critical safety rules",
+            "always": true,
+        });
+
+        let frontmatter: SkillFrontmatter = serde_json::from_value(value).unwrap();
+        assert!(
+            frontmatter.always,
+            "always: true in the wire payload must deserialize into the mirror struct"
+        );
+
+        let reserialized = serde_json::to_value(&frontmatter).unwrap();
+        assert_eq!(
+            reserialized.get("always"),
+            Some(&serde_json::Value::Bool(true)),
+            "always must round-trip through re-serialization, not be silently dropped \
+             on the TUI's load -> edit -> save path"
+        );
+    }
+}
 
 // ── Quickstart types ─────────────────────────────────────────────
 //
@@ -2364,6 +2618,64 @@ pub struct TriggerSourceRegistryView {
     pub operators: Vec<ConditionOpSpecView>,
 }
 
+/// Run status as serialized by the runtime's `SopRunStatus`. Unknown
+/// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
+/// so an older zerocode keeps rendering rather than dropping the run.
+// Staged for the SOP pane status-icon surface; no pane consumer yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopRunStatusView {
+    #[default]
+    Pending,
+    Running,
+    WaitingApproval,
+    PausedCheckpoint,
+    Completed,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SopRunStatusView {
+    /// True while the run is parked on an operator decision (approval gate
+    /// or deterministic checkpoint).
+    // Staged for the status-icon surface; consumed by the icon aggregation rule.
+    #[allow(dead_code)]
+    pub fn needs_input(self) -> bool {
+        matches!(self, Self::WaitingApproval | Self::PausedCheckpoint)
+    }
+
+    /// True once the run has reached a terminal state.
+    // Staged for the status-icon surface; consumed by the icon aggregation rule.
+    #[allow(dead_code)]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
+/// Every field defaults so a field added daemon-side never breaks an
+/// older zerocode.
+// Staged for the SOP pane status-icon surface; no pane consumer yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SopRunSummaryView {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatusView,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub trigger_source: String,
+    /// True while the run is live in the engine's active set rather than
+    /// a retained terminal record.
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchRule {
     pub name: String,
@@ -2718,6 +3030,62 @@ pub struct StatusResult {
     pub server_version: String,
     pub protocol_version: u64,
     pub active_sessions: usize,
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    #[serde(default)]
+    pub config_file: Option<String>,
+    #[serde(default)]
+    pub config_kind: Option<String>,
+    #[serde(default)]
+    pub local_ipc_endpoint: Option<String>,
+}
+
+#[cfg(test)]
+mod dashboard_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_result_decodes_runtime_context_fields() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2,
+            "config_dir": "/tmp/zeroclaw-profile",
+            "config_file": "/tmp/zeroclaw-profile/config.toml",
+            "config_kind": "temporary",
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.config_dir.as_deref(), Some("/tmp/zeroclaw-profile"));
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some("/tmp/zeroclaw-profile/config.toml")
+        );
+        assert_eq!(status.config_kind.as_deref(), Some("temporary"));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some("/tmp/zeroclaw-profile/data/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn status_result_decodes_legacy_payload_without_runtime_context() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.server_version, "0.8.4");
+        assert_eq!(status.config_dir, None);
+        assert_eq!(status.config_file, None);
+        assert_eq!(status.config_kind, None);
+        assert_eq!(status.local_ipc_endpoint, None);
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3200,6 +3568,97 @@ mod sop_method_tests {
     }
 
     #[tokio::test]
+    async fn sops_runs_sends_filter_and_parses_summaries() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(Some("deploy")).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], "deploy");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "runs": [
+                    {
+                        "run_id": "run-1",
+                        "sop_name": "deploy",
+                        "status": "waiting_approval",
+                        "current_step": 2,
+                        "total_steps": 5,
+                        "started_at": "2026-08-02T00:00:00Z",
+                        "completed_at": null,
+                        "trigger_source": "manual",
+                        "active": true
+                    },
+                    {
+                        "run_id": "run-0",
+                        "sop_name": "deploy",
+                        "status": "some_future_status",
+                        "current_step": 5,
+                        "total_steps": 5,
+                        "started_at": "2026-08-01T00:00:00Z",
+                        "completed_at": "2026-08-01T00:05:00Z",
+                        "trigger_source": "cron",
+                        "active": false,
+                        "some_future_field": {"nested": true}
+                    }
+                ]
+            })),
+            None,
+        );
+
+        let runs = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, SopRunStatusView::WaitingApproval);
+        assert!(runs[0].status.needs_input());
+        assert!(runs[0].active);
+        assert_eq!(
+            runs[1].status,
+            SopRunStatusView::Unknown,
+            "a status from a newer daemon must fold to Unknown, not fail the whole list"
+        );
+        assert!(!runs[1].status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn sops_runs_unfiltered_sends_null_and_requires_runs_key() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(None).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], serde_json::Value::Null);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"not_runs": []})), None);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .expect_err("a response without `runs` must error, not silently return empty");
+        assert!(err.to_string().contains("missing runs"));
+    }
+
+    #[tokio::test]
     async fn sops_wire_draft_sends_sop_and_edit_envelopes() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
@@ -3403,6 +3862,48 @@ mod session_method_tests {
             .expect("client.session_approve must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_sends_path_and_aliases() {
+        assert_eq!(CONFIG_RENAME_TIMEOUT, std::time::Duration::from_secs(120));
+
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task =
+            tokio::spawn(async move { client.config_map_key_rename("agents", "old", "new").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.config_map_key_rename must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "config/map-key-rename");
+        assert_eq!(req["params"]["path"], "agents");
+        assert_eq!(req["params"]["from"], "old");
+        assert_eq!(req["params"]["to"], "new");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "path": "agents",
+                "from": "old",
+                "to": "new",
+                "renamed": true,
+                "warnings": ["workspace move skipped"]
+            })),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.config_map_key_rename must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert!(result.renamed);
+        assert_eq!(result.warnings, vec!["workspace move skipped"]);
     }
 }
 
@@ -3652,6 +4153,27 @@ mod plan_parse_tests {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
         }
+    }
+
+    #[test]
+    fn parses_history_trimmed_update() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                kept_turns: 3,
+                reason,
+            }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
     }
 
     #[test]
