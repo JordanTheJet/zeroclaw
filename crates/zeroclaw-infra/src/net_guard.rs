@@ -1752,9 +1752,9 @@ mod tests {
 
     #[test]
     fn overlapping_prefixes_reject_when_a_specific_translation_is_private() {
-        // Same overlap shape, but the more-specific translation reaches RFC
-        // 1918 space rather than metadata. Only the public validator refuses
-        // private destinations, so this case is asserted there alone.
+        // Same overlap shape, but the more-specific translation reaches
+        // RFC 1918 space rather than metadata. Only the public validator
+        // refuses private destinations, so this case is asserted there alone.
         let ips = [ip("2001:67c:5db8:d822:1234:5678:a00:1")];
 
         for prefixes in both_orders(OVERLAP_BROAD_32, OVERLAP_SPECIFIC_96) {
