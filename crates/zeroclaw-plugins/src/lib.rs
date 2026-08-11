@@ -59,8 +59,8 @@ pub struct PluginManifest {
     /// This is a signature-covered **attestation of intent**, never a grant:
     /// nothing here confers network reach. The effective allowlist is the
     /// operator's `plugins.entries[].egress_hosts`. Keeping the two apart is
-    /// what closes the self-grant path in #9395 — an unsigned component that
-    /// writes its own `[egress]` table still reaches nothing.
+    /// what shuts the self-grant path — an unsigned component that writes its
+    /// own `[egress]` table still reaches nothing.
     #[serde(default)]
     pub egress: PluginEgressDeclaration,
 }
