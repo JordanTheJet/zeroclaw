@@ -5,7 +5,7 @@ use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
     PluginState, PluginStoreSpec, call_plugin, call_store, call_tool_execute, engine,
-    load_component, wt,
+    load_component, wt, wt_instantiate,
 };
 use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
@@ -73,7 +73,7 @@ pub async fn create_plugin(
     );
     let linker = build_linker(store.data())?;
     let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-        wt(
+        wt_instantiate(
             ToolPlugin::instantiate_async(store, &component, &linker).await,
             "failed to instantiate tool plugin",
         )
@@ -221,6 +221,20 @@ mod tests {
             &component,
             &scope,
             &crate::services::test_host_services(),
+            crate::component::test_limits(0),
+        )
+        .await;
+
+        let error = result.err().expect("capability mismatch must fail");
+        assert!(format!("{error:#}").contains("capability"));
+    }
+
+    #[tokio::test]
+    async fn create_plugin_rejects_a_scope_for_another_capability() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let result = create_plugin(
+            Path::new("/path/that/must/not-be-read.wasm"),
+            &scope,
             crate::component::test_limits(0),
         )
         .await;

@@ -431,6 +431,12 @@ pub struct ModelInfo {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Maximum input window in tokens, as reported by the provider catalog.
+    /// `None` when the catalog does not publish one — callers must treat that
+    /// as "unknown" rather than substituting a default, so an operator can be
+    /// told the window is unset instead of silently getting a stub value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 #[async_trait]
@@ -438,6 +444,20 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Query the effective capabilities for the model that will be dispatched.
+    ///
+    /// Most providers have one capability set for every model and inherit this
+    /// default. Composite providers override it when the model selects a route
+    /// or when failover can reach children with different capabilities.
+    fn capabilities_for_model(&self, _model: &str) -> ProviderCapabilities {
+        let mut capabilities = self.capabilities();
+        // Preserve compatibility with providers that historically overrode the
+        // convenience accessor instead of capabilities(). Composite overrides
+        // should still make the model-aware value authoritative.
+        capabilities.vision = self.supports_vision();
+        capabilities
     }
 
     /// Family-preferred temperature default. Override per family. Documented
@@ -513,7 +533,11 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             .list_models()
             .await?
             .into_iter()
-            .map(|id| ModelInfo { id, pricing: None })
+            .map(|id| ModelInfo {
+                id,
+                pricing: None,
+                context_window: None,
+            })
             .collect())
     }
 
@@ -691,6 +715,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        self.as_ref().capabilities_for_model(model)
     }
 
     fn default_max_tokens(&self) -> u32 {
