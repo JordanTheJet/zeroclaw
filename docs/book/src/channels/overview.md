@@ -29,13 +29,17 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Channel | Feature flag | Dedicated guide |
 |---|---|---|
 | Matrix | `channel-matrix` | [Matrix](./matrix.md) |
+| Telegram | `channel-telegram` | [Telegram](./telegram.md) |
+| Discord | `channel-discord` | [Discord](./discord.md) |
+| Slack | `channel-slack` | [Slack](./slack.md) |
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
+| Twitch | `channel-twitch` | No dedicated guide |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
-| Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -84,7 +88,7 @@ See [Voice & telephony](./voice.md).
 |---|---|---|
 | Webhook | `channel-webhook` | Inbound HTTP → agent |
 | CLI | always on | Local stdin/stdout |
-| Gateway REST/WS | always on | HTTP + WebSocket |
+| Gateway REST/WS | `gateway` (enabled by default) | HTTP + WebSocket |
 | ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio: editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
