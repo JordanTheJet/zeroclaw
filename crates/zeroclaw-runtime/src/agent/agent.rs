@@ -1566,7 +1566,13 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority) must
+            // follow reloads rather than this call's `config` snapshot. `None`
+            // here would silently pin them to startup state for the Agent's
+            // whole lifetime. One-shot callers pass `None` and keep the
+            // documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -3164,6 +3170,14 @@ mod safety_net;
 #[cfg(test)]
 #[path = "parity.rs"]
 mod parity;
+
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
 
 #[cfg(test)]
 mod tests {

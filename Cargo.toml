@@ -425,7 +425,7 @@ metrics = ["observability-prometheus"]
 #   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
 #   performance.
 plugins-wasm-runtime-only = ["plugins-wasm", "zeroclaw-plugins/plugins-wasmtime"]
-plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift", "zeroclaw-runtime/plugins-wasm-cranelift"]
 plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pulley"]
 
 # CI meta-feature
