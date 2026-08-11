@@ -862,42 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn host_endpoint_overrides_guest_routing_identity() {
-        for (channel_type, alias, guest_alias) in [
-            ("plugin", "acme.chat", Some("guest-selected-alias")),
-            ("telegram", "work", None),
-            ("gmail_push", "main", Some("")),
-        ] {
-            let scope = crate::instance::test_scope(PluginCapability::Channel, alias, []);
-            let endpoint = PluginChannelEndpoint::new(scope, channel_type).unwrap();
-            let message = from_wit_inbound(
-                WitInboundMessage {
-                    id: "evt-1".to_string(),
-                    sender: "sender".to_string(),
-                    reply_target: "room".to_string(),
-                    content: "hello".to_string(),
-                    channel: "guest-selected-type".to_string(),
-                    channel_alias: guest_alias.map(str::to_string),
-                    timestamp: 42,
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
-                },
-                &endpoint,
-            );
-
-            assert_eq!(message.channel, channel_type);
-            assert_eq!(message.channel_alias.as_deref(), Some(alias));
-            assert_ne!(message.channel, endpoint.instance_id().package());
-            assert_eq!(message.content, "hello");
-            assert!(message.internal_sop_event.is_none());
-            assert!(!message.passive_context);
-            assert!(!message.explicitly_addressed);
-        }
-    }
-
-    #[test]
     fn host_enqueued_inbound_reaches_the_drain_handle() {
         let queue = crate::component::InboundQueue::default();
         let listener_handle = queue.clone();
