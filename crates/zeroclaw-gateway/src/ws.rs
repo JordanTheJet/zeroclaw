@@ -1,4 +1,8 @@
 //! WebSocket agent chat handler.
+//!
+//! Approval summaries are operator-facing strings produced by the runtime's
+//! key-name redaction heuristic. Approval decisions bind to `request_id`; this
+//! transport forwards the summary without rebuilding it from raw arguments.
 
 use super::AppState;
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
@@ -24,6 +28,19 @@ use zeroclaw_runtime::sop::approval::{
 /// `approval_request` frame before the channel auto-denies. Mirrors the
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
+
+/// Single ingress identity for gateway WebSocket turns.
+///
+/// This name is used in three places that MUST agree:
+///   1. `Agent.channel_name` — observer/attribution events for the turn
+///   2. the turn span's `channel` field — tracing/log correlation
+///   3. the interactive back-channel registration key — how `ask_user`,
+///      `poll`, and `escalate_to_human` find this conversation
+///
+/// If (3) diverges from (1) and (2), one turn is split across two channel
+/// names in observability while interactive tools still route correctly —
+/// or, worse, tools route to an arbitrary seeded channel.
+const WS_CHANNEL_KEY: &str = "wss";
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -109,17 +126,26 @@ pub async fn handle_ws_chat(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth: check header, subprotocol, then query param (precedence order)
-    if state.pairing.require_pairing() {
+    // Auth: check header, subprotocol, then query param (precedence order). On
+    // success derive a STABLE transport-authenticated subject (the paired-token
+    // hash) so a required-group approval policy can be satisfied over WS; an
+    // operator grants approval rights to this paired device via a `ws:<token-hash>`
+    // group member. `None` when pairing is not required (no auth identity).
+    let auth_subject = if state.pairing.require_pairing() {
         let token = extract_ws_token(&headers, params.token.as_deref()).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
-            )
-                .into_response();
+        match state.pairing.authenticate_and_hash(token) {
+            Some(hash) => Some(hash),
+            None => {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "Unauthorized: provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
+                )
+                    .into_response();
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol.
     let ws = if headers
@@ -165,6 +191,7 @@ pub async fn handle_ws_chat(
             session_id,
             session_name,
             session_cwd,
+            auth_subject,
         )
     })
     .into_response()
@@ -198,6 +225,7 @@ async fn handle_ws_sop_frame<S>(
     parsed: &serde_json::Value,
     state: &AppState,
     session_id: &str,
+    auth_subject: Option<&str>,
     sender: &mut S,
 ) -> bool
 where
@@ -230,22 +258,23 @@ where
         return true;
     };
     let frame = if let Some(engine) = state.sop_engine.as_ref() {
-        let principal = SopApprovalPrincipal::ws(session_id.to_string(), None);
+        let principal =
+            SopApprovalPrincipal::ws(session_id.to_string(), auth_subject.map(str::to_string));
+        // EPIC G: route through the broker (membership + quorum); with no
+        // `[sop.approval]` policy this is exactly `resolve_gate`.
         let resolved = match engine.lock() {
-            Ok(mut g) => Some(g.resolve_gate(&run_id, decision, principal)),
+            Ok(mut g) => Some(g.resolve_via_broker(&run_id, decision, principal)),
             Err(_) => None,
         };
         match resolved {
             Some(Ok(outcome)) => {
-                if let zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action) = &outcome {
-                    let config = state.config.read().clone();
-                    zeroclaw_runtime::sop::spawn_headless_run_driver(
-                        config,
-                        std::sync::Arc::clone(engine),
-                        state.sop_audit.clone(),
-                        action.as_ref().clone(),
-                    );
-                }
+                let config = state.config.read();
+                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                    &config,
+                    std::sync::Arc::clone(engine),
+                    state.sop_audit.clone(),
+                    &outcome,
+                );
                 serde_json::json!({
                     "type": "sop_approval_result",
                     "run_id": run_id,
@@ -288,6 +317,10 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
+    // The transport-authenticated approval subject (paired-token hash), if the
+    // connection was authenticated. Threaded to SOP approval frames so a policied
+    // gate can be satisfied by an identified WS caller.
+    auth_subject: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -422,11 +455,13 @@ async fn handle_socket(
     }
 
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
-            &config,
+        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
             true,
+            false,
+            // The gateway WebSocket turn does not transport ACP file attachments.
             false,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
@@ -460,11 +495,18 @@ async fn handle_socket(
                 return;
             }
         };
-    agent.set_channel_name("wss".to_string());
+    // Keep ONE ingress identity for the WebSocket turn: the turn span records
+    // `channel = "wss"`, and observer events derive from `Agent.channel_name`,
+    // so this must stay `wss` or a single turn is split across two names.
+    // The back-channel is registered under the same `wss` key below, which is
+    // what lets ask_user/poll/escalate_to_human default to this conversation.
+    agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
-    if !stored_messages.is_empty() {
-        agent.seed_history(&stored_messages);
-    }
+    let restore_trim_event = if stored_messages.is_empty() {
+        None
+    } else {
+        agent.seed_history_with_event(&stored_messages)
+    };
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
@@ -476,7 +518,7 @@ async fn handle_socket(
     ));
     agent
         .channel_handles()
-        .register_channel("ws", approval_channel.clone());
+        .register_channel(WS_CHANNEL_KEY, approval_channel.clone());
 
     let ch = agent.channel_handles();
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
@@ -495,6 +537,19 @@ async fn handle_socket(
             ),
             "Seeded {} channel(s) into dashboard agent session",
         );
+    }
+
+    // Seeding happens before the connection's agent setup is complete. Forward
+    // its one-shot trim outcome only after channels are registered, so restore
+    // notifications cannot race setup or be emitted twice.
+    if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        kept_turns,
+        reason,
+    }) = restore_trim_event
+    {
+        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
     // Process the first message if it was not a connect frame
@@ -526,6 +581,7 @@ async fn handle_socket(
                         &content,
                         &session_key,
                         &session_id,
+                        auth_subject.as_deref(),
                     )
                     .await;
                 }
@@ -600,7 +656,15 @@ async fn handle_socket(
                     // engine + resolve_gate (keyed by run_id), NOT the tool-prompt
                     // pending_approvals map (keyed by request_id). The principal is
                     // transport-derived (ws + session id), never from the frame.
-                    if handle_ws_sop_frame(&parsed, &state, &session_id, &mut sender).await {
+                    if handle_ws_sop_frame(
+                        &parsed,
+                        &state,
+                        &session_id,
+                        auth_subject.as_deref(),
+                        &mut sender,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     let request_id = parsed["request_id"].as_str().unwrap_or("");
@@ -676,6 +740,7 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
+                        auth_subject.as_deref(),
                 )
                 .await;
             }
@@ -692,6 +757,8 @@ async fn handle_socket(
 
             approval_event = approval_event_rx.recv() => {
                 let Some(event) = approval_event else { break };
+                // Forward the runtime-produced summary without inspecting or
+                // reconstructing it from the raw argument object.
                 let frame = match event {
                     zeroclaw_api::agent::TurnEvent::ApprovalRequest {
                         request_id,
@@ -809,6 +876,19 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
+fn history_trimmed_ws_frame(
+    dropped_messages: usize,
+    kept_turns: usize,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "history_trimmed",
+        "dropped_messages": dropped_messages,
+        "kept_turns": kept_turns,
+        "reason": reason,
+    })
+}
+
 fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
@@ -844,6 +924,7 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+#[allow(clippy::too_many_arguments)]
 async fn process_chat_message(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
@@ -855,6 +936,9 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
+    // Transport-authenticated approval subject (paired-token hash), threaded so a
+    // mid-turn SOP approval frame carries the same identity as the top-level path.
+    auth_subject: Option<&str>,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -926,7 +1010,7 @@ async fn process_chat_message(
             agent_alias = %turn_alias,
             model_provider = %turn_provider,
             model = %turn_model,
-            channel = "wss",
+            channel = WS_CHANNEL_KEY,
         );
         zeroclaw_runtime::agent::loop_::scope_session_key(
             Some(session_key_owned.clone()),
@@ -1002,8 +1086,14 @@ async fn process_chat_message(
                             // not a tool-prompt response (keyed by request_id). Resolve
                             // it here too so it is answered mid-turn instead of being
                             // silently dropped on the request_id path below.
-                            if handle_ws_sop_frame(&parsed, state, session_id, &mut *sender)
-                                .await
+                            if handle_ws_sop_frame(
+                                &parsed,
+                                state,
+                                session_id,
+                                auth_subject,
+                                &mut *sender,
+                            )
+                            .await
                             {
                                 continue;
                             }
@@ -1103,7 +1193,9 @@ async fn process_chat_message(
                         TurnEvent::ToolCall { id, name, args } => {
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
-                        TurnEvent::ToolResult { id, name, output } => {
+                        TurnEvent::ToolResult {
+                            id, name, output, ..
+                        } => {
                             serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                         }
                         TurnEvent::ApprovalRequest {
@@ -1122,12 +1214,7 @@ async fn process_chat_message(
                             dropped_messages,
                             kept_turns,
                             reason,
-                        } => serde_json::json!({
-                            "type": "history_trimmed",
-                            "dropped_messages": dropped_messages,
-                            "kept_turns": kept_turns,
-                            "reason": reason,
-                        }),
+                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -1421,6 +1508,73 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn ws_turn_has_a_single_channel_identity() {
+        // Regression: `Agent.channel_name` was set to "ws" to match the
+        // back-channel registration key while the turn span still recorded
+        // `channel = "wss"`, so one turn was attributed to two channel names.
+        // All three uses now derive from WS_CHANNEL_KEY; this pins the value
+        // to the historical ingress name so observability stays stable and
+        // interactive-tool lookups still resolve.
+        assert_eq!(
+            WS_CHANNEL_KEY, "wss",
+            "WS ingress identity must stay `wss` — it is the name already used by \
+             the turn span and SSE `channel` field; changing it splits attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_back_channel_registers_under_the_ingress_identity() {
+        // The interactive tools (`ask_user`, `poll`, `escalate_to_human`) look
+        // the channel up by the agent's channel name. If the registration key
+        // and WS_CHANNEL_KEY ever diverge, that lookup misses and the tools
+        // silently fall back to an arbitrary seeded channel — the original bug.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let approval_channel = Arc::new(WsApprovalChannel::new(
+            tx,
+            pending,
+            Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+        ));
+
+        let handle: zeroclaw_runtime::tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        handle.write().insert(
+            WS_CHANNEL_KEY.to_string(),
+            approval_channel as Arc<dyn zeroclaw_api::channel::Channel>,
+        );
+
+        // Interactive tools resolve the back-channel by the agent's channel
+        // name; this is the lookup `ask_user` / `poll` / `escalate_to_human`
+        // perform against their shared channel map.
+        let resolved = handle.read().get(WS_CHANNEL_KEY).cloned();
+        assert!(
+            resolved.is_some(),
+            "back-channel must be resolvable by the same key the agent reports \
+             as its channel name ({WS_CHANNEL_KEY})"
+        );
+        assert!(
+            !resolved.unwrap().supports_outbound_send(),
+            "WS approval channel must declare that `send` does not deliver, so \
+             poll/escalate_to_human fail honestly instead of reporting false success"
+        );
+    }
+
+    #[test]
+    fn restore_trim_uses_live_history_trimmed_frame_shape() {
+        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "history_trimmed",
+                "dropped_messages": 12,
+                "kept_turns": 3,
+                "reason": "message limit",
+            })
+        );
+    }
 
     #[test]
     fn sop_ws_error_frames_resolve_via_fluent() {
@@ -1933,6 +2087,92 @@ mod tests {
             backend.append_calls.lock().unwrap().is_empty(),
             "persist_conversation_messages must not resurrect a session whose \
              session_exists() returned false (see #7126)"
+        );
+    }
+
+    /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
+    /// smoke can inspect the response without a real WebSocket.
+    struct CollectSink(Vec<String>);
+    impl futures_util::Sink<Message> for CollectSink {
+        type Error = std::convert::Infallible;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            if let Message::Text(t) = item {
+                self.get_mut().0.push(t.to_string());
+            }
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_sop_frame_enforces_policy_membership_via_auth_subject() {
+        use zeroclaw_runtime::security::pairing::PairingGuard;
+        // Reuse the HTTP policied-gate harness: a run parked at a `prod` policy whose
+        // group is granted to the paired-token subject (bare, any source).
+        let (state, run_id) = crate::api_sop::tests::state_with_policied_gate("ws-tok");
+        let member = PairingGuard::token_hash("ws-tok");
+        let outsider = PairingGuard::token_hash("someone-else");
+        let frame = serde_json::json!({
+            "kind": "sop",
+            "run_id": run_id,
+            "decision": "approve",
+        });
+        let run_status = |st: &AppState| {
+            st.sop_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|r| format!("{:?}", r.status))
+        };
+
+        // A non-member WS subject is rejected; the gate stays waiting.
+        let mut sink = CollectSink(Vec::new());
+        assert!(
+            handle_ws_sop_frame(&frame, &state, "sess-1", Some(&outsider), &mut sink).await,
+            "a sop-kind frame is handled"
+        );
+        assert!(
+            sink.0.iter().any(|m| m.contains("not_authorized")),
+            "a non-member WS caller is not authorized: {:?}",
+            sink.0
+        );
+        assert_eq!(
+            run_status(&state).as_deref(),
+            Some("WaitingApproval"),
+            "the gate stays waiting after a non-member WS attempt"
+        );
+
+        // The member WS subject clears the policied gate.
+        let mut sink = CollectSink(Vec::new());
+        handle_ws_sop_frame(&frame, &state, "sess-1", Some(&member), &mut sink).await;
+        assert!(
+            sink.0.iter().any(|m| m.contains("resumed")),
+            "an authenticated member clears the gate over WS: {:?}",
+            sink.0
+        );
+        assert_ne!(
+            run_status(&state).as_deref(),
+            Some("WaitingApproval"),
+            "the gate is cleared once an authorized WS member approves"
         );
     }
 }
