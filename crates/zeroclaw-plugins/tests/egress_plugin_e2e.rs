@@ -198,10 +198,10 @@ fn assert_denied_by_policy(report: &str, hop: &str) {
 
 /// A store with `http_client` granted and **no** egress policy reaches nothing.
 ///
-/// This is the property that closes #9395: the manifest permission grants the
-/// `wasi:http` surface, never the destinations. The listener assertion is the
-/// load-bearing half — it proves the request was refused *before* any packet
-/// left, not merely that the guest saw an error.
+/// This is the property that shuts the self-grant path: the manifest permission
+/// grants the `wasi:http` surface, never the destinations. The listener
+/// assertion is the load-bearing half — it proves the request was refused
+/// *before* any packet left, not merely that the guest saw an error.
 #[tokio::test]
 async fn deny_by_default_refuses_every_destination_without_a_policy() {
     let server = TestServer::start(OK_RESPONSE);

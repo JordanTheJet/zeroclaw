@@ -10,9 +10,9 @@
 //! 1. **Deny by default.** A store built without a policy denies every request.
 //!    The linker still carries `wasi:http` — store construction is unchanged —
 //!    but nothing gets out. "Granted `http_client`" and "may reach the network"
-//!    are deliberately different states, which is what closes the #9395
-//!    self-grant path: a component that writes `http_client` into its own
-//!    unsigned manifest still reaches nothing.
+//!    are deliberately different states, which is what shuts the self-grant
+//!    path: a component that writes `http_client` into its own unsigned
+//!    manifest still reaches nothing.
 //!
 //! 2. **Policy is read per request, never snapshotted.** [`EgressPolicy`] holds
 //!    a resolver closure, not a value. An operator's edit to the canonical
