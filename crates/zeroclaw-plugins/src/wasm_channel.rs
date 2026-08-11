@@ -10,7 +10,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
 };
 use crate::component::{
     PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
-    load_component, wt,
+    load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
 use crate::services::PluginHostServices;
@@ -101,7 +101,7 @@ impl WasmChannel {
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
         let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-            wt(
+            wt_instantiate(
                 ChannelPlugin::instantiate_async(store, &component, &linker).await,
                 "failed to instantiate channel plugin",
             )
@@ -822,6 +822,42 @@ mod tests {
         };
 
         assert!(error.to_string().contains("invalid-before-load"));
+    }
+
+    #[test]
+    fn host_endpoint_overrides_guest_routing_identity() {
+        for (channel_type, alias, guest_alias) in [
+            ("plugin", "acme.chat", Some("guest-selected-alias")),
+            ("telegram", "work", None),
+            ("gmail_push", "main", Some("")),
+        ] {
+            let scope = crate::instance::test_scope(PluginCapability::Channel, alias, []);
+            let endpoint = PluginChannelEndpoint::new(scope, channel_type).unwrap();
+            let message = from_wit_inbound(
+                WitInboundMessage {
+                    id: "evt-1".to_string(),
+                    sender: "sender".to_string(),
+                    reply_target: "room".to_string(),
+                    content: "hello".to_string(),
+                    channel: "guest-selected-type".to_string(),
+                    channel_alias: guest_alias.map(str::to_string),
+                    timestamp: 42,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: Vec::new(),
+                    subject: None,
+                },
+                &endpoint,
+            );
+
+            assert_eq!(message.channel, channel_type);
+            assert_eq!(message.channel_alias.as_deref(), Some(alias));
+            assert_ne!(message.channel, endpoint.instance_id().package());
+            assert_eq!(message.content, "hello");
+            assert!(message.internal_sop_event.is_none());
+            assert!(!message.passive_context);
+            assert!(!message.explicitly_addressed);
+        }
     }
 
     #[test]
