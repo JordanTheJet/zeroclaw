@@ -63,6 +63,7 @@ fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(suffix);
@@ -476,6 +477,27 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         );
         self.inner
             .store_with_options(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            options.namespace.as_deref(),
+            session_id,
+            None,
+        );
+        self.inner
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
             .await
     }
 

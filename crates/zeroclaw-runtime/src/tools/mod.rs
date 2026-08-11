@@ -1,6 +1,7 @@
 //! Tool subsystem for agent-callable capabilities.
 
 pub mod attribution;
+pub(crate) mod coding_cli_executor;
 pub mod cron_add;
 pub(crate) mod cron_common;
 pub mod cron_list;
@@ -9,10 +10,12 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
+mod runtime_command_error;
 pub mod schedule;
 pub mod scoped;
 pub mod security_ops;
@@ -127,6 +130,10 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use deliver_file::{
+    DeliverFileTool, MAX_DELIVER_FILE_BYTES, attachment_deliver_uri,
+    read_delivered_artifact_bounded,
+};
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -196,9 +203,23 @@ impl Tool for ArcToolRef {
         self.0.param_domains()
     }
 
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.0.spec()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
+}
+
+fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
+    root_config.claude_code.enabled
+        || root_config.codex_cli.enabled
+        || root_config.gemini_cli.enabled
+        || root_config.opencode_cli.enabled
 }
 
 #[derive(Clone)]
@@ -243,6 +264,13 @@ impl Tool for ArcDelegatingTool {
         self.inner.param_domains()
     }
 
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -276,6 +304,10 @@ pub fn default_tools_with_runtime(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -711,9 +743,15 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
+    let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
+        runtime.clone(),
+        sandbox.clone(),
+        root_config.runtime.kind == zeroclaw_config::schema::RuntimeKind::Native,
+    );
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
@@ -721,7 +759,7 @@ pub fn all_tools_with_runtime(
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
+                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
                     .with_timeout_secs(if security.shell_timeout_secs > 0 {
                         security.shell_timeout_secs
                     } else {
@@ -738,6 +776,10 @@ pub fn all_tools_with_runtime(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -903,8 +945,8 @@ pub fn all_tools_with_runtime(
         root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+        // ReadSkillTool holds full config to support workspace skills,
+        // open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -1206,10 +1248,23 @@ pub fn all_tools_with_runtime(
         );
     }
 
+    if any_coding_cli_tool_enabled(root_config) && !register_coding_cli_tools {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "coding_cli: skipped registration because runtime shell or filesystem access is unavailable"
+        );
+    }
+
     // Claude Code delegation tool
-    if root_config.claude_code.enabled {
+    if register_coding_cli_tools && root_config.claude_code.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            ClaudeCodeTool::new(security.clone(), root_config.claude_code.clone()),
+            ClaudeCodeTool::new_with_executor(
+                security.clone(),
+                root_config.claude_code.clone(),
+                coding_cli_executor.clone(),
+            ),
             security.clone(),
         )));
     }
@@ -1231,25 +1286,37 @@ pub fn all_tools_with_runtime(
     }
 
     // Codex CLI delegation tool
-    if root_config.codex_cli.enabled {
+    if register_coding_cli_tools && root_config.codex_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            CodexCliTool::new(security.clone(), root_config.codex_cli.clone()),
+            CodexCliTool::new_with_executor(
+                security.clone(),
+                root_config.codex_cli.clone(),
+                coding_cli_executor.clone(),
+            ),
             security.clone(),
         )));
     }
 
     // Gemini CLI delegation tool
-    if root_config.gemini_cli.enabled {
+    if register_coding_cli_tools && root_config.gemini_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            GeminiCliTool::new(security.clone(), root_config.gemini_cli.clone()),
+            GeminiCliTool::new_with_executor(
+                security.clone(),
+                root_config.gemini_cli.clone(),
+                coding_cli_executor.clone(),
+            ),
             security.clone(),
         )));
     }
 
     // OpenCode CLI delegation tool
-    if root_config.opencode_cli.enabled {
+    if register_coding_cli_tools && root_config.opencode_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            OpenCodeCliTool::new(security.clone(), root_config.opencode_cli.clone()),
+            OpenCodeCliTool::new_with_executor(
+                security.clone(),
+                root_config.opencode_cli.clone(),
+                coding_cli_executor.clone(),
+            ),
             security.clone(),
         )));
     }
@@ -1353,12 +1420,16 @@ pub fn all_tools_with_runtime(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
             tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_agent_alias(agent_alias)
+                    .with_audit(Arc::clone(sop_audit)),
             ));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
+            ));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
@@ -1585,17 +1656,12 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-    // Verifiable Intent tool (opt-in via config)
-    if root_config.verifiable_intent.enabled {
-        let strictness = match root_config.verifiable_intent.strictness.as_str() {
-            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
-            _ => crate::verifiable_intent::StrictnessMode::Strict,
-        };
-        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
-            security.clone(),
-            strictness,
-        )));
-    }
+    // `vi_verify` is deliberately absent while no chain verifier exists: it checked
+    // caller-supplied constraints against a caller-supplied fulfillment with nothing
+    // establishing that either came from a signed credential. The operator-facing
+    // notice lives at config load, since this function also runs per gateway request
+    // and per nested registry rebuild. Register it again only behind a
+    // verify-and-evaluate path that consumes a verified chain result.
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
@@ -1619,9 +1685,17 @@ pub fn all_tools_with_runtime(
                         Arc::clone(&config),
                         live_config.clone(),
                     );
-                    let details = host.tool_plugin_details();
+                    let mut details = host.tool_plugin_details();
+                    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
                     let discovered_count = details.len();
                     let mut registered_count = 0_usize;
+                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect();
+                    if root_config.pipeline.enabled {
+                        registered_names.insert(PipelineTool::NAME.to_string());
+                    }
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1648,6 +1722,25 @@ pub fn all_tools_with_runtime(
                         })();
                         match tool {
                             Ok(tool) => {
+                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Load
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "plugin": manifest.name,
+                                                "tool": tool.name(),
+                                                "error_key": "plugin_tool_name_conflict",
+                                            })
+                                        ),
+                                        "Plugin tool conflicts with an already registered tool"
+                                    );
+                                    continue;
+                                }
                                 tool_arcs.push(Arc::new(tool));
                                 registered_count += 1;
                             }
@@ -1709,14 +1802,8 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
-    if root_config.pipeline.enabled {
-        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
-        tool_arcs.push(Arc::new(PipelineTool::new(
-            root_config.pipeline.clone(),
-            pipeline_tools,
-        )));
-    }
+    // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
+    // effective per-agent policy and optional caller allowlist are both known.
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
@@ -1730,11 +1817,22 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
+) -> bool {
+    registered_names.insert(plugin_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+    use zeroclaw_config::schema::{
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
+        SopApprovalConfig,
+    };
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -1932,7 +2030,88 @@ const = true
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_reserved_or_prior_plugin_tools() {
+        let mut registered_names =
+            std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
+        let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted, vec!["novel-tool"]);
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from([
+                "shell".to_string(),
+                PipelineTool::NAME.to_string(),
+                "novel-tool".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn component_with_failed_metadata_probe_is_not_registered() {
+        let tmp = TempDir::new().unwrap();
+        let package_dir = tmp.path().join("plugins").join("metadata-probe");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            "name = \"metadata-probe\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), b"not a component").unwrap();
+
+        let mut config = test_config(&tmp);
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        let security = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "markdown".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+
+        let tools = all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            memory,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        assert!(
+            tools.iter().all(|tool| tool.name() != "metadata-probe"),
+            "a component whose required metadata probe fails must not receive manifest fallback metadata"
+        );
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -2122,6 +2301,225 @@ const = true
         );
     }
 
+    struct CapturingRuntime {
+        seen_command: Arc<Mutex<Option<String>>>,
+        filesystem_access: bool,
+    }
+
+    impl RuntimeAdapter for CapturingRuntime {
+        fn name(&self) -> &str {
+            "capturing-test"
+        }
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+        fn has_filesystem_access(&self) -> bool {
+            self.filesystem_access
+        }
+        fn storage_path(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            *self.seen_command.lock().unwrap() = Some(command.to_string());
+            let mut process = tokio::process::Command::new("/bin/sh");
+            process
+                .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
+                .current_dir(workspace_dir);
+            Ok(process)
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_coding_cli_tools_use_configured_runtime_executor() {
+        type EnableCodingCli = fn(&mut Config);
+
+        let cases: [(&str, &str, EnableCodingCli); 4] = [
+            ("claude_code", "claude -p", |cfg: &mut Config| {
+                cfg.claude_code.enabled = true;
+                cfg.claude_code.timeout_secs = 5;
+            }),
+            ("codex_cli", "codex exec", |cfg: &mut Config| {
+                cfg.codex_cli.enabled = true;
+                cfg.codex_cli.timeout_secs = 5;
+            }),
+            ("gemini_cli", "gemini -p", |cfg: &mut Config| {
+                cfg.gemini_cli.enabled = true;
+                cfg.gemini_cli.timeout_secs = 5;
+            }),
+            ("opencode_cli", "opencode run", |cfg: &mut Config| {
+                cfg.opencode_cli.enabled = true;
+                cfg.opencode_cli.timeout_secs = 5;
+            }),
+        ];
+
+        for (tool_name, expected_fragment, enable) in cases {
+            let tmp = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: tmp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let mem_cfg = MemoryConfig {
+                backend: "markdown".into(),
+                ..MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> =
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            let browser = BrowserConfig {
+                enabled: false,
+                ..BrowserConfig::default()
+            };
+            let mut cfg = test_config(&tmp);
+            cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+            cfg.claude_code.enabled = false;
+            cfg.codex_cli.enabled = false;
+            cfg.gemini_cli.enabled = false;
+            cfg.opencode_cli.enabled = false;
+            enable(&mut cfg);
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(false),
+                sandbox_backend: Some("none".to_string()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            let seen_command = Arc::new(Mutex::new(None));
+
+            let tools = all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(CapturingRuntime {
+                    seen_command: Arc::clone(&seen_command),
+                    filesystem_access: true,
+                }),
+                mem,
+                None,
+                None,
+                &browser,
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .tools;
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name() == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} should register"));
+
+            let result = tool
+                .execute(serde_json::json!({"prompt": "route through runtime"}))
+                .await
+                .unwrap_or_else(|error| panic!("{tool_name} should return a tool result: {error}"));
+
+            assert!(
+                result.success,
+                "{tool_name} unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(result.output.trim(), "zc-runtime");
+            let command = seen_command
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| panic!("registry-wired {tool_name} should call runtime"));
+            assert!(
+                command.contains(expected_fragment),
+                "{tool_name} command was {command:?}"
+            );
+            assert!(
+                command.contains("route through runtime"),
+                "{tool_name} command was {command:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_without_workspace_mount_does_not_register_coding_cli_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+        cfg.runtime.docker.mount_workspace = false;
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(false),
+            sandbox_backend: Some("none".to_string()),
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                cfg.runtime.docker.clone(),
+            )),
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for tool_name in ["claude_code", "codex_cli", "gemini_cli", "opencode_cli"] {
+            assert!(
+                !names.contains(&tool_name),
+                "{tool_name} must not register without runtime filesystem access"
+            );
+        }
+        assert!(
+            names.contains(&"shell"),
+            "positive control: ordinary tools should still register"
+        );
+    }
+
     #[test]
     fn sop_workshop_registered_only_when_procedural_memory_enabled() {
         let tmp = TempDir::new().unwrap();
@@ -2260,6 +2658,154 @@ const = true
         // copying state.
         assert!(Arc::strong_count(&shared_engine) >= 3);
         assert!(Arc::strong_count(&shared_audit) >= 3);
+    }
+
+    #[tokio::test]
+    async fn sop_approve_registry_binds_the_calling_agent_alias() {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopRunStatus, SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["agent:ZeroClawOperator".to_string()],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".to_string()),
+                quorum: 1,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let mut engine = SopEngine::new(zeroclaw_config::schema::SopConfig {
+            approval: SopApprovalConfig { groups, policies },
+            ..Default::default()
+        })
+        .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![Sop {
+            name: "deploy".into(),
+            description: "test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "gate".into(),
+                    kind: SopStepKind::Execute,
+                    requires_confirmation: true,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "execute".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "deploy",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected WaitApproval, got {other:?}"),
+        };
+        let shared_engine = Arc::new(Mutex::new(engine));
+        let cfg = test_config(&tmp);
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let build = |agent_alias: &str, memory: Arc<dyn Memory>| {
+            all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &risk,
+                agent_alias,
+                Arc::new(NativeRuntime::new()),
+                memory,
+                None,
+                None,
+                &browser,
+                &http,
+                &web,
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                Some(shared_engine.clone()),
+                None,
+                None,
+            )
+            .tools
+        };
+        let unauthorized_tools = build("ZeroClawAgent", mem.clone());
+        let authorized_tools = build("ZeroClawOperator", mem);
+
+        let unauthorized = unauthorized_tools
+            .iter()
+            .find(|tool| tool.name() == "sop_approve")
+            .expect("unauthorized registry has sop_approve");
+        let result = unauthorized
+            .execute(serde_json::json!({ "run_id": run_id.clone() }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            shared_engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval)
+        );
+
+        let authorized = authorized_tools
+            .iter()
+            .find(|tool| tool.name() == "sop_approve")
+            .expect("authorized registry has sop_approve");
+        let result = authorized
+            .execute(serde_json::json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(result.success, "authorized alias must resolve: {result:?}");
     }
 
     #[test]
@@ -2671,6 +3217,7 @@ const = true
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"deliver_file"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
@@ -2886,7 +3433,7 @@ const = true
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_excludes_read_skill_for_explicit_global_full() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -3051,7 +3598,8 @@ const = true
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         // Global is Compact; a runtime profile pins this agent to Full and the
-        // agent selects it via `runtime_profile`.
+        // agent selects it via `runtime_profile`. The Full pin inlines skills
+        // eagerly, so read_skill must be omitted.
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
         cfg.runtime_profiles.insert(
@@ -3097,6 +3645,56 @@ const = true
             "full runtime-profile override should omit read_skill even when global is compact"
         );
     }
+
+    /// `vi_verify` checked caller-supplied constraints against a caller-supplied
+    /// fulfillment with nothing establishing that either came from a signed
+    /// credential. Until a chain verifier exists the tool must not reach the model
+    /// even when an operator opts in.
+    #[test]
+    fn vi_verify_is_not_registered_even_when_verifiable_intent_is_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(&tmp);
+        cfg.verifiable_intent.enabled = true;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !names.contains(&"vi_verify"),
+            "vi_verify must not be model-callable while no chain verifier exists"
+        );
+        assert!(
+            names.contains(&"shell"),
+            "positive control: the registry must still be populated"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3105,5 +3703,103 @@ mod todo_registration_tests {
     fn todo_write_tool_name_is_stable() {
         use zeroclaw_api::tool::Tool;
         assert_eq!(super::todo_write::TodoWriteTool::new().name(), "TodoWrite");
+    }
+}
+
+#[cfg(test)]
+mod wrapper_spec_forwarding_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use zeroclaw_api::tool::ToolSpec;
+
+    /// Stand-in for `McpToolWrapper`: stores its schema once and overrides
+    /// `spec()` to hand out `Arc::clone`, so tests can assert wrappers
+    /// preserve `Arc` identity instead of falling back to the trait
+    /// default (which would deep-clone via `parameters_schema()`).
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ArcSchemaTool {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                })),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn arc_tool_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool::new());
+        let inner_params = inner.spec().parameters;
+        let wrapped = ArcToolRef(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ArcToolRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
+        );
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &wrapped.spec().parameters),
+            "repeated spec() calls must hand out the same allocation"
+        );
+    }
+
+    #[test]
+    fn arc_delegating_tool_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool::new());
+        let inner_params = inner.spec().parameters;
+        let boxed = ArcDelegatingTool::boxed(inner);
+
+        assert!(
+            Arc::ptr_eq(&boxed.spec().parameters, &inner_params),
+            "ArcDelegatingTool must forward spec() so the inner Arc-shared \
+             schema survives; the trait default deep-clones it every call"
+        );
     }
 }
