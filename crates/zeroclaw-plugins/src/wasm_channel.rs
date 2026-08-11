@@ -10,7 +10,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
 };
 use crate::component::{
     PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
-    load_component, wt,
+    load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
 use crate::event::{PluginEventError, PluginEventRouter};
@@ -128,7 +128,7 @@ impl WasmChannel {
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
         let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-            wt(
+            wt_instantiate(
                 ChannelPlugin::instantiate_async(store, &component, &linker).await,
                 "failed to instantiate channel plugin",
             )

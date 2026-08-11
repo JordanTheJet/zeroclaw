@@ -36,6 +36,10 @@ pub use event::{
     severity_text_from_tracing_level,
 };
 pub use layer::LogCaptureLayer;
+pub use writer::{
+    EPHEMERAL_BROADCAST_MARKER, frame_carries_ephemeral_credentials,
+    strip_ephemeral_broadcast_marker,
+};
 
 /// Opaque span handle. Same wire format as `tracing::Span` (we re-export
 /// the type) but the public path is `zeroclaw_log::Span` — no `tracing`
@@ -63,7 +67,8 @@ pub use reader::{LogFilter, LogPage, current_log_path, find_event_by_id, load_pa
 pub use subscriber::{install_global_subscriber, try_install_capture_subscriber};
 pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
 pub use writer::{
-    flush_for_test, init_from_config, llm_request_payload_policy, record_event, runtime_trace_path,
+    active_log_path, flush_for_test, init_from_config, llm_request_payload_policy, record_event,
+    runtime_trace_path,
 };
 
 mod r#macro;

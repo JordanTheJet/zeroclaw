@@ -205,7 +205,6 @@ channels-full = [
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
-  "channel-wati",
   "channel-wecom",
   "channel-wecom-ws",
   "channel-whatsapp-cloud",
@@ -259,7 +258,6 @@ channel-mqtt = ["dep:rumqttc"]
 channel-filesystem = ["dep:notify", "dep:glob"]
 channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
-channel-wati = []
 channel-nextcloud = []
 channel-mochat = []
 channel-wechat = [
@@ -290,6 +288,14 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
+matrix-sdk = { version = "0.18", default-features = false, features = [
+  "testing",
+  "e2e-encryption",
+  "markdown",
+  "sqlite",
+] }
+matrix-sdk-base = { version = "0.18", default-features = false, features = ["e2e-encryption"] }
+matrix-sdk-test = "0.18"
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
