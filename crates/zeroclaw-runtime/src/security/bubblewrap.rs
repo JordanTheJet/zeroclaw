@@ -132,12 +132,6 @@ impl BubblewrapSandbox {
             "--die-with-parent",
         ]);
         Self::append_capability_drops(&mut bwrap_cmd, support);
-        // Conditionally bind dynamic-loader library directories that may exist
-        // on the host.  On Fedora / RHEL systems the ELF interpreter and shared
-        // libraries live in /lib64; on some older or non-merged-usr distros they
-        // live in /lib.  Without these paths inside the sandbox, any dynamically
-        // linked executable (including `cargo`) will fail to start even when its
-        // binary is reachable.
         for lib_dir in &["/lib64", "/lib"] {
             if std::path::Path::new(lib_dir).exists() {
                 bwrap_cmd.args(["--ro-bind", lib_dir, lib_dir]);
@@ -166,6 +160,12 @@ impl Sandbox for BubblewrapSandbox {
 
     fn description(&self) -> &str {
         "User namespace sandbox (requires bwrap)"
+    }
+
+    fn coding_cli_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "bubblewrap sandbox does not bind the validated workspace or select the validated working directory inside the namespace",
+        )
     }
 }
 
@@ -264,6 +264,17 @@ mod tests {
         assert!(BubblewrapSandbox::support_from_help("--cap-drop", "").cap_drop);
         assert!(BubblewrapSandbox::support_from_help("", "--cap-drop").cap_drop);
         assert!(!BubblewrapSandbox::support_from_help("", "").cap_drop);
+    }
+
+    #[test]
+    fn bubblewrap_sandbox_rejects_coding_cli_execution() {
+        let sandbox = BubblewrapSandbox;
+        let reason = sandbox
+            .coding_cli_unsupported_reason()
+            .expect("bubblewrap sandbox must fail closed for coding CLIs");
+
+        assert!(reason.contains("workspace"));
+        assert!(reason.contains("working directory"));
     }
 
     #[test]

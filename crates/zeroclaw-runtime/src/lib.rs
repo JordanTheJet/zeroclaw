@@ -34,6 +34,7 @@ pub mod platform;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
+pub mod restart;
 pub mod routines;
 pub mod rpc;
 pub mod security;

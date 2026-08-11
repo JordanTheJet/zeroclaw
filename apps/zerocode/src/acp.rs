@@ -58,12 +58,24 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_pane_navigation(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
 
     pub(crate) fn in_browse_mode(&self) -> bool {
         self.inner.in_browse_mode()
+    }
+
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        self.inner.wants_quit_chord()
+    }
+
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        self.inner.take_help_request()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {
@@ -84,6 +96,10 @@ impl Acp {
 
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
+    }
+
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        self.inner.current_cwd()
     }
 }
 
