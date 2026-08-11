@@ -34,7 +34,7 @@
     clippy::unnecessary_wraps
 )]
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "agent-runtime")]
@@ -213,8 +213,23 @@ Examples:
 }
 
 /// Service management subcommands
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceLogStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
+    /// Internal OpenRC logger that drains one daemon stream into bounded storage
+    #[command(hide = true)]
+    RunOpenrcLogWriter {
+        #[arg(value_enum)]
+        stream: ServiceLogStream,
+    },
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -292,8 +307,8 @@ Examples:
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
-        /// Telegram channel alias to bind to (the <alias> in
-        /// channels.telegram.<alias>). Defaults to `default`.
+        /// Telegram channel alias to bind to (the `<alias>` in
+        /// `channels.telegram.<alias>`). Defaults to `default`.
         #[arg(long, default_value = "default")]
         alias: String,
     },
@@ -533,6 +548,9 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Remove an installed skill
     Remove {
@@ -604,6 +622,10 @@ pub enum MigrateCommands {
         /// Validate and preview migration without writing any data
         #[arg(long)]
         dry_run: bool,
+
+        /// Rebuild backend indexes after importing entries
+        #[arg(long)]
+        reindex: bool,
     },
 }
 
@@ -622,9 +644,9 @@ When --tz is omitted, cron schedules use the runtime local timezone. \
 For user-facing schedules, pass --tz with an explicit IANA timezone.
 
 Examples:
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'")]
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel")]
     Add {
         /// Cron expression
         expression: String,

@@ -59,6 +59,43 @@ journalctl --user -u zeroclaw --since "1h ago"
 
 </div>
 
+### Environment overrides (systemd)
+
+Use a user-service override when the daemon needs environment variables that are not present in your interactive shell:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+systemctl --user edit zeroclaw.service
+```
+
+</div>
+
+For example, a Bedrock profile that uses `credential_process` needs `AWS_PROFILE` in the service environment:
+
+```ini
+[Service]
+Environment=AWS_PROFILE=zeroclaw-bedrock
+```
+
+After saving the override, reload and restart the user service:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart zeroclaw
+journalctl --user -u zeroclaw -f
+```
+
+</div>
+
+The generated user service sets `HOME=%h`, so provider code that reads files under the service user's home directory can resolve paths such as `~/.aws/config`. If an override references an executable, use an absolute path; systemd services often run with a smaller `PATH` than an interactive shell.
+
 ### Starting before user login
 
 The CLI only ever writes a user-scoped unit (`systemctl --user`), which by default starts at login and stops at logout. To keep ZeroClaw running on a headless box without an active session, enable lingering for the service user:
@@ -92,6 +129,11 @@ rc-update add zeroclaw default    # start on boot
 
 </div>
 
+OpenRC keeps daemon output in `/var/log/zeroclaw/access.log` and
+`/var/log/zeroclaw/error.log`. Each file retains recent output within an 8 MiB
+bound. Reinstall and restart the service after upgrading so the generated init
+script uses bounded logger processes.
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
@@ -108,7 +150,7 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 
 </div>
 
-Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead.
+Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead. Each launchd capture file retains recent output within an 8 MiB bound. Reinstall and restart the service after upgrading so the generated LaunchAgent uses bounded capture.
 
 ### Homebrew-managed
 
