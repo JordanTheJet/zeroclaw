@@ -89,7 +89,7 @@ If the user requests changes, update the draft and re-present. Iterate until the
 Before final submission, analyze the collected content for scope creep:
 - Does the bug report describe multiple independent defects?
 - Does the feature request bundle unrelated changes?
-- Is an RFC/design proposal being filed as an ordinary feature request?
+- Is an RFC/design proposal being filed as an ordinary feature request? Check the reverse too, which is the more common error: ordinary features, schema or data migrations, configuration field and default changes, and bounded refactors are **not** RFCs. Route to the RFC form only when the proposal crosses a trigger in [`rfcs.md`](../../../docs/book/src/contributing/rfcs.md#when-to-file-an-rfc-vs-just-a-pr); when unsure, file the feature request and note why it might cross one.
 - Is an active coordination surface being filed as one ordinary bug or feature instead of a roadmap/tracker?
 - Is a docs-only gap being mixed with a behavior change that should have its own bug or feature issue?
 
