@@ -246,18 +246,4 @@ mod tests {
         let error = result.err().expect("capability mismatch must fail");
         assert!(format!("{error:#}").contains("capability"));
     }
-
-    #[tokio::test]
-    async fn create_plugin_rejects_a_scope_for_another_capability() {
-        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
-        let result = create_plugin(
-            Path::new("/path/that/must/not-be-read.wasm"),
-            &scope,
-            crate::component::test_limits(0),
-        )
-        .await;
-
-        let error = result.err().expect("capability mismatch must fail");
-        assert!(format!("{error:#}").contains("capability"));
-    }
 }
