@@ -713,7 +713,7 @@ impl std::str::FromStr for AuthProvider {
                 "auth: unknown auth provider"
             );
             anyhow::Error::msg(format!(
-                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini, xai.",
+                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini, xai, zerorouter.",
             ))
         })
     }
@@ -766,12 +766,13 @@ fn resolve_requested_profile_id(model_provider: &str, requested: &str) -> String
 
 /// The token a ZeroRouter profile carries, but only when that profile is
 /// bound to `want_issuer`. `None` covers every fail-closed case: a profile
-/// minted by a different router, a profile with no issuer recorded at all
-/// (so its provenance cannot be established), and a profile holding no
+/// minted by a different router — including one that merely shares an
+/// origin with this request's router — a profile with no issuer recorded at
+/// all (so its provenance cannot be established), and a profile holding no
 /// usable token.
 fn zerorouter_profile_token(profile: &AuthProfile, want_issuer: &str) -> Option<String> {
     let bound_issuer = profile.metadata.get(ZEROROUTER_ISSUER_METADATA_KEY)?;
-    if !zerorouter_device::issuers_match(bound_issuer, want_issuer) {
+    if !zerorouter_device::issuer_identities_match(bound_issuer, want_issuer) {
         return None;
     }
     profile
@@ -2243,6 +2244,46 @@ mod tests {
             Some("zcr_key_for_a"),
             "the newer login became the active profile and must not displace A's binding",
         );
+    }
+
+    /// A reverse proxy can host several independently operated routers on one
+    /// origin, distinguished only by a path prefix. Origin-only binding made
+    /// those aliases one issuer, so A's key was selectable for B.
+    #[tokio::test]
+    async fn zerorouter_key_is_never_offered_to_a_sibling_path_on_the_same_origin() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        store_zerorouter_key(
+            &auth,
+            "router-a",
+            "https://gateway.example/router-a",
+            "zcr_key_for_a",
+        )
+        .await;
+
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://gateway.example/router-a/v1", None)
+                .await
+                .expect("router A's own request resolves its key")
+                .as_deref(),
+            Some("zcr_key_for_a"),
+            "the path-prefixed router must still authenticate itself",
+        );
+
+        let error = auth
+            .get_zerorouter_bearer_token("https://gateway.example/router-b/v1", None)
+            .await
+            .expect_err("a sibling path on the same origin is a different router");
+        assert!(
+            !error.to_string().contains("zcr_key_for_a"),
+            "the key leaked into the error text: {error}"
+        );
+
+        let error = auth
+            .get_zerorouter_bearer_token("https://gateway.example/v1", None)
+            .await
+            .expect_err("the bare origin is not the path-prefixed router either");
+        assert!(!error.to_string().contains("zcr_key_for_a"), "{error}");
     }
 
     #[tokio::test]
