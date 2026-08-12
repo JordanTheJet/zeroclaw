@@ -3384,14 +3384,17 @@ fn is_known_field_code(token: &str) -> bool {
 }
 
 /// Tokenize a (general-unescaped) desktop-entry `Exec` value into its whitespace-
-/// separated arguments, applying the `Exec` quoting rules to each. Fails closed
-/// (`None`) on any malformed token: an unterminated quote, a dangling or invalid
-/// escape, a raw reserved character (`"`, `` ` ``, `$`, `\` unquoted or an
-/// unescaped `$`/`` ` `` inside quotes), or text directly adjacent to a closing
-/// quote (e.g. `"…"junk`). Validating the whole line — not just the first token —
-/// is what keeps a malformed entry from launching its first argument.
+/// separated arguments, applying the `Exec` quoting rules to each. Each token is
+/// returned with a flag recording whether it was quoted, so field-code
+/// validation can reject a field code that appears inside a quoted argument (the
+/// Desktop Entry Specification forbids that). Fails closed (`None`) on any
+/// malformed token: an unterminated quote, a dangling or invalid escape, a raw
+/// reserved character (`"`, `` ` ``, `$`, `\` unquoted or an unescaped `$`/`` ` ``
+/// inside quotes), or text directly adjacent to a closing quote (e.g. `"…"junk`).
+/// Validating the whole line — not just the first token — is what keeps a
+/// malformed entry from launching its first argument.
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
-fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
+fn tokenize_exec_line(line: &str) -> Option<Vec<(String, bool)>> {
     let mut tokens = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
@@ -3402,7 +3405,8 @@ fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
             break;
         }
         let mut token = String::new();
-        if chars.peek() == Some(&'"') {
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
             chars.next(); // opening quote
             loop {
                 match chars.next() {
@@ -3433,9 +3437,33 @@ fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
                 chars.next();
             }
         }
-        tokens.push(token);
+        tokens.push((token, quoted));
     }
     Some(tokens)
+}
+
+/// Validate the field codes carried by a single tokenized `Exec` argument per the
+/// Desktop Entry Specification. Inside a token, the only permitted `%` is the
+/// escaped literal `%%`; a bare, embedded, or unknown field code (`%U`, `%Z`,
+/// `ZeroClaw-%Z.AppImage`, `--flag=%U`) invalidates the command line. The one
+/// exception is that an *argument* (never the program) that was *not* quoted may
+/// be exactly one known standalone field code such as `%U`. A field code inside a
+/// quoted argument is always rejected.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn exec_token_field_codes_ok(token: &str, quoted: bool, is_program: bool) -> bool {
+    // A lone, unquoted, standalone known field code is a valid argument — but the
+    // program (executable) can never be a field code, so it has no exception.
+    if !is_program && !quoted && is_known_field_code(token) {
+        return true;
+    }
+    // Otherwise every `%` must be the escaped literal `%%`.
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() != Some('%') {
+            return false;
+        }
+    }
+    true
 }
 
 /// Parse the program token (first argument) from a desktop-entry `Exec=` value,
@@ -3451,14 +3479,22 @@ fn tokenize_exec_line(line: &str) -> Option<Vec<String>> {
 fn parse_exec_program(exec: &str) -> Option<String> {
     let unescaped = unescape_desktop_value(exec)?;
     let mut tokens = tokenize_exec_line(&unescaped)?.into_iter();
-    let program = tokens.next()?;
-    if program.is_empty() || program.starts_with('%') || program.contains('=') {
+    let (program, program_quoted) = tokens.next()?;
+    // The executable may not be empty, carry an `=`, or contain any field code
+    // (bare or embedded — only an escaped `%%` literal is allowed). This rejects
+    // a program like `ZeroClaw-%Z.AppImage` whose basename would otherwise pass
+    // the AppImage-name check.
+    if program.is_empty()
+        || program.contains('=')
+        || !exec_token_field_codes_ok(&program, program_quoted, true)
+    {
         return None;
     }
-    // Every remaining `%`-token must be a known field code; an unknown one
-    // invalidates the command line.
-    for token in tokens {
-        if token.starts_with('%') && !is_known_field_code(&token) {
+    // Every argument token must likewise carry no field code, except a single
+    // unquoted standalone known field code. An unknown, embedded, or quoted field
+    // code anywhere on the line invalidates it.
+    for (token, quoted) in tokens {
+        if !exec_token_field_codes_ok(&token, quoted, false) {
             return None;
         }
     }
@@ -8629,6 +8665,23 @@ mod tests {
         assert_eq!(
             parse_exec_program("zeroclaw-desktop %%").as_deref(),
             Some("zeroclaw-desktop")
+        );
+        // A field code embedded in the PROGRAM token (not just a leading `%`)
+        // invalidates it, even though the basename would pass the AppImage-name
+        // check — both an unknown (`%Z`) and a known (`%U`) code are rejected.
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%Z.AppImage"), None);
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%U.AppImage"), None);
+        // A field code embedded in an ARGUMENT token (must stand alone) is
+        // rejected for both unknown and known codes.
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%Z"), None);
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%U"), None);
+        // A field code inside a quoted argument is rejected — the quote context
+        // is retained so `"%U"` cannot masquerade as a standalone field code.
+        assert_eq!(parse_exec_program("zeroclaw-desktop \"%U\""), None);
+        // An escaped literal percent embedded in a path stays valid.
+        assert_eq!(
+            parse_exec_program("/opt/zeroclaw-desktop 100%%done").as_deref(),
+            Some("/opt/zeroclaw-desktop")
         );
     }
 
