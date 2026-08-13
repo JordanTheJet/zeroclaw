@@ -142,6 +142,50 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
+    /// Discord role IDs that authorize a guild member, additive with the peer
+    /// allowlist. Wired from `DiscordConfig.allowed_role_ids`; empty preserves
+    /// user-ID-only gating. See [`member_role_allowed`].
+    allowed_role_ids: Vec<String>,
+}
+
+/// Whether a member's roles admit them under `allowed`.
+///
+/// Both sides are Discord role-ID snowflakes, compared exactly: IDs are
+/// immutable and case-sensitive, so a rename cannot widen access and a
+/// case-folded compare could only ever produce false matches.
+///
+/// An empty `allowed` denies — the role check contributes nothing until an
+/// operator opts in, which keeps this additive to the peer allowlist rather
+/// than a second way to accidentally open the channel. There is deliberately
+/// no `"*"` wildcard: "everyone" is already expressible in the peer allowlist,
+/// and a second spelling of it is a second thing to audit.
+#[must_use]
+fn member_role_allowed(allowed: &[String], member_roles: &[String]) -> bool {
+    if allowed.is_empty() || member_roles.is_empty() {
+        return false;
+    }
+    member_roles
+        .iter()
+        .any(|held| allowed.iter().any(|a| a == held))
+}
+
+/// Extract `member.roles` from a gateway payload's `d` object.
+///
+/// Guild events (`MESSAGE_CREATE`, `INTERACTION_CREATE`, reaction adds) carry a
+/// partial member object; DMs do not. A missing or malformed `roles` array
+/// yields an empty vec, which [`member_role_allowed`] treats as "no roles" —
+/// so a payload shape change fails closed rather than admitting everyone.
+fn member_roles_from_payload(d: &serde_json::Value) -> Vec<String> {
+    d.get("member")
+        .and_then(|m| m.get("roles"))
+        .and_then(serde_json::Value::as_array)
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(|r| r.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -192,7 +236,16 @@ impl DiscordChannel {
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
+            allowed_role_ids: Vec::new(),
         }
+    }
+
+    /// Set the role IDs that authorize a guild member, additive with the peer
+    /// allowlist. Wired from `DiscordConfig.allowed_role_ids`.
+    #[must_use]
+    pub fn with_allowed_role_ids(mut self, role_ids: Vec<String>) -> Self {
+        self.allowed_role_ids = role_ids;
+        self
     }
 
     /// Provide the resolver for skill-derived slash commands. Only consulted
@@ -479,7 +532,7 @@ impl DiscordChannel {
         {
             return;
         }
-        if !self.is_user_allowed(author_id) {
+        if !self.is_member_allowed(author_id, &member_roles_from_payload(d)) {
             return;
         }
 
@@ -525,7 +578,7 @@ impl DiscordChannel {
         if user_id == bot_user_id {
             return;
         }
-        if !self.is_user_allowed(user_id) {
+        if !self.is_member_allowed(user_id, &member_roles_from_payload(d)) {
             return;
         }
         if !self.guild_ids.is_empty()
@@ -752,12 +805,18 @@ impl DiscordChannel {
         )
     }
 
-    /// Check if a Discord user ID is in the allowlist.
-    /// Empty list means deny everyone until explicitly configured.
-    /// `"*"` means allow everyone.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
+    /// Authorize a guild member by user ID **or** role.
+    ///
+    /// The two checks are additive and independently sufficient: an operator
+    /// can name individuals, grant a role, or both. `member_roles` empty
+    /// (a DM, or a payload with no member object) degrades to the user-ID
+    /// check, so this is never weaker than the peer allowlist alone.
+    fn is_member_allowed(&self, user_id: &str, member_roles: &[String]) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+        if crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive) {
+            return true;
+        }
+        member_role_allowed(&self.allowed_role_ids, member_roles)
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -1363,16 +1422,21 @@ enum InteractionDenial {
     ChannelNotAllowed,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interaction_gate(
     peers: &[String],
+    allowed_role_ids: &[String],
     guild_filter: &[String],
     channel_filter: &[String],
     user_id: &str,
+    member_roles: &[String],
     guild_id: Option<&str>,
     channel_id: &str,
     thread_parent: Option<&str>,
 ) -> Result<(), InteractionDenial> {
-    if !crate::allowlist::is_user_allowed(peers, user_id, crate::allowlist::Match::Sensitive) {
+    let by_user =
+        crate::allowlist::is_user_allowed(peers, user_id, crate::allowlist::Match::Sensitive);
+    if !by_user && !member_role_allowed(allowed_role_ids, member_roles) {
         return Err(InteractionDenial::UnauthorizedUser);
     }
     if !guild_filter.is_empty()
@@ -2340,6 +2404,9 @@ impl Channel for DiscordChannel {
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
+                                // Owned before the spawn, same as the options
+                                // above: the 'static task cannot borrow `event`.
+                                let member_roles = member_roles_from_payload(d);
 
                                 // Without id/token/app there is nothing we
                                 // can even acknowledge.
@@ -2350,6 +2417,7 @@ impl Channel for DiscordChannel {
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
                                     let peers = (self.peer_resolver)();
+                                    let allowed_role_ids = self.allowed_role_ids.clone();
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let thread_channels = Arc::clone(&self.thread_channels);
@@ -2369,11 +2437,17 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
+                                        // Early reject mirrors interaction_gate's
+                                        // first check so an unauthorized click
+                                        // never costs a thread-parent REST call.
+                                        // Keep the two in step: a member admitted
+                                        // by role must survive this too.
                                         if !crate::allowlist::is_user_allowed(
                                             &peers,
                                             &user_id,
                                             crate::allowlist::Match::Sensitive,
-                                        ) {
+                                        ) && !member_role_allowed(&allowed_role_ids, &member_roles)
+                                        {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized slash command interaction");
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unauthorized",
@@ -2399,9 +2473,11 @@ impl Channel for DiscordChannel {
                                         };
                                         if let Err(denial) = interaction_gate(
                                             &peers,
+                                            &allowed_role_ids,
                                             &guild_filter,
                                             &channel_filter,
                                             &user_id,
+                                            &member_roles,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
                                             parent_id.as_deref(),
@@ -2531,6 +2607,7 @@ impl Channel for DiscordChannel {
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
+                                let member_roles = member_roles_from_payload(d);
 
                                 if custom_id::CustomId::parse(&custom_id_raw).is_none() {
                                     continue;
@@ -2542,6 +2619,7 @@ impl Channel for DiscordChannel {
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
                                     let peers = (self.peer_resolver)();
+                                    let allowed_role_ids = self.allowed_role_ids.clone();
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let thread_channels = Arc::clone(&self.thread_channels);
@@ -2552,11 +2630,17 @@ impl Channel for DiscordChannel {
                                     let tx = tx.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
+                                        // Early reject mirrors interaction_gate's
+                                        // first check so an unauthorized click
+                                        // never costs a thread-parent REST call.
+                                        // Keep the two in step: a member admitted
+                                        // by role must survive this too.
                                         if !crate::allowlist::is_user_allowed(
                                             &peers,
                                             &user_id,
                                             crate::allowlist::Match::Sensitive,
-                                        ) {
+                                        ) && !member_role_allowed(&allowed_role_ids, &member_roles)
+                                        {
                                             // Shared-token deployments: every
                                             // alias receives every click, and
                                             // each alias has its OWN peer list —
@@ -2611,9 +2695,11 @@ impl Channel for DiscordChannel {
                                         };
                                         if let Err(denial) = interaction_gate(
                                             &peers,
+                                            &allowed_role_ids,
                                             &guild_filter,
                                             &channel_filter,
                                             &user_id,
+                                            &member_roles,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
                                             parent_id.as_deref(),
@@ -2941,9 +3027,11 @@ impl Channel for DiscordChannel {
                                 // `event`). Discord marks exactly one option
                                 // `"focused": true`; absent → no completion.
                                 let focused = slash_options::extract_focused_option(d);
+                                let member_roles = member_roles_from_payload(d);
                                 if !interaction_id.is_empty() && !interaction_token.is_empty() {
                                     let client = self.http_client();
                                     let peers = (self.peer_resolver)();
+                                    let allowed_role_ids = self.allowed_role_ids.clone();
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
                                     let resolver = self.slash_command_resolver.clone();
@@ -2957,9 +3045,11 @@ impl Channel for DiscordChannel {
                                         .await;
                                         let authorized = interaction_gate(
                                             &peers,
+                                            &allowed_role_ids,
                                             &guild_filter,
                                             &channel_filter,
                                             &user_id,
+                                            &member_roles,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
                                             thread_parent.as_deref(),
@@ -3072,8 +3162,9 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
-                    // Sender validation
-                    if !self.is_user_allowed(author_id) {
+                    // Sender validation: user ID or role (guild events carry
+                    // `member.roles`; DMs do not, degrading to the ID check).
+                    if !self.is_member_allowed(author_id, &member_roles_from_payload(d)) {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"author_id": author_id})), "ignoring message from unauthorized user");
                         continue;
                     }
@@ -4167,23 +4258,212 @@ mod tests {
     }
 
     #[test]
+    fn member_role_allowed_requires_an_explicit_overlap() {
+        // Empty on either side denies: the role check contributes nothing
+        // until an operator opts in, so it can only ever widen access
+        // deliberately.
+        assert!(!member_role_allowed(&[], &s(&["r1"])));
+        assert!(!member_role_allowed(&s(&["r1"]), &[]));
+        assert!(!member_role_allowed(&[], &[]));
+        // Any single overlap is enough; members usually hold several roles.
+        assert!(member_role_allowed(&s(&["r1"]), &s(&["r1"])));
+        assert!(member_role_allowed(&s(&["r1", "r2"]), &s(&["r9", "r2"])));
+        assert!(!member_role_allowed(&s(&["r1"]), &s(&["r2", "r3"])));
+        // Role IDs are opaque snowflakes: exact match only. No wildcard, and
+        // no case folding — both would be new ways to admit someone.
+        assert!(!member_role_allowed(&s(&["*"]), &s(&["r1"])));
+        assert!(!member_role_allowed(&s(&["R1"]), &s(&["r1"])));
+    }
+
+    #[test]
+    fn member_roles_from_payload_reads_guild_members_and_fails_closed() {
+        let guild = serde_json::json!({"member": {"roles": ["r1", "r2"]}});
+        assert_eq!(member_roles_from_payload(&guild), s(&["r1", "r2"]));
+        // A DM carries no member object; absent/!array/non-string entries all
+        // degrade to "no roles", which denies rather than admits.
+        assert!(member_roles_from_payload(&serde_json::json!({"user": {"id": "u1"}})).is_empty());
+        assert!(member_roles_from_payload(&serde_json::json!({"member": {}})).is_empty());
+        assert!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": "r1"}})).is_empty()
+        );
+        assert_eq!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": [1, "r2"]}})),
+            s(&["r2"])
+        );
+    }
+
+    #[test]
+    fn interaction_gate_admits_by_role_additively() {
+        let roles = s(&["maintainer"]);
+        // Role alone admits a user absent from the peer list — the point of
+        // the feature.
+        assert_eq!(
+            interaction_gate(
+                &[],
+                &roles,
+                &[],
+                &[],
+                "u1",
+                &s(&["maintainer"]),
+                None,
+                "c1",
+                None
+            ),
+            Ok(())
+        );
+        // Peer list alone still admits, with no roles configured or held.
+        assert_eq!(
+            interaction_gate(&s(&["u1"]), &[], &[], &[], "u1", &[], None, "c1", None),
+            Ok(())
+        );
+        // Neither → denied. Both empty is still deny-everyone.
+        assert_eq!(
+            interaction_gate(
+                &[],
+                &roles,
+                &[],
+                &[],
+                "u1",
+                &s(&["visitor"]),
+                None,
+                "c1",
+                None
+            ),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+        assert_eq!(
+            interaction_gate(
+                &[],
+                &[],
+                &[],
+                &[],
+                "u1",
+                &s(&["maintainer"]),
+                None,
+                "c1",
+                None
+            ),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+        // Role admission does NOT bypass the guild/channel filters — it
+        // replaces only the identity check.
+        assert_eq!(
+            interaction_gate(
+                &[],
+                &roles,
+                &s(&["g1"]),
+                &[],
+                "u1",
+                &s(&["maintainer"]),
+                Some("g2"),
+                "c1",
+                None
+            ),
+            Err(InteractionDenial::GuildNotAllowed)
+        );
+        assert_eq!(
+            interaction_gate(
+                &[],
+                &roles,
+                &[],
+                &s(&["c1"]),
+                "u1",
+                &s(&["maintainer"]),
+                Some("g1"),
+                "c2",
+                None
+            ),
+            Err(InteractionDenial::ChannelNotAllowed)
+        );
+    }
+
+    /// Adapter-boundary proof: a vendor-shaped payload goes in, an
+    /// authorization decision comes out — parsing and policy joined, on a real
+    /// `DiscordChannel` rather than the helpers in isolation.
+    #[test]
+    fn vendor_payload_authorizes_a_role_holder_absent_from_the_peer_list() {
+        // Discord nests the invoker under `member.user` on guild events and
+        // ships that member's roles beside it. Shape copied from a real
+        // INTERACTION_CREATE `d` object.
+        let interaction = serde_json::json!({
+            "id": "interaction-1",
+            "token": "interaction-token",
+            "application_id": "app-1",
+            "guild_id": "g1",
+            "channel_id": "c1",
+            "data": { "name": "lookup" },
+            "member": {
+                "user": { "id": "u-maintainer", "username": "maintainer" },
+                "roles": ["role-other", "role-maintainer"]
+            }
+        });
+
+        // Peer resolver returns an EMPTY list: before this feature that denied
+        // everyone, which is exactly the regression this guards.
+        let ch = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            true,
+        )
+        .with_allowed_role_ids(s(&["role-maintainer"]));
+
+        let roles = member_roles_from_payload(&interaction);
+        assert_eq!(roles, s(&["role-other", "role-maintainer"]));
+        assert!(
+            ch.is_member_allowed("u-maintainer", &roles),
+            "a role holder must be admitted with an empty peer allowlist"
+        );
+
+        // Same guild, same payload shape, no listed role → still denied.
+        let visitor = serde_json::json!({
+            "member": { "user": { "id": "u-visitor" }, "roles": ["role-other"] }
+        });
+        assert!(
+            !ch.is_member_allowed("u-visitor", &member_roles_from_payload(&visitor)),
+            "an unlisted role must not admit"
+        );
+
+        // A DM from the very same person carries no member object, so no roles
+        // are available and the peer allowlist alone decides — documented
+        // behavior, and the reason role gating cannot be relied on for DMs.
+        let dm = serde_json::json!({ "user": { "id": "u-maintainer" } });
+        assert!(
+            !ch.is_member_allowed("u-maintainer", &member_roles_from_payload(&dm)),
+            "a DM has no roles and must fall back to the peer allowlist"
+        );
+    }
+
+    #[test]
     fn interaction_gate_applies_peer_allowlist() {
         // Wildcard admits anyone; otherwise the invoker must be listed.
         assert_eq!(
-            interaction_gate(&s(&["*"]), &[], &[], "u1", None, "c1", None),
+            interaction_gate(&s(&["*"]), &[], &[], &[], "u1", &[], None, "c1", None),
             Ok(())
         );
         assert_eq!(
-            interaction_gate(&s(&["u1"]), &[], &[], "u1", None, "c1", None),
+            interaction_gate(&s(&["u1"]), &[], &[], &[], "u1", &[], None, "c1", None),
             Ok(())
         );
         assert_eq!(
-            interaction_gate(&s(&["u1"]), &[], &[], "intruder", None, "c1", None),
+            interaction_gate(
+                &s(&["u1"]),
+                &[],
+                &[],
+                &[],
+                "intruder",
+                &[],
+                None,
+                "c1",
+                None
+            ),
             Err(InteractionDenial::UnauthorizedUser)
         );
         // Empty peer list = nobody, same as the message path.
         assert_eq!(
-            interaction_gate(&[], &[], &[], "u1", None, "c1", None),
+            interaction_gate(&[], &[], &[], &[], "u1", &[], None, "c1", None),
             Err(InteractionDenial::UnauthorizedUser)
         );
     }
@@ -4195,21 +4475,41 @@ mod tests {
         let channels = s(&["c1"]);
 
         assert_eq!(
-            interaction_gate(&peers, &guilds, &channels, "u1", Some("g1"), "c1", None),
+            interaction_gate(
+                &peers,
+                &[],
+                &guilds,
+                &channels,
+                "u1",
+                &[],
+                Some("g1"),
+                "c1",
+                None
+            ),
             Ok(())
         );
         assert_eq!(
-            interaction_gate(&peers, &guilds, &[], "u1", Some("g2"), "c1", None),
+            interaction_gate(&peers, &[], &guilds, &[], "u1", &[], Some("g2"), "c1", None),
             Err(InteractionDenial::GuildNotAllowed)
         );
         // DM interactions carry no guild_id and pass the guild filter,
         // mirroring MESSAGE_CREATE.
         assert_eq!(
-            interaction_gate(&peers, &guilds, &[], "u1", None, "c1", None),
+            interaction_gate(&peers, &[], &guilds, &[], "u1", &[], None, "c1", None),
             Ok(())
         );
         assert_eq!(
-            interaction_gate(&peers, &[], &channels, "u1", Some("g1"), "c2", None),
+            interaction_gate(
+                &peers,
+                &[],
+                &[],
+                &channels,
+                "u1",
+                &[],
+                Some("g1"),
+                "c2",
+                None
+            ),
             Err(InteractionDenial::ChannelNotAllowed)
         );
         // A thread whose parent is allowlisted passes, like threaded messages.
@@ -4217,8 +4517,10 @@ mod tests {
             interaction_gate(
                 &peers,
                 &[],
+                &[],
                 &channels,
                 "u1",
+                &[],
                 Some("g1"),
                 "thread9",
                 Some("c1")
@@ -5898,8 +6200,8 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(!ch.is_user_allowed("12345"));
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.is_member_allowed("12345", &[]));
+        assert!(!ch.is_member_allowed("anyone", &[]));
     }
 
     #[test]
@@ -5914,8 +6216,8 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(ch.is_user_allowed("12345"));
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.is_member_allowed("12345", &[]));
+        assert!(ch.is_member_allowed("anyone", &[]));
     }
 
     #[test]
@@ -5930,10 +6232,10 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("222"));
-        assert!(!ch.is_user_allowed("333"));
-        assert!(!ch.is_user_allowed("unknown"));
+        assert!(ch.is_member_allowed("111", &[]));
+        assert!(ch.is_member_allowed("222", &[]));
+        assert!(!ch.is_member_allowed("333", &[]));
+        assert!(!ch.is_member_allowed("unknown", &[]));
     }
 
     #[test]
@@ -5948,9 +6250,9 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(!ch.is_user_allowed("1111"));
-        assert!(!ch.is_user_allowed("11"));
-        assert!(!ch.is_user_allowed("0111"));
+        assert!(!ch.is_member_allowed("1111", &[]));
+        assert!(!ch.is_member_allowed("11", &[]));
+        assert!(!ch.is_member_allowed("0111", &[]));
     }
 
     #[test]
@@ -5965,7 +6267,7 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(!ch.is_user_allowed(""));
+        assert!(!ch.is_member_allowed("", &[]));
     }
 
     #[test]
@@ -5980,8 +6282,8 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("anyone_else"));
+        assert!(ch.is_member_allowed("111", &[]));
+        assert!(ch.is_member_allowed("anyone_else", &[]));
     }
 
     #[test]
@@ -5996,9 +6298,9 @@ mod tests {
             listen_to_bots,
             mention_only,
         );
-        assert!(ch.is_user_allowed("ABC"));
-        assert!(!ch.is_user_allowed("abc"));
-        assert!(!ch.is_user_allowed("Abc"));
+        assert!(ch.is_member_allowed("ABC", &[]));
+        assert!(!ch.is_member_allowed("abc", &[]));
+        assert!(!ch.is_member_allowed("Abc", &[]));
     }
 
     #[test]
@@ -7389,7 +7691,7 @@ mod tests {
     ) -> bool {
         // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
         // with an empty peer list = nobody, exactly like the message path.
-        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+        if interaction_gate(peers, &[], &[], &[], user_id, &[], None, "c1", None).is_err() {
             return false; // unauthorized: must not drain or resolve anything
         }
         let intent = pending_components.lock().take(custom_id);
@@ -7782,7 +8084,18 @@ mod tests {
     #[test]
     fn autocomplete_authz_is_side_effect_free() {
         assert!(
-            interaction_gate(&[String::from("*")], &[], &[], "u1", None, "c1", None).is_ok(),
+            interaction_gate(
+                &[String::from("*")],
+                &[],
+                &[],
+                &[],
+                "u1",
+                &[],
+                None,
+                "c1",
+                None
+            )
+            .is_ok(),
             "authorized keystroke gates open"
         );
         assert!(
@@ -7790,7 +8103,9 @@ mod tests {
                 &[String::from("u1")],
                 &[],
                 &[],
+                &[],
                 "intruder",
+                &[],
                 None,
                 "c1",
                 None
@@ -7800,7 +8115,7 @@ mod tests {
         );
         // DM (no guild) with an empty peer list = nobody, same as messages.
         assert!(
-            interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
+            interaction_gate(&[], &[], &[], &[], "u1", &[], None, "c1", None).is_err(),
             "empty peer list denies"
         );
     }
@@ -7852,11 +8167,13 @@ mod tests {
             interaction_gate(
                 &peers,
                 &[],
+                &[],
                 &channel_filter,
                 "u1",
+                &[],
                 Some("g1"),
                 "thread_cached",
-                parent.as_deref(),
+                parent.as_deref()
             )
             .is_ok(),
             "cached allowlisted parent authorizes autocomplete in the thread"
@@ -7869,11 +8186,13 @@ mod tests {
             interaction_gate(
                 &peers,
                 &[],
+                &[],
                 &channel_filter,
                 "u1",
+                &[],
                 Some("g1"),
                 "thread_uncached",
-                parent.as_deref(),
+                parent.as_deref()
             )
             .is_err(),
             "uncached thread stays fail-closed"

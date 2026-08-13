@@ -14025,6 +14025,21 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// Discord role IDs whose holders may use this channel, in addition to the
+    /// individually listed peers. A member is authorized when their user ID is
+    /// in the resolved peer allowlist **or** they hold any role listed here;
+    /// the two are additive, so neither can revoke the other.
+    ///
+    /// Role IDs only — Discord's gateway payloads carry `member.roles` as IDs,
+    /// never names, so a role rename cannot silently change who is admitted.
+    ///
+    /// Empty (default) preserves the user-ID-only behavior. Roles are only
+    /// available on guild events; DMs carry no member object, so a DM is
+    /// authorized by the peer allowlist alone. There is no wildcard: use `"*"`
+    /// in the peer allowlist if you intend to admit everyone.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_role_ids: Vec<String>,
     /// When true, the channel opens a sidecar `discord.db` SQLite memory
     /// backend, archives every non-bot message it sees, and registers the
     /// `discord_search` tool against it. Default: false. Folded in from
@@ -27464,6 +27479,7 @@ default_temperature = 0.7
             bot_token: "discord-token".into(),
             guild_ids: vec!["12345".into()],
             channel_ids: vec![],
+            allowed_role_ids: Vec::new(),
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -27495,6 +27511,7 @@ default_temperature = 0.7
             bot_token: "tok".into(),
             guild_ids: Vec::new(),
             channel_ids: vec![],
+            allowed_role_ids: Vec::new(),
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
