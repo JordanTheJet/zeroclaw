@@ -131,7 +131,11 @@ jobs:
   source-images:
     name: Source Image Build (no push)
     needs: changes
-    runs-on: ubuntu-latest
+    # On Blacksmith (CI_USE_BLACKSMITH=true) these builds get NVMe sticky-disk
+    # Docker layer caching; any other value / unset falls back to GitHub-hosted
+    # with the existing type=gha cache. Runner and build action are selected by
+    # the same toggle so the fallback is a full no-op relative to today.
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -139,10 +143,32 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Multi-platform (arm64) builds need QEMU. GitHub-hosted runners ship
+      # binfmt already, so this is a harmless no-op there; Blacksmith runners
+      # need it registered explicitly.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      # GitHub-hosted path only: useblacksmith/build-push-action sets up its own
+      # sticky-disk-backed builder, so a separate buildx builder would bypass the
+      # cache and is skipped when running on Blacksmith.
       - name: Set up Docker Buildx
+        if: ${{ vars.CI_USE_BLACKSMITH != 'true' }}
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
+      - name: Build ${{ matrix.dockerfile }} (${{ matrix.platform }}) from source [Blacksmith]
+        if: ${{ vars.CI_USE_BLACKSMITH == 'true' }}
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}
+          platforms: ${{ matrix.platform }}
+          tags: ${{ matrix.tag }}
+
       - name: Build ${{ matrix.dockerfile }} (${{ matrix.platform }}) from source
+        if: ${{ vars.CI_USE_BLACKSMITH != 'true' }}
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
