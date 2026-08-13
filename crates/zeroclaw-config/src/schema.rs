@@ -14869,7 +14869,13 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
@@ -15021,6 +15027,24 @@ pub struct WhatsAppConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for WhatsAppConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree.
+    ///
+    /// A hand-written field list was the other option and was rejected: this
+    /// struct carries two dozen fields, so such a list silently goes stale the
+    /// first time one is added, which is the same class of defect this exists
+    /// to remove. Every field here either declares a serde default or is an
+    /// `Option`, which is what makes the empty object total. The unwrap is
+    /// covered by `whatsapp_rust_default_matches_serde_default` below, so a
+    /// field added without a default fails that test rather than reaching a
+    /// caller.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every WhatsAppConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -36328,6 +36352,121 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+    }
+
+    /// The test above proves the SERDE path. It says nothing about the RUST
+    /// path, and the two used to disagree: a derived `Default` zeroed the
+    /// field while serde supplied 300.
+    ///
+    /// That gap is not cosmetic. An alias created through a surface that
+    /// constructs the struct in Rust, rather than parsing a file, got `0`,
+    /// and `Duration::from_secs(0)` is an already-elapsed deadline, so every
+    /// approval on that alias denied at once with nothing in the operator's
+    /// config looking wrong.
+    #[test]
+    async fn whatsapp_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            WhatsAppConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "a constructed alias must wait the documented timeout, not deny at once"
+        );
+    }
+
+    /// Pins the whole struct rather than the one field, so a field added later
+    /// with a serde default but no matching Rust default fails here instead of
+    /// reaching an operator. This is also what makes the `expect` in
+    /// `Default::default` safe: if any field stopped being defaultable, the
+    /// deserialize would fail and this test would panic first.
+    #[test]
+    async fn whatsapp_rust_default_matches_serde_default() {
+        let from_rust = serde_json::to_value(WhatsAppConfig::default()).unwrap();
+        let from_serde =
+            serde_json::to_value(serde_json::from_str::<WhatsAppConfig>("{}").unwrap()).unwrap();
+        assert_eq!(
+            from_rust, from_serde,
+            "Default::default() and the serde defaults disagree; every field must match"
+        );
+    }
+
+    /// A zero is still honoured when an operator writes it. The fix above
+    /// changes what an UNSET field means, and must not take away the ability
+    /// to refuse every gated tool deliberately.
+    #[test]
+    async fn whatsapp_explicit_zero_timeout_is_preserved() {
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 0);
+    }
+
+    /// The whole lifecycle that persisted the accidental zero: create an alias
+    /// through the supported map-key surface, save, reload.
+    ///
+    /// The two tests above compare `Default::default()` against the serde
+    /// defaults, which pins the TYPE. That is where the fix lives, and it is
+    /// not where the defect was felt. An operator never calls
+    /// `WhatsAppConfig::default()`; they add an alias, and the generated
+    /// `create_map_key` inserts `<T>::default()` on their behalf. The field
+    /// carries no `skip_serializing_if` and the struct sets no global skip, so
+    /// whatever that default held is written out EXPLICITLY, and a serde
+    /// default only fires on an ABSENT key. The zero therefore reached the file
+    /// and survived every reload after it, with nothing in the operator's
+    /// config looking wrong.
+    ///
+    /// So this drives the surface rather than the type, and asserts on the
+    /// bytes as well as the reparse: the on-disk assert names the mechanism
+    /// (an explicit `= 0` was persisted) while the reparse asserts what the
+    /// operator gets back. Nothing here sets `approval_timeout_secs`; it is
+    /// omitted throughout, which is the case that broke.
+    #[test]
+    async fn whatsapp_alias_created_through_the_map_key_surface_reloads_waiting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+
+        // The same wire sequence the create dispatch runs: create_map_key,
+        // then mark the new alias dirty.
+        let created = config
+            .create_map_key("channels.whatsapp", "shop")
+            .expect("channels.whatsapp must be a map-keyed section");
+        assert!(
+            created,
+            "a fresh alias must be created, not silently reused"
+        );
+        config.mark_dirty("channels.whatsapp.shop");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("approval_timeout_secs = 0"),
+            "creating an alias must not persist an already-elapsed approval deadline; \
+             got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        let shop = reparsed
+            .channels
+            .whatsapp
+            .get("shop")
+            .expect("the created alias must survive save and reload");
+        assert_eq!(
+            shop.approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "an alias whose approval_timeout_secs was never set must reload waiting the \
+             documented timeout, not denying at once"
+        );
     }
 
     #[test]

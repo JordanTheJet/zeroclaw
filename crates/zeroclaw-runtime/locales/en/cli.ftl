@@ -1131,6 +1131,8 @@ channel-approval-btn-always = Always
 channel-approval-tap-instruction = Tap a button below:
 channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    This is a group chat, so everyone here can see this code and the tool arguments shown above. Only an authorized peer for this channel can answer.
 channel-telegram-approval-ack-approved = Approved
 channel-telegram-approval-ack-always-approved = Always approved
 channel-telegram-approval-ack-denied = Denied

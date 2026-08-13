@@ -983,6 +983,8 @@ channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-approval-group-visibility-warning =
+    这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
 channel-telegram-approval-ack-approved = 已批准
 channel-telegram-approval-ack-always-approved = 已始终批准
 channel-telegram-approval-ack-denied = 已拒绝

@@ -984,6 +984,8 @@ channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning =
+    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました

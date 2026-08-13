@@ -984,6 +984,8 @@ channel-approval-btn-always = Siempre
 channel-approval-tap-instruction = Toca un botón a continuación:
 channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Este es un chat de grupo, por lo que todos los presentes pueden ver este código y los argumentos de la herramienta mostrados arriba. Solo un par autorizado de este canal puede responder.
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
