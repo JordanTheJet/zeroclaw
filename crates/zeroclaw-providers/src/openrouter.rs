@@ -632,6 +632,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -704,6 +705,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -774,6 +776,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -886,6 +889,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
+                .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
                 .header("Accept", "text/event-stream")
                 .json(&payload)
                 .send()
@@ -1002,6 +1006,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
