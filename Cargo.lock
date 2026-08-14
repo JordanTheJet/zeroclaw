@@ -13304,6 +13304,7 @@ dependencies = [
  "jsonwebtoken",
  "lapin",
  "lettre",
+ "libc",
  "lru 0.18.2",
  "mail-parser",
  "matrix-sdk",
@@ -13830,6 +13831,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "zeroclaw-api",
  "zeroclaw-log",
 ]
 
