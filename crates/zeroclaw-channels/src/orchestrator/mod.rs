@@ -2346,6 +2346,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
+/// Select the user-facing channel failure after preserving the typed terminal
+/// cause. Substring-based transient hints remain a fallback only: an earlier
+/// transport failure in an aggregate must not mask the final terminal cause.
+fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+        .map(|message| format!("⚠️ Error: {message}"))
+        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
+}
+
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -6804,9 +6814,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
+                    let user_msg = channel_user_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -12321,6 +12329,27 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
     #[test]
+    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+
+        let delivered = channel_user_error_message(&error, "safe fallback");
+
+        assert_eq!(
+            delivered,
+            format!(
+                "⚠️ Error: {}",
+                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+            )
+        );
+        assert!(
+            !delivered.contains("temporarily unavailable"),
+            "an aggregate's earlier transient hint must not mask terminal completion failure"
+        );
+    }
+
+    #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
         // `config_path` and `data_dir` deliberately live under unrelated
         // temp roots, so `config_path.parent()` (the old install-root-derived
@@ -17173,9 +17202,6 @@ BTC is currently around $65,000 based on latest tool output."#
         fn name(&self) -> &str {
             "fingerprint-test-runtime"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -17184,6 +17210,9 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> platform::ShellDialect {
+            platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -22078,7 +22107,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_preserve_instructions_without_compact_loader() {
+    fn prompt_helpers_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -22103,7 +22132,24 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(
+            ws.path(),
+            "model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            None,
+        );
+        let prompt_with_tool_calls =
+            zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_tool_calls(
+                ws.path(),
+                "model",
+                &[("read_skill", "Load skill instructions by name")],
+                &skills,
+                None,
+                None,
+                true,
+            );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -22118,6 +22164,12 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
+        assert!(prompt_with_tool_calls.contains("<instructions>"));
+        assert!(
+            prompt_with_tool_calls.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
     }
 
     #[test]
@@ -24132,6 +24184,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
