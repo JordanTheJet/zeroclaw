@@ -552,6 +552,26 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+/// One plugin instance's egress policy, read from canonical config at use time.
+///
+/// The operator's `plugins.entries[].egress_hosts` is the only source of reach.
+/// The deployment's NAT64 prefixes and connection ceiling are read from the same
+/// config so a plugin and a built-in tool cannot classify one answer set
+/// differently.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_egress_policy(
+    config: &Config,
+    binding: &str,
+) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    let (hosts, allow_private) = config.plugins.entry_egress(binding);
+    zeroclaw_plugins::egress::EgressPolicy::new(
+        &hosts,
+        &allow_private,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    )
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -1562,12 +1582,39 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
+                    // ADR-013: one host-owned egress authority for every plugin
+                    // instance in this registry. It resolves a *view* of
+                    // canonical config at the moment each request is made rather
+                    // than snapshotting one here, so an operator edit takes
+                    // effect without re-instantiating the guest. Sharing the one
+                    // service across the registry is also what makes the
+                    // per-instance connection budget span an instance's stores.
+                    // The live handle is preferred; one-shot callers that have
+                    // none fall back to the documented `root_config` snapshot.
+                    let egress_service = {
+                        let live = live_config.clone();
+                        let snapshot = Arc::clone(&config);
+                        zeroclaw_plugins::egress::EgressHostService::new(
+                            zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
+                                // For tool plugins the binding *is* the entry
+                                // name key `plugins.entries[].name`, the same key
+                                // `entry_config` below resolves against.
+                                let binding = scope.id().binding();
+                                match live.as_ref() {
+                                    Some(handle) => plugin_egress_policy(&handle.read(), binding),
+                                    None => plugin_egress_policy(&snapshot, binding),
+                                }
+                            }),
+                        )
+                    };
+
                     for (manifest, wasm_path) in details {
                         let plugin_config = config
                             .plugins
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
+                        let egress_service = egress_service.clone();
                         let tool = (|| -> anyhow::Result<_> {
                             let scope =
                                 zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
@@ -1581,6 +1628,7 @@ pub fn all_tools_with_runtime(
                                 scope,
                                 plugin_config,
                                 plugin_limits,
+                                Some(egress_service),
                             )
                         })();
                         match tool {

@@ -637,6 +637,7 @@ mod tests {
             permissions,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, grants)
             .unwrap()
