@@ -165,14 +165,14 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 // ── strict egress grammar and matching ────────────────────────────
 // The tool-layer `allowed_domains` semantics above are deliberately
 // permissive: a bare `*` matches everything and a bare domain implies its
-// subdomains. Plugin egress policy (ADR-013) requires the opposite defaults,
+// subdomains. Plugin egress policy requires the opposite defaults,
 // so it gets its own grammar and its own matcher rather than a flag on the
 // permissive one. Keeping them as separate functions means a caller cannot
 // accidentally inherit the loose rules by forgetting an argument.
 
 /// Canonicalize one egress allowlist entry, or explain why it is rejected.
 ///
-/// This is the single grammar for both halves of ADR-013's split: the signed
+/// This is the single grammar for both halves of the egress contract: the signed
 /// manifest's `egress.hosts` declaration and the operator's
 /// `plugins.entries[].egress_hosts` grant. Both validate here so a pattern that
 /// a publisher can declare is exactly a pattern an operator can grant.
@@ -331,7 +331,7 @@ pub fn normalize_egress_patterns(patterns: &[String], label: &str) -> anyhow::Re
 /// dotted name would let a pattern like `*.0.0.1` match `127.0.0.1` — a real
 /// hole, since that pattern passes validation as an ordinary two-label suffix.
 ///
-/// An empty `allowed` list matches nothing, which is the ADR-013 default.
+/// An empty `allowed` list matches nothing: no grant means no reach.
 #[must_use]
 pub fn egress_host_matches(host: &str, allowed: &[String]) -> bool {
     let host = host
@@ -1071,19 +1071,35 @@ fn normalize_request_host(host: &str) -> Option<String> {
     valid.then_some(host)
 }
 
-/// True when `ip` is not globally routable, or a configured NAT64 prefix
-/// translates it to an IPv4 destination that is not.
+/// The trust classes one answer address can land in: `(reaches_global,
+/// reaches_non_global)` across the raw address itself and every configured
+/// NAT64 translation that contains it.
 ///
 /// This is the *trust-zone* question, not the deny question: it exists so a
-/// caller can tell whether one answer set spans two zones. Whether an address
-/// may be dialed at all is decided by the validators.
-fn is_effectively_non_global(ip: std::net::IpAddr, nat64_prefixes: &[Nat64Prefix]) -> bool {
+/// caller can tell whether one answer set spans two zones. Overlapping
+/// declared prefixes can translate a single IPv6 address to destinations in
+/// different zones, and the raw address is itself one of the interpretations,
+/// so the answer must be the set of classes observed rather than one
+/// collapsed verdict; which interpretation carries the connection is route
+/// selection's choice, not this module's. Whether an address may be dialed at
+/// all is decided by the validators.
+fn effective_trust_classes(ip: std::net::IpAddr, nat64_prefixes: &[Nat64Prefix]) -> (bool, bool) {
     match ip {
-        std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+        std::net::IpAddr::V4(v4) => {
+            let non_global = is_non_global_v4(v4);
+            (!non_global, non_global)
+        }
         std::net::IpAddr::V6(v6) => {
-            is_non_global_v6(v6)
-                || network_specific_embedded_ipv4s(v6, nat64_prefixes)
-                    .any(|(_, embedded)| is_non_global_v4(embedded))
+            let mut reaches_non_global = is_non_global_v6(v6);
+            let mut reaches_global = !reaches_non_global;
+            for (_, embedded) in network_specific_embedded_ipv4s(v6, nat64_prefixes) {
+                if is_non_global_v4(embedded) {
+                    reaches_non_global = true;
+                } else {
+                    reaches_global = true;
+                }
+            }
+            (reaches_global, reaches_non_global)
         }
     }
 }
@@ -1193,11 +1209,9 @@ impl ResolvedDestination {
         let mut saw_public = false;
         let mut saw_private = false;
         for ip in &ips {
-            if is_effectively_non_global(*ip, nat64_prefixes) {
-                saw_private = true;
-            } else {
-                saw_public = true;
-            }
+            let (reaches_global, reaches_non_global) = effective_trust_classes(*ip, nat64_prefixes);
+            saw_public |= reaches_global;
+            saw_private |= reaches_non_global;
         }
         if saw_public && saw_private {
             return Err(NetworkGuardError::MixedAddressClasses);
@@ -2643,6 +2657,47 @@ mod tests {
                 [sock("1.1.1.1", 443), sock(translated, 443)],
                 PrivateNetworkAccess::Allow,
                 &[],
+            )
+            .is_ok()
+        );
+    }
+
+    /// One IPv6 answer whose overlapping declared translations land in two
+    /// trust zones is itself a mixed answer: a broad prefix decodes it to a
+    /// global destination while a nested prefix decodes it to a private one,
+    /// and which translation carries the connection is the network's choice.
+    /// Collapsing the interpretations to a single class would accept it as
+    /// simply private under the opt-in, so the class set must be preserved
+    /// per address, in either declaration order.
+    #[test]
+    fn overlapping_translations_of_one_answer_are_a_mixed_class_set() {
+        let address = "2001:67c:5db8:d822:1234:5678:a00:1"; // /32 -> 93.184.216.34, /96 -> 10.0.0.1
+        for order in [
+            ["2001:67c::/32", "2001:67c:5db8:d822:1234:5678::/96"],
+            ["2001:67c:5db8:d822:1234:5678::/96", "2001:67c::/32"],
+        ] {
+            let prefixes = nat64_in_order(&order);
+            assert_eq!(
+                ResolvedDestination::new(
+                    "rebind.example.com",
+                    443,
+                    [sock(address, 443)],
+                    PrivateNetworkAccess::Allow,
+                    &prefixes,
+                ),
+                Err(NetworkGuardError::MixedAddressClasses),
+                "declaration order {order:?} must not change the verdict"
+            );
+        }
+        // With only the broad prefix declared, both interpretations (raw and
+        // the /32 translation) are global, and the answer is uniformly public.
+        assert!(
+            ResolvedDestination::new(
+                "rebind.example.com",
+                443,
+                [sock(address, 443)],
+                PrivateNetworkAccess::Allow,
+                &nat64_in_order(&["2001:67c::/32"]),
             )
             .is_ok()
         );
