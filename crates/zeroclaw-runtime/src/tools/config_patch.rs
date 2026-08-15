@@ -19,13 +19,13 @@
 //!   approval prompt. What the operator sees is computed by the host from
 //!   the ops themselves.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::api_error::ConfigApiError;
@@ -35,9 +35,46 @@ use zeroclaw_config::patch::{
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_config::schema::Config;
 
+/// Deterministic content fingerprint (fixed-key SipHash via `DefaultHasher`)
+/// used to detect config drift between the operator's preview and the apply.
+fn fingerprint(bytes: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Fingerprint of just the `ops` array — the stable identity of a patch across
+/// the preview and the apply. The top-level arguments gain a host-injected
+/// `approved` field between the two calls, so the whole-args value is not
+/// stable; the ops are.
+fn ops_fingerprint(args: &serde_json::Value) -> Option<u64> {
+    Some(fingerprint(&args.get("ops")?.to_string()))
+}
+
+/// Process-wide, per-config-path async locks that serialize `config_patch`'s
+/// read-modify-write so two concurrent calls cannot each read the same base
+/// and clobber the other's write.
+static CONFIG_WRITE_LOCKS: LazyLock<
+    parking_lot::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn write_lock_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    CONFIG_WRITE_LOCKS
+        .lock()
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub struct ConfigPatchTool {
     config_path: PathBuf,
     security: Arc<SecurityPolicy>,
+    /// Base-config fingerprint previewed for a given ops fingerprint. Set by
+    /// `approval_summary`, consumed by `execute` to refuse if the config
+    /// drifted between the operator's preview and the apply. Bounded; entries
+    /// are removed on use, and the map is cleared if it grows past a cap (stale
+    /// entries accrue from previews that were never applied).
+    previews: Arc<parking_lot::Mutex<HashMap<u64, u64>>>,
 }
 
 impl ConfigPatchTool {
@@ -45,7 +82,18 @@ impl ConfigPatchTool {
         Self {
             config_path,
             security,
+            previews: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record the base-config fingerprint previewed for `ops_fp`, bounding the
+    /// map so unapplied previews cannot accumulate without limit.
+    fn record_preview(&self, ops_fp: u64, base_fp: u64) {
+        let mut map = self.previews.lock();
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(ops_fp, base_fp);
     }
 
     /// One human-readable line for a structured patch error. Same rendering
@@ -272,6 +320,13 @@ impl Tool for ConfigPatchTool {
             out.push_str(&delta);
         }
         out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
+
+        // Bind this preview to the base it was computed against: `execute`
+        // refuses if the config changed before the operator's approval is
+        // applied, so the applied effect is always the one previewed.
+        if let Some(ops_fp) = ops_fingerprint(args) {
+            self.record_preview(ops_fp, fingerprint(&raw));
+        }
         Some(out)
     }
 
@@ -301,6 +356,13 @@ impl Tool for ConfigPatchTool {
             return Ok(ToolResult::err(error));
         }
 
+        // Serialize this tool's read-modify-write against other `config_patch`
+        // calls sharing this file: two concurrent calls must not each read the
+        // same base and clobber the other's write. Held across the read, apply,
+        // and save below.
+        let write_lock = write_lock_for(&self.config_path);
+        let _write_guard = write_lock.lock().await;
+
         // Fresh read of the on-disk state, not the boot-time snapshot: the
         // operator may have edited config since this process started, and a
         // stale base would resurrect overwritten values. By the time an agent
@@ -319,6 +381,27 @@ impl Tool for ConfigPatchTool {
                 });
             }
         };
+        let base_fp = fingerprint(&raw);
+
+        // Honor the operator's preview. If these exact ops were previewed
+        // against a different base, the permission delta the operator approved
+        // no longer matches the current config, so applying now would enact an
+        // effect that was never shown. Refuse, and consume the binding.
+        if let Some(ops_fp) = ops_fingerprint(&args)
+            && let Some(previewed_base) = self.previews.lock().remove(&ops_fp)
+            && previewed_base != base_fp
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "configuration changed since the approval preview was shown; the \
+                     requested change was not applied. Re-run so the operator can review \
+                     it against the current configuration."
+                        .to_string(),
+                ),
+            });
+        }
         let mut working: Config = match toml::from_str(&raw) {
             Ok(config) => config,
             Err(err) => {
@@ -348,6 +431,36 @@ impl Tool for ConfigPatchTool {
                     Self::error_text(&api_err)
                 )),
             });
+        }
+
+        // Version-check against writers outside this lock (the CLI, the
+        // gateway, an editor). The write lock blocks other `config_patch`
+        // calls; this re-read catches anyone else who changed the file since
+        // the base read, so a concurrent update is failed explicitly rather
+        // than silently clobbered by `save_dirty` rewriting from our base.
+        match tokio::fs::read_to_string(&self.config_path).await {
+            Ok(current) if fingerprint(&current) == base_fp => {}
+            Ok(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "configuration changed on disk while this patch was being applied; \
+                         nothing was saved. Re-run to apply against the current configuration."
+                            .to_string(),
+                    ),
+                });
+            }
+            Err(err) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "failed to re-read {} before saving: {err}",
+                        self.config_path.display()
+                    )),
+                });
+            }
         }
 
         working.save_dirty().await?;
@@ -427,6 +540,79 @@ mod tests {
             data["note"].as_str().expect("note").contains("reloads"),
             "success output must state that nothing is live until reload"
         );
+    }
+
+    /// The required TOCTOU regression: if the configuration changes between the
+    /// operator's preview and the apply, the approved ops must NOT be written —
+    /// the effect the operator saw no longer matches the current base.
+    #[tokio::test]
+    async fn drift_between_preview_and_execute_is_refused_and_nothing_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.99"}]
+        });
+
+        // Operator previews the change against the current base.
+        assert!(
+            tool.approval_summary(&args).is_some(),
+            "the preview must be produced so it binds to the base"
+        );
+
+        // The config changes underneath — a different writer edits an unrelated
+        // field. A separate tool instance has no preview binding of its own.
+        config_patch_tool(path.clone())
+            .execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4242"}]
+            }))
+            .await
+            .expect("the concurrent edit applies");
+
+        // Applying the previewed ops now must refuse: the base drifted.
+        let result = tool.execute(args).await.expect("execute");
+        assert!(!result.success, "a drifted apply must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed since the approval preview"),
+            "the refusal names the drift: {:?}",
+            result.error
+        );
+
+        let saved = read_config(&path);
+        assert_ne!(
+            saved.gateway.host, "10.0.0.99",
+            "the unapproved effect must never be written"
+        );
+        assert_eq!(
+            saved.gateway.port, 4242,
+            "the concurrent writer's change is preserved"
+        );
+    }
+
+    /// Binding must not break the normal path: preview then apply with no drift
+    /// still succeeds.
+    #[tokio::test]
+    async fn preview_then_execute_without_drift_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.42"}]
+        });
+
+        assert!(tool.approval_summary(&args).is_some());
+        let result = tool.execute(args).await.expect("execute");
+
+        assert!(
+            result.success,
+            "an undrifted apply succeeds: {:?}",
+            result.error
+        );
+        assert_eq!(read_config(&path).gateway.host, "10.0.0.42");
     }
 
     #[tokio::test]
