@@ -366,6 +366,33 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         None
     }
 
+    /// When `true`, the operator prompt for this tool MUST come from
+    /// [`Tool::approval_summary`]; if that returns `None`, the approval gate
+    /// refuses rather than falling back to the generic argument summary.
+    ///
+    /// A tool that carries secret values in its arguments (see
+    /// [`Tool::redact_args_for_log`]) and promises a secret-aware,
+    /// effects-based prompt cannot let the fallback path display those raw
+    /// arguments, nor let the operator approve blind when the specialized
+    /// summary could not be produced. Default: `false`.
+    fn requires_host_approval_summary(&self) -> bool {
+        false
+    }
+
+    /// A log-safe rendering of `args` for audit logs, observer events, and
+    /// client-facing tool-call frames, or `None` (the default) to let callers
+    /// apply the generic credential scrubber.
+    ///
+    /// Override this when the arguments carry secret values the generic
+    /// scrubber cannot recognize — e.g. a bare value written to a config
+    /// secret path, which sits under an innocuously-named `value` key. The
+    /// override redacts them at the source so no logging or telemetry sink
+    /// ever receives the raw value. It MUST be a pure function of `args` that
+    /// cannot fail: a sink has no safe fallback other than the raw arguments.
+    fn redact_args_for_log(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

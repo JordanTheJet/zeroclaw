@@ -215,6 +215,13 @@ impl Tool for ArcToolRef {
         self.0.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.0.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.0.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.0.approval_summary(args)
     }
@@ -284,6 +291,13 @@ impl Tool for ArcDelegatingTool {
         self.inner.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
     }

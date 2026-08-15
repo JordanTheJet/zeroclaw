@@ -3,7 +3,7 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
-use super::redact::scrub_credentials;
+use super::redact::{loggable_args_string, scrub_credentials};
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
@@ -45,11 +45,26 @@ pub(crate) async fn gate_tool_approval(
         // Non-interactive (channels): try the channel's inline
         // approval (e.g. Telegram inline keyboard) before falling
         // back to auto-deny.
+        // A tool that promises a secret-aware, effects-based operator prompt
+        // (config authoring) must not fall back to the generic argument summary
+        // when that prompt cannot be produced: the raw arguments may carry
+        // secrets, and approving blind is itself unsafe. Refuse closed.
+        let tool = ctx.tool_by_name(tool_name);
+        let summary_required_but_missing = request.host_summary.is_none()
+            && tool.is_some_and(|t| t.requires_host_approval_summary());
+        // Redacted arguments for every non-execution sink (approval audit,
+        // WARN records, channel frame). `redact_args_for_log` masks secret op
+        // values at the source; for tools that do not opt in it returns the
+        // arguments unchanged.
+        let redacted_args = tool
+            .and_then(|t| t.redact_args_for_log(tool_args))
+            .unwrap_or_else(|| tool_args.clone());
+
         let mut operator_only_channel_refused = false;
-        let (decision, decided_by, unanswerable) = if mgr.is_non_interactive() {
-            let operator_only = ctx
-                .tool_by_name(tool_name)
-                .is_some_and(|tool| tool.approval_requires_operator());
+        let (decision, decided_by, unanswerable) = if summary_required_but_missing {
+            (ApprovalResponse::No, None, true)
+        } else if mgr.is_non_interactive() {
+            let operator_only = tool.is_some_and(|tool| tool.approval_requires_operator());
             let attributed = if let Some(ch) = ctx.channel {
                 if operator_only && !ch.is_operator_approval_surface() {
                     // Whoever holds this chat account is not necessarily the
@@ -74,8 +89,10 @@ pub(crate) async fn gate_tool_approval(
                         arguments_summary: request
                             .host_summary
                             .clone()
-                            .unwrap_or_else(|| crate::approval::summarize_args(&request.arguments)),
-                        raw_arguments: Some(request.arguments.clone()),
+                            .unwrap_or_else(|| crate::approval::summarize_args(&redacted_args)),
+                        // The channel frame crosses to a remote client; never
+                        // ship the raw (possibly secret-bearing) arguments.
+                        raw_arguments: Some(redacted_args.clone()),
                     };
                     let recipient = ctx.channel_reply_target.unwrap_or_default();
                     match ch.request_approval_attributed(recipient, &ch_request).await {
@@ -137,7 +154,10 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        // Audit with the redacted arguments: `record_decision` runs
+        // `summarize_args`, which is not path-aware and would otherwise retain
+        // a short nested secret value.
+        mgr.record_decision(tool_name, &redacted_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -154,7 +174,13 @@ pub(crate) async fn gate_tool_approval(
             // specific cause (we deliberately did not ask a chat channel that
             // could otherwise have answered), and it always coincides with
             // `unanswerable` since no decision was collected.
-            let denied = if operator_only_channel_refused {
+            let denied = if summary_required_but_missing {
+                format!(
+                    "Tool call not executed: '{tool_name}' requires an operator approval \
+                     preview that could not be produced (the configuration could not be read \
+                     or the requested change does not apply). Not approved."
+                )
+            } else if operator_only_channel_refused {
                 format!(
                     "`{tool_name}` requires operator approval and cannot be approved \
                      from a chat channel. Not approved. The operator can run this \
@@ -178,7 +204,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": loggable_args_string(tool, tool_args),
                         "result": denied,
                         "trace_id": ctx.turn_id,
                         // Operator-facing only. The remedy lives here rather than
@@ -234,7 +260,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": loggable_args_string(tool, tool_args),
                         "replaced": true,
                         "output": scrub_credentials(replacement),
                         "trace_id": ctx.turn_id,
@@ -325,8 +351,15 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct StubTool {
         operator_only: bool,
+        requires_summary: bool,
+        summary: Option<String>,
+        /// When true, `redact_args_for_log` masks each nested `ops[].value`,
+        /// mirroring how `config_patch` redacts a secret that sits under an
+        /// innocuously-named key the generic summary would not catch.
+        redacts_secret: bool,
     }
 
     impl Attributable for StubTool {
@@ -352,6 +385,28 @@ mod tests {
         fn approval_requires_operator(&self) -> bool {
             self.operator_only
         }
+        fn requires_host_approval_summary(&self) -> bool {
+            self.requires_summary
+        }
+        fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+            self.summary.clone()
+        }
+        fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+            if !self.redacts_secret {
+                return None;
+            }
+            let mut redacted = args.clone();
+            if let Some(ops) = redacted.get_mut("ops").and_then(|v| v.as_array_mut()) {
+                for op in ops.iter_mut() {
+                    if let Some(obj) = op.as_object_mut()
+                        && obj.contains_key("value")
+                    {
+                        obj.insert("value".into(), serde_json::json!("[redacted]"));
+                    }
+                }
+            }
+            Some(redacted)
+        }
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult::ok("ok"))
         }
@@ -372,6 +427,7 @@ mod tests {
         let channel = StubChannel::new(operator_surface_channel);
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(StubTool {
             operator_only: operator_only_tool,
+            ..Default::default()
         })];
         let pacing = PacingConfig::default();
         let ctx = TurnCtx {
@@ -438,5 +494,109 @@ mod tests {
             outcome,
             ApprovalGateOutcome::Proceed { approved: true }
         ));
+    }
+
+    /// Drive the gate with a specific stub tool and arguments; return the
+    /// outcome, the audit-log arguments summaries, and how often the channel
+    /// was asked.
+    async fn run_gate_with(
+        tool: StubTool,
+        args: serde_json::Value,
+        operator_surface_channel: bool,
+    ) -> (ApprovalGateOutcome, Vec<String>, usize) {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_profile());
+        let channel = StubChannel::new(operator_surface_channel);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &crate::observability::NoopObserver,
+            provider_name: "stub",
+            model: "stub-model",
+            temperature: None,
+            approval: Some(&mgr),
+            channel_name: "stub",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&channel),
+            turn_id: "gate-test",
+            agent_alias: None,
+            parent_agent_alias: None,
+            tools: &tools,
+        };
+        let outcome = gate_tool_approval(&ctx, "stub_tool", &args, 0).await;
+        let audit = mgr
+            .audit_log()
+            .into_iter()
+            .map(|e| e.arguments_summary)
+            .collect();
+        (outcome, audit, channel.asked.load(Ordering::SeqCst))
+    }
+
+    /// A tool that requires a host-computed, secret-aware approval summary must
+    /// be refused — never asked, never shown the generic argument fallback —
+    /// when that summary cannot be produced.
+    #[tokio::test]
+    async fn refuses_when_a_required_host_summary_is_unavailable() {
+        let tool = StubTool {
+            operator_only: true,
+            requires_summary: true,
+            summary: None,
+            ..Default::default()
+        };
+        let (outcome, _audit, asked) = run_gate_with(tool, serde_json::json!({"x": 1}), true).await;
+
+        assert_eq!(
+            asked, 0,
+            "a tool whose required summary is missing must not be prompted anywhere"
+        );
+        match outcome {
+            ApprovalGateOutcome::Deny(result) => assert!(
+                result.output.contains("could not be produced"),
+                "the refusal explains the missing preview: {}",
+                result.output
+            ),
+            _ => panic!("must be denied when the required summary is unavailable"),
+        }
+    }
+
+    /// A secret carried in the arguments must not survive into the approval
+    /// audit: `record_decision` runs the non-path-aware `summarize_args`, so
+    /// the gate must hand it the tool-redacted arguments.
+    #[tokio::test]
+    async fn the_approval_audit_never_retains_a_redacted_secret() {
+        let tool = StubTool {
+            requires_summary: false,
+            redacts_secret: true,
+            ..Default::default()
+        };
+        // The secret sits under the nested `value` key — not a top-level
+        // secret-named key the generic summary would auto-redact — and early
+        // enough in the stringified ops to survive the 80-char truncation.
+        let (outcome, audit, _asked) = run_gate_with(
+            tool,
+            serde_json::json!({"ops": [
+                {"op": "add", "path": "/x", "value": "sentinel-never-logged-01234567"}
+            ]}),
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ApprovalGateOutcome::Proceed { approved: true }),
+            "the non-operator-only tool is approved by the channel"
+        );
+        for summary in &audit {
+            assert!(
+                !summary.contains("sentinel-never-logged"),
+                "the raw secret leaked into the approval audit: {summary}"
+            );
+        }
+        assert!(!audit.is_empty(), "the decision was recorded");
     }
 }

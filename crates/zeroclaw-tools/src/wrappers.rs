@@ -57,6 +57,13 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
     }
@@ -160,6 +167,13 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         self.inner.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
     }

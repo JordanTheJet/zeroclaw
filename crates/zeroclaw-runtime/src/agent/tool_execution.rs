@@ -116,7 +116,14 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
-    let full_args = call_arguments.to_string();
+    // Redact secret-bearing arguments (e.g. a `config_patch` value written to
+    // a config secret path) at the source, before they reach any observer
+    // event, structured log, or client `TurnEvent`. `loggable_args_value`
+    // returns the arguments unchanged for tools that do not opt in, so every
+    // other tool's telemetry is byte-identical.
+    let log_tool = find_tool(dispatch.tools_registry, call_name);
+    let log_args = crate::agent::turn::redact::loggable_args_value(log_tool, &call_arguments);
+    let full_args = log_args.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -225,7 +232,7 @@ pub(crate) async fn execute_one_tool(
             .with_attrs(::serde_json::json!({
                 "tool": call_name,
                 "tool_call_id": tool_call_id,
-                "input": call_arguments,
+                "input": log_args,
             })),
         format!("tool call: {call_name}")
     );
@@ -244,7 +251,9 @@ pub(crate) async fn execute_one_tool(
             .send(TurnEvent::ToolCall {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
-                args: call_arguments.clone(),
+                // Client-facing frame — carries the redacted arguments so a
+                // secret value never crosses to a connected UI.
+                args: log_args.clone(),
             })
             .await;
     }

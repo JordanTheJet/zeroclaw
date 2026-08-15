@@ -177,13 +177,47 @@ impl Tool for ConfigPatchTool {
         true
     }
 
+    /// The operator prompt is the secret-aware [`Self::approval_summary`], and
+    /// there is no safe fallback: the raw arguments carry secret values that
+    /// the generic summary would leak. If the summary cannot be produced the
+    /// gate refuses instead of showing the arguments verbatim.
+    fn requires_host_approval_summary(&self) -> bool {
+        true
+    }
+
+    /// Mask every op `value` (and `comment`) before the arguments reach any
+    /// log, audit, observer, or client sink. A patch value may be a bare
+    /// secret written to a config secret path — the generic scrubber does not
+    /// recognize it because it sits under the innocuous `value` key — so this
+    /// redacts at the source. Pure and infallible: it never reads config, so
+    /// no sink is left to fall back to the raw arguments. `path` and `op` are
+    /// preserved so audit records stay useful; a config path names a setting,
+    /// not a secret.
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        let mut redacted = args.clone();
+        if let Some(ops) = redacted.get_mut("ops").and_then(|v| v.as_array_mut()) {
+            for op in ops.iter_mut() {
+                if let Some(obj) = op.as_object_mut() {
+                    if obj.contains_key("value") {
+                        obj.insert("value".into(), serde_json::json!("[redacted]"));
+                    }
+                    if obj.contains_key("comment") {
+                        obj.insert("comment".into(), serde_json::json!("[redacted]"));
+                    }
+                }
+            }
+        }
+        Some(redacted)
+    }
+
     /// The operator's approval prompt: what the ops are, and — the part the
     /// raw JSON never shows — what they do to each agent's resolved
     /// permissions. Everything here is computed from the ops against the
     /// on-disk config; none of it is model text. Returns `None` when the
     /// patch can't be previewed (unreadable config, ops that don't apply);
-    /// the generic argument summary shows instead, and execution will
-    /// refuse with the precise error.
+    /// because [`Self::requires_host_approval_summary`] is `true`, the gate
+    /// then refuses rather than showing the raw arguments, and execution would
+    /// refuse with the precise error regardless.
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         let ops = parse_patch_ops(args.get("ops")?.clone()).ok()?;
         let raw = std::fs::read_to_string(&self.config_path).ok()?;
@@ -657,6 +691,43 @@ mod tests {
             summary.is_none(),
             "ops that will be refused fall back to the generic summary"
         );
+    }
+
+    /// Log-facing redaction masks every op value and comment at the source,
+    /// independent of config readability (it never reads config), so no audit,
+    /// log, observer, or client sink can receive a raw secret — including the
+    /// failed-preview path where `approval_summary` returns `None`.
+    #[test]
+    fn redact_args_for_log_masks_every_value_and_comment() {
+        let tool = config_patch_tool(std::env::temp_dir().join("config.toml"));
+        let args = serde_json::json!({
+            "ops": [
+                {"op": "add", "path": "/http_request/secrets/api_token",
+                 "value": "sentinel-token-never-logged-0123", "comment": "sentinel-comment"},
+                {"op": "replace", "path": "/gateway/host", "value": "10.0.0.1"},
+                {"op": "remove", "path": "/gateway/tls"}
+            ]
+        });
+        let redacted = tool
+            .redact_args_for_log(&args)
+            .expect("config_patch redacts");
+        let text = redacted.to_string();
+
+        assert!(
+            !text.contains("sentinel-token-never-logged") && !text.contains("sentinel-comment"),
+            "no op value or comment may survive redaction: {text}"
+        );
+        // Even a non-secret value is masked for logs — the operator saw the
+        // real values in the host-computed prompt; sinks do not need them.
+        assert!(
+            !text.contains("10.0.0.1"),
+            "non-secret values are masked too: {text}"
+        );
+        // Paths and ops stay, so audit records remain useful.
+        assert!(text.contains("http_request/secrets/api_token"));
+        assert!(text.contains("gateway.host") || text.contains("/gateway/host"));
+        assert_eq!(redacted["ops"][0]["value"], "[redacted]");
+        assert_eq!(redacted["ops"][0]["comment"], "[redacted]");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
-use super::redact::scrub_credentials;
+use super::redact::{loggable_args_string, scrub_credentials};
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -43,7 +43,7 @@ async fn record_duplicate_tool_call(
                 "model": ctx.model,
                 "iteration": iteration + 1,
                 "tool": tool_name,
-                "arguments": scrub_credentials(&tool_args.to_string()),
+                "arguments": loggable_args_string(ctx.tool_by_name(tool_name), tool_args),
                 "result": duplicate,
                 "deduplicated": true,
                 "trace_id": ctx.turn_id,
@@ -105,7 +105,7 @@ pub(crate) async fn prepare_tool_calls(
                                 "model": ctx.model,
                                 "iteration": iteration + 1,
                                 "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
+                                "arguments": loggable_args_string(ctx.tool_by_name(&tool_name), &tool_args),
                                 "result": cancelled,
                                 "trace_id": ctx.turn_id,
                             })),
@@ -181,7 +181,7 @@ pub(crate) async fn prepare_tool_calls(
                             "model": ctx.model,
                             "iteration": iteration + 1,
                             "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
+                            "arguments": loggable_args_string(ctx.tool_by_name(&tool_name), &tool_args),
                             "result": repeated,
                             "trace_id": ctx.turn_id,
                         })),
@@ -234,7 +234,7 @@ pub(crate) async fn prepare_tool_calls(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "arguments": loggable_args_string(ctx.tool_by_name(&tool_name), &tool_args),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_start"
