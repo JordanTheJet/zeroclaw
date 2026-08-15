@@ -4786,17 +4786,24 @@ async fn fetch_openrouter_context_window(
 /// way the rest of the family already does, rather than inventing a second
 /// convention. A plain `bearer_auth()` here would send a `ZhipuJwt` family's
 /// long-lived `id.secret` verbatim.
+///
+/// `Err` when the stored credential cannot be turned into a header, in which
+/// case no probe is built. `provider_type` names the family in that refusal
+/// record: discovery runs outside any per-provider span, so it has to carry
+/// its own attribution.
 fn context_catalog_request(
     client: &reqwest::Client,
     base_url: &str,
     auth: &crate::compatible::AuthStyle,
     api_key: Option<&str>,
-) -> reqwest::RequestBuilder {
+    provider_type: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     crate::compatible::apply_auth_to_request(
         client.get(&url),
         auth,
         api_key.filter(|s| !s.is_empty() && *s != "<unset>"),
+        provider_type,
     )
 }
 
@@ -4822,13 +4829,20 @@ async fn fetch_openai_compatible_context_window(
         .filter(|s| !s.is_empty() && *s != "<unset>")
         .or(default_uri)
         .unwrap_or("");
-    let resp = context_catalog_request(&client, base_url, &auth, config.api_key.as_deref())
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
+    let resp = context_catalog_request(
+        &client,
+        base_url,
+        &auth,
+        config.api_key.as_deref(),
+        provider_type,
+    )
+    .ok()?
+    .send()
+    .await
+    .ok()?
+    .json::<serde_json::Value>()
+    .await
+    .ok()?;
     let model = config.model.as_deref().unwrap_or("");
     let model_entry = resp["data"]
         .as_array()?
@@ -5048,7 +5062,8 @@ mod context_window_discovery_tests {
                 matches!(auth, crate::compatible::AuthStyle::ZhipuJwt),
                 "{family} is expected to use credential-transforming auth"
             );
-            super::context_catalog_request(&client, &base_url, &auth, Some(STORED))
+            super::context_catalog_request(&client, &base_url, &auth, Some(STORED), family)
+                .expect("a well-formed stored credential mints and builds a probe")
                 .send()
                 .await
                 .expect("catalog probe should reach the test server");
@@ -5090,6 +5105,48 @@ mod context_window_discovery_tests {
                 "the minted token is short-lived: {payload}"
             );
         }
+        server.abort();
+    }
+
+    /// A `ZhipuJwt` credential that is not `id.secret` cannot be minted into a
+    /// token. Refusing is the security property: the alternative — sending the
+    /// stored value as a plain bearer token — is exactly the leak the
+    /// exclusion above exists to prevent, and it would also be a request that
+    /// could only ever be rejected upstream.
+    ///
+    /// Wire-level: nothing at all reaches the server, so the stored value
+    /// cannot have left the client in any form.
+    #[tokio::test]
+    async fn a_malformed_zhipu_credential_builds_no_probe_at_all() {
+        const MALFORMED: &str = "no-dot-separator-here";
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+        let client = reqwest::Client::new();
+
+        let refusal = super::context_catalog_request(
+            &client,
+            &base_url,
+            &crate::compatible::AuthStyle::ZhipuJwt,
+            Some(MALFORMED),
+            "zai",
+        )
+        .expect_err("a credential that cannot be minted must not produce a request");
+
+        assert!(
+            !refusal.to_string().contains(MALFORMED),
+            "the refusal must not quote the stored credential: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("zai"),
+            "the refusal must name the family discovery was probing: {refusal}"
+        );
+
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert!(
+            seen.is_empty(),
+            "no request may leave the client for a credential that cannot be minted: {seen:?}"
+        );
         server.abort();
     }
 }
