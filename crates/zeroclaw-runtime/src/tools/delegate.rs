@@ -32,6 +32,15 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
+fn invalid_semantic_completion_error(agent_name: &str) -> String {
+    crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
+}
+
+fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -1344,26 +1353,41 @@ impl DelegateTool {
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            &provider_type,
+            &model,
+            result,
+        ))
+    }
 
-                Ok(ToolResult {
-                    success: true,
-                    output:
-                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
-                            .into(),
-                    error: None,
-                })
+    fn render_non_agentic_result(
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        result: anyhow::Result<String>,
+    ) -> ToolResult {
+        match result {
+            Ok(response)
+                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+            {
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(invalid_semantic_completion_error(agent_name)),
+                }
             }
-            Err(e) => Ok(ToolResult {
+            Ok(response) => ToolResult {
+                success: true,
+                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                    .into(),
+                error: None,
+            },
+            Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+                error: Some(delegate_failure_error(agent_name, &e)),
+            },
         }
     }
 }
@@ -2326,6 +2350,10 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
+        let mut resolved_agent_config = agent_config.clone();
+        resolved_agent_config.resolved = self.resolve_loop_runtime(agent_alias, agent_config);
+        let agent_config = &resolved_agent_config;
+
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2379,7 +2407,7 @@ impl DelegateTool {
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
@@ -2576,8 +2604,6 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
-        let mut prompt_agent_config = agent_config.clone();
-        prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2586,7 +2612,7 @@ impl DelegateTool {
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            &prompt_agent_config,
+            agent_config,
             model,
             &sub_tools,
             prompt_workspace,
@@ -2696,26 +2722,23 @@ impl DelegateTool {
         .await;
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
-                    "[Empty response]".to_string()
-                } else {
-                    response
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    )
-                    .into(),
-                    error: None,
-                })
-            }
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(invalid_semantic_completion_error(agent_name)),
+            }),
+            Ok(Ok(response)) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                )
+                .into(),
+                error: None,
+            }),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                error: Some(delegate_failure_error(agent_name, &e)),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -2767,6 +2790,13 @@ impl Tool for ToolArcRef {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2944,10 +2974,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -2958,6 +2984,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -4504,6 +4534,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
+        let server = start_final_chat_server(vec![""]).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "return a final answer",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "{background:?}"
+        );
+        assert!(background.output.is_none(), "{background:?}");
+        assert_eq!(
+            background.error.as_deref(),
+            Some(invalid_semantic_completion_error("target").as_str()),
+            "{background:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Parallel fan-out gets its own coverage because each spawned worker
         // rebuilds a delegate tool instance before entering the agentic loop.
@@ -4837,7 +4905,7 @@ mod tests {
                 test_security(),
             ))])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4922,6 +4990,122 @@ mod tests {
             "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
             tool_message
         );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_empty_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok(" \n\t".to_string()),
+        );
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok("<think>internal reasoning</think>".to_string()),
+        );
+
+        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+        );
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let expected = invalid_semantic_completion_error("delegate");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_terminal_completion() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &EmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenEmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
     }
 
     #[tokio::test]
@@ -5149,6 +5333,10 @@ mod tests {
 
     struct FinalOnlyModelProvider;
 
+    struct EmptyTerminalModelProvider;
+
+    struct ToolThenEmptyTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -5185,6 +5373,108 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: Some("reasoning only".to_string()),
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenEmptyTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: Some("reasoning only".to_string()),
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenEmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolThenEmptyTerminalModelProvider"
         }
     }
 
@@ -5501,6 +5791,60 @@ mod tests {
         assert!(!prompt.contains("ISO 8601:"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_resolves_explicit_global_full_skill_mode() {
+        let mut root_config = Config::default();
+        root_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        root_config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let root_config = Arc::new(root_config);
+        let config = root_config.agents.get("alpha").unwrap().clone();
+        let workspace = std::env::temp_dir();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run <smoke> & release checks.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace.to_path_buf());
+        assert_eq!(
+            tool.resolve_loop_runtime("alpha", &config)
+                .prompt_injection_mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+        );
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                Some(&skills),
+            )
+            .unwrap();
+
+        assert!(prompt.contains("<instructions>"));
+        assert!(
+            prompt.contains("<instruction>Run &lt;smoke&gt; &amp; release checks.</instruction>")
+        );
+        assert!(!prompt.contains("read_skill"));
+        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
@@ -8185,6 +8529,76 @@ command = "echo hi"
             credential.as_deref(),
             Some("sk-ant-global-coordinator-key"),
             "non-OAuth target without api_key must fall back to global credential"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_arc_ref_spec_tests {
+    use super::*;
+    use zeroclaw_api::tool::ToolSpec;
+
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
+            schema: Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            })),
+        });
+        let inner_params = inner.spec().parameters;
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ToolArcRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
         );
     }
 }

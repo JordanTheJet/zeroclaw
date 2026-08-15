@@ -632,6 +632,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -704,6 +705,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -774,6 +776,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -864,10 +867,14 @@ impl ModelProvider for OpenRouterModelProvider {
             stream: Some(true),
         };
 
-        let payload = match serde_json::to_value(&native_request) {
+        let payload = match self.merge_extra_body(&native_request) {
             Ok(v) => v,
             Err(e) => {
-                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+                let error = match e.downcast::<serde_json::Error>() {
+                    Ok(e) => StreamError::Json(e),
+                    Err(e) => StreamError::ModelProvider(e.to_string()),
+                };
+                return stream::once(async move { Err(error) }).boxed();
             }
         };
 
@@ -882,6 +889,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
+                .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
                 .header("Accept", "text/event-stream")
                 .json(&payload)
                 .send()
@@ -998,6 +1006,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
             .json(&body)
             .send()
             .await?;
@@ -2180,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_body_with_nested_provider_routing() {
+    fn streaming_extra_body_with_nested_provider_routing() {
         let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).extra_body(
             serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
         ).build();
@@ -2191,7 +2200,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
-            stream: None,
+            stream: Some(true),
         };
 
         let merged = model_provider.merge_extra_body(&request).unwrap();
@@ -2199,6 +2208,48 @@ mod tests {
         let prov = obj.get("model_provider").unwrap();
         assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
         assert_eq!(prov["allow_fallbacks"], false);
+        assert_eq!(obj.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_rejects_non_object_extra_body_before_request() {
+        use crate::traits::{ChatRequest, StreamOptions};
+        use futures_util::StreamExt as _;
+
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!(["invalid"]))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should yield the request-body error")
+            .expect_err("non-object provider_extra should fail before the request");
+        assert!(
+            error
+                .to_string()
+                .contains("provider_extra must be a JSON object"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

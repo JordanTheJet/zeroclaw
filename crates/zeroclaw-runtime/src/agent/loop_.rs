@@ -965,10 +965,10 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop, ToolLoopCancelled,
-    drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop,
-    scrub_credentials,
+    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution, ResolvedIo,
+    ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop,
+    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
+    run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1128,6 +1128,30 @@ fn api_key_and_uri_for_provider(
         fallback.and_then(|e| e.api_key.clone()),
         fallback.and_then(|e| e.uri.clone()),
     )
+}
+
+/// Project a typed terminal-completion failure only at the direct CLI boundary.
+///
+/// The typed error's `Display` remains the stable diagnostic used by provider
+/// and runtime telemetry. CLI delivery is the presentation boundary, where the
+/// corresponding Fluent message is required instead.
+fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error {
+    let Some(user_message) = crate::agent::terminal_completion_error_message(&error, None) else {
+        return error;
+    };
+    let diagnostic = error.to_string();
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": diagnostic,
+                "error_key": "terminal_completion",
+            })),
+        "CLI agent turn failed"
+    );
+    anyhow::Error::msg(user_message)
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -1527,9 +1551,9 @@ pub async fn run(
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-        ));
+                "read_skill",
+                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+            ));
         }
         tool_descs.push((
         "cron_add",
@@ -1888,7 +1912,7 @@ pub async fn run(
                                     ResolvedIo {
                                         tools_registry: &tools_registry,
                                         observer: observer.as_ref(),
-                                        silent: false,
+                                        silent: !interactive,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
@@ -1999,7 +2023,7 @@ pub async fn run(
 
                             continue;
                         }
-                        return Err(e);
+                        return Err(project_cli_terminal_completion_error(e));
                     }
                 }
             }
@@ -2363,6 +2387,7 @@ pub async fn run(
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
+                            StreamDelta::Lifecycle(_) => {}
                             StreamDelta::Status(text) => {
                                 if is_tty {
                                     let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
@@ -2662,7 +2687,8 @@ pub async fn run(
                                 }
                             }
 
-                            eprintln!("\nError: {e}\n");
+                            let error = project_cli_terminal_completion_error(e);
+                            eprintln!("\nError: {error}\n");
                             break String::new();
                         }
                     }
@@ -3639,35 +3665,6 @@ mod tests {
         assert_eq!(est, 10_004);
     }
 
-    // ── shared_budget tests ───────────────────────────────────────
-
-    #[test]
-    fn shared_budget_decrement_logic() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let budget = Arc::new(AtomicUsize::new(3));
-
-        // Simulate 3 iterations decrementing
-        for i in 0..3 {
-            let remaining = budget.load(Ordering::Relaxed);
-            assert!(remaining > 0, "Budget should be >0 at iteration {i}");
-            budget.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Budget should now be 0
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn shared_budget_none_has_no_effect() {
-        // When shared_budget is None, the check is simply skipped
-        let budget: Option<Arc<std::sync::atomic::AtomicUsize>> = None;
-        assert!(budget.is_none());
-    }
-
-    // ── existing tests ────────────────────────────────────────────
-
     #[test]
     fn interactive_session_state_round_trips_history() {
         let dir = tempdir().unwrap();
@@ -4087,6 +4084,25 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn direct_cli_terminal_completion_projection_localizes_delivery() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let diagnostic = error.to_string();
+
+        let projected = super::project_cli_terminal_completion_error(error);
+
+        assert_eq!(
+            projected.to_string(),
+            crate::agent::semantic_empty_terminal_completion_message(None),
+            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+        );
+        assert_eq!(
+            diagnostic, "provider completed without final text or tool calls",
+            "the diagnostic supplied to the CLI boundary must remain stable for telemetry"
+        );
     }
 
     struct NonVisionModelProvider {
@@ -4789,6 +4805,185 @@ mod tests {
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
             Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
+
+    /// A channel that always answers `Deny`, with a configurable provenance.
+    ///
+    /// This is the exact ambiguity the gate has to resolve: an operator tapping
+    /// "Deny" and a channel synthesizing a deny because nobody answered are
+    /// indistinguishable on the wire — both are `Some(Deny)` with no decider.
+    /// Only [`ApprovalSource`] separates them.
+    struct SourcedDenyChannel {
+        source: ::zeroclaw_api::channel::ApprovalSource,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SourcedDenyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "sourced-deny-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for SourcedDenyChannel {
+        fn name(&self) -> &str {
+            "sourced-deny-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<::zeroclaw_api::channel::AttributedApprovalResponse>> {
+            Ok(Some(
+                ::zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    self.source,
+                ),
+            ))
+        }
+    }
+
+    /// Drive one denied tool call through the gate and return the
+    /// `[Tool results]` text the MODEL would see.
+    async fn tool_results_for_denying_channel(
+        source: ::zeroclaw_api::channel::ApprovalSource,
+    ) -> String {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let write_call = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"a.txt","content":"x"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let channel = SourcedDenyChannel { source };
+        let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("write a file"),
+        ];
+        let observer = NoopObserver;
+
+        let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "acp",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: Some(&channel),
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await;
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "a denied tool must not execute"
+        );
+
+        history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present")
+            .content
+            .clone()
+    }
+
+    /// The gate-level half of the contract: an OPERATOR's deny still reads as a
+    /// user decision. Without this the fix could "pass" by never saying
+    /// "Denied by user." at all, which would lose real information.
+    #[tokio::test]
+    async fn operator_sourced_deny_is_still_reported_as_a_user_denial() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+        assert!(
+            content.contains("Denied by user."),
+            "an operator's deny is a real user decision and must say so: {content}"
+        );
+    }
+
+    /// The other half: a channel-synthesized deny reaching the gate with
+    /// runtime provenance must NOT be reported as a user's decision, even
+    /// though it is byte-identical to one on the `ChannelApprovalResponse` wire.
+    #[tokio::test]
+    async fn runtime_sourced_deny_is_not_reported_as_a_user_denial() {
+        for source in [
+            ::zeroclaw_api::channel::ApprovalSource::TimedOut,
+            ::zeroclaw_api::channel::ApprovalSource::Unreachable,
+            ::zeroclaw_api::channel::ApprovalSource::Unavailable,
+        ] {
+            let content = tool_results_for_denying_channel(source).await;
+            assert!(
+                !content.contains("Denied by user."),
+                "{source:?} is a runtime denial, not a user's: {content}"
+            );
+            assert!(
+                content.contains("no operator decision was available"),
+                "{source:?} should state that no operator decided: {content}"
+            );
         }
     }
 
@@ -7438,6 +7633,122 @@ mod tests {
         assert!(!tool_results.content.contains("Denied by user."));
     }
 
+    /// An auto-denial in a non-interactive run must not claim a user denied it.
+    ///
+    /// With no channel able to answer, the gate denies on the runtime's own authority. Reporting
+    /// that as "Denied by user." is false and actively misleading: it sends the model looking for
+    /// an operator decision that never happened, and hides the real remedy, which is the agent's
+    /// `auto_approve` policy.
+    #[tokio::test]
+    async fn run_tool_call_loop_reports_unanswerable_approval_without_blaming_the_user() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let write_call = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"a.txt","content":"x"}}
+</tool_call>"#;
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let approval_mgr = ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("write a file"),
+        ];
+        let observer = NoopObserver;
+
+        let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await;
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        assert!(
+            !tool_results.content.contains("Denied by user."),
+            "an unanswerable approval must not be attributed to a user: {}",
+            tool_results.content
+        );
+        assert!(
+            tool_results.content.contains("requires approval")
+                && tool_results
+                    .content
+                    .contains("no operator decision was available"),
+            "the denial should state the outcome and that no operator decided: {}",
+            tool_results.content
+        );
+        // The model must not be told how to switch its own approval policy off.
+        // `auto_approve` bypasses operator approval for the named tool and
+        // `level = "full"` removes approval gates for every tool while dropping
+        // workspace-only confinement, so naming either here hands the model an
+        // argument for expanding its own privileges in response to an approval
+        // channel simply being unavailable. Operators get that guidance from the
+        // WARN record's `operator_hint` instead.
+        for leak in ["auto_approve", "level = \"full\"", "risk profile"] {
+            assert!(
+                !tool_results.content.contains(leak),
+                "model-visible denial must not prescribe a policy bypass ({leak}): {}",
+                tool_results.content
+            );
+        }
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "a denied tool must not execute"
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -9833,6 +10144,7 @@ This is an example, not an invocation."#;
             deltas.iter().all(|delta| match delta {
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
+                StreamDelta::Lifecycle(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9927,7 +10239,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10019,7 +10331,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11005,7 +11317,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11477,7 +11789,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12867,6 +13179,87 @@ Let me check the result."#;
     }
 
     #[test]
+    fn compact_text_prompt_advertises_read_skill_and_omits_inlined_instructions() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        // A non-native provider exercises the text tool-use protocol path where
+        // compact skill loading must advertise `read_skill` explicitly.
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        assert!(!zeroclaw_providers::ModelProvider::supports_native_tools(
+            &provider
+        ));
+
+        // Compact mode registers `read_skill`; model it in the registry here.
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "read_skill",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        // The prompt-visible description survives registry filtering because
+        // the compact-mode registry advertises the same tool.
+        let tool_descs: Vec<(&str, &str)> = vec![(
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        )];
+
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: Some(workspace.path().join("skills/deploy/SKILL.md")),
+        }];
+
+        let risk_profile = RiskProfileConfig::default();
+
+        let system_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &skills,
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Compact,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("compact-mode text prompt should build");
+
+        // Skills section is compact: on-demand loading, no inlined instructions.
+        assert!(
+            system_prompt.contains("read_skill(name)"),
+            "compact skills section must instruct on-demand loading via read_skill"
+        );
+        assert!(
+            !system_prompt.contains("Run smoke tests before deploy."),
+            "compact mode must not inline skill instructions"
+        );
+
+        // The prompt-visible text tool list advertises the compact loader.
+        assert!(
+            system_prompt.contains("**read_skill**"),
+            "non-native compact text protocol must advertise read_skill"
+        );
+    }
+
+    #[test]
     fn non_native_system_prompt_with_no_tools_contains_zero_tool_protocol() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
 
@@ -13811,6 +14204,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::Lifecycle(_) => "",
             })
             .collect();
 
@@ -13988,6 +14382,285 @@ Let me check the result."#;
         assert_eq!(summary.request_count, 1);
         assert_eq!(summary.total_tokens, 1_200);
         assert!(summary.session_cost_usd > 0.0);
+    }
+
+    /// The local budget gate rejects the turn before any provider request is
+    /// made, so the user must not be told the agent is waiting on a model.
+    /// `WaitingOnModel` is announced by `announce_llm_request`, which must run
+    /// after `enforce_tool_loop_budget`, never before it.
+    #[tokio::test]
+    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use crate::agent::turn::events::StreamDelta;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+        use zeroclaw_api::channel::ProgressEvent;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        // If the gate were bypassed this provider would answer, so a passing
+        // assertion cannot be explained by the provider simply not replying.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.01,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        // Put the tracker over its daily limit before the turn starts.
+        tracker
+            .record_usage(zeroclaw_config::cost::TokenUsage {
+                model: "mock-model".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                total_tokens: 2,
+                cost_usd: 5.0,
+                pricing_available: true,
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()));
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &[],
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: Some(delta_tx),
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
+                }),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an exhausted budget must reject the turn, got {result:?}"
+        );
+        let mut lifecycle = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let StreamDelta::Lifecycle(event) = delta {
+                lifecycle.push(event);
+            }
+        }
+        assert!(
+            !lifecycle.contains(&ProgressEvent::WaitingOnModel),
+            "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_rejected_usage_is_billed_without_replacing_accepted_context_usage() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        let rejected = ChatResponse {
+            text: Some("   ".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let accepted = ChatResponse {
+            text: Some("accepted response".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let provider = ReliableModelProvider::new(
+            "reliable-test",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from([rejected, accepted]))),
+                    capabilities: ProviderCapabilities::default(),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let observer = CapturingObserver::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let usage_ctx = ToolLoopCostTrackingContext::usage_only();
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("current question"),
+        ];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(usage_ctx.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "reliable-test",
+                            model: "test-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &[],
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 100,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: "recovered-usage-test",
+                }),
+            )
+            .await
+            .expect("reliable recovery should produce the accepted response");
+
+        assert_eq!(result, "accepted response");
+        let usage = usage_ctx.snapshot_turn_usage();
+        assert_eq!(usage.input_tokens, 160, "both billed attempts are retained");
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted response may set the context-window fill"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "earlier question"),
+            "the accepted 80-token context fill must not trim existing history"
+        );
+
+        let events = observer.events.lock();
+        let responses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::LlmResponse {
+                    success: true,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => Some((*input_tokens, *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses, vec![(Some(80), Some(7))]);
+        drop(events);
+
+        let mut usage_events = Vec::new();
+        let mut history_trimmed = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage_events.push((input_tokens, output_tokens)),
+                TurnEvent::HistoryTrimmed { .. } => history_trimmed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(usage_events, vec![(Some(80), Some(7))]);
+        assert!(
+            !history_trimmed,
+            "recovered rejected usage must not trim history"
+        );
     }
 
     #[tokio::test]
@@ -15127,6 +15800,164 @@ Let me check the result."#;
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
         );
+    }
+
+    #[test]
+    fn single_shot_run_routes_narration_by_interactive_mode() {
+        fn run_helper(interactive: bool) -> std::process::Output {
+            let current_exe = std::env::current_exe().expect("current test binary path");
+            std::process::Command::new(current_exe)
+                .args([
+                    "single_shot_narration_boundary_helper_8760",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(
+                    "ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE",
+                    if interactive { "1" } else { "0" },
+                )
+                .output()
+                .expect("helper test process should run")
+        }
+
+        let non_interactive = run_helper(false);
+        let non_interactive_stderr = String::from_utf8_lossy(&non_interactive.stderr);
+        assert!(
+            non_interactive.status.success(),
+            "non-interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            non_interactive.status.code(),
+            String::from_utf8_lossy(&non_interactive.stdout),
+            non_interactive_stderr
+        );
+        assert!(
+            !non_interactive_stderr.contains("single-shot narration sentinel"),
+            "non-interactive narration leaked to stderr:\n{non_interactive_stderr}"
+        );
+
+        let interactive = run_helper(true);
+        let interactive_stderr = String::from_utf8_lossy(&interactive.stderr);
+        assert!(
+            interactive.status.success(),
+            "interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            interactive.status.code(),
+            String::from_utf8_lossy(&interactive.stdout),
+            interactive_stderr
+        );
+        assert!(
+            interactive_stderr.contains("single-shot narration sentinel"),
+            "interactive narration was not routed to stderr:\n{interactive_stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for single-shot stderr boundary regression"]
+    async fn single_shot_narration_boundary_helper_8760() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(if call == 0 {
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "single-shot narration sentinel",
+                                    "tool_calls": [{
+                                        "id": "call-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "missing_test_tool",
+                                            "arguments": "{}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{"message": {"content": "final answer"}}]
+                        })
+                    })
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let interactive = std::env::var("ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE")
+            .expect("interactive mode env")
+            == "1";
+        let response = super::run(
+            config,
+            "test-agent",
+            Some("run a tool".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            interactive,
+            Some(tmp.path().join("session.json")),
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("single-shot run should finish");
+        assert_eq!(response, "final answer");
+
+        server_handle.abort();
     }
 
     #[tokio::test]

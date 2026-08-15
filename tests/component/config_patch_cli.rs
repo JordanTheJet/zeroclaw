@@ -47,6 +47,7 @@ fn test_state(config: Config) -> AppState {
         Arc::new(NoneMemory::new("config-patch-cli-test"));
     AppState {
         config: Arc::new(RwLock::new(config)),
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
         temperature: None,
@@ -80,8 +81,6 @@ fn test_state(config: Config) -> AppState {
         nextcloud_talk: HashMap::new(),
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret: HashMap::new(),
-        #[cfg(feature = "channel-wati")]
-        wati: HashMap::new(),
         #[cfg(feature = "channel-email")]
         gmail_push: None,
         observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
