@@ -137,6 +137,21 @@ impl ConfigPatchTool {
     /// against both the current and the patched config so a value written
     /// to a *newly created* secret path (dynamic per-alias credentials)
     /// is masked too.
+    /// Render a value for the operator prompt: bounded, but with the
+    /// truncation made explicit (character count) rather than a silent `...`
+    /// that could hide a security-relevant suffix. `s` is expected to already
+    /// be in a display-safe form (JSON text or a `{:?}`-escaped string).
+    fn bounded_display(s: &str) -> String {
+        const CAP: usize = 160;
+        let count = s.chars().count();
+        if count > CAP {
+            let head: String = s.chars().take(CAP).collect();
+            format!("{head} … ({count} chars total, truncated)")
+        } else {
+            s.to_string()
+        }
+    }
+
     fn render_op(op: &PatchOp, before: &Config, after: &Config) -> String {
         let dotted = json_pointer_to_dotted(&op.path);
         let sensitive = [before, after].iter().any(|cfg| {
@@ -144,27 +159,37 @@ impl ConfigPatchTool {
                 .map(|info| info.is_secret || info.derived_from_secret)
                 .unwrap_or(false)
         });
-        match op.op.as_str() {
+        let mut line = match op.op.as_str() {
             "add" | "replace" | "test" => {
                 let value = if sensitive {
                     "[redacted]".to_string()
                 } else {
+                    // JSON form is already escaped and unambiguous (strings
+                    // quoted, control chars encoded); bound it with an explicit
+                    // truncation marker.
                     let raw = op
                         .value
                         .as_ref()
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "null".to_string());
-                    if raw.chars().count() > 80 {
-                        let head: String = raw.chars().take(77).collect();
-                        format!("{head}...")
-                    } else {
-                        raw
-                    }
+                    Self::bounded_display(&raw)
                 };
                 format!("  {:<8} {dotted} = {value}", op.op)
             }
             _ => format!("  {:<8} {dotted}", op.op),
+        };
+        // Comments are model-authored bytes that get written to `config.toml`.
+        // The operator must see them or the "no self-narration" guarantee is
+        // hollow. Escape via `{:?}` so a newline or control char cannot forge
+        // additional prompt lines.
+        if let Some(comment) = &op.comment {
+            let _ = write!(
+                line,
+                "  # comment: {}",
+                Self::bounded_display(&format!("{comment:?}"))
+            );
         }
+        line
     }
 }
 
@@ -472,6 +497,7 @@ impl Tool for ConfigPatchTool {
             .zip(results.iter())
             .filter_map(|(op, res)| op.comment.as_ref().map(|c| (res.path.clone(), c.clone())))
             .collect();
+        let mut comment_error: Option<String> = None;
         if !annotations.is_empty()
             && let Err(err) =
                 zeroclaw_config::comment_writer::apply_comments(&self.config_path, &annotations)
@@ -484,14 +510,25 @@ impl Tool for ConfigPatchTool {
                     .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                 "config_patch: failed to apply op comments to config.toml"
             );
+            comment_error = Some(err.to_string());
         }
 
-        Ok(ToolResult::ok(ToolOutput::json(serde_json::json!({
+        // Report the comment outcome honestly: the operator approved seeing
+        // those comments persisted, so a best-effort failure must surface here
+        // rather than the result claiming an unqualified success.
+        let mut out = serde_json::json!({
             "saved": true,
             "results": results,
             "note": "written to config.toml; the running daemon keeps its current \
                      configuration until the operator reloads or restarts it"
-        }))))
+        });
+        if let Some(err) = comment_error {
+            out["comments_applied"] = serde_json::Value::Bool(false);
+            out["comment_error"] = serde_json::Value::String(format!(
+                "the values were saved, but writing the approved comment(s) failed: {err}"
+            ));
+        }
+        Ok(ToolResult::ok(ToolOutput::json(out)))
     }
 }
 
@@ -591,6 +628,75 @@ mod tests {
             saved.gateway.port, 4242,
             "the concurrent writer's change is preserved"
         );
+    }
+
+    /// The operator prompt must show model-authored comment text (it is
+    /// written to config.toml) and must not silently truncate a value; a
+    /// truncated value states its full length.
+    #[tokio::test]
+    async fn prompt_shows_comment_text_and_marks_truncation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path);
+
+        let long = "x".repeat(300);
+        let summary = tool
+            .approval_summary(&serde_json::json!({
+                "ops": [{
+                    "op": "replace", "path": "/gateway/host",
+                    "value": long, "comment": "set by the assistant"
+                }]
+            }))
+            .expect("summary");
+
+        assert!(
+            summary.contains("comment: ") && summary.contains("set by the assistant"),
+            "the operator must see the persisted comment: {summary}"
+        );
+        assert!(
+            summary.contains("chars total, truncated"),
+            "a truncated value must state its full length, not a silent ellipsis: {summary}"
+        );
+    }
+
+    /// Two concurrent, disjoint patches must not lose an update: the per-path
+    /// write lock serializes the read-modify-write, so the second call reads
+    /// the first's result as its base. Both changes survive (or, had one raced
+    /// past the base check, it would fail explicitly — never silently clobber).
+    #[tokio::test]
+    async fn concurrent_disjoint_patches_both_survive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+
+        let host_tool = config_patch_tool(path.clone());
+        let port_tool = config_patch_tool(path.clone());
+        let (a, b) = tokio::join!(
+            host_tool.execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.1.1.1"}]
+            })),
+            port_tool.execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4343"}]
+            })),
+        );
+        let a = a.expect("execute a");
+        let b = b.expect("execute b");
+
+        // Neither may silently clobber: any non-success must be an explicit
+        // drift refusal, not a lost update.
+        for r in [&a, &b] {
+            if !r.success {
+                assert!(
+                    r.error.as_deref().unwrap_or_default().contains("changed"),
+                    "a non-success must be an explicit drift refusal: {:?}",
+                    r.error
+                );
+            }
+        }
+        // Under serialization both apply cleanly, so both updates survive.
+        assert!(a.success && b.success, "both disjoint patches should apply");
+        let saved = read_config(&path);
+        assert_eq!(saved.gateway.host, "10.1.1.1", "host update survived");
+        assert_eq!(saved.gateway.port, 4343, "port update survived");
     }
 
     /// Binding must not break the normal path: preview then apply with no drift
