@@ -515,6 +515,10 @@ async fn handle_socket(
         approval_event_tx.clone(),
         pending_approvals.clone(),
         Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+        // Only a paired-token-authenticated connection counts as an operator
+        // surface. `auth_subject` is `None` when pairing is disabled, where
+        // the socket is unauthenticated and must not approve operator-only tools.
+        auth_subject.is_some(),
     ));
     agent
         .channel_handles()
@@ -1536,6 +1540,7 @@ mod tests {
             tx,
             pending,
             Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+            true,
         ));
 
         let handle: zeroclaw_runtime::tools::PerToolChannelHandle =
