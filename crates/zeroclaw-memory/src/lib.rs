@@ -221,6 +221,33 @@ pub fn is_user_autosave_key(key: &str) -> bool {
     normalized == "user_msg" || normalized.starts_with("user_msg_")
 }
 
+/// Whether a turn's origin permits autosaving its user-side text as a
+/// Conversation memory.
+///
+/// Conversation autosave records what a person said. On a scheduled turn
+/// (cron, heartbeat) the "user message" is an operator-configured task
+/// prompt, and on a sub-turn it is text the parent turn composed — storing
+/// either as a `user_msg` row feeds synthetic text back into recall as if a
+/// person had typed it. `AgentDirect` stays autosaved: an embedding
+/// application may be relaying a real user's chat, and suppressing it would
+/// change library behavior beyond this rule's claim.
+///
+/// This is the load-bearing gate; [`should_skip_autosave_content`] is a
+/// content-shape backstop for stored histories and origin-less surfaces. The
+/// content filter alone is defeatable — a heartbeat prompt with session
+/// context prepended no longer starts with `[Heartbeat Task`, and leaked
+/// that way in production — which is why suppression keys on origin first.
+///
+/// Exhaustive match on purpose: a new origin variant must decide its
+/// autosave posture here explicitly.
+pub fn should_autosave_origin(origin: zeroclaw_api::ingress::TurnOrigin) -> bool {
+    use zeroclaw_api::ingress::TurnOrigin;
+    match origin {
+        TurnOrigin::Interactive | TurnOrigin::Channel | TurnOrigin::AgentDirect => true,
+        TurnOrigin::Cron | TurnOrigin::Daemon | TurnOrigin::SubTurn => false,
+    }
+}
+
 /// Filter known synthetic autosave noise patterns that should not be
 /// persisted as user conversation memories.
 pub fn should_skip_autosave_content(content: &str) -> bool {
@@ -1719,6 +1746,49 @@ mod tests {
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
         ));
+    }
+
+    /// The full truth table. Conversation autosave records what a person
+    /// said; scheduled and parent-composed turns do not qualify, and the
+    /// embedded-library origin keeps its existing behavior.
+    #[test]
+    fn autosave_origin_permits_only_turns_a_person_could_have_typed() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        assert!(should_autosave_origin(TurnOrigin::Interactive));
+        assert!(should_autosave_origin(TurnOrigin::Channel));
+        assert!(should_autosave_origin(TurnOrigin::AgentDirect));
+
+        assert!(!should_autosave_origin(TurnOrigin::Cron));
+        assert!(!should_autosave_origin(TurnOrigin::Daemon));
+        assert!(!should_autosave_origin(TurnOrigin::SubTurn));
+    }
+
+    /// The production leak this gate exists for: a heartbeat prompt with
+    /// session context prepended starts with the context header, not
+    /// `[Heartbeat Task`, so the content filter misses it — every tick
+    /// stored the full synthetic prompt (quoted prior conversation
+    /// included) as a fresh user message. The content filter's miss is
+    /// pinned deliberately: it documents that the prefix check is a
+    /// backstop, and the origin gate is what actually stops this shape.
+    #[test]
+    fn heartbeat_session_context_shape_defeats_the_content_filter_but_not_the_origin_gate() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked = "[Recent conversation history — use this for context when composing                       your message] (last message ~5 minutes ago)
+User: how was the deploy?
+                      You: all green.
+
+[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_skip_autosave_content(leaked),
+            "the content filter does not catch the prepended-context shape;              if this starts passing, the origin gate has a redundant partner — update this test"
+        );
+        assert!(
+            !should_autosave_origin(TurnOrigin::Daemon),
+            "the origin gate is what stops the heartbeat leak"
+        );
     }
 
     #[test]

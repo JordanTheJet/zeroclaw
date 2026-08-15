@@ -158,6 +158,25 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// The single autosave decision for a turn's user-side text, shared by both
+/// store sites in this file so the gates cannot drift apart.
+///
+/// Order matters for meaning, not correctness: the origin gate
+/// (`should_autosave_origin`) is the load-bearing check — a scheduled or
+/// parent-composed turn is never a person typing, whatever its text looks
+/// like. The content filter remains as a backstop for synthetic shapes that
+/// arrive on user-authored origins (e.g. replayed histories).
+fn should_autosave_user_message(
+    auto_save: bool,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    content: &str,
+) -> bool {
+    auto_save
+        && zeroclaw_memory::should_autosave_origin(origin)
+        && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(content)
+}
+
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -1798,11 +1817,9 @@ pub async fn run(
                 return Ok(final_output);
             }
 
-            // Auto-save user message to memory (skip short/trivial messages)
-            if config.memory.auto_save
-                && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
-            {
+            // Auto-save user message to memory (skip autonomous origins
+            // and short/trivial or synthetic messages).
+            if should_autosave_user_message(config.memory.auto_save, origin, &effective_msg) {
                 let user_key = autosave_memory_key("user_msg");
                 let store_start = std::time::Instant::now();
                 let store_result = mem
@@ -2316,11 +2333,9 @@ pub async fn run(
                     continue;
                 }
 
-                // Auto-save conversation turns (skip short/trivial messages)
-                if config.memory.auto_save
-                    && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                    && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-                {
+                // Auto-save conversation turns (skip autonomous origins
+                // and short/trivial or synthetic messages).
+                if should_autosave_user_message(config.memory.auto_save, origin, &effective_input) {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
                     let store_result = mem
@@ -3356,6 +3371,64 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
+    /// One decision, four gates. The origin gate is the load-bearing one:
+    /// the heartbeat session-context shape defeats the content filter (it no
+    /// longer starts with `[Heartbeat Task`), and only the origin check
+    /// stops it. Interactive keeps storing that same text — a person can
+    /// paste anything — which pins that the fix keys on origin, not on
+    /// smarter content sniffing.
+    #[test]
+    fn autosave_decision_keys_on_origin_before_content() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked_heartbeat_shape = "[Recent conversation history — use this for context \
+             when composing your message] (last message ~5 minutes ago)\nUser: how was the \
+             deploy?\n\n[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Daemon, leaked_heartbeat_shape),
+            "a heartbeat turn must not autosave its synthetic prompt, whatever its shape"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Cron, "[cron:job-1 build] check"),
+            "cron prompts stay suppressed (origin now, prefix as backstop)"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::SubTurn, leaked_heartbeat_shape),
+            "parent-composed sub-turn text is not a person typing"
+        );
+
+        assert!(
+            should_autosave_user_message(true, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "a person may paste anything, including text resembling a heartbeat prompt"
+        );
+        assert!(
+            should_autosave_user_message(
+                true,
+                TurnOrigin::Channel,
+                "please remember I prefer staged rollouts"
+            ),
+            "channel peers are people typing"
+        );
+
+        assert!(
+            !should_autosave_user_message(false, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "auto_save off wins over everything"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Interactive, "short msg"),
+            "the length floor is unchanged"
+        );
+        assert!(
+            !should_autosave_user_message(
+                true,
+                TurnOrigin::Interactive,
+                "[cron:job-1 build] check the build status now"
+            ),
+            "the content backstop still filters synthetic shapes on user origins"
+        );
+    }
 
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
