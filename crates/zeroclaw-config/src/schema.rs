@@ -8418,7 +8418,7 @@ pub struct PluginEntryConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
-    /// Destinations this plugin instance may reach (ADR-013). Default: empty,
+    /// Destinations this plugin instance may reach. Default: empty,
     /// which means **no network reach at all** — a transport permission such as
     /// `http_client` grants the surface, this field grants the destinations.
     ///
@@ -8491,7 +8491,8 @@ impl PluginsConfig {
     ///
     /// A missing entry returns two empty lists, which is deny-everything. This
     /// is the read the plugin host performs **per request**, so an operator's
-    /// edit applies without re-instantiating the guest (ADR-012's use-time
+    /// edit applies without re-instantiating the guest (resolved from live
+    /// config at use time
     /// resolution). Both lists are returned as authored; they were validated by
     /// [`Config::validate`] at load, and the matcher re-canonicalizes nothing.
     #[must_use]
@@ -21822,7 +21823,7 @@ impl Config {
             );
         }
 
-        // ADR-013: the granted egress allowlist is a security control, so a
+        // The granted egress allowlist is a security control, so a
         // malformed entry is a hard config error rather than a silently
         // dropped line. Both lists validate against the one shared strict
         // grammar in `zeroclaw_infra::net_guard`.
