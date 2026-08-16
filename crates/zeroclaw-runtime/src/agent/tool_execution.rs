@@ -558,6 +558,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use zeroclaw_api::agent::TurnEvent;
     use zeroclaw_api::tool::Tool;
 
     /// Minimal tool that records invocations. Used to verify that the
@@ -728,6 +729,183 @@ mod tests {
             "Tool not available in this turn: extract_text"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Tool that opts into source-level argument redaction, standing in for
+    /// `config_patch`: it masks every `value` under `ops` before the arguments
+    /// reach any rendering sink, mirroring the real tool's
+    /// `redact_args_for_log`.
+    struct RedactingStubTool;
+
+    impl zeroclaw_api::attribution::Attributable for RedactingStubTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-redacting-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RedactingStubTool {
+        fn name(&self) -> &str {
+            "config_patch_stub"
+        }
+
+        fn description(&self) -> &str {
+            "Redacts secret arguments for the observer/TurnEvent sink test"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+        }
+
+        fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+            let mut cloned = args.clone();
+            if let Some(ops) = cloned.get_mut("ops").and_then(|v| v.as_array_mut()) {
+                for op in ops {
+                    if let Some(obj) = op.as_object_mut()
+                        && obj.contains_key("value")
+                    {
+                        obj.insert("value".into(), serde_json::json!("[redacted]"));
+                    }
+                }
+            }
+            Some(cloned)
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Observer that captures the `arguments` string of every `ToolCallStart`
+    /// it records, so a test can assert the rendering sink never carried a
+    /// secret.
+    #[derive(Default)]
+    struct RecordingObserver {
+        tool_start_args: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl crate::observability::Observer for RecordingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            if let crate::observability::ObserverEvent::ToolCallStart {
+                arguments: Some(arguments),
+                ..
+            } = event
+            {
+                self.tool_start_args.lock().push(arguments.clone());
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recording-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_and_turnevent_sinks_never_carry_a_secret_argument() {
+        // A tool that opts into source redaction must have its redacted args —
+        // never the raw secret — flow to the observer's `ToolCallStart` and to
+        // the client-facing `TurnEvent::ToolCall`. This pins the two rendering
+        // sinks in `execute_one_tool` that route through `loggable_args_value`,
+        // complementing the approval-audit sentinel in `approval_gate` (which
+        // covers the audit-log sink but not these two).
+        const SECRET: &str = "sentinel-smtp-pw-3f9c-must-not-leak";
+
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(RedactingStubTool)];
+        let observer = RecordingObserver::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let args = serde_json::json!({
+            "ops": [{
+                "op": "add",
+                "path": "/channels/email/smtp_password",
+                "value": SECRET,
+            }]
+        });
+
+        let outcome = execute_one_tool(
+            "config_patch_stub",
+            args,
+            Some("call-secret"),
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &observer,
+            None,
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("stub tool executes");
+        assert!(outcome.success);
+
+        // Close the sender so the receiver drains cleanly.
+        drop(tx);
+
+        // Observer `ToolCallStart`: redacted marker present, secret absent.
+        let starts = observer.tool_start_args.lock();
+        assert!(
+            !starts.is_empty(),
+            "execute_one_tool must record a ToolCallStart"
+        );
+        for arguments in starts.iter() {
+            assert!(
+                !arguments.contains(SECRET),
+                "observer ToolCallStart leaked the secret argument: {arguments}"
+            );
+            assert!(
+                arguments.contains("[redacted]"),
+                "observer ToolCallStart should carry the redacted marker: {arguments}"
+            );
+        }
+
+        // Every `TurnEvent` frame must be free of the secret, and the
+        // `ToolCall` frame must carry the redacted marker.
+        let mut saw_tool_call = false;
+        while let Ok(event) = rx.try_recv() {
+            let rendered = format!("{event:?}");
+            assert!(
+                !rendered.contains(SECRET),
+                "TurnEvent leaked the secret argument: {rendered}"
+            );
+            if let TurnEvent::ToolCall { args, .. } = &event {
+                saw_tool_call = true;
+                assert!(
+                    args.to_string().contains("[redacted]"),
+                    "TurnEvent::ToolCall should carry the redacted marker: {args}"
+                );
+            }
+        }
+        assert!(
+            saw_tool_call,
+            "execute_one_tool must emit a TurnEvent::ToolCall frame"
+        );
     }
 
     use super::should_execute_tools_in_parallel;
