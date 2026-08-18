@@ -3,6 +3,8 @@ mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+mod desktop_cli_linux;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;

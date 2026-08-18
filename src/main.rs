@@ -3624,6 +3624,38 @@ fn resolve_executable(command: &str) -> Option<PathBuf> {
     which::which(command).ok()
 }
 
+/// Maximum accepted size of one XDG desktop entry. Desktop files are small
+/// metadata documents; bounding ambient entries prevents one unrelated file
+/// from consuming unbounded memory before a valid ZeroClaw entry is reached.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const DESKTOP_ENTRY_MAX_BYTES: u64 = 256 * 1024;
+
+/// Open and read a desktop entry without following its final symlink, blocking
+/// on a FIFO, or trusting pathname metadata that can change before the open.
+/// Classification and the byte limit are both applied to the opened handle.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn read_desktop_entry(path: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = file.take(DESKTOP_ENTRY_MAX_BYTES + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).ok()? > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Recursively collect `.desktop` entries under `root` (an `applications`
 /// directory) as `(desktop-file-id, path)` pairs. Per the Desktop Entry
 /// Specification the ID is the path relative to `root` with directory
@@ -3657,7 +3689,8 @@ fn collect_desktop_entries(
         };
         if file_type.is_dir() {
             collect_desktop_entries(root, &path, out, visited);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("desktop")
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("desktop")
             && let Ok(rel) = path.strip_prefix(root)
         {
             let id = rel.to_string_lossy().replace('/', "-");
@@ -3683,7 +3716,7 @@ fn discover_desktop_app(data_dirs: &[PathBuf]) -> Option<PathBuf> {
             if !seen_ids.insert(id) {
                 continue; // shadowed by a higher-precedence entry with the same ID
             }
-            let Ok(contents) = std::fs::read_to_string(&path) else {
+            let Some(contents) = read_desktop_entry(&path) else {
                 continue;
             };
             if let Some(target) =
@@ -5407,7 +5440,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t(
                         "cli-desktop-download",
-                        "Download the ZeroClaw companion app:"
+                        "Opening the ZeroClaw companion app download page:"
                     )
                 );
                 println!();
@@ -5432,7 +5465,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         "{}",
                         t(
                             "cli-desktop-linux-pkg",
-                            "  Download the .deb or .AppImage for your architecture."
+                            "  The page provides .deb and .AppImage downloads by architecture."
                         )
                     );
                 }
@@ -8907,6 +8940,53 @@ mod tests {
         // Terminates (no infinite loop) and collects only the real entry.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "ZeroClaw.desktop");
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_special_symlink_and_oversized_entries() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        let fifo = apps.join("000-fifo.desktop");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_name` is a live, NUL-terminated pathname and the mode is
+        // a valid permission bitmask. The return value is checked immediately.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_desktop_entry(&fifo), None);
+
+        let fifo_link = apps.join("001-fifo-link.desktop");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert_eq!(read_desktop_entry(&fifo_link), None);
+
+        let oversized = apps.join("002-oversized.desktop");
+        let oversized_len = usize::try_from(DESKTOP_ENTRY_MAX_BYTES).unwrap() + 1;
+        std::fs::write(&oversized, vec![b'x'; oversized_len]).unwrap();
+        assert_eq!(read_desktop_entry(&oversized), None);
+
+        let real = dir.path().join("zeroclaw-desktop");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&real).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&real, permissions).unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
     }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]

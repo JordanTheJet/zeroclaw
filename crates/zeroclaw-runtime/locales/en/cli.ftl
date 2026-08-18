@@ -738,9 +738,9 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
-cli-desktop-download = Download the ZeroClaw companion app:
+cli-desktop-download = Opening the ZeroClaw companion app download page:
 cli-desktop-homebrew = Or install via Homebrew (coming soon):
-cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
+cli-desktop-linux-pkg = {"  "}The page provides .deb and .AppImage downloads by architecture.
 cli-desktop-launching = Launching ZeroClaw companion app...
 
 # ── status fields ──
