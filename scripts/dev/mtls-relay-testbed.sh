@@ -168,7 +168,7 @@ else
   say "building zeroclaw, zerocode, zerorelay ($PROFILE) with ${CARGO_CMD[*]} ..."
   ( cd "$REPO_ROOT" && CARGO_TARGET_DIR="$CARGO_TARGET_DIR" "${CARGO_CMD[@]}" build $CARGO_PROFILE_FLAG \
       --features channels-full \
-      -p zeroclawlabs -p zerocode -p zerorelay ) \
+      -p zeroclaw -p zerocode -p zerorelay ) \
     || die "build failed"
 fi
 ok "binaries ready in $BIN_DIR"
