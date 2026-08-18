@@ -99,7 +99,16 @@ fi
 
 case "$PROFILE" in
   release) BIN_DIR="$CARGO_TARGET_DIR/release"; CARGO_PROFILE_FLAG="--release" ;;
-  debug)   BIN_DIR="$CARGO_TARGET_DIR/debug";   CARGO_PROFILE_FLAG="" ;;
+  debug)   BIN_DIR="$CARGO_TARGET_DIR/debug";   CARGO_PROFILE_FLAG=""
+           # Debug frames are far larger than release ones, and the browser
+           # frontdoor enrollment path (self-check E) nests deeply enough to
+           # blow tokio's default 2 MiB worker stack: the daemon aborts with
+           # "thread 'tokio-rt-worker' has overflowed its stack" and the
+           # browser then only sees "chat bridge socket error". The recursion
+           # is deep but finite - 4 MiB already clears it, 8 MiB leaves
+           # headroom. Release builds pass on the default stack, so this is
+           # scoped to the debug profile only.
+           export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" ;;
   *) echo "ZC_PROFILE must be 'release' or 'debug' (got '$PROFILE')" >&2; exit 2 ;;
 esac
 ZEROCLAW="$BIN_DIR/zeroclaw"
