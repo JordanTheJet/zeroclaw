@@ -8,8 +8,12 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// Operation timed out.
-    #[error("transport timeout after {0}s")]
-    Timeout(u64),
+    #[error("transport timeout after {secs}s: {source}")]
+    Timeout {
+        secs: u64,
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
 
     /// Transport is disconnected or device was removed.
     #[error("transport disconnected")]
@@ -84,10 +88,16 @@ mod tests {
         assert_eq!(TransportKind::Native.to_string(), "native");
     }
 
-    #[test]
-    fn transport_error_display() {
-        let err = TransportError::Timeout(5);
-        assert_eq!(err.to_string(), "transport timeout after 5s");
+    #[tokio::test]
+    async fn transport_error_display() {
+        let source = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let err = TransportError::Timeout { secs: 5, source };
+        assert_eq!(
+            err.to_string(),
+            "transport timeout after 5s: deadline has elapsed"
+        );
 
         let err = TransportError::Disconnected;
         assert_eq!(err.to_string(), "transport disconnected");
@@ -103,5 +113,10 @@ mod tests {
     fn transport_kind_equality() {
         assert_eq!(TransportKind::Serial, TransportKind::Serial);
         assert_ne!(TransportKind::Serial, TransportKind::Swd);
+    }
+
+    #[test]
+    fn aardvark_transport_kind_display() {
+        assert_eq!(TransportKind::Aardvark.to_string(), "aardvark");
     }
 }

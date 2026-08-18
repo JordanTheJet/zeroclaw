@@ -3,7 +3,7 @@ pub mod native;
 
 pub use docker::DockerRuntime;
 pub use native::NativeRuntime;
-pub use zeroclaw_api::runtime_traits::RuntimeAdapter;
+pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
 
@@ -13,6 +13,8 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
             let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
             #[cfg(unix)]
             validate_shell(&shell)?;
+            #[cfg(windows)]
+            validate_shell_windows(&shell)?;
             Ok(Box::new(NativeRuntime::with_shell(shell)))
         }
         RuntimeKind::Docker => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
@@ -62,17 +64,25 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
         );
     }
 
-    // Coarse check: reject only when no execute bit is set at all. A precise
-    // "can *we* execute it" test (uid/gid vs. the file owner) buys little —
-    // the kernel's spawn is the real authority (ACLs, caps, mount flags) — and
-    // this is a fail-fast sanity check, not a security gate.
-    let mode = match resolved.metadata() {
-        Ok(meta) => meta.permissions().mode(),
+    let metadata = match resolved.metadata() {
+        Ok(metadata) => metadata,
         Err(e) => anyhow::bail!(
             "runtime.shell {shell:?} (resolved to {}) could not be inspected: {e}",
             resolved.display()
         ),
     };
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "runtime.shell {shell:?} (resolved to {}) is not a regular file",
+            resolved.display()
+        );
+    }
+
+    // Coarse check: reject only when no execute bit is set at all. A precise
+    // "can *we* execute it" test (uid/gid vs. the file owner) buys little —
+    // the kernel's spawn is the real authority (ACLs, caps, mount flags) — and
+    // this is a fail-fast sanity check, not a security gate.
+    let mode = metadata.permissions().mode();
     if mode & 0o111 == 0 {
         anyhow::bail!(
             "runtime.shell {shell:?} (resolved to {}) is not executable",
@@ -80,6 +90,21 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Validate a configured `runtime.shell` on Windows.
+///
+/// Unlike the Unix check this does not resolve a binary on `PATH`: on Windows
+/// `runtime.shell` selects the interpreter family (`cmd.exe` vs PowerShell),
+/// and the interpreter is located at spawn time. The only fail-fast condition
+/// worth catching up front is an empty/whitespace value, which would otherwise
+/// spawn with no program.
+#[cfg(windows)]
+fn validate_shell_windows(shell: &str) -> anyhow::Result<()> {
+    if shell.trim().is_empty() {
+        anyhow::bail!("runtime.shell must not be empty or whitespace");
+    }
     Ok(())
 }
 
@@ -186,6 +211,17 @@ mod tests {
         assert!(
             err.to_string().contains("does not exist"),
             "error should name the missing path, got: {err}"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn validate_shell_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = validate_shell(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should identify the non-file shell target, got: {err}"
         );
     }
 

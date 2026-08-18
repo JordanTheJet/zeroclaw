@@ -29,11 +29,10 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, StreamDelta};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
-pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
@@ -41,6 +40,11 @@ pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
+};
+pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub use outcome::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
 };
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
@@ -85,6 +89,101 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Complete system-prompt variants for the two tool transports supported by a
+/// turn. The caller owns construction; the loop only selects the variant after
+/// a before-LLM hook has finalized the model that will receive the request.
+#[derive(Clone)]
+pub(crate) struct ToolProtocolPrompts {
+    text_tools_section: String,
+}
+
+impl ToolProtocolPrompts {
+    pub(crate) fn new(_native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self { text_tools_section }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+}
+
+/// Scope complete prompt variants around an Agent turn. This remains transient
+/// request state: durable history keeps the caller-owned canonical prompt.
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+    prompts: Arc<ToolProtocolPrompts>,
+    future: F,
+) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+}
+
+fn refresh_scoped_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+        if let Some(system) = request_messages
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+    });
+}
+
+fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
+    let start = prompt.find("## Tools\n")?;
+    let following = &prompt[start..];
+    let end = following
+        .find("\n\n## Safety")
+        .map_or(prompt.len(), |offset| start + offset);
+    Some(start..end)
+}
+
+fn replace_tool_protocol_section(
+    prompt: &mut String,
+    text_tools_section: &str,
+    use_native_tools: bool,
+) {
+    if let Some(bounds) = tool_section_bounds(prompt) {
+        if use_native_tools {
+            prompt.replace_range(bounds, "");
+        } else {
+            prompt.replace_range(bounds, text_tools_section);
+        }
+        return;
+    }
+
+    if !use_native_tools && !text_tools_section.is_empty() {
+        let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
+        prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
+fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
+    budget
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+}
 
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
@@ -175,10 +274,114 @@ async fn enforce_reported_budget(
     }
 }
 
-pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+/// Per-invocation turn state: owns the provider-visible transcript and
+/// the canonical current-turn buffer during one `run_tool_call_loop` call.
+///
+/// - `history`: the provider-visible transcript.
+/// - `canonical`: append-only persistence delta (messages that must be
+///   replayed into durable history after the loop).
+/// - `synced`: cursor — messages before this index in `canonical` have
+///   already been synced into `history`.
+struct TurnState<'a> {
+    history: &'a mut Vec<ChatMessage>,
+    canonical: Option<&'a mut Vec<ChatMessage>>,
+    synced: usize,
+}
+
+impl<'a> TurnState<'a> {
+    fn new(history: &'a mut Vec<ChatMessage>, canonical: Option<&'a mut Vec<ChatMessage>>) -> Self {
+        Self {
+            history,
+            canonical,
+            synced: 0,
+        }
+    }
+
+    /// Clone-and-append: sync pending canonical messages into history.
+    fn sync_pending(&mut self) {
+        if let Some(ref canonical) = self.canonical {
+            if self.synced > canonical.len() {
+                self.synced = 0;
+            }
+            for msg in &canonical[self.synced..] {
+                self.history.push(msg.clone());
+            }
+            self.synced = canonical.len();
+        }
+    }
+
+    /// Push a message to both buffers and advance the cursor.
+    fn push_dual(&mut self, msg: ChatMessage) {
+        if let Some(ref mut canonical) = self.canonical {
+            canonical.push(msg.clone());
+        }
+        self.history.push(msg);
+        self.synced = self.canonical.as_ref().map_or(0, |c| c.len());
+    }
+
+    /// Advance the cursor past all current canonical messages.  Call after
+    /// external code modifies both buffers (e.g. `drive_live_sop_actions`).
+    fn mark_all_synced(&mut self) {
+        if let Some(ref canonical) = self.canonical {
+            self.synced = canonical.len();
+        }
+    }
+
+    /// Append assistant + tool-result messages to both buffers and advance
+    /// the cursor.  Wraps `append_tool_round_to_history` + canonical sync.
+    fn append_tool_round(
+        &mut self,
+        assistant_history_content: String,
+        native_tool_calls: &[zeroclaw_providers::ToolCall],
+        individual_results: &[(Option<String>, String)],
+        tool_results: &str,
+        use_native_tools: bool,
+    ) {
+        let from = self.history.len();
+        crate::agent::turn::history_append::append_tool_round_to_history(
+            self.history,
+            assistant_history_content,
+            native_tool_calls,
+            individual_results,
+            tool_results,
+            use_native_tools,
+        );
+        if let Some(ref mut canonical) = self.canonical {
+            canonical.extend_from_slice(&self.history[from..]);
+        }
+        self.synced = self.canonical.as_ref().map_or(0, |c| c.len());
+    }
+
+    /// Trim history to the given token budget, writing the result back
+    /// into `self.history`.  Returns the trim metadata so the caller can
+    /// emit log/observer events (the returned `history` field is empty —
+    /// it was consumed by the assignment to `self.history`).
+    fn trim_to_budget(
+        &mut self,
+        context_token_budget: usize,
+    ) -> crate::agent::history_trim::TrimResult {
+        let taken = std::mem::take(self.history);
+        let mut result =
+            crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+        let mut history = std::mem::take(&mut result.history);
+        if result.trimmed {
+            crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
+        }
+        *self.history = history;
+        result
+    }
+}
+
+pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+    let model_switch_state = p
+        .exec
+        .model_switch_callback
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
+    p.exec.model_switch_callback = Some(Arc::clone(&model_switch_state));
     let ToolLoop {
         exec,
-        history,
+        history: raw_history,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -188,7 +391,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         collected_receipts,
         event_tx,
         mut steering,
-        mut new_messages_out,
+        new_messages_out: raw_canonical,
         mut image_cache,
         ingress,
         memory,
@@ -226,8 +429,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    let mut turn_state = TurnState::new(raw_history, raw_canonical);
+
+    turn_state.sync_pending();
+
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = history
+    let p1_text = turn_state
+        .history
         .iter()
         .rev()
         .find(|m| m.role == "user")
@@ -261,10 +469,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ingress.origin,
             has_session,
             turn_memory.suppress,
-        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+        ) && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
             // Idempotence: a model-switch retry re-enters the engine with the
             // same history; the preamble must not stack.
-            && !history[last_user_idx]
+            && !turn_state.history[last_user_idx]
                 .content
                 .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
         {
@@ -286,8 +494,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             )
             .await;
             if !context.is_empty() {
-                let existing = &history[last_user_idx].content;
-                history[last_user_idx].content = format!("{context}{existing}");
+                let existing = &turn_state.history[last_user_idx].content;
+                turn_state.history[last_user_idx].content = format!("{context}{existing}");
             }
         }
     }
@@ -370,10 +578,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 IngressDecision::Drop { .. } => continue,
             }
             let msg = ChatMessage::user(steering_message);
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            turn_state.push_dual(msg);
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -386,26 +591,25 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
 
         // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget {
-            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
-            if remaining == 0 {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration"
-                );
-                break;
-            }
-            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref budget) = shared_budget
+            && !try_reserve_shared_iteration(budget)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"iteration": iteration})),
+                "Shared iteration budget exhausted at iteration"
+            );
+            break;
         }
 
-        preflight_history_maintenance(history);
+        preflight_history_maintenance(turn_state.history);
 
         if iteration == 0 && context_token_budget > 0 {
-            let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+            let system_floor =
+                crate::agent::history::estimate_system_floor_tokens(turn_state.history);
             if system_floor >= context_token_budget {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
@@ -430,13 +634,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     )
                 );
             }
-            let taken = std::mem::take(history);
-            let result =
-                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            let result = turn_state.trim_to_budget(context_token_budget);
             if result.trimmed {
-                let mut trimmed = result.history;
-                crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
-                *history = trimmed;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -491,8 +690,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         turn_id: None,
                     },
                 );
-            } else {
-                *history = result.history;
             }
         }
 
@@ -520,6 +717,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
+            model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -528,7 +726,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,
             model_provider,
-            history,
+            turn_state.history,
             multimodal_config,
             provider_name,
             model,
@@ -547,34 +745,90 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
+        let prepared_messages = prepare_messages_for_iteration(
+            turn_state.history,
+            multimodal_config,
+            degrade_strip_images,
+            image_cache.as_deref_mut(),
+        )
+        .await?;
+        let mut provider_request_messages = prepared_messages.messages;
+        let mut hook_selected_model = None;
+
+        if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            let mut candidate_model = active_model.to_string();
+            match hooks
+                .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
+                .await
+            {
+                crate::hooks::HookResult::Continue(()) => {
+                    hook_selected_model = Some(candidate_model);
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    anyhow::bail!("LLM call cancelled by hook: {reason}");
+                }
+            }
+        }
+        let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // Only direct Agent turns scope the complete prompt variants. Preserve
+        // the channel loop's existing hook/protocol behavior rather than
+        // silently widening this delegation-focused repair into channel prompt
+        // reconciliation.
+        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let protocol_model = if uses_scoped_tool_protocol {
+            provider_request_model
+        } else {
+            active_model
+        };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let IterationToolSpecs {
             ref tool_specs,
             use_native_tools,
             ..
         } = iteration_tool_specs;
 
-        refresh_prompt_anchor(history, use_native_tools);
+        // For scoped direct Agent turns, the hook can choose a different routed
+        // model. Every protocol-bearing surface follows that dispatched model.
+        // Unscoped channel turns intentionally retain their pre-existing
+        // protocol behavior; channel prompt reconciliation is separate work.
+        refresh_prompt_anchor(turn_state.history, use_native_tools);
+        refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
+        refresh_scoped_tool_protocol_prompt(
+            turn_state.history,
+            &mut provider_request_messages,
+            use_native_tools,
+        );
 
-        let prepared_messages = prepare_messages_for_iteration(
-            history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
-        )
-        .await?;
+        // Fail closed on the local budget BEFORE announcing the request.
+        // `announce_llm_request` emits the user-visible `WaitingOnModel`
+        // state, and a rejected turn never reaches the provider — announcing
+        // first would claim the agent is waiting on a model that is never
+        // called.
+        enforce_tool_loop_budget()?;
+
+        if strict_tool_parsing
+            && !tool_specs.is_empty()
+            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
+        {
+            return Err(zeroclaw_providers::ProviderCapabilityError {
+                model_provider: active_model_provider_name.to_string(),
+                capability: "tool_protocol".to_string(),
+                message: crate::i18n::get_required_cli_string(
+                    "turn-tool-protocol-strict-mixed-error",
+                ),
+            }
+            .into());
+        }
 
         let llm_started_at = announce_llm_request(
             &ctx,
-            history,
+            &provider_request_messages,
             active_model_provider,
             active_model_provider_name,
-            active_model,
+            provider_request_model,
             iteration,
         )
         .await;
-
-        enforce_tool_loop_budget()?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -584,8 +838,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             None
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
-        let base_provider_supports_native_tools = model_provider.supports_native_tools();
-        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let base_provider_supports_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+        let active_provider_supports_native_tools = active_model_provider
+            .capabilities_for_model(provider_request_model)
+            .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
@@ -615,19 +873,48 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
+            rejected_attempt_usage,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
-            active_model,
-            &prepared_messages.messages,
+            provider_request_model,
+            &provider_request_messages,
             request_tools,
             should_consume_provider_stream,
             iteration,
         )
         .await?;
+
+        if let Some(usage) = rejected_attempt_usage.as_ref() {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                ctx.provider_name,
+                ctx.model,
+                usage,
+            );
+        }
+
+        // Reliable providers classify this before retries and fallback. Keep
+        // the turn-level guard for direct/unwrapped providers: a transport
+        // success with no final text and no tool calls cannot complete a turn.
+        // This runs before response-success telemetry and history mutation.
+        let chat_result = chat_result.and_then(|response| {
+            if response.is_semantically_empty_terminal() {
+                if let Some(usage) = response.usage.as_ref() {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        usage,
+                    );
+                }
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                ));
+            }
+            Ok(response)
+        });
 
         let (
             response_text,
@@ -643,8 +930,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
+                    provider_request_model,
                     resp,
-                    &prepared_messages.messages,
+                    &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -665,12 +953,22 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(&ctx, llm_started_at, iteration, &e);
+                if let Some(rejected) = e.chain().find_map(|cause| {
+                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                }) {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        &rejected.usage,
+                    );
+                }
+                record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
-                    history,
+                    turn_state.history,
                     &e,
                     iteration,
                     event_tx.as_ref(),
+                    on_delta.as_ref(),
                     observer,
                     context_token_budget,
                 )
@@ -689,10 +987,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         interrupted.partial_text,
                         crate::i18n::get_required_cli_string("turn-stream-interrupted")
                     ));
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(msg.clone());
-                    }
-                    history.push(msg);
+                    turn_state.push_dual(msg);
                 }
                 // Same for a user cancel after visible streamed output —
                 // the pre-consolidation streaming engine committed the
@@ -705,10 +1000,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         cancelled.partial_text,
                         crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(msg.clone());
-                    }
-                    history.push(msg);
+                    turn_state.push_dual(msg);
                 }
                 return Err(e);
             }
@@ -765,10 +1057,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                      tool-call schema, or answer in natural language if no tool is needed."
                         .to_string(),
                 );
-                if let Some(out) = new_messages_out.as_deref_mut() {
-                    out.push(msg.clone());
-                }
-                history.push(msg);
+                turn_state.push_dual(msg);
                 continue;
             }
 
@@ -779,10 +1068,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
             let msg = ChatMessage::assistant(fallback.to_string());
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            turn_state.push_dual(msg);
             return Ok(accumulated_display_text);
         }
 
@@ -833,13 +1119,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
 
             let msg = ChatMessage::assistant(response_text.clone());
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
-                    history,
+                    turn_state.history,
                     reported as usize,
                     context_token_budget,
                     event_tx.as_ref(),
@@ -901,6 +1184,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -918,6 +1202,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_sequential(
                         &executable_calls,
@@ -1020,7 +1305,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
-            history,
+            turn_state.history,
             &mut loop_detector,
             &loop_ignore_tools,
             max_tool_result_chars,
@@ -1043,18 +1328,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             )?;
         }
 
-        let appended_from = history.len();
-        append_tool_round_to_history(
-            history,
+        turn_state.append_tool_round(
             assistant_history_content,
             &native_tool_calls,
             &individual_results,
             &tool_results,
             use_native_tools,
         );
-        if let Some(out) = new_messages_out.as_deref_mut() {
-            out.extend_from_slice(&history[appended_from..]);
-        }
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
@@ -1067,7 +1347,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             // stack-allocated future for every turn, SOP or not.
             Box::pin(drive_live_sop_actions(
                 queued_sop_actions,
-                history,
+                turn_state.history,
                 model_provider,
                 provider_name,
                 model,
@@ -1099,7 +1379,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 channel,
                 collected_receipts,
                 event_tx.clone(),
-                new_messages_out.as_deref_mut(),
+                turn_state.canonical.as_deref_mut(),
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
@@ -1107,11 +1387,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &mut sop_exec_cache,
             ))
             .await?;
+            turn_state.mark_all_synced();
         }
 
         if let Some(reported) = reported_input_tokens {
             enforce_reported_budget(
-                history,
+                turn_state.history,
                 reported as usize,
                 context_token_budget,
                 event_tx.as_ref(),
@@ -1123,7 +1404,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
     finish_after_max_iterations(
         model_provider,
-        history,
+        turn_state.history,
         provider_name,
         model,
         temperature,
@@ -1133,7 +1414,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
-        new_messages_out,
+        turn_state.canonical.as_deref_mut(),
     )
     .await
 }
@@ -1400,6 +1681,7 @@ pub(crate) async fn assemble_owned_execution(
             mcp_registry: None,
             connect_peripherals: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
@@ -1520,7 +1802,17 @@ async fn drive_live_sop_actions(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
+    // The enclosing round's own switch state (`run_tool_call_loop`'s
+    // `model_switch_state`, threaded through by the caller exactly like
+    // every other per-round context value here). Deliberately UNUSED: every
+    // nested step loop this function drives — same-agent or cross-agent —
+    // mints its own fresh switch state at its `ToolLoop` construction site
+    // below instead of inheriting this one, so a step's `model_switch` can
+    // never mutate the enclosing round's shared `Arc`. Kept in the
+    // signature (rather than dropped) so the call site stays symmetric with
+    // its sibling per-round parameters and so tests can pass a distinct
+    // `Arc` here and assert it is untouched after a nested step's switch.
+    _model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
     strict_tool_parsing: bool,
     parallel_tools: bool,
@@ -1632,6 +1924,10 @@ async fn drive_live_sop_actions(
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
+                    // Empty buffer for same-agent child loops: populated by
+                    // the child's dual-write, then replayed to the parent's
+                    // new_messages_out after the child returns (§3.2.4).
+                    let mut inner_new_msgs: Vec<ChatMessage> = Vec::new();
                     let step_output = if let Some(err) = assembly_error {
                         // Fail closed: never run a delegated step with the parent
                         // agent's broader context when the step agent's own
@@ -1782,7 +2078,7 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            crate::sop::executor::scope_step_call_sink(
+                            let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
@@ -1801,7 +2097,25 @@ async fn drive_live_sop_actions(
                                             config,
                                             hooks,
                                             activated_tools: eff_activated,
-                                            model_switch_callback: model_switch_callback.clone(),
+                                            // Deliberately NOT the outer round's
+                                            // `model_switch_callback`: every nested
+                                            // step loop — same-agent or cross-agent —
+                                            // gets `None` here, so `run_tool_call_loop`
+                                            // mints a fresh, isolated switch state
+                                            // scoped to just this child call (see its
+                                            // top-of-function fallback). Reusing the
+                                            // parent's shared state let a child's
+                                            // `model_switch` mutate the SAME `Arc` the
+                                            // parent round checks after every
+                                            // iteration, so a cross-agent step's own
+                                            // switch could silently become the
+                                            // parent's. A switch still reaches the
+                                            // caller correctly: it surfaces as this
+                                            // child loop's own `ModelSwitchRequested`
+                                            // error, not via continued access to
+                                            // shared mutable state after the call
+                                            // returns.
+                                            model_switch_callback: None,
                                             receipt_generator,
                                         },
                                         ResolvedRuntimeKnobs {
@@ -1826,13 +2140,19 @@ async fn drive_live_sop_actions(
                                     collected_receipts,
                                     event_tx: event_tx.clone(),
                                     steering: None,
-                                    // A cross-agent child transcript is not part
-                                    // of the parent's persisted conversation;
-                                    // only its final output flows back (below).
+                                    // Same-agent: pass a fresh empty buffer so
+                                    // the child loop's one-time clone-and-append
+                                    // does not sync the parent's accumulated
+                                    // messages into the child's nested_history.
+                                    // After the child returns, replay its buffer
+                                    // back to the parent's new_messages_out.
+                                    // Cross-agent: None (child transcript does
+                                    // not flow into the parent's persisted
+                                    // conversation; only the final output does).
                                     new_messages_out: if owned.is_some() {
                                         None
                                     } else {
-                                        new_messages_out.as_deref_mut()
+                                        Some(&mut inner_new_msgs)
                                     },
                                     image_cache: image_cache.as_deref_mut(),
                                     memory: None,
@@ -1856,7 +2176,15 @@ async fn drive_live_sop_actions(
                                     sop_reassembly,
                                 })),
                             )
-                            .await
+                            .await;
+                            // Replay child loop's new messages to the parent's
+                            // new_messages_out for same-agent steps (§3.2.4).
+                            if owned.is_none()
+                                && let Some(outer) = new_messages_out.as_deref_mut()
+                            {
+                                outer.extend_from_slice(&inner_new_msgs);
+                            }
+                            step_result
                         }
                     };
                     // A cross-agent step's final output flows back into the
@@ -2157,12 +2485,73 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
+    async fn recovered_rejected_usage_does_not_trigger_context_trim() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+
+        // The rejected attempt's 80 input tokens remain billed separately; the
+        // accepted response reports 80 input tokens, which is within this
+        // model's 100-token context budget and must not trim history.
+        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver).await;
+
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "accepted context usage must not include rejected usage"
+        );
+    }
+
+    #[tokio::test]
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+#[cfg(test)]
+mod shared_iteration_budget_tests {
+    use super::try_reserve_shared_iteration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn exhausted_budget_never_wraps() {
+        let budget = AtomicUsize::new(1);
+
+        assert!(try_reserve_shared_iteration(&budget));
+        assert!(!try_reserve_shared_iteration(&budget));
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn contention_grants_exactly_the_available_iterations() {
+        const AVAILABLE: usize = 8;
+        const WORKERS: usize = 64;
+
+        let budget = Arc::new(AtomicUsize::new(AVAILABLE));
+        let granted = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let budget = Arc::clone(&budget);
+                let granted = Arc::clone(&granted);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    if try_reserve_shared_iteration(&budget) {
+                        granted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        assert_eq!(granted.load(Ordering::Relaxed), AVAILABLE);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 }
 
@@ -2772,6 +3161,11 @@ mod sop_step_reassembly_tests {
         new_messages_out: Option<&mut Vec<ChatMessage>>,
         agent_alias: Option<&str>,
         sop_reassembly: Option<SopStepReassembly<'_>>,
+        // The (would-be) enclosing round's own switch state. Real callers
+        // always pass `None` here (they have no enclosing round); the
+        // isolation regression below passes `Some(parent_arc)` to prove the
+        // nested step loop never touches it.
+        model_switch_callback: Option<ModelSwitchCallback>,
         exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
     ) {
         use crate::sop::executor::QueuedSopAction;
@@ -2799,7 +3193,7 @@ mod sop_step_reassembly_tests {
             &[],
             &[],
             None,
-            None,
+            model_switch_callback,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
             false,
@@ -2888,6 +3282,7 @@ mod sop_step_reassembly_tests {
             Some(&mut new_out),
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -2995,6 +3390,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3070,6 +3466,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3115,6 +3512,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3140,6 +3538,52 @@ mod sop_step_reassembly_tests {
         assert_eq!(
             step1_result(&engine, &run_id).effective_agent.as_deref(),
             Some("outer")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_agent_step_output_reaches_parent_capture_once() {
+        let (engine, _run_id, action) = start_single_cross_agent_step("outer");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let observer = IdentityCapture::default();
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut capture: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &observer,
+            &mut history,
+            Some(&mut capture),
+            Some("outer"),
+            Some(handle),
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        // The capture must contain the step context (user message) and the
+        // child loop's assistant output, each exactly once.
+        assert!(
+            !capture.is_empty(),
+            "same-agent capture must not be empty: {capture:?}"
+        );
+        let user_count = capture.iter().filter(|m| m.role == "user").count();
+        assert_eq!(
+            user_count, 1,
+            "exactly one user message in capture: {capture:?}"
+        );
+        let assistant_count = capture.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(
+            assistant_count, 1,
+            "exactly one assistant message in capture: {capture:?}"
         );
     }
 
@@ -3173,6 +3617,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3217,6 +3662,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             None,
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3234,6 +3680,196 @@ mod sop_step_reassembly_tests {
             step1_result(&engine, &run_id).status,
             crate::sop::types::SopStepStatus::Failed,
             "the no-handle cross-agent step must fail closed"
+        );
+    }
+
+    // ── Model-switch isolation ──────────────────────────────────────────────
+
+    /// The CHILD provider for the model-switch isolation regression: its
+    /// first (and only expected) call emits a tool call that queues a
+    /// pending model switch on whatever task-local switch state is ambient
+    /// when the tool runs — the CHILD's own if isolation holds, the
+    /// PARENT's if the leak regresses.
+    struct ChildSwitchProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ChildSwitchProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ChildSwitchProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ChildSwitchProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "00000000-0000-0000-0000-000000000099".into(),
+                    name: "child_model_switch".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Test tool standing in for the real `model_switch` tool inside the
+    /// CHILD step: queues a pending switch to a provider/model DISTINCT from
+    /// both the parent's and the child's own current binding, via the
+    /// ambient task-local switch state (see `current_model_switch_state`).
+    struct ChildModelSwitchTool;
+
+    ::zeroclaw_api::tool_attribution!(
+        ChildModelSwitchTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ChildModelSwitchTool {
+        fn name(&self) -> &str {
+            "child_model_switch"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch from inside a cross-agent SOP step"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = current_model_switch_state()?;
+            *state.lock().expect("switch state lock") =
+                Some(("child-provider".to_string(), "child-model".to_string()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "switch queued".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Regression for the isolation gap: `drive_live_sop_actions` used to
+    /// clone the OUTER round's `model_switch_callback` straight into every
+    /// nested step `ToolLoop`, including cross-agent steps with their own
+    /// transcript/alias/turn id. A child's `model_switch` tool call then
+    /// mutated the SAME shared `Arc` the parent loop checks after every
+    /// iteration, so the CHILD's requested provider/model could silently
+    /// become the PARENT's. This passes a distinct `parent_switch_state`
+    /// `Arc` in — exactly what the real outer `run_tool_call_loop` threads
+    /// down as its own `model_switch_state` — and proves it is completely
+    /// untouched after a cross-agent child step's own `model_switch` fires.
+    #[tokio::test]
+    async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let mut exec_cache = std::collections::HashMap::new();
+        let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        stepper_agent.resolved.max_tool_iterations = 3;
+        // Full autonomy so the test tool call executes directly — approval
+        // gating for an unrecognized tool name is an orthogonal concern this
+        // regression does not exercise.
+        let stepper_risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        exec_cache.insert(
+            "stepper".to_string(),
+            OwnedAgentExecution {
+                model_provider: Box::new(ChildSwitchProvider),
+                provider_name: "child-original-provider".into(),
+                model: "child-original-model".into(),
+                temperature: None,
+                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                approval: crate::approval::ApprovalManager::for_non_interactive(
+                    &stepper_risk_profile,
+                ),
+                activated_tools: None,
+                agent: stepper_agent,
+                risk_profile: stepper_risk_profile,
+                skills: Vec::new(),
+                mcp_tool_names: std::collections::HashSet::new(),
+                mcp_prompt_section: String::new(),
+            },
+        );
+
+        // The PARENT's own switch state — exactly the `Arc` the real outer
+        // `run_tool_call_loop` creates for its round and hands down to
+        // `drive_live_sop_actions`.
+        let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
+
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            Some(Arc::clone(&parent_switch_state)),
+            &mut exec_cache,
+        )
+        .await;
+
+        // The parent's own switch state must be untouched: the child's
+        // `model_switch` tool call must never mutate the SAME `Arc` the
+        // enclosing round would check on its own next iteration. Under the
+        // bug (`drive_live_sop_actions` forwarding its switch-state
+        // parameter straight into the child `ToolLoop`), this would observe
+        // `Some(("child-provider", "child-model"))` instead.
+        assert_eq!(
+            *parent_switch_state
+                .lock()
+                .expect("parent switch state lock"),
+            None,
+            "a cross-agent child step's model_switch must never mutate the parent's own switch state"
+        );
+
+        // The child's own request was still observed — not silently dropped
+        // by the isolation fix: the step is recorded Failed, naming exactly
+        // the child's requested provider/model.
+        let step = step1_result(&engine, &run_id);
+        assert_eq!(
+            step.status,
+            crate::sop::types::SopStepStatus::Failed,
+            "the child's own model_switch must still surface as this step's outcome"
+        );
+        assert!(
+            step.output.contains("child-provider") && step.output.contains("child-model"),
+            "the step failure must name the CHILD's own requested switch: {}",
+            step.output
         );
     }
 }

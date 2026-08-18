@@ -1,3 +1,23 @@
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+use zeroclaw_api::channel::ProgressEvent;
+
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
+    match event {
+        ProgressEvent::Received => "channel-runtime-progress-received",
+        ProgressEvent::Planning => "channel-runtime-progress-planning",
+        ProgressEvent::WaitingOnModel => "channel-runtime-progress-waiting-on-model",
+        ProgressEvent::RunningTool => "channel-runtime-progress-running-tool",
+        ProgressEvent::CompactingContext => "channel-runtime-progress-compacting-context",
+        ProgressEvent::FinalizingResponse => "channel-runtime-progress-finalizing-response",
+    }
+}
+
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
+}
+
 /// Truncate a string to `max_chars` Unicode characters, appending "..." if truncated.
 pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
@@ -19,6 +39,58 @@ pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+#[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+pub(crate) async fn read_response_body_limited(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length()
+        && content_length > max_bytes
+    {
+        anyhow::bail!(
+            "response body content length {content_length} exceeds {max_bytes}-byte limit"
+        );
+    }
+
+    let mut body = Vec::new();
+
+    while let Some(chunk) = response.chunk().await? {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        let next_len = u64::try_from(body.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(chunk_len);
+        if next_len > max_bytes {
+            anyhow::bail!("response body exceeds {max_bytes}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+#[cfg(all(test, any(feature = "channel-mattermost", feature = "channel-qq")))]
+pub(crate) async fn spawn_raw_http_response(
+    raw_response: Vec<u8>,
+    hold_open: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = zeroclaw_spawn::spawn!(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(&raw_response).await.unwrap();
+        if hold_open {
+            std::future::pending::<()>().await;
+        }
+        socket.shutdown().await.unwrap();
+    });
+
+    (format!("http://{address}"), server)
 }
 
 pub const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
@@ -344,6 +416,14 @@ pub(crate) fn new_approval_token() -> String {
         .collect()
 }
 
+pub(crate) const APPROVAL_REPLY_YES: &str = "yes";
+pub(crate) const APPROVAL_REPLY_YES_SHORT: &str = "y";
+pub(crate) const APPROVAL_REPLY_APPROVE: &str = "approve";
+pub(crate) const APPROVAL_REPLY_NO: &str = "no";
+pub(crate) const APPROVAL_REPLY_NO_SHORT: &str = "n";
+pub(crate) const APPROVAL_REPLY_DENY: &str = "deny";
+pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
+
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -356,12 +436,82 @@ pub fn parse_approval_reply(
     }
     let action_word = parts.next()?.split_whitespace().next()?;
     let response = match action_word {
-        "yes" | "y" | "approve" => ChannelApprovalResponse::Approve,
-        "no" | "n" | "deny" => ChannelApprovalResponse::Deny,
-        "always" => ChannelApprovalResponse::AlwaysApprove,
+        APPROVAL_REPLY_YES | APPROVAL_REPLY_YES_SHORT | APPROVAL_REPLY_APPROVE => {
+            ChannelApprovalResponse::Approve
+        }
+        APPROVAL_REPLY_NO | APPROVAL_REPLY_NO_SHORT | APPROVAL_REPLY_DENY => {
+            ChannelApprovalResponse::Deny
+        }
+        APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
         _ => return None,
     };
     Some((token, response))
+}
+
+/// Localized text-reply approval prompt using yes/no/always reply keywords:
+/// Discord's plaintext fallback, Signal, WhatsApp, and Slack's polling-mode
+/// fallback all send this exact shape. The heading/labels/instruction come
+/// from the runtime Fluent catalogue; `token`/`tool_name`/`arguments_summary`
+/// are protocol-exact values echoed verbatim — never localized — so a locale
+/// switch cannot desync the prompt from [`parse_approval_reply`].
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
+pub(crate) fn build_yesno_approval_prompt(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> String {
+    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let yes_command = format!("{token} {APPROVAL_REPLY_YES}");
+    let no_command = format!("{token} {APPROVAL_REPLY_NO}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-approval-reply-instruction-yesno",
+        &[
+            ("yes_command", yes_command.as_str()),
+            ("no_command", no_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
+    );
+    format!(
+        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+    )
+}
+
+/// Localized text-reply approval prompt using approve/deny/always reply
+/// keywords: Matrix's own reply parser (distinct from
+/// [`parse_approval_reply`]) expects this shape.
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn build_approve_deny_approval_prompt(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> String {
+    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
+    let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
+    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-approval-reply-instruction-approve-deny",
+        &[
+            ("approve_command", approve_command.as_str()),
+            ("deny_command", deny_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
+    );
+    format!(
+        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+    )
 }
 
 /// Generate a conversation history key from a channel message.
@@ -378,6 +528,101 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    async fn response_from_raw_http(
+        raw_response: Vec<u8>,
+        hold_open: bool,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let (url, server) = spawn_raw_http_response(raw_response, hold_open).await;
+        let response = reqwest::get(url).await.unwrap();
+        (response, server)
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_rejects_declared_oversize() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n".to_vec(),
+            true,
+        )
+        .await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response_body_limited(response, 5),
+        )
+        .await
+        .expect("declared oversize must be rejected before reading the body")
+        .unwrap_err();
+        server.abort();
+
+        assert!(
+            error
+                .to_string()
+                .contains("content length 6 exceeds 5-byte limit")
+        );
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_accepts_chunked_body_at_limit() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n".to_vec(),
+            false,
+        )
+        .await;
+
+        let body = read_response_body_limited(response, 5).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(body, b"abcde");
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_rejects_chunked_body_over_limit() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n".to_vec(),
+            true,
+        )
+        .await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response_body_limited(response, 5),
+        )
+        .await
+        .expect("chunked oversize must be rejected before the response ends")
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("exceeds 5-byte limit"));
+    }
+
+    #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+    #[test]
+    fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
+        assert_eq!(
+            [
+                ProgressEvent::Received,
+                ProgressEvent::Planning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::RunningTool,
+                ProgressEvent::CompactingContext,
+                ProgressEvent::FinalizingResponse,
+            ]
+            .map(lifecycle_progress_fluent_key),
+            [
+                "channel-runtime-progress-received",
+                "channel-runtime-progress-planning",
+                "channel-runtime-progress-waiting-on-model",
+                "channel-runtime-progress-running-tool",
+                "channel-runtime-progress-compacting-context",
+                "channel-runtime-progress-finalizing-response",
+            ]
+        );
+    }
 
     #[test]
     fn floor_char_boundary_handles_mid_codepoint_offset() {
@@ -629,6 +874,130 @@ mod tests {
                 super::parse_approval_reply(input).is_none(),
                 "expected None for input {:?}",
                 input
+            );
+        }
+    }
+
+    #[test]
+    fn yesno_approval_prompt_keywords_still_parse_via_parse_approval_reply() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Localization must not desync the prompt text from
+        // `parse_approval_reply`: whatever locale is active, the reply
+        // keywords embedded in the prompt prose must remain the literal
+        // ASCII words the parser expects. Exercises the exact prompt shared
+        // by Discord's plaintext fallback, Signal, WhatsApp, and Slack's
+        // polling-mode fallback.
+        let token = "ab12cd";
+        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la");
+        assert!(
+            prompt.contains(token),
+            "prompt should echo the token verbatim; got {prompt:?}"
+        );
+        assert!(
+            prompt.contains("shell") && prompt.contains("ls -la"),
+            "prompt should echo the tool name and args verbatim; got {prompt:?}"
+        );
+
+        for (word, expected) in [
+            ("yes", ChannelApprovalResponse::Approve),
+            ("no", ChannelApprovalResponse::Deny),
+            ("always", ChannelApprovalResponse::AlwaysApprove),
+        ] {
+            let reply = format!("{token} {word}");
+            assert!(
+                prompt.contains(&reply),
+                "prompt should show the exact reply {reply:?}; got {prompt:?}"
+            );
+            let (parsed_token, response) = super::parse_approval_reply(&reply)
+                .unwrap_or_else(|| panic!("{reply:?} should parse"));
+            assert_eq!(parsed_token, token);
+            assert_eq!(response, expected);
+        }
+    }
+
+    #[test]
+    fn approve_deny_approval_prompt_matches_matrix_own_parser_keywords() {
+        // Same desync guard as above, for Matrix's `approve`/`deny`/`always`
+        // reply shape (Matrix uses its own parser, not
+        // `parse_approval_reply`, but the keyword contract is identical).
+        let token = "AB12CD34";
+        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la");
+        assert!(prompt.contains(token));
+        for word in ["approve", "deny", "always"] {
+            let reply = format!("{token} {word}");
+            assert!(
+                prompt.contains(&reply),
+                "prompt should show the exact reply {reply:?}; got {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_approval_keys_in_listed_adapter_sources_resolve() {
+        // Heuristic smoke guard for literal Fluent keys in the current
+        // adapter list. It complements, but does not replace, compile-time
+        // feature coverage or the explicit catalogue-key tests.
+        // `include_str!` embeds each source at compile time regardless of its
+        // `#[cfg(feature = ...)]`, so this always-compiled test can catch
+        // literal-key typos in feature-gated sources.
+        const SOURCES: &[&str] = &[
+            include_str!("telegram.rs"),
+            include_str!("discord/mod.rs"),
+            include_str!("discord/approval.rs"),
+            include_str!("slack.rs"),
+            include_str!("matrix.rs"),
+            include_str!("signal.rs"),
+            include_str!("whatsapp.rs"),
+            include_str!("whatsapp_web.rs"),
+            include_str!("acp_channel.rs"),
+            include_str!("util.rs"),
+        ];
+        let mut keys = std::collections::BTreeSet::new();
+        for src in SOURCES {
+            // Capture the quoted first argument of every runtime lookup call
+            // (`get_required_cli_string` also prefixes the `_with_args`
+            // form), keeping only approval keys.
+            for (idx, _) in src.match_indices("get_required_cli_string") {
+                let rest = &src[idx..];
+                let Some(open) = rest.find('"') else {
+                    continue;
+                };
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('"') else {
+                    continue;
+                };
+                let key = &after[..close];
+                if key.starts_with("channel-") && key.contains("approval") {
+                    keys.insert(key.to_string());
+                }
+            }
+        }
+        assert!(
+            keys.len() >= 18,
+            "expected to scan the shared approval keys across adapters; found only {} ({keys:?}) — the scanner is likely broken",
+            keys.len()
+        );
+        for key in &keys {
+            // Supply dummy values for every arg any approval key might take.
+            // Fluent ignores args a message doesn't reference, so no-arg keys
+            // still resolve; arg-requiring messages resolved with no args
+            // would otherwise fail to format and false-positive here.
+            let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                key,
+                &[
+                    ("tool", "TOOL"),
+                    ("yes_command", "TKN yes"),
+                    ("no_command", "TKN no"),
+                    ("approve_command", "TKN approve"),
+                    ("deny_command", "TKN deny"),
+                    ("always_command", "TKN always"),
+                ],
+            );
+            assert_ne!(
+                resolved,
+                format!("{{{key}}}"),
+                "adapter source references Fluent key {key:?}, but it resolves to the missing-string sentinel (undefined or typo'd)"
             );
         }
     }
