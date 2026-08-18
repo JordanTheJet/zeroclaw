@@ -224,13 +224,13 @@ pub fn is_user_autosave_key(key: &str) -> bool {
 /// Whether a turn's origin permits autosaving its user-side text as a
 /// Conversation memory.
 ///
-/// Conversation autosave records what a person said. On a scheduled turn
-/// (cron, heartbeat) the "user message" is an operator-configured task
-/// prompt, and on a sub-turn it is text the parent turn composed — storing
-/// either as a `user_msg` row feeds synthetic text back into recall as if a
-/// person had typed it. `AgentDirect` stays autosaved: an embedding
-/// application may be relaying a real user's chat, and suppressing it would
-/// change library behavior beyond this rule's claim.
+/// Turn origin is trusted caller provenance, not proof that a person authored
+/// the text. `Interactive`, `Channel`, and `AgentDirect` remain autosave-
+/// eligible because each can carry user-facing or externally supplied text.
+/// On a scheduled turn (cron, heartbeat), however, the "user message" is an
+/// operator-configured task prompt, and on a sub-turn it is text the parent
+/// turn composed. Storing either as a `user_msg` row feeds known internal
+/// synthetic text back into recall.
 ///
 /// This is the load-bearing gate; [`should_skip_autosave_content`] is a
 /// content-shape backstop for stored histories and origin-less surfaces. The
@@ -1748,11 +1748,11 @@ mod tests {
         ));
     }
 
-    /// The full truth table. Conversation autosave records what a person
-    /// said; scheduled and parent-composed turns do not qualify, and the
-    /// embedded-library origin keeps its existing behavior.
+    /// The full truth table. User-facing or external-capable origins preserve
+    /// their existing autosave behavior; known scheduled and parent-composed
+    /// origins do not qualify.
     #[test]
-    fn autosave_origin_permits_only_turns_a_person_could_have_typed() {
+    fn autosave_origin_allows_user_facing_and_external_capable_turns() {
         use zeroclaw_api::ingress::TurnOrigin;
 
         assert!(should_autosave_origin(TurnOrigin::Interactive));

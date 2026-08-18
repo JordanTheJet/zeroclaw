@@ -162,10 +162,11 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 /// store sites in this file so the gates cannot drift apart.
 ///
 /// Order matters for meaning, not correctness: the origin gate
-/// (`should_autosave_origin`) is the load-bearing check — a scheduled or
-/// parent-composed turn is never a person typing, whatever its text looks
-/// like. The content filter remains as a backstop for synthetic shapes that
-/// arrive on user-authored origins (e.g. replayed histories).
+/// (`should_autosave_origin`) is the load-bearing check — scheduled and
+/// parent-composed origins are known internal synthetic producers, whatever
+/// their text looks like. The content filter remains as a backstop for
+/// synthetic shapes that arrive on autosave-eligible origins (e.g. replayed
+/// histories).
 fn should_autosave_user_message(
     auto_save: bool,
     origin: zeroclaw_api::ingress::TurnOrigin,
@@ -3375,9 +3376,9 @@ mod tests {
     /// One decision, four gates. The origin gate is the load-bearing one:
     /// the heartbeat session-context shape defeats the content filter (it no
     /// longer starts with `[Heartbeat Task`), and only the origin check
-    /// stops it. Interactive keeps storing that same text — a person can
-    /// paste anything — which pins that the fix keys on origin, not on
-    /// smarter content sniffing.
+    /// stops it. Interactive remains autosave-eligible for that same text,
+    /// which pins that the fix keys on trusted caller provenance, not on
+    /// smarter content sniffing or human-authorship detection.
     #[test]
     fn autosave_decision_keys_on_origin_before_content() {
         use zeroclaw_api::ingress::TurnOrigin;
@@ -3396,12 +3397,12 @@ mod tests {
         );
         assert!(
             !should_autosave_user_message(true, TurnOrigin::SubTurn, leaked_heartbeat_shape),
-            "parent-composed sub-turn text is not a person typing"
+            "known parent-composed sub-turn text is not autosave-eligible"
         );
 
         assert!(
             should_autosave_user_message(true, TurnOrigin::Interactive, leaked_heartbeat_shape),
-            "a person may paste anything, including text resembling a heartbeat prompt"
+            "interactive provenance remains autosave-eligible regardless of prompt shape"
         );
         assert!(
             should_autosave_user_message(
@@ -3409,7 +3410,7 @@ mod tests {
                 TurnOrigin::Channel,
                 "please remember I prefer staged rollouts"
             ),
-            "channel peers are people typing"
+            "channel provenance remains autosave-eligible even when a peer may be automated"
         );
 
         assert!(
