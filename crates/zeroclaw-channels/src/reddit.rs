@@ -50,15 +50,11 @@ struct RedditItemData {
     name: Option<String>,
     author: Option<String>,
     body: Option<String>,
-    subject: Option<String>,
     parent_id: Option<String>,
-    link_id: Option<String>,
     subreddit: Option<String>,
     created_utc: Option<f64>,
-    new: Option<bool>,
     #[serde(rename = "type")]
     message_type: Option<String>,
-    context: Option<String>,
 }
 
 const REDDIT_API_BASE: &str = "https://oauth.reddit.com";
@@ -440,14 +436,10 @@ mod tests {
             name: Some("t1_abc123".into()),
             author: Some("user1".into()),
             body: Some("hello bot".into()),
-            subject: None,
             parent_id: Some("t1_parent1".into()),
-            link_id: Some("t3_post1".into()),
             subreddit: Some("rust".into()),
             created_utc: Some(1_700_000_000.0),
-            new: Some(true),
             message_type: Some("comment_reply".into()),
-            context: None,
         };
 
         let msg = ch.parse_item(&item).unwrap();
@@ -465,14 +457,10 @@ mod tests {
             name: Some("t4_dm456".into()),
             author: Some("user2".into()),
             body: Some("private message".into()),
-            subject: Some("Hello".into()),
             parent_id: None,
-            link_id: None,
             subreddit: None,
             created_utc: Some(1_700_000_100.0),
-            new: Some(true),
             message_type: None,
-            context: None,
         };
 
         let msg = ch.parse_item(&item).unwrap();
@@ -488,14 +476,10 @@ mod tests {
             name: Some("t1_self".into()),
             author: Some("testbot".into()),
             body: Some("my own message".into()),
-            subject: None,
             parent_id: None,
-            link_id: None,
             subreddit: None,
             created_utc: Some(1_700_000_000.0),
-            new: Some(true),
             message_type: None,
-            context: None,
         };
 
         assert!(ch.parse_item(&item).is_none());
@@ -508,14 +492,10 @@ mod tests {
             name: Some("t1_empty".into()),
             author: Some("user1".into()),
             body: Some(String::new()),
-            subject: None,
             parent_id: None,
-            link_id: None,
             subreddit: None,
             created_utc: Some(1_700_000_000.0),
-            new: Some(true),
             message_type: None,
-            context: None,
         };
 
         assert!(ch.parse_item(&item).is_none());
@@ -528,14 +508,10 @@ mod tests {
             name: Some("t1_other".into()),
             author: Some("user1".into()),
             body: Some("hello".into()),
-            subject: None,
             parent_id: None,
-            link_id: None,
             subreddit: Some("python".into()),
             created_utc: Some(1_700_000_000.0),
-            new: Some(true),
             message_type: None,
-            context: None,
         };
 
         assert!(ch.parse_item(&item).is_none());
@@ -544,14 +520,10 @@ mod tests {
             name: Some("t1_match".into()),
             author: Some("user1".into()),
             body: Some("hello".into()),
-            subject: None,
             parent_id: None,
-            link_id: None,
             subreddit: Some("rust".into()),
             created_utc: Some(1_700_000_000.0),
-            new: Some(true),
             message_type: None,
-            context: None,
         };
 
         assert!(ch.parse_item(&matching_item).is_some());
