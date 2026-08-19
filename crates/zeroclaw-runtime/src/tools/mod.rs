@@ -1829,6 +1829,8 @@ const = true
         let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
             name: name.to_string(),
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
+            egress_hosts: Vec::new(),
+            egress_allow_private: Vec::new(),
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![entry(&instance_key, "false")];
