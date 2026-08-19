@@ -1086,7 +1086,13 @@ impl Tool for JiraTool {
                 ToolOperation::Read
             }
             "comment_ticket" | "transition_ticket" | "create_ticket" => ToolOperation::Act,
-            _ => unreachable!(),
+            _ => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Unknown Jira action: {action}")),
+                });
+            }
         };
 
         if let Err(error) = self.security.enforce_tool_operation(operation, "jira") {
@@ -1282,7 +1288,9 @@ impl Tool for JiraTool {
                 )
                 .await
             }
-            _ => unreachable!(),
+            _ => Err(anyhow::Error::msg(format!(
+                "Unknown Jira action after validation: {action}"
+            ))),
         };
 
         match result {
@@ -1414,7 +1422,9 @@ fn shape_full(raw: &Value) -> Value {
         }
     }
 
-    result.as_object_mut().unwrap().remove("renderedFields");
+    if let Some(result) = result.as_object_mut() {
+        result.remove("renderedFields");
+    }
     result
 }
 
@@ -1559,7 +1569,11 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
                 if next.is_whitespace() {
                     break;
                 }
-                raw.push(chars.next().unwrap());
+                if let Some(next) = chars.next() {
+                    raw.push(next);
+                } else {
+                    break;
+                }
             }
             let email = clean_email(&raw);
             // Compute the end position of `email` within `raw` via pointer
