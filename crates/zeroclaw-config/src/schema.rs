@@ -4148,7 +4148,9 @@ impl Config {
     pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_tool_result_chars)
-            .unwrap_or_else(default_max_tool_result_chars)
+            // History estimation uses roughly four characters per token, so
+            // this bounds one result to about one quarter of the window.
+            .unwrap_or_else(|| self.effective_model_context_window(agent_alias))
     }
 
     #[must_use]
@@ -5929,7 +5931,7 @@ impl Default for ToolReceiptsConfig {
 }
 
 fn default_max_tool_result_chars() -> usize {
-    50_000
+    UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
 }
 
 fn default_keep_tool_context_turns() -> usize {
@@ -12222,7 +12224,8 @@ pub struct RuntimeProfileConfig {
     pub tool_call_dedup_exempt: Vec<String>,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
-    /// Maximum characters for a single tool result. `None` inherits.
+    /// Maximum characters for a single tool result. `None` derives the limit
+    /// from the agent's effective model context window.
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
     pub keep_tool_context_turns: Option<usize>,
@@ -23767,6 +23770,66 @@ max_height = 8
         // Pinned so a change to the stub is a deliberate, reviewed edit — the
         // value is load-bearing for trim budgets on unconfigured profiles.
         assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn tool_result_limit_derives_from_model_context_window() {
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(272_000);
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(cfg.effective_max_tool_result_chars("coder"), 272_000);
+        assert_eq!(
+            cfg.resolved_agent_config("coder")
+                .expect("configured agent should resolve")
+                .resolved
+                .max_tool_result_chars,
+            272_000
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn explicit_tool_result_limit_overrides_model_context_window() {
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(272_000);
+        cfg.runtime_profiles.insert(
+            "bounded".to_string(),
+            super::RuntimeProfileConfig {
+                max_tool_result_chars: Some(200_000),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                runtime_profile: "bounded".into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(cfg.effective_max_tool_result_chars("coder"), 200_000);
+        assert_eq!(
+            cfg.resolved_agent_config("coder")
+                .expect("configured agent should resolve")
+                .resolved
+                .max_tool_result_chars,
+            200_000
+        );
     }
 
     #[::core::prelude::v1::test]
