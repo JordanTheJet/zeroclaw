@@ -582,7 +582,7 @@ fn plugin_config_values(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn plugin_config_resolver(
+pub(crate) fn plugin_config_resolver(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
