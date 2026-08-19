@@ -488,7 +488,17 @@ impl Tool for ConfigPatchTool {
             }
         }
 
-        working.save_dirty().await?;
+        if !working.save_dirty_if_source_unchanged(&raw).await? {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "configuration changed on disk while this patch was being applied; nothing \
+                     was saved. Re-run to apply against the current configuration."
+                        .to_string(),
+                ),
+            });
+        }
 
         // Comments go on after save so the comment-preserving sync_table
         // pass doesn't strip them — same order as the gateway and CLI.

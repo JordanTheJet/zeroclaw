@@ -295,7 +295,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
+                            "input": log_args.clone(),
                             "output": r.output,
                         })),
                         format!("tool result: {call_name}")
@@ -310,7 +310,7 @@ pub(crate) async fn execute_one_tool(
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,
                                 "tool_call_id": tool_call_id,
-                                "input": call_arguments,
+                                "input": log_args.clone(),
                                 "error": r.error.clone().unwrap_or_default(),
                                 "output": r.output,
                             })),
@@ -381,7 +381,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
+                            "input": log_args.clone(),
                             "error": format!("{e:?}"),
                         })),
                     format!("tool error: {call_name}")
@@ -558,6 +558,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use zeroclaw_api::agent::TurnEvent;
     use zeroclaw_api::tool::Tool;
 
@@ -816,6 +817,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn observer_and_turnevent_sinks_never_carry_a_secret_argument() {
         // A tool that opts into source redaction must have its redacted args —
@@ -825,6 +827,15 @@ mod tests {
         // complementing the approval-audit sentinel in `approval_gate` (which
         // covers the audit-log sink but not these two).
         const SECRET: &str = "sentinel-smtp-pw-3f9c-must-not-leak";
+
+        // `record!` is a process-global rendering sink. Hold its two test
+        // locks while this call executes so concurrent log tests cannot swap
+        // the hook/writer underneath the assertion.
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
 
         let registry: Vec<Box<dyn Tool>> = vec![Box::new(RedactingStubTool)];
         let observer = RecordingObserver::default();
@@ -906,6 +917,33 @@ mod tests {
             saw_tool_call,
             "execute_one_tool must emit a TurnEvent::ToolCall frame"
         );
+
+        // Canonical success log: the same tool-aware projection must reach
+        // the structured `input` field after execution. This is a separate
+        // sink from observer/client events and previously regressed to raw
+        // `call_arguments` on completion/failure/error records.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_result_log = false;
+        while !saw_result_log && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(Duration::from_millis(50));
+            match tokio::time::timeout(step, log_rx.recv()).await {
+                Ok(Ok(value)) => {
+                    let rendered = value.to_string();
+                    if rendered.contains("tool result: config_patch_stub") {
+                        saw_result_log = true;
+                        assert!(!rendered.contains(SECRET), "log leaked secret: {rendered}");
+                        assert!(
+                            rendered.contains("[redacted]"),
+                            "log should carry redacted input: {rendered}"
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+            }
+        }
+        assert!(saw_result_log, "expected canonical tool-result log event");
     }
 
     use super::should_execute_tools_in_parallel;

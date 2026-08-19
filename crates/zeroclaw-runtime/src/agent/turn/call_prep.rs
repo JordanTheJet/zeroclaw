@@ -26,6 +26,29 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     (tool_name.trim().to_ascii_lowercase(), args_json)
 }
 
+/// Render the model-visible start-progress line without reflecting arbitrary
+/// argument fields. Only the small set of established, purpose-specific hints
+/// is eligible; unknown/new tools show their name alone until they add an
+/// explicit safe projection. Even eligible text is credential-scrubbed before
+/// it reaches the draft stream.
+fn render_start_progress(tool_name: &str, tool_args: &serde_json::Value) -> String {
+    let raw = match tool_name {
+        "shell" => tool_args.get("command").and_then(|v| v.as_str()),
+        "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    let hint = raw
+        .map(scrub_credentials)
+        .map(|value| truncate_with_ellipsis(&value, 60))
+        .unwrap_or_default();
+
+    if hint.is_empty() {
+        format!("\u{23f3} {tool_name}\n")
+    } else {
+        format!("\u{23f3} {tool_name}: {hint}\n")
+    }
+}
+
 async fn record_duplicate_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
@@ -243,25 +266,7 @@ pub(crate) async fn prepare_tool_calls(
         // ── Progress: tool start ────────────────────────────
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
         if let Some(tx) = ctx.on_delta {
-            let hint = {
-                let raw = match tool_name.as_str() {
-                    "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-                    "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
-                    _ => tool_args
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| tool_args.get("query").and_then(|v| v.as_str())),
-                };
-                match raw {
-                    Some(s) => truncate_with_ellipsis(s, 60),
-                    None => String::new(),
-                }
-            };
-            let progress = if hint.is_empty() {
-                format!("\u{23f3} {}\n", tool_name)
-            } else {
-                format!("\u{23f3} {}: {hint}\n", tool_name)
-            };
+            let progress = render_start_progress(&tool_name, &tool_args);
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -294,4 +299,34 @@ pub(crate) async fn prepare_tool_calls(
         executable_indices,
         executable_calls,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_start_progress;
+
+    #[test]
+    fn unknown_tool_progress_never_reflects_action_or_query_arguments() {
+        let sentinel = "sentinel-progress-secret-must-not-leak";
+        let rendered = render_start_progress(
+            "future_tool",
+            &serde_json::json!({"action": sentinel, "query": sentinel}),
+        );
+
+        assert_eq!(rendered, "\u{23f3} future_tool\n");
+        assert!(!rendered.contains(sentinel));
+    }
+
+    #[test]
+    fn shell_progress_scrubs_credential_text() {
+        let rendered = render_start_progress(
+            "shell",
+            &serde_json::json!({
+                "command": "curl -H 'api_key=sentinel-shell-secret-12345678' example.test"
+            }),
+        );
+
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("sentinel-shell-secret-12345678"));
+    }
 }
