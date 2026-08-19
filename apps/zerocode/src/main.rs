@@ -463,7 +463,7 @@ fn enroll_host_from(uri: Option<&str>) -> Option<String> {
     let uri = uri?.trim();
     let s = uri
         .strip_prefix("wss://")
-        .or_else(|| uri.strip_prefix("ws://")) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        .or_else(|| uri.strip_prefix("ws://"))
         .unwrap_or(uri);
     let s = s.split('/').next().unwrap_or(s);
     let host = s.rsplit_once(':').map(|(h, _)| h).unwrap_or(s);

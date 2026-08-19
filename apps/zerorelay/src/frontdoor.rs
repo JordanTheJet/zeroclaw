@@ -433,7 +433,7 @@ mod tests {
         // WS upgrade with the frontdoor off still completes the handshake.
         let (client_io, server_io) = tokio::io::duplex(4096);
         let accept = tokio::spawn(async move { accept_or_serve(server_io, false).await });
-        let ws = tokio_tungstenite::client_async("ws://relay.test/relay", client_io).await; // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        let ws = tokio_tungstenite::client_async("ws://relay.test/relay", client_io).await;
         assert!(ws.is_ok(), "WS upgrade must succeed with frontdoor off");
         assert!(matches!(accept.await.unwrap(), Ok(Frontdoor::WebSocket(_))));
     }
