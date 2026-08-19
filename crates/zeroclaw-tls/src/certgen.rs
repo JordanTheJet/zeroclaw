@@ -325,7 +325,7 @@ pub struct IssuedLeaf {
 /// public key. [`rcgen::CertificateSigningRequestParams::from_pem`] verifies the
 /// CSR self-signature and rejects unsupported extensions; we then **discard every
 /// CSR-requested field** by replacing the parsed params wholesale with the
-/// daemon's own client profile ([`client_params`]: subject CN = `device_id`,
+/// daemon's own client profile (`client_params`: subject CN = `device_id`,
 /// `clientAuth`-only EKU, `digitalSignature` KU, `CA:FALSE`, `notBefore`
 /// backdated). A requester therefore cannot inject a subject, SAN, EKU, or
 /// basic-constraints into the issued certificate. The keypair stays on the
