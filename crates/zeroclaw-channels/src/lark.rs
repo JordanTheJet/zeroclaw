@@ -158,7 +158,6 @@ struct LarkEvent {
 #[derive(Debug, serde::Deserialize)]
 struct LarkEventHeader {
     event_type: String,
-    event_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
