@@ -51,6 +51,7 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO reads/writes, device discovery, firmware flashing |
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+| `android_screenshot`, `android_ui_read`, `android_action`, `android_launch` | `[android].enabled = true` **and** the process is running on Android. Drive the phone UI through a companion bridge app; see [Android UI control](./android.md) |
 
 ## Extension protocols
 
