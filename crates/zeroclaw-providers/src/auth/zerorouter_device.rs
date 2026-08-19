@@ -431,7 +431,7 @@ pub async fn start_device_flow(
 }
 
 /// Poll until approval. The returned string IS the minted `zcr_` API key.
-/// The advertised lifetime is capped at [`MAX_DEVICE_LIFETIME_SECS`].
+/// The advertised lifetime is capped at `MAX_DEVICE_LIFETIME_SECS`.
 pub async fn poll_device_key(
     client: &Client,
     issuer: &str,
