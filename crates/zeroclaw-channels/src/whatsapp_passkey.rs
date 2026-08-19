@@ -176,9 +176,8 @@ fn publish_private_sync(path: &str, contents: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
 
-    std::fs::rename(&staging, path).map_err(|error| {
+    std::fs::rename(&staging, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&staging);
-        error
     })
 }
 
