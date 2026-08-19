@@ -934,6 +934,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .map(AttributedApprovalResponse::operator))
     }
 
+    /// Request approval for a tool whose authority may be granted only by an
+    /// authenticated operator surface.
+    ///
+    /// The default fails closed for ordinary chat channels and delegates to
+    /// the attributed approval path only after the channel has explicitly
+    /// opted into [`Channel::is_operator_approval_surface`]. Synthetic
+    /// fan-out channels must override this method when they contain a mix of
+    /// operator and non-operator back-channels so only the former are asked.
+    async fn request_operator_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        if !self.is_operator_approval_surface() {
+            return Ok(None);
+        }
+        self.request_approval_attributed(recipient, request).await
+    }
+
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
     /// approval) on this channel, rendered natively — an embed with one button
     /// per choice on Discord, an inline keyboard on Telegram, and so on.

@@ -95,7 +95,13 @@ pub(crate) async fn gate_tool_approval(
                         raw_arguments: Some(redacted_args.clone()),
                     };
                     let recipient = ctx.channel_reply_target.unwrap_or_default();
-                    match ch.request_approval_attributed(recipient, &ch_request).await {
+                    let response = if operator_only {
+                        ch.request_operator_approval_attributed(recipient, &ch_request)
+                            .await
+                    } else {
+                        ch.request_approval_attributed(recipient, &ch_request).await
+                    };
+                    match response {
                         Ok(Some(a)) => Some(a),
                         Ok(None) => None,
                         Err(e) => {
