@@ -181,6 +181,8 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
             ("uppercase".to_string(), "false".to_string()),
             ("max_len".to_string(), "0".to_string()),
         ]),
+        egress_hosts: Vec::new(),
+        egress_allow_private: Vec::new(),
     }];
     config
 }
