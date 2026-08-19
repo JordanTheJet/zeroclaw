@@ -143,7 +143,13 @@ esac
 url="https://github.com/${repository}/releases/download/${tag}/${asset}"
 
 if [[ "$mode" == "--print-manifest" ]]; then
-  binaries_csv="$(IFS=,; echo "${binaries[*]}")"
+  binaries_csv=""
+  for binary in "${binaries[@]}"; do
+    if [[ -n "$binaries_csv" ]]; then
+      binaries_csv+=","
+    fi
+    binaries_csv+="$binary"
+  done
   printf 'tool=%s\nversion=%s\nos=%s\narch=%s\nasset=%s\nprimary_binary=%s\nbinaries=%s\nsha256=%s\nurl=%s\n' \
     "$tool" "$version" "$os" "$arch" "$asset" "$primary_binary" "$binaries_csv" "$sha256" "$url"
   exit 0
