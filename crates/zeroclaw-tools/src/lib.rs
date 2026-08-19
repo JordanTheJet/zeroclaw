@@ -6,6 +6,10 @@ pub(crate) mod i18n;
 pub mod microsoft365;
 pub mod util_helpers;
 
+/// Android UI-control tools. Unix-only: the bridge transport is a
+/// Unix-domain socket, so the family is absent on Windows builds.
+#[cfg(unix)]
+pub mod android;
 pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;

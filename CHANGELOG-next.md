@@ -53,6 +53,7 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ### Configuration, Logging, and Tools
 
+- Add an opt-in Android UI tool family (`android_screenshot`, `android_ui_read`, `android_action`, `android_launch`, `android_device`) that drives the device through a companion bridge app over a Unix-domain socket. Off by default; requires `[android] enabled = true` and a runtime Android check. `android_action` is excluded from the default auto-approve list and refuses to register when the active risk profile would auto-approve it.
 - Preserve partial configuration during salvage and improve dotted-map keys, nested values, dirty-path resolution, and patch error handling (#8836, #9309, #9297, #9243, #9310, #9296).
 - Serialize configuration writes and reject unsafe or invalid inputs without panics (#9312, #9059, #9441).
 - Align the inert `context_compression.enabled` schema default with actual runtime behavior and warn when obsolete compression fields are authored (#9299).
