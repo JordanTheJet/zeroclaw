@@ -46,7 +46,6 @@ struct NotificationListResponse {
     cursor: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct Notification {
     uri: String,
@@ -60,7 +59,6 @@ struct Notification {
     indexed_at: String,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct NotificationAuthor {
     did: String,
