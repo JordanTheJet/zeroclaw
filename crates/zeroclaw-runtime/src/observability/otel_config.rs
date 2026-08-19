@@ -12,6 +12,7 @@ impl OtelContentConfig {
     /// All-off policy: emit no GenAI or tool I/O content attributes.
     /// Used by tests and as a sensible default; non-test builds construct
     /// configs via [`Self::from_observability_config`].
+    #[cfg(test)]
     pub(crate) fn off() -> Self {
         Self {
             genai_policy: OtelContentPolicy::Off,
