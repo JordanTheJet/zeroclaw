@@ -45,14 +45,8 @@ impl NotionTool {
                 anyhow::Error::msg(format!("Invalid Notion API key header value: {e}"))
             })?,
         );
-        headers.insert(
-            reqwest::header::HeaderName::from_static("notion-version"),
-            reqwest::header::HeaderValue::from_static(NOTION_VERSION),
-        );
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
+        headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
+        headers.insert("Content-Type", "application/json".parse().unwrap());
         Ok(headers)
     }
 
@@ -331,9 +325,7 @@ impl Tool for NotionTool {
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 self.search(query).await
             }
-            _ => Err(anyhow::Error::msg(format!(
-                "Unknown Notion action after validation: {action}"
-            ))),
+            _ => unreachable!(), // Already handled above
         };
 
         match result {

@@ -6,15 +6,6 @@ use std::path::{Path, PathBuf};
 use zeroclaw_config::schema::LinkedInImageConfig;
 
 const LINKEDIN_API_BASE: &str = "https://api.linkedin.com";
-
-fn article_payload(url: &str, title: Option<&str>) -> serde_json::Value {
-    let mut article = json!({ "source": url });
-    if let Some(title) = title.filter(|title| !title.is_empty()) {
-        article["title"] = json!(title);
-    }
-    article
-}
-
 const LINKEDIN_OAUTH_TOKEN_URL: &str = "https://www.linkedin.com/oauth/v2/accessToken";
 const LINKEDIN_REQUEST_TIMEOUT_SECS: u64 = 30;
 const LINKEDIN_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -266,21 +257,31 @@ impl LinkedInClient {
             && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
         {
             let epoch_ms = dt.timestamp_millis();
-            if let Some(body) = body.as_object_mut() {
-                body.insert(
-                    "scheduledPublishOptions".to_string(),
-                    json!({ "scheduledPublishTime": epoch_ms }),
-                );
-            }
+            body.as_object_mut().unwrap().insert(
+                "scheduledPublishOptions".to_string(),
+                json!({ "scheduledPublishTime": epoch_ms }),
+            );
             // Scheduled posts use DRAFT lifecycle
             body["lifecycleState"] = json!("DRAFT");
         }
 
         if let Some(url) = article_url {
-            let article = article_payload(url, article_title);
-            if let Some(body) = body.as_object_mut() {
-                body.insert("content".to_string(), json!({ "article": article }));
+            let mut article = json!({
+                "source": url,
+                "title": article_title.unwrap_or(""),
+            });
+            if article_title.is_none() || article_title.is_some_and(|t| t.is_empty()) {
+                article.as_object_mut().unwrap().remove("title");
             }
+            body.as_object_mut().unwrap().insert(
+                "content".to_string(),
+                json!({
+                    "article": {
+                        "source": url,
+                        "title": article_title.unwrap_or("")
+                    }
+                }),
+            );
         }
 
         let url = format!("{}/rest/posts", LINKEDIN_API_BASE);
@@ -713,12 +714,10 @@ impl LinkedInClient {
             && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
         {
             let epoch_ms = dt.timestamp_millis();
-            if let Some(body) = body.as_object_mut() {
-                body.insert(
-                    "scheduledPublishOptions".to_string(),
-                    json!({ "scheduledPublishTime": epoch_ms }),
-                );
-            }
+            body.as_object_mut().unwrap().insert(
+                "scheduledPublishOptions".to_string(),
+                json!({ "scheduledPublishTime": epoch_ms }),
+            );
         }
 
         let url = format!("{LINKEDIN_API_BASE}/rest/posts");
@@ -1288,21 +1287,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn article_payload_omits_absent_or_empty_title() {
-        for title in [None, Some("")] {
-            let article = article_payload("https://example.com/article", title);
-            assert_eq!(article["source"], "https://example.com/article");
-            assert!(article.get("title").is_none());
-        }
-    }
-
-    #[test]
-    fn article_payload_preserves_nonempty_title() {
-        let article = article_payload("https://example.com/article", Some("Launch"));
-        assert_eq!(article["title"], "Launch");
-    }
 
     #[tokio::test]
     async fn credentials_parsed_plain_values() {
