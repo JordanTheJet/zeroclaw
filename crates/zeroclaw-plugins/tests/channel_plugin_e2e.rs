@@ -168,6 +168,7 @@ fn outbound(content: &str, recipient: &str) -> SendMessage {
         cancellation_token: None,
         attachments: Vec::new(),
         in_reply_to: None,
+        references: Vec::new(),
         suppress_voice: false,
         force_voice: false,
     }
