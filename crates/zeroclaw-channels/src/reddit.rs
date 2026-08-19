@@ -45,7 +45,6 @@ struct RedditChild {
     data: RedditItemData,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct RedditItemData {
     name: Option<String>,
