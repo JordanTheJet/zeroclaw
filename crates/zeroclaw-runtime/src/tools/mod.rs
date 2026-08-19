@@ -1611,10 +1611,6 @@ pub fn all_tools_with_runtime(
                         Arc::clone(&config),
                         live_config.clone(),
                     );
-                    let mut details = host.tool_plugin_details();
-                    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
-                    let discovered_count = details.len();
-                    let mut registered_count = 0_usize;
                     let mut registered_names: std::collections::HashSet<String> = tool_arcs
                         .iter()
                         .map(|tool| tool.name().to_string())
@@ -1632,71 +1628,12 @@ pub fn all_tools_with_runtime(
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
                     };
-                    for (manifest, wasm_path) in details {
-                        let tool = (|| -> anyhow::Result<_> {
-                            let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
-                                manifest,
-                                zeroclaw_plugins::PluginCapability::Tool,
-                                manifest.permissions.iter().copied(),
-                            )?;
-                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                                wasm_path.to_path_buf(),
-                                scope,
-                                config_resolver.clone(),
-                                plugin_limits,
-                            )
-                        })();
-                        match tool {
-                            Ok(tool) => {
-                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Load
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(
-                                            ::serde_json::json!({
-                                                "plugin": manifest.name,
-                                                "tool": tool.name(),
-                                                "error_key": "plugin_tool_name_conflict",
-                                            })
-                                        ),
-                                        "Plugin tool conflicts with an already registered tool"
-                                    );
-                                    continue;
-                                }
-                                tool_arcs.push(Arc::new(tool));
-                                registered_count += 1;
-                            }
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Load
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "plugin": manifest.name,
-                                            "error": format!("{e:#}"),
-                                        })
-                                    ),
-                                    "Failed to register WASM plugin tool"
-                                );
-                            }
-                        }
-                    }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "discovered": discovered_count,
-                                "registered": registered_count,
-                            })),
-                        "Registered WASM plugin tools"
+                    register_plugin_tools(
+                        &host,
+                        &config_resolver,
+                        plugin_limits,
+                        &mut registered_names,
+                        &mut tool_arcs,
                     );
                 }
                 Err(e) => {
@@ -1749,6 +1686,108 @@ fn claim_plugin_tool_name(
     plugin_name: &str,
 ) -> bool {
     registered_names.insert(plugin_name.to_string())
+}
+
+/// Construct and register every discovered tool-plugin package.
+///
+/// Packages are visited in sorted package-name order so admission is
+/// deterministic across runs regardless of directory iteration order.
+///
+/// Admission is two-phase, and the order matters. The signed manifest name is
+/// the only identifier the host knows before the guest runs, so it is checked
+/// against the registered tool names *first*: a package that could never be
+/// registered is refused without resolving its scoped config, instantiating
+/// its component, or calling its metadata export. The guest-declared callable
+/// name is claimed afterwards, because nothing can know it earlier.
+#[cfg(feature = "plugins-wasm")]
+fn register_plugin_tools(
+    host: &zeroclaw_plugins::host::PluginHost,
+    config_resolver: &zeroclaw_plugins::config::PluginConfigResolver,
+    plugin_limits: zeroclaw_plugins::component::PluginLimits,
+    registered_names: &mut std::collections::HashSet<String>,
+    tool_arcs: &mut Vec<Arc<dyn Tool>>,
+) {
+    let mut details = host.tool_plugin_details();
+    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+    let discovered_count = details.len();
+    let mut registered_count = 0_usize;
+
+    for (manifest, wasm_path) in details {
+        // Phase one: guest-free refusal. Deliberately a check and not a claim —
+        // the reservation set holds callable tool names, and a package name is
+        // not one until its guest declares it.
+        if registered_names.contains(&manifest.name) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": manifest.name,
+                        "error_key": "plugin_package_name_conflict",
+                    })),
+                "Plugin package name conflicts with an already registered tool; \
+                 refused before loading its component"
+            );
+            continue;
+        }
+
+        let tool = (|| -> anyhow::Result<_> {
+            let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
+                manifest,
+                zeroclaw_plugins::PluginCapability::Tool,
+                manifest.permissions.iter().copied(),
+            )?;
+            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                wasm_path.to_path_buf(),
+                scope,
+                config_resolver.clone(),
+                plugin_limits,
+            )
+        })();
+        match tool {
+            Ok(tool) => {
+                if !claim_plugin_tool_name(registered_names, tool.name()) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name,
+                                "tool": tool.name(),
+                                "error_key": "plugin_tool_name_conflict",
+                            })),
+                        "Plugin tool conflicts with an already registered tool"
+                    );
+                    continue;
+                }
+                tool_arcs.push(Arc::new(tool));
+                registered_count += 1;
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "error": format!("{e:#}"),
+                        })),
+                    "Failed to register WASM plugin tool"
+                );
+            }
+        }
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "discovered": discovered_count,
+                "registered": registered_count,
+            })
+        ),
+        "Registered WASM plugin tools"
+    );
 }
 
 #[cfg(test)]
@@ -1897,6 +1936,134 @@ const = true
                 "novel-tool".to_string(),
             ])
         );
+    }
+
+    /// Write a discoverable tool package whose component bytes are deliberately
+    /// invalid. Package admission never compiles the component, so reaching the
+    /// guest is the only thing this payload would fail at — which makes the
+    /// config-resolution probe below an exact witness for "construction was
+    /// attempted".
+    #[cfg(feature = "plugins-wasm")]
+    fn write_tool_package(root: &std::path::Path, name: &str) {
+        let package_dir = root.join(name);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), b"not a component").unwrap();
+    }
+
+    /// A plugin whose name already belongs to a native, reserved, or
+    /// earlier-plugin tool can never be registered, so it must be refused by
+    /// the host before any of its guest code is constructed.
+    ///
+    /// `WasmTool::from_wasm` resolves the instance's scoped config as its very
+    /// first act, before instantiating the component. Recording every scope the
+    /// resolver is asked about therefore detects construction even when the
+    /// component itself is unloadable: if the loader ever enters `from_wasm`
+    /// for `shell`, the resolver sees `shell`.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn colliding_plugin_is_refused_before_its_guest_is_constructed() {
+        let plugins = TempDir::new().unwrap();
+        write_tool_package(plugins.path(), "shell");
+        write_tool_package(plugins.path(), "novel-tool");
+
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let probed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = {
+            let host = Arc::clone(&host);
+            let probed = Arc::clone(&probed);
+            zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+                let package = scope.id().package().to_string();
+                probed.lock().unwrap().push(package.clone());
+                let manifest = host.manifest(&package).ok_or_else(|| {
+                    zeroclaw_plugins::error::PluginError::NotFound(package.clone())
+                })?;
+                zeroclaw_plugins::config::resolve_plugin_config(manifest, scope, None)
+            })
+        };
+        let limits = zeroclaw_plugins::component::PluginLimits {
+            call_fuel: 1_000_000,
+            max_memory_bytes: 16 * 1024 * 1024,
+            max_table_elements: 10_000,
+            max_instances: 8,
+        };
+
+        // `shell` is already taken by a native tool; `novel-tool` is free.
+        let mut registered_names = std::collections::HashSet::from(["shell".to_string()]);
+        let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+        register_plugin_tools(
+            &host,
+            &resolver,
+            limits,
+            &mut registered_names,
+            &mut tool_arcs,
+        );
+
+        let probed = probed.lock().unwrap().clone();
+        assert!(
+            !probed.iter().any(|package| package == "shell"),
+            "a plugin named `shell` collides with a registered tool and must be \
+             rejected before construction, but its guest setup was entered: {probed:?}"
+        );
+        assert!(
+            probed.iter().any(|package| package == "novel-tool"),
+            "a non-colliding plugin must still be constructed: {probed:?}"
+        );
+    }
+
+    /// The pre-construction gate must not swallow the packages it is meant to
+    /// let through: with nothing registered, both packages are constructed.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn non_colliding_plugins_all_reach_construction() {
+        let plugins = TempDir::new().unwrap();
+        write_tool_package(plugins.path(), "alpha");
+        write_tool_package(plugins.path(), "beta");
+
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let probed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = {
+            let host = Arc::clone(&host);
+            let probed = Arc::clone(&probed);
+            zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+                let package = scope.id().package().to_string();
+                probed.lock().unwrap().push(package.clone());
+                let manifest = host.manifest(&package).ok_or_else(|| {
+                    zeroclaw_plugins::error::PluginError::NotFound(package.clone())
+                })?;
+                zeroclaw_plugins::config::resolve_plugin_config(manifest, scope, None)
+            })
+        };
+        let limits = zeroclaw_plugins::component::PluginLimits {
+            call_fuel: 1_000_000,
+            max_memory_bytes: 16 * 1024 * 1024,
+            max_table_elements: 10_000,
+            max_instances: 8,
+        };
+
+        let mut registered_names = std::collections::HashSet::new();
+        let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+        register_plugin_tools(
+            &host,
+            &resolver,
+            limits,
+            &mut registered_names,
+            &mut tool_arcs,
+        );
+
+        let mut probed = probed.lock().unwrap().clone();
+        probed.sort();
+        assert_eq!(probed, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
     #[cfg(feature = "plugins-wasm")]
