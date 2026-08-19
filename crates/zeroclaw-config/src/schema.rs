@@ -23985,6 +23985,7 @@ max_height = 8
         plugins.entries.push(super::PluginEntryConfig {
             name: "image_gen_fal".into(),
             config: std::collections::HashMap::new(),
+            ..Default::default()
         });
         assert_eq!(
             plugins.entry_config("image_gen_fal"),
@@ -24000,10 +24001,12 @@ max_height = 8
             super::PluginEntryConfig {
                 name: "zpi1_same".into(),
                 config: std::collections::HashMap::new(),
+                ..Default::default()
             },
             super::PluginEntryConfig {
                 name: "zpi1_same".into(),
                 config: std::collections::HashMap::new(),
+                ..Default::default()
             },
         ];
 
