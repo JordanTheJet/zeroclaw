@@ -1277,6 +1277,7 @@ fn reconcile_spawned_daemon_identity(
     Ok(false)
 }
 
+#[cfg(unix)]
 fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Result<()> {
     daemon
         .terminate_and_wait()
@@ -1545,6 +1546,7 @@ mod connection_tests {
         assert!(daemon.try_wait().expect("poll helper").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawned_daemon_startup_signal_cleanup_terminates_and_reaps_child() {
         let mut daemon =
