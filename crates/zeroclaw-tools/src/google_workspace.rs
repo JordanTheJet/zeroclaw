@@ -19,6 +19,8 @@ pub struct GoogleWorkspaceTool {
     allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     credentials_path: Option<String>,
     default_account: Option<String>,
+    #[allow(dead_code)] // Config field for future rate-limiting
+    rate_limit_per_minute: u32,
     timeout_secs: u64,
     audit_log: bool,
 }
@@ -32,7 +34,7 @@ impl GoogleWorkspaceTool {
         allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
         credentials_path: Option<String>,
         default_account: Option<String>,
-        _rate_limit_per_minute: u32,
+        rate_limit_per_minute: u32,
         timeout_secs: u64,
         audit_log: bool,
     ) -> Self {
@@ -64,6 +66,7 @@ impl GoogleWorkspaceTool {
             allowed_operations: operations,
             credentials_path,
             default_account,
+            rate_limit_per_minute,
             timeout_secs,
             audit_log,
         }
