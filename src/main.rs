@@ -3210,14 +3210,8 @@ fn issue_wss_client_cert(
         use zeroclaw_runtime::security::cert_ledger::{
             CertLedger, CertStatus, IssuanceActor, LedgerEntry,
         };
-        let der = rustls_pemfile::certs(&mut issued.cert_pem.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()
+        let fingerprint = zeroclaw_tls::single_cert_pem_sha256_fingerprint(&issued.cert_pem)
             .context("parse staged issued certificate")?;
-        let fingerprint = zeroclaw_tls::cert_sha256_fingerprint(
-            der.first()
-                .context("issued client certificate PEM is empty")?
-                .as_ref(),
-        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -3330,11 +3324,13 @@ fn issue_wss_client_cert(
         }
         println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
         if has_out_dir {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
             println!(
                 "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
                 relay.url, relay_node, relay_flags
             );
         } else {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
             println!(
                 "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
                 relay.url,
@@ -3349,6 +3345,7 @@ fn issue_wss_client_cert(
         println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
     } else {
         println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
+        // i18n-exempt: literal zerocode command line; the flags are not translatable
         println!(
             "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
             ca_cert.display(),
@@ -3468,6 +3465,7 @@ fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
         )
     );
     for e in &active {
+        // i18n-exempt: structured cert row; device/not_after/actor are field identifiers
         println!(
             "  {}  device={}  not_after={}  actor={}",
             e.fingerprint, e.device_id, e.not_after, e.actor
@@ -5796,10 +5794,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     );
                 }
                 zeroclaw_runtime::relay::request_node_id_rotation(&config.data_dir)?;
+                let rotate_secs = 15.to_string();
                 println!(
-                    "Requested a relay node-id rotation. A running daemon will rotate within ~{}s; \
-                     the new id reaches clients in-band on their next certificate renewal.",
-                    15
+                    "{}",
+                    ta(
+                        "cli-relay-rotation-requested",
+                        &[("secs", &rotate_secs)],
+                        "relay node-id rotation requested"
+                    )
                 );
                 Ok(())
             }

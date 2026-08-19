@@ -1082,6 +1082,7 @@ cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for c
 cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── daemon mTLS and enrollment operator output ──
+cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
