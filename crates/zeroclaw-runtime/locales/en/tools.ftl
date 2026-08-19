@@ -202,6 +202,20 @@ tool-screenshot-output-size = Size: { $size } bytes
 tool-screenshot-output-too-large = The image is too large to encode inline.
 tool-screenshot-output-base64-length = Base64 length: { $length }
 tool-screenshot-output-truncated = (truncated)
+tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
+tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
+tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace
+tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is missing a filename component
+tool-browser-screenshot-error-runtime-config-target = Cannot write screenshot to runtime config path '{ $target }'
+tool-browser-screenshot-error-symlink-target = Cannot write screenshot to symlink target '{ $target }'
+tool-browser-screenshot-error-path-not-utf8 = Screenshot path '{ $path }' resolves to a non-UTF-8 pathname; refusing to write through a lossy conversion
+tool-browser-screenshot-error-computeruse-non-string-path = Screenshot 'path' parameter must be a string, got { $path }
+tool-browser-screenshot-error-non-string-path = Screenshot 'path' must be a string or absent
+tool-browser-screenshot-error-args-not-object = Screenshot arguments must be a JSON object
+tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not return PNG data
+tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
+tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
+tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
