@@ -27968,6 +27968,39 @@ guild_id = "123"
         assert_eq!(parsed.bot_token, "tok");
     }
 
+    /// The value documented in `docs/book/src/channels/discord.md` must survive
+    /// a full write-then-read cycle. Role IDs are snowflakes that look like
+    /// integers, so the risk this pins down is a numeric round-trip silently
+    /// reshaping them; the existing tests only ever construct the field empty
+    /// or inject roles straight into the channel.
+    #[test]
+    async fn discord_config_allowed_role_ids_survives_toml_round_trip() {
+        let toml_str = r#"
+bot_token = "tok"
+allowed_role_ids = ["1472160206116094017", "9"]
+"#;
+        let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.allowed_role_ids, vec!["1472160206116094017", "9"]);
+
+        let reserialized = toml::to_string(&parsed).unwrap();
+        let reparsed: DiscordConfig = toml::from_str(&reserialized).unwrap();
+        assert_eq!(
+            reparsed.allowed_role_ids, parsed.allowed_role_ids,
+            "allowed_role_ids must survive serialize -> deserialize; got {reserialized}"
+        );
+    }
+
+    /// Omitting the field keeps user-ID-only gating: the additive role grant
+    /// must never appear from nowhere on an existing config.
+    #[test]
+    async fn discord_config_without_allowed_role_ids_defaults_empty() {
+        let toml_str = r#"
+bot_token = "tok"
+"#;
+        let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.allowed_role_ids.is_empty());
+    }
+
     #[test]
     async fn slack_config_toml_with_channel_ids() {
         let toml_str = r#"

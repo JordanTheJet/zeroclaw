@@ -175,17 +175,29 @@ fn member_role_allowed(allowed: &[String], member_roles: &[String]) -> bool {
 /// partial member object; DMs do not. A missing or malformed `roles` array
 /// yields an empty vec, which [`member_role_allowed`] treats as "no roles" —
 /// so a payload shape change fails closed rather than admitting everyone.
+///
+/// Parsing is deliberately **all-or-nothing**: a single non-string entry
+/// discards the whole array. This is an authorization input, and salvaging the
+/// well-formed half of a payload we do not recognize would let a shape we never
+/// anticipated still admit a member. Discord sends role IDs as an array of
+/// strings; anything else means we are not reading what we think we are, and
+/// the safe reading of an unrecognized payload is "no roles".
 fn member_roles_from_payload(d: &serde_json::Value) -> Vec<String> {
-    d.get("member")
+    let Some(roles) = d
+        .get("member")
         .and_then(|m| m.get("roles"))
         .and_then(serde_json::Value::as_array)
-        .map(|roles| {
-            roles
-                .iter()
-                .filter_map(|r| r.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::with_capacity(roles.len());
+    for role in roles {
+        let Some(role) = role.as_str() else {
+            return Vec::new();
+        };
+        parsed.push(role.to_string());
+    }
+    parsed
 }
 
 #[derive(Clone, Debug, Default)]
@@ -535,6 +547,14 @@ impl DiscordChannel {
         if !self.is_member_allowed(author_id, &member_roles_from_payload(d)) {
             return;
         }
+        // Identity is not the whole gate: the create path only archived this
+        // row because the message passed `guild_ids`/`channel_ids` too, and an
+        // edit mutates that same row. Re-apply the location policy so an
+        // authorized member in an excluded guild or channel cannot rewrite
+        // retained history.
+        if !self.event_location_allowed(d).await {
+            return;
+        }
 
         let key = format!("discord_{message_id}");
         let Some(existing) = self.archived_entry(archive_mem, &key).await else {
@@ -578,27 +598,6 @@ impl DiscordChannel {
         if user_id == bot_user_id {
             return;
         }
-        if !self.is_member_allowed(user_id, &member_roles_from_payload(d)) {
-            return;
-        }
-        if !self.guild_ids.is_empty()
-            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
-            && !self.guild_ids.iter().any(|allowed| allowed == g)
-        {
-            return;
-        }
-        if !self.channel_ids.is_empty() {
-            let parent_id =
-                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
-                    self.thread_parent(&self.http_client(), channel_id).await
-                } else {
-                    None
-                };
-            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
-                return;
-            }
-        }
-
         // Key identity: custom-emoji `id` first — names are mutable guild
         // state (rename/delete between ADD and REMOVE would orphan the
         // entry, and two same-named emoji would collide). Unicode emoji have
@@ -634,7 +633,30 @@ impl DiscordChannel {
             return;
         };
 
+        // Location policy applies to every archive mutation, add or retract.
+        // `guild_id`/`channel_id` are on both events, so this gate never
+        // depends on a field Discord withholds.
+        if !self.event_location_allowed(d).await {
+            return;
+        }
+
         if event_type == "MESSAGE_REACTION_REMOVE" {
+            // Removal is a *retraction of a row we wrote*, not a fresh action
+            // to authorize, so it deliberately skips the identity gate.
+            // Discord sends `member` on MESSAGE_REACTION_ADD but not on
+            // MESSAGE_REACTION_REMOVE, so re-running the role check here would
+            // deny every member admitted by role alone and strand their
+            // reaction in the archive forever — leaving the archive asserting a
+            // reaction that no longer exists. Authorization is instead settled
+            // by the row: it exists only because an add already passed.
+            //
+            // Nothing widens. The key is `message_id`+`user_id`+`emoji`, all
+            // taken from the event, so this can only forget the exact row that
+            // user's own add created, and a `forget` on a key we never stored
+            // is a no-op. `sweep_message_reactions` (REMOVE_ALL/REMOVE_EMOJI)
+            // has always retracted without an identity check; this makes the
+            // single-reaction path consistent with it.
+            //
             // A failed forget leaves the same stale entry a missed event
             // would — log it like the store path does.
             if let Err(e) = archive_mem.forget(&key).await {
@@ -649,6 +671,13 @@ impl DiscordChannel {
                     "failed to forget archived discord reaction"
                 );
             }
+            return;
+        }
+
+        // From here down is the ADD path, which *creates* a row and so carries
+        // the identity gate too. MESSAGE_REACTION_ADD is the event Discord
+        // documents as carrying `member`, so the role check has its data here.
+        if !self.is_member_allowed(user_id, &member_roles_from_payload(d)) {
             return;
         }
 
@@ -704,26 +733,11 @@ impl DiscordChannel {
 
     async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
         let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
-        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
         if message_id.is_empty() {
             return;
         }
-        if !self.guild_ids.is_empty()
-            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
-            && !self.guild_ids.iter().any(|allowed| allowed == g)
-        {
+        if !self.event_location_allowed(d).await {
             return;
-        }
-        if !self.channel_ids.is_empty() {
-            let parent_id =
-                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
-                    self.thread_parent(&self.http_client(), channel_id).await
-                } else {
-                    None
-                };
-            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
-                return;
-            }
         }
 
         // REMOVE_EMOJI carries one `emoji` object; REMOVE_ALL carries none.
@@ -817,6 +831,37 @@ impl DiscordChannel {
             return true;
         }
         member_role_allowed(&self.allowed_role_ids, member_roles)
+    }
+
+    /// Whether an event's `guild_id`/`channel_id` pass the configured filters,
+    /// resolving the thread parent when the channel itself is not listed.
+    ///
+    /// Identity (`is_member_allowed`) answers *who* may act; this answers
+    /// *where* they may act, and the two are independent — being named in the
+    /// peer allowlist or holding an authorized role does not carry an operator
+    /// past `guild_ids`/`channel_ids`. Every archive-mutating path calls this
+    /// so the contextual policy cannot drift between them.
+    async fn event_location_allowed(&self, d: &serde_json::Value) -> bool {
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return false;
+        }
+        if self.channel_ids.is_empty() {
+            return true;
+        }
+        let channel_id = d
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let parent_id =
+            if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                self.thread_parent(&self.http_client(), channel_id).await
+            } else {
+                None
+            };
+        channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref())
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -4286,10 +4331,47 @@ mod tests {
         assert!(
             member_roles_from_payload(&serde_json::json!({"member": {"roles": "r1"}})).is_empty()
         );
-        assert_eq!(
-            member_roles_from_payload(&serde_json::json!({"member": {"roles": [1, "r2"]}})),
-            s(&["r2"])
+        // All-or-nothing: one non-string entry makes the WHOLE array unusable.
+        // Salvaging the well-formed half would let a payload shape we do not
+        // recognize still authorize a member off the entries we happened to
+        // understand — the opposite of failing closed.
+        assert!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": [1, "r2"]}}))
+                .is_empty(),
+            "a malformed entry must discard the entire role set"
         );
+        assert!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": ["r1", null]}}))
+                .is_empty()
+        );
+        assert!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": ["r1", ["r2"]]}}))
+                .is_empty()
+        );
+        // An empty array is well-formed and simply means "holds no roles".
+        assert!(
+            member_roles_from_payload(&serde_json::json!({"member": {"roles": []}})).is_empty()
+        );
+    }
+
+    /// The malformed-array contract must hold at the *gate*, not just in the
+    /// parser: a member whose payload carries one bad entry alongside an
+    /// authorized role ID is denied.
+    #[test]
+    fn malformed_role_array_denies_even_when_it_contains_an_authorized_role() {
+        let allowed = s(&["maintainer"]);
+        let poisoned = serde_json::json!({"member": {"roles": [1, "maintainer"]}});
+        let roles = member_roles_from_payload(&poisoned);
+        assert!(
+            !member_role_allowed(&allowed, &roles),
+            "partial salvage of a malformed roles array must not authorize"
+        );
+        // Control: the same payload, well-formed, does admit.
+        let clean = serde_json::json!({"member": {"roles": ["maintainer"]}});
+        assert!(member_role_allowed(
+            &allowed,
+            &member_roles_from_payload(&clean)
+        ));
     }
 
     #[test]
@@ -5389,6 +5471,176 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Pre-resolve a channel in the thread-parent cache so location filtering
+    /// answers from memory instead of calling the Discord REST API. `None`
+    /// means "looked up, not a thread" — the shape a plain guild channel has.
+    async fn seed_not_a_thread(ch: &DiscordChannel, channel_id: &str) {
+        ch.thread_channels
+            .lock()
+            .await
+            .insert(channel_id.to_string(), None);
+    }
+
+    /// Roles replace only the *identity* check. A member admitted by role is
+    /// still subject to `channel_ids`, including when they edit a message that
+    /// is already archived — an edit mutates retained history, so it carries
+    /// the same contextual policy the create path applied.
+    #[tokio::test]
+    async fn role_authorized_editor_in_excluded_channel_cannot_rewrite_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            // Nobody is admitted by user ID: the role is the only grant, so a
+            // pass here can only have come through the role path.
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["200".into()])
+        .with_allowed_role_ids(vec!["maintainer".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        seed_not_a_thread(&ch, "999").await;
+        seed_archived_message(&mem).await;
+
+        let excluded = serde_json::json!({
+            "id": "111", "channel_id": "999", "content": "rewritten by role holder",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-role-only", "bot": false},
+            "member": {"roles": ["maintainer"]}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &excluded, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(
+            entry.content, "@alice in #200 at t0: original text",
+            "an excluded channel must not admit an edit, even by role"
+        );
+
+        // Control: identical event in an allowed channel does apply, proving
+        // the denial above came from the channel filter and not from the role
+        // grant failing outright.
+        let allowed = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "rewritten by role holder",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-role-only", "bot": false},
+            "member": {"roles": ["maintainer"]}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &allowed, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry.content.contains("rewritten by role holder"),
+            "role-authorized edit in an allowed channel should apply; got {}",
+            entry.content
+        );
+    }
+
+    /// Discord sends `member` on MESSAGE_REACTION_ADD but **not** on
+    /// MESSAGE_REACTION_REMOVE. A member admitted only by role must still be
+    /// able to un-react: if removal re-ran the role check it would find no
+    /// roles, deny, and strand the row forever.
+    #[tokio::test]
+    async fn role_authorized_add_is_retractable_by_a_member_less_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_allowed_role_ids(vec!["maintainer".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        // Vendor-shaped ADD: carries the partial member object.
+        let add = serde_json::json!({
+            "user_id": "u-role-only", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"roles": ["maintainer"], "user": {"username": "rolefan"}}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u-role-only_👍")
+                .await
+                .unwrap()
+                .is_some(),
+            "role alone should admit the add"
+        );
+
+        // Vendor-shaped REMOVE: no member object at all, per the gateway docs.
+        let remove = serde_json::json!({
+            "user_id": "u-role-only", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u-role-only_👍")
+                .await
+                .unwrap()
+                .is_none(),
+            "a member-less remove must still retract the row its add created"
+        );
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    /// The retraction exemption is identity-only. `guild_id`/`channel_id` are
+    /// present on MESSAGE_REACTION_REMOVE, so location policy still gates it —
+    /// removal is not a hole through the configured scope.
+    #[tokio::test]
+    async fn remove_still_honours_the_guild_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Same key, wrong guild: dropped before the forget.
+        let foreign = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g2", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &foreign, "botid")
+            .await;
+        assert_eq!(
+            mem.count().await.unwrap(),
+            1,
+            "a remove from an excluded guild must not retract"
+        );
+
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
     }
 
     #[tokio::test]
