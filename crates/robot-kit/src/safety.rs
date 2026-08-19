@@ -156,8 +156,7 @@ impl SafetyMonitor {
         // Update last command time
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map_or(0, |duration| duration.as_millis() as u64);
         self.state.last_command_ms.store(now_ms, Ordering::SeqCst);
 
         // Calculate speed limit based on proximity

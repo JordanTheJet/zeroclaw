@@ -101,12 +101,10 @@ impl SpeakTool {
         // `--output_file`, so its own stdout/stderr are detached: they are never
         // surfaced to the caller and must not block on or pollute our stdio.
         let mut piper = Command::new(piper_path)
-            .args([
-                "--model",
-                model_path.to_str().unwrap(),
-                "--output_file",
-                output_path.to_str().unwrap(),
-            ])
+            .arg("--model")
+            .arg(&model_path)
+            .arg("--output_file")
+            .arg(&output_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -127,14 +125,14 @@ impl SpeakTool {
 
         // Play audio using aplay
         let mut aplay = Command::new("aplay");
-        aplay.args(["-D", speaker_device, output_path.to_str().unwrap()]);
+        aplay.args(["-D", speaker_device]).arg(&output_path);
         let play_result =
             run_audio_command_with_timeout(aplay, "aplay", AUDIO_PLAYBACK_TIMEOUT).await?;
 
         if !play_result.status.success() {
             // Fallback: try paplay (PulseAudio)
             let mut paplay = Command::new("paplay");
-            paplay.arg(output_path.to_str().unwrap());
+            paplay.arg(&output_path);
             let fallback =
                 run_audio_command_with_timeout(paplay, "paplay", AUDIO_PLAYBACK_TIMEOUT).await?;
 
@@ -163,7 +161,7 @@ impl SpeakTool {
 
         let speaker_device = &self.config.audio.speaker_device;
         let mut aplay = Command::new("aplay");
-        aplay.args(["-D", speaker_device, sound_file.to_str().unwrap()]);
+        aplay.args(["-D", speaker_device]).arg(&sound_file);
         let output = run_audio_command_with_timeout(aplay, "aplay", AUDIO_PLAYBACK_TIMEOUT).await?;
 
         if !output.status.success() {

@@ -53,7 +53,7 @@ impl SenseTool {
     /// Mock LIDAR for testing
     async fn scan_mock(&self) -> Result<LidarScan> {
         // Simulate a room with walls
-        let mut ranges = vec![3.0; 360];
+        let mut ranges: Vec<f64> = vec![3.0; 360];
 
         // Wall in front at 2m
         for range in &mut ranges[350..360] {
@@ -71,7 +71,7 @@ impl SenseTool {
         let nearest = ranges
             .iter()
             .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .min_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, &d)| (d, i as u16))
             .unwrap_or((999.0, 0));
 
@@ -114,7 +114,7 @@ impl SenseTool {
                 let nearest = ranges
                     .iter()
                     .enumerate()
-                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .min_by(|a, b| a.1.total_cmp(b.1))
                     .map(|(i, &d)| (d, i as u16))
                     .unwrap_or((999.0, 0));
 
@@ -155,7 +155,7 @@ impl SenseTool {
 
         // Parse ROS2 LaserScan message (simplified)
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let ranges = vec![999.0; 360];
+        let ranges: Vec<f64> = vec![999.0; 360];
 
         // Very simplified parsing - in production use rclrs
         if let Some(_ranges_line) = stdout.lines().find(|l| l.contains("ranges:")) {
@@ -166,7 +166,7 @@ impl SenseTool {
         let nearest = ranges
             .iter()
             .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .min_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, &d)| (d, i as u16))
             .unwrap_or((999.0, 0));
 

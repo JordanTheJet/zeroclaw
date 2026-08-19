@@ -38,20 +38,15 @@ impl ListenTool {
         let device = &self.config.audio.mic_device;
 
         // Record using arecord (standard on Linux/Pi)
+        let duration = duration_secs.to_string();
         let output = tokio::process::Command::new("arecord")
             .args([
-                "-D",
-                device,
-                "-f",
-                "S16_LE", // 16-bit signed little-endian
-                "-r",
-                "16000", // 16kHz (Whisper expects this)
-                "-c",
-                "1", // Mono
-                "-d",
-                &duration_secs.to_string(),
-                filename.to_str().unwrap(),
+                "-D", device, "-f", "S16_LE", // 16-bit signed little-endian
+                "-r", "16000", // 16kHz (Whisper expects this)
+                "-c", "1", // Mono
+                "-d", &duration,
             ])
+            .arg(&filename)
             .output()
             .await?;
 
@@ -82,14 +77,11 @@ impl ListenTool {
 
         // Run whisper.cpp
         let output = tokio::process::Command::new(whisper_path)
-            .args([
-                "-m",
-                model_path.to_str().unwrap(),
-                "-f",
-                audio_path.to_str().unwrap(),
-                "--no-timestamps",
-                "-otxt", // Output as text
-            ])
+            .arg("-m")
+            .arg(&model_path)
+            .arg("-f")
+            .arg(audio_path)
+            .args(["--no-timestamps", "-otxt"])
             .output()
             .await?;
 

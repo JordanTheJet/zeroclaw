@@ -50,8 +50,8 @@ impl LookTool {
                 "-frames:v",
                 "1",
                 "-y", // Overwrite
-                filename.to_str().unwrap(),
             ])
+            .arg(&filename)
             .output()
             .await?;
 
@@ -64,8 +64,8 @@ impl LookTool {
                     "--no-banner",
                     "-d",
                     device,
-                    filename.to_str().unwrap(),
                 ])
+                .arg(&filename)
                 .output()
                 .await?;
 
