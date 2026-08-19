@@ -223,7 +223,7 @@ default = [
 ]
 
 # Chat onboarding flow.
-onboarding = ["dep:zeroclaw-onboarding"]
+onboarding = ["agent-runtime", "dep:zeroclaw-onboarding"]
 
 # The core agent runtime — agent loop, tools, persistence subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
@@ -411,7 +411,6 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 rcgen = "0.13"
-portable-pty = "0.8"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 # test-only: moved out of [dependencies] — no `src/` usage

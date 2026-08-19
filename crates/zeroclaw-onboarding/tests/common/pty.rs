@@ -50,7 +50,7 @@ fn zeroclaw_binary() -> PathBuf {
     BINARY
         .get_or_init(|| {
             escargot::CargoBuild::new()
-                .package("zeroclawlabs")
+                .package("zeroclaw")
                 .bin("zeroclaw")
                 .run()
                 .expect("build the zeroclaw binary from source for the test")
@@ -122,11 +122,23 @@ pub fn drive_flow(
     let deadline = Instant::now() + deadline;
     let mut idle_since = Instant::now();
     let mut completed = false;
+    let mut prompt_output_seen = false;
+    let mut last_answer: Option<String> = None;
 
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
-                transcript.push_str(&String::from_utf8_lossy(&chunk));
+                let text = String::from_utf8_lossy(&chunk);
+                // Terminal echo is not a new prompt. Waiting for non-echo
+                // output keeps startup latency and secret-prompt input-buffer
+                // resets from consuming the answer script ahead of the UI.
+                let is_echo = last_answer
+                    .as_deref()
+                    .is_some_and(|answer| text.trim() == answer);
+                transcript.push_str(&text);
+                if !is_echo {
+                    prompt_output_seen = true;
+                }
                 idle_since = Instant::now();
                 if transcript.contains("[completed") {
                     completed = true;
@@ -134,12 +146,14 @@ pub fn drive_flow(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if idle_since.elapsed() >= Duration::from_millis(200) {
+                if prompt_output_seen && idle_since.elapsed() >= Duration::from_millis(200) {
                     if let Some(answer) = answers.next() {
                         writer
                             .write_all(format!("{answer}\n").as_bytes())
                             .expect("write answer");
                         writer.flush().expect("flush");
+                        last_answer = Some(answer);
+                        prompt_output_seen = false;
                         idle_since = Instant::now();
                     } else if transcript.contains("[completed") {
                         completed = true;
@@ -151,6 +165,12 @@ pub fn drive_flow(
         }
     }
 
+    // A failed prompt script must not leave the child blocked on terminal
+    // input forever. Kill it before waiting so the test reports the captured
+    // transcript at the deadline instead of hanging past the test timeout.
+    if !completed {
+        let _ = child.kill();
+    }
     let _ = child.wait();
     PtyDrive {
         completed,

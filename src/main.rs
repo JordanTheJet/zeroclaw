@@ -557,6 +557,7 @@ enum Commands {
         agent: Option<String>,
     },
 
+    #[cfg(feature = "onboarding")]
     /// Run the spec-driven section flow over a chosen transport. The section
     /// prefix is a dotted config path such as `channels.matrix.home`.
     #[command(hide = true)]
@@ -1305,7 +1306,7 @@ fn quickstart_runtime_profile_for_provider(
 /// `--agent`) silently seed the relevant selector's value and mark it
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
 /// still open that selector and overwrite it.
-#[cfg(feature = "agent-runtime")]
+#[cfg(feature = "onboarding")]
 #[derive(Clone, Copy, PartialEq)]
 enum OnboardFlowMode {
     Cli,
@@ -1313,7 +1314,7 @@ enum OnboardFlowMode {
     LlmFreeform,
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(feature = "onboarding")]
 impl OnboardFlowMode {
     fn from_flags(llm: bool, freeform: bool) -> Self {
         match (llm, freeform) {
@@ -1324,7 +1325,7 @@ impl OnboardFlowMode {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(feature = "onboarding")]
 async fn run_onboard_flow(
     mut config: zeroclaw_config::schema::Config,
     section: &str,
@@ -1437,6 +1438,7 @@ async fn run_onboard_flow(
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
 async fn run_quickstart_cli(
     model_provider: Option<String>,
     model: Option<String>,
@@ -3960,6 +3962,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
             Ok(())
         }
 
+        #[cfg(feature = "onboarding")]
         Commands::OnboardFlow {
             section,
             layer,

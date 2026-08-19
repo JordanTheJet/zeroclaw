@@ -21,6 +21,6 @@ tempfile = "3.26"
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt", "macros", "sync"] }
-portable-pty = "0.8"
+portable-pty = "0.9"
 escargot = "0.5"
 toml = "1.0"
