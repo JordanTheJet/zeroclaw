@@ -30,7 +30,6 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code,
     unused_variables,
     unused_imports
 )]
@@ -42,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
 
+#[cfg(any(not(feature = "agent-runtime"), windows))]
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -80,6 +80,7 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
 /// UTF-8 char boundary. `String::truncate` panics when the byte index lands
 /// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
 /// is a latent panic. No-op when the string already fits.
+#[cfg(any(windows, test))]
 fn cap_line_utf8_safe(line: &mut String, cap: usize) {
     if line.len() > cap {
         line.truncate(line.floor_char_boundary(cap));
@@ -1171,62 +1172,6 @@ enum DeprecatedPropsCommands {
 }
 
 #[cfg(feature = "agent-runtime")]
-fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
-    match name {
-        "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
-        "ZEROCLAW_WORKSPACE" => !value.is_empty(),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn resolve_homebrew_onboard_config_dir(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-) -> Option<PathBuf> {
-    let explicit_runtime_dir = [
-        "ZEROCLAW_CONFIG_DIR",
-        "ZEROCLAW_DATA_DIR",
-        "ZEROCLAW_WORKSPACE",
-    ]
-    .iter()
-    .any(|name| env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value)));
-
-    if explicit_runtime_dir {
-        return None;
-    }
-
-    zeroclaw_runtime::service::homebrew_var_dir_from_exe(exe)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir_with(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-    mut set_env: impl FnMut(&'static str, &Path),
-) -> Option<PathBuf> {
-    let config_dir = resolve_homebrew_onboard_config_dir(exe, env_lookup)?;
-    set_env("ZEROCLAW_CONFIG_DIR", &config_dir);
-    Some(config_dir)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-
-    apply_homebrew_onboard_config_dir_with(
-        &exe,
-        |name| std::env::var(name).ok(),
-        |name, value| {
-            // SAFETY: called early in the onboard command path before new threads are spawned.
-            unsafe { std::env::set_var(name, value) };
-        },
-    );
-}
-
-#[cfg(feature = "agent-runtime")]
 fn quickstart_runtime_profile_for_provider(
     provider_type: &str,
     providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
@@ -1336,7 +1281,6 @@ async fn run_quickstart_cli(
     enum ChannelChoice {
         Fresh {
             kind: String,
-            display_name: String,
             alias: String,
             extras: std::collections::BTreeMap<String, String>,
         },
@@ -1992,7 +1936,6 @@ async fn run_quickstart_cli(
                         }
                         form.channels.push(ChannelChoice::Fresh {
                             kind: chosen.kind.clone(),
-                            display_name: chosen.display_name.clone(),
                             alias,
                             extras,
                         });
@@ -6198,7 +6141,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
         },
 
-        Commands::Props { .. } => {
+        Commands::Props { props_command } => {
+            let DeprecatedPropsCommands::Any(args) = props_command;
+            drop(args);
             anyhow::bail!(
                 "`zeroclaw props` has been renamed to `zeroclaw config`. \
                  Replace `props` with `config` in your command and try again."
@@ -9107,110 +9052,6 @@ mod tests {
                 other => panic!("expected onboard command, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_cellar_paths() {
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/opt/homebrew/var/zeroclaw")),
-        );
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/usr/local/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/usr/local/var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_brew_bin_symlink_layout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let prefix = temp.path().join("homebrew");
-        std::fs::create_dir_all(prefix.join("Cellar")).expect("create Cellar marker");
-        let exe = prefix.join("bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(&exe, |_| None),
-            Some(prefix.join("var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        for var in [
-            "ZEROCLAW_CONFIG_DIR",
-            "ZEROCLAW_DATA_DIR",
-            "ZEROCLAW_WORKSPACE",
-        ] {
-            assert_eq!(
-                resolve_homebrew_onboard_config_dir(exe, |name| {
-                    (name == var).then(|| "/tmp/zeroclaw-explicit".to_string())
-                }),
-                None,
-                "{var} should take precedence over Homebrew detection",
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(exe, |name| {
-                (name == "ZEROCLAW_WORKSPACE").then(|| "   ".to_string())
-            }),
-            None,
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_sets_detected_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |_| None,
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-        assert_eq!(
-            applied,
-            Some((
-                "ZEROCLAW_CONFIG_DIR",
-                PathBuf::from("/opt/homebrew/var/zeroclaw"),
-            )),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_skips_explicit_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |name| (name == "ZEROCLAW_CONFIG_DIR").then(|| "/tmp/zeroclaw".to_string()),
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, None);
-        assert_eq!(applied, None);
     }
 
     #[test]

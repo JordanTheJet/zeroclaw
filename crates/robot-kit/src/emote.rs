@@ -114,18 +114,16 @@ impl Expression {
 }
 
 pub struct EmoteTool {
-    #[allow(dead_code)]
-    config: RobotConfig,
     sounds_dir: PathBuf,
 }
 
 impl EmoteTool {
-    pub fn new(config: RobotConfig) -> Self {
+    pub fn new(_config: RobotConfig) -> Self {
         let sounds_dir = directories::UserDirs::new()
             .map(|d| d.home_dir().join(".zeroclaw/sounds"))
             .unwrap_or_else(|| PathBuf::from("/usr/local/share/zeroclaw/sounds"));
 
-        Self { config, sounds_dir }
+        Self { sounds_dir }
     }
 
     /// Set LED matrix expression
