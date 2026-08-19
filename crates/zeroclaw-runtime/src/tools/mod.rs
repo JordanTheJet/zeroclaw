@@ -1339,18 +1339,14 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(git_forge_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
-    let channel_room_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    let channel_room_tool = ChannelRoomTool::new(
-        security.clone(),
-        channel_room_handle.as_ref().cloned().unwrap(),
-    );
+    let channel_room_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let channel_room_tool =
+        ChannelRoomTool::new(security.clone(), Arc::clone(&channel_room_handle));
     tool_arcs.push(Arc::new(channel_room_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+    let ask_user_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_handle));
     tool_arcs.push(Arc::new(ask_user_tool));
 
     {
@@ -1363,17 +1359,17 @@ pub fn all_tools_with_runtime(
         };
         tool_arcs.push(Arc::new(SendViaTool::new(
             security.clone(),
-            ask_user_handle.as_ref().cloned().unwrap(),
+            Arc::clone(&ask_user_handle),
             agent_peer_groups,
         )));
     }
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        Arc::clone(&escalate_handle),
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
@@ -1410,11 +1406,11 @@ pub fn all_tools_with_runtime(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
-                    ask_user_handle,
-                    channel_room_handle,
+                    ask_user_handle: Some(ask_user_handle),
+                    channel_room_handle: Some(channel_room_handle),
                     reaction_handle,
                     poll_handle: Some(poll_handle),
-                    escalate_handle,
+                    escalate_handle: Some(escalate_handle),
                 };
             }
 
@@ -1684,11 +1680,11 @@ pub fn all_tools_with_runtime(
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
-        ask_user_handle,
-        channel_room_handle,
+        ask_user_handle: Some(ask_user_handle),
+        channel_room_handle: Some(channel_room_handle),
         reaction_handle,
         poll_handle: Some(poll_handle),
-        escalate_handle,
+        escalate_handle: Some(escalate_handle),
     }
 }
 
