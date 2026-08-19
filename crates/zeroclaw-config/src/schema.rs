@@ -14030,7 +14030,7 @@ pub struct DiscordConfig {
     /// in the resolved peer allowlist **or** they hold any role listed here;
     /// the two are additive, so neither can revoke the other.
     ///
-    /// Role IDs only — Discord's gateway payloads carry `member.roles` as IDs,
+    /// Role IDs only. Discord's gateway payloads carry `member.roles` as IDs,
     /// never names, so a role rename cannot silently change who is admitted.
     ///
     /// Empty (default) preserves the user-ID-only behavior. Roles are only
