@@ -1620,7 +1620,6 @@ pub async fn run_gateway(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -1951,12 +1950,18 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // Manual cron-trigger, webhook, and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. All run a
     // synchronous agent turn inline. Layers attached here travel with the
     // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    //
+    // /webhook belongs here for the same reason as the other two, and its absence was a real
+    // bug: any turn that takes a screenshot and calls a vision model comfortably exceeds 30s,
+    // so a caller waiting on the reply got 408 while the agent was still working. Quick
+    // endpoints keep the tight default rather than everything being loosened to suit this one.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .route("/webhook", post(handle_webhook));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
