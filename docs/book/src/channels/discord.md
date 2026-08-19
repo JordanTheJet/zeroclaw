@@ -111,7 +111,7 @@ Some details worth knowing:
 
 Discord's own **Server Settings -> Integrations -> _app_ -> Command Permissions**
 can additionally restrict a slash command to a role. That hides the command in
-the picker, while `allowed_role_ids` is what the runtime enforces — and it also
+the picker, while `allowed_role_ids` is what the runtime enforces. It also
 covers @-mentions, which command permissions do not.
 
 ## Threads and context
