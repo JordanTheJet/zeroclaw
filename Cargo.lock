@@ -13514,6 +13514,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.9",
  "zeroclaw-api",
+ "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
 ]
