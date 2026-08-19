@@ -19,10 +19,6 @@ const AA_I2C_NO_FLAGS: i32 = 0x00;
 /// Enable both onboard I2C pullup resistors (hardware v2+ only).
 const AA_I2C_PULLUP_BOTH: u8 = 0x03;
 
-fn initialized_device_count(reported: i32, capacity: usize) -> usize {
-    usize::try_from(reported).unwrap_or_default().min(capacity)
-}
-
 // ── Library loading ───────────────────────────────────────────────────────
 
 static AARDVARK_LIB: OnceLock<Option<Library>> = OnceLock::new();
@@ -56,18 +52,11 @@ fn lib() -> Option<&'static Library> {
                     continue;
                 }
                 tried_any = true;
-                // SAFETY: loading a native library runs code outside Rust's
-                // guarantees. These candidates are the configured or bundled
-                // Total Phase library, and the handle is retained for the
-                // process lifetime before any symbols are used.
                 match unsafe { Library::new(path) } {
                     Ok(lib) => {
                         // Verify the .so exports aa_c_version (Total Phase version gate).
                         // The .so exports c_aa_* symbols (not aa_*); aa_c_version is the
                         // one non-prefixed symbol used to confirm library identity.
-                        // SAFETY: the symbol name and no-argument `u32` ABI
-                        // match `aardvark.h`; this lookup is used only as an
-                        // identity/version gate while `lib` remains loaded.
                         let version_ok = unsafe {
                             lib.get::<unsafe extern "C" fn() -> u32>(b"aa_c_version\0").is_ok()
                         };
@@ -163,9 +152,6 @@ impl AardvarkHandle {
     /// Open a specific Aardvark adapter by port index.
     pub fn open_port(port: i32) -> Result<Self> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: `c_aa_open` has the declared signature in `aardvark.h`, and
-        // `lib` is retained in the process-wide `OnceLock` for the call and
-        // the lifetime of every returned handle.
         let handle: i32 = unsafe {
             let f: Symbol<unsafe extern "C" fn(i32) -> i32> = lib
                 .get(b"c_aa_open\0")
@@ -188,9 +174,6 @@ impl AardvarkHandle {
             return Vec::new();
         };
         let mut ports = [0u16; 16];
-        // SAFETY: the symbol signature matches `aardvark.h`; `ports` is a
-        // writable 16-element array and the same capacity is passed to C, so
-        // the vendor function cannot initialize beyond the allocation.
         let n: i32 = unsafe {
             let f: std::result::Result<Symbol<unsafe extern "C" fn(i32, *mut u16) -> i32>, _> =
                 lib.get(b"c_aa_find_devices\0");
@@ -202,15 +185,14 @@ impl AardvarkHandle {
                 }
             }
         };
-        let initialized = initialized_device_count(n, ports.len());
         eprintln!(
-            "[aardvark-sys] find_devices: c_aa_find_devices returned {n}, initialized ports={:?}",
-            &ports[..initialized]
+            "[aardvark-sys] find_devices: c_aa_find_devices returned {n}, ports={:?}",
+            &ports[..n.max(0) as usize]
         );
-        if initialized == 0 {
+        if n <= 0 {
             return Vec::new();
         }
-        let free: Vec<u16> = ports[..initialized]
+        let free: Vec<u16> = ports[..n as usize]
             .iter()
             .filter(|&&p| (p & AA_PORT_NOT_FREE) == 0)
             .copied()
@@ -224,9 +206,6 @@ impl AardvarkHandle {
     /// Enable I2C mode and set the bitrate (kHz).
     pub fn i2c_enable(&self, bitrate_khz: u32) -> Result<()> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: all three symbol signatures match `aardvark.h`; `self`
-        // keeps the positive, not-yet-closed adapter handle alive, and the
-        // calls pass only integer configuration values.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32, i32) -> i32> = lib
                 .get(b"c_aa_configure\0")
@@ -247,9 +226,6 @@ impl AardvarkHandle {
     /// Write `data` bytes to the I2C device at `addr`.
     pub fn i2c_write(&self, addr: u8, data: &[u8]) -> Result<()> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: the symbol signature matches `aardvark.h`, the adapter
-        // handle remains live through `&self`, and `data.as_ptr()` is valid
-        // for at least the `u16`-truncated byte count passed to the C API.
         let ret: i32 = unsafe {
             let f: Symbol<unsafe extern "C" fn(i32, u16, i32, u16, *const u8) -> i32> = lib
                 .get(b"c_aa_i2c_write\0")
@@ -273,9 +249,6 @@ impl AardvarkHandle {
     pub fn i2c_read(&self, addr: u8, len: usize) -> Result<Vec<u8>> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
         let mut buf = vec![0u8; len];
-        // SAFETY: the symbol signature matches `aardvark.h`, the adapter
-        // handle remains live, and `buf.as_mut_ptr()` is writable for at
-        // least the `u16`-truncated byte count passed to the C API.
         let ret: i32 = unsafe {
             let f: Symbol<unsafe extern "C" fn(i32, u16, i32, u16, *mut u8) -> i32> = lib
                 .get(b"c_aa_i2c_read\0")
@@ -307,20 +280,15 @@ impl AardvarkHandle {
         let Some(lib) = lib() else {
             return Vec::new();
         };
-        // SAFETY: this lookup uses the exact `aa_i2c_read` signature from
-        // `aardvark.h`, and the process-wide library handle remains loaded.
-        let symbol = unsafe {
-            lib.get::<unsafe extern "C" fn(i32, u16, i32, u16, *mut u8) -> i32>(b"c_aa_i2c_read\0")
-        };
-        let Ok(f) = symbol else {
+        let Ok(f): std::result::Result<
+            Symbol<unsafe extern "C" fn(i32, u16, i32, u16, *mut u8) -> i32>,
+            _,
+        > = (unsafe { lib.get(b"c_aa_i2c_read\0") }) else {
             return Vec::new();
         };
         let mut found = Vec::new();
         let mut buf = [0u8; 1];
         for addr in 0x08u16..=0x77 {
-            // SAFETY: `f` has the vendor-declared signature, the handle is
-            // live through `&self`, and `buf` is writable for the one byte
-            // requested by this probe.
             let ret = unsafe { f(self.handle, addr, AA_I2C_NO_FLAGS, 1, buf.as_mut_ptr()) };
             // ret > 0: bytes received → device ACKed
             // ret == 0: NACK → no device at this address
@@ -337,9 +305,6 @@ impl AardvarkHandle {
     /// Enable SPI mode and set the bitrate (kHz).
     pub fn spi_enable(&self, bitrate_khz: u32) -> Result<()> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: all three symbol signatures match `aardvark.h`; `self`
-        // keeps the positive adapter handle live, and only integer mode and
-        // bitrate values cross the FFI boundary.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32, i32) -> i32> = lib
                 .get(b"c_aa_configure\0")
@@ -364,9 +329,6 @@ impl AardvarkHandle {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
         let mut recv = vec![0u8; send.len()];
         // aa_spi_write(aardvark, out_num_bytes, data_out, in_num_bytes, data_in)
-        // SAFETY: the symbol signature matches `aardvark.h`; both slices stay
-        // alive for the call, and their pointers are valid for at least the
-        // `u16`-truncated lengths supplied to the vendor function.
         let ret: i32 = unsafe {
             let f: Symbol<unsafe extern "C" fn(i32, u16, *const u8, u16, *mut u8) -> i32> = lib
                 .get(b"c_aa_spi_write\0")
@@ -393,9 +355,6 @@ impl AardvarkHandle {
     /// `value`: output state bitmask.
     pub fn gpio_set(&self, direction: u8, value: u8) -> Result<()> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: both symbol signatures match `aardvark.h`, the adapter
-        // handle remains live through `&self`, and the GPIO masks are passed
-        // by value with no raw pointers.
         unsafe {
             let dir_f: Symbol<unsafe extern "C" fn(i32, u8) -> i32> = lib
                 .get(b"c_aa_gpio_direction\0")
@@ -418,8 +377,6 @@ impl AardvarkHandle {
     /// Read the current GPIO pin states as a bitmask.
     pub fn gpio_get(&self) -> Result<u8> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
-        // SAFETY: `c_aa_gpio_get` has the declared `aardvark.h` signature and
-        // `self` keeps the positive adapter handle alive for the call.
         let ret: i32 = unsafe {
             let f: Symbol<unsafe extern "C" fn(i32) -> i32> = lib
                 .get(b"c_aa_gpio_get\0")
@@ -437,9 +394,6 @@ impl AardvarkHandle {
 impl Drop for AardvarkHandle {
     fn drop(&mut self) {
         if let Some(lib) = lib() {
-            // SAFETY: the lookup uses the vendor-declared close signature;
-            // this handle was returned positive by `c_aa_open`, has not been
-            // closed elsewhere, and the library outlives this value.
             unsafe {
                 if let Ok(f) = lib.get::<unsafe extern "C" fn(i32) -> i32>(b"c_aa_close\0") {
                     f(self.handle);
@@ -452,13 +406,6 @@ impl Drop for AardvarkHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn device_count_is_bounded_by_the_initialized_output_buffer() {
-        assert_eq!(initialized_device_count(-1, 16), 0);
-        assert_eq!(initialized_device_count(3, 16), 3);
-        assert_eq!(initialized_device_count(17, 16), 16);
-    }
 
     #[test]
     fn find_devices_does_not_panic() {
