@@ -41,6 +41,12 @@ max_conns_per_node = 256
 # Drop a client connection after this many seconds of inactivity (a connection
 # paused by flow control still counts as active).
 idle_timeout_secs = 300
+# Global cap on sockets past accept but not yet classified (TLS handshake, WS
+# upgrade, first control frame), and the deadline covering that window. The
+# per-IP rate cap bounds one source; this bounds the SUM, so a slowloris spread
+# across many addresses sheds new sockets instead of accumulating state.
+max_pending_handshakes = 256
+handshake_timeout_secs = 10
 # Lease TTL (seconds) advertised to daemons at registration.
 lease_ttl_secs = 300
 # Abuse caps (A6). Per-source-IP connection-handshake rate: a burst allowance

@@ -138,6 +138,17 @@ pub struct RelayConfig {
     /// Off by default (a client cert whose CN is not a node-id would misroute). The
     /// outer client-cert REQUIREMENT itself is configured on the TLS acceptor.
     pub route_by_client_cert: bool,
+    /// Global cap on sockets that are past accept but not yet classified
+    /// (TLS handshake, HTTP/WebSocket upgrade, first control frame). The
+    /// per-IP token bucket bounds one source; this bounds the SUM, so a
+    /// slowloris spread across many source addresses cannot accumulate
+    /// unbounded TLS/parser/task state. When the pool is exhausted new
+    /// sockets are shed at accept.
+    pub max_pending_handshakes: usize,
+    /// Deadline covering TLS accept, the HTTP/WebSocket upgrade, and the
+    /// first control frame. `idle_timeout` only starts once a connection is
+    /// classified; without this, a socket could sit in the handshake forever.
+    pub handshake_timeout: Duration,
     /// Serve the browser enrollment frontdoor (HTML/JS/worker) from this relay.
     /// OFF by default: a relay that serves enrollment code is a TRUSTED code
     /// origin for those browsers - it could substitute JS that leaks the
@@ -174,6 +185,8 @@ impl Default for RelayConfig {
             connect_burst_per_node: 60,
             connect_rate_per_node: 20.0,
             route_by_client_cert: false,
+            max_pending_handshakes: 256,
+            handshake_timeout: Duration::from_secs(10),
             frontdoor_enabled: false,
         }
     }
@@ -298,6 +311,9 @@ struct Inner {
     connect_rate_per_node: f64,
     /// Outer-mTLS variant: read the target node-id from the client cert CN.
     route_by_client_cert: bool,
+    /// Pre-classification handshake permits (see `RelayConfig::max_pending_handshakes`).
+    handshake_permits: Arc<tokio::sync::Semaphore>,
+    handshake_timeout: Duration,
     /// Serve the browser frontdoor over plain HTTP hits (opt-in; see
     /// [`RelayConfig::frontdoor_enabled`]).
     frontdoor_enabled: bool,
@@ -349,6 +365,10 @@ impl RelayServer {
                 connect_burst_per_node: cfg.connect_burst_per_node,
                 connect_rate_per_node: cfg.connect_rate_per_node,
                 route_by_client_cert: cfg.route_by_client_cert,
+                handshake_permits: Arc::new(tokio::sync::Semaphore::new(
+                    cfg.max_pending_handshakes.max(1),
+                )),
+                handshake_timeout: cfg.handshake_timeout,
                 frontdoor_enabled: cfg.frontdoor_enabled,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
@@ -397,29 +417,55 @@ impl RelayServer {
             }
             let inner = self.inner.clone();
             let acceptor = acceptor.clone();
+            // Global pre-classification bound: a socket holds a permit from
+            // accept until its first control frame is classified. The per-IP
+            // bucket above bounds ONE source; this bounds the sum, so stalled
+            // handshakes spread across many addresses shed new sockets instead
+            // of accumulating unbounded TLS/parser/task state.
+            let Ok(permit) = inner.handshake_permits.clone().try_acquire_owned() else {
+                drop(sock);
+                continue;
+            };
             tokio::spawn(async move {
-                let tls = match acceptor.accept(sock).await {
-                    Ok(t) => t,
-                    Err(_) => return,
+                let deadline = inner.handshake_timeout;
+                let hs_inner = inner.clone();
+                // Deadline covers TLS accept, the HTTP/WS upgrade (including a
+                // frontdoor HTTP response), and below it, the first control
+                // frame. `idle_timeout` only begins on classified connections.
+                let handshake = async move {
+                    let tls = hs_inner.route_by_client_cert;
+                    let accepted = acceptor.accept(sock).await.ok()?;
+                    // Outer-mTLS variant: read a target node-id from the peer's
+                    // outer client cert CN before the TlsStream is consumed by
+                    // the WS handshake. None otherwise.
+                    let cert_node_id = if tls {
+                        accepted
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|c| c.first())
+                            .and_then(|c| zeroclaw_tls::client_cert_node_id(c.as_ref()))
+                    } else {
+                        None
+                    };
+                    match frontdoor::accept_or_serve(accepted, hs_inner.frontdoor_enabled).await {
+                        Ok(frontdoor::Frontdoor::WebSocket(w)) => Some((w, cert_node_id)),
+                        Ok(frontdoor::Frontdoor::ServedHttp) | Err(_) => None,
+                    }
                 };
-                // Outer-mTLS variant: read a target node-id from the peer's outer
-                // client cert CN (when configured + a cert was presented), before
-                // the TlsStream is consumed by the WS handshake. None otherwise.
-                let cert_node_id = if inner.route_by_client_cert {
-                    tls.get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|c| c.first())
-                        .and_then(|c| zeroclaw_tls::client_cert_node_id(c.as_ref()))
-                } else {
-                    None
+                let Ok(Some((ws, cert_node_id))) = tokio::time::timeout(deadline, handshake).await
+                else {
+                    return; // shed: timed out or never became a relay WebSocket
                 };
-                let ws = match frontdoor::accept_or_serve(tls, inner.frontdoor_enabled).await {
-                    Ok(frontdoor::Frontdoor::WebSocket(w)) => w,
-                    Ok(frontdoor::Frontdoor::ServedHttp) => return,
-                    Err(_) => return,
+                let mut ws = *ws;
+                let first = match tokio::time::timeout(deadline, next_control(&mut ws)).await {
+                    Ok(f) => f,
+                    Err(_) => return, // stalled before sending a first frame
                 };
-                let _ = handle_conn(inner, *ws, cert_node_id).await;
+                // Classified. Release the pre-classification permit before the
+                // long-lived connection pump.
+                drop(permit);
+                let _ = handle_conn(inner, ws, cert_node_id, first).await;
             });
         }
     }
@@ -440,11 +486,12 @@ async fn handle_conn<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
     cert_node_id: Option<String>,
+    first: Option<Control>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    match next_control(&mut ws).await {
+    match first {
         Some(Control::Hello {
             daemon_pubkey,
             node_id,

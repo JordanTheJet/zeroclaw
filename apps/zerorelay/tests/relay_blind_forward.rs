@@ -641,3 +641,64 @@ async fn per_node_connect_cap_rate_limits() {
         other => panic!("expected rate_limited, got {other:?}"),
     }
 }
+
+/// Slowloris regression (July review, finding: stalled handshakes had no
+/// deadline or global cap). Sockets that stall before classification must
+/// (a) shed NEW sockets while the pre-classification pool is full, rather than
+/// queueing unbounded TLS/parser/task state, and (b) be reaped at the
+/// handshake deadline so the pool recovers and a well-behaved client succeeds.
+#[tokio::test]
+async fn stalled_handshakes_shed_then_recover_at_the_deadline() {
+    let cfg = RelayConfig {
+        max_pending_handshakes: 4,
+        handshake_timeout: std::time::Duration::from_secs(2),
+        // Keep the per-IP bucket out of the way: this test exercises the
+        // GLOBAL bound, and every socket here shares 127.0.0.1.
+        accept_burst_per_ip: 1000,
+        accept_rate_per_ip: 1000.0,
+        ..RelayConfig::default()
+    };
+    let addr = start_relay(cfg).await;
+
+    // Fill the pool with sockets that never even start TLS.
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        stalled.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    // Give the accept loop a beat to hand each socket its permit.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Pool exhausted: the next socket is shed at accept — it sees EOF quickly,
+    // long before the 2s deadline could be the explanation.
+    let mut shed = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(1000),
+        tokio::io::AsyncReadExt::read(&mut shed, &mut buf),
+    )
+    .await;
+    match read {
+        Ok(Ok(0)) => {} // clean EOF: shed
+        other => panic!("expected the 5th socket to be shed with EOF, got {other:?}"),
+    }
+
+    // Past the deadline the stalled four are reaped and the pool recovers:
+    // a genuine TLS+WS client must now complete its handshake.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let mut ws = connect_ws(addr).await;
+    ws.send(Message::text(
+        Control::Connect {
+            node_id: "no-such-node".into(),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    // Any control reply proves the full handshake path is live again; this
+    // node-id does not exist, so `no_such_node` is the expected answer.
+    match next_control(&mut ws).await {
+        Some(Control::Error { code, .. }) => assert_eq!(code, "no_such_node"),
+        other => panic!("expected a control reply after recovery, got {other:?}"),
+    }
+    drop(stalled);
+}

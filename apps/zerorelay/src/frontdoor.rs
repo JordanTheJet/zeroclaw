@@ -368,6 +368,16 @@ where
     }
 }
 
+/// WebSocket parser limits for the relay plane, derived from the protocol
+/// budget in `zeroclaw-relay-proto` so the transport and application bounds
+/// cannot drift apart.
+pub(crate) fn relay_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    cfg.max_frame_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,14 +679,4 @@ mod tests {
         assert!(text.contains("Unsupported browser RPC request"));
         assert!(text.contains("pairing_code"));
     }
-}
-
-/// WebSocket parser limits for the relay plane, derived from the protocol
-/// budget in `zeroclaw-relay-proto` so the transport and application bounds
-/// cannot drift apart.
-pub(crate) fn relay_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-    cfg.max_message_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
-    cfg.max_frame_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
-    cfg
 }

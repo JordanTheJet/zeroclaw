@@ -99,6 +99,16 @@ struct Cli {
     #[arg(long)]
     lease_ttl_secs: Option<u64>,
 
+    /// Global cap on sockets past accept but not yet classified (TLS handshake,
+    /// WS upgrade, first control frame); excess sockets are shed. [default: 256]
+    #[arg(long)]
+    max_pending_handshakes: Option<usize>,
+
+    /// Deadline (seconds) covering TLS accept, the WS upgrade, and the first
+    /// control frame. [default: 10]
+    #[arg(long)]
+    handshake_timeout_secs: Option<u64>,
+
     /// Write a per-node metrics snapshot (JSON) to this path, refreshed on a timer
     /// and on SIGUSR1. Read it back with `zerorelay status --file <path>`.
     #[arg(long)]
@@ -179,6 +189,9 @@ struct LimitsFile {
     /// Per-node-id client-connect rate cap (A6).
     connect_burst_per_node: Option<u32>,
     connect_rate_per_node: Option<f64>,
+    /// Global pre-classification handshake bound + deadline (slowloris).
+    max_pending_handshakes: Option<usize>,
+    handshake_timeout_secs: Option<u64>,
 }
 
 /// The CLI admission overrides, captured so SIGHUP can re-apply them on top of a
@@ -368,6 +381,15 @@ async fn main() -> Result<()> {
         connect_burst_per_node: file.limits.connect_burst_per_node.unwrap_or(60),
         connect_rate_per_node: file.limits.connect_rate_per_node.unwrap_or(20.0),
         route_by_client_cert,
+        max_pending_handshakes: cli
+            .max_pending_handshakes
+            .or(file.limits.max_pending_handshakes)
+            .unwrap_or(256),
+        handshake_timeout: Duration::from_secs(
+            cli.handshake_timeout_secs
+                .or(file.limits.handshake_timeout_secs)
+                .unwrap_or(10),
+        ),
         frontdoor_enabled: cli.frontdoor || file.frontdoor.enabled.unwrap_or(false),
     };
 
