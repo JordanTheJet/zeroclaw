@@ -162,6 +162,17 @@ pub fn decode_data(bytes: &[u8]) -> Option<(u64, &[u8])> {
 /// logical connection before it must pause for a [`Control::DataAck`]. Bounds the
 /// memory and link share any single conn can take (head-of-line + A6). Both ends
 /// assume this default; a [`Control::Window`] frame can change it explicitly.
+/// Largest legal WebSocket message on the relay plane: a `DATA` message is an
+/// 8-byte `conn_id` header plus at most [`MAX_DATA_PAYLOAD`], and control frames
+/// are bounded by [`MAX_CONTROL_FRAME`]. Transport ingress must cap the
+/// WebSocket parser at this value so an oversized message is refused while it is
+/// being framed, rather than buffered to completion and rejected afterwards.
+pub const MAX_WS_MESSAGE: usize = if MAX_CONTROL_FRAME > MAX_DATA_PAYLOAD + 8 {
+    MAX_CONTROL_FRAME
+} else {
+    MAX_DATA_PAYLOAD + 8
+};
+
 pub const INITIAL_WINDOW: u32 = 4 * MAX_DATA_PAYLOAD as u32;
 
 /// Credit-based send window for one logical connection in one direction.

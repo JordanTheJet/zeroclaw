@@ -34,9 +34,17 @@ where
                 prefix: Cursor::new(prefix),
                 inner: stream,
             };
-            let ws = tokio_tungstenite::accept_hdr_async(io, select_subprotocol)
-                .await
-                .context("relay websocket handshake")?;
+            // Bound the parser at the protocol budget. Without this,
+            // tungstenite's defaults (16 MiB frame / 64 MiB message) let a peer
+            // allocate far beyond MAX_WS_MESSAGE before the application-level
+            // check ever runs.
+            let ws = tokio_tungstenite::accept_hdr_async_with_config(
+                io,
+                select_subprotocol,
+                Some(relay_ws_config()),
+            )
+            .await
+            .context("relay websocket handshake")?;
             return Ok(Frontdoor::WebSocket(Box::new(ws)));
         }
 
@@ -661,4 +669,14 @@ mod tests {
         assert!(text.contains("Unsupported browser RPC request"));
         assert!(text.contains("pairing_code"));
     }
+}
+
+/// WebSocket parser limits for the relay plane, derived from the protocol
+/// budget in `zeroclaw-relay-proto` so the transport and application bounds
+/// cannot drift apart.
+pub(crate) fn relay_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    cfg.max_frame_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    cfg
 }

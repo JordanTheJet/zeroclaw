@@ -524,9 +524,15 @@ async fn serve_once(
         .context("building relay ws uri")?;
     let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
         .with_sub_protocol(SUBPROTOCOL);
-    let (mut ws, _resp) = tokio_tungstenite::client_async(request, tls)
-        .await
-        .context("relay websocket handshake")?;
+    // Relay-protocol plane: bound the parser at the protocol budget so an
+    // oversized message is refused while framing rather than buffered whole.
+    let mut relay_ws_cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    relay_ws_cfg.max_message_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    relay_ws_cfg.max_frame_size = Some(zeroclaw_relay_proto::MAX_WS_MESSAGE);
+    let (mut ws, _resp) =
+        tokio_tungstenite::client_async_with_config(request, tls, Some(relay_ws_cfg))
+            .await
+            .context("relay websocket handshake")?;
 
     // Signed registration handshake: Hello -> Challenge -> Register -> Registered.
     ws.send(tungstenite_text(&Control::Hello {

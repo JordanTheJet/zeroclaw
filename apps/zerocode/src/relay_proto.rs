@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 pub const SUBPROTOCOL: &str = "zeroclaw.relay.v1";
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 pub const MAX_DATA_PAYLOAD: usize = 64 * 1024;
+/// Largest legal WebSocket message on the relay plane: a `DATA` message is an
+/// 8-byte `conn_id` header plus at most [`MAX_DATA_PAYLOAD`]; control frames are
+/// bounded by [`MAX_CONTROL_FRAME`]. Mirrors `zeroclaw-relay-proto`; zerocode
+/// cannot depend on `zeroclaw-*` crates (RPC-boundary gate), so this module is
+/// a deliberate copy and the two must be changed together.
+pub const MAX_WS_MESSAGE: usize = if MAX_CONTROL_FRAME > MAX_DATA_PAYLOAD + 8 {
+    MAX_CONTROL_FRAME
+} else {
+    MAX_DATA_PAYLOAD + 8
+};
+
 pub const INITIAL_WINDOW: u32 = 4 * MAX_DATA_PAYLOAD as u32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

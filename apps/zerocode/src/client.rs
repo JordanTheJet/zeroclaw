@@ -951,10 +951,14 @@ async fn dial_through_relay(
             .context("building relay ws uri")?;
     let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(relay_uri)
         .with_sub_protocol(SUBPROTOCOL);
-    let (relay_ws, _resp) =
-        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, outer)
-            .await
-            .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
+    let (relay_ws, _resp) = tokio_tungstenite::client_async_tls_with_config(
+        request,
+        tcp,
+        Some(relay_ws_config()),
+        outer,
+    )
+    .await
+    .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
 
     // Persist a TOFU-observed relay pin so later runs pin this leaf instead of
     // re-trusting (opt-in path only).
@@ -1243,10 +1247,14 @@ impl RpcClient {
                 tls,
             )?))
         };
-        let (ws_stream, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
-                .await
-                .with_context(|| format!("WSS connect to {url}"))?;
+        let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            url,
+            Some(rpc_ws_config()),
+            false,
+            connector,
+        )
+        .await
+        .with_context(|| format!("WSS connect to {url}"))?;
         Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
     }
 
@@ -1268,7 +1276,7 @@ impl RpcClient {
         let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
             inner_url,
             client_io,
-            None,
+            Some(rpc_ws_config()),
             Some(connector),
         )
         .await
@@ -4805,4 +4813,27 @@ mod plan_parse_tests {
         let params = serde_json::json!({ "type": "plan", "session_id": "s" });
         assert!(parse_session_update(&params).is_none());
     }
+}
+
+/// Parser limits for the RELAY-PROTOCOL plane (client <-> relay outer session),
+/// derived from `zeroclaw-relay-proto` so transport and application bounds
+/// cannot drift apart.
+fn relay_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(crate::relay_proto::MAX_WS_MESSAGE);
+    cfg.max_frame_size = Some(crate::relay_proto::MAX_WS_MESSAGE);
+    cfg
+}
+
+/// Parser limits for the INNER RPC plane. This is NOT the relay budget: RPC
+/// carries attachments up to `zeroclaw_runtime::rpc::attachments::MAX_REQUEST_BYTES`
+/// (20 MiB), so a relay-sized cap would truncate legitimate traffic. 32 MiB
+/// leaves encoding headroom above that limit while still replacing
+/// tungstenite's unbounded-by-default 64 MiB with an explicit ceiling.
+fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    const RPC_WS_MAX: usize = 32 * 1024 * 1024;
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(RPC_WS_MAX);
+    cfg.max_frame_size = Some(RPC_WS_MAX);
+    cfg
 }
