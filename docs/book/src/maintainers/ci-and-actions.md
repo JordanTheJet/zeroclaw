@@ -256,7 +256,15 @@ Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust
   runs use `SCCACHE_GHA_RW_MODE=READ_ONLY`; they can consume master-seeded
   entries but cannot populate or evict the shared compiler cache. Changing
   `SCCACHE_GHA_VERSION` in the composite intentionally invalidates the cache.
-
+- **Blacksmith target caches use three bounded families.** Stable native Linux
+  jobs (`lint`, Linux `build`, `check`, plugin backends, `bench`, `test`,
+  `parallel-runtime-test`, and `installer-drift`) share
+  `blacksmith-linux-stable-v1`. The i686 and MSRV jobs use separate families so
+  target/toolchain artifacts do not inflate the native cache. The cache action
+  still appends OS/architecture plus rustc, compiler-environment, manifest, and
+  lockfile hashes; `shared-key` removes only job-ID fragmentation. When
+  Blacksmith is off, keys remain job-specific (including Parallel Runtime
+  Test's established `test` fallback key).
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.

@@ -126,6 +126,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -258,6 +259,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Linux system dependencies
@@ -352,6 +354,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -402,6 +405,7 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
@@ -441,6 +445,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-msrv-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -471,6 +476,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-i686-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
@@ -494,6 +500,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -550,6 +557,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check firmware protocol crate
@@ -633,7 +641,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
-          shared-key: test
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || 'test' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -908,6 +916,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          shared-key: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-linux-stable-v1' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
