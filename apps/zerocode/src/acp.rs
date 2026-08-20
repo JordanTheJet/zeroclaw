@@ -12,9 +12,12 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
-    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+    pub(crate) fn new(
+        rpc: Arc<RpcClient>,
+        inbound_request_claims: Arc<chat::InboundRequestClaims>,
+    ) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new_with_claims(rpc, chat::PaneKind::Acp, inbound_request_claims),
         }
     }
 
