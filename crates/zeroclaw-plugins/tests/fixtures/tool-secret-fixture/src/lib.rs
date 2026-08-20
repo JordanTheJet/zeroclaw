@@ -1,10 +1,25 @@
-//! Tool component that exercises the host's scoped secret service.
+//! Tool component that exercises the host's **scoped secret service**.
 //!
-//! Distinct from the sibling `tool-fixture`, which covers typed-config
-//! materialization. This one asserts the secret contract from the guest side:
-//! secrets are unavailable during metadata calls, only `x-secret` properties
-//! are readable through `secrets.get`, and each binding sees only its own
-//! secret values.
+//! This is deliberately a separate crate from `tests/fixtures/tool-fixture`.
+//! That fixture is the typed-config echo component asserted byte-for-byte by
+//! `tests/reference_plugin.rs` and by the runtime crate's
+//! `plugin_live_config` regression, so it cannot also carry the secret
+//! probes below: a component exports exactly one `tool` world, and the two
+//! suites need different `name()` values, different `config_schema` shapes,
+//! and different `execute` outputs.
+//!
+//! What this component proves, from the guest side:
+//!
+//! * `name()` runs during *metadata*, where the secret service must be
+//!   closed. It reports `metadata-secret-gate-failed` if a secret is ever
+//!   readable there, so the gate failing open turns into a visible tool name
+//!   rather than a silent leak.
+//! * `execute()` receives only the **non-secret** properties in `__config`,
+//!   and reaches secrets solely through the host-mediated `secrets` import.
+//! * A property marked `x-secret` is withheld from `__config`, and a public
+//!   property is *not* reachable through the secret import.
+//! * The secret it reads is the one bound to *its own* instance, so two
+//!   bindings of the same package cannot read each other's values.
 
 #[cfg(target_family = "wasm")]
 mod component {
@@ -22,7 +37,7 @@ mod component {
 
     impl PluginInfo for FixtureTool {
         fn plugin_name() -> String {
-            "tool-fixture".to_string()
+            "tool-secret-fixture".to_string()
         }
 
         fn plugin_version() -> String {
