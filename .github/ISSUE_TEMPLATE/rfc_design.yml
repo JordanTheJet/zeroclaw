@@ -17,8 +17,10 @@ body:
 
         **Do not use this form** for an ordinary feature addition, a schema or data migration, a
         configuration field or default change, or a bounded implementation refactor. A new channel,
-        provider, or tool is ordinary work however large the diff. Those go to the
-        [Feature Request](?template=feature_request.yml) form and proceed through an issue and PR.
+        provider, or tool is ordinary work however large the diff, unless its substantive effect
+        also crosses one of the triggers above. Those requests proceed through the ordinary issue
+        or PR path. Use the [Feature Request](?template=feature_request.yml) form when requesting a
+        new capability.
 
         The test is substantive project effect, not the size of the change. If you are unsure, file a
         feature request and say why it might cross a trigger; a maintainer can promote it. Maintainers
@@ -26,7 +28,7 @@ body:
         rejecting it.
 
         Scope and ratification rules: [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496)
-        (FND-003 Rev. 9). Security vulnerabilities must be reported privately, never as a public RFC.
+        (FND-003 Rev. 15). Security vulnerabilities must be reported privately, never as a public RFC.
 
   - type: dropdown
     id: trigger

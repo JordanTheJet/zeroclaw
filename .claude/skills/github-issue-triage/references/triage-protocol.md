@@ -379,7 +379,7 @@ Stale closures are especially sensitive — a reporter may have been waiting pat
 
 ## §7 Label Taxonomy
 
-Derived from current maintainer label policy, with RFC scope set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496) (FND-003 Rev. 9). Apply these consistently:
+Derived from current maintainer label policy, with RFC scope set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496) (FND-003 Rev. 15). Apply these consistently:
 
 ### Type
 
@@ -402,11 +402,12 @@ project-level decision before implementation, meaning it is at least one of:
 
 An ordinary feature addition, a schema or data migration, a configuration field or default change, and
 a bounded implementation refactor are **not** RFCs, however large the diff or however sensitive the
-surrounding subsystem. A new channel, provider, or tool is ordinary work.
+surrounding subsystem. A new channel, provider, or tool is ordinary work unless its substantive effect
+also crosses one of the triggers above.
 
-The test is substantive project effect, not the issue title, the author, or an AI-assisted origin. An
-issue whose own body scopes itself with explicit non-goals and acceptance criteria is describing
-bounded work, not proposing a project-level decision.
+The test is substantive project effect, not the issue title, the author, or an AI-assisted origin.
+Explicit non-goals and acceptance criteria help scope the work, but they do not determine the trigger
+by themselves.
 
 When in doubt, do not apply `type:rfc`; leave the type label as-is and flag the issue to the user.
 Adding it wrongly parks the work behind a Core vote it does not need.
