@@ -151,29 +151,11 @@ impl PairingGuard {
             }
         }
 
-        {
-            let mut pairing_code = self.pairing_code.lock();
-            if let Some(ref expected) = *pairing_code
-                && constant_time_eq(code.trim(), expected.trim())
-            {
-                // Reset failed attempts for this client on success
-                {
-                    let mut guard = self.failed_attempts.lock();
-                    guard.0.remove(&client_id);
-                }
-                let reservation = PairingReservation {
-                    guard: self.clone(),
-                    code: expected.clone(),
-                    token: generate_token(),
-                    committed: false,
-                };
-
-                // Reserve the pairing code so concurrent requests cannot both
-                // issue, but restore it on drop if issuance fails before commit.
-                *pairing_code = None;
-
-                return Ok(Some(reservation));
-            }
+        if let Some(reservation) = self.try_reserve_code(code) {
+            // Reset failed attempts for this client on success
+            let mut guard = self.failed_attempts.lock();
+            guard.0.remove(&client_id);
+            return Ok(Some(reservation));
         }
 
         // Increment failed attempts for this client
@@ -221,6 +203,44 @@ impl PairingGuard {
 
     /// Reserve the given code without committing it. The returned reservation
     /// restores the code on drop unless `commit()` is called.
+    /// Constant-time code check + reservation, with NO lockout bookkeeping.
+    /// The shared core of the keyed and unkeyed paths.
+    fn try_reserve_code(&self, code: &str) -> Option<PairingReservation> {
+        let mut pairing_code = self.pairing_code.lock();
+        if let Some(ref expected) = *pairing_code
+            && constant_time_eq(code.trim(), expected.trim())
+        {
+            let reservation = PairingReservation {
+                guard: self.clone(),
+                code: expected.clone(),
+                token: generate_token(),
+                committed: false,
+            };
+            // Reserve the pairing code so concurrent requests cannot both
+            // issue, but restore it on drop if issuance fails before commit.
+            *pairing_code = None;
+            return Some(reservation);
+        }
+        None
+    }
+
+    /// Code check WITHOUT per-client lockout accounting, for callers whose
+    /// peers all share one network identity and which apply their own
+    /// class-wide rate policy instead. The relay enrollment bridge is the
+    /// canonical case: every relay-routed client reaches the daemon from
+    /// loopback, so keying lockout on the peer address would let five wrong
+    /// codes from ONE hostile client lock out EVERY relay-routed enrollee
+    /// (shared-fate lockout). Never expose this to a caller that has a real
+    /// per-client identity - use [`PairingGuard::reserve_pair`] there.
+    pub async fn reserve_pair_unkeyed(&self, code: &str) -> Option<PairingReservation> {
+        let this = self.clone();
+        let code = code.to_string();
+        let handle = tokio::task::spawn_blocking(move || this.try_reserve_code(&code));
+        handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")
+    }
+
     pub async fn reserve_pair(
         &self,
         code: &str,

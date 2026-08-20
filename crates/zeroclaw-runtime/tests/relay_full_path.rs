@@ -168,6 +168,7 @@ async fn zerocode_to_relay_to_daemon_full_path() {
             relay_token: None,
             local_wss_addr: format!("127.0.0.1:{}", wss_addr.port()),
             local_enroll_addr: None,
+            enroll_bridge_ports: None,
             signing_key_pkcs8: signing_key,
             relay_ca_path: None,
             relay_insecure: true, // self-signed relay outer cert in the test
@@ -249,6 +250,8 @@ async fn enrollment_post_round_trips_through_relay_route() {
         static_client_pins_configured: false,
         allow_unpaired_until: None,
         relay_profile: zeroclaw_runtime::enroll::RelayProfile::default(),
+        bridge_ports: None,
+        relay_attempt_bucket: zeroclaw_runtime::enroll::RelayAttemptBucket::default(),
         paircode_admin_data_dir: None,
     });
     let enroll_ledger = enroll_server.ledger.clone();
@@ -279,6 +282,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
             relay_token: None,
             local_wss_addr: "127.0.0.1:9".into(),
             local_enroll_addr: Some(format!("127.0.0.1:{}", enroll_addr.port())),
+            enroll_bridge_ports: None,
             signing_key_pkcs8: signing_key,
             relay_ca_path: None,
             relay_insecure: true,

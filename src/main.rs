@@ -5015,11 +5015,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     })
                 }));
 
+                // Shared between the relay bridge and the enrollment endpoint:
+                // the bridge registers its enroll-dial source ports here so the
+                // endpoint can classify those loopback connections as
+                // relay-routed rather than direct (finding: relay enrollment
+                // collapsed every client to the bridge's loopback identity, so
+                // one hostile client's failures locked out all relay enrollees).
+                let enroll_bridge_ports: zeroclaw_runtime::enroll::BridgePortSet =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                let enroll_bridge_ports_for_bridge = enroll_bridge_ports.clone();
+                let enroll_bridge_ports_for_endpoint = enroll_bridge_ports.clone();
                 // Relay bridge: keep an outbound connection to a nominated relay
                 // so clients behind NAT can reach this daemon through it. The
                 // relay forwards to the local WSS listener (loopback), where the
                 // inner mTLS terminates; it never decrypts anything.
-                registry.register_relay(Box::new(|ctx, cancel, _client_count| {
+                registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
                     Box::pin(async move {
                         let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
                             let cfg = ctx.config.read();
@@ -5090,6 +5101,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             local_enroll_addr: enroll_cfg
                                 .enabled
                                 .then(|| format!("127.0.0.1:{}", enroll_cfg.port)),
+                            enroll_bridge_ports: Some(enroll_bridge_ports_for_bridge.clone()),
                             signing_key_pkcs8,
                             relay_ca_path: Some(relay_cfg.relay_ca_path)
                                 .filter(|p| !p.is_empty()),
@@ -5117,7 +5129,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // certless client reaches for its FIRST cert (server-auth TLS +
                 // one-time pairing code, CSR-only). The daemon owns the CA, so
                 // this works with no gateway. It is NOT the mTLS RPC plane.
-                registry.register_enroll(Box::new(|ctx, cancel, _client_count| {
+                registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
                         let (enroll_cfg, wss_cfg, relay_cfg, audit_cfg, data_dir) = {
                             let cfg = ctx.config.read();
@@ -5297,6 +5310,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 .unwrap_or(false),
                             allow_unpaired_until,
                             relay_profile,
+                            bridge_ports: Some(enroll_bridge_ports.clone()),
+                            relay_attempt_bucket:
+                                zeroclaw_runtime::enroll::RelayAttemptBucket::default(),
                             paircode_admin_data_dir: Some(data_dir.clone()),
                         });
                         zeroclaw_runtime::enroll::serve(server, cancel).await

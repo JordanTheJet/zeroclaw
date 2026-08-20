@@ -120,6 +120,61 @@ struct EnrollTrustResponse {
 }
 
 /// Everything the enrollment endpoint needs to serve requests.
+/// Source ports the in-process relay bridge is dialing the enrollment endpoint
+/// from. The bridge registers each outbound port BEFORE connecting (bind, then
+/// register, then connect), so accept-side membership is race-free. A loopback
+/// peer in this set is relay-class; every other peer is direct-class.
+pub type BridgePortSet = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>;
+
+/// Class-wide attempt budget for relay-routed enrollment. Relay clients share
+/// one network identity (the bridge's loopback), so per-client lockout cannot
+/// apply; this refilling bucket bounds their SUM of pairing attempts instead.
+/// Throttle, not lockout: a hostile client can slow relay enrollment, never
+/// freeze it for everyone. Brute-force exposure stays small because codes are
+/// one-time and short-lived (stronger codes are #6613), and the relay's own
+/// per-node connect bucket caps attempt rate upstream. When OIDC lands at this
+/// boundary (#7141), authenticated enrollees get per-subject limits and this
+/// class bucket remains only for bare pairing-code enrollment.
+pub struct RelayAttemptBucket {
+    state: std::sync::Mutex<(f64, std::time::Instant)>,
+    burst: f64,
+    rate_per_sec: f64,
+}
+
+impl RelayAttemptBucket {
+    pub fn new(burst: u32, rate_per_sec: f64) -> Self {
+        Self {
+            state: std::sync::Mutex::new((f64::from(burst), std::time::Instant::now())),
+            burst: f64::from(burst),
+            rate_per_sec,
+        }
+    }
+
+    /// Take one attempt token; `false` = over budget, caller answers 429.
+    pub fn try_take(&self) -> bool {
+        let mut st = self.state.lock().expect("relay attempt bucket lock");
+        let now = std::time::Instant::now();
+        let (ref mut tokens, ref mut last) = *st;
+        *tokens =
+            (*tokens + now.duration_since(*last).as_secs_f64() * self.rate_per_sec).min(self.burst);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for RelayAttemptBucket {
+    /// Burst 5, refill 0.5/s: a legitimate enrollee is untouched, while a
+    /// sustained brute force across ALL relay clients is held to ~30/min.
+    fn default() -> Self {
+        Self::new(5, 0.5)
+    }
+}
+
 pub struct EnrollServer {
     pub bind_addr: SocketAddr,
     /// Server-authentication-only TLS acceptor (no client cert; this is the
@@ -143,6 +198,10 @@ pub struct EnrollServer {
     /// Data dir used for local operator requests to mint additional pairing
     /// codes. This is intentionally not exposed through the public enrollment
     /// HTTP route because relay traffic reaches this listener over loopback.
+    /// Ports the relay bridge dials enrollment from (None = no relay bridge).
+    pub bridge_ports: Option<BridgePortSet>,
+    /// Class-wide attempt budget for relay-routed enrollment.
+    pub relay_attempt_bucket: RelayAttemptBucket,
     pub paircode_admin_data_dir: Option<PathBuf>,
 }
 
@@ -153,6 +212,7 @@ impl EnrollServer {
         &self,
         req: &EnrollRequest,
         peer: &str,
+        class: PeerClass,
     ) -> Result<EnrollResponse, (u16, String)> {
         // 1. Authenticate: the pairing code is consumed and brute-force protected
         //    before any certificate is signed.
@@ -172,13 +232,36 @@ impl EnrollServer {
                     .to_string(),
             ));
         }
-        let pairing = match self.pairing.reserve_pair(pairing_code, peer).await {
-            Ok(Some(pairing)) => pairing,
-            Ok(None) => {
-                return Err((401, "invalid or already-used pairing code".to_string()));
-            }
-            Err(secs) => {
-                return Err((429, format!("too many attempts; retry in {secs}s")));
+        let pairing = match class {
+            // Direct clients have a real network identity: per-client
+            // brute-force lockout applies as before.
+            PeerClass::Direct => match self.pairing.reserve_pair(pairing_code, peer).await {
+                Ok(Some(pairing)) => pairing,
+                Ok(None) => {
+                    return Err((401, "invalid or already-used pairing code".to_string()));
+                }
+                Err(secs) => {
+                    return Err((429, format!("too many attempts; retry in {secs}s")));
+                }
+            },
+            // Relay-routed clients all share the bridge's loopback identity, so
+            // per-peer lockout would be shared-fate: one hostile client's five
+            // failures would freeze enrollment for every relay client. Bound
+            // their SUM with the class bucket instead, and skip lockout
+            // accounting (see PairingGuard::reserve_pair_unkeyed).
+            PeerClass::RelayBridge => {
+                if !self.relay_attempt_bucket.try_take() {
+                    return Err((
+                        429,
+                        "relay enrollment attempt budget exhausted; retry shortly".to_string(),
+                    ));
+                }
+                match self.pairing.reserve_pair_unkeyed(pairing_code).await {
+                    Some(pairing) => pairing,
+                    None => {
+                        return Err((401, "invalid or already-used pairing code".to_string()));
+                    }
+                }
             }
         };
         let token_hash = pairing.token_hash();
@@ -271,10 +354,24 @@ pub async fn serve_on(
                     continue;
                 };
                 let server = server.clone();
+                // Relay-class detection: the in-process bridge registered its
+                // outbound source port before connecting, so membership here is
+                // authoritative. Loopback-only: a remote host can never claim it.
+                let class = if peer.ip().is_loopback()
+                    && server
+                        .bridge_ports
+                        .as_ref()
+                        .is_some_and(|set| {
+                            set.lock().expect("bridge port set lock").contains(&peer.port())
+                        }) {
+                    PeerClass::RelayBridge
+                } else {
+                    PeerClass::Direct
+                };
                 zeroclaw_spawn::spawn!(async move {
                     let _permit = permit;
                     let peer_ip = peer.ip().to_string();
-                    let fut = handle_conn(&server, tcp, &peer_ip);
+                    let fut = handle_conn(&server, tcp, &peer_ip, class);
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(CONN_TIMEOUT_SECS),
                         fut,
@@ -286,7 +383,22 @@ pub async fn serve_on(
     }
 }
 
-async fn handle_conn(server: &EnrollServer, tcp: tokio::net::TcpStream, peer: &str) {
+/// Which trust class the accepted peer belongs to (see [`BridgePortSet`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PeerClass {
+    /// A directly-connecting client with a real network identity.
+    Direct,
+    /// A logical connection tunnelled by this daemon's own relay bridge; all
+    /// such peers share the bridge's loopback identity.
+    RelayBridge,
+}
+
+async fn handle_conn(
+    server: &EnrollServer,
+    tcp: tokio::net::TcpStream,
+    peer: &str,
+    class: PeerClass,
+) {
     let mut tls = match server.acceptor.accept(tcp).await {
         Ok(s) => s,
         Err(_) => return, // not a TLS client / handshake failure
@@ -329,7 +441,7 @@ async fn handle_conn(server: &EnrollServer, tcp: tokio::net::TcpStream, peer: &s
             return;
         }
     };
-    match server.process(&req, peer).await {
+    match server.process(&req, peer, class).await {
         Ok(resp) => {
             let json = serde_json::to_vec(&resp).unwrap_or_default();
             let _ = write_json(&mut tls, 200, "OK", &json).await;
@@ -532,8 +644,58 @@ mod tests {
             static_client_pins_configured: false,
             allow_unpaired_until: deadline,
             relay_profile: RelayProfile::default(),
+            bridge_ports: None,
+            relay_attempt_bucket: RelayAttemptBucket::default(),
             paircode_admin_data_dir: None,
         }
+    }
+
+    #[tokio::test]
+    async fn relay_class_bad_codes_do_not_lock_out_other_relay_clients() {
+        // Regression: relay-routed clients all reach the daemon from the
+        // bridge's loopback identity. Keyed lockout would let ONE hostile relay
+        // client's five wrong codes freeze enrollment for EVERY relay client for
+        // 300s. RelayBridge peers must use the class bucket (throttle), never
+        // per-peer lockout.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[]);
+        let good = pairing.pairing_code().unwrap();
+        let server = test_server(pairing, None);
+
+        // A hostile relay client submits many wrong codes. All share the bridge
+        // peer; none must trip a per-peer lockout that would return 5xx-flavoured
+        // "retry in Ns" and freeze the class.
+        for _ in 0..12 {
+            let (csr, _k) = zeroclaw_tls::testing::gen_client_csr("x");
+            let req = EnrollRequest {
+                pairing_code: "000000".into(),
+                csr_pem: csr,
+            };
+            let err = server
+                .process(&req, "127.0.0.1", PeerClass::RelayBridge)
+                .await
+                .unwrap_err();
+            // 401 (bad code) or 429 (budget) are both fine; a lockout would also
+            // be 429 but the point is the GOOD code below must still succeed.
+            assert!(matches!(err.0, 401 | 429), "unexpected status {}", err.0);
+        }
+
+        // Time passes so the refilling class bucket has a token for the honest
+        // client (burst 5, refill 0.5/s).
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // A DIFFERENT relay client with the CORRECT code still enrolls. Under
+        // per-peer lockout it would be frozen out by the attacker's failures.
+        let (csr, _k) = zeroclaw_tls::testing::gen_client_csr("honest");
+        let req = EnrollRequest {
+            pairing_code: good,
+            csr_pem: csr,
+        };
+        let resp = server
+            .process(&req, "127.0.0.1", PeerClass::RelayBridge)
+            .await
+            .expect("an honest relay client must still enroll despite another's failures");
+        assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
     }
 
     #[tokio::test]
@@ -548,7 +710,10 @@ mod tests {
             pairing_code: code,
             csr_pem: csr,
         };
-        let resp = server.process(&req, "1.2.3.4").await.unwrap();
+        let resp = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap();
         assert!(resp.device_id.starts_with("dev_"));
         assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(resp.ca_chain_pem.contains("BEGIN CERTIFICATE"));
@@ -582,7 +747,10 @@ mod tests {
             csr_pem: csr,
         };
 
-        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 500);
         assert!(err.1.contains("certificate audit event"), "got: {}", err.1);
         assert!(
@@ -604,7 +772,10 @@ mod tests {
             csr_pem: csr,
         };
 
-        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 409);
         assert!(err.1.contains("pinned_certs"), "got: {}", err.1);
         assert_eq!(
@@ -625,7 +796,10 @@ mod tests {
             csr_pem: "not a csr".to_string(),
         };
 
-        let err = server.process(&bad, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&bad, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 400);
         assert_eq!(
             server.pairing.pairing_code().as_deref(),
@@ -639,7 +813,10 @@ mod tests {
             csr_pem: csr,
         };
         assert!(
-            server.process(&good, "1.2.3.4").await.is_ok(),
+            server
+                .process(&good, "1.2.3.4", PeerClass::Direct)
+                .await
+                .is_ok(),
             "the restored code should work on retry"
         );
     }
@@ -654,7 +831,10 @@ mod tests {
             pairing_code: "000000".to_string(),
             csr_pem: csr,
         };
-        let err = server.process(&bad, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&bad, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 401);
         assert!(server.ledger.list_active().unwrap().is_empty());
     }
@@ -669,7 +849,10 @@ mod tests {
             pairing_code: String::new(),
             csr_pem: csr,
         };
-        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 401);
     }
 
@@ -764,7 +947,10 @@ mod tests {
             pairing_code: String::new(),
             csr_pem: csr,
         };
-        let err = server.process(&req, "1.2.3.4").await.unwrap_err();
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, 401);
         assert!(server.ledger.list_active().unwrap().is_empty());
     }

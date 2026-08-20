@@ -78,6 +78,11 @@ pub struct RelayBridgeConfig {
     pub local_wss_addr: String,
     /// Optional loopback address of the daemon's narrow enrollment listener.
     pub local_enroll_addr: Option<String>,
+    /// Shared with the enrollment endpoint: the bridge registers each outbound
+    /// enroll-dial source port here BEFORE connecting, so the endpoint can
+    /// classify those loopback connections as relay-routed (shared-identity
+    /// peers) rather than direct clients. See `enroll::BridgePortSet`.
+    pub enroll_bridge_ports: Option<crate::enroll::BridgePortSet>,
     /// PKCS#8 of the daemon's Ed25519 registration key.
     pub signing_key_pkcs8: Vec<u8>,
     /// PEM CA to trust for the relay's outer cert; `None` uses public roots.
@@ -643,8 +648,11 @@ async fn serve_once(
                                         .await;
                                     continue;
                                 }
-                                let local = match open_route_target(cfg, peer_hint.as_deref()) {
-                                    Ok(addr) => addr.to_string(),
+                                let (local, is_enroll) = match open_route_target(
+                                    cfg,
+                                    peer_hint.as_deref(),
+                                ) {
+                                    Ok((addr, is_enroll)) => (addr.to_string(), is_enroll),
                                     Err(reason) => {
                                         let _ = to_relay
                                             .send(tungstenite_text(&Control::Close {
@@ -671,9 +679,17 @@ async fn serve_once(
                                     let to_relay = to_relay.clone();
                                     let link_dead = link_dead.clone();
                                     let conns = conns.clone();
+                                    // For enroll-routed conns, share the port set
+                                    // so the endpoint can classify the loopback
+                                    // peer as relay-routed.
+                                    let bridge_ports =
+                                        is_enroll.then(|| cfg.enroll_bridge_ports.clone()).flatten();
                                     zeroclaw_spawn::spawn!(async move {
-                                        bridge_conn(conn_id, &local, to_relay, rx, link_dead, conns)
-                                            .await;
+                                        bridge_conn(
+                                            conn_id, &local, to_relay, rx, link_dead, conns,
+                                            bridge_ports,
+                                        )
+                                        .await;
                                     });
                                 }
                             }
@@ -727,11 +743,26 @@ async fn serve_once(
 fn open_route_target<'a>(
     cfg: &'a RelayBridgeConfig,
     peer_hint: Option<&str>,
-) -> std::result::Result<&'a str, &'static str> {
+) -> std::result::Result<(&'a str, bool), &'static str> {
     match peer_hint {
-        Some(PEER_HINT_ENROLL) => cfg.local_enroll_addr.as_deref().ok_or("enroll_unavailable"),
-        _ => Ok(&cfg.local_wss_addr),
+        Some(PEER_HINT_ENROLL) => cfg
+            .local_enroll_addr
+            .as_deref()
+            .map(|a| (a, true))
+            .ok_or("enroll_unavailable"),
+        _ => Ok((&cfg.local_wss_addr, false)),
     }
+}
+
+/// Minimal drop guard: remove `port` from `set` when the returned value drops.
+fn scopeguard_deregister(set: crate::enroll::BridgePortSet, port: u16) -> impl Drop {
+    struct Guard(crate::enroll::BridgePortSet, u16);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.lock().expect("bridge port set lock").remove(&self.1);
+        }
+    }
+    Guard(set, port)
 }
 
 /// Bridge one logical connection: dial the selected loopback listener, accept the
@@ -743,6 +774,10 @@ async fn bridge_conn(
     mut inbound: mpsc::Receiver<ConnMsg>,
     link_dead: CancellationToken,
     conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>>,
+    // Present only for enroll-routed conns: register our outbound source port
+    // so the enrollment endpoint classifies this loopback peer as relay-routed.
+    // A drop guard deregisters it however this task ends.
+    bridge_ports: Option<crate::enroll::BridgePortSet>,
 ) {
     let local = match TcpStream::connect(local_addr).await {
         Ok(s) => s,
@@ -757,6 +792,18 @@ async fn bridge_conn(
             return;
         }
     };
+
+    // Register our loopback source port so the enrollment endpoint can classify
+    // this connection as relay-routed. Race-free: the port is live the moment
+    // `connect` returned, and we register before shuttling any bytes. `_port_guard`
+    // deregisters on every exit path.
+    let _port_guard = bridge_ports.and_then(|ports| {
+        local.local_addr().ok().map(|a| {
+            let port = a.port();
+            ports.lock().expect("bridge port set lock").insert(port);
+            scopeguard_deregister(ports, port)
+        })
+    });
     // Accept the connection to the relay (it tells the waiting client).
     let _ = to_relay
         .send(tungstenite_text(&Control::Opened { conn_id }))
@@ -1021,6 +1068,7 @@ mod node_id_tests {
             relay_token: None,
             local_wss_addr: "127.0.0.1:9781".into(),
             local_enroll_addr: Some("127.0.0.1:9782".into()),
+            enroll_bridge_ports: None,
             signing_key_pkcs8: Vec::new(),
             relay_ca_path: None,
             relay_insecure: true,
@@ -1039,10 +1087,13 @@ mod node_id_tests {
     #[test]
     fn open_route_defaults_to_wss() {
         let cfg = route_test_config();
-        assert_eq!(open_route_target(&cfg, None).unwrap(), "127.0.0.1:9781");
+        assert_eq!(
+            open_route_target(&cfg, None).unwrap(),
+            ("127.0.0.1:9781", false)
+        );
         assert_eq!(
             open_route_target(&cfg, Some("unknown")).unwrap(),
-            "127.0.0.1:9781"
+            ("127.0.0.1:9781", false)
         );
     }
 
@@ -1051,7 +1102,7 @@ mod node_id_tests {
         let cfg = route_test_config();
         assert_eq!(
             open_route_target(&cfg, Some(PEER_HINT_ENROLL)).unwrap(),
-            "127.0.0.1:9782"
+            ("127.0.0.1:9782", true)
         );
     }
 

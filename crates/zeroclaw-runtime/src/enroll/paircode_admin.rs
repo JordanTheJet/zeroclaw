@@ -275,6 +275,8 @@ mod tests {
             static_client_pins_configured: false,
             allow_unpaired_until: None,
             relay_profile: RelayProfile::default(),
+            bridge_ports: None,
+            relay_attempt_bucket: crate::enroll::RelayAttemptBucket::default(),
             paircode_admin_data_dir: None,
         })
     }
