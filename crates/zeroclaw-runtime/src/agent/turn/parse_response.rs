@@ -630,6 +630,7 @@ mod cost_usd_regression_tests {
             event_tx: Some(&tx),
             hooks: None,
             dedup_exempt_tools: &dedup_exempt_tools,
+            tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
