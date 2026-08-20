@@ -80,7 +80,8 @@ pub(crate) fn render(what: &str, data: &Value) -> anyhow::Result<ToolResult> {
     text.push('\n');
     let mut rendered = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
     if rendered.len() > MAX_OUTPUT_BYTES {
-        rendered.truncate(MAX_OUTPUT_BYTES);
+        let boundary = crate::util_helpers::floor_char_boundary(&rendered, MAX_OUTPUT_BYTES);
+        rendered.truncate(boundary);
         rendered.push_str("\n… truncated");
     }
     text.push_str(&rendered);
@@ -194,6 +195,23 @@ mod tests {
             text.contains("truncated"),
             "truncation must be visible to the reader"
         );
+    }
+
+    #[test]
+    fn truncates_multibyte_reading_on_a_char_boundary() {
+        let data = json!({ "value": "€".repeat(MAX_OUTPUT_BYTES) });
+        let serialized = serde_json::to_string_pretty(&data).unwrap();
+        assert!(serialized.len() > MAX_OUTPUT_BYTES);
+        assert!(
+            !serialized.is_char_boundary(MAX_OUTPUT_BYTES),
+            "fixture must place the byte cap inside a multibyte character"
+        );
+
+        let result = render("sensors", &data).expect("UTF-8 output truncation must not panic");
+
+        let text = result.output.as_str();
+        assert!(text.contains("truncated"));
+        assert!(text.is_char_boundary(text.len()));
     }
 
     #[test]
