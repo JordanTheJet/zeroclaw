@@ -28,7 +28,11 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use tempfile::TempDir;
-use zeroclaw_config::schema::{AliasedAgentConfig, Config, PluginEntryConfig, RiskProfileConfig};
+use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+use zeroclaw_config::schema::{
+    AliasedAgentConfig, Config, DelegateExecutionMode, DelegateTargetConfig, PluginEntryConfig,
+    RiskProfileConfig, RuntimeProfileConfig,
+};
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::{PluginCapability, PluginManifest};
 
@@ -187,6 +191,56 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
     config
 }
 
+/// The delegating variant of [`live_agent_config`]: `plugin-agent` may delegate,
+/// and reaches `plugin-target` in **independent** mode, which is the mode that
+/// makes the delegate build a target-owned tool registry (and therefore a second,
+/// nested set of plugin tools) instead of lending the parent's own tools.
+fn live_delegating_agent_config(
+    tmp: &TempDir,
+    plugins_root: &std::path::Path,
+    instance_key: &str,
+) -> Config {
+    let mut config = live_agent_config(tmp, plugins_root, instance_key);
+
+    config.risk_profiles.insert(
+        "delegator-profile".to_string(),
+        RiskProfileConfig {
+            delegation_policy: DelegationPolicy {
+                mode: DelegationMode::Allow,
+            },
+            ..RiskProfileConfig::default()
+        },
+    );
+    config.runtime_profiles.insert(
+        "agentic-profile".to_string(),
+        RuntimeProfileConfig {
+            agentic: true,
+            ..RuntimeProfileConfig::default()
+        },
+    );
+
+    let parent = config
+        .agents
+        .get_mut("plugin-agent")
+        .expect("the parent agent is seeded by live_agent_config");
+    parent.risk_profile = "delegator-profile".into();
+    parent.delegates = vec![DelegateTargetConfig {
+        agent: "plugin-target".to_string(),
+        mode: DelegateExecutionMode::Independent,
+    }];
+
+    config.agents.insert(
+        "plugin-target".to_string(),
+        AliasedAgentConfig {
+            model_provider: "custom.default".into(),
+            risk_profile: "test-profile".into(),
+            runtime_profile: "agentic-profile".into(),
+            ..AliasedAgentConfig::default()
+        },
+    );
+    config
+}
+
 #[tokio::test]
 async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
     let tmp = TempDir::new().expect("temp dir");
@@ -254,5 +308,110 @@ async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
         "an already-constructed plugin tool must resolve config from the live handle \
          on every call; observing the startup value means the live-Agent constructor \
          dropped the handle when it built the tool registry"
+    );
+}
+
+/// The same contract one level down: a **delegated** target's plugin tools.
+///
+/// The test above only reaches the parent agent's own registry. An independent
+/// delegate target gets a *second*, nested registry, built by
+/// `DelegateTool::independent_agentic_tools_for_target` from the `Arc<Config>`
+/// snapshot the DelegateTool captured at construction. If the shared handle is
+/// not carried into the DelegateTool and forwarded into that nested build, the
+/// delegated target's plugin tools resolve `[plugins.entries.config]` against
+/// startup state forever - config reload and credential rotation are invisible
+/// to every plugin tool a delegate ever runs, while the parent's own copies of
+/// the same plugin follow reloads correctly. That split is the failure this
+/// pins.
+///
+/// The delegate instance under test is the one the **production** registry
+/// built (`Agent.delegate_tool`, captured from `all_tools_with_runtime`), not a
+/// hand-rolled one: re-deriving the builder chain in the test would keep
+/// passing if the production chain dropped the handle, which is exactly the
+/// defect class here.
+#[tokio::test]
+async fn live_delegated_plugin_tool_observes_config_reload_after_construction() {
+    let tmp = TempDir::new().expect("temp dir");
+    let plugins_root = tmp.path().join("plugins");
+    let instance_key = install_fixture_plugin(&plugins_root);
+    let config = live_delegating_agent_config(&tmp, &plugins_root, &instance_key);
+
+    let live = Arc::new(RwLock::new(config));
+    let agent = Agent::from_live_config_with_tui_env(
+        Arc::clone(&live),
+        "plugin-agent",
+        None,
+        false,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("build a live-config Agent that can delegate independently");
+
+    let delegate = agent.delegate_tool.as_ref().expect(
+        "the parent registry must register a DelegateTool when delegation targets are \
+         configured; without it this regression cannot reach a delegated registry at all",
+    );
+    let target_policy = delegate
+        .policy_for_target("plugin-target")
+        .expect("the independent target's security policy resolves");
+
+    // The nested registry is built ONCE, here - before the reload below. Its
+    // plugin tools must still resolve per execution.
+    let delegated = delegate
+        .independent_agentic_tools_for_target("plugin-target", target_policy)
+        .await
+        .expect("the independent target's own tool registry builds");
+
+    let tool = delegated
+        .tools
+        .iter()
+        .find(|tool| tool.name() == "config-echo")
+        .expect(
+            "the fixture tool plugin must be registered on the delegated target; without it \
+             this regression cannot observe delegated plugin config resolution at all",
+        );
+
+    let before = tool
+        .execute(serde_json::json!({"text": "hello world"}))
+        .await
+        .expect("first delegated plugin execution");
+    assert!(
+        before.success,
+        "first delegated plugin execution failed: {before:?}"
+    );
+    assert_eq!(
+        before.output.as_str(),
+        "label=before-reload|uppercase=false|max_len=0|keys=3|text=hello world",
+        "the delegated plugin must observe the operator's section as configured at startup"
+    );
+
+    // A reload / credential rotation, with no parent rebuild, no new DelegateTool,
+    // and no new delegated registry.
+    live.write()
+        .plugins
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == instance_key)
+        .expect("the canonical instance entry is present in the live config")
+        .config
+        .insert("label".to_string(), "after-reload".to_string());
+
+    let after = tool
+        .execute(serde_json::json!({"text": "hello world"}))
+        .await
+        .expect("second delegated plugin execution");
+    assert!(
+        after.success,
+        "second delegated plugin execution failed: {after:?}"
+    );
+    assert_eq!(
+        after.output.as_str(),
+        "label=after-reload|uppercase=false|max_len=0|keys=3|text=hello world",
+        "a delegated plugin tool must resolve config from the live handle on every call; \
+         observing the startup value means the shared handle was dropped between the parent \
+         registry and the target-owned registry the DelegateTool builds"
     );
 }
