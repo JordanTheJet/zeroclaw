@@ -19,13 +19,19 @@
 use zeroclaw_infra::net_guard::normalize_egress_pattern;
 
 /// The config path holding an instance's granted allowlist.
+///
+/// `instance_key` is the opaque `zpi1_` key from
+/// `PluginInstanceScope::config_entry_key()` — the same key the instance's
+/// private `config` map resolves against. One `[[plugins.entries]]` row per
+/// instance carries both, so the grant and the config an operator edits are
+/// never split across two rows.
 #[must_use]
-pub fn egress_hosts_path(plugin_name: &str) -> String {
-    format!("plugins.entries.{plugin_name}.egress_hosts")
+pub fn egress_hosts_path(instance_key: &str) -> String {
+    format!("plugins.entries.{instance_key}.egress_hosts")
 }
 
-/// The exact `zeroclaw config set` invocation that makes `hosts` the entry's
-/// granted allowlist.
+/// The exact `zeroclaw config set` invocation that makes `hosts` the instance
+/// row's granted allowlist.
 ///
 /// `config set` on a string array **replaces** the list rather than appending
 /// to it, so a command that is meant to *add* a destination has to carry the
@@ -34,10 +40,10 @@ pub fn egress_hosts_path(plugin_name: &str) -> String {
 /// additions. The value is double-quoted because suffix patterns start with `*`
 /// and a bare `*.example.com` would be glob-expanded by the operator's shell.
 #[must_use]
-pub fn egress_set_command(plugin_name: &str, hosts: &[String]) -> String {
+pub fn egress_set_command(instance_key: &str, hosts: &[String]) -> String {
     format!(
         "zeroclaw config set {} \"{}\"",
-        egress_hosts_path(plugin_name),
+        egress_hosts_path(instance_key),
         hosts.join(",")
     )
 }
@@ -226,14 +232,21 @@ mod tests {
     }
 
     #[test]
-    fn set_command_quotes_the_value_so_suffix_patterns_survive_the_shell() {
-        let cmd = egress_set_command(
-            "weather-tool",
-            &v(&["api.example.com", "*.cdn.example.com"]),
-        );
+    fn set_command_targets_the_instance_row_and_quotes_the_value() {
+        // The path is keyed by the opaque `zpi1_` instance key, not the
+        // package name: that is the row `entry_config` resolves against, so
+        // config and grant stay on one row.
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let cmd = egress_set_command(key, &v(&["api.example.com", "*.cdn.example.com"]));
         assert_eq!(
             cmd,
-            "zeroclaw config set plugins.entries.weather-tool.egress_hosts \"api.example.com,*.cdn.example.com\""
+            format!(
+                "zeroclaw config set plugins.entries.{key}.egress_hosts \"api.example.com,*.cdn.example.com\""
+            )
+        );
+        assert!(
+            !cmd.contains("plugins.entries.weather-tool."),
+            "the command must not address a package-name-keyed row: {cmd}"
         );
         assert!(
             cmd.contains('"'),
