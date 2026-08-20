@@ -35,6 +35,17 @@ expect "runtime live-config regression" "true" \
 expect "runtime elsewhere" "true" \
     "crates/zeroclaw-runtime/src/tools/mod.rs"
 
+# Config-only changes must run the backend job: zeroclaw-config owns the
+# operator-facing plugin config surface that zeroclaw-plugins compiles
+# against, so this job can break with nothing under the plugin crate touched.
+expect "config plugin entry schema" "true" \
+    "crates/zeroclaw-config/src/schema.rs"
+expect "config crate elsewhere" "true" \
+    "crates/zeroclaw-config/src/lib.rs"
+expect "mixed unrelated then config" "true" \
+    "web/src/pages/AgentChat.tsx" \
+    "crates/zeroclaw-config/src/schema.rs"
+
 expect "wit contracts" "true" "wit/v0/tool-plugin.wit"
 expect "workspace manifest" "true" "Cargo.toml"
 expect "workspace lockfile" "true" "Cargo.lock"
