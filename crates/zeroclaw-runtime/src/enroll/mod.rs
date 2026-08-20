@@ -131,9 +131,9 @@ pub type BridgePortSet = std::sync::Arc<std::sync::Mutex<std::collections::HashS
 /// apply; this refilling bucket bounds their SUM of pairing attempts instead.
 /// Throttle, not lockout: a hostile client can slow relay enrollment, never
 /// freeze it for everyone. Brute-force exposure stays small because codes are
-/// one-time and short-lived (stronger codes are #6613), and the relay's own
-/// per-node connect bucket caps attempt rate upstream. When OIDC lands at this
-/// boundary (#7141), authenticated enrollees get per-subject limits and this
+/// one-time and short-lived, and the relay's own per-node connect bucket caps
+/// attempt rate upstream. When pluggable inbound authentication lands at this
+/// enrollment boundary, authenticated enrollees get per-subject limits and this
 /// class bucket remains only for bare pairing-code enrollment.
 pub struct RelayAttemptBucket {
     state: std::sync::Mutex<(f64, std::time::Instant)>,
