@@ -26,10 +26,19 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zerorelay-target,target=/app/target,sharing=locked \
     cargo build --release -p zerorelay \
     && cp target/release/zerorelay /usr/local/bin/zerorelay
+# Seed an empty /data owned by the runtime UID. The runtime stage is distroless
+# (no shell), so the directory cannot be created there. Docker copies an image
+# directory's ownership into a FRESH named volume mounted over it, so shipping
+# /data as 65532 is what lets the documented `compose up` self-provision TLS.
+RUN mkdir -p /seed/data && chown -R 65532:65532 /seed/data
 
 # --- Stage 2: minimal distroless runtime (no shell) ---
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /usr/local/bin/zerorelay /usr/local/bin/zerorelay
+# /data must exist in the image owned by nonroot (65532) or a fresh named
+# volume mounts root-owned and self-provisioning fails with
+# `mkdir: can't create directory '/data/tls': Permission denied`.
+COPY --from=builder --chown=65532:65532 /seed/data /data
 # Ship a default config (bind 0.0.0.0:8443, self-provision TLS into /data/tls,
 # open admission). Mount your own at /etc/zerorelay/relay.toml to override, then
 # `kill -HUP` the process to hot-reload the [admission] section.
