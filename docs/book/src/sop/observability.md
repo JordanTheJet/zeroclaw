@@ -23,6 +23,13 @@ page displays these events as a timeline. The CLI and ZeroCode Logs pane query
 the same persisted, scrubbed runtime trace rather than maintaining separate SOP
 log storage:
 
+Each completed, failed, or skipped step also emits a structured result event.
+Its message contains a short result summary and its `attributes.output` contains
+up to 4,096 characters of credential-scrubbed output, together with the step
+number, status, effective agent, and captured tool-call count. The canonical
+untruncated step result remains in the SOP audit record; the bounded projection
+keeps the shared runtime log safe to render and search.
+
 <div class="os-tabs-src">
 
 #### sh

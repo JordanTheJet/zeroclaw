@@ -4254,6 +4254,21 @@ impl RpcDispatcher {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let dedup_key = req
+            .dedup_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "dedup_key exceeds {} bytes",
+                    crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                ),
+            ));
+        }
 
         let event = crate::sop::SopEvent {
             source: crate::sop::SopTriggerSource::Manual,
@@ -4262,8 +4277,14 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results =
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        let results = if let Some(dedup_key) = dedup_key {
+            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
+                engine, audit, event, &req.name, dedup_key,
+            )
+            .await
+        } else {
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        };
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
