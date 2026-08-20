@@ -3216,7 +3216,7 @@ fn issue_wss_client_cert(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let ledger = CertLedger::open(&config.data_dir, None)?;
+        let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
         ledger.record_issued(
             &LedgerEntry {
                 device_id: name.to_string(),
@@ -3369,7 +3369,7 @@ fn revoke_wss_client_cert(
     use zeroclaw_runtime::security::cert_ledger::CertLedger;
     // `operator` matches the issuance actor `issue-client-cert` records.
     const ACTOR: &str = "operator";
-    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
     let changed = if let Some(fp) = fingerprint {
         let fp = fp.trim().to_ascii_lowercase();
         if ledger.mark_revoked(&fp, ACTOR)? {
@@ -3426,13 +3426,25 @@ fn revoke_wss_client_cert(
     Ok(())
 }
 
+/// The revoked-fingerprint list this daemon's WSS verifier actually reads:
+/// `[wss.client_auth].crl_path` when set, else the ledger default. Operator
+/// commands must materialize to this path or a revocation is reported but never
+/// enforced.
+#[cfg(feature = "agent-runtime")]
+fn effective_crl_path(config: &Config) -> std::path::PathBuf {
+    zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+        &config.data_dir,
+        config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+    )
+}
+
 /// List the still-active client certificates this daemon's CA has issued, read
 /// from the issued-cert ledger. Read-only operator visibility into who holds a
 /// live certificate.
 #[cfg(feature = "agent-runtime")]
 fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
     use zeroclaw_runtime::security::cert_ledger::CertLedger;
-    let ledger = CertLedger::open(&config.data_dir, None)?;
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
     let active = ledger.list_active()?;
     if json {
         let rows: Vec<serde_json::Value> = active
@@ -4927,10 +4939,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let crl_path = configured_crl_path.clone().unwrap_or_else(|| {
                             default_crl_path.to_string_lossy().into_owned()
                         });
-                        if configured_crl_path.is_none() {
+                        // Materialize to the path the verifier will read,
+                        // including a configured override. Skipping this when an
+                        // override is set left `revoke-client-cert` writing to
+                        // the default file while the handshake honoured a stale
+                        // one, so a revoked cert kept authenticating.
+                        {
                             let ledger =
-                                zeroclaw_runtime::security::cert_ledger::CertLedger::open(
-                                    &data_dir, None,
+                                zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+                                    &data_dir,
+                                    None,
+                                    std::path::PathBuf::from(&crl_path),
                                 )
                                 .context(
                                     "open cert ledger before starting WSS revocation checks",

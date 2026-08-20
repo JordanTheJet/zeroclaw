@@ -111,17 +111,46 @@ pub fn revoked_list_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("tls").join("revoked")
 }
 
+/// The revoked-fingerprint list the WSS verifier will *actually* read: the
+/// operator's `[wss.client_auth].crl_path` when set, otherwise the ledger
+/// default under `<data_dir>/tls/revoked`.
+///
+/// Revocation must materialize to THIS path. Materializing to the default while
+/// the verifier honours a configured override lets `revoke-client-cert` report
+/// success while the next handshake still accepts the certificate — the
+/// transport design of record requires revocation to fail closed.
+pub fn effective_revoked_list_path(
+    data_dir: &Path,
+    configured_crl_path: Option<&str>,
+) -> std::path::PathBuf {
+    match configured_crl_path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => revoked_list_path(data_dir),
+    }
+}
+
 impl CertLedger {
     /// Open (creating if absent) the ledger at `<data_dir>/tls/ledger.db`. The CA
     /// already lives under `<data_dir>/tls/`, so the ledger sits beside it.
     pub fn open(data_dir: &Path, audit: Option<Arc<AuditLogger>>) -> Result<Self> {
+        Self::open_at(data_dir, audit, revoked_list_path(data_dir))
+    }
+
+    /// Open the ledger with an explicit materialization target, for callers that
+    /// know the verifier reads a configured `crl_path` rather than the default.
+    /// See [`effective_revoked_list_path`].
+    pub fn open_at(
+        data_dir: &Path,
+        audit: Option<Arc<AuditLogger>>,
+        revoked_path: std::path::PathBuf,
+    ) -> Result<Self> {
         let tls_dir = data_dir.join("tls");
         std::fs::create_dir_all(&tls_dir)
             .with_context(|| format!("create tls dir {}", tls_dir.display()))?;
         let db_path = tls_dir.join("ledger.db");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open cert ledger DB: {}", db_path.display()))?;
-        Self::init(conn, audit, Some(revoked_list_path(data_dir)))
+        Self::init(conn, audit, Some(revoked_path))
     }
 
     /// In-memory ledger for unit tests.
@@ -542,6 +571,54 @@ mod tests {
         let set = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
         assert!(set.contains("fpa")); // load normalizes to lowercase
         assert!(!set.contains("fpb"));
+    }
+
+    #[test]
+    fn revoke_materializes_to_a_configured_crl_path_not_the_default() {
+        // Regression: with `[wss.client_auth].crl_path` set, the WSS verifier
+        // reads THAT file. Materializing to the default instead let
+        // `revoke-client-cert` report success while the next handshake still
+        // accepted the certificate. Revocation must fail closed.
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("operator-managed.crl");
+
+        let effective = effective_revoked_list_path(dir.path(), Some(custom.to_str().unwrap()));
+        assert_eq!(effective, custom, "a configured path wins over the default");
+
+        let led = CertLedger::open_at(dir.path(), None, effective.clone()).unwrap();
+        led.record_issued(&entry("fpA", "dev1"), false).unwrap();
+        assert!(led.mark_revoked("fpA", "operator").unwrap());
+
+        // The configured file - the one the verifier reads - carries the revocation.
+        let set = zeroclaw_tls::load_revoked_fingerprints(&custom).unwrap();
+        assert!(
+            set.contains("fpa"),
+            "revocation must land in the configured CRL path"
+        );
+
+        // And it did not silently go only to the default path.
+        let default_body =
+            std::fs::read_to_string(revoked_list_path(dir.path())).unwrap_or_default();
+        assert!(
+            !default_body.contains("fpA"),
+            "revocation must not be written only to the unused default path"
+        );
+    }
+
+    #[test]
+    fn effective_revoked_list_path_falls_back_when_unset_or_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = revoked_list_path(dir.path());
+        assert_eq!(effective_revoked_list_path(dir.path(), None), default_path);
+        assert_eq!(
+            effective_revoked_list_path(dir.path(), Some("")),
+            default_path
+        );
+        assert_eq!(
+            effective_revoked_list_path(dir.path(), Some("   ")),
+            default_path,
+            "a whitespace-only crl_path is not a real override"
+        );
     }
 
     #[test]
