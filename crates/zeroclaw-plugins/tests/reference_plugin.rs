@@ -27,12 +27,15 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use tempfile::TempDir;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::error::PluginError;
+use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
+use zeroclaw_plugins::signature;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 use support::admit_fixture;
@@ -144,6 +147,35 @@ fn host_services(
     PluginHostServices::new(PluginConfigResolver::new(move |scope| {
         resolve_plugin_config(&manifest, scope, configured.as_ref())
     }))
+}
+
+/// Admit the fixture from a package directory the caller keeps alive.
+///
+/// `support::admit_fixture` drops its package as soon as it returns, which is
+/// what every other test here wants. This variant hands the package back so a
+/// test can rewrite the payload on disk *after* admission and then observe
+/// which bytes actually execute.
+fn admit_from_live_package(manifest: &PluginManifest) -> (TempDir, AdmittedComponent, PathBuf) {
+    let root = tempfile::tempdir().expect("create fixture package root");
+    let plugin_dir = root.path().join(&manifest.name);
+    std::fs::create_dir_all(&plugin_dir).expect("create fixture package directory");
+    let relative = manifest
+        .wasm_path
+        .as_deref()
+        .expect("executable fixture declares wasm_path");
+    let payload = plugin_dir.join(relative);
+    std::fs::copy(fixture(), &payload).expect("copy fixture payload into package");
+    std::fs::write(
+        plugin_dir.join("manifest.toml"),
+        toml::to_string(manifest).expect("serialize fixture manifest"),
+    )
+    .expect("write fixture manifest");
+
+    let host = PluginHost::from_plugins_dir(root.path()).expect("admit fixture package");
+    let details = host.tool_plugin_details();
+    assert_eq!(details.len(), 1, "fixture package must be admitted once");
+    let component = details[0].1.clone();
+    (root, component, payload)
 }
 
 #[tokio::test]
@@ -315,6 +347,49 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
     assert_eq!(
         result.output.as_str(),
         "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO"
+    );
+}
+
+/// The whole point of component admission, proven where it matters: in a live
+/// guest, not in a unit test over a struct field.
+///
+/// The manifest pins `wasm_sha256`, so admission verifies the digest against
+/// the bytes it actually read and keeps *those* bytes. The payload on disk is
+/// then replaced with a bare core module — a well-formed WASM file that is not
+/// a component. If any later stage reopened the manifest path, instantiation
+/// would fail outright. It instead runs, and produces the exact output line of
+/// the generation that was admitted.
+#[tokio::test]
+async fn reference_plugin_executes_the_exact_admitted_payload_bytes() {
+    let (mut manifest, _) = context([PluginPermission::ConfigRead]);
+    manifest.wasm_sha256 = Some(signature::sha256_hex(
+        &std::fs::read(fixture()).expect("read the built fixture payload"),
+    ));
+    let scope = PluginInstanceScope::from_manifest(
+        &manifest,
+        PluginCapability::Tool,
+        "main",
+        [PluginPermission::ConfigRead],
+    )
+    .expect("digest-pinned fixture manifest admits its effective grants");
+
+    let (_package, component, payload) = admit_from_live_package(&manifest);
+    std::fs::write(&payload, b"\0asm\x01\x00\x00\x00").expect("replace the admitted payload");
+
+    let services = host_services(manifest, Some(operator_section()));
+    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+        .await
+        .expect("the admitted bytes instantiate even after the file on disk was replaced");
+
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
+        .await
+        .expect("execute config-echo tool");
+
+    assert!(result.success);
+    assert_eq!(
+        result.output.as_str(),
+        "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO",
+        "the executed component must be the exact generation admission verified"
     );
 }
 
