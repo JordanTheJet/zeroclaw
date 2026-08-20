@@ -54,9 +54,7 @@ runs:
         echo "SCCACHE_GHA_VERSION=zeroclaw-v1" >> "$GITHUB_ENV"
         echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-        # Temporary PR-scoped seed experiment. GitHub isolates these writes to
-        # refs/pull/10154/merge; restore master-only writes after the seed run.
-        if [[ "$GITHUB_REF" == "refs/heads/master" || "$GITHUB_REF" == "refs/pull/10154/merge" ]]; then
+        if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
           echo "SCCACHE_GHA_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
         else
           echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"

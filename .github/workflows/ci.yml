@@ -153,9 +153,6 @@ jobs:
           bash scripts/ci/comment_hygiene_gate.sh
       - name: act-local artifact compatibility tests
         run: bash scripts/dev/act-local.test.sh
-      - name: Show sccache statistics
-        if: ${{ always() && vars.CI_USE_BLACKSMITH == 'true' }}
-        run: sccache --show-stats
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
@@ -317,9 +314,6 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      - name: Show sccache statistics
-        if: ${{ always() && vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
-        run: sccache --show-stats
 
   check:
     name: Check (${{ matrix.name }})
@@ -538,9 +532,6 @@ jobs:
           exit "$cargo_status"
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
-      - name: Show sccache statistics
-        if: ${{ always() && vars.CI_USE_BLACKSMITH == 'true' }}
-        run: sccache --show-stats
 
   # ── Post-format tests ─────────────────────────────────────────────────────
 
@@ -583,9 +574,6 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      - name: Show sccache statistics
-        if: ${{ always() && vars.CI_USE_BLACKSMITH == 'true' }}
-        run: sccache --show-stats
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
