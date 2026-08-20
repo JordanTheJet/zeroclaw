@@ -45,12 +45,14 @@
 //! the rename it could read a truncated document, and without the mode the
 //! challenge would sit at the prevailing umask. The assertion and
 //! acknowledgement are written by whoever runs the ceremony, so their
-//! permissions are theirs to set; this module consumes and deletes them as soon
-//! as they are read.
+//! permissions are theirs to set. Assertions are consumed only after they parse
+//! completely and match the current challenge; an in-progress or superseded
+//! response remains available to be completed or replaced until the deadline.
 
 #![cfg(feature = "whatsapp-web")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -270,6 +272,8 @@ impl FilePasskeyConfirmation {
 pub struct FilePasskeyAuthenticator {
     session_path: String,
     wait: Duration,
+    generation: AtomicU64,
+    file_ops: tokio::sync::Mutex<()>,
 }
 
 impl FilePasskeyAuthenticator {
@@ -278,6 +282,8 @@ impl FilePasskeyAuthenticator {
         Self {
             session_path: session_path.into(),
             wait: DEFAULT_WAIT,
+            generation: AtomicU64::new(0),
+            file_ops: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -292,6 +298,24 @@ impl FilePasskeyAuthenticator {
     #[must_use]
     pub fn into_arc(self) -> Arc<dyn PasskeyAuthenticator> {
         Arc::new(self)
+    }
+
+    fn begin_attempt(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn owns_attempt(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == generation
+    }
+
+    async fn cleanup_attempt(&self, generation: u64, request_file: &str, assertion_file: &str) {
+        let _file_guard = self.file_ops.lock().await;
+        if self.owns_attempt(generation) {
+            let _ = tokio::fs::remove_file(assertion_file).await;
+            let _ = tokio::fs::remove_file(request_file).await;
+        }
     }
 }
 
@@ -346,21 +370,78 @@ pub fn parse_assertion(bytes: Vec<u8>) -> Result<Assertion, PasskeyError> {
     })
 }
 
+fn parse_assertion_for_request(
+    bytes: Vec<u8>,
+    request: &AssertionRequest,
+) -> Result<Assertion, PasskeyError> {
+    let assertion = parse_assertion(bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&assertion.assertion_json)
+        .map_err(|e| PasskeyError::InvalidOptions(format!("assertion is not valid JSON: {e}")))?;
+    let client_data = value
+        .get("response")
+        .and_then(|response| response.get("clientDataJSON"))
+        .and_then(|client_data| client_data.as_str())
+        .ok_or_else(|| {
+            PasskeyError::InvalidOptions(
+                "assertion is missing `response.clientDataJSON`; save the full credential JSON returned by navigator.credentials.get()".into(),
+            )
+        })?;
+    let client_data = BASE64_URL_SAFE_NO_PAD
+        .decode(client_data.trim_end_matches('='))
+        .map_err(|e| {
+            PasskeyError::InvalidOptions(format!("clientDataJSON is not base64url: {e}"))
+        })?;
+    let client_data: serde_json::Value = serde_json::from_slice(&client_data).map_err(|e| {
+        PasskeyError::InvalidOptions(format!("clientDataJSON is not valid JSON: {e}"))
+    })?;
+    let challenge = client_data
+        .get("challenge")
+        .and_then(|challenge| challenge.as_str())
+        .ok_or_else(|| {
+            PasskeyError::InvalidOptions("clientDataJSON is missing the request challenge".into())
+        })?;
+    let challenge = BASE64_URL_SAFE_NO_PAD
+        .decode(challenge.trim_end_matches('='))
+        .map_err(|e| {
+            PasskeyError::InvalidOptions(format!("clientDataJSON challenge is not base64url: {e}"))
+        })?;
+    if challenge != request.challenge {
+        return Err(PasskeyError::InvalidOptions(
+            "assertion challenge does not match the current passkey request".into(),
+        ));
+    }
+    Ok(assertion)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PasskeyAuthenticator for FilePasskeyAuthenticator {
     async fn get_assertion(&self, request: &AssertionRequest) -> Result<Assertion, PasskeyError> {
         let request_file = request_path(&self.session_path);
         let assertion_file = assertion_path(&self.session_path);
+        let generation;
 
-        // Clear any assertion left by a previous attempt before advertising a
-        // new challenge. A stale file answers the WRONG challenge, so the
-        // server would reject it and burn this attempt for no reason.
-        let _ = tokio::fs::remove_file(&assertion_file).await;
+        {
+            // The lock covers only short file mutations. It never spans the
+            // operator wait, so a reissued request supersedes the old one
+            // instead of queuing behind its five-minute deadline.
+            let _file_guard = self.file_ops.lock().await;
+            generation = self.begin_attempt();
 
-        publish_private(&request_file, request.raw_options_json.as_bytes())
-            .await
-            .map_err(|e| PasskeyError::Backend(format!("could not write {request_file}: {e}")))?;
+            // Clear any assertion left by a previous attempt before
+            // advertising a new challenge. A stale file answers the wrong
+            // challenge, so the server would reject it and burn this attempt.
+            let _ = tokio::fs::remove_file(&assertion_file).await;
+            if let Err(error) =
+                publish_private(&request_file, request.raw_options_json.as_bytes()).await
+            {
+                let _ = tokio::fs::remove_file(&request_file).await;
+                let _ = tokio::fs::remove_file(format!("{request_file}.tmp")).await;
+                return Err(PasskeyError::Backend(format!(
+                    "could not write {request_file}: {error}"
+                )));
+            }
+        }
 
         ::zeroclaw_log::record!(
             WARN,
@@ -376,29 +457,49 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
         );
 
         let deadline = tokio::time::Instant::now() + self.wait;
+        let mut last_invalid = None;
         loop {
-            match tokio::fs::read(&assertion_file).await {
-                Ok(bytes) if !bytes.is_empty() => {
-                    // Consume it either way: on success it is spent, and on a
-                    // malformed payload leaving it in place would make the
-                    // next attempt re-read the same bad file forever.
-                    let _ = tokio::fs::remove_file(&assertion_file).await;
-                    let _ = tokio::fs::remove_file(&request_file).await;
-                    let assertion = parse_assertion(bytes)?;
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "WhatsApp passkey assertion accepted; resuming device linking"
-                    );
-                    return Ok(assertion);
+            {
+                let _file_guard = self.file_ops.lock().await;
+                if !self.owns_attempt(generation) {
+                    return Err(PasskeyError::Cancelled);
                 }
-                // Absent, or present but still being written: keep waiting.
-                _ => {}
+
+                match tokio::fs::read(&assertion_file).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        match parse_assertion_for_request(bytes, request) {
+                            Ok(assertion) => {
+                                let _ = tokio::fs::remove_file(&assertion_file).await;
+                                let _ = tokio::fs::remove_file(&request_file).await;
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    ),
+                                    "WhatsApp passkey assertion accepted; resuming device linking"
+                                );
+                                return Ok(assertion);
+                            }
+                            Err(error) => {
+                                // A manual writer may still be appending JSON,
+                                // or this may be a late response to the request
+                                // this generation replaced. Leave it available
+                                // to be completed or overwritten until the
+                                // deadline rather than destroying the response.
+                                last_invalid = Some(error);
+                            }
+                        }
+                    }
+                    // Absent or empty: keep waiting.
+                    _ => {}
+                }
             }
 
             if tokio::time::Instant::now() >= deadline {
-                let _ = tokio::fs::remove_file(&request_file).await;
-                return Err(PasskeyError::Cancelled);
+                self.cleanup_attempt(generation, &request_file, &assertion_file)
+                    .await;
+                return Err(last_invalid.unwrap_or(PasskeyError::Cancelled));
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -410,13 +511,50 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
 mod tests {
     use super::*;
 
+    fn assertion_request(challenge: &[u8]) -> AssertionRequest {
+        AssertionRequest {
+            challenge: challenge.to_vec(),
+            rp_id: Some("web.whatsapp.com".into()),
+            allow_credentials: vec![],
+            user_verification: whatsapp_rust::passkey::UserVerification::Preferred,
+            timeout_ms: Some(60_000),
+            raw_options_json: serde_json::json!({
+                "challenge": BASE64_URL_SAFE_NO_PAD.encode(challenge),
+            })
+            .to_string(),
+        }
+    }
+
+    async fn wait_for_contents(path: &str, expected: &str) {
+        for _ in 0..100 {
+            if tokio::fs::read_to_string(path)
+                .await
+                .is_ok_and(|contents| contents == expected)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{path} never contained the expected passkey request");
+    }
+
     fn credential_json(raw_id: &str, signature: &str) -> Vec<u8> {
+        credential_json_for_challenge(raw_id, signature, &[1, 2, 3])
+    }
+
+    fn credential_json_for_challenge(raw_id: &str, signature: &str, challenge: &[u8]) -> Vec<u8> {
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(challenge),
+            "origin": "https://web.whatsapp.com",
+        });
+        let client_data = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&client_data).unwrap());
         serde_json::json!({
             "id": raw_id,
             "rawId": raw_id,
             "type": "public-key",
             "response": {
-                "clientDataJSON": "eyJ0IjoxfQ",
+                "clientDataJSON": client_data,
                 "authenticatorData": "YXV0aA",
                 "signature": signature,
                 "userHandle": null,
@@ -481,6 +619,13 @@ mod tests {
         // Well-formed envelope with nothing to verify.
         let no_signature = credential_json(&BASE64_URL_SAFE_NO_PAD.encode(b"cred"), "");
         assert!(parse_assertion(no_signature).is_err());
+
+        // A structurally valid response to an older challenge cannot answer
+        // the request currently published for the operator.
+        let request = assertion_request(&[1, 2, 3]);
+        let stale =
+            credential_json_for_challenge(&BASE64_URL_SAFE_NO_PAD.encode(b"cred"), "c2ln", &[9]);
+        assert!(parse_assertion_for_request(stale, &request).is_err());
     }
 
     #[tokio::test]
@@ -493,14 +638,7 @@ mod tests {
         let expected_request = request_path(&session);
 
         let auth = FilePasskeyAuthenticator::new(&session).with_wait(Duration::from_secs(10));
-        let request = AssertionRequest {
-            challenge: vec![1, 2, 3],
-            rp_id: Some("web.whatsapp.com".into()),
-            allow_credentials: vec![],
-            user_verification: whatsapp_rust::passkey::UserVerification::Preferred,
-            timeout_ms: Some(60_000),
-            raw_options_json: r#"{"challenge":"AQID"}"#.into(),
-        };
+        let request = assertion_request(&[1, 2, 3]);
 
         // Drive the wait and the operator concurrently without spawning: the
         // authenticator only resolves once the second future drops the file,
@@ -537,6 +675,124 @@ mod tests {
             !tokio::fs::try_exists(&expected_request).await.unwrap(),
             "the request file must be cleaned up once answered"
         );
+    }
+
+    #[tokio::test]
+    async fn reissued_request_supersedes_old_waiter_without_touching_new_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().to_string();
+        let auth =
+            Arc::new(FilePasskeyAuthenticator::new(&session).with_wait(Duration::from_secs(5)));
+        let request_file = request_path(&session);
+        let assertion_file = assertion_path(&session);
+        let first_request = assertion_request(&[1]);
+        let first_options = first_request.raw_options_json.clone();
+
+        let first = {
+            let auth = Arc::clone(&auth);
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&first_request).await })
+        };
+        wait_for_contents(&request_file, &first_options).await;
+
+        let second_request = assertion_request(&[2]);
+        let second_options = second_request.raw_options_json.clone();
+        let second = {
+            let auth = Arc::clone(&auth);
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&second_request).await })
+        };
+        wait_for_contents(&request_file, &second_options).await;
+
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("superseded waiter should exit promptly")
+            .unwrap();
+        assert!(matches!(first_result, Err(PasskeyError::Cancelled)));
+        assert_eq!(
+            tokio::fs::read_to_string(&request_file).await.unwrap(),
+            second_options,
+            "the old waiter must not remove the replacement request"
+        );
+        assert!(
+            !tokio::fs::try_exists(format!("{request_file}.tmp"))
+                .await
+                .unwrap()
+        );
+
+        // A late response to the superseded challenge remains available to be
+        // replaced; it cannot be consumed as the current attempt's response.
+        let raw_id = BASE64_URL_SAFE_NO_PAD.encode(b"current-credential");
+        tokio::fs::write(
+            &assertion_file,
+            credential_json_for_challenge(&raw_id, "c2ln", &[1]),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_millis(200)).await;
+        assert!(!second.is_finished());
+        assert!(tokio::fs::try_exists(&assertion_file).await.unwrap());
+
+        tokio::fs::write(
+            &assertion_file,
+            credential_json_for_challenge(&raw_id, "c2ln", &[2]),
+        )
+        .await
+        .unwrap();
+        let assertion = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("current waiter should consume its matching assertion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(assertion.credential_id, b"current-credential".to_vec());
+        assert!(!tokio::fs::try_exists(&request_file).await.unwrap());
+        assert!(!tokio::fs::try_exists(&assertion_file).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn partial_manual_assertion_is_not_consumed_before_write_finishes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().to_string();
+        let auth =
+            Arc::new(FilePasskeyAuthenticator::new(&session).with_wait(Duration::from_secs(5)));
+        let request = assertion_request(&[1, 2, 3]);
+        let expected_options = request.raw_options_json.clone();
+        let request_file = request_path(&session);
+        let assertion_file = assertion_path(&session);
+        let waiter = {
+            let auth = Arc::clone(&auth);
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&request).await })
+        };
+        wait_for_contents(&request_file, &expected_options).await;
+
+        let raw_id = BASE64_URL_SAFE_NO_PAD.encode(b"credential");
+        let assertion = credential_json(&raw_id, "c2ln");
+        let split = assertion.len() / 2;
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&assertion_file)
+            .await
+            .unwrap();
+        writer.write_all(&assertion[..split]).await.unwrap();
+        writer.flush().await.unwrap();
+
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished());
+        assert!(tokio::fs::try_exists(&assertion_file).await.unwrap());
+
+        writer.write_all(&assertion[split..]).await.unwrap();
+        writer.sync_all().await.unwrap();
+        drop(writer);
+
+        let assertion = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter should accept the completed assertion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(assertion.credential_id, b"credential".to_vec());
+        assert!(!tokio::fs::try_exists(&request_file).await.unwrap());
+        assert!(!tokio::fs::try_exists(&assertion_file).await.unwrap());
     }
 
     #[tokio::test]
