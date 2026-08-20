@@ -631,6 +631,15 @@ fn plugin_config_resolver(
             })
         }
     })
+#[cfg(unix)]
+fn android_action_would_be_auto_approved(
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> bool {
+    matches!(
+        crate::approval::ApprovalManager::from_risk_profile(risk_profile)
+            .approval_requirement("android_action"),
+        crate::approval::ApprovalRequirement::Approved
+    )
 }
 
 /// Create full tool registry including memory tools and optional Composio.
@@ -995,25 +1004,17 @@ pub fn all_tools_with_runtime(
                 // `android_action` taps, swipes, and types on a real phone.
                 // It is deliberately absent from `default_auto_approve()`, so
                 // it normally falls through to `ApprovalRequirement::Prompt`.
-                // If the operator's risk profile auto-approves it anyway
-                // (explicitly or via `"*"`), and `always_ask` does not pull it
-                // back, fail closed rather than granting unattended device
-                // control.
-                let auto_approved = risk_profile
-                    .auto_approve
-                    .iter()
-                    .any(|entry| entry == "*" || entry == "android_action");
-                let always_asked = risk_profile
-                    .always_ask
-                    .iter()
-                    .any(|entry| entry == "*" || entry == "android_action");
-
-                if android_cfg.require_approval_for_actions && auto_approved && !always_asked {
+                // If the effective profile auto-approves it anyway, including
+                // Full autonomy's unconditional approval, fail closed rather
+                // than granting unattended device control.
+                if android_cfg.require_approval_for_actions
+                    && android_action_would_be_auto_approved(risk_profile)
+                {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "android_action: skipped registration because the active risk profile auto-approves it while android.require_approval_for_actions is true"
+                        "android_action: skipped registration because the effective risk profile auto-approves it while android.require_approval_for_actions is true"
                     );
                 } else {
                     tool_arcs.push(Arc::new(AndroidActionTool::new(client, security.clone())));
@@ -2150,6 +2151,49 @@ const = true
     /// The generic screenshot tool must stay registered. On Android it is wired to the bridge
     /// rather than removed, so a model reaching for the familiar name gets a working capture
     /// instead of "not supported"; everywhere else it keeps its subprocess behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn android_action_approval_guard_uses_effective_autonomy() {
+        let supervised = zeroclaw_config::schema::RiskProfileConfig::default();
+        assert!(!android_action_would_be_auto_approved(&supervised));
+
+        let explicit = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(android_action_would_be_auto_approved(&explicit));
+
+        let wildcard = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(android_action_would_be_auto_approved(&wildcard));
+
+        let explicit_but_asked = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            always_ask: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(!android_action_would_be_auto_approved(&explicit_but_asked));
+
+        let wildcard_ask = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            always_ask: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(!android_action_would_be_auto_approved(&wildcard_ask));
+
+        let full = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            always_ask: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(
+            android_action_would_be_auto_approved(&full),
+            "Full autonomy approves before always_ask and must fail the registration guard"
+        );
+    }
+
     #[test]
     fn generic_screenshot_is_always_registered() {
         let tmp = TempDir::new().unwrap();
