@@ -18,9 +18,10 @@ fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
     FIXTURE
         .get_or_init(|| {
-            let fixture_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-fixture");
-            let target_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tool-plugin-fixture");
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/secret-tool-fixture");
+            let target_dir =
+                PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secret-tool-plugin-fixture");
             let status = Command::new(env!("CARGO"))
                 .current_dir(&fixture_dir)
                 .args([
@@ -28,7 +29,7 @@ fn fixture() -> PathBuf {
                     "--locked",
                     "--quiet",
                     "--package",
-                    "zeroclaw-tool-plugin-fixture",
+                    "zeroclaw-secret-tool-plugin-fixture",
                     "--target",
                     "wasm32-wasip2",
                     "--target-dir",
@@ -41,7 +42,8 @@ fn fixture() -> PathBuf {
                 "tool fixture must build; install the wasm32-wasip2 target"
             );
 
-            let wasm = target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
+            let wasm =
+                target_dir.join("wasm32-wasip2/debug/zeroclaw_secret_tool_plugin_fixture.wasm");
             assert!(wasm.is_file(), "tool fixture WASM was not produced");
             wasm
         })

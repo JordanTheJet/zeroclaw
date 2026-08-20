@@ -85,11 +85,11 @@ The manifest declares two orthogonal things:
   tools can resolve schema-designated secrets during `execute`) and
   `http_client` have behavioral effect. The HTTP permission is the necessary
   grant for adapters that implement outbound `wasi:http`: tool and channel
-  enable that surface, while memory intentionally does not yet.
-  `config_read` must be paired with the manifest's `config_schema`; either one
-  without the other is rejected. Channel-capable manifests cannot use
-  `x-secret` yet. The filesystem and memory-access permissions are accepted by
-  the schema but not yet backed by host functions, so declaring them grants
+  enable that surface, while memory intentionally does not yet. `config_read`
+  must be paired with the manifest's `config_schema`; either one without the
+  other is rejected. Channel-capable manifests cannot use `x-secret` yet. The
+  filesystem and memory-access permissions are accepted by the schema but not
+  yet backed by host functions, so declaring them grants
   nothing.
 
 ## The worlds
@@ -184,11 +184,14 @@ zeroclaw config set plugins.limits.max_memory_mb 256
 Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
 identity. Installation prints and seeds the keys for the package's default
-tool binding; `zeroclaw plugin info <package>` prints that key again. Alias-owned
-channel construction must seed the key derived from its actual alias rather
-than inventing a package-name binding. Full-identity keys let different packages
-and capability worlds safely reuse aliases such as `main` without sharing
-credentials. The canonical operator values are a secret-marked string map and
+tool binding; `zeroclaw plugin info <package>` prints that tool key again. Those
+automatic surfaces are tool-only. Alias-owned channel construction must derive,
+display, and seed the key from its actual configured alias rather than inventing
+a package-name binding. That production path is not present in this slice; it is
+tracked in [#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its
+accepted successor. Full-identity keys let different packages and capability
+worlds safely reuse aliases such as `main` without sharing credentials. The
+canonical operator values are a secret-marked string map and
 remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
 declares the map's single type contract in `config_schema`: a closed Draft
 2020-12 object whose
@@ -197,30 +200,34 @@ top-level properties explicitly use `string`, `boolean`, `integer`, `number`,
 may set `x-secret = true` on a top-level string property; the host validates it
 with the full object, removes it from `__config`, and makes it available only
 through the admitted instance's `secrets.get` import during `execute`. A
-manifest that declares the `channel` capability cannot use `x-secret` until
-the host has a coherent warm-store secret lifecycle. Store strings directly,
-JSON scalar text for booleans and numbers, and JSON text for arrays and
-objects. The host
-materializes and validates the resulting typed object before using tool or
-channel guest code; unknown, malformed, or out-of-range values fail instead of
-reaching the plugin. Memory plugins do not yet have a config export and must
-not request `config_read` until that ABI is added.
+manifest that declares the `channel` capability cannot use `x-secret` until the
+host has a coherent warm-store secret lifecycle. Store strings directly, JSON
+scalar text for booleans and numbers, and JSON text for arrays and objects. The
+host materializes and validates the resulting typed object before instantiating
+tool or channel guest code; unknown, malformed, or out-of-range values fail
+instead of reaching the plugin. Memory plugins do not yet have a config export
+and must not request `config_read` until that ABI is added.
 
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
 schema matching the current values, update tool/channel guests to deserialize
 typed JSON rather than a string map, rebuild, and re-sign because the schema is
-signature-covered. Host integrations inject `PluginHostServices`, which wraps
-a `PluginConfigResolver`, instead of an owned config map. Each tool `execute`
-frame materializes one scope-bound `ResolvedPluginConfig`, uses that one view
-for public config and secret reads, and drops it when the frame ends. Channels
-receive their validated typed object once through `configure`; their manifests
-cannot currently contain `x-secret`.
+signature-covered. Host integrations now inject `PluginHostServices`, the
+bundle that wraps `PluginConfigResolver`, instead of an owned config map, and
+still pass only `ResolvedPluginConfig` to low-level guest calls. Each tool
+`execute` frame materializes one scope-bound `ResolvedPluginConfig`, uses that
+one view for public config and secret reads, and drops it when the frame ends.
+Channels receive their validated typed object once through `configure`; their
+manifests cannot currently contain `x-secret`. [Migrating to typed
+config](./migrating-to-typed-config.md) is the step-by-step recipe, including
+the release decision to ship this enforcement without a compatibility shim.
 
 This is a strict pre-1.0 key format: legacy entries named only after a package
 or binding are not consulted. For an existing tool package, run `zeroclaw
 plugin info <package>` to obtain its full-instance key, rename the old entry to
 that key, and save the config. Fresh tool installs seed it automatically.
+Channel-only packages must not be declared migrated for this contract until the
+alias-aware path above can surface their actual instance keys.
 
 Effective grants are checked separately from manifest requests. If
 `config_read` is denied, the host validates an empty object: an all-optional

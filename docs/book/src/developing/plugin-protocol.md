@@ -59,16 +59,16 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, typed config, tool-scoped secrets, `http_client`, and host-fed
-  inbound are wired.** Of the permissions a manifest can declare,
-  `config_read` exposes the plugin's own section only after the host
-  materializes and validates it against the manifest-owned `config_schema`. A
-  tool-only schema can designate secrets that are withheld from `__config` and
-  resolved during `execute`; a channel-capable manifest cannot use secret
-  markers yet. An `http_client` grant is necessary for outbound `wasi:http`,
-  but the capability adapter must also opt into that host surface. Tool and
-  channel adapters do; memory intentionally remains HTTP-free until its
-  network boundary has component-level coverage. Filesystem and
+- **`logging`, typed config injection, tool-scoped secrets, and host-fed inbound
+  are wired; tool and channel adapters also implement `http_client`.** Of the
+  permissions a manifest can declare, `config_read` exposes the plugin's own
+  section only after the host materializes and validates it against the
+  manifest-owned `config_schema`. A tool-only schema can designate secrets that
+  are withheld from `__config` and resolved during `execute`; a channel-capable
+  manifest cannot use secret markers yet. An `http_client` grant is necessary
+  for outbound `wasi:http`, but the adapter must also opt into the host surface.
+  Memory intentionally remains HTTP-free until its network boundary has
+  component-level coverage. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
@@ -274,19 +274,19 @@ bundle (`validate_manifest_shape` in `host.rs`).
 Be aware of the gap between declared and enforced: in the component host today
 `config_read` and `http_client` have behavioral effect. Requesting
 `config_read` requires a `config_schema`, and declaring that schema without the
-permission is also rejected. Before a tool or channel component is used, the
-host resolves its effective grant, materializes the plugin's operator values to
-typed JSON, and validates the complete object. `runtime.rs` strips any
-caller-supplied `__config` before injecting validated non-secret values into a
-tool call; direct top-level string properties marked `x-secret: true` are read
-through the host-scoped `secrets` import during `execute`. A channel receives
-its validated object through `configure`, and a channel-capable manifest with
-any `x-secret` marker is rejected. `http_client` is a necessary grant, not a
-complete authority decision: the capability adapter must also construct the
-HTTP context and link `wasi:http`. Tool and channel adapters opt in after grant
-validation. The memory adapter deliberately does not, so granting
-`http_client` to a memory scope alone adds no network surface. The remaining
-variants
+permission is also rejected. Before a tool or channel component is
+instantiated, the host resolves its effective grant, materializes the plugin's
+operator values to typed JSON, and validates the complete object. `runtime.rs`
+strips any caller-supplied `__config` before injecting the validated non-secret
+values into a tool call; direct top-level string properties marked
+`x-secret: true` are read through the host-scoped `secrets` import during
+`execute`. A channel receives its validated object through `configure`, and a
+channel-capable manifest with any `x-secret` marker is rejected. `http_client`
+is a necessary grant, not a complete authority decision: the capability adapter
+must also construct the HTTP context and link `wasi:http`. Tool and channel
+adapters opt in after grant validation. The memory adapter deliberately does
+not, so granting `http_client` to a memory scope alone adds no network surface.
+The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -442,9 +442,8 @@ or through a package-local JSON Pointer. In a manifest that includes `tool` and
 excludes `channel`, a direct top-level string property may set `x-secret: true`;
 nested, false, or non-boolean markers and secret non-string properties are
 rejected. A manifest with the `channel` capability and any `x-secret` marker is
-also rejected.
-Unknown keys, malformed encodings, and constraint violations reject the
-instance before values are delivered to guest code.
+also rejected. Unknown keys, malformed encodings, and constraint violations
+reject the instance before guest code runs.
 
 The operator's canonical `plugins.entries.<instance-key>.config` values remain
 a secret-marked string map in memory and are encrypted when persisted. The host
@@ -455,8 +454,8 @@ A `string` value is stored directly; `boolean`,
 `integer`, and `number` values use JSON scalar text such as `"true"`, `"4"`,
 or `"0.5"`; `array` and `object` values use JSON text such as
 `'["urgent","ops"]'` or `'{"region":"us-east"}'`. The host materializes and
-validates the complete data into typed JSON for each use, then partitions every
-property exactly once. For a tool, non-secret values are injected under the
+validates that data into typed JSON for each use, then partitions every property
+exactly once. For a tool, it injects only the non-secret values under the
 reserved `__config` key:
 
 ```json
@@ -472,16 +471,16 @@ reserved `__config` key:
 
 The omitted `api_key` is read explicitly with `secrets.get("api_key")` if its
 schema marks it secret. `runtime.rs` strips any caller-supplied `__config`
-before injecting the public section, so the section cannot be spoofed. Tool
-public injection and secret reads within one `execute` frame share one resolved
-live-config revision; the frame is dropped on success, error, trap, panic, or
-cancellation. A channel receives its complete validated object as the JSON
-argument to `configure`; secret markers are not admitted for that capability.
-When the manifest requests `config_read` but the host does not effectively
-grant it, resolution substitutes an empty object and validates that object too.
-Optional schemas therefore see `{}` (and tools omit an empty `__config`), while
-a schema with required fields fails closed before the guest starts. A plugin
-only ever sees its own section.
+before injecting the resolved public section, so the section cannot be spoofed.
+Tool public injection and secret reads within one `execute` frame share one
+resolved live-config revision; the frame is dropped on success, error, trap,
+panic, or cancellation. A channel receives its complete validated object as the
+JSON argument to `configure`; secret markers are not admitted for that
+capability. When the manifest requests `config_read` but the host does not
+effectively grant it, resolution substitutes an empty object and validates that
+object too. Optional schemas therefore see `{}` (and tools omit an empty
+`__config`), while a schema with required fields fails closed before the guest
+starts. A plugin only ever sees its own section.
 Tool and channel are the current config consumers. The memory world has no
 config export yet, so memory plugins must not request `config_read` until that
 ABI and runtime wiring land.
@@ -600,12 +599,12 @@ Copy it alongside your `manifest.toml`. For a runtime-only host build with no JI
 backend, precompile the component to a `.cwasm` with a matching wasmtime and ship
 that instead, since such a host deserializes rather than compiles on load.
 
-The reference fixture is not committed to the tree (it is a build artifact, not
-source). When `crates/zeroclaw-plugins/tests/fixtures/reference-plugin.wasm` is
-provisioned by a clean `cargo build --target wasm32-wasip2` of the published
-reference plugin, `reference_plugin.rs` and `reference_plugin_e2e.rs` load it
-through the same `PluginHost` and config-resolution paths the daemon runs. When
-the artifact is absent, those tests skip.
+The host's tool-plugin tests do not depend on a published artifact:
+`crates/zeroclaw-plugins/tests/fixtures/tool-fixture` is an in-tree component
+built from source at test time, and `reference_plugin.rs` and
+`reference_plugin_e2e.rs` drive it through the same `PluginHost`,
+`config_schema`, and config-resolution paths the daemon runs. If the fixture
+cannot be built, those tests fail.
 
 ### Installing
 
@@ -627,9 +626,14 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 Operator values currently enter through generic string-map storage: edit
 `[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
-has seeded its package-name binding entry. `zeroclaw plugin info <package>`
-prints the same key for migration and later edits. Schema-driven forms and
-inline field help are not implemented yet. The current surfaces are:
+has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
+the same tool key for migration and later edits. These automatic print and seed
+surfaces are tool-only. A channel key depends on its configured alias, which
+install and info do not own; the alias-aware production path in
+[#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its accepted
+successor, must derive, display, and seed that key before a channel-only package
+can complete this migration. Schema-driven forms and inline field help are not
+implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
   `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw

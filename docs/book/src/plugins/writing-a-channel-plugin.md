@@ -35,9 +35,8 @@ ways, and each drives a design decision in your code:
 2. **Configuration arrives before anything else.** The host calls your
    `configure` export exactly once, at load, before any other call. The
    argument is the typed JSON object materialized and validated against your
-   manifest's `config_schema`, including credential fields the schema treats
-   as ordinary strings. If the requested `config_read` grant is denied, the
-   host validates `{}` instead; an optional
+   manifest's `config_schema`, with secrets already decrypted. If the requested
+   `config_read` grant is denied, the host validates `{}` instead; an optional
    schema receives that object, while required fields make construction fail
    before guest code runs. Deserialize the object into a typed config struct
    and store it in your component's state. The channel world does not import
@@ -283,7 +282,12 @@ arrive as real arrays and objects. Because `api_token` is required, withholding
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
-isolated.
+isolated. The install and info commands cannot create this key because they do
+not own the configured channel alias; their automatic print and seed behavior
+is tool-only. Alias-aware channel key display and seeding is tracked in
+[#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its accepted
+successor. Prepare the manifest and guest now, but do not publish a channel-only
+package as migrated to typed config until that production path exists.
 
 > **Credential limitation.** Do not add `x-secret` to this channel schema.
 > The current channel world has no `secrets` import, and admission rejects any
@@ -316,12 +320,12 @@ cargo add --dev zeroclaw-plugins \
   --no-default-features --features plugins-wasm-cranelift
 ```
 
-The test then wraps a `PluginConfigResolver::new` backed by the manifest and
-test operator values in `PluginHostServices`, loads your component through
-`WasmChannel::from_wasm`, enqueues onto the `InboundQueue` handle it exposes,
-and asserts your `poll-message` drains and translates the message. That is the
-same code path a production daemon will run; passing it is the strongest
-pre-distribution signal you can get without a live host.
+The test then loads your built component through `WasmChannel::from_wasm` with
+a `PluginHostServices` bundle wrapping a `PluginConfigResolver` backed by the
+manifest and test operator values, enqueues onto the `InboundQueue` handle it
+exposes, and asserts your `poll-message` drains and translates the message.
+That is the same code path a production daemon will run; passing it is the
+strongest pre-distribution signal you can get without a live host.
 
 ## Next
 
