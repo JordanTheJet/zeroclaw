@@ -23,6 +23,24 @@ const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
+/// Root keywords that admit properties by pattern or constraint instead of by
+/// name.
+///
+/// The dialect is deliberately *enumerable*: `resolve_plugin_config_from`
+/// materializes an operator value only when the root `properties` map names its
+/// key. A schema whose keys are admitted solely by one of these keywords
+/// therefore passes admission and validation while every one of those keys is
+/// unreachable - the plugin author sees an accepted contract the host never
+/// honours. Reject at admission and name the keyword instead.
+///
+/// `additionalProperties` is absent by design: the root check below already
+/// pins it to exactly `false`, which rejects the schema-object form too.
+const DYNAMIC_KEY_KEYWORDS: [&str; 3] = [
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+];
+
 /// A typed, validated per-use view of one plugin's canonical config section.
 ///
 /// Construction is private so adapters cannot accidentally pass raw or
@@ -152,6 +170,17 @@ fn compile_manifest_config(
     if schema.get("additionalProperties") != Some(&Value::Bool(false)) {
         return Err(invalid_manifest(format!(
             "plugin '{}' config_schema must set additionalProperties = false",
+            manifest.name
+        )));
+    }
+    if let Some(keyword) = DYNAMIC_KEY_KEYWORDS
+        .into_iter()
+        .find(|keyword| schema.get(*keyword).is_some())
+    {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema must not declare '{keyword}' at the root; config values \
+             are materialized only for keys named in the properties map, so keys admitted by \
+             '{keyword}' would never reach the plugin",
             manifest.name
         )));
     }
@@ -503,6 +532,82 @@ mod tests {
             ));
         }
         assert!(validate_manifest_config(&manifest(Some(schema), true)).is_ok());
+    }
+
+    /// A schema whose keys exist only under a dynamic-key keyword is an
+    /// accepted-contract trap: admission and validation both pass, but
+    /// resolution walks the root `properties` map, so none of those keys is
+    /// ever materialized for the guest. Admission must refuse it and say which
+    /// keyword is at fault.
+    #[test]
+    fn root_dynamic_key_keywords_are_rejected_at_admission() {
+        for (keyword, value) in [
+            ("patternProperties", json!({"^x-": {"type": "string"}})),
+            ("propertyNames", json!({"pattern": "^x-"})),
+            ("unevaluatedProperties", json!(false)),
+        ] {
+            let mut schema = object_schema(json!({"label": {"type": "string"}}));
+            schema[keyword] = value;
+
+            let error = validate_manifest_config(&manifest(Some(schema), true))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a root '{keyword}' schema must be refused at admission; admitting it \
+                         hands the author a contract whose keys can never be resolved"
+                    )
+                });
+            assert!(
+                matches!(error, PluginError::InvalidManifest(_)),
+                "a dynamic-key schema is a manifest defect, not a config defect: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(keyword),
+                "the admission error must name the offending keyword so the author can find \
+                 it; got {error}"
+            );
+        }
+    }
+
+    /// The refusal is about the manifest alone, so it must not quote the
+    /// operator's section - these errors surface in install output and logs.
+    #[test]
+    fn dynamic_key_rejection_does_not_leak_operator_values() {
+        let mut schema = object_schema(json!({"label": {"type": "string"}}));
+        schema["patternProperties"] = json!({"^secret-": {"type": "string"}});
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let configured = configured(&[("label", "s3cr3t-operator-value")]);
+
+        let (display, debug) =
+            error_text(resolve_plugin_config(&manifest, &scope, Some(&configured)));
+        for rendered in [&display, &debug] {
+            assert!(
+                !rendered.contains("s3cr3t-operator-value"),
+                "the admission error must not quote operator values; got {rendered}"
+            );
+        }
+        assert!(
+            display.contains("patternProperties"),
+            "the resolve-time refusal must still name the keyword; got {display}"
+        );
+    }
+
+    /// The neighbouring keywords keep working: the rejection is scoped to the
+    /// root, matching how the size, depth, type, and `additionalProperties`
+    /// checks are scoped, and does not reach into nested property schemas.
+    #[test]
+    fn nested_dynamic_key_keywords_are_left_alone() {
+        let schema = object_schema(json!({
+            "options": {
+                "type": "object",
+                "patternProperties": {"^x-": {"type": "string"}}
+            }
+        }));
+        validate_manifest_config(&manifest(Some(schema), true)).expect(
+            "the enumerable-key rule constrains the root object; a nested property's own \
+             schema keeps the full dialect",
+        );
     }
 
     #[test]
