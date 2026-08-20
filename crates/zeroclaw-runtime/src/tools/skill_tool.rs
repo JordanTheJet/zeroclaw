@@ -243,6 +243,10 @@ impl Tool for SkillShellTool {
         self.build_parameters_schema()
     }
 
+    fn host_owns_approved_arg(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
@@ -259,7 +263,11 @@ impl Tool for SkillShellTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(&command, approved) {
+        match self.security.validate_command_execution_for_shell(
+            &command,
+            approved,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -270,7 +278,10 @@ impl Tool for SkillShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -468,6 +479,10 @@ impl Tool for SkillBuiltinTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         (*self.advertised_schema).clone()
+    }
+
+    fn host_owns_approved_arg(&self) -> bool {
+        self.target_tool.host_owns_approved_arg()
     }
 
     // Hand out the stored schema by `Arc::clone` instead of the trait
