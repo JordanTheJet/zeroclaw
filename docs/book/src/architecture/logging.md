@@ -102,6 +102,10 @@ zeroclaw_log::scope!(
 ).await
 ```
 
+SOP step execution uses the same mechanism with `sop_run_id`. Unlike a turn's
+`trace_id`, this attribution is stable across every nested step turn in the run,
+so the gateway, CLI, and TUI can all query one durable correlation key.
+
 `scope!` straddles the attribution/attrs line deliberately: field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed `zeroclaw.*` attribution slot; everything else lands in the event `attributes` map for every descendant emission. Either way the value rides on every nested `record!` without being a call-site argument.
 
 ## The `record!` macro and its call-site contract

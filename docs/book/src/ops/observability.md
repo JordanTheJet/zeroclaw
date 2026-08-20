@@ -221,6 +221,9 @@ curl "$ZEROCLAW_GATEWAY/api/logs?channel=discord.glados"
 
 # A single agent turn:
 curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
+
+# Every retained event attributed to one SOP run (across its step turns):
+curl "$ZEROCLAW_GATEWAY/api/logs?sop_run_id=<run-id>"
 ```
 
 </div>
@@ -229,6 +232,8 @@ Log pagination walks backward with a byte-offset cursor. While `at_end` is false
 
 `until_line_offset` is a position in the current active file, not a durable event checkpoint. Pure appends preserve it, but rolling trim, archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to. Restart from the newest page after those boundaries rather than reusing an older offset. `/api/logs` reads only the active file; inspect timestamped archives directly when older rotated history is required.
 
+The log response includes `persistence_enabled: boolean`, which distinguishes
+"no matching events" from a daemon where runtime-trace persistence is disabled.
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an
 extra round-trip.

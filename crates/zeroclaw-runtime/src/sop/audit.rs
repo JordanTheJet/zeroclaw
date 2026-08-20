@@ -24,7 +24,8 @@ impl SopAuditLogger {
         self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run.run_id.as_str()})),
             &format!(
                 "SOP audit: run {} started for '{}'",
                 run.run_id, run.sop_name
@@ -116,7 +117,8 @@ impl SopAuditLogger {
         self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run.run_id.as_str()})),
             &format!(
                 "SOP audit: run {} finished with status {}",
                 run.run_id, run.status

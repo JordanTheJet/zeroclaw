@@ -2202,6 +2202,7 @@ export interface LogsResponse {
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
   at_end: boolean;
+  persistence_enabled: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so
