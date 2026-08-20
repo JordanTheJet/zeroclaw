@@ -33,11 +33,24 @@
 //! (most modern ones) render them correctly. The OSC 9;4 channel is unaffected,
 //! being ASCII, which is the other reason state is carried there rather than
 //! inferred from the glyph.
+//!
+//! Title restoration is best-effort. XTPUSHTITLE has no capability response:
+//! a terminal may accept the bytes, ignore the title stack, and still honor
+//! OSC 2. Zerocode therefore never treats `Write::is_ok()` as proof of support.
+//! It records a restore obligation before the first overwrite, pairs every
+//! graceful teardown with a neutral title followed by XTPOPTITLE, and retains
+//! that obligation when a pop fails so a later teardown path can retry. A
+//! stack-capable terminal restores its saved title; a stack-less terminal keeps
+//! the neutral fallback instead of a stale working or blocked title.
 
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 use crate::turn_status::TurnStatus;
+
+/// Terminal tabs are narrow and titles can contain model-influenced tool
+/// names. Bound the payload as defense in depth even after controls are removed.
+const MAX_TITLE_CHARS: usize = 120;
 
 /// Status glyph for a turn state. Leading character of the title.
 fn glyph(status: &TurnStatus) -> char {
@@ -90,23 +103,29 @@ pub(crate) fn progress_for(status: &TurnStatus) -> &'static str {
 /// title. Reporting the *visible* pane would answer the wrong question — the
 /// status is read from outside the window, where what matters is whether
 /// anything in here needs a human. Blocked outranks working, which outranks
-/// idle; ties go to the first pane, which is the primary one.
+/// idle; a named pane outranks an unnamed one at equal urgency; remaining ties
+/// go to the first pane, which is the primary one.
 pub(crate) fn most_urgent<'a>(
     panes: impl IntoIterator<Item = (Option<&'a TurnStatus>, Option<&'a str>)>,
 ) -> (Option<&'a TurnStatus>, Option<&'a str>) {
-    fn rank(status: Option<&TurnStatus>) -> u8 {
-        match status {
+    fn rank(pane: (Option<&TurnStatus>, Option<&str>)) -> (u8, bool) {
+        let urgency = match pane.0 {
             Some(TurnStatus::WaitingForApproval) => 2,
             Some(TurnStatus::Idle) | None => 0,
             Some(_) => 1,
-        }
+        };
+        // Naming breaks an urgency tie only. An unnamed pane knows of no agent,
+        // so preferring it would drop a real name from the title for nothing —
+        // an idle session on the secondary pane still reads better as
+        // `✓ osctest` than as `✓ zerocode`.
+        (urgency, pane.1.is_some())
     }
 
     // Not `max_by_key`: it returns the *last* maximum, which would hand ties to
     // the secondary pane.
     let mut best: Option<(Option<&'a TurnStatus>, Option<&'a str>)> = None;
     for pane in panes {
-        if best.is_none_or(|current| rank(pane.0) > rank(current.0)) {
+        if best.is_none_or(|current| rank(pane) > rank(current)) {
             best = Some(pane);
         }
     }
@@ -122,9 +141,10 @@ pub(crate) fn most_urgent<'a>(
 pub(crate) struct StatusReporter {
     last_title: Option<String>,
     last_progress: Option<&'static str>,
-    /// Whether the terminal's own title was pushed onto its title stack, so
-    /// teardown only pops a title it actually saved.
-    pushed: bool,
+    /// Whether any title overwrite may have reached the terminal and therefore
+    /// needs a best-effort XTPOPTITLE. Set before I/O because a failed write can
+    /// still be partial; cleared only after a complete pop and flush.
+    title_restore_needed: bool,
 }
 
 impl StatusReporter {
@@ -136,10 +156,12 @@ impl StatusReporter {
 
         let title = title_for(status, agent);
         if self.last_title.as_deref() != Some(title.as_str()) {
-            // Save the terminal's own title before the first overwrite, so
-            // teardown can hand back what was actually there.
-            if !self.pushed {
-                self.pushed = push_title(out).is_ok();
+            // A successful write cannot prove title-stack support, and a
+            // failed write may be partial. Record cleanup ownership before
+            // sending either sequence, then always pair it with a later pop.
+            if !self.title_restore_needed {
+                self.title_restore_needed = true;
+                let _ = push_title(out);
             }
             // Cache only a write that landed: a failed or partial write leaves
             // the terminal showing something else, and caching it as success
@@ -167,9 +189,14 @@ impl StatusReporter {
 
     fn release_to(&mut self, out: &mut impl Write) {
         let _ = write_progress(out, PROGRESS_CLEARED);
-        if self.pushed {
-            let _ = pop_title(out);
-            self.pushed = false;
+        if self.title_restore_needed {
+            // Neutralize attention state before pop. Terminals with a title
+            // stack restore the prior title; terminals that ignored the push
+            // retain this harmless fallback instead of stale busy text.
+            let _ = write_title(out, "zerocode");
+            if pop_title(out).is_ok() {
+                self.title_restore_needed = false;
+            }
         }
         self.invalidate();
     }
@@ -207,35 +234,102 @@ pub(crate) fn invalidate() {
 /// taskbar for as long as that terminal lives. Safe to call more than once, and
 /// from a panic or signal handler.
 pub(crate) fn release() {
-    with_reporter(|r| r.release_to(&mut std::io::stdout()));
+    release_reporter_to(&REPORTER, &mut std::io::stdout());
 }
 
-/// Save the terminal's current title (XTPUSHTITLE). Terminals without a title
-/// stack ignore it, which is why the pop is conditional on this succeeding.
+/// Release through `reporter` without waiting for its mutex.
+///
+/// A panic can originate inside a terminal write while `sync` holds this lock;
+/// blocking here would deadlock the panic hook before raw mode is restored. In
+/// that case emit the idempotent cleanup sequences directly. They may race a
+/// write from the failing thread, but the process is already unwinding and a
+/// bounded best-effort cleanup is strictly safer than waiting forever.
+fn release_reporter_to(reporter: &Mutex<Option<StatusReporter>>, out: &mut impl Write) {
+    match reporter.try_lock() {
+        Ok(mut guard) => guard
+            .get_or_insert_with(StatusReporter::default)
+            .release_to(out),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned
+            .into_inner()
+            .get_or_insert_with(StatusReporter::default)
+            .release_to(out),
+        Err(TryLockError::WouldBlock) => emergency_release_to(out),
+    }
+}
+
+fn emergency_release_to(out: &mut impl Write) {
+    let _ = write_progress(out, PROGRESS_CLEARED);
+    let _ = write_title(out, "zerocode");
+    let _ = pop_title(out);
+}
+
+/// Ask the terminal to save its current title (XTPUSHTITLE). There is no
+/// capability acknowledgment; teardown pairs any attempted overwrite with a
+/// best-effort pop regardless of this write's result.
 fn push_title(out: &mut impl Write) -> std::io::Result<()> {
-    write!(out, "\x1b[22;0t")?;
+    out.write_all(b"\x1b[22;0t")?;
     out.flush()
 }
 
 /// Restore the saved title (XTPOPTITLE).
 fn pop_title(out: &mut impl Write) -> std::io::Result<()> {
-    write!(out, "\x1b[23;0t")?;
+    out.write_all(b"\x1b[23;0t")?;
     out.flush()
+}
+
+/// Unicode Default_Ignorable format controls that can reorder or hide title
+/// text without being `char::is_control()`. Keep this local and dependency-free
+/// because the title path needs only a denylist, not full Unicode segmentation.
+fn is_format_control(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+fn sanitize_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_control(*c))
+        .take(MAX_TITLE_CHARS)
+        .collect()
 }
 
 /// Write an OSC 2 (set window title) sequence to `out`.
 fn write_title(out: &mut impl Write, title: &str) -> std::io::Result<()> {
-    // Strip control characters: the sequence is BEL-terminated, so an embedded
-    // one would truncate the title and leave the rest to be read as input.
-    let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
-    write!(out, "\x1b]2;{sanitized}\x07")?;
+    // BEL/ESC could terminate or extend the sequence; bidi and other format
+    // controls can visually spoof its source even without injecting bytes.
+    let sanitized = sanitize_title(title);
+    let sequence = format!("\x1b]2;{sanitized}\x07");
+    out.write_all(sequence.as_bytes())?;
     out.flush()
 }
 
 /// Write an OSC 9;4 (progress) sequence to `out`. `payload` is
 /// `<state>;<progress>`.
 fn write_progress(out: &mut impl Write, payload: &str) -> std::io::Result<()> {
-    write!(out, "\x1b]9;4;{payload}\x07")?;
+    let sequence = format!("\x1b]9;4;{payload}\x07");
+    out.write_all(sequence.as_bytes())?;
     out.flush()
 }
 
@@ -355,8 +449,9 @@ mod tests {
         assert!(written.contains("\x1b]9;4;0;0\x07"));
     }
 
-    /// Teardown clears progress and pops the saved title. Without it a process
-    /// killed mid-turn leaves the tab reading as busy for the terminal's life.
+    /// Teardown clears progress, writes a neutral fallback, then pops. A
+    /// title-stack terminal restores its saved title; a stack-less terminal
+    /// ignores the pop but no longer displays stale busy state.
     #[test]
     fn release_clears_progress_and_restores_title() {
         let mut r = reporter();
@@ -367,9 +462,46 @@ mod tests {
         r.release_to(&mut out);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "\x1b]9;4;0;0\x07\x1b[23;0t",
-            "release must clear progress and pop the pushed title"
+            "\x1b]9;4;0;0\x07\x1b]2;zerocode\x07\x1b[23;0t",
+            "release must clear progress, neutralize stack-less terminals, then pop"
         );
+    }
+
+    /// Terminals are allowed to ignore XTPUSHTITLE/XTPOPTITLE while still
+    /// honoring OSC 2. Model that behavior explicitly: release must replace
+    /// the stale working title with the neutral fallback before the ignored
+    /// pop, rather than relying on a title stack that does not exist.
+    #[test]
+    fn stackless_terminal_keeps_neutral_title_after_release() {
+        struct StacklessTerminal {
+            title: String,
+        }
+
+        impl Write for StacklessTerminal {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(payload) = buf
+                    .strip_prefix(b"\x1b]2;")
+                    .and_then(|payload| payload.strip_suffix(b"\x07"))
+                {
+                    self.title = String::from_utf8(payload.to_vec()).unwrap();
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut terminal = StacklessTerminal {
+            title: "shell".to_string(),
+        };
+        let mut r = reporter();
+        r.sync_to(&mut terminal, Some(&TurnStatus::Working), Some("herder"));
+        assert_eq!(terminal.title, "⏳ herder — working");
+
+        r.release_to(&mut terminal);
+        assert_eq!(terminal.title, "zerocode");
     }
 
     /// Nothing was ever written, so there is no saved title to pop — releasing
@@ -431,6 +563,172 @@ mod tests {
         );
     }
 
+    /// XTPUSHTITLE has no capability response. Even when its write fails, a
+    /// later OSC 2 may land, so teardown must still attempt XTPOPTITLE.
+    #[test]
+    fn failed_push_still_creates_a_restore_obligation() {
+        #[derive(Default)]
+        struct FailPush {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+        impl Write for FailPush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.failed && buf == b"\x1b[22;0t" {
+                    self.failed = true;
+                    return Err(std::io::Error::other("push rejected"));
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        let mut out = FailPush::default();
+        r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
+        assert!(r.title_restore_needed);
+        assert!(out.bytes.starts_with(b"\x1b]2;"));
+
+        let mut released = Vec::new();
+        r.release_to(&mut released);
+        assert!(released.ends_with(b"\x1b[23;0t"));
+        assert!(!r.title_restore_needed);
+    }
+
+    /// A `write_all` failure can happen after a prefix reached the terminal.
+    /// Cache must stay invalid, while cleanup ownership must remain set.
+    #[test]
+    fn partial_title_write_is_not_cached_and_is_still_restored() {
+        #[derive(Default)]
+        struct PartialTitle {
+            bytes: Vec<u8>,
+            fail_next: bool,
+            split_done: bool,
+        }
+        impl Write for PartialTitle {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.fail_next {
+                    self.fail_next = false;
+                    return Err(std::io::Error::other("partial title"));
+                }
+                if !self.split_done && buf.starts_with(b"\x1b]2;") {
+                    let written = 3.min(buf.len());
+                    self.bytes.extend_from_slice(&buf[..written]);
+                    self.split_done = true;
+                    self.fail_next = true;
+                    return Ok(written);
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        r.sync_to(
+            &mut PartialTitle::default(),
+            Some(&TurnStatus::Working),
+            Some("herder"),
+        );
+        assert_eq!(r.last_title, None);
+        assert!(r.title_restore_needed);
+
+        let mut released = Vec::new();
+        r.release_to(&mut released);
+        assert!(released.ends_with(b"\x1b[23;0t"));
+    }
+
+    /// A complete byte write followed by a failed flush is still an uncertain
+    /// terminal mutation, so it must not be cached as success or skip cleanup.
+    #[test]
+    fn failed_title_flush_is_not_cached_and_is_still_restored() {
+        #[derive(Default)]
+        struct FailSecondFlush {
+            flushes: usize,
+        }
+        impl Write for FailSecondFlush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == 2 {
+                    Err(std::io::Error::other("title flush failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut r = reporter();
+        r.sync_to(
+            &mut FailSecondFlush::default(),
+            Some(&TurnStatus::Working),
+            Some("herder"),
+        );
+        assert_eq!(r.last_title, None);
+        assert!(r.title_restore_needed);
+
+        let mut released = Vec::new();
+        r.release_to(&mut released);
+        assert!(released.ends_with(b"\x1b[23;0t"));
+    }
+
+    /// A failed pop keeps the obligation live so a second teardown path can
+    /// retry instead of silently declaring the title restored.
+    #[test]
+    fn failed_pop_is_retried_by_the_next_release() {
+        #[derive(Default)]
+        struct FailFirstPop {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+        impl Write for FailFirstPop {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.failed && buf == b"\x1b[23;0t" {
+                    self.failed = true;
+                    return Err(std::io::Error::other("pop failed"));
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        let mut initial = Vec::new();
+        r.sync_to(&mut initial, Some(&TurnStatus::Working), Some("herder"));
+
+        let mut out = FailFirstPop::default();
+        r.release_to(&mut out);
+        assert!(r.title_restore_needed, "failed pop must remain retryable");
+        r.release_to(&mut out);
+        assert!(!r.title_restore_needed);
+        assert!(out.bytes.ends_with(b"\x1b[23;0t"));
+    }
+
+    /// Panic cleanup must not wait on the same reporter lock whose critical
+    /// section panicked. The fallback is a direct clear + pop pair.
+    #[test]
+    fn reentrant_release_uses_nonblocking_emergency_cleanup() {
+        let reporter = Mutex::new(Some(StatusReporter {
+            title_restore_needed: true,
+            ..StatusReporter::default()
+        }));
+        let held = reporter.lock().unwrap();
+        let mut out = Vec::new();
+        release_reporter_to(&reporter, &mut out);
+        drop(held);
+        assert_eq!(out, b"\x1b]9;4;0;0\x07\x1b]2;zerocode\x07\x1b[23;0t");
+    }
+
     /// A blocked pane wins even when it is not the visible one — the whole
     /// point is to answer "does anything in this window need me?".
     #[test]
@@ -471,6 +769,38 @@ mod tests {
         assert_eq!(agent, Some("chat"));
     }
 
+    /// Observed live: finishing a turn in the Code pane with no Chat agent
+    /// selected settled the title to `✓ zerocode` instead of `✓ osctest`,
+    /// because both panes ranked idle and the tie went to the nameless primary.
+    #[test]
+    fn most_urgent_keeps_a_named_pane_over_a_nameless_tie() {
+        let idle = TurnStatus::Idle;
+        let (_, agent) = most_urgent([(None, None), (Some(&idle), Some("osctest"))]);
+        assert_eq!(agent, Some("osctest"));
+
+        // Same rank, both named: the primary still wins, so this does not
+        // reorder panes that both have something to say.
+        let (_, agent) = most_urgent([(Some(&idle), Some("chat")), (Some(&idle), Some("code"))]);
+        assert_eq!(agent, Some("chat"));
+    }
+
+    /// Naming breaks ties; it must never outrank urgency itself.
+    #[test]
+    fn most_urgent_ranks_urgency_above_naming() {
+        let idle = TurnStatus::Idle;
+        let working = TurnStatus::Working;
+        let blocked = TurnStatus::WaitingForApproval;
+
+        // A nameless working pane still beats a named idle one.
+        let (status, agent) = most_urgent([(Some(&idle), Some("chat")), (Some(&working), None)]);
+        assert!(matches!(status, Some(TurnStatus::Working)));
+        assert_eq!(agent, None);
+
+        // ...and a nameless blocked pane still beats a named working one.
+        let (status, _) = most_urgent([(Some(&working), Some("chat")), (Some(&blocked), None)]);
+        assert!(matches!(status, Some(TurnStatus::WaitingForApproval)));
+    }
+
     /// A BEL inside the alias would terminate the OSC string early and leave
     /// the remainder to be read as terminal input.
     #[test]
@@ -478,5 +808,18 @@ mod tests {
         let mut out = Vec::new();
         write_title(&mut out, &title_for(&TurnStatus::Idle, Some("her\x07der"))).unwrap();
         assert_eq!(out, "\x1b]2;✓ herder\x07".as_bytes());
+    }
+
+    #[test]
+    fn bidi_and_other_format_controls_are_stripped_from_titles() {
+        assert_eq!(sanitize_title("safe\u{202e}txt\u{200d}"), "safetxt");
+    }
+
+    #[test]
+    fn title_payload_is_bounded_without_splitting_unicode() {
+        let input = "界".repeat(MAX_TITLE_CHARS + 20);
+        let sanitized = sanitize_title(&input);
+        assert_eq!(sanitized.chars().count(), MAX_TITLE_CHARS);
+        assert!(sanitized.chars().all(|c| c == '界'));
     }
 }
