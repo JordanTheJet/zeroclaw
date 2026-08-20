@@ -41,7 +41,7 @@
 | 7 | 2026-07-04 | Restored the desktop installer and its release, architecture, roadmap, and success-criteria obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
 | 8 | 2026-07-20 | Made root `AGENTS.md` the compact project contract, routed maintained detail through the architecture map and coding-agent guidelines, and prevented crate policy from weakening project safety, privacy, or authorization requirements ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
 | 9 | 2026-08-11 | Removed WATI from the current-state gateway inventory and v0.9.0 plugin-migration target after the channel was retired in [#9571](https://github.com/zeroclaw-labs/zeroclaw/pull/9571); the generic webhook/plugin boundary remains unchanged |
-| 10 | 2026-08-19 | Removed `aardvark-sys` and `zeroclaw-robot-kit` from the workspace-inheritance exclusion table after both crates were retired in [#9853](https://github.com/zeroclaw-labs/zeroclaw/pull/9853); the published 0.1.0 releases stay on crates.io and are unaffected |
+| 10 | 2026-08-19 | Removed `aardvark-sys` and `zeroclaw-robot-kit` from the workspace-inheritance and independent-release guidance after both crates were retired in [#9853](https://github.com/zeroclaw-labs/zeroclaw/pull/9853); the published 0.1.0 releases stay on crates.io and are unaffected |
 
 Revision numbers in this canonical document follow the ratified repository
 history. The linked RFC issue also labels a configuration-discipline edit as
@@ -317,7 +317,7 @@ Stability tiers are **promoted, never demoted** through a deliberate team decisi
 
 ##### Release automation
 
-Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. Crates with independent versions (`zeroclaw-api`, hardware library crates) are managed separately using the same tool's per-crate configuration.
+Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. The independently versioned `zeroclaw-api` crate is managed separately using the same tool's per-crate configuration.
 
 #### 4.4.2 Release Artifacts
 
