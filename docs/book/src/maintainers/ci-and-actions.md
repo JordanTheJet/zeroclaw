@@ -244,6 +244,19 @@ transfers, coordinate the package rename or merge in one reviewed change.
 
 Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust-cache` composite, which selects the cache backend from the same `CI_USE_BLACKSMITH` toggle that selects the runner: `useblacksmith/rust-cache` (Blacksmith NVMe sticky disk) when the job runs on a Blacksmith runner, and `Swatinem/rust-cache` otherwise. Any non-`true` toggle value (including unset, and every fork PR) falls back to `Swatinem/rust-cache` on GitHub-hosted runners, so caching is never lost when Blacksmith is off. Both action references live in the composite regardless of the toggle, so both must stay in the allowlist. The macOS and Windows build legs stay on `Swatinem/rust-cache`, and the `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) use no Rust cache. These behaviors are worth knowing when triaging cache-related flakes:
 
+- **Blacksmith jobs also share compiler artifacts through sccache.** The
+  provider-aware composite installs SHA-256-pinned sccache 0.17.0 and enables
+  its GitHub Actions backend as `RUSTC_WRAPPER`. This is separate from the
+  target/dependency cache: sccache keys individual rustc outputs by compiler,
+  inputs, and flags, so compatible feature/target work can be reused across
+  jobs even when their target directories stay isolated. Blacksmith currently
+  forwards sccache to GitHub's cache backend rather than its colocated cache.
+  Each Blacksmith job validates the pinned runner/asset manifest before setup.
+- **Only trusted `master` runs write sccache.** Pull requests and merge-queue
+  runs use `SCCACHE_GHA_RW_MODE=READ_ONLY`; they can consume master-seeded
+  entries but cannot populate or evict the shared compiler cache. Changing
+  `SCCACHE_GHA_VERSION` in the composite intentionally invalidates the cache.
+
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
@@ -275,6 +288,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
+| `actions/github-script` (`v9.0.0`) | `.github/actions/rust-cache` | Export GitHub cache-service credentials to sccache on Blacksmith runners |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |

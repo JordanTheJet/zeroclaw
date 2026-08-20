@@ -1,10 +1,10 @@
 name: Rust cache (provider-aware)
 description: >
-  Restore/save the Rust build cache using Blacksmith's sticky-disk cache when
-  the job runs on a Blacksmith runner, otherwise Swatinem/rust-cache on a
-  GitHub-hosted runner. This preserves the CI_USE_BLACKSMITH fail-safe: any
-  non-'true' value (including unset) selects Swatinem, so GitHub-hosted jobs
-  stay fully cached and the toggle can be flipped off with no loss of caching.
+  Restore/save the Rust target/dependency cache and enable a shared sccache
+  compiler cache when the job runs on Blacksmith. GitHub-hosted jobs keep the
+  Swatinem/rust-cache fallback. This preserves the CI_USE_BLACKSMITH fail-safe:
+  any non-'true' value (including unset) selects Swatinem with no sccache
+  wrapper, so the toggle can be flipped off with no loss of existing caching.
 
 inputs:
   use-blacksmith:
@@ -34,6 +34,31 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate sccache manifest
+      if: ${{ inputs.use-blacksmith == 'true' }}
+      shell: bash
+      run: bash "$GITHUB_WORKSPACE/scripts/ci/install_sccache.test.sh"
+    - name: Expose GitHub cache credentials to sccache
+      if: ${{ inputs.use-blacksmith == 'true' }}
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Install and enable shared sccache
+      if: ${{ inputs.use-blacksmith == 'true' }}
+      shell: bash
+      run: |
+        bash "$GITHUB_WORKSPACE/scripts/ci/install_sccache.sh"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_VERSION=zeroclaw-v1" >> "$GITHUB_ENV"
+        echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
+          echo "SCCACHE_GHA_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
+        else
+          echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"
+        fi
     - id: bs
       if: ${{ inputs.use-blacksmith == 'true' }}
       uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
