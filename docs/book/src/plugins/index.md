@@ -226,6 +226,9 @@ config plus credential rotation within the same logical binding is visible as
 one revision on the next operation. Static identity and capability exports are
 read once at load; changing the bot/account identity or other static metadata
 requires channel lifecycle reconstruction.
+[Migrating to typed config](./migrating-to-typed-config.md) is the step-by-step
+recipe, including the release decision to ship this enforcement without a
+compatibility shim.
 
 This is a strict pre-1.0 key format: legacy entries named only after a package
 or binding are not consulted. For an existing tool package, run `zeroclaw

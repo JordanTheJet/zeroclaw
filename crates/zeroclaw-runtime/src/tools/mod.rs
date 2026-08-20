@@ -498,6 +498,15 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The exact `DelegateTool` this factory registered, in its concrete type.
+    ///
+    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
+    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
+    /// delegate instance's nested-registry construction - it can only
+    /// re-derive the wiring by hand, which is exactly the thing that must not
+    /// be trusted. `None` when no agents are configured.
+    #[cfg(test)]
+    pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -1463,6 +1472,8 @@ pub fn all_tools_with_runtime(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
+                    #[cfg(test)]
+                    delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
                     reaction_handle,
@@ -1542,6 +1553,8 @@ pub fn all_tools_with_runtime(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
+    #[cfg(test)]
+    let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -1578,8 +1591,19 @@ pub fn all_tools_with_runtime(
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
+        // `with_root_config` above is only a snapshot. Delegated targets get
+        // their own nested registry, whose plugin tools and `send_via`
+        // authority resolve per execution; without the shared handle they would
+        // resolve against that snapshot forever. Same contract as the
+        // `live_config` argument this function received.
+        .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
-        tool_arcs.push(Arc::new(delegate_tool));
+        let delegate_tool = Arc::new(delegate_tool);
+        #[cfg(test)]
+        {
+            built_delegate_tool = Some(Arc::clone(&delegate_tool));
+        }
+        tool_arcs.push(delegate_tool as Arc<dyn Tool>);
         Some(parent_tools)
     };
 
@@ -1741,6 +1765,8 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        #[cfg(test)]
+        delegate_tool: built_delegate_tool,
     }
 }
 

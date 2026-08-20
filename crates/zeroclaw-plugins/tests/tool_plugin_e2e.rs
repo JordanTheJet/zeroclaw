@@ -18,9 +18,10 @@ fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
     FIXTURE
         .get_or_init(|| {
-            let fixture_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-fixture");
-            let target_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tool-plugin-fixture");
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tool-secret-fixture");
+            let target_dir =
+                PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tool-secret-plugin-fixture");
             let status = Command::new(env!("CARGO"))
                 .current_dir(&fixture_dir)
                 .args([
@@ -28,21 +29,22 @@ fn fixture() -> PathBuf {
                     "--locked",
                     "--quiet",
                     "--package",
-                    "zeroclaw-tool-plugin-fixture",
+                    "zeroclaw-tool-secret-plugin-fixture",
                     "--target",
                     "wasm32-wasip2",
                     "--target-dir",
                 ])
                 .arg(&target_dir)
                 .status()
-                .expect("run Cargo for the tool component fixture");
+                .expect("run Cargo for the tool secret component fixture");
             assert!(
                 status.success(),
-                "tool fixture must build; install the wasm32-wasip2 target"
+                "tool secret fixture must build; install the wasm32-wasip2 target"
             );
 
-            let wasm = target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
-            assert!(wasm.is_file(), "tool fixture WASM was not produced");
+            let wasm =
+                target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_secret_plugin_fixture.wasm");
+            assert!(wasm.is_file(), "tool secret fixture WASM was not produced");
             wasm
         })
         .clone()
@@ -59,11 +61,11 @@ fn limits() -> PluginLimits {
 
 async fn execute(binding: &str) -> String {
     let manifest = PluginManifest {
-        name: "tool-fixture".to_string(),
+        name: "tool-secret-fixture".to_string(),
         version: "0.0.0".to_string(),
         description: None,
         author: None,
-        wasm_path: Some("tool-fixture.wasm".to_string()),
+        wasm_path: Some("tool-secret-fixture.wasm".to_string()),
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::ConfigRead],
         config_schema: Some(serde_json::json!({
