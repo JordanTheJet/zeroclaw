@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -133,9 +133,60 @@ pub(crate) struct Chat {
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
     deferred_elicitations: Vec<DeferredInboundRequest>,
+    inbound_request_claims: Arc<InboundRequestClaims>,
 }
 
 const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
+const INBOUND_REQUEST_CLAIM_CAPACITY: usize = crate::client::INBOUND_REQUEST_CHANNEL_CAPACITY * 2;
+
+/// Shared ownership tombstones for the two panes' duplicate broadcast frames.
+///
+/// One registry is created with each App pane pair. The owner claims a JSON-RPC
+/// request id before installing or answering it; the non-owner then discards
+/// its copy rather than cancelling the owner's modal after the grace period.
+#[derive(Debug, Default)]
+pub(crate) struct InboundRequestClaims {
+    inner: Mutex<InboundRequestClaimState>,
+}
+
+#[derive(Debug, Default)]
+struct InboundRequestClaimState {
+    claimed: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl InboundRequestClaims {
+    fn key(id: &serde_json::Value) -> String {
+        serde_json::to_string(id).unwrap_or_else(|_| format!("{id:?}"))
+    }
+
+    fn claim(&self, id: &serde_json::Value) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = Self::key(id);
+        if state.claimed.contains(&key) {
+            return false;
+        }
+        while state.claimed.len() >= INBOUND_REQUEST_CLAIM_CAPACITY {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            state.claimed.remove(&oldest);
+        }
+        state.order.push_back(key.clone());
+        state.claimed.insert(key)
+    }
+
+    fn contains(&self, id: &serde_json::Value) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.claimed.contains(&Self::key(id))
+    }
+}
 
 /// An inbound server-initiated request buffered for a retry pass because it
 /// could not be installed on arrival. Carries the arrival instant so the drain
@@ -150,6 +201,8 @@ struct DeferredInboundRequest {
 enum ElicitationRouting {
     /// Modal installed on the active session; it owns the request id.
     Installed,
+    /// Another pane already owns or answered this broadcast request id.
+    Claimed,
     /// Schema/params could not be decoded; caller must answer `cancel`.
     Unparseable(serde_json::Value),
     /// Parsed but does not target the active session yet; retry briefly.
@@ -179,7 +232,16 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
 }
 
 impl Chat {
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
+        Self::new_with_claims(rpc, pane_kind, Arc::new(InboundRequestClaims::default()))
+    }
+
+    pub(crate) fn new_with_claims(
+        rpc: Arc<RpcClient>,
+        pane_kind: PaneKind,
+        inbound_request_claims: Arc<InboundRequestClaims>,
+    ) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         Self {
@@ -207,6 +269,7 @@ impl Chat {
             todo_settings_loaded: false,
             help_requested: false,
             deferred_elicitations: Vec::new(),
+            inbound_request_claims,
         }
     }
 
@@ -575,7 +638,7 @@ impl Chat {
         None
     }
 
-    // ── Drain channels (called from draw) ────────────────────────
+    // ── Drain channels (called from poll) ────────────────────────
 
     fn drain_notifications(&mut self) {
         let mut applied = false;
@@ -620,6 +683,9 @@ impl Chat {
                 other => {
                     let method = other.to_string();
                     let id = req.id.clone();
+                    if !self.inbound_request_claims.claim(&id) {
+                        continue;
+                    }
                     let rpc = self.rpc.clone();
                     tokio::spawn(async move {
                         let _ = rpc
@@ -648,8 +714,12 @@ impl Chat {
     /// outright if its schema is unparseable.
     fn route_inbound_elicitation(&mut self, req: crate::client::RpcInboundRequest) {
         match self.try_install_elicitation(req) {
-            ElicitationRouting::Installed => {}
-            ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
+            ElicitationRouting::Installed | ElicitationRouting::Claimed => {}
+            ElicitationRouting::Unparseable(id) => {
+                if self.inbound_request_claims.claim(&id) {
+                    Self::answer_cancel(&self.rpc, id);
+                }
+            }
             ElicitationRouting::Defer(req) => {
                 self.deferred_elicitations.push(DeferredInboundRequest {
                     req,
@@ -669,13 +739,25 @@ impl Chat {
         }
         let pending = std::mem::take(&mut self.deferred_elicitations);
         for entry in pending {
+            // The other pane may have installed this request after our first
+            // pass. Its claim is authoritative; this pane must never cancel
+            // or answer the duplicate broadcast copy.
+            if self.inbound_request_claims.contains(&entry.req.id) {
+                continue;
+            }
             let expired = entry.first_seen.elapsed() >= ELICITATION_ROUTE_GRACE;
             match self.try_install_elicitation(entry.req) {
-                ElicitationRouting::Installed => {}
-                ElicitationRouting::Unparseable(id) => Self::answer_cancel(&self.rpc, id),
+                ElicitationRouting::Installed | ElicitationRouting::Claimed => {}
+                ElicitationRouting::Unparseable(id) => {
+                    if self.inbound_request_claims.claim(&id) {
+                        Self::answer_cancel(&self.rpc, id);
+                    }
+                }
                 ElicitationRouting::Defer(req) => {
                     if expired {
-                        Self::answer_cancel(&self.rpc, req.id);
+                        if self.inbound_request_claims.claim(&req.id) {
+                            Self::answer_cancel(&self.rpc, req.id);
+                        }
                     } else {
                         self.deferred_elicitations.push(DeferredInboundRequest {
                             req,
@@ -725,6 +807,13 @@ impl Chat {
         );
         if !matches_active {
             return ElicitationRouting::Defer(req);
+        }
+
+        // Every Chat pane receives the same broadcast request. Claim before
+        // installing the modal so a non-owner pane can observe the ownership
+        // tombstone and discard its deferred copy after the grace period.
+        if !self.inbound_request_claims.claim(&req.id) {
+            return ElicitationRouting::Claimed;
         }
 
         let pending = match shape {
@@ -1027,8 +1116,6 @@ impl Chat {
     }
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        self.poll();
-
         match &mut self.phase {
             ChatPhase::PickAgent {
                 agents,
@@ -12517,10 +12604,15 @@ mod tests {
         }
     }
 
-    fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+    fn test_client() -> (Arc<RpcClient>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(rpc));
+        (client, rx)
+    }
+
+    fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+        let (client, rx) = test_client();
         (Chat::new(client, PaneKind::Chat), rx)
     }
 
@@ -12634,6 +12726,93 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a deferred elicitation must not be answered during its grace window"
+        );
+    }
+
+    /// Both panes subscribe to one broadcast. The non-owner sees the request
+    /// first and defers it; once the owner installs the modal, that shared
+    /// claim must suppress the non-owner's expiry-time cancel response.
+    #[tokio::test]
+    async fn non_owner_never_cancels_an_elicitation_claimed_by_the_other_pane() {
+        let (client, mut rx) = test_client();
+        let claims = Arc::new(InboundRequestClaims::default());
+        let mut chat = Chat::new_with_claims(client.clone(), PaneKind::Chat, claims.clone());
+        let mut acp = Chat::new_with_claims(client.clone(), PaneKind::Acp, claims);
+
+        let mut chat_state = state();
+        chat_state.session_id = "sess-chat".to_string();
+        chat_state.git_branch_last_fetch = Some(Instant::now());
+        chat.phase = ChatPhase::Active(Box::new(chat_state));
+
+        let mut acp_state = state();
+        acp_state.session_id = "sess-acp".to_string();
+        acp_state.git_branch_last_fetch = Some(Instant::now());
+        acp.phase = ChatPhase::Active(Box::new(acp_state));
+
+        client.publish_inbound_request_for_test(inbound_single_elicitation("e1", "sess-acp"));
+
+        // App order is Chat then ACP. Chat defers the foreign request; ACP
+        // claims it and installs the modal on the same tick.
+        chat.poll();
+        acp.poll();
+        assert_eq!(chat.deferred_elicitations.len(), 1);
+        assert!(matches!(
+            &acp.phase,
+            ChatPhase::Active(state) if state.pending_elicitation().is_some()
+        ));
+
+        // Hold the owner's modal beyond the old grace deadline, then give the
+        // non-owner another poll. It must discard its duplicate without
+        // answering the daemon's request id.
+        chat.deferred_elicitations[0].first_seen =
+            Instant::now() - (ELICITATION_ROUTE_GRACE + Duration::from_millis(1));
+        chat.poll();
+        tokio::task::yield_now().await;
+
+        while let Ok(line) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_ne!(
+                frame.get("id"),
+                Some(&serde_json::json!("e1")),
+                "the non-owner must not answer the owner's request: {frame}"
+            );
+        }
+        assert!(matches!(
+            &acp.phase,
+            ChatPhase::Active(state) if state.pending_elicitation().is_some()
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_unknown_method_is_answered_once_across_panes() {
+        let (client, mut rx) = test_client();
+        let claims = Arc::new(InboundRequestClaims::default());
+        let mut chat = Chat::new_with_claims(client.clone(), PaneKind::Chat, claims.clone());
+        let mut acp = Chat::new_with_claims(client.clone(), PaneKind::Acp, claims);
+        client.publish_inbound_request_for_test(crate::client::RpcInboundRequest {
+            id: serde_json::json!("unknown-1"),
+            method: "future/method".to_string(),
+            params: serde_json::Value::Null,
+        });
+
+        chat.poll();
+        acp.poll();
+
+        let line = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("one method-not-found response")
+            .expect("writer channel open");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["id"], "unknown-1");
+        assert_eq!(
+            frame["error"]["code"],
+            crate::jsonrpc::error_codes::METHOD_NOT_FOUND
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the duplicate pane must not send a second response"
         );
     }
 

@@ -1780,6 +1780,11 @@ impl RpcClient {
         }
     }
 
+    #[cfg(test)]
+    pub fn publish_inbound_request_for_test(&self, req: RpcInboundRequest) {
+        let _ = self.inbound_requests_bcast.send(req);
+    }
+
     /// Transport protocol of this connection.
     pub fn transport(&self) -> Transport {
         self.transport
