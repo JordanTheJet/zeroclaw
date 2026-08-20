@@ -75,3 +75,9 @@ libc = "0.2"
 
 [build-dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# `test-util` enables tokio's paused-clock test runtime so deadline regressions
+# (e.g. the enrollment read timeout) assert instantly instead of sleeping out
+# the real timeout. Test-only: it does not reach the shipped binary.
+tokio = { version = "1.50", default-features = false, features = ["test-util"] }

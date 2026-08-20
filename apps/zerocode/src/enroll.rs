@@ -290,8 +290,7 @@ where
     tls.write_all(request.as_bytes()).await?;
     tls.flush().await?;
 
-    let mut raw = Vec::new();
-    tls.read_to_end(&mut raw).await?;
+    let raw = read_enroll_response(&mut tls).await?;
     parse_http_json(&raw)
 }
 
@@ -323,9 +322,59 @@ where
     tls.write_all(request.as_bytes()).await?;
     tls.flush().await?;
 
-    let mut raw = Vec::new();
-    tls.read_to_end(&mut raw).await?;
+    let raw = read_enroll_response(&mut tls).await?;
     parse_http_json(&raw)
+}
+
+/// Largest enrollment response this client will buffer. An enrollment reply is a
+/// certificate, a CA chain, and a small relay profile; the daemon bounds its own
+/// side of the exchange at the same figure. Mirrors that bound so a hostile
+/// endpoint or relay cannot grow the client's buffer without limit.
+const MAX_ENROLL_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Wall-clock ceiling on reading an enrollment response, mirroring the daemon's
+/// own connection timeout so a peer cannot hold the stream open indefinitely.
+const ENROLL_READ_TIMEOUT_SECS: u64 = 15;
+
+/// Read an enrollment response under both a byte cap and a deadline.
+///
+/// `read_to_end` alone is unbounded in both dimensions, and these helpers run
+/// BEFORE the response is trusted: the CA fetch happens before SAS confirmation,
+/// and the enroll POST before any certificate is persisted. A malicious endpoint
+/// (or a relay in the path) could stream arbitrary bytes, or simply stall, while
+/// the client grew its buffer.
+async fn read_enroll_response<S>(tls: &mut S) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let read = async {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = tls.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok::<Vec<u8>, std::io::Error>(raw);
+            }
+            if raw.len() + n > MAX_ENROLL_RESPONSE_BYTES {
+                return Err(std::io::Error::other(format!(
+                    "enrollment response exceeded {MAX_ENROLL_RESPONSE_BYTES} bytes; refusing to buffer further"
+                )));
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(ENROLL_READ_TIMEOUT_SECS),
+        read,
+    )
+    .await
+    {
+        Ok(r) => r.context("read enrollment response"),
+        Err(_) => anyhow::bail!(
+            "enrollment response timed out after {ENROLL_READ_TIMEOUT_SECS}s; \
+             the endpoint stopped sending or is stalling the stream"
+        ),
+    }
 }
 
 fn provisional_enrollment_config() -> rustls::ClientConfig {
@@ -667,6 +716,51 @@ mod tests {
             .to_string();
         assert!(err.contains("operator-confirmed daemon CA"), "got: {err}");
         ensure_response_ca_matches_confirmed(&daemon_ca, &daemon_ca).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enroll_response_read_refuses_an_oversized_stream() {
+        // A hostile endpoint (or relay in the path) can stream arbitrary bytes
+        // before the response is trusted: the CA fetch runs before SAS
+        // confirmation and the enroll POST before any cert is persisted. The
+        // read must stop at the cap instead of growing the buffer.
+        use tokio::io::AsyncWriteExt as _;
+        let (client, mut server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let junk = vec![b'A'; 8192];
+            // Well past MAX_ENROLL_RESPONSE_BYTES; stop once the reader gives up.
+            for _ in 0..64 {
+                if server.write_all(&junk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = client;
+        let err = read_enroll_response(&mut client)
+            .await
+            .expect_err("an oversized enrollment response must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeded") && msg.contains("refusing to buffer further"),
+            "expected a size-cap refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enroll_response_read_times_out_on_a_stalled_stream() {
+        // A peer that opens the stream and then sends nothing must not hold the
+        // client forever. Time is paused so the deadline fires without the test
+        // actually waiting ENROLL_READ_TIMEOUT_SECS.
+        let (client, _server) = tokio::io::duplex(8192);
+        let mut client = client;
+        let err = read_enroll_response(&mut client)
+            .await
+            .expect_err("a stalled enrollment response must time out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "expected a deadline error, got: {msg}"
+        );
     }
 
     #[tokio::test]
