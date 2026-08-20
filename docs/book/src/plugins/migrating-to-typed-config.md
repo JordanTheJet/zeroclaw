@@ -87,6 +87,27 @@ the host materializes a value only for a key the root `properties` map names,
 so keys admitted by pattern would never reach your plugin. Nested property
 schemas are unaffected.
 
+#### `pattern` uses the linear-time regex dialect
+
+The host resolves config by recompiling and revalidating your schema on every
+call, and that work runs on the host, not inside your component's fuel budget.
+So `pattern` is restricted to regexes whose cost the host can predict:
+
+- **Backreferences and look-around are rejected.** `(\w+)\s\1`, `(?=...)`,
+  `(?<=...)` and friends need a backtracking matcher. Patterns are compiled
+  with the linear-time [`regex`](https://docs.rs/regex) dialect instead, which
+  matches in time proportional to the value's length no matter how the pattern
+  is written.
+- **A single pattern may not compile to more than 256 KiB of program.** This
+  bites on large repetition counts: `^[\s\S]{0,200}$` is fine,
+  `^[\s\S]{0,1000}$` is not. Use `maxLength` for length bounds; it is free to
+  check and it says what you mean.
+
+Both refusals happen at install time with an `InvalidManifest` error naming the
+schema, so a plugin whose `pattern` the host cannot bound never runs at all.
+Structural patterns behave as you would expect: slugs, UUIDs, email addresses,
+URLs, and short bounded free text all compile.
+
 ### 2. Match the value encodings
 
 Operator storage stays a string map. The schema tells the host how to read each
