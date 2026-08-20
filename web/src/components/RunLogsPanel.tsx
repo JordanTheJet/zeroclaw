@@ -48,12 +48,29 @@ function EventRow({ event }: { event: LogEvent }) {
         <button
           type="button"
           disabled={!hasDetails}
+          aria-expanded={hasDetails ? expanded : undefined}
+          aria-label={
+            hasDetails
+              ? `${expanded ? t('run_detail.logs_collapse') : t('run_detail.logs_expand')}: ${event.message || `${event.event.category}.${event.event.action}`}`
+              : undefined
+          }
           onClick={() => setExpanded((value) => !value)}
-          className="group flex w-full items-start gap-2 text-left disabled:cursor-default"
+          className={`group -mx-2 flex w-[calc(100%+1rem)] items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-pc-accent ${
+            hasDetails
+              ? 'cursor-pointer hover:border-pc-border hover:bg-pc-elevated'
+              : 'cursor-default'
+          }`}
         >
-          <span className="mt-0.5 w-3 shrink-0 text-pc-text-faint">
+          <span
+            className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors ${
+              hasDetails
+                ? 'border-pc-border bg-pc-surface text-pc-text-muted group-hover:border-pc-accent group-hover:text-pc-accent'
+                : 'border-transparent text-pc-text-faint'
+            }`}
+            aria-hidden
+          >
             {hasDetails ? (
-              expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />
+              expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />
             ) : null}
           </span>
           <span className="min-w-0">

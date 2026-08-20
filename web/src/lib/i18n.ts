@@ -1143,6 +1143,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'run_detail.logs_empty': 'No retained log events were found for this run.',
     'run_detail.logs_disabled': 'Log persistence is not enabled on this gateway.',
     'run_detail.logs_no_message': 'No message',
+    'run_detail.logs_expand': 'Expand log details',
+    'run_detail.logs_collapse': 'Collapse log details',
     'runs.load_error': 'Failed to load runs',
     'runs.count_one': '{n} run',
     'runs.count_other': '{n} runs',
