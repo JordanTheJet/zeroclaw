@@ -288,5 +288,4 @@ mod tests {
              last: {last_failure}"
         );
     }
-
 }
