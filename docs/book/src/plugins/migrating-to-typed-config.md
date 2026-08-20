@@ -81,6 +81,33 @@ The host enforces these limits on the schema itself: 64 KiB serialized, at most
 32 levels of nesting, no `$id`, and `$ref` targets must be local JSON Pointers.
 Remote references are rejected, so a schema never causes a network fetch.
 
+Dynamic-key keywords are not part of this dialect: `patternProperties`,
+`propertyNames`, and `unevaluatedProperties` are rejected at the root, because
+the host materializes a value only for a key the root `properties` map names,
+so keys admitted by pattern would never reach your plugin. Nested property
+schemas are unaffected.
+
+#### `pattern` uses the linear-time regex dialect
+
+The host resolves config by recompiling and revalidating your schema on every
+call, and that work runs on the host, not inside your component's fuel budget.
+So `pattern` is restricted to regexes whose cost the host can predict:
+
+- **Backreferences and look-around are rejected.** `(\w+)\s\1`, `(?=...)`,
+  `(?<=...)` and friends need a backtracking matcher. Patterns are compiled
+  with the linear-time [`regex`](https://docs.rs/regex) dialect instead, which
+  matches in time proportional to the value's length no matter how the pattern
+  is written.
+- **A single pattern may not compile to more than 256 KiB of program.** This
+  bites on large repetition counts: `^[\s\S]{0,200}$` is fine,
+  `^[\s\S]{0,1000}$` is not. Use `maxLength` for length bounds; it is free to
+  check and it says what you mean.
+
+Both refusals happen at install time with an `InvalidManifest` error naming the
+schema, so a plugin whose `pattern` the host cannot bound never runs at all.
+Structural patterns behave as you would expect: slugs, UUIDs, email addresses,
+URLs, and short bounded free text all compile.
+
 ### 2. Match the value encodings
 
 Operator storage stays a string map. The schema tells the host how to read each
@@ -165,6 +192,7 @@ channel key path in this slice.
 | requests `config_read` but declares no `config_schema` | step 1 not done |
 | declares `config_schema` without requesting `config_read` | remove the schema or add the permission |
 | `config_schema` must set `additionalProperties = false` | the root object is open |
+| `config_schema` must not declare `<keyword>` at the root | the root uses a dynamic-key keyword; name every key in `properties` instead |
 | property uses unsupported type | a property has no explicit supported type, or an unresolvable local `$ref` |
 | config contains a property absent from `config_schema` | an operator key is not declared, often a typo |
 | config property must be a JSON integer | the stored string does not parse as the declared type |
