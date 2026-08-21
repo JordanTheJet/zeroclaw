@@ -1,17 +1,26 @@
-//! Zerona's capability-free, guided agent-creation conversation.
+//! ZeroClaw's transport-independent management core.
 //!
-//! This crate deliberately sits above `zeroclaw-runtime`. It keeps an
-//! in-memory provider conversation, exposes no tools, reads a borrowed live
-//! [`zeroclaw_config::schema::Config`] on every turn, and produces a narrowly
-//! typed agent proposal. Preview and validation are pure. Persistence remains
-//! a host concern: the root CLI passes the approved source bytes to
-//! Quickstart's revision-bound add-agent path, which atomically replaces config
-//! before committing its staged personality files.
+//! [`ControlService`] is the management authority: it resolves the canonical
+//! configuration, validates one typed operation against it, builds a preview
+//! bound to that exact source revision, applies through Quickstart's
+//! revision-bound transaction, and verifies the result. Every transport — the
+//! terminal onboarding flow today, native tools and stdio MCP later — goes
+//! through it rather than reimplementing its validators or persistence rules.
+//!
+//! [`ZeronaSession`] is the other half and deliberately not part of that
+//! authority: it is a client-side adapter that holds an in-memory
+//! capability-restricted provider conversation, exposes no tools, and produces
+//! a narrowly typed agent proposal for the service to judge. Conversation,
+//! model selection, approval prompting, and rendering all stay outside the
+//! service.
+//!
+//! This crate deliberately sits above `zeroclaw-runtime`.
 
 mod guard;
 mod inventory;
 mod preview;
 mod proposal;
+mod service;
 mod session;
 
 pub use guard::{
@@ -29,6 +38,10 @@ pub use preview::{
 pub use proposal::{
     AgentProposal, PROPOSAL_MARKER, PersonalityFileProposal, ProposalError, ProposalErrorCode,
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
+};
+pub use service::{
+    BoundProposal, ControlApplyOutcome, ControlError, ControlInspection, ControlService,
+    source_schema_is_current,
 };
 pub use session::{MAX_OPERATOR_TURNS, SessionError, SessionErrorCode, SessionTurn, ZeronaSession};
 
