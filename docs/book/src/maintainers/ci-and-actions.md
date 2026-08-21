@@ -297,9 +297,10 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless GHCR container-image signing |
 | `anchore/sbom-action` (`v0.24.0`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Report-only container vulnerability scanning |
-| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml` | Upload Trivy SARIF reports to the Security tab |
-| `github/codeql-action/init` (`v3`) | `ci-code-analysis.yml` | Initialize CodeQL Rust analysis |
-| `github/codeql-action/analyze` (`v3`) | `ci-code-analysis.yml` | Upload CodeQL SARIF to the Security tab |
+| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml`, `ci-code-analysis.yml` | Upload Trivy and Semgrep SARIF reports to the Security tab |
+| `github/codeql-action/init` (`v3.36.2`) | `codeql.yml` | Initialize CodeQL analysis (Rust and JS/TS) |
+| `github/codeql-action/autobuild` (`v3.36.2`) | `codeql.yml` | JS/TS source extraction |
+| `github/codeql-action/analyze` (`v3.36.2`) | `codeql.yml` | Upload CodeQL SARIF to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
