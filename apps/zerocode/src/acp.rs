@@ -101,6 +101,14 @@ impl Acp {
         self.inner.poll();
     }
 
+    pub(crate) fn refresh_visible_metadata(&mut self) {
+        self.inner.refresh_visible_metadata();
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
+    }
+
     pub(crate) fn turn_status(&self) -> Option<&crate::turn_status::TurnStatus> {
         self.inner.turn_status()
     }

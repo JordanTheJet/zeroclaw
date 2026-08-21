@@ -22,7 +22,7 @@
 //! |------------|-------------|---------|
 //! | idle — waiting for input | `✓` | `0;0` — cleared |
 //! | working — turn in flight | `⏳` | `3;0` — indeterminate |
-//! | blocked — awaiting approval | `⚠` | `4;0` — warning |
+//! | blocked — awaiting approval or input | `⚠` | `4;0` — warning |
 //!
 //! The terminal is process-global, so the reporter is too: teardown paths and
 //! the editor-suspend path need to reach it without threading a handle through
@@ -38,13 +38,18 @@
 //! a terminal may accept the bytes, ignore the title stack, and still honor
 //! OSC 2. Zerocode therefore never treats `Write::is_ok()` as proof of support.
 //! It records a restore obligation before the first overwrite, pairs every
-//! graceful teardown with a neutral title followed by XTPOPTITLE, and retains
-//! that obligation when a pop fails so a later teardown path can retry. A
-//! stack-capable terminal restores its saved title; a stack-less terminal keeps
-//! the neutral fallback instead of a stale working or blocked title.
+//! graceful teardown with a neutral title followed by XTPOPTITLE, and lets only
+//! one teardown path claim a successful pop. A failed pop re-arms the
+//! obligation so a later path can retry. A stack-capable terminal restores its
+//! saved title; a stack-less terminal keeps the neutral fallback instead of a
+//! stale working or blocked title.
 
+use std::cell::Cell;
 use std::io::Write;
-use std::sync::{Mutex, TryLockError};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::turn_status::TurnStatus;
 
@@ -54,10 +59,12 @@ const MAX_TITLE_CHARS: usize = 120;
 
 /// Status glyph for a turn state. Leading character of the title.
 fn glyph(status: &TurnStatus) -> char {
-    match status {
-        TurnStatus::Idle => '✓',
-        TurnStatus::WaitingForApproval => '⚠',
-        _ => '⏳',
+    if matches!(status, TurnStatus::Idle) {
+        '✓'
+    } else if status.is_blocked() {
+        '⚠'
+    } else {
+        '⏳'
     }
 }
 
@@ -73,7 +80,14 @@ pub(crate) fn title_for(status: &TurnStatus, agent: Option<&str>) -> String {
     };
     match status {
         TurnStatus::Idle => format!("{glyph} {agent}"),
-        TurnStatus::WaitingForApproval => format!("{glyph} {agent} — awaiting approval"),
+        TurnStatus::WaitingForApproval => format!(
+            "{glyph} {agent} — {}",
+            crate::i18n::t("zc-chat-status-awaiting-approval")
+        ),
+        TurnStatus::WaitingForInput => format!(
+            "{glyph} {agent} — {}",
+            crate::i18n::t("zc-chat-status-awaiting-input")
+        ),
         other => match other.verb() {
             Some(verb) => format!("{glyph} {agent} — {verb}"),
             None => format!("{glyph} {agent}"),
@@ -90,10 +104,12 @@ pub(crate) const PROGRESS_CLEARED: &str = "0;0";
 /// what an agent turn is. `4` (warning) marks a turn that has stopped and wants
 /// the operator — distinct from `2` (error), which would claim the turn failed.
 pub(crate) fn progress_for(status: &TurnStatus) -> &'static str {
-    match status {
-        TurnStatus::Idle => PROGRESS_CLEARED,
-        TurnStatus::WaitingForApproval => "4;0",
-        _ => "3;0",
+    if matches!(status, TurnStatus::Idle) {
+        PROGRESS_CLEARED
+    } else if status.is_blocked() {
+        "4;0"
+    } else {
+        "3;0"
     }
 }
 
@@ -110,7 +126,7 @@ pub(crate) fn most_urgent<'a>(
 ) -> (Option<&'a TurnStatus>, Option<&'a str>) {
     fn rank(pane: (Option<&TurnStatus>, Option<&str>)) -> (u8, bool) {
         let urgency = match pane.0 {
-            Some(TurnStatus::WaitingForApproval) => 2,
+            Some(status) if status.is_blocked() => 2,
             Some(TurnStatus::Idle) | None => 0,
             Some(_) => 1,
         };
@@ -141,17 +157,19 @@ pub(crate) fn most_urgent<'a>(
 pub(crate) struct StatusReporter {
     last_title: Option<String>,
     last_progress: Option<&'static str>,
-    /// Whether any title overwrite may have reached the terminal and therefore
-    /// needs a best-effort XTPOPTITLE. Set before I/O because a failed write can
-    /// still be partial; cleared only after a complete pop and flush.
-    title_restore_needed: bool,
 }
 
 impl StatusReporter {
     /// Sync both channels from the current turn state. `status` is absent
     /// outside an active chat session (agent picker, dashboard-only use), which
     /// reads as idle.
-    fn sync_to(&mut self, out: &mut impl Write, status: Option<&TurnStatus>, agent: Option<&str>) {
+    fn sync_to(
+        &mut self,
+        out: &mut impl Write,
+        restore_needed: &AtomicBool,
+        status: Option<&TurnStatus>,
+        agent: Option<&str>,
+    ) {
         let status = status.unwrap_or(&TurnStatus::Idle);
 
         let title = title_for(status, agent);
@@ -159,8 +177,7 @@ impl StatusReporter {
             // A successful write cannot prove title-stack support, and a
             // failed write may be partial. Record cleanup ownership before
             // sending either sequence, then always pair it with a later pop.
-            if !self.title_restore_needed {
-                self.title_restore_needed = true;
+            if !restore_needed.swap(true, Ordering::AcqRel) {
                 let _ = push_title(out);
             }
             // Cache only a write that landed: a failed or partial write leaves
@@ -187,15 +204,18 @@ impl StatusReporter {
         self.last_progress = None;
     }
 
-    fn release_to(&mut self, out: &mut impl Write) {
+    fn release_to(&mut self, out: &mut impl Write, restore_needed: &AtomicBool) {
         let _ = write_progress(out, PROGRESS_CLEARED);
-        if self.title_restore_needed {
+        if restore_needed.swap(false, Ordering::AcqRel) {
             // Neutralize attention state before pop. Terminals with a title
             // stack restore the prior title; terminals that ignored the push
             // retain this harmless fallback instead of stale busy text.
             let _ = write_title(out, "zerocode");
-            if pop_title(out).is_ok() {
-                self.title_restore_needed = false;
+            if pop_title(out).is_err() {
+                // A failed or partial pop is ambiguous. Re-arm so a later
+                // teardown path can retry, while a successful emergency pop
+                // cannot be repeated by the normal path.
+                restore_needed.store(true, Ordering::Release);
             }
         }
         self.invalidate();
@@ -204,20 +224,53 @@ impl StatusReporter {
 
 /// The terminal is process-global, and so is what is currently displayed on it.
 static REPORTER: Mutex<Option<StatusReporter>> = Mutex::new(None);
+/// Cleanup ownership lives outside `REPORTER` so a panic hook can claim it
+/// without waiting for the mutex that the panicking write may still hold.
+static TITLE_RESTORE_NEEDED: AtomicBool = AtomicBool::new(false);
 
-fn with_reporter(f: impl FnOnce(&mut StatusReporter)) {
-    // A poisoned lock means another thread panicked mid-write. The terminal is
-    // best-effort decoration; recover the guard rather than propagate.
-    let mut guard = match REPORTER.lock() {
+thread_local! {
+    /// Reentrant panic cleanup must not lock the reporter already held by this
+    /// thread. A panic on another thread may wait for the short status write,
+    /// which preserves ordering and avoids racing away restore ownership.
+    static REPORTER_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ReporterLockMarker {
+    previous: bool,
+}
+
+impl ReporterLockMarker {
+    fn enter() -> Self {
+        let previous = REPORTER_LOCK_HELD.with(|held| held.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for ReporterLockMarker {
+    fn drop(&mut self) {
+        REPORTER_LOCK_HELD.with(|held| held.set(self.previous));
+    }
+}
+
+fn with_reporter_mutex(
+    reporter: &Mutex<Option<StatusReporter>>,
+    f: impl FnOnce(&mut StatusReporter),
+) {
+    let mut guard = match reporter.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    let _marker = ReporterLockMarker::enter();
     f(guard.get_or_insert_with(StatusReporter::default));
+}
+
+fn with_reporter(f: impl FnOnce(&mut StatusReporter)) {
+    with_reporter_mutex(&REPORTER, f);
 }
 
 /// Report the current turn state.
 pub(crate) fn sync(status: Option<&TurnStatus>, agent: Option<&str>) {
-    with_reporter(|r| r.sync_to(&mut std::io::stdout(), status, agent));
+    with_reporter(|r| r.sync_to(&mut std::io::stdout(), &TITLE_RESTORE_NEEDED, status, agent));
 }
 
 /// Drop the cached view of the terminal after another program may have changed
@@ -234,33 +287,37 @@ pub(crate) fn invalidate() {
 /// taskbar for as long as that terminal lives. Safe to call more than once, and
 /// from a panic or signal handler.
 pub(crate) fn release() {
-    release_reporter_to(&REPORTER, &mut std::io::stdout());
+    release_reporter_to(&REPORTER, &TITLE_RESTORE_NEEDED, &mut std::io::stdout());
 }
 
-/// Release through `reporter` without waiting for its mutex.
+/// Release through `reporter` without deadlocking a reentrant panic.
 ///
 /// A panic can originate inside a terminal write while `sync` holds this lock;
-/// blocking here would deadlock the panic hook before raw mode is restored. In
-/// that case emit the idempotent cleanup sequences directly. They may race a
-/// write from the failing thread, but the process is already unwinding and a
-/// bounded best-effort cleanup is strictly safer than waiting forever.
-fn release_reporter_to(reporter: &Mutex<Option<StatusReporter>>, out: &mut impl Write) {
-    match reporter.try_lock() {
-        Ok(mut guard) => guard
-            .get_or_insert_with(StatusReporter::default)
-            .release_to(out),
-        Err(TryLockError::Poisoned(poisoned)) => poisoned
-            .into_inner()
-            .get_or_insert_with(StatusReporter::default)
-            .release_to(out),
-        Err(TryLockError::WouldBlock) => emergency_release_to(out),
+/// that same thread uses direct emergency cleanup. A different thread waits for
+/// the in-flight write to finish, then releases under the mutex; otherwise it
+/// could pop first and let the writer publish a stale title afterward.
+fn release_reporter_to(
+    reporter: &Mutex<Option<StatusReporter>>,
+    restore_needed: &AtomicBool,
+    out: &mut impl Write,
+) {
+    if REPORTER_LOCK_HELD.with(Cell::get) {
+        emergency_release_to(out, restore_needed);
+        return;
     }
+    with_reporter_mutex(reporter, |status| {
+        status.release_to(out, restore_needed);
+    });
 }
 
-fn emergency_release_to(out: &mut impl Write) {
+fn emergency_release_to(out: &mut impl Write, restore_needed: &AtomicBool) {
     let _ = write_progress(out, PROGRESS_CLEARED);
-    let _ = write_title(out, "zerocode");
-    let _ = pop_title(out);
+    if restore_needed.swap(false, Ordering::AcqRel) {
+        let _ = write_title(out, "zerocode");
+        if pop_title(out).is_err() {
+            restore_needed.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// Ask the terminal to save its current title (XTPUSHTITLE). There is no
@@ -336,12 +393,52 @@ fn write_progress(out: &mut impl Write, payload: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::{Deref, DerefMut};
 
     /// Every test drives its own reporter over an in-memory sink. Going through
     /// the module-level functions would write escape sequences to the terminal
     /// running `cargo test` and retitle it.
-    fn reporter() -> StatusReporter {
-        StatusReporter::default()
+    #[derive(Default)]
+    struct TestReporter {
+        inner: StatusReporter,
+        restore_needed: AtomicBool,
+    }
+
+    impl TestReporter {
+        fn sync_to(
+            &mut self,
+            out: &mut impl Write,
+            status: Option<&TurnStatus>,
+            agent: Option<&str>,
+        ) {
+            self.inner.sync_to(out, &self.restore_needed, status, agent);
+        }
+
+        fn release_to(&mut self, out: &mut impl Write) {
+            self.inner.release_to(out, &self.restore_needed);
+        }
+
+        fn needs_restore(&self) -> bool {
+            self.restore_needed.load(Ordering::Acquire)
+        }
+    }
+
+    impl Deref for TestReporter {
+        type Target = StatusReporter;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl DerefMut for TestReporter {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    fn reporter() -> TestReporter {
+        TestReporter::default()
     }
 
     #[test]
@@ -353,7 +450,7 @@ mod tests {
     fn working_title_carries_the_verb() {
         assert_eq!(
             title_for(&TurnStatus::Working, Some("herder")),
-            "⏳ herder — working"
+            format!("⏳ herder — {}", crate::i18n::t("zc-chat-status-working"))
         );
     }
 
@@ -361,7 +458,10 @@ mod tests {
     fn tool_call_title_names_the_tool() {
         assert_eq!(
             title_for(&TurnStatus::CallingTool("git_diff".into()), Some("herder")),
-            "⏳ herder — calling tool git_diff"
+            format!(
+                "⏳ herder — {}",
+                crate::i18n::t_args("zc-chat-status-calling-tool", &[("tool", "git_diff")])
+            )
         );
     }
 
@@ -369,7 +469,21 @@ mod tests {
     fn approval_title_is_the_warning_glyph() {
         assert_eq!(
             title_for(&TurnStatus::WaitingForApproval, Some("herder")),
-            "⚠ herder — awaiting approval"
+            format!(
+                "⚠ herder — {}",
+                crate::i18n::t("zc-chat-status-awaiting-approval")
+            )
+        );
+    }
+
+    #[test]
+    fn elicitation_title_is_the_warning_glyph() {
+        assert_eq!(
+            title_for(&TurnStatus::WaitingForInput, Some("herder")),
+            format!(
+                "⚠ herder — {}",
+                crate::i18n::t("zc-chat-status-awaiting-input")
+            )
         );
     }
 
@@ -389,6 +503,7 @@ mod tests {
         assert_eq!(progress_for(&TurnStatus::Cancelling), "3;0");
         assert_eq!(progress_for(&TurnStatus::CallingTool("git".into())), "3;0");
         assert_eq!(progress_for(&TurnStatus::WaitingForApproval), "4;0");
+        assert_eq!(progress_for(&TurnStatus::WaitingForInput), "4;0");
     }
 
     /// First sync saves the terminal's own title before overwriting it, then
@@ -399,7 +514,10 @@ mod tests {
         reporter().sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "\x1b[22;0t\x1b]2;⏳ herder — working\x07\x1b]9;4;3;0\x07"
+            format!(
+                "\x1b[22;0t\x1b]2;⏳ herder — {}\x07\x1b]9;4;3;0\x07",
+                crate::i18n::t("zc-chat-status-working")
+            )
         );
     }
 
@@ -431,7 +549,10 @@ mod tests {
         let mut out = Vec::new();
         r.sync_to(&mut out, Some(&TurnStatus::Thinking), Some("herder"));
         let written = String::from_utf8(out).unwrap();
-        assert!(written.contains("thinking"), "title should update");
+        assert!(
+            written.contains(&crate::i18n::t("zc-chat-status-thinking")),
+            "title should update"
+        );
         assert!(
             !written.contains("\x1b]9;4;"),
             "progress must not be re-emitted: {written:?}"
@@ -498,7 +619,10 @@ mod tests {
         };
         let mut r = reporter();
         r.sync_to(&mut terminal, Some(&TurnStatus::Working), Some("herder"));
-        assert_eq!(terminal.title, "⏳ herder — working");
+        assert_eq!(
+            terminal.title,
+            format!("⏳ herder — {}", crate::i18n::t("zc-chat-status-working"))
+        );
 
         r.release_to(&mut terminal);
         assert_eq!(terminal.title, "zerocode");
@@ -527,7 +651,10 @@ mod tests {
         r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
         let written = String::from_utf8(out).unwrap();
         assert!(
-            written.contains("⏳ herder — working"),
+            written.contains(&format!(
+                "⏳ herder — {}",
+                crate::i18n::t("zc-chat-status-working")
+            )),
             "title must re-emit"
         );
         assert!(
@@ -589,13 +716,13 @@ mod tests {
         let mut r = reporter();
         let mut out = FailPush::default();
         r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
-        assert!(r.title_restore_needed);
+        assert!(r.needs_restore());
         assert!(out.bytes.starts_with(b"\x1b]2;"));
 
         let mut released = Vec::new();
         r.release_to(&mut released);
         assert!(released.ends_with(b"\x1b[23;0t"));
-        assert!(!r.title_restore_needed);
+        assert!(!r.needs_restore());
     }
 
     /// A `write_all` failure can happen after a prefix reached the terminal.
@@ -636,7 +763,7 @@ mod tests {
             Some("herder"),
         );
         assert_eq!(r.last_title, None);
-        assert!(r.title_restore_needed);
+        assert!(r.needs_restore());
 
         let mut released = Vec::new();
         r.release_to(&mut released);
@@ -672,7 +799,7 @@ mod tests {
             Some("herder"),
         );
         assert_eq!(r.last_title, None);
-        assert!(r.title_restore_needed);
+        assert!(r.needs_restore());
 
         let mut released = Vec::new();
         r.release_to(&mut released);
@@ -708,9 +835,9 @@ mod tests {
 
         let mut out = FailFirstPop::default();
         r.release_to(&mut out);
-        assert!(r.title_restore_needed, "failed pop must remain retryable");
+        assert!(r.needs_restore(), "failed pop must remain retryable");
         r.release_to(&mut out);
-        assert!(!r.title_restore_needed);
+        assert!(!r.needs_restore());
         assert!(out.bytes.ends_with(b"\x1b[23;0t"));
     }
 
@@ -718,15 +845,88 @@ mod tests {
     /// section panicked. The fallback is a direct clear + pop pair.
     #[test]
     fn reentrant_release_uses_nonblocking_emergency_cleanup() {
-        let reporter = Mutex::new(Some(StatusReporter {
-            title_restore_needed: true,
-            ..StatusReporter::default()
-        }));
-        let held = reporter.lock().unwrap();
+        let reporter = Mutex::new(Some(StatusReporter::default()));
+        let restore_needed = AtomicBool::new(true);
         let mut out = Vec::new();
-        release_reporter_to(&reporter, &mut out);
-        drop(held);
+        with_reporter_mutex(&reporter, |_| {
+            release_reporter_to(&reporter, &restore_needed, &mut out);
+        });
         assert_eq!(out, b"\x1b]9;4;0;0\x07\x1b]2;zerocode\x07\x1b[23;0t");
+        assert!(!restore_needed.load(Ordering::Acquire));
+    }
+
+    /// The emergency path claims the one restore obligation atomically. Once
+    /// it succeeds, the normal teardown that follows unwinding may clear
+    /// progress again, but it must not pop an outer terminal title.
+    #[test]
+    fn emergency_then_normal_release_pops_exactly_once() {
+        let reporter = Mutex::new(Some(StatusReporter::default()));
+        let restore_needed = AtomicBool::new(true);
+        let mut out = Vec::new();
+        with_reporter_mutex(&reporter, |_| {
+            release_reporter_to(&reporter, &restore_needed, &mut out);
+        });
+        release_reporter_to(&reporter, &restore_needed, &mut out);
+
+        assert_eq!(
+            out.windows(b"\x1b[23;0t".len())
+                .filter(|window| *window == b"\x1b[23;0t")
+                .count(),
+            1
+        );
+    }
+
+    /// A panic hook on another worker must serialize after an in-flight status
+    /// write. Treating every busy lock as reentrant lets cleanup pop first and
+    /// the writer publish a stale title afterward with no restore obligation.
+    #[test]
+    fn concurrent_release_waits_for_inflight_sync() {
+        let reporter = std::sync::Arc::new(Mutex::new(Some(StatusReporter::default())));
+        let restore_needed = std::sync::Arc::new(AtomicBool::new(false));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        let writer_reporter = std::sync::Arc::clone(&reporter);
+        let writer_restore = std::sync::Arc::clone(&restore_needed);
+        let writer = std::thread::spawn(move || {
+            with_reporter_mutex(&writer_reporter, |status| {
+                let mut sink = Vec::new();
+                status.sync_to(
+                    &mut sink,
+                    &writer_restore,
+                    Some(&TurnStatus::Working),
+                    Some("herder"),
+                );
+                locked_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        locked_rx.recv().unwrap();
+
+        let release_reporter = std::sync::Arc::clone(&reporter);
+        let release_restore = std::sync::Arc::clone(&restore_needed);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            release_reporter_to(&release_reporter, &release_restore, &mut out);
+            done_tx.send(out).unwrap();
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "another thread's cleanup must wait for the reporter lock"
+        );
+        resume_tx.send(()).unwrap();
+        let out = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cleanup should finish after the in-flight sync");
+
+        writer.join().unwrap();
+        release.join().unwrap();
+        assert!(out.ends_with(b"\x1b[23;0t"));
+        assert!(!restore_needed.load(Ordering::Acquire));
     }
 
     /// A blocked pane wins even when it is not the visible one — the whole
@@ -734,12 +934,20 @@ mod tests {
     #[test]
     fn most_urgent_prefers_blocked_then_working() {
         let blocked = TurnStatus::WaitingForApproval;
+        let asking = TurnStatus::WaitingForInput;
         let working = TurnStatus::Working;
         let idle = TurnStatus::Idle;
 
         let (status, agent) =
             most_urgent([(Some(&idle), Some("chat")), (Some(&blocked), Some("code"))]);
         assert!(matches!(status, Some(TurnStatus::WaitingForApproval)));
+        assert_eq!(agent, Some("code"));
+
+        let (status, agent) = most_urgent([
+            (Some(&working), Some("chat")),
+            (Some(&asking), Some("code")),
+        ]);
+        assert!(matches!(status, Some(TurnStatus::WaitingForInput)));
         assert_eq!(agent, Some("code"));
 
         let (status, agent) =

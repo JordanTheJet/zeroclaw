@@ -36,6 +36,11 @@ tokio::task_local! {
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 
+    /// Canonical ID of the tool call currently executing. Scoped by the common
+    /// dispatcher so response-bearing channel requests can correlate with the
+    /// same ToolCall/ToolResult pair without parsing presentation text.
+    pub static TOOL_LOOP_TOOL_CALL_ID: Option<String>;
+
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
