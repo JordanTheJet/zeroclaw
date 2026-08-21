@@ -22772,6 +22772,7 @@ impl Config {
             return result;
         }
 
+        let write_lock = acquire_config_write_lock(&config_path).await?;
         let existing = fs::read_to_string(&config_path).await.with_context(|| {
             format!(
                 "Failed to read existing config for incremental save: {}",
@@ -22779,7 +22780,7 @@ impl Config {
             )
         })?;
 
-        self.save_dirty_from_source(&config_path, &existing, None)
+        self.save_dirty_from_source(&config_path, &existing, None, &write_lock)
             .await
             .map(|_| ())
     }
@@ -22787,10 +22788,14 @@ impl Config {
     /// Incremental save against an exact caller-provided source revision.
     ///
     /// Dirty paths are applied to `expected_source`, never to a later re-read
-    /// selected inside the save path. Immediately before atomic replacement,
-    /// the live file must still be byte-identical to that source. Returns
-    /// `Ok(false)` on revision drift and leaves the file and dirty set
-    /// untouched so the caller can re-read, re-validate, and retry.
+    /// selected inside the save path. As the final step before entering the
+    /// atomic replacement pipeline, the live file must still be byte-identical
+    /// to that source. Returns `Ok(false)` on revision drift and leaves the file
+    /// and dirty set untouched so the caller can re-read, re-validate, and retry.
+    ///
+    /// This is optimistic expected-source protection, not a strict cross-process
+    /// filesystem compare-and-swap: another process can still replace the file
+    /// in the narrow window between the final comparison and atomic rename.
     ///
     /// This is the persistence boundary for an operation whose effect was
     /// approved against a specific config revision. Ordinary editors should
@@ -22801,8 +22806,14 @@ impl Config {
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
-        self.save_dirty_from_source(&config_path, expected_source, Some(expected_source))
-            .await
+        let write_lock = acquire_config_write_lock(&config_path).await?;
+        self.save_dirty_from_source(
+            &config_path,
+            expected_source,
+            Some(expected_source),
+            &write_lock,
+        )
+        .await
     }
 
     /// Materialize dirty paths onto one explicit TOML source. When
@@ -22814,6 +22825,7 @@ impl Config {
         config_path: &Path,
         source: &str,
         expected_current: Option<&str>,
+        _write_lock: &ConfigWriteLock,
     ) -> Result<bool> {
         let mut config_to_save = self.clone();
         let zeroclaw_dir = config_path
@@ -22884,7 +22896,12 @@ impl Config {
             }
         }
 
-        write_config_atomically(config_path, &toml_str).await?;
+        resolve_atomic_write_result(
+            config_path,
+            &toml_str,
+            write_config_atomically_locked(config_path, &toml_str).await,
+        )
+        .await?;
         self.clear_dirty();
         Ok(true)
     }
@@ -22926,8 +22943,140 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+struct ConfigWriteLock(std::fs::File);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWriteDisposition {
+    NotCommitted,
+    Committed,
+    Ambiguous,
+}
+
+#[derive(Debug)]
+struct ConfigWriteFailure {
+    disposition: ConfigWriteDisposition,
+    message: String,
+}
+
+impl std::fmt::Display for ConfigWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigWriteFailure {}
+
+fn config_write_failure(
+    disposition: ConfigWriteDisposition,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::new(ConfigWriteFailure {
+        disposition,
+        message: error.to_string(),
+    })
+}
+
+#[must_use]
+pub fn config_write_disposition(error: &anyhow::Error) -> ConfigWriteDisposition {
+    error
+        .downcast_ref::<ConfigWriteFailure>()
+        .map_or(ConfigWriteDisposition::NotCommitted, |failure| {
+            failure.disposition
+        })
+}
+
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+async fn acquire_config_write_lock(config_path: &Path) -> Result<ConfigWriteLock> {
+    let parent_dir = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    fs::create_dir_all(parent_dir).await?;
+    let config_path = config_path.to_path_buf();
+    let lock =
+        tokio::task::spawn_blocking(move || acquire_config_write_lock_blocking(&config_path))
+            .await
+            .context("Config write-lock task failed")??;
+    Ok(lock)
+}
+
+fn acquire_config_write_lock_blocking(config_path: &Path) -> std::io::Result<ConfigWriteLock> {
+    use fs2::FileExt as _;
+    let parent_dir = config_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path must have a parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent_dir)?;
+    let lock_path = parent_dir.join(".config.toml.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path)?;
+    file.lock_exclusive()?;
+    Ok(ConfigWriteLock(file))
+}
+
+async fn resolve_atomic_write_result(
+    config_path: &Path,
+    intended: &str,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if config_write_disposition(&error) == ConfigWriteDisposition::Committed => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "path": config_path.display().to_string(),
+                        "post_commit_error": error.to_string(),
+                    })),
+                "Config replacement committed but directory durability confirmation failed"
+            );
+            Ok(())
+        }
+        Err(error) => match fs::read_to_string(config_path).await {
+            Ok(current) if current == intended => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "path": config_path.display().to_string(),
+                            "post_commit_error": error.to_string(),
+                        })),
+                    "Config replacement committed but post-commit durability confirmation failed"
+                );
+                Ok(())
+            }
+            _ => Err(error),
+        },
+    }
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    let _write_lock = acquire_config_write_lock(config_path).await?;
+    resolve_atomic_write_result(
+        config_path,
+        toml_str,
+        write_config_atomically_locked(config_path, toml_str).await,
+    )
+    .await
+}
+
+async fn write_config_atomically_locked(config_path: &Path, toml_str: &str) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -22979,10 +23128,16 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
         let _ = fs::remove_file(&temp_path).await;
-        if had_existing_config && backup_path.exists() {
-            fs::copy(&backup_path, config_path)
-                .await
-                .context("Failed to restore config backup")?;
+        if had_existing_config
+            && backup_path.exists()
+            && let Err(restore_error) = fs::copy(&backup_path, config_path).await
+        {
+            return Err(config_write_failure(
+                ConfigWriteDisposition::Ambiguous,
+                format!(
+                    "Failed to atomically replace config ({e}) and failed to restore backup ({restore_error})"
+                ),
+            ));
         }
         anyhow::bail!("Failed to atomically replace config file: {e}");
     }
@@ -23004,7 +23159,9 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
+    sync_directory(parent_dir)
+        .await
+        .map_err(|error| config_write_failure(ConfigWriteDisposition::Committed, error))?;
 
     if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
@@ -32509,19 +32666,150 @@ group_policy = "disabled"
             external_source,
             "a drift refusal must leave the external writer's bytes untouched"
         );
-
         // Refusal keeps the dirty set, so a caller that re-validates against
         // the new revision can retry without reconstructing its edit.
+        assert!(
+            edited.dirty_paths.contains("observability.backend"),
+            "a drift refusal must preserve dirty paths for diagnostics or retry"
+        );
+
         assert!(
             edited
                 .save_dirty_if_source_unchanged(&external_source)
                 .await
-                .unwrap()
+                .unwrap(),
+            "a caller may retry after re-validating the newer source"
         );
         let written: Config =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(written.gateway.port, 4242);
         assert_eq!(written.observability.backend, ObservabilityBackend::Otel);
+        assert!(edited.dirty_paths.is_empty());
+    }
+
+    #[test]
+    async fn config_write_lock_serializes_independent_file_handles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "schema_version = 3\n").unwrap();
+        let first = acquire_config_write_lock(&config_path).await.unwrap();
+        let second_path = config_path.clone();
+        let second = std::thread::spawn(move || acquire_config_write_lock_blocking(&second_path));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !second.is_finished(),
+            "a second writer must wait while the first OS lock is held"
+        );
+        drop(first);
+        second
+            .join()
+            .expect("lock thread should join")
+            .expect("second lock should succeed");
+    }
+
+    #[test]
+    async fn save_dirty_holds_the_lock_across_source_read_and_replace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut edited = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        edited.save().await.unwrap();
+        edited.observability.backend = ObservabilityBackend::Otel;
+        edited.mark_dirty("observability.backend");
+
+        let held_lock = acquire_config_write_lock(&config_path).await.unwrap();
+        let save_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move { edited.save_dirty().await })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !save_thread.is_finished(),
+            "save_dirty must wait for the write lock before reading its merge base"
+        );
+
+        let mut external = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        external.gateway.port = 4242;
+        let external_toml = toml::to_string_pretty(&external).unwrap();
+        std::fs::write(&config_path, external_toml).unwrap();
+        drop(held_lock);
+        save_thread
+            .join()
+            .expect("save thread should join")
+            .expect("save_dirty should succeed");
+
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written.gateway.port, 4242, "external update survives");
+        assert_eq!(written.observability.backend, ObservabilityBackend::Otel);
+    }
+
+    #[test]
+    async fn post_rename_error_is_committed_only_when_intended_bytes_are_visible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let intended = "schema_version = 3\n[observability]\nbackend = \"none\"\n";
+        std::fs::write(&config_path, intended).unwrap();
+        assert!(
+            resolve_atomic_write_result(
+                &config_path,
+                intended,
+                Err(anyhow::Error::msg("injected post-rename fsync failure")),
+            )
+            .await
+            .is_ok(),
+            "visible intended bytes prove the rename committed"
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
+        assert!(
+            resolve_atomic_write_result(
+                &config_path,
+                intended,
+                Err(config_write_failure(
+                    ConfigWriteDisposition::Committed,
+                    "injected committed-state error with unreadable destination",
+                )),
+            )
+            .await
+            .is_ok(),
+            "typed committed state must not depend on a successful verification read"
+        );
+
+        let ambiguous = resolve_atomic_write_result(
+            &config_path,
+            intended,
+            Err(config_write_failure(
+                ConfigWriteDisposition::Ambiguous,
+                "injected ambiguous rename/restore outcome",
+            )),
+        )
+        .await
+        .expect_err("an unreadable ambiguous outcome must remain an error");
+        assert_eq!(
+            config_write_disposition(&ambiguous),
+            ConfigWriteDisposition::Ambiguous
+        );
+
+        std::fs::write(&config_path, "schema_version = 3\n# different\n").unwrap();
+        assert!(
+            resolve_atomic_write_result(
+                &config_path,
+                intended,
+                Err(anyhow::Error::msg("injected pre-rename failure")),
+            )
+            .await
+            .is_err(),
+            "different live bytes must preserve the write error"
+        );
     }
 
     /// Regression for the per-field `[[mcp.servers]]` editor: after
