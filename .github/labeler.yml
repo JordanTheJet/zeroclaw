@@ -380,7 +380,7 @@
   - changed-files:
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/quickstart/**"
-          - "crates/zeroclaw-onboarding/**"
+          - "crates/zeroclaw-control/**"
           - "crates/zeroclaw-gateway/src/api_quickstart.rs"
           - "apps/zerocode/src/quickstart_pane.rs"
           - "web/src/pages/quickstart/**"

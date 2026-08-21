@@ -23,7 +23,7 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
-| Zerona add-agent apply | `zeroclaw-onboarding`, root CLI, and Quickstart's strict agent-scoped apply path | Per-agent OS lock, exact-source checks, durable personality workspace commit, then locked atomic config replacement | The created agent is available on the next command/load; running daemon subsystems still need reload |
+| Zerona add-agent apply | `zeroclaw-control`, root CLI, and Quickstart's strict agent-scoped apply path | Per-agent OS lock, exact-source checks, durable personality workspace commit, then locked atomic config replacement | The created agent is available on the next command/load; running daemon subsystems still need reload |
 | Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Gateway-visible state updates immediately; daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 

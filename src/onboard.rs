@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use zeroclaw_api::principal::Principal;
 use zeroclaw_config::multi_agent::MemoryBackendKind;
 use zeroclaw_config::schema::{Config, SopConfig};
-use zeroclaw_onboarding::{
+use zeroclaw_control::{
     CurrentProviderFactory, FluentMessage, PROPOSAL_MARKER, PersonalityFilePreview,
     ProposalPreview, ValidatedProposal, ZeronaSession, build_preview, eligible_provider_refs,
     revalidate_proposal, validate_operator_input,
@@ -586,9 +586,9 @@ fn verify_install(
     };
     let raw = proposal.proposal();
     let expected_memory = match raw.memory {
-        zeroclaw_onboarding::MemoryChoice::Sqlite => MemoryBackendKind::Sqlite,
-        zeroclaw_onboarding::MemoryChoice::Markdown => MemoryBackendKind::Markdown,
-        zeroclaw_onboarding::MemoryChoice::None => MemoryBackendKind::None,
+        zeroclaw_control::MemoryChoice::Sqlite => MemoryBackendKind::Sqlite,
+        zeroclaw_control::MemoryChoice::Markdown => MemoryBackendKind::Markdown,
+        zeroclaw_control::MemoryChoice::None => MemoryBackendKind::None,
     };
     if !preserved.matches_after_add(config, expected_alias)?
         || agent.model_provider.as_str() != proposal.selected_provider_ref()

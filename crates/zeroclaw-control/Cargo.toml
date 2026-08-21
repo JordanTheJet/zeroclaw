@@ -1,9 +1,9 @@
 [package]
-name = "zeroclaw-onboarding"
+name = "zeroclaw-control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Capability-free guided agent creation for ZeroClaw"
+description = "Transport-independent management core for ZeroClaw; currently capability-free guided agent creation (seed of ControlService)"
 publish = false
 
 [dependencies]

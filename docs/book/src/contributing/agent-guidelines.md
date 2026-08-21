@@ -66,7 +66,7 @@ The stability-tier definitions and versioning policy live in [FND-001](../founda
 | `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-runtime` | Experimental | Agent runtime: agent loop, security, cron, SOP, skills, and observability |
-| `zeroclaw-onboarding` | Experimental | Capability-free Zerona agent-creation workflow |
+| `zeroclaw-control` | Experimental | Capability-free Zerona agent-creation workflow |
 | `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
 | `zerocode` | Experimental | TUI onboarding wizard |
 | `zeroclaw-plugins` | Experimental | WASM plugin system and foundation for the v1.0.0 plugin ecosystem |
