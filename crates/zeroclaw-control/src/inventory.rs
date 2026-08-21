@@ -12,7 +12,7 @@ use crate::guard::{TextMode, assess_effective_posture, ensure_display_text, ensu
 pub const PERSONALITY_FILENAMES: &[&str] = &["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md"];
 pub const MAX_PERSONALITY_FILE_CHARS: usize = zeroclaw_runtime::agent::personality::MAX_FILE_CHARS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskChoice {
     LockedDown,
@@ -31,7 +31,7 @@ impl RiskChoice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeChoice {
     Tight,
@@ -52,7 +52,7 @@ impl RuntimeChoice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryChoice {
     Sqlite,

@@ -6,10 +6,22 @@ license.workspace = true
 description = "Transport-independent management core for ZeroClaw; currently capability-free guided agent creation (seed of ControlService)"
 publish = false
 
+[features]
+# Test-only. Compiles the fixture-credential constructors that let a test drive
+# the grant-gated tools before phase 3 registration exists. Deliberately absent
+# from `default` and from every released profile: the workspace enables it only
+# through `[dev-dependencies]`, so `cargo build --release` links none of it.
+fixture-grants = []
+
 [dependencies]
 anyhow = "1.0"
+# Already an unconditional dependency of the `zeroclaw` binary, so the control
+# protocol's request and response schemas are generated from the compiled types
+# rather than hand written without adding anything to a shipped build.
+schemars = "1.2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs"] }
 toml = "1.0"
 zeroclaw-api.workspace = true

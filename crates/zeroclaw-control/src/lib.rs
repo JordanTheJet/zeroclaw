@@ -19,7 +19,9 @@
 mod guard;
 mod inventory;
 mod preview;
+mod principal;
 mod proposal;
+pub mod protocol;
 mod service;
 mod session;
 
@@ -35,6 +37,12 @@ pub use preview::{
     ApplyIntegration, PersistencePreview, PersonalityFilePreview, ProfileDisposition,
     ProposalPreview, RevisionBinding, build_preview,
 };
+pub use principal::{
+    ACCEPTED_ASSURANCE_CLASSES, ControlSession, PROPOSAL_DOMAIN_AGENT, REJECTED_ASSURANCE_CLASSES,
+    RequesterGrant, registration_help,
+};
+#[cfg(feature = "fixture-grants")]
+pub use principal::{FIXTURE_ASSURANCE_CLASS, FIXTURE_CREDENTIAL_MARKER};
 pub use proposal::{
     AgentProposal, PROPOSAL_MARKER, PersonalityFileProposal, ProposalError, ProposalErrorCode,
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
