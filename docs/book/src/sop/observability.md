@@ -56,6 +56,12 @@ may have no retained rows after rolling trim or rotation. The UI and CLI report
 when persistence is disabled; rotated archives remain offline diagnostic
 artifacts.
 
+An `observability-otel` build with `backend = "otel"` also exports these same
+canonical events as standard OTLP/HTTP protobuf LogRecords. Provider, tool, and
+step rows retain `zeroclaw.sop_run_id` as an OTel attribute, so a collector or
+vendor can query the same run without replacing the local dashboard/CLI/TUI
+path. See [Logs & observability](../ops/observability.md#native-otlp-logs-observability-otel).
+
 ### 2.2 Definition-level CLI
 
 <div class="os-tabs-src">
