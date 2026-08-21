@@ -17,6 +17,8 @@ pub enum TurnStatus {
     CallingTool(String),
     /// Approval request is blocking the turn.
     WaitingForApproval,
+    /// A structured user question is blocking the turn.
+    WaitingForInput,
     /// Cancel request fired; awaiting `TurnComplete` so input stays gated
     /// until the daemon actually winds the turn down.
     Cancelling,
@@ -27,19 +29,35 @@ impl TurnStatus {
     pub(crate) fn verb(&self) -> Option<String> {
         match self {
             TurnStatus::Idle => None,
-            TurnStatus::Working => Some("working".into()),
-            TurnStatus::Thinking => Some("thinking".into()),
-            TurnStatus::Responding => Some("responding".into()),
-            TurnStatus::CallingTool(name) => Some(format!("calling tool {name}")),
-            TurnStatus::WaitingForApproval => None,
-            TurnStatus::Cancelling => Some("cancelling".into()),
+            TurnStatus::Working => Some(crate::i18n::t("zc-chat-status-working")),
+            TurnStatus::Thinking => Some(crate::i18n::t("zc-chat-status-thinking")),
+            TurnStatus::Responding => Some(crate::i18n::t("zc-chat-status-responding")),
+            TurnStatus::CallingTool(name) => Some(crate::i18n::t_args(
+                "zc-chat-status-calling-tool",
+                &[("tool", name)],
+            )),
+            TurnStatus::WaitingForApproval | TurnStatus::WaitingForInput => None,
+            TurnStatus::Cancelling => Some(crate::i18n::t("zc-chat-status-cancelling")),
         }
+    }
+
+    /// Whether the turn is stopped at an operator-input boundary.
+    pub(crate) fn is_blocked(&self) -> bool {
+        matches!(
+            self,
+            TurnStatus::WaitingForApproval | TurnStatus::WaitingForInput
+        )
     }
 
     pub fn label(&self, animation_origin: Instant) -> String {
         match self {
             TurnStatus::Idle => " > ".to_string(),
-            TurnStatus::WaitingForApproval => " (awaiting approval) ".to_string(),
+            TurnStatus::WaitingForApproval => {
+                format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-approval"))
+            }
+            TurnStatus::WaitingForInput => {
+                format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-input"))
+            }
             _ => {
                 let verb = self.verb().unwrap_or_default();
                 let dots = dots_for(animation_origin);
@@ -76,20 +94,33 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(5);
         assert_eq!(
             TurnStatus::WaitingForApproval.label(past),
-            " (awaiting approval) "
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-approval"))
         );
+    }
+
+    #[test]
+    fn input_label_has_no_dots() {
+        let past = Instant::now() - Duration::from_secs(5);
+        assert_eq!(
+            TurnStatus::WaitingForInput.label(past),
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-input"))
+        );
+        assert!(TurnStatus::WaitingForInput.is_blocked());
     }
 
     #[test]
     fn working_label_has_dots_animation() {
         // origin = now → 0 ms elapsed → phase 0 → no dots.
-        assert_eq!(TurnStatus::Working.label(Instant::now()), " (working) ");
+        assert_eq!(
+            TurnStatus::Working.label(Instant::now()),
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-working"))
+        );
     }
 
     #[test]
     fn calling_tool_includes_name() {
         let s = TurnStatus::CallingTool("git_diff".into()).label(Instant::now());
-        assert!(s.starts_with(" (calling tool git_diff"), "got: {s}");
+        assert!(s.contains("git_diff"), "got: {s}");
     }
 
     #[test]

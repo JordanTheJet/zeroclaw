@@ -37,6 +37,7 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+const AUTOMATIC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -646,7 +647,7 @@ impl Chat {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
                     if let ChatPhase::Active(ref mut state) = self.phase
-                        && let Some(update) = parse_session_update(&notif.params)
+                        && let Some(update) = parse_session_update(&notif.params, notif.received_at)
                     {
                         state.apply_update(update);
                         applied = true;
@@ -686,19 +687,15 @@ impl Chat {
                     if !self.inbound_request_claims.claim(&id) {
                         continue;
                     }
-                    let rpc = self.rpc.clone();
-                    tokio::spawn(async move {
-                        let _ = rpc
-                            .respond_to_inbound_request(
-                                id,
-                                Err(crate::jsonrpc::JsonRpcError {
-                                    code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
-                                    message: format!("Method not found: {method}"),
-                                    data: None,
-                                }),
-                            )
-                            .await;
-                    });
+                    Self::spawn_inbound_response(
+                        &self.rpc,
+                        id,
+                        Err(crate::jsonrpc::JsonRpcError {
+                            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                            message: format!("Method not found: {method}"),
+                            data: None,
+                        }),
+                    );
                 }
             }
         }
@@ -773,12 +770,95 @@ impl Chat {
     /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
     /// calling tool takes its non-channel fallback path.
     fn answer_cancel(rpc: &Arc<RpcClient>, id: serde_json::Value) {
-        let rpc = rpc.clone();
+        Self::spawn_inbound_response(rpc, id, Ok(serde_json::json!({ "action": "cancel" })));
+    }
+
+    /// Automatic protocol replies have no modal the operator can retry. Keep
+    /// them queued through transient writer backpressure, but bound the task so
+    /// a dead transport cannot accumulate waiters indefinitely.
+    fn spawn_inbound_response(
+        rpc: &Arc<RpcClient>,
+        id: serde_json::Value,
+        result: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
+    ) {
+        let rpc = Arc::clone(rpc);
         tokio::spawn(async move {
-            let _ = rpc
-                .respond_to_inbound_request(id, Ok(serde_json::json!({ "action": "cancel" })))
-                .await;
+            let _ = tokio::time::timeout(
+                AUTOMATIC_RESPONSE_TIMEOUT,
+                rpc.respond_to_inbound_request(id, result),
+            )
+            .await;
         });
+    }
+
+    /// Send an answer to a structured agent question without losing the modal
+    /// if the local writer has already gone away. A successful send releases
+    /// the blocked state immediately; the daemon does not emit a separate
+    /// acknowledgement for JSON-RPC responses.
+    fn answer_elicitation(
+        rpc: &RpcClient,
+        state: &mut ChatState,
+        pending: PendingElicitation,
+        response: serde_json::Value,
+    ) {
+        let request_id = pending.request_id.clone();
+        match rpc.try_respond_to_inbound_request(request_id, Ok(response)) {
+            Ok(()) => state.finish_operator_response(TurnStatus::Working),
+            Err(error) => {
+                state.pending_elicitation = Some(pending);
+                state.reassert_operator_wait();
+                state.set_response_error(&error);
+            }
+        }
+        state.mark_dirty_full();
+    }
+
+    /// Resolve a tool approval and keep the prompt recoverable on RPC error.
+    /// Allowing resumes the named tool; rejecting hands control back to the
+    /// agent. Either is active work, not a warning state.
+    async fn answer_approval(
+        rpc: &RpcClient,
+        state: &mut ChatState,
+        mut pending: PendingApproval,
+        decision: ApprovalDecision,
+    ) {
+        // `$EDITOR` can suspend the UI past the deadline while the transport
+        // reader continues. Do not submit a decision the daemon has already
+        // expired (its legacy response acknowledges unknown IDs as a no-op).
+        if pending.is_expired() {
+            state.finish_operator_response(TurnStatus::Working);
+            state.mark_dirty_full();
+            return;
+        }
+
+        let retry_replacement = match &decision {
+            ApprovalDecision::RejectWithEdit { replacement } => Some(replacement.clone()),
+            _ => None,
+        };
+        let next_status = if matches!(
+            &decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+        ) {
+            TurnStatus::CallingTool(pending.tool_name.clone())
+        } else {
+            TurnStatus::Working
+        };
+
+        match rpc
+            .session_approve(&state.session_id, &pending.request_id, decision)
+            .await
+        {
+            Ok(_) => state.finish_operator_response(next_status),
+            Err(error) => {
+                if let Some(replacement) = retry_replacement {
+                    pending.retry_replacement = Some(replacement);
+                }
+                state.pending_approval = Some(pending);
+                state.reassert_operator_wait();
+                state.set_response_error(&error);
+            }
+        }
+        state.mark_dirty_full();
     }
 
     fn try_install_elicitation(
@@ -809,6 +889,20 @@ impl Chat {
             return ElicitationRouting::Defer(req);
         }
 
+        // Cancellation owns the session now. Do not let a delayed question
+        // replace `Cancelling` (which would disable the watchdog), and do not
+        // leave the daemon's response-bearing request parked until timeout.
+        let cancelling = matches!(
+            &self.phase,
+            ChatPhase::Active(state) if matches!(state.turn_status, TurnStatus::Cancelling)
+        );
+        if cancelling {
+            if self.inbound_request_claims.claim(&req.id) {
+                Self::answer_cancel(&self.rpc, req.id);
+            }
+            return ElicitationRouting::Claimed;
+        }
+
         // Every Chat pane receives the same broadcast request. Claim before
         // installing the modal so a non-owner pane can observe the ownership
         // tombstone and discard its deferred copy after the grace period.
@@ -816,9 +910,24 @@ impl Chat {
             return ElicitationRouting::Claimed;
         }
 
+        // The notification queue is drained before inbound requests. If this
+        // call already completed while the UI was paused, the request is stale
+        // and must not resurrect a blocked modal.
+        let tool_already_completed = params.tool_call_id.as_ref().is_some_and(|id| {
+            matches!(
+                &self.phase,
+                ChatPhase::Active(state) if state.tool_call_completed(id)
+            )
+        });
+        if tool_already_completed {
+            Self::answer_cancel(&self.rpc, req.id);
+            return ElicitationRouting::Claimed;
+        }
+
         let pending = match shape {
             crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
                 request_id: req.id,
+                tool_call_id: params.tool_call_id,
                 session_id: params.session_id,
                 message: params.message,
                 choices: choices.into_iter().map(|c| c.title).collect(),
@@ -837,6 +946,7 @@ impl Chat {
                 let n = choices.len();
                 PendingElicitation {
                     request_id: req.id,
+                    tool_call_id: params.tool_call_id,
                     session_id: params.session_id,
                     message: params.message,
                     choices: choices.into_iter().map(|c| c.title).collect(),
@@ -1109,9 +1219,20 @@ impl Chat {
     pub(crate) fn poll(&mut self) {
         self.drain_notifications();
         self.drain_inbound_requests();
+        if let ChatPhase::Active(state) = &mut self.phase {
+            state.settle_expired_approval();
+        }
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
+    }
+
+    /// Refresh metadata used only by this pane's visible chrome.
+    ///
+    /// Lifecycle polling stays active for both panes, but a hidden pane must
+    /// not make a filesystem-backed RPC every second for a branch label no one
+    /// can see.
+    pub(crate) fn refresh_visible_metadata(&mut self) {
         self.maybe_refresh_git_branch();
     }
 
@@ -1367,42 +1488,36 @@ impl Chat {
                     // Build the response without holding the modal borrow,
                     // then answer the daemon. For an invalid multi-select
                     // (bounds unmet) keep the modal open.
-                    let payload = state
+                    let content = state
                         .pending_elicitation
                         .as_ref()
-                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
-                    if let Some((id, content)) = payload {
-                        state.pending_elicitation = None;
-                        state.mark_dirty_full();
+                        .and_then(PendingElicitation::accept_content);
+                    if let Some(content) = content
+                        && let Some(pending) = state.pending_elicitation.take()
+                    {
                         let rpc = self.rpc.clone();
-                        tokio::spawn(async move {
-                            let _ = rpc
-                                .respond_to_inbound_request(
-                                    id,
-                                    Ok(serde_json::json!({
-                                        "action": "accept",
-                                        "content": content
-                                    })),
-                                )
-                                .await;
-                        });
+                        Self::answer_elicitation(
+                            &rpc,
+                            state,
+                            pending,
+                            serde_json::json!({
+                                "action": "accept",
+                                "content": content
+                            }),
+                        );
                     }
                     // else: invalid selection — swallow, leave modal up.
                     return false;
                 }
                 Some(ModalAction::Cancel) => {
-                    if let Some(e) = state.pending_elicitation.take() {
-                        state.mark_dirty_full();
-                        let id = e.request_id;
+                    if let Some(pending) = state.pending_elicitation.take() {
                         let rpc = self.rpc.clone();
-                        tokio::spawn(async move {
-                            let _ = rpc
-                                .respond_to_inbound_request(
-                                    id,
-                                    Ok(serde_json::json!({ "action": "cancel" })),
-                                )
-                                .await;
-                        });
+                        Self::answer_elicitation(
+                            &rpc,
+                            state,
+                            pending,
+                            serde_json::json!({ "action": "cancel" }),
+                        );
                     }
                     return false;
                 }
@@ -1745,38 +1860,20 @@ impl Chat {
             }
             Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
-                    let _ = self
-                        .rpc
-                        .session_approve(
-                            &state.session_id,
-                            &pa.request_id,
-                            ApprovalDecision::AllowOnce,
-                        )
-                        .await;
+                    let rpc = self.rpc.clone();
+                    Self::answer_approval(&rpc, state, pa, ApprovalDecision::AllowOnce).await;
                 }
             }
             Some(ChatTabAction::CancelTurn) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
-                    let _ = self
-                        .rpc
-                        .session_approve(
-                            &state.session_id,
-                            &pa.request_id,
-                            ApprovalDecision::Reject,
-                        )
-                        .await;
+                    let rpc = self.rpc.clone();
+                    Self::answer_approval(&rpc, state, pa, ApprovalDecision::Reject).await;
                 }
             }
             Some(ChatTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
-                    let _ = self
-                        .rpc
-                        .session_approve(
-                            &state.session_id,
-                            &pa.request_id,
-                            ApprovalDecision::AllowAlways,
-                        )
-                        .await;
+                    let rpc = self.rpc.clone();
+                    Self::answer_approval(&rpc, state, pa, ApprovalDecision::AllowAlways).await;
                 }
             }
             Some(ChatTabAction::ApprovalApproveEdit) if state.pending_approval().is_some() => {
@@ -1785,19 +1882,22 @@ impl Chat {
                     .map(|pa| matches!(pa.tool_name.as_str(), "file_edit" | "file_write"))
                     .unwrap_or(false);
                 if is_edit_tool && let Some(pa) = state.take_pending_approval() {
-                    let initial = pa.arguments_summary.clone();
+                    let initial = pa
+                        .retry_replacement
+                        .clone()
+                        .unwrap_or_else(|| pa.arguments_summary.clone());
                     let edited = open_editor_for_content(&initial).await;
                     let _ = term.clear();
-                    let _ = self
-                        .rpc
-                        .session_approve(
-                            &state.session_id,
-                            &pa.request_id,
-                            ApprovalDecision::RejectWithEdit {
-                                replacement: edited,
-                            },
-                        )
-                        .await;
+                    let rpc = self.rpc.clone();
+                    Self::answer_approval(
+                        &rpc,
+                        state,
+                        pa,
+                        ApprovalDecision::RejectWithEdit {
+                            replacement: edited,
+                        },
+                    )
+                    .await;
                 }
             }
             Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
@@ -5203,13 +5303,29 @@ pub struct PendingApproval {
     pub request_id: String,
     pub tool_name: String,
     pub arguments_summary: String,
+    /// Operator-authored replacement retained only for retrying an edited
+    /// denial. The original summary remains authoritative for Allow/Always.
+    pub retry_replacement: Option<String>,
     pub timeout_secs: u64,
+    /// Local receipt time for the daemon-advertised approval deadline. Generic
+    /// progress cannot prove this request resolved because direct approval
+    /// notifications may overtake older queued turn events.
+    received_at: Instant,
+}
+
+impl PendingApproval {
+    fn is_expired(&self) -> bool {
+        self.received_at.elapsed() >= Duration::from_secs(self.timeout_secs)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
     pub request_id: serde_json::Value,
+    /// Correlated `ask_user`/`poll` call. A sibling tool result must not close
+    /// this response-bearing prompt; only this call's result may do so.
+    pub tool_call_id: Option<String>,
     /// Session this elicitation belongs to. Captured at install time so a
     /// future mouse handler (or a cross-session correctness assert) can
     /// confirm the modal still targets the active session. Read indirectly
@@ -6769,7 +6885,90 @@ impl ChatState {
     /// keeping the newest).
     pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
         self.pending_elicitation = Some(e);
+        self.reassert_operator_wait();
         self.mark_dirty_full();
+    }
+
+    fn tool_call_completed(&self, tool_call_id: &str) -> bool {
+        self.entries.iter().rev().any(|entry| {
+            matches!(
+                entry,
+                ChatEntry::Tool {
+                    tool_call_id: id,
+                    result: Some(_),
+                    ..
+                } if id.as_ref() == tool_call_id
+            )
+        })
+    }
+
+    fn finish_operator_response(&mut self, next_status: TurnStatus) {
+        self.clear_info_notice();
+        self.turn_status = if let Some(blocked) = self.operator_wait_status() {
+            blocked
+        } else if self.turn_in_flight {
+            next_status
+        } else {
+            TurnStatus::Idle
+        };
+    }
+
+    fn operator_wait_status(&self) -> Option<TurnStatus> {
+        if self.pending_elicitation.is_some() {
+            Some(TurnStatus::WaitingForInput)
+        } else if self.pending_approval.is_some() {
+            Some(TurnStatus::WaitingForApproval)
+        } else {
+            None
+        }
+    }
+
+    fn reassert_operator_wait(&mut self) {
+        if matches!(self.turn_status, TurnStatus::Cancelling) {
+            self.clear_operator_wait();
+            return;
+        }
+        if let Some(status) = self.operator_wait_status() {
+            self.turn_status = status;
+        }
+    }
+
+    fn clear_operator_wait(&mut self) {
+        self.pending_approval = None;
+        self.pending_elicitation = None;
+    }
+
+    /// Apply uncorrelated turn progress without discarding a live operator wait.
+    /// Direct approval/elicitation traffic can overtake older queued turn events,
+    /// so generic progress proves neither request has resolved.
+    fn apply_progress_status(&mut self, next_status: TurnStatus) {
+        self.turn_status = self.operator_wait_status().unwrap_or(next_status);
+    }
+
+    fn settle_expired_approval(&mut self) {
+        if !self
+            .pending_approval
+            .as_ref()
+            .is_some_and(PendingApproval::is_expired)
+        {
+            return;
+        }
+        self.pending_approval = None;
+        self.turn_status = if let Some(blocked) = self.operator_wait_status() {
+            blocked
+        } else if self.turn_in_flight {
+            TurnStatus::Working
+        } else {
+            TurnStatus::Idle
+        };
+        self.mark_dirty_full();
+    }
+
+    fn set_response_error(&mut self, error: &anyhow::Error) {
+        self.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+            "zc-chat-response-error",
+            &[("error", &error.to_string())],
+        )));
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -6829,14 +7028,14 @@ impl ChatState {
                 // set us back to Idle. Late-arriving notifications (broadcast
                 // channel lag) can otherwise flip the input bar back to the
                 // working animator even though the turn is done.
-                if self.turn_in_flight {
-                    self.turn_status = TurnStatus::Responding;
+                if self.accepts_progress_status() {
+                    self.apply_progress_status(TurnStatus::Responding);
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
                 self.streaming_thought.push_str(&text);
-                if self.turn_in_flight {
-                    self.turn_status = TurnStatus::Thinking;
+                if self.accepts_progress_status() {
+                    self.apply_progress_status(TurnStatus::Thinking);
                 }
             }
             SessionUpdate::ToolCall {
@@ -6853,8 +7052,8 @@ impl ChatState {
                 }
                 self.flush_streaming_thought();
                 self.turn_had_tool_calls = true;
-                if self.turn_in_flight {
-                    self.turn_status = TurnStatus::CallingTool(name.clone());
+                if self.accepts_progress_status() {
+                    self.apply_progress_status(TurnStatus::CallingTool(name.clone()));
                 }
                 self.entries.push(ChatEntry::Tool {
                     tool_call_id: Arc::<str>::from(tool_call_id),
@@ -6893,8 +7092,22 @@ impl ChatState {
                         break;
                     }
                 }
-                if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
-                    self.turn_status = TurnStatus::Working;
+                if self.accepts_progress_status() {
+                    let resolved_elicitation =
+                        self.pending_elicitation.as_ref().is_some_and(|pending| {
+                            pending.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                        });
+                    if resolved_elicitation {
+                        self.pending_elicitation = None;
+                    }
+
+                    if let Some(blocked) = self.operator_wait_status() {
+                        self.turn_status = blocked;
+                    } else if resolved_elicitation
+                        || matches!(self.turn_status, TurnStatus::CallingTool(_))
+                    {
+                        self.turn_status = TurnStatus::Working;
+                    }
                 }
             }
             SessionUpdate::ApprovalRequest {
@@ -6902,17 +7115,18 @@ impl ChatState {
                 tool_name,
                 arguments_summary,
                 timeout_secs,
+                received_at,
                 ..
             } => {
                 self.pending_approval = Some(PendingApproval {
                     request_id,
                     tool_name,
                     arguments_summary,
+                    retry_replacement: None,
                     timeout_secs,
+                    received_at,
                 });
-                if self.turn_in_flight {
-                    self.turn_status = TurnStatus::WaitingForApproval;
-                }
+                self.reassert_operator_wait();
             }
             SessionUpdate::ContextUsage {
                 input_tokens,
@@ -6964,6 +7178,10 @@ impl ChatState {
         }
     }
 
+    fn accepts_progress_status(&self) -> bool {
+        self.turn_in_flight && !matches!(self.turn_status, TurnStatus::Cancelling)
+    }
+
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
@@ -6993,6 +7211,7 @@ impl ChatState {
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.mark_dirty_append();
+        self.clear_operator_wait();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -7004,6 +7223,7 @@ impl ChatState {
     }
 
     pub fn enter_cancelling(&mut self) {
+        self.clear_operator_wait();
         self.turn_status = TurnStatus::Cancelling;
         self.cancel_started_at = Some(Instant::now());
     }
@@ -7476,8 +7696,7 @@ impl ChatState {
         self.cached_entry_count = 0;
         self.cached_render_start = 0;
         self.cached_render_width = 0;
-        self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.clear_operator_wait();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -10751,17 +10970,21 @@ mod tests {
     #[test]
     fn approval_request_sets_pending_approval() {
         let mut s = state();
+        let received_at = Instant::now();
         s.apply_update(SessionUpdate::ApprovalRequest {
             session_id: "sess-1".to_string(),
             request_id: "req-1".to_string(),
             tool_name: "shell".to_string(),
             arguments_summary: "rm -rf /".to_string(),
             timeout_secs: 30,
+            received_at,
         });
         assert!(s.pending_approval().is_some());
         let pa = s.pending_approval().unwrap();
         assert_eq!(pa.request_id, "req-1");
         assert_eq!(pa.tool_name, "shell");
+        assert!(matches!(s.turn_status, TurnStatus::WaitingForApproval));
+        assert_eq!(crate::osc_status::progress_for(&s.turn_status), "4;0");
     }
 
     #[test]
@@ -10783,6 +11006,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "command: pwd".to_string(),
             timeout_secs: 120,
+            received_at: Instant::now(),
         });
 
         let area = Rect::new(0, 0, 100, 30);
@@ -12463,6 +12687,7 @@ mod tests {
     fn single_elicitation() -> PendingElicitation {
         PendingElicitation {
             request_id: serde_json::json!("elicit-1"),
+            tool_call_id: None,
             session_id: "sess-1".to_string(),
             message: "Pick a fruit".to_string(),
             choices: vec![
@@ -12481,6 +12706,7 @@ mod tests {
     fn multi_elicitation() -> PendingElicitation {
         PendingElicitation {
             request_id: serde_json::json!(42),
+            tool_call_id: None,
             session_id: "sess-1".to_string(),
             message: "Pick toppings".to_string(),
             choices: vec![
@@ -12586,6 +12812,7 @@ mod tests {
             method: "elicitation/create".to_string(),
             params: serde_json::json!({
                 "sessionId": session_id,
+                "toolCallId": format!("tool-{id}"),
                 "mode": "form",
                 "message": "Pick one",
                 "requestedSchema": {
@@ -12662,7 +12889,9 @@ mod tests {
             request_id: "request-1".to_string(),
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
             timeout_secs: 30,
+            received_at: Instant::now(),
         });
         assert!(!chat.claims_pane_navigation(&word_left));
 
@@ -12695,10 +12924,19 @@ mod tests {
 
         // Modal installed.
         match &chat.phase {
-            ChatPhase::Active(s) => assert!(
-                s.pending_elicitation().is_some(),
-                "matching-session elicitation must install a modal"
-            ),
+            ChatPhase::Active(s) => {
+                assert!(
+                    s.pending_elicitation().is_some(),
+                    "matching-session elicitation must install a modal"
+                );
+                assert!(matches!(s.turn_status, TurnStatus::WaitingForInput));
+                assert_eq!(crate::osc_status::progress_for(&s.turn_status), "4;0");
+                assert_eq!(
+                    s.pending_elicitation()
+                        .and_then(|pending| pending.tool_call_id.as_deref()),
+                    Some("tool-e1")
+                );
+            }
             _ => panic!("expected Active phase"),
         }
         // Nothing deferred, and no auto-response was written.
@@ -12707,6 +12945,439 @@ mod tests {
             rx.try_recv().is_err(),
             "an installed elicitation must not be auto-answered"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_tool_call_does_not_resurrect_a_late_elicitation() {
+        let (mut chat, mut rx) = test_chat();
+        let mut active = state();
+        active.turn_in_flight = true;
+        active.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tool-e1".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({"question": "  Pick one  "}),
+        });
+        active.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tool-e1".to_string(),
+            raw_output: "timed out".to_string(),
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
+
+        let response = next_rpc_request(&mut rx, "stale elicitation should be cancelled").await;
+        assert_eq!(response["id"], "e1");
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(matches!(
+            &chat.phase,
+            ChatPhase::Active(state)
+                if state.pending_elicitation().is_none()
+                    && matches!(state.turn_status, TurnStatus::Working)
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_elicitation_answer_releases_blocked_state() {
+        let (client, mut rx) = test_client();
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.set_pending_elicitation(single_elicitation());
+        let pending = s.pending_elicitation.take().expect("test installs a modal");
+
+        Chat::answer_elicitation(
+            &client,
+            &mut s,
+            pending,
+            serde_json::json!({"action":"accept","content":{"choice":"choice-0"}}),
+        );
+
+        let response = next_rpc_request(&mut rx, "elicitation response should be written").await;
+        assert_eq!(response["id"], serde_json::json!("elicit-1"));
+        assert!(s.pending_elicitation().is_none());
+        assert!(matches!(s.turn_status, TurnStatus::Working));
+        assert_eq!(crate::osc_status::progress_for(&s.turn_status), "3;0");
+    }
+
+    #[tokio::test]
+    async fn failed_elicitation_answer_restores_modal_and_blocked_state() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        drop(rx);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)));
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.set_pending_elicitation(single_elicitation());
+        let pending = s.pending_elicitation.take().expect("test installs a modal");
+
+        Chat::answer_elicitation(
+            &client,
+            &mut s,
+            pending,
+            serde_json::json!({"action":"cancel"}),
+        );
+
+        assert!(s.pending_elicitation().is_some());
+        assert!(matches!(s.turn_status, TurnStatus::WaitingForInput));
+        assert!(s.info_message.is_some(), "the failed send must be visible");
+    }
+
+    #[tokio::test]
+    async fn full_writer_queue_restores_elicitation_without_blocking() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        tx.try_send("occupied".to_string()).unwrap();
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)));
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.set_pending_elicitation(single_elicitation());
+        let pending = s.pending_elicitation.take().expect("test installs a modal");
+
+        Chat::answer_elicitation(
+            &client,
+            &mut s,
+            pending,
+            serde_json::json!({"action":"cancel"}),
+        );
+
+        assert!(s.pending_elicitation().is_some());
+        assert!(matches!(s.turn_status, TurnStatus::WaitingForInput));
+        assert!(
+            s.info_message.is_some(),
+            "queue backpressure must be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_response_waits_for_writer_capacity() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("occupied".to_string()).unwrap();
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+
+        Chat::answer_cancel(&client, serde_json::json!("auto-cancel"));
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+
+        let response = next_rpc_request(&mut rx, "automatic response should retry capacity").await;
+        assert_eq!(response["id"], serde_json::json!("auto-cancel"));
+        assert_eq!(response["result"]["action"], "cancel");
+    }
+
+    #[tokio::test]
+    async fn successful_tool_approval_releases_blocked_state() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.turn_status = TurnStatus::WaitingForApproval;
+        let pending = PendingApproval {
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
+            timeout_secs: 30,
+            received_at: Instant::now(),
+        };
+
+        let task = tokio::spawn(async move {
+            Chat::answer_approval(&client, &mut s, pending, ApprovalDecision::AllowOnce).await;
+            s
+        });
+        let request = next_rpc_request(&mut rx, "approval response should be requested").await;
+        assert_eq!(request["method"], method::SESSION_APPROVE);
+        respond_ok(&outbound, &request, serde_json::json!({}));
+
+        let s = task.await.expect("approval task should finish");
+        assert!(s.pending_approval().is_none());
+        assert!(matches!(
+            s.turn_status,
+            TurnStatus::CallingTool(ref name) if name == "shell"
+        ));
+        assert_eq!(crate::osc_status::progress_for(&s.turn_status), "3;0");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_approval_restores_modal_and_blocked_state() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        drop(rx);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)));
+        let mut s = state();
+        s.turn_in_flight = true;
+        let pending = PendingApproval {
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
+            timeout_secs: 30,
+            received_at: Instant::now(),
+        };
+
+        Chat::answer_approval(
+            &client,
+            &mut s,
+            pending,
+            ApprovalDecision::RejectWithEdit {
+                replacement: "edited replacement".to_string(),
+            },
+        )
+        .await;
+
+        assert!(s.pending_approval().is_some());
+        assert_eq!(
+            s.pending_approval().unwrap().arguments_summary,
+            "pwd",
+            "the original action shown for Allow/Always must stay immutable"
+        );
+        assert_eq!(
+            s.pending_approval().unwrap().retry_replacement.as_deref(),
+            Some("edited replacement")
+        );
+        assert!(matches!(s.turn_status, TurnStatus::WaitingForApproval));
+        assert!(s.info_message.is_some(), "the failed RPC must be visible");
+    }
+
+    #[tokio::test]
+    async fn expired_tool_approval_is_not_sent_as_a_noop() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)));
+        let mut s = state();
+        s.turn_in_flight = true;
+        let pending = PendingApproval {
+            request_id: "expired-approval".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
+            timeout_secs: 30,
+            received_at: Instant::now() - Duration::from_secs(31),
+        };
+
+        Chat::answer_approval(&client, &mut s, pending, ApprovalDecision::AllowOnce).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an expired decision must not be sent"
+        );
+        assert!(matches!(s.turn_status, TurnStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_poll_does_not_refresh_hidden_git_metadata() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.cwd = Some("/tmp/worktree".to_string());
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.poll();
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "hidden lifecycle polling must not start session/git_branch"
+        );
+
+        chat.refresh_visible_metadata();
+        let request = next_rpc_request(&mut rx, "visible pane should refresh git metadata").await;
+        assert_eq!(request["method"], method::SESSION_GIT_BRANCH);
+
+        chat.refresh_visible_metadata();
+        assert!(
+            rx.try_recv().is_err(),
+            "an in-flight metadata request must suppress duplicates"
+        );
+
+        respond_ok(
+            &outbound,
+            &request,
+            serde_json::json!({"branch":"main","hash":"abc123"}),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.git_branch_inflight {
+                chat.poll();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("git metadata response should reach the pane");
+        chat.refresh_visible_metadata();
+        assert!(
+            rx.try_recv().is_err(),
+            "a fresh visible cache must not be polled again immediately"
+        );
+    }
+
+    #[test]
+    fn resolving_one_operator_prompt_keeps_another_blocked() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.pending_approval = Some(PendingApproval {
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
+            timeout_secs: 30,
+            received_at: Instant::now(),
+        });
+
+        s.finish_operator_response(TurnStatus::Working);
+
+        assert!(matches!(s.turn_status, TurnStatus::WaitingForApproval));
+        assert_eq!(crate::osc_status::progress_for(&s.turn_status), "4;0");
+    }
+
+    #[test]
+    fn parallel_sibling_progress_preserves_live_elicitation() {
+        let mut elicitation = state();
+        elicitation.turn_in_flight = true;
+        let mut pending = single_elicitation();
+        pending.tool_call_id = Some("ask-1".to_string());
+        elicitation.set_pending_elicitation(pending);
+        elicitation.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "shell-1".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "pwd"}),
+        });
+        elicitation.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "ask-1".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({"question": "Pick a fruit"}),
+        });
+        assert_eq!(
+            elicitation
+                .pending_elicitation()
+                .and_then(|pending| pending.tool_call_id.as_deref()),
+            Some("ask-1")
+        );
+
+        elicitation.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "shell-1".to_string(),
+            raw_output: "/tmp".to_string(),
+        });
+        assert!(elicitation.pending_elicitation().is_some());
+        assert!(matches!(
+            elicitation.turn_status,
+            TurnStatus::WaitingForInput
+        ));
+
+        elicitation.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "ask-1".to_string(),
+            raw_output: "Apple".to_string(),
+        });
+        assert!(elicitation.pending_elicitation().is_none());
+        assert!(matches!(elicitation.turn_status, TurnStatus::Working));
+    }
+
+    #[test]
+    fn queued_progress_preserves_live_approval() {
+        let mut approval = state();
+        approval.turn_in_flight = true;
+        approval.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+            received_at: Instant::now(),
+        });
+        approval.apply_update(SessionUpdate::AgentThoughtChunk {
+            session_id: "sess-1".to_string(),
+            text: "queued before approval".to_string(),
+        });
+        assert!(approval.pending_approval().is_some());
+        assert!(matches!(
+            approval.turn_status,
+            TurnStatus::WaitingForApproval
+        ));
+    }
+
+    #[test]
+    fn advertised_approval_timeout_releases_blocked_state() {
+        let mut approval = state();
+        approval.turn_in_flight = true;
+        let received_at = Instant::now() - Duration::from_secs(31);
+        approval.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+            received_at,
+        });
+
+        approval.settle_expired_approval();
+
+        assert!(approval.pending_approval().is_none());
+        assert!(matches!(approval.turn_status, TurnStatus::Working));
+    }
+
+    #[test]
+    fn turn_completion_and_cancellation_clear_operator_prompts() {
+        let mut completed = state();
+        completed.turn_in_flight = true;
+        completed.set_pending_elicitation(single_elicitation());
+        completed.commit_turn(String::new(), false);
+        assert!(completed.pending_elicitation().is_none());
+        assert!(matches!(completed.turn_status, TurnStatus::Idle));
+
+        let mut cancelling = state();
+        cancelling.turn_in_flight = true;
+        cancelling.pending_approval = Some(PendingApproval {
+            request_id: "approval-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
+            timeout_secs: 30,
+            received_at: Instant::now(),
+        });
+        cancelling.enter_cancelling();
+        assert!(cancelling.pending_approval().is_none());
+        assert!(matches!(cancelling.turn_status, TurnStatus::Cancelling));
+    }
+
+    #[tokio::test]
+    async fn late_prompts_cannot_disable_cancellation_watchdog() {
+        let (mut chat, mut rx) = test_chat();
+        let mut active = state();
+        active.turn_in_flight = true;
+        active.enter_cancelling();
+        active.cancel_started_at = Some(Instant::now() - CANCEL_WATCHDOG);
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.route_inbound_elicitation(inbound_single_elicitation("late", "sess-1"));
+        let response = next_rpc_request(&mut rx, "late elicitation should be cancelled").await;
+        assert_eq!(response["id"], serde_json::json!("late"));
+        assert_eq!(response["result"]["action"], "cancel");
+
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.apply_update(SessionUpdate::ApprovalRequest {
+                session_id: "sess-1".to_string(),
+                request_id: "late-approval".to_string(),
+                tool_name: "shell".to_string(),
+                arguments_summary: "pwd".to_string(),
+                timeout_secs: 30,
+                received_at: Instant::now(),
+            });
+            state.apply_update(SessionUpdate::AgentMessageChunk {
+                session_id: "sess-1".to_string(),
+                text: "late".to_string(),
+            });
+            assert!(state.pending_elicitation().is_none());
+            assert!(state.pending_approval().is_none());
+            assert!(matches!(state.turn_status, TurnStatus::Cancelling));
+            assert!(state.cancel_watchdog_expired());
+        } else {
+            panic!("expected active chat");
+        }
+
+        chat.settle_stuck_cancel();
+        assert!(matches!(
+            &chat.phase,
+            ChatPhase::Active(state) if matches!(state.turn_status, TurnStatus::Idle)
+        ));
     }
 
     #[tokio::test]

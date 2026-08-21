@@ -471,6 +471,11 @@ pub async fn run(
         // goes on working and its approvals still arrive.
         chat_pane.poll();
         acp_pane.poll();
+        match mode {
+            Mode::Chat => chat_pane.refresh_visible_metadata(),
+            Mode::Acp => acp_pane.refresh_visible_metadata(),
+            _ => {}
+        }
 
         // Report whichever pane most wants the operator, not whichever is
         // visible: the terminal status exists to be read from outside this
@@ -497,6 +502,7 @@ pub async fn run(
             // the status bar, only while the active pane has a message to show.
             let info_message = match mode {
                 Mode::Chat => chat_pane.info_message().cloned(),
+                Mode::Acp => acp_pane.info_message().cloned(),
                 _ => None,
             };
             let has_info = info_message.is_some();
