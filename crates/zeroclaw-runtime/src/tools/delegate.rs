@@ -2939,6 +2939,13 @@ impl Tool for ToolArcRef {
         self.inner.approval_summary(args)
     }
 
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
+    }
+
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
     // schemas; the trait default would rebuild the spec from
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
