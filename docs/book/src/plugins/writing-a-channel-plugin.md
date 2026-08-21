@@ -325,6 +325,21 @@ across all capabilities. Explicit channel bindings rank ahead of
 auto-discovered tools and skills, so a full plugin directory cannot displace a
 channel the operator configured by hand.
 
+The same admitted set drives all three loaders — the channel loader, the tool
+registry, and the plugin-skill loader — so the ceiling is one shared budget
+rather than a per-capability one. A package that provides both a channel and a
+tool really does spend two slots, and a tool or skill over the ceiling is not
+constructed at all. Admission is a pure function of your current config and
+installed packages: it holds no counter, so the tool registries rebuilt per
+agent, per CLI run, per delegate, and per SOP execution each re-derive the same
+set instead of exhausting the ceiling over a long-running daemon's lifetime.
+
+Tool and skill instances are *auto-discovered*, so they are admitted only when
+`plugins.auto_discover` is true. Explicit `[channels.plugin.<alias>]`
+declarations do not need it. With `plugins.enabled = true` and
+`auto_discover = false`, you get exactly the channel bindings you declared and
+nothing else.
+
 > **Migrating from `plugins.max_plugins`.** The old key was never enforced and
 > has been replaced by `plugins.max_active_instances`. The two count different
 > things: the old key counted installed packages, the new one counts admitted

@@ -47,10 +47,26 @@ impl PluginActivationPlan {
     /// The single configured ceiling is applied only after all candidates have
     /// been placed in stable package/capability/binding order.
     ///
+    /// The enumeration order is the contract every loader depends on, so it is
+    /// stated once here rather than re-derived per capability:
+    ///
+    /// 1. Explicit `[channels.plugin.<alias>]` declarations, then
+    /// 2. auto-discovered tool and skill package bindings,
+    ///
+    /// each group ordered by package name, then capability, then binding. The
+    /// ceiling truncates that one sequence, so an operator-configured channel
+    /// can never be displaced by a package that merely happens to be installed.
+    ///
     /// Nothing here touches component bytes: candidates are derived from the
     /// manifests the package host already admitted, so a package with an
     /// unloadable component still plans identically. That property is what lets
     /// the ceiling be applied before any guest runs.
+    ///
+    /// The decision is a pure function of `config` and `host`: it holds no
+    /// counter and consumes no budget. Every physical registry reconstruction
+    /// (per agent, per CLI run, per delegate, per SOP execution) re-derives the
+    /// identical admitted set from the same snapshot instead of spending slots
+    /// cumulatively.
     pub(crate) fn build(config: &Config, host: &PluginHost) -> Result<Self, PluginError> {
         if !config.plugins.enabled {
             return Ok(Self {
@@ -130,6 +146,32 @@ impl PluginActivationPlan {
         })
     }
 
+    fn find(
+        &self,
+        package: &str,
+        capability: PluginCapability,
+        binding: &str,
+    ) -> Option<&PluginInstanceScope> {
+        self.admitted.iter().find(|scope| {
+            let id = scope.id();
+            id.package() == package && id.capability() == capability && id.binding() == binding
+        })
+    }
+
+    /// Whether this plan admitted one exact logical instance.
+    ///
+    /// The skill loader reads a directory per package rather than a component,
+    /// so it walks host details and asks this question instead of re-deriving
+    /// the admission rule for itself.
+    pub(crate) fn admits(
+        &self,
+        package: &str,
+        capability: PluginCapability,
+        binding: &str,
+    ) -> bool {
+        self.find(package, capability, binding).is_some()
+    }
+
     /// Return the exact host-issued scope admitted for one logical instance.
     ///
     /// Production construction iterates [`Self::scopes`] by capability; this
@@ -141,16 +183,11 @@ impl PluginActivationPlan {
         capability: PluginCapability,
         binding: &str,
     ) -> Option<PluginInstanceScope> {
-        self.admitted
-            .iter()
-            .find(|scope| {
-                let id = scope.id();
-                id.package() == package && id.capability() == capability && id.binding() == binding
-            })
-            .cloned()
+        self.find(package, capability, binding).cloned()
     }
 
-    fn scopes(
+    /// Admitted scopes of one capability, in the plan's enumeration order.
+    pub(crate) fn scopes(
         &self,
         capability: PluginCapability,
     ) -> impl Iterator<Item = PluginInstanceScope> + '_ {

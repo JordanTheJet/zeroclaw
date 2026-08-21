@@ -8463,7 +8463,12 @@ pub struct PluginsConfig {
     /// Directory where plugins are stored
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: String,
-    /// Auto-discover and load plugins on startup
+    /// Auto-discover and load plugins on startup (default: false)
+    ///
+    /// This gates the package-bound *tool* and *skill* instances the activation
+    /// plan discovers from installed manifests. Explicit
+    /// `[channels.plugin.<alias>]` declarations are operator-named, not
+    /// discovered, so they activate without it.
     #[serde(default)]
     pub auto_discover: bool,
     /// Maximum number of logical plugin instances admitted across capabilities.
