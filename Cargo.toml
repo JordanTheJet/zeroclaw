@@ -415,6 +415,11 @@ parking_lot = "0.12"
 regex = "1.10"
 portable-pty = "0.9"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+# test-only: turns on the control crate's fixture-credential constructors so the
+# grant-gated control tools can be exercised before phase 3 client registration
+# exists. Cargo does not build dev-dependencies for `cargo build`, so a release
+# artifact links none of that code.
+zeroclaw-control = { workspace = true, features = ["fixture-grants"] }
 
 [[test]]
 name = "component"
