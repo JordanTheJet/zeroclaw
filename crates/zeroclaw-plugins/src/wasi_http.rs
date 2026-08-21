@@ -453,9 +453,10 @@ mod tests {
     /// refused on the same masked path, not reported as a distinct condition.
     #[test]
     fn a_malformed_request_host_is_denied_without_resolving() {
-        let service = EgressHostService::new(EgressPolicyResolver::new(|_| {
-            EgressPolicy::new(&["example.com".to_string()], &[], &[], 4)
-        }));
+        let service =
+            EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+                |_| EgressPolicy::new(&["example.com".to_string()], &[], &[], 4),
+            ));
         let mut hooks = hooks(Some(service));
         let response = hooks
             .send_request(request("http://exa_mple.com/"), config())
@@ -469,8 +470,12 @@ mod tests {
     /// A loopback grant with the private carveout and a one-connection ceiling.
     /// The tight ceiling is the point: a slot that leaks on a failed dial makes
     /// the next authorization fail, so the budget is observable.
+    ///
+    /// Accounting is private to the caller. Connection counts are otherwise
+    /// process-wide, and a one-slot ceiling shared with whatever else the test
+    /// binary is running concurrently would not be observable at all.
     fn loopback_service() -> EgressHostService {
-        EgressHostService::new(EgressPolicyResolver::new(|_| {
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(|_| {
             EgressPolicy::new(
                 &["127.0.0.1".to_string()],
                 &["127.0.0.1".to_string()],
