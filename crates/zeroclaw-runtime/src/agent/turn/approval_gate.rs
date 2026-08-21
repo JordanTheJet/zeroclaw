@@ -304,7 +304,7 @@ mod tests {
         Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
     };
     use zeroclaw_api::tool::{Tool, ToolResult};
-    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
 
     /// A channel that always answers Approve and counts how often it is asked.
     struct StubChannel {
@@ -452,6 +452,7 @@ mod tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: Some(&channel),
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "gate-test",
             agent_alias: None,
             parent_agent_alias: None,
@@ -530,6 +531,7 @@ mod tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: Some(&channel),
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "gate-test",
             agent_alias: None,
             parent_agent_alias: None,

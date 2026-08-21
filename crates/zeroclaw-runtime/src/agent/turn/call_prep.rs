@@ -6,47 +6,40 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
-use super::redact::{loggable_args_string, scrub_credentials};
+use super::redact::{loggable_args_string, scrub_credentials, streamable_args_value};
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Per-call immutable snapshot for draft start/completion events.
+    pub(crate) stream_calls: Vec<Option<StreamToolCall>>,
+}
+
+/// Per-call draft metadata retained only until the matching completion event.
+/// The arguments are the prepared call arguments; `tool_provenance` is copied
+/// from the resolved tool's canonical attribution, not from a second registry.
+pub(crate) struct StreamToolCall {
+    pub(crate) arguments: Arc<serde_json::Value>,
+    /// A narrow carry-through while draft events carry presentation metadata,
+    /// not resolved tool identity. A future event-subsystem redesign should
+    /// carry the resolved tool identity directly instead of copying its
+    /// provenance into paired events.
+    pub(crate) tool_provenance: Option<ToolProvenance>,
 }
 
 fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
     let canonical_args = canonicalize_json_for_tool_signature(tool_args);
     let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
     (tool_name.trim().to_ascii_lowercase(), args_json)
-}
-
-/// Render the model-visible start-progress line without reflecting arbitrary
-/// argument fields. Only the small set of established, purpose-specific hints
-/// is eligible; unknown/new tools show their name alone until they add an
-/// explicit safe projection. Even eligible text is credential-scrubbed before
-/// it reaches the draft stream.
-fn render_start_progress(tool_name: &str, tool_args: &serde_json::Value) -> String {
-    let raw = match tool_name {
-        "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-        "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
-        _ => None,
-    };
-    let hint = raw
-        .map(scrub_credentials)
-        .map(|value| truncate_with_ellipsis(&value, 60))
-        .unwrap_or_default();
-
-    if hint.is_empty() {
-        format!("\u{23f3} {tool_name}\n")
-    } else {
-        format!("\u{23f3} {tool_name}: {hint}\n")
-    }
 }
 
 async fn record_duplicate_tool_call(
@@ -95,6 +88,8 @@ async fn record_duplicate_tool_call(
 /// loop body, per-call prep loop).
 pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
@@ -105,6 +100,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut executable_stream_calls = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
@@ -265,8 +261,18 @@ pub(crate) async fn prepare_tool_calls(
 
         // ── Progress: tool start ────────────────────────────
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
-        if let Some(tx) = ctx.on_delta {
-            let progress = render_start_progress(&tool_name, &tool_args);
+        let stream_call = ctx.on_delta.map(|_| StreamToolCall {
+            arguments: Arc::new(streamable_args_value(
+                ctx.tool_by_name(&tool_name),
+                &tool_args,
+            )),
+            tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
+                tools_registry,
+                activated_tools,
+                &tool_name,
+            ),
+        });
+        if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call.as_ref()) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -274,10 +280,17 @@ pub(crate) async fn prepare_tool_calls(
                     .with_attrs(::serde_json::json!({"tool": tool_name})),
                 "Sending progress start to draft"
             );
-            let _ = tx.send(StreamDelta::Status(progress)).await;
+            let _ = tx
+                .send(StreamDelta::ToolStart {
+                    tool: tool_name.clone(),
+                    arguments: Arc::clone(&stream_call.arguments),
+                    tool_provenance: stream_call.tool_provenance,
+                })
+                .await;
         }
 
         executable_indices.push(idx);
+        executable_stream_calls.push(stream_call);
         let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
             name: tool_name.clone(),
             arguments: tool_args.clone(),
@@ -298,35 +311,271 @@ pub(crate) async fn prepare_tool_calls(
         ordered_results,
         executable_indices,
         executable_calls,
+        stream_calls: executable_stream_calls,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::render_start_progress;
+    use super::{PreparedToolCalls, prepare_tool_calls};
+    use crate::agent::tool_execution::ToolExecutionOutcome;
+    use crate::agent::turn::context::TurnCtx;
+    use crate::agent::turn::post_exec::record_executed_outcomes;
+    use crate::agent::turn::{DraftEvent, StreamDelta};
+    use crate::observability::NoopObserver;
+    use crate::skills::SkillTool;
+    use crate::tools::skill_tool::SkillBuiltinTool;
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
+    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+    use zeroclaw_tool_call_parser::ParsedToolCall;
 
-    #[test]
-    fn unknown_tool_progress_never_reflects_action_or_query_arguments() {
-        let sentinel = "sentinel-progress-secret-must-not-leak";
-        let rendered = render_start_progress(
-            "future_tool",
-            &serde_json::json!({"action": sentinel, "query": sentinel}),
-        );
-
-        assert_eq!(rendered, "\u{23f3} future_tool\n");
-        assert!(!rendered.contains(sentinel));
+    struct AttributedTool {
+        name: String,
+        provenance: ToolProvenance,
+        redact_args: bool,
     }
 
-    #[test]
-    fn shell_progress_scrubs_credential_text() {
-        let rendered = render_start_progress(
-            "shell",
-            &serde_json::json!({
-                "command": "curl -H 'api_key=sentinel-shell-secret-12345678' example.test"
-            }),
+    impl Attributable for AttributedTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            &self.name
+        }
+
+        fn tool_provenance(&self) -> ToolProvenance {
+            self.provenance
+        }
+    }
+
+    #[async_trait]
+    impl Tool for AttributedTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn redact_args_for_log(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
+            self.redact_args
+                .then(|| serde_json::json!({"value": "[redacted]"}))
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    fn test_ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        on_delta: &'a mpsc::Sender<DraftEvent>,
+        tools: &'a [Box<dyn Tool>],
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(on_delta),
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            tools,
+        }
+    }
+
+    async fn emitted_tool_provenance(
+        tools_registry: Vec<Box<dyn Tool>>,
+        tool_name: &str,
+    ) -> Vec<Option<ToolProvenance>> {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let ctx = test_ctx(&observer, &pacing, &tx, &tools_registry);
+        let tool_calls = [ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments: serde_json::json!({"action": "run"}),
+            tool_call_id: Some("call-1".to_string()),
+        }];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared: PreparedToolCalls = prepare_tool_calls(
+            &ctx,
+            &tools_registry,
+            None,
+            &tool_calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("preparation should accept the test call");
+
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            vec![ToolExecutionOutcome {
+                output: "ok".to_string(),
+                output_data: None,
+                success: true,
+                error_reason: None,
+                duration: Duration::ZERO,
+                receipt: None,
+            }],
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+
+        let mut provenance = Vec::new();
+        while provenance.len() < 2 {
+            match rx.recv().await.expect("start and completion events") {
+                StreamDelta::ToolStart {
+                    tool_provenance, ..
+                }
+                | StreamDelta::ToolComplete {
+                    tool_provenance, ..
+                } => provenance.push(tool_provenance),
+                StreamDelta::Lifecycle(_) => {}
+                other => panic!("expected a tool event, got {other:?}"),
+            }
+        }
+        provenance
+    }
+
+    #[tokio::test]
+    async fn prepare_streams_the_tools_secret_aware_argument_projection() {
+        let sentinel = "sentinel-stream-secret-must-not-leak";
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AttributedTool {
+            name: "secret-test".to_string(),
+            provenance: ToolProvenance::Extension,
+            redact_args: true,
+        })];
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, mut rx) = mpsc::channel(2);
+        let ctx = test_ctx(&observer, &pacing, &tx, &tools);
+        let tool_calls = [ParsedToolCall {
+            name: "secret-test".to_string(),
+            arguments: serde_json::json!({"value": sentinel}),
+            tool_call_id: Some("call-secret".to_string()),
+        }];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        prepare_tool_calls(
+            &ctx,
+            &tools,
+            None,
+            &tool_calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("preparation should accept the test call");
+
+        loop {
+            match rx.recv().await.expect("tool start event") {
+                StreamDelta::ToolStart { arguments, .. } => {
+                    let rendered = arguments.to_string();
+                    assert!(rendered.contains("[redacted]"), "{rendered}");
+                    assert!(!rendered.contains(sentinel), "{rendered}");
+                    break;
+                }
+                StreamDelta::Lifecycle(_) => {}
+                other => panic!("expected a tool start event, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_carries_provenance_through_start_and_completion() {
+        let extension_registry: Vec<Box<dyn Tool>> = vec![Box::new(AttributedTool {
+            name: "extension-test".to_string(),
+            provenance: ToolProvenance::Extension,
+            redact_args: false,
+        })];
+        assert_eq!(
+            emitted_tool_provenance(extension_registry, "extension-test").await,
+            vec![
+                Some(ToolProvenance::Extension),
+                Some(ToolProvenance::Extension)
+            ],
+            "the provenance resolved during preparation must be identical in both events"
         );
 
-        assert!(rendered.contains("[REDACTED]"), "{rendered}");
-        assert!(!rendered.contains("sentinel-shell-secret-12345678"));
+        assert_eq!(
+            emitted_tool_provenance(Vec::new(), "unresolved-test").await,
+            vec![None, None],
+            "an unresolved tool must remain untrusted through both events"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_keeps_native_targets_wrapped_by_skills_as_extensions() {
+        let target: Arc<dyn Tool> = Arc::new(AttributedTool {
+            name: "browser".to_string(),
+            provenance: ToolProvenance::Native,
+            redact_args: false,
+        });
+        let skill_tool = SkillBuiltinTool::new(
+            "skill_browser",
+            &SkillTool {
+                name: "open".to_string(),
+                description: "Open a browser page through a skill".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: HashMap::new(),
+                target: Some("browser".to_string()),
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            },
+            target,
+            HashMap::new(),
+        );
+        let skill_name = skill_tool.name().to_string();
+
+        assert_eq!(
+            emitted_tool_provenance(vec![Box::new(skill_tool)], &skill_name).await,
+            vec![
+                Some(ToolProvenance::Extension),
+                Some(ToolProvenance::Extension)
+            ],
+            "the callable skill boundary, not its native target, controls both stream events"
+        );
     }
 }
