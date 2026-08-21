@@ -1103,6 +1103,30 @@ Examples:
         #[command(subcommand)]
         locales_command: LocalesCommands,
     },
+
+    #[cfg(feature = "agent-runtime")]
+    /// Read-only management control plane.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Read-only management control plane.
+
+With --mcp, serve the read-only control protocol as an MCP server over stdio
+(JSON-RPC 2.0), for an external harness such as Claude Code or Codex. The
+process pins this install's config root at startup, exposes no tool that
+changes host state, and makes no model-provider request.
+
+Until client registration ships, a launched session is an unregistered
+requester: it sees only control.ping, control.server_info, and
+control.registration_help. Registration is an operator ceremony on the host and
+cannot be performed through this session.
+
+Examples:
+  zeroclaw control --mcp")]
+    Control {
+        /// Serve the read-only control protocol over stdio as an MCP server.
+        #[arg(long)]
+        mcp: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3468,6 +3492,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
             ephemeral: true, ..
         } => "debug",
         Commands::Acp { .. } | Commands::Agent { message: None, .. } => "warn",
+        // Same reason as `Acp`: stdout is a JSON-RPC frame channel, so the
+        // recording floor is kept high even though the fmt layer already
+        // writes to stderr rather than stdout.
+        #[cfg(feature = "agent-runtime")]
+        Commands::Control { mcp: true } => "warn",
         _ => "info",
     };
 
@@ -5269,6 +5298,21 @@ async fn async_main(command: clap::Command) -> Result<()> {
             let LocalesCommands::Fetch { locale, catalog } = locales_command;
             fetch_locales(&locale, catalog.as_deref()).await?;
             Ok(())
+        }
+
+        // The read-only control plane. `--mcp` hands stdout to the JSON-RPC
+        // framer and never returns until the client closes stdin; without it
+        // the subcommand only explains itself, because there is nothing else a
+        // read-only control surface does from a terminal.
+        Commands::Control { mcp } => {
+            if !mcp {
+                let mut command = Cli::command();
+                if let Some(control) = command.find_subcommand_mut("control") {
+                    control.print_help()?;
+                }
+                return Ok(());
+            }
+            Box::pin(zeroclaw::control_mcp::run(config.config_path.clone())).await
         }
 
         Commands::Update {
