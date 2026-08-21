@@ -402,6 +402,14 @@ impl Tool for SkillBuiltinTool {
         self.target_tool.approval_summary(&merged)
     }
 
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.approval_summary_for_call(&merged)
+    }
+
     // Hand out the stored schema by `Arc::clone` instead of the trait
     // default's per-call deep clone — specs are rebuilt every agent-loop
     // iteration and elevated skill tools can front MCP-derived schemas.

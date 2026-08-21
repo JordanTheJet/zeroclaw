@@ -21,9 +21,15 @@ pub(crate) enum ApprovalGateOutcome {
 pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
-    tool_args: &serde_json::Value,
+    tool_args: &mut serde_json::Value,
     iteration: usize,
 ) -> ApprovalGateOutcome {
+    // This namespace belongs to the host. A model or modifying hook cannot
+    // smuggle a binding into execution: hooks run before this gate and every
+    // caller-provided value is removed before the tool creates a fresh one.
+    if let Some(args) = tool_args.as_object_mut() {
+        args.remove(zeroclaw_api::tool::APPROVAL_EXECUTION_BINDING_ARG);
+    }
     let mut approval_requirement = ctx
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
@@ -31,14 +37,25 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
+        let tool = ctx.tool_by_name(tool_name);
+        let host_summary = tool
+            .and_then(|tool| tool.approval_summary_for_call(tool_args))
+            .and_then(|summary| {
+                if let Some(binding) = summary.execution_binding {
+                    let args = tool_args.as_object_mut()?;
+                    args.insert(
+                        zeroclaw_api::tool::APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+                        binding,
+                    );
+                }
+                Some(summary.text)
+            });
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
             // Host-computed from the arguments' effects by the tool itself;
             // the model cannot author what the operator reads here.
-            host_summary: ctx
-                .tool_by_name(tool_name)
-                .and_then(|tool| tool.approval_summary(tool_args)),
+            host_summary,
         };
 
         // Interactive CLI: prompt the operator.
@@ -49,7 +66,6 @@ pub(crate) async fn gate_tool_approval(
         // (config authoring) must not fall back to the generic argument summary
         // when that prompt cannot be produced: the raw arguments may carry
         // secrets, and approving blind is itself unsafe. Refuse closed.
-        let tool = ctx.tool_by_name(tool_name);
         let summary_required_but_missing = request.host_summary.is_none()
             && tool.is_some_and(|t| t.requires_host_approval_summary());
         // Redacted arguments for every non-execution sink (approval audit,
@@ -362,6 +378,7 @@ mod tests {
         operator_only: bool,
         requires_summary: bool,
         summary: Option<String>,
+        execution_binding: Option<serde_json::Value>,
         /// When true, `redact_args_for_log` masks each nested `ops[].value`,
         /// mirroring how `config_patch` redacts a secret that sits under an
         /// innocuously-named key the generic summary would not catch.
@@ -396,6 +413,18 @@ mod tests {
         }
         fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
             self.summary.clone()
+        }
+        fn approval_summary_for_call(
+            &self,
+            args: &serde_json::Value,
+        ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+            let text = self.approval_summary(args)?;
+            Some(match self.execution_binding.clone() {
+                Some(binding) => {
+                    zeroclaw_api::tool::ToolApprovalSummary::with_execution_binding(text, binding)
+                }
+                None => zeroclaw_api::tool::ToolApprovalSummary::new(text),
+            })
         }
         fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
             if !self.redacts_secret {
@@ -458,7 +487,8 @@ mod tests {
             parent_agent_alias: None,
             tools: &tools,
         };
-        let outcome = gate_tool_approval(&ctx, "stub_tool", &serde_json::json!({"x": 1}), 0).await;
+        let mut args = serde_json::json!({"x": 1});
+        let outcome = gate_tool_approval(&ctx, "stub_tool", &mut args, 0).await;
         (outcome, channel.asked.load(Ordering::SeqCst))
     }
 
@@ -508,9 +538,9 @@ mod tests {
     /// was asked.
     async fn run_gate_with(
         tool: StubTool,
-        args: serde_json::Value,
+        mut args: serde_json::Value,
         operator_surface_channel: bool,
-    ) -> (ApprovalGateOutcome, Vec<String>, usize) {
+    ) -> (ApprovalGateOutcome, Vec<String>, usize, serde_json::Value) {
         let mgr = ApprovalManager::for_non_interactive(&supervised_profile());
         let channel = StubChannel::new(operator_surface_channel);
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
@@ -537,13 +567,13 @@ mod tests {
             parent_agent_alias: None,
             tools: &tools,
         };
-        let outcome = gate_tool_approval(&ctx, "stub_tool", &args, 0).await;
+        let outcome = gate_tool_approval(&ctx, "stub_tool", &mut args, 0).await;
         let audit = mgr
             .audit_log()
             .into_iter()
             .map(|e| e.arguments_summary)
             .collect();
-        (outcome, audit, channel.asked.load(Ordering::SeqCst))
+        (outcome, audit, channel.asked.load(Ordering::SeqCst), args)
     }
 
     /// A tool that requires a host-computed, secret-aware approval summary must
@@ -557,7 +587,8 @@ mod tests {
             summary: None,
             ..Default::default()
         };
-        let (outcome, _audit, asked) = run_gate_with(tool, serde_json::json!({"x": 1}), true).await;
+        let (outcome, _audit, asked, _args) =
+            run_gate_with(tool, serde_json::json!({"x": 1}), true).await;
 
         assert_eq!(
             asked, 0,
@@ -586,7 +617,7 @@ mod tests {
         // The secret sits under the nested `value` key — not a top-level
         // secret-named key the generic summary would auto-redact — and early
         // enough in the stringified ops to survive the 80-char truncation.
-        let (outcome, audit, _asked) = run_gate_with(
+        let (outcome, audit, _asked, _args) = run_gate_with(
             tool,
             serde_json::json!({"ops": [
                 {"op": "add", "path": "/x", "value": "sentinel-never-logged-01234567"}
@@ -606,5 +637,32 @@ mod tests {
             );
         }
         assert!(!audit.is_empty(), "the decision was recorded");
+    }
+
+    #[tokio::test]
+    async fn model_supplied_approval_binding_is_replaced_by_the_host() {
+        let tool = StubTool {
+            requires_summary: true,
+            summary: Some("host preview".to_string()),
+            execution_binding: Some(serde_json::json!("host-authenticated-binding")),
+            ..Default::default()
+        };
+        let mut supplied_args = serde_json::json!({"x": 1});
+        supplied_args.as_object_mut().expect("object args").insert(
+            zeroclaw_api::tool::APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+            serde_json::json!("model-forged-binding"),
+        );
+        let (outcome, _audit, asked, args) = run_gate_with(tool, supplied_args, true).await;
+
+        assert!(matches!(
+            outcome,
+            ApprovalGateOutcome::Proceed { approved: true }
+        ));
+        assert_eq!(asked, 1);
+        assert_eq!(
+            args[zeroclaw_api::tool::APPROVAL_EXECUTION_BINDING_ARG],
+            "host-authenticated-binding",
+            "the model-controlled value must never reach execution"
+        );
     }
 }
