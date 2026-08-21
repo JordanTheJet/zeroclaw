@@ -21,13 +21,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    APPROVAL_EXECUTION_BINDING_ARG, Tool, ToolApprovalSummary, ToolOutput, ToolResult,
+};
 use zeroclaw_config::api_error::ConfigApiError;
 use zeroclaw_config::patch::{
     PatchOp, apply_patch_ops, json_pointer_to_dotted, lookup_prop_field, parse_patch_ops,
@@ -35,20 +39,26 @@ use zeroclaw_config::patch::{
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_config::schema::Config;
 
-/// Deterministic content fingerprint (fixed-key SipHash via `DefaultHasher`)
-/// used to detect config drift between the operator's preview and the apply.
-fn fingerprint(bytes: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+const PREVIEW_BINDING_VERSION: u8 = 1;
+const PREVIEW_BINDING_PAYLOAD_LEN: usize = 1 + 16 + 32 + 32;
+const PREVIEW_BINDING_LEN: usize = PREVIEW_BINDING_PAYLOAD_LEN + 32;
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
-/// Fingerprint of just the `ops` array — the stable identity of a patch across
-/// the preview and the apply. The top-level arguments gain a host-injected
-/// `approved` field between the two calls, so the whole-args value is not
-/// stable; the ops are.
-fn ops_fingerprint(args: &serde_json::Value) -> Option<u64> {
-    Some(fingerprint(&args.get("ops")?.to_string()))
+struct ApprovalPreview {
+    text: String,
+    ops_digest: [u8; 32],
+    base_digest: [u8; 32],
+}
+
+enum PreviewBindingError {
+    Invalid,
+    OperationsChanged,
+    ConfigChanged,
 }
 
 /// Process-wide, per-config-path async locks that serialize `config_patch`'s
@@ -69,12 +79,10 @@ fn write_lock_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 pub struct ConfigPatchTool {
     config_path: PathBuf,
     security: Arc<SecurityPolicy>,
-    /// Base-config fingerprint previewed for a given ops fingerprint. Set by
-    /// `approval_summary`, consumed by `execute` to refuse if the config
-    /// drifted between the operator's preview and the apply. Bounded; entries
-    /// are removed on use, and the map is cleared if it grows past a cap (stale
-    /// entries accrue from previews that were never applied).
-    previews: Arc<parking_lot::Mutex<HashMap<u64, u64>>>,
+    /// Per-tool random key authenticating opaque preview bindings. The key is
+    /// process-local and never leaves the tool; each binding also carries a
+    /// fresh random nonce, exact ops digest, and exact base-config digest.
+    preview_binding_key: [u8; 32],
 }
 
 impl ConfigPatchTool {
@@ -82,18 +90,8 @@ impl ConfigPatchTool {
         Self {
             config_path,
             security,
-            previews: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            preview_binding_key: rand::random(),
         }
-    }
-
-    /// Record the base-config fingerprint previewed for `ops_fp`, bounding the
-    /// map so unapplied previews cannot accumulate without limit.
-    fn record_preview(&self, ops_fp: u64, base_fp: u64) {
-        let mut map = self.previews.lock();
-        if map.len() >= 64 {
-            map.clear();
-        }
-        map.insert(ops_fp, base_fp);
     }
 
     /// One human-readable line for a structured patch error. Same rendering
@@ -191,6 +189,140 @@ impl ConfigPatchTool {
         }
         line
     }
+
+    fn build_approval_preview(&self, args: &serde_json::Value) -> Option<ApprovalPreview> {
+        let ops_value = args.get("ops")?;
+        let ops = parse_patch_ops(ops_value.clone()).ok()?;
+        let raw = std::fs::read_to_string(&self.config_path).ok()?;
+        let mut before: Config = toml::from_str(&raw).ok()?;
+        before.config_path = self.config_path.clone();
+        let mut after = before.clone();
+        apply_patch_ops(&mut after, &ops).ok()?;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "apply {} change(s) to config.toml:", ops.len());
+        for op in &ops {
+            let _ = writeln!(out, "{}", Self::render_op(op, &before, &after));
+        }
+
+        // Per-agent resolved-policy delta. Resolving per agent (not per
+        // edited path) catches indirect changes too: editing a shared
+        // `risk-profiles.*` entry re-renders every agent that references it.
+        let aliases: BTreeSet<&String> = before.agents.keys().chain(after.agents.keys()).collect();
+        let mut delta = String::new();
+        for alias in aliases {
+            let was = before
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&before, alias));
+            let now = after
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&after, alias));
+            if was == now {
+                continue;
+            }
+            let _ = writeln!(delta, "  agent `{alias}`:");
+            let _ = writeln!(
+                delta,
+                "    before:\n      {}",
+                was.as_deref()
+                    .unwrap_or("(agent does not exist)")
+                    .trim_end()
+                    .replace('\n', "\n      ")
+            );
+            let _ = writeln!(
+                delta,
+                "    after:\n      {}",
+                now.as_deref()
+                    .unwrap_or("(agent is removed)")
+                    .trim_end()
+                    .replace('\n', "\n      ")
+            );
+        }
+        if !delta.is_empty() {
+            let _ = writeln!(out, "\npermission changes if approved:");
+            out.push_str(&delta);
+        }
+        out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
+
+        Some(ApprovalPreview {
+            text: out,
+            ops_digest: sha256(&serde_json::to_vec(ops_value).ok()?),
+            base_digest: sha256(raw.as_bytes()),
+        })
+    }
+
+    fn sign_preview_binding(&self, preview: &ApprovalPreview) -> String {
+        let mut payload = Vec::with_capacity(PREVIEW_BINDING_LEN);
+        payload.push(PREVIEW_BINDING_VERSION);
+        payload.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        payload.extend_from_slice(&preview.ops_digest);
+        payload.extend_from_slice(&preview.base_digest);
+
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.preview_binding_key)
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(&payload);
+        payload.extend_from_slice(&mac.finalize().into_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    }
+
+    fn verify_preview_binding(
+        &self,
+        args: &serde_json::Value,
+        raw_config: &str,
+    ) -> Result<(), PreviewBindingError> {
+        let encoded = args
+            .get(APPROVAL_EXECUTION_BINDING_ARG)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PreviewBindingError::Invalid)?;
+        let binding = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| PreviewBindingError::Invalid)?;
+        if binding.len() != PREVIEW_BINDING_LEN || binding.first() != Some(&PREVIEW_BINDING_VERSION)
+        {
+            return Err(PreviewBindingError::Invalid);
+        }
+        let (payload, tag) = binding.split_at(PREVIEW_BINDING_PAYLOAD_LEN);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.preview_binding_key)
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| PreviewBindingError::Invalid)?;
+
+        let ops = serde_json::to_vec(
+            args.get("ops")
+                .ok_or(PreviewBindingError::OperationsChanged)?,
+        )
+        .map_err(|_| PreviewBindingError::OperationsChanged)?;
+        if payload[17..49] != sha256(&ops) {
+            return Err(PreviewBindingError::OperationsChanged);
+        }
+        if payload[49..81] != sha256(raw_config.as_bytes()) {
+            return Err(PreviewBindingError::ConfigChanged);
+        }
+        Ok(())
+    }
+
+    fn preview_binding_refusal(error: PreviewBindingError) -> ToolResult {
+        let message = match error {
+            PreviewBindingError::ConfigChanged => {
+                "configuration changed since the approval preview was shown; the \
+                 requested change was not applied. Re-run so the operator can review \
+                 it against the current configuration."
+            }
+            PreviewBindingError::Invalid | PreviewBindingError::OperationsChanged => {
+                "the host approval preview binding is missing, invalid, or belongs to \
+                 different operations; the requested change was not applied. Re-run so \
+                 the operator can review it again."
+            }
+        };
+        ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(message.to_string()),
+        }
+    }
 }
 
 #[async_trait]
@@ -250,7 +382,7 @@ impl Tool for ConfigPatchTool {
         true
     }
 
-    /// The operator prompt is the secret-aware [`Self::approval_summary`], and
+    /// The operator prompt is the secret-aware per-call approval summary, and
     /// there is no safe fallback: the raw arguments carry secret values that
     /// the generic summary would leak. If the summary cannot be produced the
     /// gate refuses instead of showing the arguments verbatim.
@@ -268,6 +400,9 @@ impl Tool for ConfigPatchTool {
     /// not a secret.
     fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
         let mut redacted = args.clone();
+        if let Some(obj) = redacted.as_object_mut() {
+            obj.remove(APPROVAL_EXECUTION_BINDING_ARG);
+        }
         if let Some(ops) = redacted.get_mut("ops").and_then(|v| v.as_array_mut()) {
             for op in ops.iter_mut() {
                 if let Some(obj) = op.as_object_mut() {
@@ -292,67 +427,17 @@ impl Tool for ConfigPatchTool {
     /// then refuses rather than showing the raw arguments, and execution would
     /// refuse with the precise error regardless.
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
-        let ops = parse_patch_ops(args.get("ops")?.clone()).ok()?;
-        let raw = std::fs::read_to_string(&self.config_path).ok()?;
-        let mut before: Config = toml::from_str(&raw).ok()?;
-        before.config_path = self.config_path.clone();
-        let mut after = before.clone();
-        apply_patch_ops(&mut after, &ops).ok()?;
+        self.build_approval_preview(args)
+            .map(|preview| preview.text)
+    }
 
-        let mut out = String::new();
-        let _ = writeln!(out, "apply {} change(s) to config.toml:", ops.len());
-        for op in &ops {
-            let _ = writeln!(out, "{}", Self::render_op(op, &before, &after));
-        }
-
-        // Per-agent resolved-policy delta. Resolving per agent (not per
-        // edited path) catches indirect changes too: editing a shared
-        // `risk-profiles.*` entry re-renders every agent that references it.
-        let aliases: BTreeSet<&String> = before.agents.keys().chain(after.agents.keys()).collect();
-        let mut delta = String::new();
-        for alias in aliases {
-            let was = before
-                .agents
-                .contains_key(alias.as_str())
-                .then(|| Self::policy_summary_for(&before, alias));
-            let now = after
-                .agents
-                .contains_key(alias.as_str())
-                .then(|| Self::policy_summary_for(&after, alias));
-            if was == now {
-                continue;
-            }
-            let _ = writeln!(delta, "  agent `{alias}`:");
-            let _ = writeln!(
-                delta,
-                "    before:\n      {}",
-                was.as_deref()
-                    .unwrap_or("(agent does not exist)")
-                    .trim_end()
-                    .replace('\n', "\n      ")
-            );
-            let _ = writeln!(
-                delta,
-                "    after:\n      {}",
-                now.as_deref()
-                    .unwrap_or("(agent is removed)")
-                    .trim_end()
-                    .replace('\n', "\n      ")
-            );
-        }
-        if !delta.is_empty() {
-            let _ = writeln!(out, "\npermission changes if approved:");
-            out.push_str(&delta);
-        }
-        out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
-
-        // Bind this preview to the base it was computed against: `execute`
-        // refuses if the config changed before the operator's approval is
-        // applied, so the applied effect is always the one previewed.
-        if let Some(ops_fp) = ops_fingerprint(args) {
-            self.record_preview(ops_fp, fingerprint(&raw));
-        }
-        Some(out)
+    fn approval_summary_for_call(&self, args: &serde_json::Value) -> Option<ToolApprovalSummary> {
+        let preview = self.build_approval_preview(args)?;
+        let binding = self.sign_preview_binding(&preview);
+        Some(ToolApprovalSummary::with_execution_binding(
+            preview.text,
+            serde_json::Value::String(binding),
+        ))
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -406,26 +491,17 @@ impl Tool for ConfigPatchTool {
                 });
             }
         };
-        let base_fp = fingerprint(&raw);
-
-        // Honor the operator's preview. If these exact ops were previewed
-        // against a different base, the permission delta the operator approved
-        // no longer matches the current config, so applying now would enact an
-        // effect that was never shown. Refuse, and consume the binding.
-        if let Some(ops_fp) = ops_fingerprint(&args)
-            && let Some(previewed_base) = self.previews.lock().remove(&ops_fp)
-            && previewed_base != base_fp
+        let base_digest = sha256(raw.as_bytes());
+        // Prompted calls carry a host-injected, tool-authenticated binding to
+        // the exact ops and config bytes shown to the operator. It is
+        // self-contained rather than stored in a shared ops-keyed cache, so
+        // identical concurrent calls cannot overwrite each other and pending
+        // previews cannot be evicted. Non-prompted standing grants carry no
+        // binding and retain their existing execution semantics.
+        if args.get(APPROVAL_EXECUTION_BINDING_ARG).is_some()
+            && let Err(error) = self.verify_preview_binding(&args, &raw)
         {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(
-                    "configuration changed since the approval preview was shown; the \
-                     requested change was not applied. Re-run so the operator can review \
-                     it against the current configuration."
-                        .to_string(),
-                ),
-            });
+            return Ok(Self::preview_binding_refusal(error));
         }
         let mut working: Config = match toml::from_str(&raw) {
             Ok(config) => config,
@@ -464,7 +540,7 @@ impl Tool for ConfigPatchTool {
         // the base read, so a concurrent update is failed explicitly rather
         // than silently clobbered by `save_dirty` rewriting from our base.
         match tokio::fs::read_to_string(&self.config_path).await {
-            Ok(current) if fingerprint(&current) == base_fp => {}
+            Ok(current) if sha256(current.as_bytes()) == base_digest => {}
             Ok(_) => {
                 return Ok(ToolResult {
                     success: false,
@@ -565,6 +641,19 @@ mod tests {
         ConfigPatchTool::new(path, Arc::new(SecurityPolicy::default()))
     }
 
+    fn bind_preview(tool: &ConfigPatchTool, args: &mut serde_json::Value) -> String {
+        let summary = tool
+            .approval_summary_for_call(args)
+            .expect("previewable call gets a per-call binding");
+        let binding = summary
+            .execution_binding
+            .expect("config patch previews bind execution");
+        args.as_object_mut()
+            .expect("tool args are an object")
+            .insert(APPROVAL_EXECUTION_BINDING_ARG.to_string(), binding);
+        summary.text
+    }
+
     #[tokio::test]
     async fn applies_a_replace_and_persists_it_to_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -597,15 +686,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let tool = config_patch_tool(path.clone());
-        let args = serde_json::json!({
+        let mut args = serde_json::json!({
             "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.99"}]
         });
 
         // Operator previews the change against the current base.
-        assert!(
-            tool.approval_summary(&args).is_some(),
-            "the preview must be produced so it binds to the base"
-        );
+        bind_preview(&tool, &mut args);
 
         // The config changes underneath — a different writer edits an unrelated
         // field. A separate tool instance has no preview binding of its own.
@@ -638,6 +724,104 @@ mod tests {
             saved.gateway.port, 4242,
             "the concurrent writer's change is preserved"
         );
+    }
+
+    /// Two turns may preview byte-identical operations on different config
+    /// revisions. Each approval must remain bound to its own base instead of a
+    /// shared ops-keyed slot that the later preview can overwrite.
+    #[tokio::test]
+    async fn concurrent_identical_previews_keep_distinct_config_bindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let original_args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.77"}]
+        });
+        let mut first = original_args.clone();
+        bind_preview(&tool, &mut first);
+
+        config_patch_tool(path.clone())
+            .execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4242"}]
+            }))
+            .await
+            .expect("intervening config write");
+
+        let mut second = original_args;
+        bind_preview(&tool, &mut second);
+        assert_ne!(
+            first[APPROVAL_EXECUTION_BINDING_ARG], second[APPROVAL_EXECUTION_BINDING_ARG],
+            "each approval call receives a fresh opaque binding"
+        );
+
+        let stale = tool.execute(first).await.expect("first execute");
+        assert!(!stale.success, "the first preview is stale and must refuse");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed since the approval preview")),
+            "the refusal names config drift: {:?}",
+            stale.error
+        );
+        assert_ne!(read_config(&path).gateway.host, "10.0.0.77");
+
+        let current = tool.execute(second).await.expect("second execute");
+        assert!(
+            current.success,
+            "the independently previewed current-base call may apply: {:?}",
+            current.error
+        );
+        assert_eq!(read_config(&path).gateway.host, "10.0.0.77");
+    }
+
+    /// More than the old 64-entry map bound must not evict an outstanding
+    /// approval. After config drift, the oldest call still has enough binding
+    /// information to refuse instead of silently applying an unreviewed effect.
+    #[tokio::test]
+    async fn oldest_preview_still_refuses_after_more_than_sixty_four_new_previews() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let mut oldest = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.88"}]
+        });
+        bind_preview(&tool, &mut oldest);
+
+        for index in 0..65 {
+            let mut filler = serde_json::json!({
+                "ops": [{
+                    "op": "comment",
+                    "path": "/gateway/host",
+                    "comment": format!("pending preview {index}")
+                }]
+            });
+            bind_preview(&tool, &mut filler);
+        }
+
+        config_patch_tool(path.clone())
+            .execute(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4343"}]
+            }))
+            .await
+            .expect("intervening config write");
+
+        let result = tool.execute(oldest).await.expect("oldest execute");
+        assert!(
+            !result.success,
+            "an old approved call must not lose its binding and apply after drift"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed since the approval preview")),
+            "the surviving binding detects drift: {:?}",
+            result.error
+        );
+        let saved = read_config(&path);
+        assert_ne!(saved.gateway.host, "10.0.0.88");
+        assert_eq!(saved.gateway.port, 4343);
     }
 
     /// The operator prompt must show model-authored comment text (it is
@@ -716,11 +900,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let tool = config_patch_tool(path.clone());
-        let args = serde_json::json!({
+        let mut args = serde_json::json!({
             "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.42"}]
         });
 
-        assert!(tool.approval_summary(&args).is_some());
+        bind_preview(&tool, &mut args);
         let result = tool.execute(args).await.expect("execute");
 
         assert!(
@@ -729,6 +913,72 @@ mod tests {
             result.error
         );
         assert_eq!(read_config(&path).gateway.host, "10.0.0.42");
+    }
+
+    #[tokio::test]
+    async fn model_supplied_preview_binding_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read_to_string(&path).expect("read before");
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.66"}]
+        });
+        args.as_object_mut().expect("object args").insert(
+            APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+            serde_json::json!("model-forged-binding"),
+        );
+
+        let result = tool.execute(args).await.expect("execute");
+        assert!(
+            !result.success,
+            "an unauthenticated binding must fail closed"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("binding is missing, invalid")),
+            "the refusal names the binding failure: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read after"),
+            before,
+            "a forged binding must not change config"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_binding_rejects_operations_changed_after_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read_to_string(&path).expect("read before");
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.42"}]
+        });
+        bind_preview(&tool, &mut args);
+        args["ops"][0]["value"] = serde_json::json!("10.0.0.43");
+
+        let result = tool.execute(args).await.expect("execute");
+        assert!(
+            !result.success,
+            "post-preview operation changes fail closed"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("different operations")),
+            "the refusal names the operation mismatch: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read after"),
+            before,
+            "operations not shown to the operator must never be written"
+        );
     }
 
     #[tokio::test]
@@ -1002,7 +1252,7 @@ mod tests {
     #[test]
     fn redact_args_for_log_masks_every_value_and_comment() {
         let tool = config_patch_tool(std::env::temp_dir().join("config.toml"));
-        let args = serde_json::json!({
+        let mut args = serde_json::json!({
             "ops": [
                 {"op": "add", "path": "/http_request/secrets/api_token",
                  "value": "sentinel-token-never-logged-0123", "comment": "sentinel-comment"},
@@ -1010,6 +1260,10 @@ mod tests {
                 {"op": "remove", "path": "/gateway/tls"}
             ]
         });
+        args.as_object_mut().expect("object args").insert(
+            APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+            serde_json::json!("opaque-host-binding"),
+        );
         let redacted = tool
             .redact_args_for_log(&args)
             .expect("config_patch redacts");
@@ -1030,6 +1284,10 @@ mod tests {
         assert!(text.contains("gateway.host") || text.contains("/gateway/host"));
         assert_eq!(redacted["ops"][0]["value"], "[redacted]");
         assert_eq!(redacted["ops"][0]["comment"], "[redacted]");
+        assert!(
+            redacted.get(APPROVAL_EXECUTION_BINDING_ARG).is_none(),
+            "the opaque binding is runtime-internal and must not reach sinks"
+        );
     }
 
     #[test]

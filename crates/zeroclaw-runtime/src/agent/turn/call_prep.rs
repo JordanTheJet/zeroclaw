@@ -240,7 +240,7 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
-        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
+        let approved = match gate_tool_approval(ctx, &tool_name, &mut tool_args, iteration).await {
             ApprovalGateOutcome::Proceed { approved } => approved,
             ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
                 // Streaming consumers see the denied/replaced call and its
