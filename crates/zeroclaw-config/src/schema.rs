@@ -345,8 +345,8 @@ pub struct Config {
     ///
     /// Off by default. When `enabled = true` *and* the process is running on
     /// Android, registers the `android_screenshot`, `android_ui_read`,
-    /// `android_action`, and `android_launch` tools, which drive the device UI
-    /// through a companion bridge app over a Unix-domain socket.
+    /// `android_action`, `android_launch`, and `android_device` tools. They expose
+    /// UI control and read-only device facts through the app-private Android bridge.
     ///
     /// Compatibility: additive and disabled by default; existing configs remain
     /// valid when omitted.
@@ -7535,10 +7535,10 @@ impl Default for BrowserComputerUseConfig {
 
 /// Android UI-control configuration (`[android]` section).
 ///
-/// Gates the `android_screenshot`, `android_ui_read`, `android_action`, and
-/// `android_launch` tools. ZeroClaw running as an ordinary Android app cannot
-/// drive the screen itself, so these tools speak newline-delimited JSON over a
-/// Unix-domain socket to a companion APK that owns the `AccessibilityService`.
+/// Gates the `android_screenshot`, `android_ui_read`, `android_action`,
+/// `android_launch`, and `android_device` tools. ZeroClaw running as an ordinary
+/// Android app cannot drive the screen itself, so these tools speak newline-delimited
+/// JSON over a Unix-domain socket to the in-APK Android bridge.
 ///
 /// Default closed: the family requires `enabled = true` **and** a runtime
 /// Android check, so enabling it on a desktop host registers nothing.
@@ -7548,7 +7548,7 @@ impl Default for BrowserComputerUseConfig {
 #[integration(
     category = "ToolsAutomation",
     display_name = "Android",
-    description = "On-device UI control",
+    description = "On-device UI and Android API tools",
     status_field = "enabled"
 )]
 pub struct AndroidConfig {
@@ -7556,8 +7556,8 @@ pub struct AndroidConfig {
     /// running on Android; on any other platform the tools stay unregistered.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the companion bridge APK's Unix-domain socket. Lives inside the
-    /// bridge app's private files directory, which is what makes it safe:
+    /// Path to the Android app's Unix-domain socket. Lives inside the app's
+    /// private files directory, which is what makes it safe:
     /// kernel UID isolation is the only trust boundary the protocol relies on.
     #[serde(default = "default_android_socket_path")]
     pub socket_path: String,
@@ -27724,7 +27724,7 @@ auto_approve = ["my_custom_tool", "another_tool"]
     }
 
     /// The remaining defaults are part of the bridge contract: the socket path
-    /// matches the companion APK's private files dir, actions are approval-
+    /// matches the Android app's private files dir, actions are approval-
     /// gated, and captures are downscaled to keep screenshots affordable.
     #[test]
     async fn android_defaults_match_the_bridge_contract() {
