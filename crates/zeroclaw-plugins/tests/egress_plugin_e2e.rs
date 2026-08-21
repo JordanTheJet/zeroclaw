@@ -1,4 +1,4 @@
-//! End-to-end proof of the plugin egress boundary (ADR-013 gate G2).
+//! End-to-end proof of the plugin egress boundary.
 //!
 //! Every test here drives a **real WASM component** through a **real
 //! `wasi:http` call** into ZeroClaw's hooks. Nothing is stubbed: the deny path

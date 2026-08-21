@@ -604,7 +604,7 @@ fn plugin_egress_policy(
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
-/// registry (ADR-013).
+/// registry.
 ///
 /// It resolves a *view* of canonical config at the moment each request is made
 /// rather than snapshotting one here, so an operator edit takes effect without

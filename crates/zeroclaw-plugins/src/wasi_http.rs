@@ -1,4 +1,4 @@
-//! ZeroClaw's `wasi:http` outbound handler for plugin stores (ADR-013).
+//! ZeroClaw's `wasi:http` outbound handler for plugin stores.
 //!
 //! A plugin granted `http_client` gets the `wasi:http` linker, but the linker is
 //! not the authority. This module replaces wasmtime's default [`WasiHttpHooks`]
