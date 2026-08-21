@@ -2,15 +2,15 @@
 //!
 //! ZeroClaw running as an app on an Android phone cannot drive the screen
 //! itself — an ordinary app UID is denied `screencap` and input injection. A
-//! companion APK holds the `AccessibilityService` and exposes UI control over
-//! a Unix-domain socket; these tools are the client half.
+//! Android APK holds the `AccessibilityService` and exposes UI control over a
+//! Unix-domain socket; these tools are the client half.
 //!
 //! The whole family is off unless `[android] enabled = true` **and** the
 //! process is actually running on Android (`zeroclaw_api::platform::is_android`).
 //! Registration lives in `zeroclaw-runtime`'s tool registry.
 //!
-//! The module is `#[cfg(unix)]` because it depends on `UnixStream`; the crate
-//! still builds on Windows with the family absent.
+//! Production builds compile this module only for `target_os = "android"`;
+//! Unix-hosted crate tests retain it for protocol and rendering coverage.
 
 pub mod action;
 pub mod client;

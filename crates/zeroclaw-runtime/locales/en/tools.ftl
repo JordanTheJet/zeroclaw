@@ -7,7 +7,7 @@
 
 # Android UI bridge (android_* tools). Only registered when [android]
 # enabled = true and the process is running on Android.
-tool-android-screenshot = Capture the Android screen through the companion bridge app and attach it for visual inspection. Use this to see what is currently on screen before acting.
+tool-android-screenshot = Capture the Android screen through the in-app bridge and attach it for visual inspection. Use this to see what is currently on screen before acting.
 tool-android-screenshot-param-max-width = Maximum capture width in pixels; the image is downscaled to fit. Defaults to the configured android.screenshot_max_width.
 tool-android-screenshot-captured = Captured Android screen: { $width }x{ $height }, { $kb } KB, saved to { $path }
 tool-android-screenshot-error-missing-png = The Android bridge returned no image data for the screenshot.
@@ -55,7 +55,7 @@ tool-android-launch-launched = Launched { $package }.
 tool-android-launch-error-missing-package = The 'package' parameter is required.
 tool-android-launch-error-bad-package = '{ $package }' is not a valid Android package name.
 
-tool-android-error-connect = Could not reach the Android UI bridge at { $path }: { $error }. Check that the companion bridge app is installed, running, and that its accessibility service is enabled.
+tool-android-error-connect = Could not reach the Android UI bridge at { $path }: { $error }. Check that the Android app is running and that its accessibility service is enabled.
 tool-android-error-connect-timeout = Timed out connecting to the Android UI bridge at { $path }.
 tool-android-error-read = Failed reading the Android UI bridge response: { $error }
 tool-android-error-timeout = The Android UI bridge did not respond within { $secs } seconds.
@@ -248,7 +248,7 @@ tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, crea
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 
-tool-android-action-param-expect-package = Package name the caller believes is on screen (for example com.tinder). When set, the action is refused if a different app is foreground, so a tap never lands in an app that drifted forward.
+tool-android-action-param-expect-package = Package name the caller believes is on screen (for example com.android.settings). When set, the action is refused if a different app is foreground, so a tap never lands in an app that drifted forward.
 tool-android-error-wrong-foreground = Refused: expected { $expected } to be on screen but { $actual } is foreground. Take a screenshot and re-orient before acting.
 
 tool-android-device = Read a device fact from the Android phone: attached sensors, last known location, or telephony/carrier state. Reads only; it never changes the device or touches the screen.

@@ -6,9 +6,9 @@ pub(crate) mod i18n;
 pub mod microsoft365;
 pub mod util_helpers;
 
-/// Android UI-control tools. Unix-only: the bridge transport is a
-/// Unix-domain socket, so the family is absent on Windows builds.
-#[cfg(unix)]
+/// Android-native tools. Production builds include them only on Android;
+/// Unix-hosted crate tests retain the module for protocol coverage.
+#[cfg(any(target_os = "android", all(test, unix)))]
 pub mod android;
 pub mod ask_user;
 pub mod backup_tool;
