@@ -2181,7 +2181,7 @@ export interface LogEvent {
   service?: { name: string; version: string };
   trace_id?: string | null;
   span_id?: string | null;
-  zeroclaw: Record<string, string> & { duration_ms?: number };
+  zeroclaw: Record<string, string | number | undefined> & { duration_ms?: number };
   message?: string;
   attributes?: Record<string, unknown>;
   schema_version?: number;

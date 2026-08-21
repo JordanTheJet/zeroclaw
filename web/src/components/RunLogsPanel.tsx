@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  Cpu,
+  ListChecks,
+  RefreshCw,
+  Workflow,
+  Wrench,
+} from 'lucide-react';
 import { getLogs, type LogEvent } from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { Card } from '@/components/ui';
+import { presentRunLogEvent, type RunLogKind } from './runLogPresentation';
 
 const PAGE_LIMIT = 100;
 const POLL_INTERVAL_MS = 3000;
@@ -28,8 +38,26 @@ function mergeEvents(current: LogEvent[], incoming: LogEvent[]): LogEvent[] {
     .slice(0, EVENT_CAPACITY);
 }
 
+const kindTone: Record<RunLogKind, string> = {
+  model: 'border-pc-accent/40 bg-pc-accent/10 text-pc-accent',
+  tool: 'border-status-info/40 bg-status-info/10 text-status-info',
+  step: 'border-status-success/40 bg-status-success/10 text-status-success',
+  run: 'border-pc-border bg-pc-surface text-pc-text-secondary',
+  event: 'border-pc-border bg-pc-input text-pc-text-muted',
+};
+
+function KindIcon({ kind }: { kind: RunLogKind }) {
+  const className = 'h-3.5 w-3.5';
+  if (kind === 'model') return <Cpu className={className} />;
+  if (kind === 'tool') return <Wrench className={className} />;
+  if (kind === 'step') return <ListChecks className={className} />;
+  if (kind === 'run') return <Workflow className={className} />;
+  return <Activity className={className} />;
+}
+
 function EventRow({ event }: { event: LogEvent }) {
   const [expanded, setExpanded] = useState(false);
+  const presentation = presentRunLogEvent(event);
   const hasDetails =
     Object.keys(event.attributes ?? {}).length > 0 ||
     Object.keys(event.zeroclaw ?? {}).length > 0 ||
@@ -62,7 +90,41 @@ function EventRow({ event }: { event: LogEvent }) {
           }`}
         >
           <span
-            className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors ${
+            className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border ${kindTone[presentation.kind]}`}
+            aria-hidden
+          >
+            <KindIcon kind={presentation.kind} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] ${kindTone[presentation.kind]}`}>
+                {presentation.eyebrow}
+              </span>
+              <span className="font-mono text-[10px] uppercase tracking-wide text-pc-text-faint">
+                {event.severity_text} · {event.event.category}.{event.event.action}
+              </span>
+            </span>
+            <span className="mt-1 block break-words text-sm font-medium leading-5 text-pc-text">
+              {presentation.title || t('run_detail.logs_no_message')}
+            </span>
+            {presentation.meta.length > 0 ? (
+              <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[11px] text-pc-text-muted">
+                {presentation.meta.map((item) => (
+                  <span key={`${item.label}:${item.value}`}>
+                    <span className="text-pc-text-faint">{item.label}</span>{' '}
+                    <span className="text-pc-text-secondary">{item.value}</span>
+                  </span>
+                ))}
+              </span>
+            ) : null}
+            {presentation.output ? (
+              <span className="mt-2 block max-w-3xl truncate rounded border-l-2 border-pc-accent/50 bg-pc-input px-2 py-1 font-mono text-[11px] text-pc-text-secondary">
+                {presentation.output}
+              </span>
+            ) : null}
+          </span>
+          <span
+            className={`mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded border transition-colors ${
               hasDetails
                 ? 'border-pc-border bg-pc-surface text-pc-text-muted group-hover:border-pc-accent group-hover:text-pc-accent'
                 : 'border-transparent text-pc-text-faint'
@@ -72,14 +134,6 @@ function EventRow({ event }: { event: LogEvent }) {
             {hasDetails ? (
               expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />
             ) : null}
-          </span>
-          <span className="min-w-0">
-            <span className="font-mono text-[11px] uppercase tracking-wide text-pc-text-muted">
-              {event.severity_text} · {event.event.category}.{event.event.action}
-            </span>
-            <span className="mt-0.5 block break-words text-sm leading-5 text-pc-text">
-              {event.message || t('run_detail.logs_no_message')}
-            </span>
           </span>
         </button>
         {expanded ? (
