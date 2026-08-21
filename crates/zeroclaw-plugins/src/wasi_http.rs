@@ -218,7 +218,17 @@ async fn send(
     // this future until the connection worker takes it, so returning early —
     // or the guest dropping the request, which aborts this future — drops the
     // token and releases the lease.
-    let deadline = Instant::now() + config.connect_timeout;
+    //
+    // `connect_timeout` is the guest's number — `wasi:http`'s
+    // `request-options.set-connect-timeout` reaches this field unclamped — so
+    // the deadline is computed with `checked_add` rather than `+`. A duration
+    // the monotonic clock cannot represent is not a budget the host can
+    // enforce, and it must not become a panic in a host function on a guest's
+    // say-so. A nonsense timeout gets the timeout error it asked for, closed
+    // and immediate.
+    let Some(deadline) = Instant::now().checked_add(config.connect_timeout) else {
+        return Err(ErrorCode::ConnectionTimeout);
+    };
 
     // ── authorize ────────────────────────────────────────────────
     // The shared boundary checks the effective grant and the operator's
@@ -483,6 +493,40 @@ mod tests {
                 1,
             )
         }))
+    }
+
+    /// The connect budget arrives from the guest: `wasi:http`'s
+    /// `request-options.set-connect-timeout` reaches `connect_timeout`
+    /// unclamped, and `WasiHttpHooks::send_request` accepts whatever
+    /// `OutgoingRequestConfig` it is handed. A duration the monotonic clock
+    /// cannot represent must therefore fail closed here rather than panic
+    /// inside a host function.
+    ///
+    /// The guest's own ceiling is `Duration::from_nanos(u64::MAX)` — about 585
+    /// years, which today's targets *can* represent — so this is a defense of
+    /// the hook boundary and of platforms whose clock epoch leaves less room,
+    /// not a reproduction of a wasm module that panics the host on demand.
+    #[tokio::test]
+    async fn an_unrepresentable_connect_budget_fails_closed_instead_of_panicking() {
+        let mut hooks = hooks(Some(loopback_service()));
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::MAX,
+            first_byte_timeout: Duration::from_secs(1),
+            between_bytes_timeout: Duration::from_secs(1),
+        };
+
+        let response = hooks
+            .send_request(request("http://127.0.0.1:1/"), config)
+            .expect("a nonsense timeout is a guest-visible error, never a trap");
+        let HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("a granted destination is dialed asynchronously");
+        };
+        let outcome = handle.await.expect("the send task must not trap");
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
+            "an unrepresentable connect budget must fail closed, got: {outcome:?}"
+        );
     }
 
     /// A peer that completes the TCP handshake and then sends nothing.
