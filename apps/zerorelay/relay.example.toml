@@ -25,6 +25,13 @@ sans = ["relay.example.com"]
 mode = "open"
 allow = []
 deny = []
+# LOUD OPT-IN — this shipped default runs an OPEN relay: any daemon that can
+# reach the port may register and claim unclaimed node-ids. That is what makes
+# the zero-config `compose up` demo work, and it is a deliberate, visible
+# choice: without this line (or --allow-public-open) the relay REFUSES to start
+# publicly bound with open, tokenless admission. For any real deployment,
+# delete this line and set relay_token or mode = "allowlist".
+allow_public_open = true
 # Optional shared-secret gate a daemon must present in its Hello.
 # relay_token = "change-me"
 # Outer-mTLS variant (additive admission on the OUTER TLS; the inner mTLS is

@@ -119,6 +119,13 @@ struct Cli {
     /// relay.example.toml [frontdoor] for the trust implications.
     #[arg(long)]
     frontdoor: bool,
+
+    /// Explicitly allow OPEN, tokenless registration on a public (non-loopback)
+    /// bind. Without this, such a configuration refuses to start: any daemon on
+    /// the internet could register and squat unclaimed node-ids. Prefer setting
+    /// [admission] relay_token or mode = "allowlist".
+    #[arg(long)]
+    allow_public_open: bool,
 }
 
 /// A `relay.toml`: every value optional, CLI flags override. The `[admission]`
@@ -175,6 +182,8 @@ struct AdmissionFile {
     /// Route to the node-id named by the outer client cert's CN, falling back to
     /// the `Connect` frame (default false; only meaningful with outer client auth).
     route_by_client_cert: Option<bool>,
+    /// See the --allow-public-open flag: opt-in for open+tokenless on a public bind.
+    allow_public_open: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -222,6 +231,25 @@ fn normalize_admission_fingerprints(entries: &[String]) -> Result<HashSet<String
         .iter()
         .map(|entry| normalize_admission_fingerprint(entry))
         .collect()
+}
+
+/// True when this configuration would run an unguarded open relay on a public
+/// address: non-loopback bind + open registration + no shared-secret token.
+/// (An allowlist guards regardless of token; a token guards open mode.)
+fn public_open_unguarded(bind: &str, mode: &Admission, relay_token: Option<&str>) -> bool {
+    if !matches!(mode, Admission::Open) || relay_token.is_some_and(|t| !t.trim().is_empty()) {
+        return false;
+    }
+    let host = bind
+        .rsplit_once(':')
+        .map_or(bind, |(h, _)| h)
+        .trim_matches(['[', ']']);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        // Unparseable host (a name): "localhost" is loopback; anything else is
+        // conservatively treated as public.
+        Err(_) => !host.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 fn resolve_admission(file: &AdmissionFile, overlay: &AdmissionOverlay) -> Result<AdmissionPolicy> {
@@ -392,6 +420,24 @@ async fn main() -> Result<()> {
         ),
         frontdoor_enabled: cli.frontdoor || file.frontdoor.enabled.unwrap_or(false),
     };
+
+    // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,
+    // tokenless relay on a public bind admits any daemon on the internet and
+    // lets unclaimed node-ids be squatted. Refuse to start unless the operator
+    // explicitly opts in — loopback binds (dev/tests) are unaffected.
+    let public_open_override =
+        cli.allow_public_open || file.admission.allow_public_open.unwrap_or(false);
+    if public_open_unguarded(&bind, &cfg.registration_mode, cfg.relay_token.as_deref())
+        && !public_open_override
+    {
+        anyhow::bail!(
+            "refusing to start: bind {bind} is public, admission mode is open, and no \
+             relay_token is set — any daemon on the internet could register and squat \
+             unclaimed node-ids. Set [admission] relay_token, use mode = \"allowlist\", \
+             or pass --allow-public-open (config: [admission] allow_public_open = true) \
+             if an open public relay is genuinely intended."
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -742,5 +788,55 @@ mod tests {
         // running stale defaults.
         let bad = "bind = \"0.0.0.0:1\"\n[admission]\nmodee = \"open\"\n";
         assert!(toml::from_str::<FileConfig>(bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admission_guard_tests {
+    use super::*;
+
+    #[test]
+    fn public_open_tokenless_is_unguarded() {
+        assert!(public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(public_open_unguarded(
+            "34.209.38.50:443",
+            &Admission::Open,
+            Some("  ")
+        ));
+        // A hostname that is not localhost is conservatively public.
+        assert!(public_open_unguarded(
+            "relay.example.com:443",
+            &Admission::Open,
+            None
+        ));
+    }
+
+    #[test]
+    fn loopback_token_or_allowlist_are_guarded() {
+        assert!(!public_open_unguarded(
+            "127.0.0.1:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(!public_open_unguarded("[::1]:8443", &Admission::Open, None));
+        assert!(!public_open_unguarded(
+            "localhost:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(!public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Open,
+            Some("secret")
+        ));
+        assert!(!public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Allowlist,
+            None
+        ));
     }
 }
