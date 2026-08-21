@@ -35,7 +35,7 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
-#[cfg(unix)]
+#[cfg(target_os = "android")]
 pub use zeroclaw_tools::android::{
     AndroidActionTool, AndroidBridgeClient, AndroidDeviceTool, AndroidLaunchTool,
     AndroidScreenshotTool, AndroidUiReadTool,
@@ -631,7 +631,9 @@ fn plugin_config_resolver(
             })
         }
     })
-#[cfg(unix)]
+}
+
+#[cfg(any(target_os = "android", test))]
 fn android_action_would_be_auto_approved(
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
 ) -> bool {
@@ -965,15 +967,14 @@ pub fn all_tools_with_runtime(
 
     // Set when the android_* family registers, so the generic screenshot tool below can be wired
     // to the bridge instead of being left in its unusable subprocess form.
-    #[cfg(all(unix, target_os = "android"))]
+    #[cfg(target_os = "android")]
     let mut android_screenshot_bridge: Option<(AndroidBridgeClient, u32)> = None;
 
     // Android UI-control tools. Gated on BOTH explicit opt-in and actually
     // running on Android: the bridge socket only exists on the phone, so
-    // registering these on a desktop host would hand the model four tools
-    // that can never succeed. Unix-only because the transport is a
-    // Unix-domain socket.
-    #[cfg(unix)]
+    // registering these on a desktop host would hand the model tools that can
+    // never succeed. Production desktop builds do not compile the family.
+    #[cfg(target_os = "android")]
     {
         if root_config.android.enabled {
             if zeroclaw_api::platform::is_android() {
@@ -984,11 +985,8 @@ pub fn all_tools_with_runtime(
                     client.clone(),
                     android_cfg.screenshot_max_width,
                 )));
-                #[cfg(target_os = "android")]
-                {
-                    android_screenshot_bridge =
-                        Some((client.clone(), android_cfg.screenshot_max_width));
-                }
+                android_screenshot_bridge =
+                    Some((client.clone(), android_cfg.screenshot_max_width));
                 tool_arcs.push(Arc::new(AndroidUiReadTool::new(client.clone())));
                 // Read-only device facts; no accessibility service needed, so it stays useful
                 // even when the service is switched off.
@@ -2151,7 +2149,6 @@ const = true
     /// The generic screenshot tool must stay registered. On Android it is wired to the bridge
     /// rather than removed, so a model reaching for the familiar name gets a working capture
     /// instead of "not supported"; everywhere else it keeps its subprocess behaviour.
-    #[cfg(unix)]
     #[test]
     fn android_action_approval_guard_uses_effective_autonomy() {
         let supervised = zeroclaw_config::schema::RiskProfileConfig::default();

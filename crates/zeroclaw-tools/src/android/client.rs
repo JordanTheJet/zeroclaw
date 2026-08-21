@@ -1,14 +1,14 @@
 //! Unix-domain-socket client for the Android UI bridge.
 //!
 //! Wire contract: newline-delimited JSON over a filesystem-namespace Unix
-//! socket owned by the companion APK (see
+//! socket owned by the Android APK (see
 //! `docs/book/src/tools/android-bridge-protocol.md`). One request line, one
 //! response line, then the client drops the connection — the server is
 //! documented not to assume connection reuse.
 //!
 //! Kernel UID isolation is the only trust boundary; the protocol carries no
-//! token or auth field by design, because the socket lives inside the bridge
-//! APK's private files directory where no other app UID can open it.
+//! token or auth field by design, because the socket lives inside the app's
+//! private files directory where no other app UID can open it.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Maximum response line the client will buffer (contract: 4 MiB).
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Client for the companion APK's UI-control socket.
+/// Client for the Android APK's UI-control socket.
 #[derive(Debug, Clone)]
 pub struct AndroidBridgeClient {
     socket_path: PathBuf,

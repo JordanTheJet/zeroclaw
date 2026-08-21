@@ -1,13 +1,14 @@
-# Android UI control
+# Android-native tools
 
 ZeroClaw can run as an ordinary app on an Android phone, but an ordinary app
 UID is denied `screencap` and input injection. It therefore cannot see or touch
 the screen on its own.
 
-The `android_*` tool family closes that gap. A companion APK holds an
-`AccessibilityService` and exposes UI control over a Unix-domain socket;
-ZeroClaw is the client. The tools let the agent look at the screen, read what
-is on it, and act on it.
+The `android_*` tool family closes that gap. The ZeroClaw Android APK holds an
+`AccessibilityService` and exposes UI control plus read-only device facts over
+an app-private Unix-domain socket to its bundled ZeroClaw process. The tools let
+the agent look at the screen, read what is on it, act on it, and inspect selected
+Android APIs.
 
 The family is **off by default** and only registers when ZeroClaw is genuinely
 running on Android. See [Bridge protocol](./android-bridge-protocol.md) for the
@@ -40,7 +41,7 @@ the tree comes back thin, capture the screen rather than guessing coordinates.
 # Android; on any other platform nothing is registered.
 enabled = true
 
-# The companion bridge app's socket, inside its private files directory.
+# The Android app's bridge socket, inside its private files directory.
 socket_path = "/data/data/org.zerodroid.bridge/files/ui.sock"
 
 # Refuse to register android_action when the active risk profile would
@@ -52,7 +53,9 @@ screenshot_max_width = 540
 ```
 
 Every field has a safe default; `enabled = true` is the only line strictly
-required.
+required in operator-authored config for the primary Android user. App-generated
+config always writes the actual `filesDir` path, including the correct
+`/data/user/<id>/` prefix for secondary users and work profiles.
 
 ## Security model
 
@@ -121,9 +124,8 @@ there when the agent is looking at content the user did not write.
 ## Failure modes
 
 Bridge errors surface as ordinary tool errors, never panics. The most common
-by far is the bridge not being reachable, which almost always means the
-companion app is not installed, not running, or its accessibility service is
-switched off in system settings.
+by far is the bridge not being reachable, which usually means the Android app
+is not running or its accessibility service is switched off in system settings.
 
 The client uses a 15 s read timeout against the server's 10 s budget, so a
 server-side `timeout` is reported as such rather than being masked by the
@@ -131,5 +133,6 @@ client giving up first.
 
 ## Platform support
 
-The module is Unix-only, because the transport is a Unix-domain socket.
-ZeroClaw still builds on Windows with the family absent.
+Production binaries compile the module only for Android. Unix-hosted unit tests
+retain the protocol client for coverage; Linux, macOS, and Windows production
+builds contain no Android tool implementation or registration path.

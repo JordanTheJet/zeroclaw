@@ -1,6 +1,6 @@
 //! `android_device` — read-only device facts (sensors, location, telephony).
 //!
-//! These come from the companion APK's platform APIs rather than the screen, so unlike the rest of
+//! These come from the Android APK's platform APIs rather than the screen, so unlike the rest of
 //! the family they need no accessibility service. They travel the same Unix socket regardless: a
 //! loopback port is reachable by every app on the device, and the phone's location and carrier
 //! identify its owner, so this is at least as sensitive as screen control.

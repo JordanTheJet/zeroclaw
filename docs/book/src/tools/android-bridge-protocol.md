@@ -1,13 +1,13 @@
 # Android UI Bridge: UDS JSON-RPC contract (v1)
 
 Shared interface between:
-- **Client** = Rust `android_*` tools in the ZeroClaw fork (`crates/zeroclaw-tools/src/android/`).
-- **Server** = Kotlin bridge in the companion APK (zerodroid), which brokers to the
+- **Client** = Rust `android_*` tools (`crates/zeroclaw-tools/src/android/`).
+- **Server** = Kotlin bridge in the Android APK (`apps/android/`), which brokers to the
   in-APK `AccessibilityService`.
 
 This file is the single source of truth for the wire format. Both sides implement it
-verbatim; neither may diverge unilaterally, because they ship in separate repositories
-and only this document keeps them compatible. A change here is a change to both halves.
+verbatim. A protocol change must update the Rust client, Kotlin server, and their tests
+together.
 
 ## Transport
 
