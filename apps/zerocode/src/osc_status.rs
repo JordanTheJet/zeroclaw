@@ -49,6 +49,7 @@ use std::sync::{
     Mutex, TryLockError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use zeroclaw_api::lifecycle::{LifecycleActivity, LifecycleState};
 
 use crate::turn_status::TurnStatus;
 
@@ -58,12 +59,10 @@ const MAX_TITLE_CHARS: usize = 120;
 
 /// Status glyph for a turn state. Leading character of the title.
 fn glyph(status: &TurnStatus) -> char {
-    if matches!(status, TurnStatus::Idle) {
-        '✓'
-    } else if status.is_blocked() {
-        '⚠'
-    } else {
-        '⏳'
+    match status.lifecycle_state() {
+        LifecycleState::Idle | LifecycleState::Done => '✓',
+        LifecycleState::Working => '⏳',
+        LifecycleState::Blocked => '⚠',
     }
 }
 
@@ -103,12 +102,14 @@ pub(crate) const PROGRESS_CLEARED: &str = "0;0";
 /// what an agent turn is. `4` (warning) marks a turn that has stopped and wants
 /// the operator — distinct from `2` (error), which would claim the turn failed.
 pub(crate) fn progress_for(status: &TurnStatus) -> &'static str {
-    if matches!(status, TurnStatus::Idle) {
-        PROGRESS_CLEARED
-    } else if status.is_blocked() {
-        "4;0"
-    } else {
-        "3;0"
+    progress_for_state(status.lifecycle_state())
+}
+
+fn progress_for_state(state: LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Idle | LifecycleState::Done => PROGRESS_CLEARED,
+        LifecycleState::Working => "3;0",
+        LifecycleState::Blocked => "4;0",
     }
 }
 
@@ -124,11 +125,9 @@ pub(crate) fn most_urgent<'a>(
     panes: impl IntoIterator<Item = (Option<&'a TurnStatus>, Option<&'a str>)>,
 ) -> (Option<&'a TurnStatus>, Option<&'a str>) {
     fn rank(pane: (Option<&TurnStatus>, Option<&str>)) -> (u8, bool) {
-        let urgency = match pane.0 {
-            Some(status) if status.is_blocked() => 2,
-            Some(TurnStatus::Idle) | None => 0,
-            Some(_) => 1,
-        };
+        let urgency = pane
+            .0
+            .map_or(0, |status| status.lifecycle_state().attention_rank());
         // Naming breaks an urgency tie only. An unnamed pane knows of no agent,
         // so preferring it would drop a real name from the title for nothing —
         // an idle session on the secondary pane still reads better as
@@ -229,7 +228,7 @@ impl StatusReporter {
     }
 
     fn release_to(&mut self, out: &mut impl Write, restore_needed: &AtomicBool) {
-        let _ = write_progress(out, PROGRESS_CLEARED);
+        let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
         if restore_needed.swap(false, Ordering::AcqRel) {
             // Neutralize attention state before pop. Terminals with a title
             // stack restore the prior title; terminals that ignored the push
@@ -258,7 +257,7 @@ impl StatusReporter {
         restore_needed: &AtomicBool,
         title_write_attempted: bool,
     ) {
-        let _ = write_progress(out, PROGRESS_CLEARED);
+        let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
         let should_pop = restore_needed.swap(false, Ordering::AcqRel);
         if title_write_attempted || should_pop {
             let _ = write_title(out, "zerocode");
@@ -358,7 +357,7 @@ fn release_reporter_to(
 }
 
 fn emergency_release_to(out: &mut impl Write, restore_needed: &AtomicBool) {
-    let _ = write_progress(out, PROGRESS_CLEARED);
+    let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
     if restore_needed.swap(false, Ordering::AcqRel) {
         let _ = write_title(out, "zerocode");
         if pop_title(out).is_err() {

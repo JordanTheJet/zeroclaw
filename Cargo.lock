@@ -14404,6 +14404,7 @@ dependencies = [
  "url",
  "webpki-roots 0.26.11",
  "zeroize",
+ "zeroclaw-api",
 ]
 
 [[package]]
