@@ -36,6 +36,69 @@ You answer one prompt per step in the terminal. The built-in `cli` channel
 works immediately, so Channels and Peer groups can be skipped. For an
 all-defaults, no-approvals config, see [YOLO mode](./yolo.md).
 
+## Create another agent with Zerona
+
+After Quickstart has configured at least one model provider, run:
+
+```sh
+zeroclaw onboard
+```
+
+Zerona requires the on-disk config to use the current schema. If it asks you to
+migrate, run `zeroclaw config migrate`, review the saved migration, and start
+onboarding again. It will not combine an automatic in-memory migration with a
+new-agent write.
+
+Zerona holds a capability-free conversation about one new agent. The host
+selects the existing model-provider alias before the conversation. Zerona
+receives no tools, memory, skills, MCP servers, file access, shell access, or
+configuration writer; every provider request carries `tools: none` and is
+pinned to that one alias and model without global routes or fallback aliases.
+
+`zeroclaw onboard` starts the compiled-in `system.zerona.create_agent` SOP
+through a typed system-only entry point. User-authored SOPs cannot shadow or
+start it. Its interactive step records only status, byte counts, and random
+markers;
+the bounded conversation transcript, proposal, preview, personality contents,
+and exact config source remain process-local in the onboarding host. Closing
+the process discards that private state, so an interrupted session restarts
+instead of reconstructing sensitive conversation text from the SOP run store.
+
+The model can propose only:
+
+- a new agent alias;
+- the `locked_down` or `balanced` risk preset;
+- the `tight`, `local_small`, or `balanced` runtime preset;
+- `sqlite`, `markdown`, or no memory; and
+- `SOUL.md`, `IDENTITY.md`, `USER.md`, and `AGENTS.md` contents.
+
+Channels, peer groups, credentials, provider settings, arbitrary config paths,
+workspace overrides, and uncontained profiles are outside this surface. If a
+message looks like a credential, ZeroClaw refuses it before a provider request.
+
+When Zerona has enough information, the host validates the proposal against
+current typed config and shows the complete personality files, effective
+security posture, workspace, config path, and persistence effects. Only the
+exact terminal verdict `apply` persists the proposed agent or personality
+files. `revise`, `cancel`, `quit`, or end-of-file leaves the proposal
+unapplied. The strict new-agent transaction finishes the complete personality
+workspace before publishing the config entry. If the config revision check then
+refuses the write, that newly-created workspace is removed, so config never
+exposes an agent with a partial personality bundle. A per-agent OS lock prevents
+two Zerona processes from sharing or deleting each other's workspace, and file
+plus directory fsyncs make the personality bundle durable before config is
+published. If the platform reports an ambiguous config-rename outcome, ZeroClaw
+preserves the complete workspace and asks the operator to inspect both surfaces;
+it never deletes files unless the writer proves config did not commit. ZeroClaw
+compares the exact
+`config.toml` source bytes before apply and again immediately before the atomic
+replacement step. Detected configuration drift ends the session; restart
+onboarding to build a new conversation and preview against current config.
+
+This focused agent creator supersedes the experimental generic section flow in
+[#8033](https://github.com/zeroclaw-labs/zeroclaw/pull/8033). It does not replace
+Quickstart's provider, channel, peer-group, web, or zerocode setup surfaces.
+
 ### OpenAI Codex subscription auth
 
 Quickstart can configure the OpenAI Codex subscription path without an API key.

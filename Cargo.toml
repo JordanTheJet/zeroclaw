@@ -413,6 +413,7 @@ base64 = "0.22"
 hmac = "0.12"
 parking_lot = "0.12"
 regex = "1.10"
+portable-pty = "0.9"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [[test]]

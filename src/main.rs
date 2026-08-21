@@ -347,6 +347,8 @@ mod multimodal;
 #[cfg(feature = "agent-runtime")]
 mod observability;
 #[cfg(feature = "agent-runtime")]
+mod onboard;
+#[cfg(feature = "agent-runtime")]
 mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
@@ -511,7 +513,8 @@ enum Commands {
         agent: Option<String>,
     },
 
-    /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
+    /// Create one contained agent through a capability-free Zerona conversation.
+    /// Deprecated legacy onboarding flags still error.
     Onboard {
         /// Configure a specific section only. Omit to run the full flow.
         #[command(subcommand)]
@@ -3521,20 +3524,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
             || *tunnel_only;
         if any_legacy_flag {
             eprintln!(
-                "error: `zeroclaw onboard` is deprecated and its flags no longer apply. \
-                 Use `zeroclaw quickstart` to create a new agent, or `zeroclaw config set <path>=<value>` \
-                 for headless updates."
+                "{}",
+                t(
+                    "cli-onboard-legacy-flags",
+                    "error: legacy `zeroclaw onboard` flags no longer apply. Use `zeroclaw quickstart` to create a new agent, or `zeroclaw config set <path>=<value>` for headless updates."
+                )
             );
             std::process::exit(2);
         }
-        eprintln!(
-            "{}",
-            t(
-                "cli-onboard-deprecated",
-                "`zeroclaw onboard` is deprecated — use `zeroclaw quickstart`."
-            )
-        );
-        return Ok(());
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if matches!(&cli.command, Commands::Onboard { .. }) {
+        Box::pin(onboard::preflight_source_schema()).await?;
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -3763,10 +3765,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     match cli.command {
-        Commands::Onboard { .. }
-        | Commands::Completions { .. }
-        | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        Commands::Onboard { .. } => Box::pin(onboard::run(config)).await,
+
+        Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
+            unreachable!()
+        }
 
         Commands::Quickstart {
             model_provider,

@@ -614,7 +614,6 @@ cli-no-channels-compiled = {"  "}此二进制文件中未编译任何通道类�
 cli-quickstart-complete = Quickstart 完成。已创建 agent `{$alias}`。
 cli-next-steps = 后续步骤：
 cli-agent-not-created = 未创建您的 agent — 磁盘上没有任何更改。
-cli-onboard-deprecated = `zeroclaw onboard` 已弃用 — 请使用 `zeroclaw quickstart`。
 cli-otp-initialized = 已为 ZeroClaw 初始化 OTP 密钥。
 cli-otp-enrollment-uri = 注册 URI：{$uri}
 cli-otp-received = {"  "}✓ OTP 已接收

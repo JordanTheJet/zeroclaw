@@ -21,3 +21,5 @@ mod reply_target_field_regression;
 mod security;
 mod skills_bundle_cli;
 mod whatsapp_webhook_security;
+#[cfg(feature = "agent-runtime")]
+mod zerona_cli;

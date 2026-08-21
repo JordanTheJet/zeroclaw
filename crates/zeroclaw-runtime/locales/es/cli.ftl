@@ -615,7 +615,6 @@ cli-no-channels-compiled = {"  "}No hay tipos de canal compilados en este binari
 cli-quickstart-complete = Quickstart completado. Se creó el agente `{$alias}`.
 cli-next-steps = Siguientes pasos:
 cli-agent-not-created = Tu agente no fue creado — y no se cambió nada en el disco.
-cli-onboard-deprecated = `zeroclaw onboard` está obsoleto — usa `zeroclaw quickstart`.
 cli-otp-initialized = Secreto OTP inicializado para ZeroClaw.
 cli-otp-enrollment-uri = URI de inscripción: {$uri}
 cli-otp-received = {"  "}✓ OTP recibido
