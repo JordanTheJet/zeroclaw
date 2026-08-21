@@ -1,21 +1,18 @@
 //! Interactive CLI host for the capability-free Zerona agent creator.
 
 use std::io::{BufRead, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use zeroclaw_api::principal::Principal;
-use zeroclaw_config::multi_agent::MemoryBackendKind;
 use zeroclaw_config::schema::{Config, SopConfig};
 use zeroclaw_control::{
-    CurrentProviderFactory, FluentMessage, PROPOSAL_MARKER, PersonalityFilePreview,
-    ProposalPreview, ValidatedProposal, ZeronaSession, build_preview, eligible_provider_refs,
-    revalidate_proposal, validate_operator_input,
+    BoundProposal, ControlApplyOutcome, ControlError, ControlInspection, ControlService,
+    FluentMessage, PROPOSAL_MARKER, PersonalityFilePreview, ProposalPreview, ZeronaSession,
+    source_schema_is_current, validate_operator_input,
 };
-use zeroclaw_runtime::quickstart::{
-    Surface, apply_new_agent_strict_if_source_unchanged_per_agent_memory,
-};
+use zeroclaw_runtime::quickstart::Surface;
 use zeroclaw_runtime::sop::approval::{ApprovalPrincipal, BrokerOutcome, ResolveOutcome};
 use zeroclaw_runtime::sop::types::SopAdmissionPolicy;
 use zeroclaw_runtime::sop::{
@@ -25,7 +22,6 @@ use zeroclaw_runtime::sop::{
 };
 
 const INPUT_CAP_BYTES: usize = 64 * 1024;
-const CONFIG_LOAD_ATTEMPTS: usize = 3;
 const ZERONA_SOP_NAME: &str = "system.zerona.create_agent";
 
 fn tr(key: &str) -> String {
@@ -43,6 +39,28 @@ fn render_message(message: &FluentMessage) -> String {
 
 fn tra(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+/// Render a [`ControlService`] refusal with the CLI's Fluent catalogue.
+///
+/// The service owns the message key; the CLI owns the catalogue. A refusal
+/// carrying no Fluent arguments is a plain catalogue lookup, one carrying
+/// arguments is formatted with them, and a host failure keeps its own text.
+fn render_control_error(error: &ControlError) -> String {
+    match error.fluent() {
+        Some(message) if message.args.is_empty() => tr(message.key),
+        Some(message) => render_message(&message),
+        None => error.to_string(),
+    }
+}
+
+/// Surface a service refusal as this command's terminal error, preserving the
+/// original error chain for host I/O and configuration-load failures.
+fn control_error(error: ControlError) -> anyhow::Error {
+    match error {
+        ControlError::Host(host) => host,
+        other => anyhow::Error::msg(render_control_error(&other)),
+    }
 }
 
 fn interactive_terminal_available() -> bool {
@@ -85,8 +103,11 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
 }
 
-fn choose_provider(config: &Config) -> Result<Option<String>> {
-    let providers = eligible_provider_refs(config, &CurrentProviderFactory);
+fn choose_provider(
+    service: &ControlService,
+    inspection: &ControlInspection,
+) -> Result<Option<String>> {
+    let providers = service.provider_inventory(inspection).provider_refs;
     if providers.is_empty() {
         println!("{}", tr("cli-zerona-no-provider"));
         return Ok(None);
@@ -102,35 +123,13 @@ fn choose_provider(config: &Config) -> Result<Option<String>> {
     Ok(selection.map(|index| providers[index].clone()))
 }
 
-/// Load a config while proving its source bytes stayed unchanged for the whole
-/// load. The returned source is the revision the operator will preview.
-async fn load_stable_config(config_path: &Path) -> Result<(Config, String)> {
-    for _ in 0..CONFIG_LOAD_ATTEMPTS {
-        let before = tokio::fs::read_to_string(config_path)
-            .await
-            .context("read config revision before Zerona preview")?;
-        if !source_schema_is_current(&before) {
-            anyhow::bail!(tr("cli-zerona-error-current-schema-required"));
-        }
-        let loaded = Box::pin(Config::load_or_init()).await?;
-        if !loaded.degraded_security.is_empty() || !loaded.degraded_sections.is_empty() {
-            anyhow::bail!(tr("cli-zerona-error-healthy-config-required"));
-        }
-        let after = tokio::fs::read_to_string(config_path)
-            .await
-            .context("read config revision after Zerona preview")?;
-        if before == after && loaded.config_path == config_path {
-            return Ok((loaded, before));
-        }
-    }
-    anyhow::bail!(tr("cli-zerona-error-config-busy"))
-}
-
-fn source_schema_is_current(source: &str) -> bool {
-    toml::from_str::<toml::Value>(source)
-        .ok()
-        .and_then(|value| zeroclaw_config::migration::detect_version(&value).ok())
-        == Some(zeroclaw_config::migration::CURRENT_SCHEMA_VERSION)
+/// Resolve one canonical revision through the control service, rendering its
+/// refusals with this command's catalogue.
+///
+/// The inspection future carries a whole `Config`, so it is boxed here rather
+/// than embedded in this command's already-large run loop.
+async fn inspect(service: &ControlService) -> Result<ControlInspection> {
+    Box::pin(service.inspect()).await.map_err(control_error)
 }
 
 /// Refuse stale on-disk schemas before the generic config loader can run its
@@ -532,81 +531,20 @@ fn resumed_broker_action(outcome: BrokerOutcome) -> Result<SopRunAction> {
     }
 }
 
-struct PendingApply {
-    validated: ValidatedProposal,
-    config: Config,
-    expected_source: String,
-}
-
 fn session_source_is_current(session_source: &str, current_source: &str) -> bool {
     session_source == current_source
 }
 
-struct PreservedApplyState {
-    memory: serde_json::Value,
-    storage: serde_json::Value,
-    agents: serde_json::Value,
-    channels: serde_json::Value,
-    peer_groups: serde_json::Value,
-    providers: serde_json::Value,
-}
-
-impl PreservedApplyState {
-    fn capture(config: &Config) -> Result<Self> {
-        Ok(Self {
-            memory: serde_json::to_value(&config.memory)?,
-            storage: serde_json::to_value(&config.storage)?,
-            agents: serde_json::to_value(&config.agents)?,
-            channels: serde_json::to_value(&config.channels)?,
-            peer_groups: serde_json::to_value(&config.peer_groups)?,
-            providers: serde_json::to_value(&config.providers)?,
-        })
+/// Print each Quickstart refusal to the operator, returning the sanitized text
+/// for the SOP step record.
+fn report_apply_errors(errors: Vec<String>) -> Vec<String> {
+    let mut rendered = Vec::with_capacity(errors.len());
+    for error in errors {
+        let error = safe_terminal(&error);
+        eprintln!("{error}");
+        rendered.push(error);
     }
-
-    fn matches_after_add(&self, config: &Config, added_alias: &str) -> Result<bool> {
-        let mut existing_agents = config.agents.clone();
-        existing_agents.remove(added_alias);
-        Ok(self.memory == serde_json::to_value(&config.memory)?
-            && self.storage == serde_json::to_value(&config.storage)?
-            && self.agents == serde_json::to_value(existing_agents)?
-            && self.channels == serde_json::to_value(&config.channels)?
-            && self.peer_groups == serde_json::to_value(&config.peer_groups)?
-            && self.providers == serde_json::to_value(&config.providers)?)
-    }
-}
-
-fn verify_install(
-    config: &Config,
-    proposal: &ValidatedProposal,
-    expected_alias: &str,
-    preserved: &PreservedApplyState,
-) -> Result<()> {
-    let Some(agent) = config.agents.get(expected_alias) else {
-        anyhow::bail!("applied agent is absent after config reload");
-    };
-    let raw = proposal.proposal();
-    let expected_memory = match raw.memory {
-        zeroclaw_control::MemoryChoice::Sqlite => MemoryBackendKind::Sqlite,
-        zeroclaw_control::MemoryChoice::Markdown => MemoryBackendKind::Markdown,
-        zeroclaw_control::MemoryChoice::None => MemoryBackendKind::None,
-    };
-    if !preserved.matches_after_add(config, expected_alias)?
-        || agent.model_provider.as_str() != proposal.selected_provider_ref()
-        || agent.risk_profile.as_str() != raw.risk.preset_name()
-        || agent.runtime_profile.as_str() != raw.runtime.preset_name()
-        || !agent.channels.is_empty()
-        || agent.memory.backend != expected_memory
-    {
-        anyhow::bail!("installed agent bindings differ from the approved proposal");
-    }
-    let workspace = config.agent_workspace_dir(expected_alias);
-    for file in &raw.personality_files {
-        let installed = std::fs::read_to_string(workspace.join(&file.filename))?;
-        if installed != file.content {
-            anyhow::bail!("installed personality differs from the approved proposal");
-        }
-    }
-    Ok(())
+    rendered
 }
 
 pub async fn run(initial_config: Config) -> Result<()> {
@@ -614,11 +552,13 @@ pub async fn run(initial_config: Config) -> Result<()> {
         anyhow::bail!(tr("cli-zerona-tty-required"));
     }
     let config_path: PathBuf = initial_config.config_path.clone();
-    let (session_config, session_source) = Box::pin(load_stable_config(&config_path)).await?;
-    let Some(selected_provider) = choose_provider(&session_config)? else {
+    let service = ControlService::new(config_path, Surface::Cli);
+    let session_inspection = inspect(&service).await?;
+    let session_source = session_inspection.source_revision().to_string();
+    let Some(selected_provider) = choose_provider(&service, &session_inspection)? else {
         return Ok(());
     };
-    let mut session = ZeronaSession::new(&session_config, selected_provider.clone())
+    let mut session = ZeronaSession::new(session_inspection.config(), selected_provider.clone())
         .map_err(|error| anyhow::Error::msg(render_message(&error.fluent())))?;
 
     println!(
@@ -633,7 +573,7 @@ pub async fn run(initial_config: Config) -> Result<()> {
     let mut action =
         sop_engine.start_system_run(SystemSopId::ZERONA_CREATE_AGENT, zerona_manual_event())?;
     let mut host_message: Option<String> = None;
-    let mut pending_apply: Option<PendingApply> = None;
+    let mut pending_apply: Option<BoundProposal> = None;
 
     loop {
         match action {
@@ -681,13 +621,13 @@ pub async fn run(initial_config: Config) -> Result<()> {
                 let message = input.as_str().ok_or_else(|| {
                     anyhow::Error::msg("Zerona SOP model step received non-string input")
                 })?;
-                let (turn_config, turn_source) = Box::pin(load_stable_config(&config_path)).await?;
-                if !session_source_is_current(&session_source, &turn_source) {
+                let turn_inspection = inspect(&service).await?;
+                if !session_source_is_current(&session_source, turn_inspection.source_revision()) {
                     sop_engine.cancel_run(&run_id)?;
                     eprintln!("{}", tr("cli-zerona-error-session-config-changed"));
                     return Ok(());
                 }
-                let turn = match session.turn(&turn_config, message).await {
+                let turn = match session.turn(turn_inspection.config(), message).await {
                     Ok(turn) => turn,
                     Err(error) => {
                         let rendered = render_message(&error.fluent());
@@ -705,22 +645,23 @@ pub async fn run(initial_config: Config) -> Result<()> {
                 let turn_digest = sha256_hex(turn.assistant_text.as_bytes());
                 let mut artifact_digest = String::new();
                 let proposal_ready = if let Some(validated) = turn.proposal {
-                    let (preview_config, expected_source) =
-                        Box::pin(load_stable_config(&config_path)).await?;
-                    if !session_source_is_current(&session_source, &expected_source) {
+                    let preview_inspection = inspect(&service).await?;
+                    if !session_source_is_current(
+                        &session_source,
+                        preview_inspection.source_revision(),
+                    ) {
                         sop_engine.cancel_run(&run_id)?;
                         eprintln!("{}", tr("cli-zerona-error-session-config-changed"));
                         return Ok(());
                     }
-                    let preview = match build_preview(
-                        &preview_config,
-                        &CurrentProviderFactory,
+                    let bound = match service.preview(
+                        preview_inspection,
                         &selected_provider,
                         validated.proposal(),
                     ) {
-                        Ok(preview) => preview.bind_expected_source(),
+                        Ok(bound) => bound,
                         Err(error) => {
-                            let rendered = render_message(&error.fluent());
+                            let rendered = render_control_error(&error);
                             eprintln!("{rendered}");
                             host_message = Some(host_drift_message());
                             action = sop_engine
@@ -728,13 +669,9 @@ pub async fn run(initial_config: Config) -> Result<()> {
                             continue;
                         }
                     };
-                    print_preview(&preview);
+                    print_preview(bound.preview());
                     artifact_digest = sha256_hex(&serde_json::to_vec(validated.proposal())?);
-                    pending_apply = Some(PendingApply {
-                        validated,
-                        config: preview_config,
-                        expected_source,
-                    });
+                    pending_apply = Some(bound);
                     true
                 } else {
                     false
@@ -803,50 +740,21 @@ pub async fn run(initial_config: Config) -> Result<()> {
                 }
             },
             SopRunAction::DeterministicStep { run_id, step, .. } if step.number == 4 => {
-                let Some(PendingApply {
-                    validated,
-                    mut config,
-                    expected_source,
-                }) = pending_apply.take()
-                else {
+                let Some(bound) = pending_apply.take() else {
                     anyhow::bail!("Zerona SOP reached apply without an approved proposal");
                 };
-                let approved =
-                    match revalidate_proposal(&config, &CurrentProviderFactory, &validated) {
-                        Ok(approved) => approved,
-                        Err(error) => {
-                            let rendered = render_message(&error.fluent());
-                            eprintln!("{rendered}");
-                            host_message = Some(host_drift_message());
-                            action = sop_engine
-                                .advance_step(&run_id, failed_sop_step(&step, rendered))?;
-                            continue;
-                        }
-                    };
-                let alias = approved.proposal().agent_alias.clone();
-                let submission = approved.to_builder_submission();
-                let preserved = PreservedApplyState::capture(&config)
-                    .map_err(|_| anyhow::Error::msg(tr("cli-zerona-error-verification")))?;
-                let apply_result =
-                    Box::pin(apply_new_agent_strict_if_source_unchanged_per_agent_memory(
-                        submission,
-                        &mut config,
-                        Surface::Cli,
-                        &expected_source,
-                    ))
-                    .await;
-                let reloaded = Box::pin(Config::load_or_init()).await?;
-                match apply_result {
-                    Ok(_) => {
-                        verify_install(&reloaded, &approved, &alias, &preserved)
-                            .map_err(|_| anyhow::Error::msg(tr("cli-zerona-error-verification")))?;
-                        action = sop_engine.advance_deterministic_step(
-                            &run_id,
-                            serde_json::json!({"agent_alias": alias}),
-                            None,
-                        )?;
-                        if !matches!(action, SopRunAction::Completed { .. }) {
-                            anyhow::bail!("Zerona SOP did not complete after a verified apply");
+                match Box::pin(service.apply(bound)).await {
+                    Ok(outcome) => {
+                        let alias = outcome.agent_alias().to_string();
+                        if matches!(outcome, ControlApplyOutcome::Verified { .. }) {
+                            action = sop_engine.advance_deterministic_step(
+                                &run_id,
+                                serde_json::json!({"agent_alias": alias}),
+                                None,
+                            )?;
+                            if !matches!(action, SopRunAction::Completed { .. }) {
+                                anyhow::bail!("Zerona SOP did not complete after a verified apply");
+                            }
                         }
                         println!(
                             "{}",
@@ -854,33 +762,24 @@ pub async fn run(initial_config: Config) -> Result<()> {
                         );
                         return Ok(());
                     }
-                    Err(errors) => {
-                        if reloaded.agents.contains_key(&alias) {
-                            verify_install(&reloaded, &approved, &alias, &preserved).map_err(
-                                |_| anyhow::Error::msg(tr("cli-zerona-error-verification")),
-                            )?;
-                            println!(
-                                "{}",
-                                tra("cli-zerona-complete", &[("alias", alias.as_str())])
-                            );
-                            return Ok(());
-                        }
-                        let ambiguous = errors
-                            .iter()
-                            .any(|error| error.field == "config_commit_ambiguous");
-                        let mut rendered = Vec::new();
-                        for error in errors {
-                            let error = safe_terminal(&error.to_string());
-                            eprintln!("{error}");
-                            rendered.push(error);
-                        }
-                        if ambiguous {
-                            anyhow::bail!(tr("cli-zerona-error-partial-apply"));
-                        }
+                    Err(ControlError::AmbiguousCommit { errors }) => {
+                        report_apply_errors(errors);
+                        anyhow::bail!(tr("cli-zerona-error-partial-apply"));
+                    }
+                    Err(ControlError::Apply { errors }) => {
+                        let rendered = report_apply_errors(errors);
                         host_message = Some(host_drift_message());
                         action = sop_engine
                             .advance_step(&run_id, failed_sop_step(&step, rendered.join("; ")))?;
                     }
+                    Err(error @ ControlError::Proposal(_)) => {
+                        let rendered = render_control_error(&error);
+                        eprintln!("{rendered}");
+                        host_message = Some(host_drift_message());
+                        action =
+                            sop_engine.advance_step(&run_id, failed_sop_step(&step, rendered))?;
+                    }
+                    Err(error) => return Err(control_error(error)),
                 }
             }
             SopRunAction::Completed { .. } => return Ok(()),
@@ -943,34 +842,6 @@ mod tests {
             "schema_version = 3\n",
             "schema_version = 3\n# external edit\n"
         ));
-    }
-
-    #[test]
-    fn zerona_refuses_to_auto_migrate_an_older_source() {
-        assert!(source_schema_is_current("schema_version = 3\n"));
-        assert!(!source_schema_is_current("schema_version = 2\n"));
-        assert!(!source_schema_is_current("[autonomy]\nlevel = 'full'\n"));
-        assert!(!source_schema_is_current("not valid toml = [\n"));
-    }
-
-    #[test]
-    fn post_apply_snapshot_allows_only_the_new_agent_in_preserved_sections() {
-        let mut before = Config::default();
-        before.agents.insert(
-            "resident".into(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-        );
-        let preserved = PreservedApplyState::capture(&before).unwrap();
-
-        let mut after = before.clone();
-        after.agents.insert(
-            "new_agent".into(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-        );
-        assert!(preserved.matches_after_add(&after, "new_agent").unwrap());
-
-        after.memory.backend = "none".into();
-        assert!(!preserved.matches_after_add(&after, "new_agent").unwrap());
     }
 
     #[test]
