@@ -145,9 +145,12 @@ pub struct RelayConfig {
     /// unbounded TLS/parser/task state. When the pool is exhausted new
     /// sockets are shed at accept.
     pub max_pending_handshakes: usize,
-    /// Deadline covering TLS accept, the HTTP/WebSocket upgrade, and the
-    /// first control frame. `idle_timeout` only starts once a connection is
-    /// classified; without this, a socket could sit in the handshake forever.
+    /// ONE absolute deadline for the whole pre-admission sequence: TLS accept,
+    /// the HTTP/WebSocket upgrade, the first control frame, and - on the daemon
+    /// path - the signed `Challenge`/`Register` exchange that follows `Hello`.
+    /// It is a single budget measured from accept, not a fresh window per
+    /// phase. `idle_timeout` only starts once a connection is admitted; without
+    /// this, a socket could sit in setup forever.
     pub handshake_timeout: Duration,
     /// Serve the browser enrollment frontdoor (HTML/JS/worker) from this relay.
     /// OFF by default: a relay that serves enrollment code is a TRUSTED code
@@ -541,7 +544,18 @@ where
             daemon_pubkey,
             node_id,
             relay_token,
-        }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token, permit, deadline).await,
+        }) => {
+            handle_daemon(
+                inner,
+                ws,
+                daemon_pubkey,
+                node_id,
+                relay_token,
+                permit,
+                deadline,
+            )
+            .await
+        }
         Some(Control::Connect { node_id }) => {
             drop(permit);
             handle_client(
@@ -1135,7 +1149,12 @@ mod tests {
                 .inner
                 .admit_ip(IpAddr::from(std::net::Ipv4Addr::from(i)));
         }
-        let tracked = server.inner.ip_buckets.lock().expect("ip bucket lock").len();
+        let tracked = server
+            .inner
+            .ip_buckets
+            .lock()
+            .expect("ip bucket lock")
+            .len();
         assert!(
             tracked <= MAX_TRACKED_IPS,
             "ip bucket map grew to {tracked}, past the {MAX_TRACKED_IPS} bound"

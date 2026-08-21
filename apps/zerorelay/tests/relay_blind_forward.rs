@@ -771,7 +771,9 @@ async fn stalled_registrations_hold_their_permit_and_are_reaped() {
     .await;
     match read {
         Ok(Ok(0)) => {} // clean EOF: shed
-        other => panic!("expected a socket to be shed while registrations are parked, got {other:?}"),
+        other => {
+            panic!("expected a socket to be shed while registrations are parked, got {other:?}")
+        }
     }
 
     // Past the shared setup deadline the parked registrations are reaped and the
