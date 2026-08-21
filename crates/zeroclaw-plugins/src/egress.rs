@@ -424,7 +424,13 @@ impl EgressHostService {
     /// [`EgressError::ConnectionLimitReached`], and adapters must not be able to
     /// read or reset it. Tests that prove a failed dial returns its slot need to
     /// see the count itself, not just that a later acquire happened to succeed.
-    #[cfg(test)]
+    ///
+    /// The gate matches the *caller's*, not just `test`: the only caller is in
+    /// [`crate::wasi_http`]'s tests, and that module exists only under
+    /// `plugins-wasmtime`. A wider gate makes this dead code on the default
+    /// feature surface, which is exactly what the `default features, all
+    /// targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
     pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
         self.counts
             .by_instance
