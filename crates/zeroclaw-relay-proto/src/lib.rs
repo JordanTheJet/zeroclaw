@@ -288,6 +288,14 @@ impl TokenBucket {
         }
     }
 
+    /// When this bucket last saw an event. The relay uses it as an LRU key: a
+    /// flood spread over many sources leaves every bucket partially drained, so
+    /// pruning full buckets alone cannot hard-bound the tracking map and the
+    /// least recently active entries have to be evicted instead.
+    pub fn last_activity(&self) -> std::time::Instant {
+        self.last_refill
+    }
+
     /// True when the bucket is at full capacity (no recent activity) - the relay
     /// uses this to prune idle per-source entries so the tracking map stays bounded.
     pub fn is_full_at(&self, now: std::time::Instant) -> bool {

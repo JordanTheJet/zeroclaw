@@ -187,6 +187,26 @@ async fn handshake(
     (ws, term)
 }
 
+/// Complete the outer TLS + WS upgrade and send a syntactically valid `Hello`,
+/// then STOP - never sending the `Register` that completes the signed exchange.
+/// A `Hello` is unauthenticated, so this is the cheapest state an unauthorized
+/// peer can park the relay in.
+async fn hello_only(relay_addr: std::net::SocketAddr, node_id: &str, pkcs8: &[u8]) -> RelayWs {
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
+    let mut ws = connect_ws(relay_addr).await;
+    ws.send(Message::text(
+        Control::Hello {
+            daemon_pubkey: B64.encode(kp.public_key().as_ref()),
+            node_id: node_id.to_string(),
+            relay_token: None,
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    ws
+}
+
 /// Open an outer TLS + WS connection to the relay WITHOUT registering (the client
 /// role: it only sends a `Connect`).
 async fn connect_ws(relay_addr: std::net::SocketAddr) -> RelayWs {
@@ -701,4 +721,120 @@ async fn stalled_handshakes_shed_then_recover_at_the_deadline() {
         other => panic!("expected a control reply after recovery, got {other:?}"),
     }
     drop(stalled);
+}
+
+/// Post-Hello slowloris regression (August review). A `Hello` proves nothing:
+/// any peer that can finish the TLS + WebSocket upgrade can send one. Releasing
+/// the pre-classification permit at classification, and then awaiting `Register`
+/// with no deadline, left an unauthenticated peer holding a task, a TLS session
+/// and a parser OUTSIDE every handshake bound - a distinct resource state from
+/// the pre-classification slowloris above.
+///
+/// The permit must be held for the whole signed registration exchange (so these
+/// peers exhaust the pool and new sockets are shed) and the wait for `Register`
+/// must share the setup deadline (so they are reaped and the pool recovers).
+#[tokio::test]
+async fn stalled_registrations_hold_their_permit_and_are_reaped() {
+    let cfg = RelayConfig {
+        max_pending_handshakes: 2,
+        handshake_timeout: std::time::Duration::from_secs(3),
+        // This test exercises the GLOBAL bound; every socket shares 127.0.0.1.
+        accept_burst_per_ip: 1000,
+        accept_rate_per_ip: 1000.0,
+        ..RelayConfig::default()
+    };
+    let addr = start_relay(cfg).await;
+
+    // Park both permits in the post-Hello registration state.
+    let mut stalled = Vec::new();
+    for i in 0..2 {
+        let key = gen_key();
+        let mut ws = hello_only(addr, &format!("stall-{i}"), &key).await;
+        // Draining the Challenge proves the relay has advanced to awaiting
+        // `Register` - the exact state under test.
+        match next_control(&mut ws).await {
+            Some(Control::Challenge { .. }) => {}
+            other => panic!("expected a challenge, got {other:?}"),
+        }
+        stalled.push(ws);
+    }
+
+    // Pool exhausted by the two parked registrations: a new socket is shed at
+    // accept. Before the fix the permits were already released at this point and
+    // this socket was accepted normally.
+    let mut shed = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(1000),
+        tokio::io::AsyncReadExt::read(&mut shed, &mut buf),
+    )
+    .await;
+    match read {
+        Ok(Ok(0)) => {} // clean EOF: shed
+        other => panic!("expected a socket to be shed while registrations are parked, got {other:?}"),
+    }
+
+    // Past the shared setup deadline the parked registrations are reaped and the
+    // pool recovers for a well-behaved client.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let mut ws = connect_ws(addr).await;
+    ws.send(Message::text(
+        Control::Connect {
+            node_id: "no-such-node".into(),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    match next_control(&mut ws).await {
+        Some(Control::Error { code, .. }) => assert_eq!(code, "no_such_node"),
+        other => panic!("expected a control reply after recovery, got {other:?}"),
+    }
+    drop(stalled);
+}
+
+/// `handshake_timeout` is documented as ONE deadline covering TLS accept, the
+/// HTTP/WebSocket upgrade and the first control frame. It was applied as a fresh
+/// relative timeout per phase, so a peer that spent most of one window on the
+/// TLS/upgrade phase got a full second window for the first frame - roughly
+/// twice the configured budget. Measured from accept, a peer that dawdles before
+/// TLS and then never sends a control frame must still be reaped at ~one
+/// `handshake_timeout`, not two.
+#[tokio::test]
+async fn handshake_timeout_is_one_budget_across_setup_phases() {
+    let cfg = RelayConfig {
+        handshake_timeout: std::time::Duration::from_secs(3),
+        accept_burst_per_ip: 1000,
+        accept_rate_per_ip: 1000.0,
+        ..RelayConfig::default()
+    };
+    let addr = start_relay(cfg).await;
+
+    let started = std::time::Instant::now();
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Burn most of the budget BEFORE the TLS handshake, so the two phases are
+    // distinguishable: the upgrade lands at ~2s of the 3s budget.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(sni, tcp).await.unwrap();
+    let req = ClientRequestBuilder::new("wss://localhost/".parse().unwrap())
+        .with_sub_protocol(SUBPROTOCOL);
+    let (mut ws, _) = tokio_tungstenite::client_async_with_config(req, tls, None)
+        .await
+        .unwrap();
+
+    // Never send a control frame; wait for the relay to reap the connection.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "relay never reaped the stalled setup");
+    let elapsed = started.elapsed();
+    // One budget is ~3s from accept. Two independent windows put this at ~5s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "setup survived {elapsed:?}, past the single {:?} budget",
+        std::time::Duration::from_secs(3)
+    );
 }

@@ -330,18 +330,49 @@ impl Inner {
 
     /// Admit one connection from `ip` under the per-source handshake rate cap.
     /// Returns false when that IP is over its rate (the caller drops the socket).
-    /// Prunes idle (refilled-to-full) entries when the map grows large.
+    ///
+    /// The map is HARD-bounded at [`MAX_TRACKED_IPS`]. Pruning idle
+    /// (refilled-to-full) entries is only the cheap first pass: a flood that
+    /// takes a single token from each of many distinct source addresses leaves
+    /// every bucket partially drained, so that pass frees nothing and the map
+    /// would grow without limit on what is designed to be a public endpoint.
+    /// When it frees nothing we evict the least-recently-active entries
+    /// instead. Evicting an idle-ish bucket only restores that source's burst
+    /// allowance, which a source-rotating flood already gets for free; the
+    /// global bound that actually caps concurrent setup work is
+    /// `max_pending_handshakes`.
     fn admit_ip(&self, ip: IpAddr) -> bool {
         let now = std::time::Instant::now();
         let mut map = self.ip_buckets.lock().expect("ip bucket lock");
-        if map.len() > MAX_TRACKED_IPS {
+        if map.len() >= MAX_TRACKED_IPS && !map.contains_key(&ip) {
             map.retain(|_, b| !b.is_full_at(now));
+            if map.len() >= MAX_TRACKED_IPS {
+                evict_least_recently_active(&mut map, MAX_TRACKED_IPS - MAX_TRACKED_IPS / 4);
+            }
         }
         map.entry(ip)
             .or_insert_with(|| {
                 TokenBucket::new_at(self.accept_burst_per_ip, self.accept_rate_per_ip, now)
             })
             .try_take_at(now)
+    }
+}
+
+/// Shrink `map` to at most `target` entries, dropping the least recently active
+/// buckets first. Evicting a batch rather than one entry per insert keeps the
+/// O(n) scan amortized to O(1) per admitted connection while the map is at its
+/// hard bound.
+fn evict_least_recently_active(map: &mut HashMap<IpAddr, TokenBucket>, target: usize) {
+    if map.len() <= target {
+        return;
+    }
+    let evict = map.len() - target;
+    let mut by_age: Vec<(std::time::Instant, IpAddr)> =
+        map.iter().map(|(ip, b)| (b.last_activity(), *ip)).collect();
+    // Partition so the `evict` oldest entries occupy the front of the vec.
+    by_age.select_nth_unstable(evict - 1);
+    for (_, ip) in by_age.into_iter().take(evict) {
+        map.remove(&ip);
     }
 }
 
@@ -427,11 +458,16 @@ impl RelayServer {
                 continue;
             };
             tokio::spawn(async move {
-                let deadline = inner.handshake_timeout;
+                // ONE absolute deadline for the whole pre-admission sequence:
+                // TLS accept, the HTTP/WS upgrade (including a frontdoor HTTP
+                // response), the first control frame, and - on the daemon path -
+                // the signed registration exchange in `handle_daemon`. A fresh
+                // relative timeout per phase would let a peer spend the full
+                // `handshake_timeout` in EACH phase, so the effective budget was
+                // a multiple of the configured value.
+                // `idle_timeout` only begins on classified connections.
+                let deadline = tokio::time::Instant::now() + inner.handshake_timeout;
                 let hs_inner = inner.clone();
-                // Deadline covers TLS accept, the HTTP/WS upgrade (including a
-                // frontdoor HTTP response), and below it, the first control
-                // frame. `idle_timeout` only begins on classified connections.
                 let handshake = async move {
                     let tls = hs_inner.route_by_client_cert;
                     let accepted = acceptor.accept(sock).await.ok()?;
@@ -453,19 +489,20 @@ impl RelayServer {
                         Ok(frontdoor::Frontdoor::ServedHttp) | Err(_) => None,
                     }
                 };
-                let Ok(Some((ws, cert_node_id))) = tokio::time::timeout(deadline, handshake).await
+                let Ok(Some((ws, cert_node_id))) =
+                    tokio::time::timeout_at(deadline, handshake).await
                 else {
                     return; // shed: timed out or never became a relay WebSocket
                 };
                 let mut ws = *ws;
-                let first = match tokio::time::timeout(deadline, next_control(&mut ws)).await {
+                let first = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
                     Ok(f) => f,
                     Err(_) => return, // stalled before sending a first frame
                 };
-                // Classified. Release the pre-classification permit before the
-                // long-lived connection pump.
-                drop(permit);
-                let _ = handle_conn(inner, ws, cert_node_id, first).await;
+                // The permit travels INTO `handle_conn`, which releases it at the
+                // point its role is fully admitted: immediately for a client, and
+                // only after the signed registration completes for a daemon.
+                let _ = handle_conn(inner, ws, cert_node_id, first, permit, deadline).await;
             });
         }
     }
@@ -482,11 +519,19 @@ fn resolve_target_node(cert_node_id: Option<String>, frame_node_id: String) -> S
 
 /// Read the first control frame and dispatch by role. `cert_node_id` is the
 /// outer-mTLS-derived target (outer client cert CN), used only on the client path.
+///
+/// `permit` is the pre-classification handshake permit. A `Connect`/`Enroll`
+/// client is fully admitted by its first frame, so the permit is released here.
+/// A daemon is NOT: its `Hello` is unauthenticated and the signed registration
+/// exchange still follows, so `handle_daemon` keeps the permit until that
+/// exchange completes. `deadline` is the absolute end of the setup budget.
 async fn handle_conn<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
     cert_node_id: Option<String>,
     first: Option<Control>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -496,8 +541,9 @@ where
             daemon_pubkey,
             node_id,
             relay_token,
-        }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token).await,
+        }) => handle_daemon(inner, ws, daemon_pubkey, node_id, relay_token, permit, deadline).await,
         Some(Control::Connect { node_id }) => {
+            drop(permit);
             handle_client(
                 inner,
                 ws,
@@ -507,6 +553,7 @@ where
             .await
         }
         Some(Control::Enroll { node_id }) => {
+            drop(permit);
             handle_client(
                 inner,
                 ws,
@@ -516,6 +563,7 @@ where
             .await
         }
         Some(other) => {
+            drop(permit);
             let _ = send_control(
                 &mut ws,
                 &Control::error("bad_first_frame", format!("unexpected {other:?}")),
@@ -528,12 +576,22 @@ where
 }
 
 /// Daemon control connection: signed admission, then multiplex client conns.
+///
+/// `permit` (the pre-classification handshake permit) is held for the WHOLE
+/// signed registration exchange and released only once the node is registered.
+/// A `Hello` proves nothing - any peer that can complete a TLS + WebSocket
+/// upgrade can send one - so releasing the permit at classification would let a
+/// peer that never sends `Register` retain a task, a TLS session and a parser
+/// outside every handshake bound. `deadline` closes the same hole in the time
+/// dimension: the wait for `Register` shares the one absolute setup budget.
 async fn handle_daemon<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
     daemon_pubkey: String,
     node_id: String,
     relay_token: Option<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -576,9 +634,12 @@ where
         },
     )
     .await?;
-    let (reg_node, sig_b64) = match next_control(&mut ws).await {
-        Some(Control::Register { node_id, sig }) => (node_id, sig),
-        _ => {
+    // Bounded by the shared setup deadline: a peer that sends Hello and then
+    // withholds Register must not be able to hold this state open forever.
+    let (reg_node, sig_b64) = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
+        Ok(Some(Control::Register { node_id, sig })) => (node_id, sig),
+        Err(_) => return Ok(()), // stalled after Hello; reap without a reply
+        Ok(_) => {
             let _ = send_control(
                 &mut ws,
                 &Control::error("bad_register", "expected register"),
@@ -647,6 +708,10 @@ where
         },
     )
     .await?;
+    // Registered: the signed exchange is complete and this connection is now a
+    // long-lived admitted daemon link, not pending setup. Release the permit so
+    // it is available to the next connection being classified.
+    drop(permit);
 
     let (mut sink, mut stream) = ws.split();
 
@@ -1049,6 +1114,56 @@ fn parse_control_text(text: &str) -> Option<Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distinct-source flood regression (August review). Pruning only
+    /// refilled-to-full buckets cannot bound the tracking map: a flood that
+    /// takes ONE token from each of many addresses leaves every bucket
+    /// partially drained, so `retain` frees nothing. The map must stay hard
+    /// bounded at `MAX_TRACKED_IPS` regardless.
+    #[test]
+    fn distinct_source_flood_cannot_grow_the_ip_map_past_its_bound() {
+        let server = RelayServer::new(RelayConfig {
+            // A burst of 1 means every touched bucket is left empty (never
+            // "full"), which is exactly the state the old prune could not free.
+            accept_burst_per_ip: 1,
+            accept_rate_per_ip: 0.0,
+            ..RelayConfig::default()
+        });
+        // Walk far past the bound with a fresh source address each time.
+        for i in 0..(MAX_TRACKED_IPS as u32 * 2) {
+            server
+                .inner
+                .admit_ip(IpAddr::from(std::net::Ipv4Addr::from(i)));
+        }
+        let tracked = server.inner.ip_buckets.lock().expect("ip bucket lock").len();
+        assert!(
+            tracked <= MAX_TRACKED_IPS,
+            "ip bucket map grew to {tracked}, past the {MAX_TRACKED_IPS} bound"
+        );
+    }
+
+    /// Eviction is by least-recent activity, so an actively flooding source is
+    /// not silently forgotten (and handed a fresh burst) ahead of an idle one.
+    #[test]
+    fn eviction_drops_the_least_recently_active_entries_first() {
+        let base = std::time::Instant::now();
+        let mut map: HashMap<IpAddr, TokenBucket> = HashMap::new();
+        for i in 0..4u32 {
+            // Older `last_activity` for lower i.
+            let at = base + std::time::Duration::from_millis(u64::from(i) * 10);
+            map.insert(
+                IpAddr::from(std::net::Ipv4Addr::from(i)),
+                TokenBucket::new_at(1, 0.0, at),
+            );
+        }
+        evict_least_recently_active(&mut map, 2);
+        assert_eq!(map.len(), 2);
+        // The two oldest went; the two most recent stayed.
+        assert!(!map.contains_key(&IpAddr::from(std::net::Ipv4Addr::from(0u32))));
+        assert!(!map.contains_key(&IpAddr::from(std::net::Ipv4Addr::from(1u32))));
+        assert!(map.contains_key(&IpAddr::from(std::net::Ipv4Addr::from(2u32))));
+        assert!(map.contains_key(&IpAddr::from(std::net::Ipv4Addr::from(3u32))));
+    }
 
     #[tokio::test]
     async fn backpressured_conn_is_closed_without_stalling_others() {
