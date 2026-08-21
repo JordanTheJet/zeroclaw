@@ -226,6 +226,13 @@ impl Tool for ArcToolRef {
         self.0.approval_summary(args)
     }
 
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.0.approval_summary_for_call(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -303,6 +310,13 @@ impl Tool for ArcDelegatingTool {
     }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1977,6 +1991,17 @@ const = true
             fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
                 Some("computed by the host".into())
             }
+            fn approval_summary_for_call(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+                Some(
+                    zeroclaw_api::tool::ToolApprovalSummary::with_execution_binding(
+                        "computed by the host".into(),
+                        serde_json::json!("host-binding"),
+                    ),
+                )
+            }
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult::ok("ok"))
             }
@@ -1990,11 +2015,27 @@ const = true
             "ArcDelegatingTool must forward approval_summary"
         );
         assert_eq!(
-            ArcToolRef(arc)
+            ArcToolRef(arc.clone())
                 .approval_summary(&serde_json::json!({}))
                 .as_deref(),
             Some("computed by the host"),
             "ArcToolRef must forward approval_summary"
+        );
+        let delegated_binding = boxed[0]
+            .approval_summary_for_call(&serde_json::json!({}))
+            .and_then(|summary| summary.execution_binding);
+        assert_eq!(
+            delegated_binding,
+            Some(serde_json::json!("host-binding")),
+            "ArcDelegatingTool must forward the per-call execution binding"
+        );
+        let ref_binding = ArcToolRef(arc)
+            .approval_summary_for_call(&serde_json::json!({}))
+            .and_then(|summary| summary.execution_binding);
+        assert_eq!(
+            ref_binding,
+            Some(serde_json::json!("host-binding")),
+            "ArcToolRef must forward the per-call execution binding"
         );
     }
 
