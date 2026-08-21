@@ -23,12 +23,30 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
+| Zerona add-agent apply | `zeroclaw-onboarding`, root CLI, and Quickstart's strict agent-scoped apply path | Per-agent OS lock, exact-source checks, durable personality workspace commit, then locked atomic config replacement | The created agent is available on the next command/load; running daemon subsystems still need reload |
 | Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Gateway-visible state updates immediately; daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
 section, secret marker, or description is wrong there, fix the schema or the
 generator and regenerate the reference.
+
+All ZeroClaw config writers serialize their final compare-and-replace section
+through the same cross-process `.config.toml.lock`. Zerona additionally holds a
+per-agent workspace lock for its complete transaction. It checks the approved
+source before mutation, commits and fsyncs the complete previously-absent
+personality workspace, then checks the source again while holding the config
+writer lock and atomically replaces `config.toml`. A detected mismatch removes
+only the workspace owned by that transaction and requires a fresh onboarding
+session. A non-cooperating external process can ignore the advisory lock, so the
+expected-source comparison remains defense in depth rather than a universal
+filesystem CAS. Post-rename failures carry a typed committed/ambiguous outcome;
+strict apply preserves the workspace unless the config writer proves the rename
+did not commit.
+
+The root command reads `schema_version` before the generic config loader runs.
+V1/V2 files are refused with `zeroclaw config migrate` guidance so a new-agent
+patch cannot be combined with the loader's in-memory or filesystem migration.
 
 ## Load order
 

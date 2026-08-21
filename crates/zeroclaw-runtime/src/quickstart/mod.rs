@@ -1,6 +1,7 @@
 //! Quickstart apply path.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use zeroclaw_config::helpers::kebab_to_snake;
 use zeroclaw_config::presets::{
@@ -40,6 +41,89 @@ impl Surface {
 struct RunCtx {
     run_id: String,
     surface: Surface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryApplyMode {
+    InstallWide,
+    CreatedAgent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonalityCommitOrder {
+    AfterConfig,
+    BeforeConfigForNewAgent,
+}
+
+fn strict_workspace_rollback_allowed(
+    disposition: zeroclaw_config::schema::ConfigWriteDisposition,
+) -> bool {
+    disposition == zeroclaw_config::schema::ConfigWriteDisposition::NotCommitted
+}
+
+struct AgentWorkspaceLock(std::fs::File);
+
+impl Drop for AgentWorkspaceLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+async fn acquire_agent_workspace_lock(
+    config: &Config,
+    agent_alias: &str,
+    ctx: Option<&RunCtx>,
+) -> Result<AgentWorkspaceLock, QuickstartError> {
+    let lock_dir = config.install_root_dir().join(".zeroclaw-locks");
+    tokio::fs::create_dir_all(&lock_dir)
+        .await
+        .map_err(|error| {
+            QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "agent_workspace_lock",
+                format!("could not create agent workspace lock directory: {error}"),
+                "cli-quickstart-error-personality-workspace",
+                &[("err", &error.to_string())],
+            )
+        })?;
+    let alias_digest = format!("{:x}", Sha256::digest(agent_alias.as_bytes()));
+    let lock_path = lock_dir.join(format!("agent-{alias_digest}.lock"));
+    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        use fs2::FileExt as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path)?;
+        file.lock_exclusive()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|error| {
+        QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "agent_workspace_lock",
+            format!("agent workspace lock task failed: {error}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &error.to_string())],
+        )
+    })?
+    .map_err(|error| {
+        QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "agent_workspace_lock",
+            format!("could not acquire agent workspace lock: {error}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &error.to_string())],
+        )
+    })?;
+    Ok(AgentWorkspaceLock(file))
 }
 
 impl RunCtx {
@@ -159,6 +243,19 @@ impl QuickstartError {
             crate::i18n::get_required_cli_string_with_args(key, args),
         )
     }
+
+    fn config_source_changed(ctx: &RunCtx) -> Self {
+        const REASON: &str =
+            "configuration changed since the Quickstart preview; reload and review before applying";
+        Self::for_surface(
+            Some(ctx),
+            QuickstartStep::Agent,
+            "config_source",
+            REASON,
+            "cli-quickstart-error-persist-config",
+            &[("err", REASON)],
+        )
+    }
 }
 
 impl std::fmt::Display for QuickstartError {
@@ -237,8 +334,108 @@ pub async fn apply_with_surface(
     config: &mut Config,
     surface: Surface,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_impl(
+        submission,
+        config,
+        surface,
+        None,
+        MemoryApplyMode::InstallWide,
+        PersonalityCommitOrder::AfterConfig,
+    )
+    .await
+}
+
+/// Apply a Quickstart submission only while `config.toml` still matches the
+/// exact source revision against which the caller previewed and approved it.
+///
+/// The source is checked before any submission mutation or personality-file
+/// staging, then checked again by [`Config::save_dirty_if_source_unchanged`]
+/// at the persistence boundary. A persistence-boundary drift refusal leaves
+/// staged tempfiles to drop and keeps the in-memory edits and dirty paths for
+/// caller diagnostics; callers should reload rather than reuse that state.
+pub async fn apply_with_surface_if_source_unchanged(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    expected_source: &str,
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_impl(
+        submission,
+        config,
+        surface,
+        Some(expected_source),
+        MemoryApplyMode::InstallWide,
+        PersonalityCommitOrder::AfterConfig,
+    )
+    .await
+}
+
+/// Revision-bound Quickstart apply for adding one agent without changing the
+/// install-wide memory backend or storage registry.
+///
+/// `submission.memory` must be a fresh `sqlite`, `markdown`, or `none` choice.
+/// That choice is written only to `agents.<new_alias>.memory.backend`; existing
+/// agents, [`Config::memory`], and [`Config::storage`] are left untouched. All
+/// other Quickstart mutation, persistence, and personality-file ordering is
+/// shared with [`apply_with_surface_if_source_unchanged`].
+pub async fn apply_with_surface_if_source_unchanged_per_agent_memory(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    expected_source: &str,
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_impl(
+        submission,
+        config,
+        surface,
+        Some(expected_source),
+        MemoryApplyMode::CreatedAgent,
+        PersonalityCommitOrder::AfterConfig,
+    )
+    .await
+}
+
+/// Strict revision-bound add-agent apply used by Zerona. Personality files are
+/// committed into a previously-absent agent workspace before the config CAS;
+/// the config is never allowed to reference an incomplete personality bundle.
+/// If the CAS refuses, the newly-created workspace is removed.
+pub async fn apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    expected_source: &str,
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_impl(
+        submission,
+        config,
+        surface,
+        Some(expected_source),
+        MemoryApplyMode::CreatedAgent,
+        PersonalityCommitOrder::BeforeConfigForNewAgent,
+    )
+    .await
+}
+
+async fn apply_with_surface_impl(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    expected_source: Option<&str>,
+    memory_mode: MemoryApplyMode,
+    personality_order: PersonalityCommitOrder,
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
+    let _agent_workspace_lock =
+        if personality_order == PersonalityCommitOrder::BeforeConfigForNewAgent {
+            Some(
+                acquire_agent_workspace_lock(config, &submission.agent.name, Some(&ctx))
+                    .await
+                    .map_err(|error| vec![error])?,
+            )
+        } else {
+            None
+        };
 
     ::zeroclaw_log::record!(
         INFO,
@@ -247,14 +444,55 @@ pub async fn apply_with_surface(
         "quickstart: apply"
     );
 
+    if let Some(expected_source) = expected_source {
+        let source_matches = match tokio::fs::read_to_string(&config.config_path).await {
+            Ok(current) => current == expected_source,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(vec![QuickstartError::for_surface(
+                    Some(&ctx),
+                    QuickstartStep::Agent,
+                    "config_source",
+                    format!("failed to read config before apply: {err}"),
+                    "cli-quickstart-error-persist-config",
+                    &[("err", &err.to_string())],
+                )]);
+            }
+        };
+        if !source_matches {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(merge_attrs(
+                        ctx.base_attrs(),
+                        serde_json::json!({
+                            "phase": "pre_apply",
+                            "reason": "config_source_changed",
+                        }),
+                    )),
+                "quickstart: expected config source changed"
+            );
+            return Err(vec![QuickstartError::config_source_changed(&ctx)]);
+        }
+    }
+
+    if personality_order == PersonalityCommitOrder::BeforeConfigForNewAgent
+        && let Err(error) =
+            ensure_new_agent_workspace_absent(config, &submission.agent.name, Some(&ctx))
+    {
+        return Err(vec![error]);
+    }
+
     let mut errors = Vec::new();
     let mut staged_files = Vec::new();
-    let applied = apply_into(
+    let applied = apply_into_with_memory_mode(
         config,
         &submission,
         &mut staged_files,
         &mut errors,
         Some(&ctx),
+        memory_mode,
     );
     if !errors.is_empty() {
         ::zeroclaw_log::record!(
@@ -309,6 +547,25 @@ pub async fn apply_with_surface(
         "quickstart: completion flag flipped"
     );
 
+    let strict_workspace = if personality_order == PersonalityCommitOrder::BeforeConfigForNewAgent {
+        if let Err(error) =
+            ensure_new_agent_workspace_absent(config, &submission.agent.name, Some(&ctx))
+        {
+            return Err(vec![error]);
+        }
+        let workspace = commit_new_agent_personality_before_config(
+            std::mem::take(&mut staged_files),
+            &mut errors,
+            Some(&ctx),
+        );
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        workspace
+    } else {
+        None
+    };
+
     let dirty_count = config.dirty_paths.len();
     let write_started = std::time::Instant::now();
     ::zeroclaw_log::record!(
@@ -321,10 +578,13 @@ pub async fn apply_with_surface(
         ),
         "quickstart: persist start"
     );
-    let write_result = config.save_dirty().await;
+    let write_result = match expected_source {
+        Some(expected_source) => config.save_dirty_if_source_unchanged(expected_source).await,
+        None => config.save_dirty().await.map(|()| true),
+    };
     let write_ms = write_started.elapsed().as_millis() as u64;
     match &write_result {
-        Ok(_) => ::zeroclaw_log::record!(
+        Ok(true) => ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
@@ -336,6 +596,21 @@ pub async fn apply_with_surface(
                     }),
                 )),
             "quickstart: persist complete"
+        ),
+        Ok(false) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(merge_attrs(
+                    ctx.base_attrs(),
+                    serde_json::json!({
+                        "dirty_path_count": dirty_count,
+                        "elapsed_ms": write_ms,
+                        "phase": "persist",
+                        "reason": "config_source_changed",
+                    }),
+                )),
+            "quickstart: expected config source changed"
         ),
         Err(err) => ::zeroclaw_log::record!(
             WARN,
@@ -352,24 +627,65 @@ pub async fn apply_with_surface(
             "quickstart: persist failed"
         ),
     }
-    write_result.map_err(|err| {
-        vec![QuickstartError::for_surface(
-            Some(&ctx),
-            QuickstartStep::Agent,
-            "",
-            format!("failed to persist config: {err}"),
-            "cli-quickstart-error-persist-config",
-            &[("err", &err.to_string())],
-        )]
-    })?;
+    let persisted = match write_result {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            let disposition = zeroclaw_config::schema::config_write_disposition(&err);
+            let error_field =
+                if disposition == zeroclaw_config::schema::ConfigWriteDisposition::Ambiguous {
+                    "config_commit_ambiguous"
+                } else {
+                    ""
+                };
+            let mut errors = vec![QuickstartError::for_surface(
+                Some(&ctx),
+                QuickstartStep::Agent,
+                error_field,
+                format!("failed to persist config: {err}"),
+                "cli-quickstart-error-persist-config",
+                &[("err", &err.to_string())],
+            )];
+            if strict_workspace_rollback_allowed(disposition)
+                && let Some(workspace) = strict_workspace
+                && let Err(cleanup_error) = workspace.rollback()
+            {
+                errors.push(QuickstartError::for_surface(
+                    Some(&ctx),
+                    QuickstartStep::Agent,
+                    "personality_files",
+                    format!("failed to roll back uncommitted workspace: {cleanup_error}"),
+                    "cli-quickstart-error-personality-write-failed",
+                    &[("path", "workspace"), ("err", &cleanup_error.to_string())],
+                ));
+            }
+            return Err(errors);
+        }
+    };
+    if !persisted {
+        let mut errors = vec![QuickstartError::config_source_changed(&ctx)];
+        if let Some(workspace) = strict_workspace
+            && let Err(cleanup_error) = workspace.rollback()
+        {
+            errors.push(QuickstartError::for_surface(
+                Some(&ctx),
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("failed to roll back stale workspace: {cleanup_error}"),
+                "cli-quickstart-error-personality-write-failed",
+                &[("path", "workspace"), ("err", &cleanup_error.to_string())],
+            ));
+        }
+        return Err(errors);
+    }
 
-    // Config landed atomically — now move the staged personality files
-    // into place. Any failure here is reported but does not unwind the
-    // already-persisted config; the agent is valid without them.
-    let mut commit_errors = Vec::new();
-    commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
-    if !commit_errors.is_empty() {
-        return Err(commit_errors);
+    if personality_order == PersonalityCommitOrder::AfterConfig {
+        // Legacy Quickstart ordering: config first, optional personality files
+        // second. Zerona uses the strict branch above instead.
+        let mut commit_errors = Vec::new();
+        commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
+        if !commit_errors.is_empty() {
+            return Err(commit_errors);
+        }
     }
 
     ::zeroclaw_log::record!(
@@ -845,6 +1161,24 @@ fn apply_into(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) -> Option<AppliedAgent> {
+    apply_into_with_memory_mode(
+        config,
+        submission,
+        staged_files,
+        errors,
+        ctx,
+        MemoryApplyMode::InstallWide,
+    )
+}
+
+fn apply_into_with_memory_mode(
+    config: &mut Config,
+    submission: &BuilderSubmission,
+    staged_files: &mut Vec<StagedPersonalityWrite>,
+    errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
+    memory_mode: MemoryApplyMode,
+) -> Option<AppliedAgent> {
     if !validate_runtime_profile_choice(config, &submission.runtime_profile, errors, ctx) {
         return None;
     }
@@ -888,7 +1222,15 @@ fn apply_into(
         &runtime_alias,
     );
 
-    let memory_backend = apply_memory(config, &submission.memory, errors, ctx)?;
+    let (memory_backend, agent_memory_backend) = match memory_mode {
+        MemoryApplyMode::InstallWide => {
+            (apply_memory(config, &submission.memory, errors, ctx)?, None)
+        }
+        MemoryApplyMode::CreatedAgent => {
+            let backend = select_per_agent_memory(&submission.memory, errors)?;
+            (memory_choice_name(&backend), Some(backend))
+        }
+    };
     emit_selector_pick(
         ctx,
         "memory",
@@ -922,6 +1264,7 @@ fn apply_into(
         &provider_ref,
         &risk_alias,
         &runtime_alias,
+        agent_memory_backend,
         &channel_refs,
         errors,
         ctx,
@@ -1351,6 +1694,45 @@ fn write_runtime_preset(config: &mut Config, preset_name: &str) -> Result<String
 
 // ── Memory ─────────────────────────────────────────────────────────
 
+fn memory_choice_name(kind: &MemoryChoice) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+}
+
+fn select_per_agent_memory(
+    choice: &SelectorChoice<MemoryChoice>,
+    errors: &mut Vec<QuickstartError>,
+) -> Option<MemoryChoice> {
+    match choice {
+        SelectorChoice::Fresh(
+            kind @ (MemoryChoice::Sqlite | MemoryChoice::Markdown | MemoryChoice::None),
+        ) => Some(*kind),
+        SelectorChoice::Fresh(kind) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::Memory,
+                "backend",
+                format!(
+                    "per-agent memory does not support `{}`; choose `sqlite`, `markdown`, or `none`",
+                    memory_choice_name(kind)
+                ),
+            ));
+            None
+        }
+        SelectorChoice::Existing(reference) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::Memory,
+                "backend",
+                format!(
+                    "per-agent memory does not accept storage reference `{reference}`; choose a fresh `sqlite`, `markdown`, or `none` backend"
+                ),
+            ));
+            None
+        }
+    }
+}
+
 fn apply_memory(
     config: &mut Config,
     choice: &SelectorChoice<MemoryChoice>,
@@ -1396,10 +1778,7 @@ fn apply_memory(
             Some(reference.clone())
         }
         SelectorChoice::Fresh(kind) => {
-            let kind_name = serde_json::to_value(kind)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("{kind:?}").to_lowercase());
+            let kind_name = memory_choice_name(kind);
             if matches!(kind, MemoryChoice::None) {
                 if let Err(err) = config.set_prop_persistent("memory.backend", "none") {
                     errors.push(QuickstartError::new(
@@ -1827,12 +2206,154 @@ fn apply_peer_groups(
 
 // ── Personality files ──────────────────────────────────────────────
 
-/// A personality file staged to a tempfile during `apply_into`, moved
-/// into place only after the atomic config write succeeds. On config
-/// failure the tempfile drops and cleans itself up — nothing orphaned.
+/// A personality file staged under an already-open install-root handle during
+/// `apply_into`, moved into a capability-bounded workspace handle only after
+/// the atomic config write succeeds. On config failure the tempfile drops and
+/// cleans itself up without creating the workspace.
 struct StagedPersonalityWrite {
-    tempfile: tempfile::NamedTempFile,
-    dest: std::path::PathBuf,
+    root: cap_std::fs::Dir,
+    temp_name: std::path::PathBuf,
+    workspace_rel: std::path::PathBuf,
+    dest_name: String,
+    display_dest: std::path::PathBuf,
+    committed: bool,
+}
+
+impl StagedPersonalityWrite {
+    fn commit(&mut self) -> std::io::Result<()> {
+        let workspace = create_bounded_dir_chain_nofollow(&self.root, &self.workspace_rel)?;
+        self.root
+            .rename(&self.temp_name, &workspace, &self.dest_name)?;
+        sync_bounded_directory(&workspace)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+fn open_existing_dir_chain_nofollow(
+    root: &cap_std::fs::Dir,
+    relative: &std::path::Path,
+) -> std::io::Result<Option<cap_std::fs::Dir>> {
+    let mut current = root.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace path must contain only normal relative components",
+            ));
+        };
+        let current_file = current.try_clone()?.into_std_file();
+        match cap_primitives::fs::open_dir_nofollow(&current_file, std::path::Path::new(name)) {
+            Ok(next) => current = cap_std::fs::Dir::from_std_file(next),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(current))
+}
+
+fn create_bounded_dir_chain_nofollow(
+    root: &cap_std::fs::Dir,
+    relative: &std::path::Path,
+) -> std::io::Result<cap_std::fs::Dir> {
+    let mut current = root.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace path must contain only normal relative components",
+            ));
+        };
+        let current_file = current.try_clone()?.into_std_file();
+        current = match cap_primitives::fs::open_dir_nofollow(
+            &current_file,
+            std::path::Path::new(name),
+        ) {
+            Ok(next) => cap_std::fs::Dir::from_std_file(next),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current.create_dir(std::path::Path::new(name))?;
+                sync_bounded_directory(&current)?;
+                let current_file = current.try_clone()?.into_std_file();
+                cap_std::fs::Dir::from_std_file(cap_primitives::fs::open_dir_nofollow(
+                    &current_file,
+                    std::path::Path::new(name),
+                )?)
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(current)
+}
+
+fn sync_bounded_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+    let result = directory.try_clone()?.into_std_file().sync_all();
+    #[cfg(windows)]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        return Ok(());
+    }
+    result
+}
+
+fn ensure_new_agent_workspace_absent(
+    config: &Config,
+    agent_alias: &str,
+    ctx: Option<&RunCtx>,
+) -> Result<(), QuickstartError> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    let install_root = config.install_root_dir();
+    let workspace = config.agent_workspace_dir(agent_alias);
+    let workspace_rel = workspace.strip_prefix(&install_root).map_err(|error| {
+        QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "personality_files",
+            format!("agent workspace is outside the install root: {error}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &error.to_string())],
+        )
+    })?;
+    let root = Dir::open_ambient_dir(&install_root, ambient_authority()).map_err(|error| {
+        QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "personality_files",
+            format!("could not open install root: {error}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &error.to_string())],
+        )
+    })?;
+    match open_existing_dir_chain_nofollow(&root, workspace_rel) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "personality_files",
+            "strict new-agent apply refuses an existing workspace".to_string(),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", "workspace already exists")],
+        )),
+        Err(error) => Err(QuickstartError::for_surface(
+            ctx,
+            QuickstartStep::Agent,
+            "personality_files",
+            format!("could not inspect bounded agent workspace: {error}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &error.to_string())],
+        )),
+    }
+}
+
+impl Drop for StagedPersonalityWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.root.remove_file(&self.temp_name);
+        }
+    }
 }
 
 fn apply_personality_files(
@@ -1846,13 +2367,46 @@ fn apply_personality_files(
     if files.is_empty() {
         return;
     }
+    use cap_std::ambient_authority;
+    use cap_std::fs::{Dir, OpenOptions};
+    use std::io::Write as _;
+
+    let install_root = config.install_root_dir();
     let workspace = config.agent_workspace_dir(agent_alias);
-    if let Err(err) = std::fs::create_dir_all(&workspace) {
+    let workspace_rel = match workspace.strip_prefix(&install_root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(err) => {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("agent workspace is outside the install root: {err}"),
+                "cli-quickstart-error-personality-workspace",
+                &[("err", &err.to_string())],
+            ));
+            return;
+        }
+    };
+    let root = match Dir::open_ambient_dir(&install_root, ambient_authority()) {
+        Ok(root) => root,
+        Err(err) => {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("could not open install root: {err}"),
+                "cli-quickstart-error-personality-workspace",
+                &[("err", &err.to_string())],
+            ));
+            return;
+        }
+    };
+    if let Err(err) = open_existing_dir_chain_nofollow(&root, &workspace_rel) {
         errors.push(QuickstartError::for_surface(
             ctx,
             QuickstartStep::Agent,
             "personality_files",
-            format!("could not create agent workspace: {err}"),
+            format!("could not open bounded agent workspace: {err}"),
             "cli-quickstart-error-personality-workspace",
             &[("err", &err.to_string())],
         ));
@@ -1894,11 +2448,22 @@ fn apply_personality_files(
             ));
             continue;
         }
-        // Stage to a tempfile in the destination directory rather than
-        // writing the final path now. The commit happens after the atomic
-        // config persist in `apply_with_surface`.
-        let mut tempfile = match tempfile::NamedTempFile::new_in(&workspace) {
-            Ok(t) => t,
+        // Stage under the existing install-root handle. The workspace is not
+        // created until after config persistence, and the later rename uses a
+        // directory handle so a symlink swap cannot redirect the write.
+        let temp_name = std::path::PathBuf::from(format!(
+            ".zeroclaw-personality-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut tempfile = match root.open_with(&temp_name, &options) {
+            Ok(file) => file,
             Err(err) => {
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1911,7 +2476,12 @@ fn apply_personality_files(
                 continue;
             }
         };
-        if let Err(err) = std::io::Write::write_all(&mut tempfile, file.content.as_bytes()) {
+        if let Err(err) = tempfile
+            .write_all(file.content.as_bytes())
+            .and_then(|()| tempfile.flush())
+            .and_then(|()| tempfile.sync_all())
+        {
+            let _ = root.remove_file(&temp_name);
             errors.push(QuickstartError::for_surface(
                 ctx,
                 QuickstartStep::Agent,
@@ -1922,9 +2492,28 @@ fn apply_personality_files(
             ));
             continue;
         }
+        let staged_root = match root.try_clone() {
+            Ok(root) => root,
+            Err(err) => {
+                let _ = root.remove_file(&temp_name);
+                errors.push(QuickstartError::for_surface(
+                    ctx,
+                    QuickstartStep::Agent,
+                    format!("personality_files[{idx}]"),
+                    format!("could not retain bounded workspace handle: {err}"),
+                    "cli-quickstart-error-personality-stage-failed",
+                    &[("filename", trimmed), ("err", &err.to_string())],
+                ));
+                continue;
+            }
+        };
         staged.push(StagedPersonalityWrite {
-            tempfile,
-            dest: workspace.join(trimmed),
+            root: staged_root,
+            temp_name,
+            workspace_rel: workspace_rel.clone(),
+            dest_name: trimmed.to_string(),
+            display_dest: workspace.join(trimmed),
+            committed: false,
         });
     }
 }
@@ -1937,19 +2526,119 @@ fn commit_personality_files(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) {
-    for write in staged {
-        if let Err(err) = write.tempfile.persist(&write.dest) {
-            let path = write.dest.display().to_string();
+    for mut write in staged {
+        if let Err(err) = write.commit() {
+            let path = write.display_dest.display().to_string();
             errors.push(QuickstartError::for_surface(
                 ctx,
                 QuickstartStep::Agent,
                 "personality_files",
-                format!("could not write `{path}`: {}", err.error),
+                format!("could not write `{path}`: {err}"),
                 "cli-quickstart-error-personality-write-failed",
-                &[("path", &path), ("err", &err.error.to_string())],
+                &[("path", &path), ("err", &err.to_string())],
             ));
         }
     }
+}
+
+struct CommittedPersonalityWorkspace {
+    root: cap_std::fs::Dir,
+    workspace_rel: std::path::PathBuf,
+}
+
+impl CommittedPersonalityWorkspace {
+    fn rollback(self) -> std::io::Result<()> {
+        match self.root.remove_dir_all(&self.workspace_rel) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Commit a complete personality bundle before config persistence. The target
+/// workspace must not already exist, which makes rollback ownership unambiguous:
+/// every path removed on failure was created by this transaction.
+fn commit_new_agent_personality_before_config(
+    mut staged: Vec<StagedPersonalityWrite>,
+    errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
+) -> Option<CommittedPersonalityWorkspace> {
+    let first = staged.first()?;
+    let root = match first.root.try_clone() {
+        Ok(root) => root,
+        Err(error) => {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("could not retain workspace rollback handle: {error}"),
+                "cli-quickstart-error-personality-stage-failed",
+                &[("filename", "workspace"), ("err", &error.to_string())],
+            ));
+            return None;
+        }
+    };
+    let workspace_rel = first.workspace_rel.clone();
+    match open_existing_dir_chain_nofollow(&root, &workspace_rel) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                "strict new-agent apply refuses an existing workspace".to_string(),
+                "cli-quickstart-error-personality-workspace",
+                &[("err", "workspace already exists")],
+            ));
+            return None;
+        }
+        Err(error) => {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("could not inspect bounded agent workspace: {error}"),
+                "cli-quickstart-error-personality-workspace",
+                &[("err", &error.to_string())],
+            ));
+            return None;
+        }
+    }
+
+    for write in &mut staged {
+        if let Err(error) = write.commit() {
+            let path = write.display_dest.display().to_string();
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Agent,
+                "personality_files",
+                format!("could not write `{path}`: {error}"),
+                "cli-quickstart-error-personality-write-failed",
+                &[("path", &path), ("err", &error.to_string())],
+            ));
+            let cleanup = CommittedPersonalityWorkspace {
+                root,
+                workspace_rel,
+            };
+            if let Err(cleanup_error) = cleanup.rollback() {
+                errors.push(QuickstartError::for_surface(
+                    ctx,
+                    QuickstartStep::Agent,
+                    "personality_files",
+                    format!("could not roll back incomplete workspace: {cleanup_error}"),
+                    "cli-quickstart-error-personality-write-failed",
+                    &[("path", &path), ("err", &cleanup_error.to_string())],
+                ));
+            }
+            return None;
+        }
+    }
+
+    Some(CommittedPersonalityWorkspace {
+        root,
+        workspace_rel,
+    })
 }
 
 // ── Default skills bundle FTUE ─────────────────────────────────────
@@ -1972,6 +2661,7 @@ fn apply_agent(
     provider_ref: &str,
     risk_alias: &str,
     runtime_alias: &str,
+    agent_memory_backend: Option<MemoryChoice>,
     channel_refs: &[String],
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
@@ -2025,6 +2715,17 @@ fn apply_agent(
             errors.push(QuickstartError::new(
                 QuickstartStep::Agent,
                 field,
+                err.to_string(),
+            ));
+            return None;
+        }
+    }
+    if let Some(memory_backend) = agent_memory_backend {
+        let path = format!("{prefix}.memory.backend");
+        if let Err(err) = config.set_prop_persistent(&path, &memory_choice_name(&memory_backend)) {
+            errors.push(QuickstartError::new(
+                QuickstartStep::Memory,
+                "backend",
                 err.to_string(),
             ));
             return None;
@@ -2175,9 +2876,9 @@ mod tests {
     use super::*;
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        SelectorChoice,
+        QuickstartPersonalityFile, SelectorChoice,
     };
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{AliasedAgentConfig, Config, SqliteStorageConfig};
 
     #[test]
     fn channel_type_options_cover_every_schema_channel() {
@@ -2826,6 +3527,647 @@ mod tests {
     fn reload(dir: &tempfile::TempDir) -> Config {
         let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         toml::from_str(&raw).expect("on-disk config must round-trip")
+    }
+
+    async fn seeded_multi_agent_config(dir: &tempfile::TempDir) -> Config {
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "sqlite.shared".into();
+        config.storage.sqlite.insert(
+            "shared".into(),
+            SqliteStorageConfig {
+                path: Some("resident-memory.db".into()),
+                open_timeout_secs: Some(17),
+            },
+        );
+        let mut resident = AliasedAgentConfig {
+            enabled: false,
+            skill_bundles: vec!["resident_bundle".into()],
+            ..Default::default()
+        };
+        resident.memory.backend = MemoryChoice::Markdown;
+        config.agents.insert("resident".into(), resident);
+        config.save().await.unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn ordinary_apply_with_surface_still_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        super::apply_with_surface(fresh_submission("ordinary"), &mut config, Surface::Test)
+            .await
+            .expect("ordinary apply_with_surface should succeed");
+
+        let reloaded = reload(&dir);
+        assert_eq!(reloaded.memory.backend, "sqlite.sqlite");
+        let agent = reloaded
+            .agents
+            .get("ordinary")
+            .expect("ordinary apply_with_surface must persist the agent");
+        assert_eq!(agent.model_provider, "anthropic.anthropic");
+        assert_eq!(agent.risk_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "balanced");
+    }
+
+    #[tokio::test]
+    async fn revision_bound_apply_refuses_stale_source_before_workspace_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let drifted_source = format!("{expected_source}\n# external config edit\n");
+        std::fs::write(&config.config_path, &drifted_source).unwrap();
+
+        let mut submission = fresh_submission("stale");
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "IDENTITY.md".into(),
+            content: "This file must never be staged.".into(),
+        }];
+        let workspace = config.agent_workspace_dir("stale");
+
+        let errors = super::apply_with_surface_if_source_unchanged(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect_err("stale expected source must refuse Quickstart apply");
+
+        assert!(errors.iter().any(|error| {
+            error.step == QuickstartStep::Agent
+                && error.field == "config_source"
+                && error.message.contains("configuration changed")
+        }));
+        assert_eq!(
+            std::fs::read_to_string(&config.config_path).unwrap(),
+            drifted_source,
+            "stale apply must not rewrite the externally changed config"
+        );
+        assert!(
+            !workspace.exists(),
+            "the pre-apply guard must run before workspace creation and tempfile staging"
+        );
+        assert!(!config.agents.contains_key("stale"));
+        assert!(config.dirty_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revision_bound_apply_with_matching_source_persists_bindings_and_personality() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let mut submission = fresh_submission("revision_bound");
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "IDENTITY.md".into(),
+            content: "Revision-bound personality".into(),
+        }];
+
+        let applied = super::apply_with_surface_if_source_unchanged(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect("matching expected source should apply");
+
+        assert_eq!(applied.alias, "revision_bound");
+        assert_eq!(applied.model_provider, "anthropic.anthropic");
+        assert_eq!(applied.risk_profile, "balanced");
+        assert_eq!(applied.runtime_profile, "balanced");
+
+        let reloaded = reload(&dir);
+        assert_eq!(reloaded.memory.backend, "sqlite.sqlite");
+        let agent = reloaded
+            .agents
+            .get("revision_bound")
+            .expect("revision-bound agent persisted");
+        assert_eq!(agent.model_provider, "anthropic.anthropic");
+        assert_eq!(agent.risk_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "balanced");
+        assert!(reloaded.risk_profiles.contains_key("balanced"));
+        assert!(reloaded.runtime_profiles.contains_key("balanced"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .find("anthropic", "anthropic")
+                .and_then(|provider| provider.model.as_deref()),
+            Some("claude-sonnet-4-5")
+        );
+
+        let personality_path = config
+            .agent_workspace_dir("revision_bound")
+            .join("IDENTITY.md");
+        assert_eq!(
+            std::fs::read_to_string(personality_path).unwrap(),
+            "Revision-bound personality"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_new_agent_apply_persists_only_after_complete_personality_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("strict_agent");
+        submission.agent.personality_files = vec![
+            QuickstartPersonalityFile {
+                filename: "SOUL.md".into(),
+                content: "Strict soul".into(),
+            },
+            QuickstartPersonalityFile {
+                filename: "IDENTITY.md".into(),
+                content: "Strict identity".into(),
+            },
+        ];
+
+        super::apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect("strict add-agent apply should succeed");
+
+        let reloaded = reload(&dir);
+        assert!(reloaded.agents.contains_key("strict_agent"));
+        let workspace = config.agent_workspace_dir("strict_agent");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
+            "Strict soul"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("IDENTITY.md")).unwrap(),
+            "Strict identity"
+        );
+    }
+
+    #[test]
+    fn strict_workspace_rollback_requires_proven_uncommitted_config() {
+        assert!(strict_workspace_rollback_allowed(
+            zeroclaw_config::schema::ConfigWriteDisposition::NotCommitted
+        ));
+        assert!(!strict_workspace_rollback_allowed(
+            zeroclaw_config::schema::ConfigWriteDisposition::Committed
+        ));
+        assert!(!strict_workspace_rollback_allowed(
+            zeroclaw_config::schema::ConfigWriteDisposition::Ambiguous
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_new_agent_apply_refuses_preexisting_workspace_without_config_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("occupied");
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "New soul".into(),
+        }];
+        let workspace = config.agent_workspace_dir("occupied");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("sentinel"), "owned elsewhere").unwrap();
+
+        super::apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect_err("strict add-agent must not claim an existing workspace");
+
+        assert!(!reload(&dir).agents.contains_key("occupied"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("sentinel")).unwrap(),
+            "owned elsewhere"
+        );
+        assert!(!workspace.join("SOUL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn strict_new_agent_without_personality_still_refuses_preexisting_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let submission = fresh_submission("occupied_without_files");
+        let workspace = config.agent_workspace_dir("occupied_without_files");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("sentinel"), "owned elsewhere").unwrap();
+
+        super::apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect_err("strict add-agent must reject an existing workspace even without new files");
+
+        assert!(!reload(&dir).agents.contains_key("occupied_without_files"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("sentinel")).unwrap(),
+            "owned elsewhere"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_strict_same_alias_apply_keeps_the_winner_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("one_winner");
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "Winner workspace".into(),
+        }];
+        let mut first_config = config.clone();
+        let mut second_config = config.clone();
+        let first_submission = submission.clone();
+        let second_submission = submission;
+        let first_source = expected_source.clone();
+        let second_source = expected_source;
+
+        let (first, second) = tokio::join!(
+            super::apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+                first_submission,
+                &mut first_config,
+                Surface::Test,
+                &first_source,
+            ),
+            super::apply_new_agent_strict_if_source_unchanged_per_agent_memory(
+                second_submission,
+                &mut second_config,
+                Surface::Test,
+                &second_source,
+            ),
+        );
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "exactly one same-alias transaction must publish"
+        );
+
+        let reloaded = reload(&dir);
+        assert!(reloaded.agents.contains_key("one_winner"));
+        assert_eq!(
+            std::fs::read_to_string(config.agent_workspace_dir("one_winner").join("SOUL.md"))
+                .unwrap(),
+            "Winner workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_workspace_rolls_back_when_config_revision_changes_after_file_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("drift_after_files");
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "Never expose partially".into(),
+        }];
+        let ctx = RunCtx::new(Surface::Test);
+        let mut staged_files = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into_with_memory_mode(
+            &mut config,
+            &submission,
+            &mut staged_files,
+            &mut errors,
+            Some(&ctx),
+            MemoryApplyMode::CreatedAgent,
+        );
+        assert!(errors.is_empty());
+        assert!(applied.is_some());
+        config
+            .set_prop_persistent("onboard_state.quickstart_completed", "true")
+            .unwrap();
+        let committed =
+            commit_new_agent_personality_before_config(staged_files, &mut errors, Some(&ctx))
+                .expect("personality bundle should commit before config");
+        assert!(errors.is_empty());
+        let workspace = config.agent_workspace_dir("drift_after_files");
+        assert!(workspace.join("SOUL.md").exists());
+
+        let drifted = format!("{expected_source}\n# external edit\n");
+        std::fs::write(&config.config_path, &drifted).unwrap();
+        assert!(
+            !config
+                .save_dirty_if_source_unchanged(&expected_source)
+                .await
+                .unwrap()
+        );
+        committed.rollback().unwrap();
+
+        assert!(!workspace.exists());
+        assert_eq!(
+            std::fs::read_to_string(&config.config_path).unwrap(),
+            drifted
+        );
+        assert!(!reload(&dir).agents.contains_key("drift_after_files"));
+    }
+
+    #[tokio::test]
+    async fn per_agent_memory_apply_preserves_global_memory_existing_agents_and_storage() {
+        for (suffix, memory_backend) in [
+            ("sqlite", MemoryChoice::Sqlite),
+            ("markdown", MemoryChoice::Markdown),
+            ("none", MemoryChoice::None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = seeded_multi_agent_config(&dir).await;
+            let persisted_before = reload(&dir);
+            let global_memory_before = persisted_before.memory.backend.clone();
+            let resident_before =
+                serde_json::to_value(&persisted_before.agents["resident"]).unwrap();
+            let storage_before = serde_json::to_value(&persisted_before.storage).unwrap();
+            let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+
+            let alias = format!("agent_{suffix}");
+            let mut submission = fresh_submission(&alias);
+            submission.memory = SelectorChoice::Fresh(memory_backend);
+            submission.agent.personality_files = vec![QuickstartPersonalityFile {
+                filename: "IDENTITY.md".into(),
+                content: format!("Per-agent {suffix} memory"),
+            }];
+
+            let applied = super::apply_with_surface_if_source_unchanged_per_agent_memory(
+                submission,
+                &mut config,
+                Surface::Test,
+                &expected_source,
+            )
+            .await
+            .expect("matching source should apply per-agent memory");
+
+            assert_eq!(applied.alias, alias);
+            assert_eq!(applied.memory_backend, suffix);
+            let reloaded = reload(&dir);
+            assert_eq!(reloaded.memory.backend, global_memory_before);
+            assert_eq!(
+                serde_json::to_value(&reloaded.agents["resident"]).unwrap(),
+                resident_before,
+                "adding {alias} must not mutate the resident agent"
+            );
+            assert_eq!(
+                serde_json::to_value(&reloaded.storage).unwrap(),
+                storage_before,
+                "adding {alias} must not create or mutate install-wide storage"
+            );
+
+            let agent = reloaded.agents.get(&alias).expect("new agent persisted");
+            assert_eq!(agent.memory.backend, memory_backend);
+            assert_eq!(agent.risk_profile, "balanced");
+            assert_eq!(agent.runtime_profile, "balanced");
+            assert_eq!(agent.model_provider, "anthropic.anthropic");
+            assert_eq!(
+                std::fs::read_to_string(config.agent_workspace_dir(&alias).join("IDENTITY.md"))
+                    .unwrap(),
+                format!("Per-agent {suffix} memory")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_agent_memory_apply_refuses_stale_source_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = seeded_multi_agent_config(&dir).await;
+        let expected_source = std::fs::read_to_string(&config.config_path).unwrap();
+        let drifted_source = format!("{expected_source}\n# concurrent edit\n");
+        std::fs::write(&config.config_path, &drifted_source).unwrap();
+
+        let global_memory_before = config.memory.backend.clone();
+        let resident_before = serde_json::to_value(&config.agents["resident"]).unwrap();
+        let storage_before = serde_json::to_value(&config.storage).unwrap();
+        let mut submission = fresh_submission("stale_agent_memory");
+        submission.memory = SelectorChoice::Fresh(MemoryChoice::None);
+        submission.agent.personality_files = vec![QuickstartPersonalityFile {
+            filename: "IDENTITY.md".into(),
+            content: "Must not be staged".into(),
+        }];
+        let workspace = config.agent_workspace_dir("stale_agent_memory");
+
+        let errors = super::apply_with_surface_if_source_unchanged_per_agent_memory(
+            submission,
+            &mut config,
+            Surface::Test,
+            &expected_source,
+        )
+        .await
+        .expect_err("stale expected source must refuse per-agent-memory apply");
+
+        assert!(errors.iter().any(|error| {
+            error.field == "config_source" && error.message.contains("configuration changed")
+        }));
+        assert_eq!(
+            std::fs::read_to_string(&config.config_path).unwrap(),
+            drifted_source
+        );
+        assert!(!workspace.exists());
+        assert!(!config.agents.contains_key("stale_agent_memory"));
+        assert_eq!(config.memory.backend, global_memory_before);
+        assert_eq!(
+            serde_json::to_value(&config.agents["resident"]).unwrap(),
+            resident_before
+        );
+        assert_eq!(
+            serde_json::to_value(&config.storage).unwrap(),
+            storage_before
+        );
+        assert!(config.dirty_paths.is_empty());
+    }
+
+    #[test]
+    fn personality_staging_does_not_create_workspace_before_config_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let workspace = config.agent_workspace_dir("staged_only");
+        let files = vec![QuickstartPersonalityFile {
+            filename: "IDENTITY.md".into(),
+            content: "staged but not committed".into(),
+        }];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        apply_personality_files(
+            &config,
+            "staged_only",
+            &files,
+            &mut staged,
+            &mut errors,
+            None,
+        );
+
+        assert!(errors.is_empty(), "staging failed: {errors:?}");
+        assert_eq!(staged.len(), 1);
+        assert!(
+            !workspace.exists(),
+            "a late config-drift refusal must not leave an empty workspace"
+        );
+        drop(staged);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zeroclaw-personality-")),
+            "dropping staged writes must remove install-root tempfiles"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personality_staging_refuses_workspace_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let workspace = config.agent_workspace_dir("escape");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        symlink(outside.path(), &workspace).unwrap();
+        let files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "must stay contained".into(),
+        }];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        apply_personality_files(&config, "escape", &files, &mut staged, &mut errors, None);
+
+        assert!(staged.is_empty());
+        assert!(
+            !errors.is_empty(),
+            "a workspace symlink must be refused before config persistence"
+        );
+        assert!(!outside.path().join("SOUL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personality_staging_refuses_workspace_symlink_to_another_agent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let resident_workspace = config.agent_workspace_dir("resident");
+        std::fs::create_dir_all(&resident_workspace).unwrap();
+        let workspace = config.agent_workspace_dir("escape");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        symlink(&resident_workspace, &workspace).unwrap();
+        let files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "must not overwrite a resident".into(),
+        }];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        apply_personality_files(&config, "escape", &files, &mut staged, &mut errors, None);
+
+        assert!(staged.is_empty());
+        assert!(
+            !errors.is_empty(),
+            "an in-install workspace symlink must be refused"
+        );
+        assert!(!resident_workspace.join("SOUL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personality_staging_refuses_intermediate_agent_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let resident_workspace = config.agent_workspace_dir("resident");
+        std::fs::create_dir_all(&resident_workspace).unwrap();
+        let escape_agent_dir = config.install_root_dir().join("agents/escape");
+        symlink(
+            config.install_root_dir().join("agents/resident"),
+            &escape_agent_dir,
+        )
+        .unwrap();
+        let files = vec![QuickstartPersonalityFile {
+            filename: "SOUL.md".into(),
+            content: "must not cross the alias boundary".into(),
+        }];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        apply_personality_files(&config, "escape", &files, &mut staged, &mut errors, None);
+
+        assert!(staged.is_empty());
+        assert!(
+            !errors.is_empty(),
+            "an intermediate agent-directory symlink must be refused"
+        );
+        assert!(!resident_workspace.join("SOUL.md").exists());
     }
 
     #[tokio::test]
