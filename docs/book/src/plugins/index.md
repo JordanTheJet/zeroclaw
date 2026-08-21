@@ -148,7 +148,7 @@ not yet reachable from a running daemon:
 |------------|--------------|----------------|
 | `tool` | `WasmTool` | Registered end to end; discovered tool plugins appear in the agent's tool set |
 | `skill` | markdown loader | Registered end to end; skills load namespaced as `plugin:<plugin>/<skill>` |
-| `channel` | `WasmChannel`, complete and unit-covered | Orchestrator registration and the per-vendor host listener are the remaining seam |
+| `channel` | `WasmChannel`, complete and unit-covered | Alias-owned construction and runtime config resolution landed ([#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146)); the per-vendor host listener that drains each transport into the channel's `inbound` queue is a follow-up |
 | `memory` | `WasmMemory`, implements the full `Memory` trait | The runtime does not yet construct it as a configurable backend |
 | `observer` | none | `PluginCapability::Observer` is reserved; no WIT world or adapter exists yet |
 
@@ -194,11 +194,15 @@ Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
 identity. Installation prints and seeds the keys for the package's default
 tool binding; `zeroclaw plugin info <package>` prints that tool key again. Those
-automatic surfaces are tool-only. Alias-owned channel construction must derive,
-display, and seed the key from its actual configured alias rather than inventing
-a package-name binding. That production path is not present in this slice; it is
-tracked in [#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its
-accepted successor. Full-identity keys let different packages and capability
+automatic surfaces are tool-only. Alias-owned channel construction derives the
+key from its actual configured alias rather than inventing a package-name
+binding. That runtime path landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146): a daemon now
+constructs an explicitly declared `[channels.plugin.<alias>]` instance and
+resolves its typed config from that alias. Automatic `plugin info` key display
+and install-time seeding for channel instances remain manual until the grant
+ceremony in [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584).
+Full-identity keys let different packages and capability
 worlds safely reuse aliases such as `main` without sharing credentials. The
 canonical operator values are a secret-marked string map and
 remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
