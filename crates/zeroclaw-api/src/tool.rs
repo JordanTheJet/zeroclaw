@@ -321,6 +321,37 @@ impl OptionEntry {
     }
 }
 
+/// Reserved argument key used by the runtime to carry a tool-owned opaque
+/// approval binding from the host-computed preview into the matching execute
+/// call. Model-provided values under this key are removed before approval.
+pub const APPROVAL_EXECUTION_BINDING_ARG: &str = "__zeroclaw_approval_binding";
+
+/// Approval text and an optional opaque value that must accompany the same
+/// call at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolApprovalSummary {
+    /// Host-rendered text shown to the operator.
+    pub text: String,
+    /// Tool-authenticated opaque value carried only into matching execution.
+    pub execution_binding: Option<serde_json::Value>,
+}
+
+impl ToolApprovalSummary {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            execution_binding: None,
+        }
+    }
+
+    pub fn with_execution_binding(text: String, execution_binding: serde_json::Value) -> Self {
+        Self {
+            text,
+            execution_binding: Some(execution_binding),
+        }
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)
@@ -372,8 +403,23 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         None
     }
 
+    /// Host-computed approval text plus optional opaque execution binding for
+    /// one concrete call. The default preserves the ordinary summary-only
+    /// contract. Tools that must bind an operator preview to later execution
+    /// can return a signed, tool-owned value in `execution_binding`; the
+    /// runtime inserts it only after model hooks have finished and carries the
+    /// same arguments into execution.
+    ///
+    /// The binding is never operator-facing or model-authored. Implementations
+    /// must authenticate it before trusting it and redact it from every log,
+    /// audit, event, or transcript projection.
+    fn approval_summary_for_call(&self, args: &serde_json::Value) -> Option<ToolApprovalSummary> {
+        self.approval_summary(args).map(ToolApprovalSummary::new)
+    }
+
     /// When `true`, the operator prompt for this tool MUST come from
-    /// [`Tool::approval_summary`]; if that returns `None`, the approval gate
+    /// [`Tool::approval_summary_for_call`] (whose default delegates to
+    /// [`Tool::approval_summary`]); if that returns `None`, the approval gate
     /// refuses rather than falling back to the generic argument summary.
     ///
     /// A tool that carries secret values in its arguments (see
