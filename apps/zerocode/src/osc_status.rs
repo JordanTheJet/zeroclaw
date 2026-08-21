@@ -44,11 +44,10 @@
 //! saved title; a stack-less terminal keeps the neutral fallback instead of a
 //! stale working or blocked title.
 
-use std::cell::Cell;
 use std::io::Write;
 use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
+    Mutex, TryLockError,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::turn_status::TurnStatus;
@@ -167,13 +166,29 @@ impl StatusReporter {
         &mut self,
         out: &mut impl Write,
         restore_needed: &AtomicBool,
+        release_epoch: &AtomicUsize,
+        expected_release_epoch: usize,
         status: Option<&TurnStatus>,
         agent: Option<&str>,
     ) {
+        // Capture happens before the reporter mutex is acquired. A release
+        // that won the mutex first invalidates this queued sync so it cannot
+        // republish stale status after teardown.
+        if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
+            self.invalidate();
+            return;
+        }
+
         let status = status.unwrap_or(&TurnStatus::Idle);
+        let mut title_write_attempted = false;
 
         let title = title_for(status, agent);
         if self.last_title.as_deref() != Some(title.as_str()) {
+            if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
+                self.invalidate();
+                return;
+            }
+            title_write_attempted = true;
             // A successful write cannot prove title-stack support, and a
             // failed write may be partial. Record cleanup ownership before
             // sending either sequence, then always pair it with a later pop.
@@ -188,9 +203,18 @@ impl StatusReporter {
             }
         }
 
+        if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
+            self.reconcile_concurrent_release(out, restore_needed, title_write_attempted);
+            return;
+        }
+
         let progress = progress_for(status);
         if self.last_progress != Some(progress) && write_progress(out, progress).is_ok() {
             self.last_progress = Some(progress);
+        }
+
+        if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
+            self.reconcile_concurrent_release(out, restore_needed, title_write_attempted);
         }
     }
 
@@ -220,6 +244,30 @@ impl StatusReporter {
         }
         self.invalidate();
     }
+
+    /// Repair bytes emitted after a concurrent nonblocking panic cleanup.
+    ///
+    /// The panic path may already have popped the saved title. In that case a
+    /// late title write is neutralized without another pop. If this writer wins
+    /// the restore obligation instead, it performs the one pop itself. Either
+    /// ordering leaves no stale busy state and permits at most one successful
+    /// pop for the saved title.
+    fn reconcile_concurrent_release(
+        &mut self,
+        out: &mut impl Write,
+        restore_needed: &AtomicBool,
+        title_write_attempted: bool,
+    ) {
+        let _ = write_progress(out, PROGRESS_CLEARED);
+        let should_pop = restore_needed.swap(false, Ordering::AcqRel);
+        if title_write_attempted || should_pop {
+            let _ = write_title(out, "zerocode");
+        }
+        if should_pop && pop_title(out).is_err() {
+            restore_needed.store(true, Ordering::Release);
+        }
+        self.invalidate();
+    }
 }
 
 /// The terminal is process-global, and so is what is currently displayed on it.
@@ -227,30 +275,10 @@ static REPORTER: Mutex<Option<StatusReporter>> = Mutex::new(None);
 /// Cleanup ownership lives outside `REPORTER` so a panic hook can claim it
 /// without waiting for the mutex that the panicking write may still hold.
 static TITLE_RESTORE_NEEDED: AtomicBool = AtomicBool::new(false);
-
-thread_local! {
-    /// Reentrant panic cleanup must not lock the reporter already held by this
-    /// thread. A panic on another thread may wait for the short status write,
-    /// which preserves ordering and avoids racing away restore ownership.
-    static REPORTER_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
-}
-
-struct ReporterLockMarker {
-    previous: bool,
-}
-
-impl ReporterLockMarker {
-    fn enter() -> Self {
-        let previous = REPORTER_LOCK_HELD.with(|held| held.replace(true));
-        Self { previous }
-    }
-}
-
-impl Drop for ReporterLockMarker {
-    fn drop(&mut self) {
-        REPORTER_LOCK_HELD.with(|held| held.set(self.previous));
-    }
-}
+/// Every teardown advances the epoch before touching the reporter mutex. A
+/// queued sync aborts when its captured epoch is stale; an in-flight sync
+/// neutralizes any bytes that could have landed after nonblocking cleanup.
+static RELEASE_EPOCH: AtomicUsize = AtomicUsize::new(0);
 
 fn with_reporter_mutex(
     reporter: &Mutex<Option<StatusReporter>>,
@@ -260,7 +288,6 @@ fn with_reporter_mutex(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let _marker = ReporterLockMarker::enter();
     f(guard.get_or_insert_with(StatusReporter::default));
 }
 
@@ -270,7 +297,17 @@ fn with_reporter(f: impl FnOnce(&mut StatusReporter)) {
 
 /// Report the current turn state.
 pub(crate) fn sync(status: Option<&TurnStatus>, agent: Option<&str>) {
-    with_reporter(|r| r.sync_to(&mut std::io::stdout(), &TITLE_RESTORE_NEEDED, status, agent));
+    let expected_release_epoch = RELEASE_EPOCH.load(Ordering::Acquire);
+    with_reporter(|r| {
+        r.sync_to(
+            &mut std::io::stdout(),
+            &TITLE_RESTORE_NEEDED,
+            &RELEASE_EPOCH,
+            expected_release_epoch,
+            status,
+            agent,
+        );
+    });
 }
 
 /// Drop the cached view of the terminal after another program may have changed
@@ -287,27 +324,37 @@ pub(crate) fn invalidate() {
 /// taskbar for as long as that terminal lives. Safe to call more than once, and
 /// from a panic or signal handler.
 pub(crate) fn release() {
-    release_reporter_to(&REPORTER, &TITLE_RESTORE_NEEDED, &mut std::io::stdout());
+    release_reporter_to(
+        &REPORTER,
+        &TITLE_RESTORE_NEEDED,
+        &RELEASE_EPOCH,
+        &mut std::io::stdout(),
+    );
 }
 
-/// Release through `reporter` without deadlocking a reentrant panic.
+/// Release through `reporter` without waiting for its mutex.
 ///
-/// A panic can originate inside a terminal write while `sync` holds this lock;
-/// that same thread uses direct emergency cleanup. A different thread waits for
-/// the in-flight write to finish, then releases under the mutex; otherwise it
-/// could pop first and let the writer publish a stale title afterward.
+/// A process-wide panic hook runs before unwinding and cannot rely on another
+/// worker releasing the lock. A busy reporter therefore gets direct emergency
+/// cleanup. The release epoch makes queued writers abort and in-flight writers
+/// neutralize any bytes that land after that cleanup.
 fn release_reporter_to(
     reporter: &Mutex<Option<StatusReporter>>,
     restore_needed: &AtomicBool,
+    release_epoch: &AtomicUsize,
     out: &mut impl Write,
 ) {
-    if REPORTER_LOCK_HELD.with(Cell::get) {
-        emergency_release_to(out, restore_needed);
-        return;
+    release_epoch.fetch_add(1, Ordering::AcqRel);
+    match reporter.try_lock() {
+        Ok(mut guard) => guard
+            .get_or_insert_with(StatusReporter::default)
+            .release_to(out, restore_needed),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned
+            .into_inner()
+            .get_or_insert_with(StatusReporter::default)
+            .release_to(out, restore_needed),
+        Err(TryLockError::WouldBlock) => emergency_release_to(out, restore_needed),
     }
-    with_reporter_mutex(reporter, |status| {
-        status.release_to(out, restore_needed);
-    });
 }
 
 fn emergency_release_to(out: &mut impl Write, restore_needed: &AtomicBool) {
@@ -402,6 +449,7 @@ mod tests {
     struct TestReporter {
         inner: StatusReporter,
         restore_needed: AtomicBool,
+        release_epoch: AtomicUsize,
     }
 
     impl TestReporter {
@@ -411,7 +459,15 @@ mod tests {
             status: Option<&TurnStatus>,
             agent: Option<&str>,
         ) {
-            self.inner.sync_to(out, &self.restore_needed, status, agent);
+            let expected_release_epoch = self.release_epoch.load(Ordering::Acquire);
+            self.inner.sync_to(
+                out,
+                &self.restore_needed,
+                &self.release_epoch,
+                expected_release_epoch,
+                status,
+                agent,
+            );
         }
 
         fn release_to(&mut self, out: &mut impl Write) {
@@ -847,12 +903,14 @@ mod tests {
     fn reentrant_release_uses_nonblocking_emergency_cleanup() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
         let restore_needed = AtomicBool::new(true);
+        let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
-            release_reporter_to(&reporter, &restore_needed, &mut out);
+            release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
         });
         assert_eq!(out, b"\x1b]9;4;0;0\x07\x1b]2;zerocode\x07\x1b[23;0t");
         assert!(!restore_needed.load(Ordering::Acquire));
+        assert_eq!(release_epoch.load(Ordering::Acquire), 1);
     }
 
     /// The emergency path claims the one restore obligation atomically. Once
@@ -862,11 +920,12 @@ mod tests {
     fn emergency_then_normal_release_pops_exactly_once() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
         let restore_needed = AtomicBool::new(true);
+        let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
-            release_reporter_to(&reporter, &restore_needed, &mut out);
+            release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
         });
-        release_reporter_to(&reporter, &restore_needed, &mut out);
+        release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
 
         assert_eq!(
             out.windows(b"\x1b[23;0t".len())
@@ -876,56 +935,129 @@ mod tests {
         );
     }
 
-    /// A panic hook on another worker must serialize after an in-flight status
-    /// write. Treating every busy lock as reentrant lets cleanup pop first and
-    /// the writer publish a stale title afterward with no restore obligation.
+    /// A sync can capture its generation before waiting for the reporter lock.
+    /// If teardown wins that lock, the queued writer must emit no status after
+    /// it finally enters the critical section.
     #[test]
-    fn concurrent_release_waits_for_inflight_sync() {
+    fn queued_sync_from_before_release_emits_nothing() {
+        let mut status = StatusReporter::default();
+        let restore_needed = AtomicBool::new(false);
+        let release_epoch = AtomicUsize::new(1);
+        let mut out = Vec::new();
+
+        status.sync_to(
+            &mut out,
+            &restore_needed,
+            &release_epoch,
+            0,
+            Some(&TurnStatus::Working),
+            Some("herder"),
+        );
+
+        assert!(out.is_empty());
+        assert!(!restore_needed.load(Ordering::Acquire));
+    }
+
+    /// A process-wide panic hook cannot wait for a different worker to release
+    /// the reporter mutex. Cleanup must return while the title write is held,
+    /// and the writer must neutralize its late bytes without a second pop.
+    #[test]
+    fn cross_thread_release_is_prompt_and_reconciles_a_late_write() {
+        struct BlockingTitleSink {
+            bytes: Vec<u8>,
+            blocked_tx: Option<std::sync::mpsc::Sender<()>>,
+            resume_rx: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Write for BlockingTitleSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.starts_with(b"\x1b]2;")
+                    && let Some(blocked_tx) = self.blocked_tx.take()
+                {
+                    blocked_tx.send(()).unwrap();
+                    self.resume_rx.recv().unwrap();
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let reporter = std::sync::Arc::new(Mutex::new(Some(StatusReporter::default())));
         let restore_needed = std::sync::Arc::new(AtomicBool::new(false));
+        let release_epoch = std::sync::Arc::new(AtomicUsize::new(0));
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
 
         let writer_reporter = std::sync::Arc::clone(&reporter);
         let writer_restore = std::sync::Arc::clone(&restore_needed);
+        let writer_epoch = std::sync::Arc::clone(&release_epoch);
         let writer = std::thread::spawn(move || {
+            let expected_release_epoch = writer_epoch.load(Ordering::Acquire);
+            let mut sink = BlockingTitleSink {
+                bytes: Vec::new(),
+                blocked_tx: Some(locked_tx),
+                resume_rx,
+            };
             with_reporter_mutex(&writer_reporter, |status| {
-                let mut sink = Vec::new();
                 status.sync_to(
                     &mut sink,
                     &writer_restore,
+                    &writer_epoch,
+                    expected_release_epoch,
                     Some(&TurnStatus::Working),
                     Some("herder"),
                 );
-                locked_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
             });
+            writer_done_tx.send(sink.bytes).unwrap();
         });
         locked_rx.recv().unwrap();
 
         let release_reporter = std::sync::Arc::clone(&reporter);
         let release_restore = std::sync::Arc::clone(&restore_needed);
+        let release_epoch = std::sync::Arc::clone(&release_epoch);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
             let mut out = Vec::new();
-            release_reporter_to(&release_reporter, &release_restore, &mut out);
+            release_reporter_to(
+                &release_reporter,
+                &release_restore,
+                &release_epoch,
+                &mut out,
+            );
             done_tx.send(out).unwrap();
         });
 
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "another thread's cleanup must wait for the reporter lock"
-        );
+        let release_out = match done_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(out) => out,
+            Err(error) => {
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap();
+                release.join().unwrap();
+                panic!("panic cleanup blocked on a held reporter mutex: {error}");
+            }
+        };
+        assert!(release_out.ends_with(b"\x1b[23;0t"));
+
         resume_tx.send(()).unwrap();
-        let out = done_rx
+        let writer_out = writer_done_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("cleanup should finish after the in-flight sync");
+            .expect("the in-flight writer should reconcile after release");
 
         writer.join().unwrap();
         release.join().unwrap();
-        assert!(out.ends_with(b"\x1b[23;0t"));
+        assert!(
+            writer_out.ends_with(b"\x1b]2;zerocode\x07"),
+            "a late title write must be neutralized: {writer_out:?}"
+        );
+        let pop = b"\x1b[23;0t";
+        let pop_count = release_out.windows(pop.len()).filter(|w| *w == pop).count()
+            + writer_out.windows(pop.len()).filter(|w| *w == pop).count();
+        assert_eq!(pop_count, 1, "concurrent cleanup must pop exactly once");
         assert!(!restore_needed.load(Ordering::Acquire));
     }
 
