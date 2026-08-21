@@ -3933,12 +3933,54 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
     }
 }
 
+/// Require the optional app-private second factor for localhost admin calls.
+///
+/// Loopback identifies the local machine on desktop, but Android shares TCP
+/// loopback across application UIDs. Embedders can set
+/// `gateway.loopback_admin_secret` so knowledge of the gateway URL alone does
+/// not let another local app mint pairing codes, rotate devices, reload, or
+/// stop the gateway.
+fn require_loopback_admin_secret(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let expected = state
+        .config
+        .read()
+        .gateway
+        .loopback_admin_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_owned);
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let provided = headers
+        .get("X-Loopback-Admin-Secret")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if constant_time_eq(provided, &expected) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Missing or invalid loopback admin secret"
+            })),
+        ))
+    }
+}
+
 /// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -4005,7 +4047,7 @@ async fn handle_admin_reload(
     // diverge from what `require_auth` will actually enforce.
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
-        AdminReloadGate::Allow => {}
+        AdminReloadGate::Allow => require_loopback_admin_secret(&state, &headers)?,
         AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
         AdminReloadGate::Forbidden => {
             return Err((
@@ -4076,8 +4118,10 @@ async fn handle_admin_reload(
 async fn handle_admin_paircode(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -4113,8 +4157,10 @@ async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(params): Query<AdminPaircodeQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
 
     if !state.pairing.require_pairing() {
         let body = serde_json::json!({
@@ -4258,7 +4304,11 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
-async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_pair_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_loopback_admin_secret(&state, &headers)?;
     let require = state.pairing.require_pairing();
     let is_paired = state.pairing.is_paired();
 
@@ -4275,7 +4325,7 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
         "pairing_code": code,
     });
 
-    (StatusCode::OK, Json(body))
+    Ok((StatusCode::OK, Json(body)))
 }
 
 #[cfg(test)]
@@ -4830,6 +4880,7 @@ path = "{trigger_path}"
                 State(state.clone()),
                 test_connect_info(),
                 Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4857,6 +4908,7 @@ path = "{trigger_path}"
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4896,6 +4948,7 @@ path = "{trigger_path}"
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4932,6 +4985,7 @@ path = "{trigger_path}"
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4956,6 +5010,7 @@ path = "{trigger_path}"
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4972,8 +5027,13 @@ path = "{trigger_path}"
 
         let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
         let (status, _json) = admin_paircode_response_json(
-            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
-                .await,
+            handle_admin_paircode_new(
+                State(state),
+                remote,
+                Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
+            )
+            .await,
         )
         .await;
 
@@ -4982,6 +5042,68 @@ path = "{trigger_path}"
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_requires_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_accepts_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Loopback-Admin-Secret",
+            HeaderValue::from_static("0123456789abcdef0123456789abcdef"),
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+                headers,
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+    }
+
+    #[tokio::test]
+    async fn public_pair_code_also_requires_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+
+        let response = handle_pair_code(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
