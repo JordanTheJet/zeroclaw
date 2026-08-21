@@ -61,6 +61,11 @@ impl ProviderEndpoint {
 
 pub(crate) trait FamilyProviderFactory {
     const ENDPOINT: ProviderEndpoint;
+    /// Whether this family can run inside a session whose capabilities are
+    /// restricted by the embedding runtime. Bespoke families must make this
+    /// decision explicitly so a newly added construction path cannot inherit
+    /// permission by default.
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool;
 
     fn create_provider(
         &self,
@@ -157,6 +162,7 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
     } else {
         ProviderEndpoint::Fixed(T::DEFAULT_URL)
     };
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -513,6 +519,40 @@ pub fn endpoint_for_family(provider_type: &str) -> Option<ProviderEndpoint> {
     zeroclaw_config::for_each_model_provider_slot!(emit_endpoint)
 }
 
+/// Resolve whether the effective typed family for an alias may run inside a
+/// capability-restricted model session. This is deliberately pure factory
+/// dispatch: it does not construct a provider, resolve credentials, or perform
+/// provider I/O.
+pub(crate) fn family_supports_capability_restricted_session(
+    family: &str,
+    opts: &ModelProviderRuntimeOptions,
+) -> bool {
+    let provider_kind = opts
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(crate::canonicalize_v2_model_provider_name)
+        .unwrap_or_else(|| crate::canonicalize_v2_model_provider_name(family));
+
+    macro_rules! emit_capability_restricted_support {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_kind {
+                "openai-compatible" | "openai_compatible" => {
+                    <zeroclaw_config::schema::ModelProviderConfig as FamilyProviderFactory>::SUPPORTS_CAPABILITY_RESTRICTED_SESSION
+                }
+                $(
+                    $type_str => {
+                        <$cfg_ty as FamilyProviderFactory>::SUPPORTS_CAPABILITY_RESTRICTED_SESSION
+                    }
+                )+
+                _ => false,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_capability_restricted_support)
+}
+
 /// Get the fixed default API URL for a canonical provider family.
 #[deprecated(note = "use endpoint_for_family or default_model_provider_url")]
 pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
@@ -862,6 +902,7 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
 
 impl FamilyProviderFactory for XaiModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(XAI_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -909,6 +950,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1048,6 +1090,7 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
 
 impl FamilyProviderFactory for OpenRouterModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::openrouter::BASE_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1071,6 +1114,7 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
 
 impl FamilyProviderFactory for AnthropicModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::anthropic::BASE_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1115,6 +1159,7 @@ fn openai_missing_entry_fallback_config() -> OpenAIModelProviderConfig {
 
 impl FamilyProviderFactory for OpenAIModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1202,6 +1247,7 @@ fn build_ollama_compat_provider(
 
 impl FamilyProviderFactory for OllamaModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OLLAMA_COMPAT_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1223,6 +1269,7 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
 
 impl FamilyProviderFactory for GeminiModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1258,6 +1305,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
 
 impl FamilyProviderFactory for TelnyxModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::telnyx::BASE_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1276,6 +1324,7 @@ impl FamilyProviderFactory for TelnyxModelProviderConfig {
 
 impl FamilyProviderFactory for AzureModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1336,6 +1385,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
 
 impl FamilyProviderFactory for BedrockModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = false;
 
     fn create_provider(
         &self,
@@ -1369,6 +1419,7 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
 
 impl FamilyProviderFactory for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1446,6 +1497,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
 
 impl FamilyProviderFactory for GroqModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1474,6 +1526,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
 
 impl FamilyProviderFactory for CopilotModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1496,6 +1549,7 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
 
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = false;
 
     fn create_provider(
         &self,
@@ -1518,6 +1572,7 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
 
 impl FamilyProviderFactory for GrokCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = false;
 
     fn create_provider(
         &self,
@@ -1555,6 +1610,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
 
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = false;
 
     fn create_provider(
         &self,
@@ -1590,6 +1646,7 @@ impl CompatFamilySpec for KiloModelProviderConfig {
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LMSTUDIO_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1618,6 +1675,7 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
 
 impl FamilyProviderFactory for LlamacppModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LLAMACPP_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1661,6 +1719,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
 
 impl FamilyProviderFactory for OsaurusModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OSAURUS_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1689,6 +1748,7 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
 
 impl FamilyProviderFactory for OvhModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OVH_DEFAULT_URL);
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1709,6 +1769,7 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
 
 impl FamilyProviderFactory for CustomModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1765,6 +1826,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
 
 impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+    const SUPPORTS_CAPABILITY_RESTRICTED_SESSION: bool = true;
 
     fn create_provider(
         &self,
@@ -1820,6 +1882,41 @@ mod tests {
         assert!(endpoint_for_family("not_a_provider").is_none());
         assert!(endpoint_for_family("openai-compatible").is_none());
         assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn capability_restricted_session_classification_denies_host_process_families() {
+        let opts = ModelProviderRuntimeOptions::default();
+
+        for family in ["openai", "ollama", "llamacpp", "custom"] {
+            assert!(
+                family_supports_capability_restricted_session(family, &opts),
+                "ordinary in-process provider family {family:?} should be supported"
+            );
+        }
+        for family in ["bedrock", "gemini_cli", "grok_cli", "kilocli"] {
+            assert!(
+                !family_supports_capability_restricted_session(family, &opts),
+                "host-process-capable provider family {family:?} must be denied"
+            );
+        }
+        assert!(!family_supports_capability_restricted_session(
+            "future_provider",
+            &opts
+        ));
+    }
+
+    #[test]
+    fn capability_restricted_session_classification_uses_effective_kind_override() {
+        let opts = ModelProviderRuntimeOptions {
+            provider_kind: Some("gemini-cli".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            !family_supports_capability_restricted_session("custom", &opts),
+            "a safe configured family must not hide an unsafe effective provider kind"
+        );
     }
 
     #[test]

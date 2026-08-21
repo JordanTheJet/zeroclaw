@@ -19,6 +19,27 @@ Notable submodules:
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
 
+### `zeroclaw-onboarding`
+
+The capability-free Zerona agent-creation conversation. This crate sits above
+the runtime rather than adding another onboarding subsystem inside it. It:
+
+- derives a secret-free, contained choice inventory from typed live config;
+- holds one bounded, process-local transcript and talks to one host-selected
+  provider alias and model with no tool catalogue;
+- parses and validates a narrow agent proposal;
+- renders the full personality, security posture, and persistence preview; and
+- converts an approved proposal into the strict new-agent Quickstart
+  `BuilderSubmission` transaction.
+
+The crate does not own config persistence. After an exact operator verdict,
+the root CLI's compiled-in Zerona SOP calls the strict Quickstart apply boundary
+with the source bytes used for the preview. Quickstart commits the complete new
+personality workspace first, checks those bytes immediately before its atomic
+config replacement, and removes the newly-created workspace when that check
+refuses. Detected drift ends the session so the operator can restart against a
+fresh config and conversation boundary.
+
 ### `zeroclaw-config`
 
 TOML schema and its validation. Handles:

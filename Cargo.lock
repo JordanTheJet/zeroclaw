@@ -13412,6 +13412,7 @@ dependencies = [
  "zeroclaw-log",
  "zeroclaw-macros",
  "zeroclaw-memory",
+ "zeroclaw-onboarding",
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
@@ -13800,6 +13801,22 @@ dependencies = [
  "zeroclaw-log",
  "zeroclaw-providers",
  "zeroclaw-spawn",
+]
+
+[[package]]
+name = "zeroclaw-onboarding"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-providers",
+ "zeroclaw-runtime",
 ]
 
 [[package]]

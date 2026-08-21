@@ -1,0 +1,21 @@
+[package]
+name = "zeroclaw-onboarding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Capability-free guided agent creation for ZeroClaw"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+zeroclaw-api.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-runtime.workspace = true
+
+[dev-dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }

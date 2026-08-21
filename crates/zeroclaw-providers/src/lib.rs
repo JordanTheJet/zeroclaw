@@ -755,6 +755,128 @@ pub fn provider_runtime_options_for_alias(
     options
 }
 
+fn configured_model_provider_alias<'config, 'name>(
+    config: &'config zeroclaw_config::schema::Config,
+    provider_ref: &'name str,
+) -> Option<(
+    &'name str,
+    &'name str,
+    &'config zeroclaw_config::schema::ModelProviderConfig,
+)> {
+    let provider_ref = provider_ref.trim();
+    let (family, alias) = provider_ref.split_once('.')?;
+    if family.is_empty() || alias.is_empty() || family.contains(':') {
+        return None;
+    }
+    config
+        .providers
+        .models
+        .find(family, alias)
+        .map(|entry| (family, alias, entry))
+}
+
+/// Return whether a configured dotted provider alias can run inside a
+/// capability-restricted model session. Missing, bare, unknown, and
+/// unsupported effective provider kinds all return `false`.
+#[must_use]
+pub fn configured_alias_supports_capability_restricted_session(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+) -> bool {
+    let Some((family, alias, _entry)) = configured_model_provider_alias(config, provider_ref)
+    else {
+        return false;
+    };
+    let options = provider_runtime_options_for_alias(config, family, alias);
+    factory::family_supports_capability_restricted_session(family, &options)
+}
+
+/// Validate a configured dotted provider alias for a capability-restricted
+/// model session without constructing it, resolving credentials, or performing
+/// provider I/O.
+pub fn validate_configured_alias_for_capability_restricted_session(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+) -> anyhow::Result<()> {
+    let Some((family, alias, _entry)) = configured_model_provider_alias(config, provider_ref)
+    else {
+        anyhow::bail!(
+            "Capability-restricted model sessions require a configured dotted model_provider alias; \
+             `{provider_ref}` does not resolve to `[providers.models.<family>.<alias>]`."
+        );
+    };
+    let options = provider_runtime_options_for_alias(config, family, alias);
+    if !factory::family_supports_capability_restricted_session(family, &options) {
+        let effective_kind = options
+            .provider_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(family);
+        anyhow::bail!(
+            "Model provider alias `{family}.{alias}` resolves to provider kind \
+             `{effective_kind}`, which is not allowed in a capability-restricted model session."
+        );
+    }
+    Ok(())
+}
+
+/// Construct one configured provider alias pinned to exactly one model for a
+/// capability-restricted session.
+///
+/// This path intentionally does not materialize `model_routes`, fallback
+/// aliases, `fallback_models`, or the global alternate API-key pool. Reliability
+/// retries, when configured, repeat only the same alias and pinned model.
+pub fn create_isolated_model_provider_for_capability_restricted_session(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    model: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    validate_configured_alias_for_capability_restricted_session(config, provider_ref)?;
+
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("Capability-restricted model sessions require one non-empty model ID.");
+    }
+    let Some((family, alias, entry)) = configured_model_provider_alias(config, provider_ref) else {
+        anyhow::bail!(
+            "Capability-restricted model sessions require a configured dotted model_provider alias; \
+             `{provider_ref}` does not resolve to `[providers.models.<family>.<alias>]`."
+        );
+    };
+    let options = provider_runtime_options_for_alias(config, family, alias);
+    let provider = create_model_provider_inner(
+        Some(config),
+        family,
+        alias,
+        entry.api_key.as_deref(),
+        entry.uri.as_deref(),
+        &options,
+    )
+    .map_err(|error| {
+        anyhow::Error::msg(format!(
+            "Capability-restricted model provider `{family}.{alias}` failed to initialize: {error}"
+        ))
+    })?;
+
+    let configured_alias = format!("{family}.{alias}");
+    let pinned_entry = ReliableModelProviderEntry::new_pinned(
+        family,
+        configured_alias.clone(),
+        alias,
+        model,
+        provider,
+    );
+    let reliable = ReliableModelProvider::new_with_entries(
+        alias,
+        vec![pinned_entry],
+        reliability.provider_retries,
+        reliability.provider_backoff_ms,
+    );
+    Ok(Box::new(reliable))
+}
+
 /// Options to use when building a provider from a name that may be either
 /// a bare family or a dotted alias. Dotted names yield alias-resolved
 /// options; bare names inherit only provider-agnostic settings from
@@ -2136,6 +2258,323 @@ pub mod test_util {
 mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
+
+    fn capability_restricted_session_config() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            BedrockModelProviderConfig, CustomModelProviderConfig, GeminiCliModelProviderConfig,
+            GrokCliModelProviderConfig, KiloCliModelProviderConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "safe_http".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("fixture-openai-key".to_string()),
+                    model: Some("configured-http-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "safe_local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("configured-local-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.custom.insert(
+            "safe_unbuilt".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("configured-custom-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.gemini_cli.insert(
+            "unsafe_gemini".to_string(),
+            GeminiCliModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gemini-cli-model".to_string()),
+                    ..Default::default()
+                },
+                binary_path: Some("fixture-gemini-binary-that-must-not-run".to_string()),
+            },
+        );
+        config.providers.models.grok_cli.insert(
+            "unsafe_grok".to_string(),
+            GrokCliModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("grok-cli-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.kilocli.insert(
+            "unsafe_kilo".to_string(),
+            KiloCliModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("kilo-cli-model".to_string()),
+                    ..Default::default()
+                },
+                binary_path: Some("fixture-kilo-binary-that-must-not-run".to_string()),
+            },
+        );
+        config.providers.models.bedrock.insert(
+            "unsafe_bedrock".to_string(),
+            BedrockModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("bedrock-model".to_string()),
+                    ..Default::default()
+                },
+                region: None,
+            },
+        );
+        config.providers.models.custom.insert(
+            "unsafe_override".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("gemini_cli".to_string()),
+                    model: Some("override-model".to_string()),
+                    uri: Some("http://127.0.0.1:9/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn capability_restricted_session_support_is_alias_aware_and_fail_closed() {
+        let config = capability_restricted_session_config();
+
+        for provider_ref in [
+            "openai.safe_http",
+            "ollama.safe_local",
+            "custom.safe_unbuilt",
+        ] {
+            assert!(
+                configured_alias_supports_capability_restricted_session(&config, provider_ref),
+                "safe configured alias {provider_ref:?} should be supported"
+            );
+        }
+        for provider_ref in [
+            "gemini_cli.unsafe_gemini",
+            "grok_cli.unsafe_grok",
+            "kilocli.unsafe_kilo",
+            "bedrock.unsafe_bedrock",
+            "custom.unsafe_override",
+            "openai.missing",
+            "openai",
+        ] {
+            assert!(
+                !configured_alias_supports_capability_restricted_session(&config, provider_ref),
+                "unsupported, missing, or non-dotted alias {provider_ref:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_restricted_session_validation_is_pure_factory_classification() {
+        let config = capability_restricted_session_config();
+
+        validate_configured_alias_for_capability_restricted_session(
+            &config,
+            "custom.safe_unbuilt",
+        )
+        .expect(
+            "validation must not construct or contact a custom provider whose URI is intentionally absent",
+        );
+
+        for provider_ref in [
+            "gemini_cli.unsafe_gemini",
+            "grok_cli.unsafe_grok",
+            "kilocli.unsafe_kilo",
+            "bedrock.unsafe_bedrock",
+            "custom.unsafe_override",
+            "openai.missing",
+        ] {
+            assert!(
+                validate_configured_alias_for_capability_restricted_session(&config, provider_ref)
+                    .is_err(),
+                "alias {provider_ref:?} must be rejected before provider construction"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_restricted_session_safe_http_and_local_aliases_build() {
+        let config = capability_restricted_session_config();
+
+        for provider_ref in ["openai.safe_http", "ollama.safe_local"] {
+            let provider = create_isolated_model_provider_for_capability_restricted_session(
+                &config,
+                provider_ref,
+                "isolated-model",
+                &config.reliability,
+            )
+            .unwrap_or_else(|error| {
+                panic!("safe configured alias {provider_ref:?} should build: {error:#}")
+            });
+            assert!(provider.has_stable_request_identity("isolated-model"));
+            assert!(!provider.has_stable_request_identity("unrelated-model"));
+        }
+    }
+
+    #[test]
+    fn capability_restricted_session_host_process_aliases_are_refused_at_construction() {
+        let config = capability_restricted_session_config();
+
+        for provider_ref in [
+            "gemini_cli.unsafe_gemini",
+            "grok_cli.unsafe_grok",
+            "kilocli.unsafe_kilo",
+            "bedrock.unsafe_bedrock",
+            "custom.unsafe_override",
+        ] {
+            let result = create_isolated_model_provider_for_capability_restricted_session(
+                &config,
+                provider_ref,
+                "isolated-model",
+                &config.reliability,
+            );
+            assert!(
+                result.is_err(),
+                "host-process-capable alias {provider_ref:?} must be refused without spawning"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_restricted_session_wrapper_never_uses_configured_fallbacks_or_other_models()
+    {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+
+        type ModelCapture = Arc<Mutex<Vec<String>>>;
+
+        async fn reject_primary(
+            State(capture): State<ModelCapture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            capture.lock().expect("capture lock poisoned").push(
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {"message": "fixture rejection"}})),
+            )
+        }
+
+        async fn accept_backup(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "choices": [{"message": {"content": "unexpected backup"}}]
+            }))
+        }
+
+        let primary_models: ModelCapture = Arc::new(Mutex::new(Vec::new()));
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary test server");
+        let primary_addr = primary_listener.local_addr().expect("primary server addr");
+        let primary_app = Router::new()
+            .route("/v1/chat/completions", post(reject_primary))
+            .with_state(Arc::clone(&primary_models));
+        let primary_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(primary_listener, primary_app)
+                .await
+                .expect("serve primary test server");
+        });
+
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backup test server");
+        let backup_addr = backup_listener.local_addr().expect("backup server addr");
+        let backup_app = Router::new()
+            .route("/v1/chat/completions", post(accept_backup))
+            .with_state(Arc::clone(&backup_calls));
+        let backup_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(backup_listener, backup_app)
+                .await
+                .expect("serve backup test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.custom.insert(
+            "primary".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("fixture-primary-key".to_string()),
+                    uri: Some(format!("http://{primary_addr}/v1")),
+                    model: Some("configured-primary-model".to_string()),
+                    fallback_models: vec!["configured-alternate-model".to_string()],
+                    fallback: vec![ModelProviderRef::new("custom.backup")],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("fixture-backup-key".to_string()),
+                    uri: Some(format!("http://{backup_addr}/v1")),
+                    model: Some("configured-backup-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 0,
+            provider_backoff_ms: 0,
+            ..Default::default()
+        };
+        let provider = create_isolated_model_provider_for_capability_restricted_session(
+            &config,
+            "custom.primary",
+            "isolated-model",
+            &reliability,
+        )
+        .expect("safe isolated provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "unrelated-request-model", None)
+            .await;
+
+        primary_server.abort();
+        backup_server.abort();
+        assert!(result.is_err(), "the one isolated entry should fail closed");
+        assert_eq!(
+            *primary_models.lock().expect("capture lock poisoned"),
+            vec!["isolated-model".to_string()],
+            "the wrapper must ignore both the requested model and configured alternate models"
+        );
+        assert_eq!(
+            backup_calls.load(Ordering::SeqCst),
+            0,
+            "the wrapper must never materialize or call a configured fallback alias"
+        );
+    }
 
     #[test]
     fn runtime_recommendations_distinguish_local_backends_from_cli_shims() {
