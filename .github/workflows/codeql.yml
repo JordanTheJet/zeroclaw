@@ -1,7 +1,8 @@
 name: CodeQL
 
 # Deep static analysis for both CodeQL-covered languages:
-#   javascript-typescript — web/ dashboard source (autobuild extraction)
+#   javascript-typescript — web/ dashboard source (no build step needed;
+#                           CodeQL extracts interpreted languages directly)
 #   rust                  — workspace crates (manual cargo build)
 # Uses the shared .github/codeql/codeql-config.yml (paths-ignore tests/).
 # Semgrep's fast per-PR pattern scan lives in the sibling ci-code-analysis.yml.
@@ -26,9 +27,12 @@ on:
     - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
   workflow_dispatch:
 
+# A scan of a superseded commit has no value: a newer push cancels any
+# in-flight run so the latest master analysis is never queued behind a
+# stale or scheduled one (same policy the Rust job had in its old home).
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -64,10 +68,6 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           config-file: .github/codeql/codeql-config.yml
-
-      - name: Autobuild
-        if: matrix.language == 'javascript-typescript'
-        uses: github/codeql-action/autobuild@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
 
       - name: Build
         if: matrix.language == 'rust'
