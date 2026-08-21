@@ -2,11 +2,11 @@
 
 ## Runtime contract
 
-- SOP definitions are loaded from `<shared>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
+- User SOP definitions are loaded from `<shared>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`. Compiled-in workflows use typed `SystemSopId` registration and cannot be addressed through ordinary string dispatch.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
 - SOP runs are started by a live event fan-in (MQTT, filesystem, or AMQP), by the daemon's periodic SOP maintenance tick for `cron` triggers, or by the in-agent tool `sop_execute`. The remaining trigger types (webhook, peripheral, calendar) are defined and matched but not yet wired to a live event source (see [SOP Fan-In](./fan-in/overview.md)).
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
-- Run state is process-local by default. With `sop.persist_runs = true`, successful initialization of the default SQLite backend stores it under `<data_dir>/sop/runs.db` and restores active runs after restart. Initialization failure logs a warning and falls back to process-local memory.
+- Run state is durable by default (`sop.persist_runs = true`). Successful initialization of the default SQLite backend stores it under `<data_dir>/sop/runs.db` and restores active runs after restart. Set it to `false` to opt into process-local state. Initialization failure logs a warning and falls back to process-local memory.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
 
 Run state and audit history are separate surfaces. See [Background work lifecycle](../architecture/background-work-lifecycle.md) for lifecycle ownership, cancellation, and restart semantics.
@@ -26,8 +26,16 @@ graph LR
     Run --> Action{Action}
     Action -->|ExecuteStep| Agent[Agent Loop]
     Action -->|WaitApproval| Human[Operator]
+    Action -->|InteractiveInputWait| TrustedHost[Authenticated host input]
     Human -->|sop_approve| Run
+    TrustedHost -->|submit input| Run
 ```
+
+Interactive input is currently reserved for compiled-in system workflows. The
+generic run record keeps only request and value metadata. Zerona deliberately
+uses a private in-memory engine: its raw operator/model transcript and proposal
+never enter durable SOP state, and process restart requires a fresh onboarding
+conversation.
 
 ## Getting started
 

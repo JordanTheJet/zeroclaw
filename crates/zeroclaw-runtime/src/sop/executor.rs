@@ -320,7 +320,8 @@ async fn drive_headless_run(
                 }
             }
             SopRunAction::WaitApproval { run_id, step, .. }
-            | SopRunAction::CheckpointWait { run_id, step, .. } => {
+            | SopRunAction::CheckpointWait { run_id, step, .. }
+            | SopRunAction::InteractiveInputWait { run_id, step, .. } => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

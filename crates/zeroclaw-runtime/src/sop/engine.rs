@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use sha2::{Digest, Sha256};
 
 use super::capability::SopCapabilityRegistry;
 use super::load_sops;
@@ -23,12 +24,30 @@ use super::types::{
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
 use crate::security::{ContentSafety, new_marker_id};
+use crate::security::{LeakDetector, LeakResult};
 use serde_json::Value;
+use zeroclaw_api::principal::{AuthMethod, Principal};
 use zeroclaw_config::schema::SopConfig;
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SystemSopId(&'static str);
+
+impl SystemSopId {
+    pub const ZERONA_CREATE_AGENT: Self = Self("system.zerona.create_agent");
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 pub struct SopEngine {
     sops: Vec<Sop>,
+    /// Compiled-in workflows under the reserved `system.` namespace. They are
+    /// never loaded from `sops_dir`, cannot be shadowed by user definitions,
+    /// and are re-appended after every filesystem reload.
+    builtin_sops: Vec<(SystemSopId, Sop)>,
     active_runs: HashMap<String, SopRun>,
     /// Completed/failed/cancelled runs (kept for status queries).
     finished_runs: Vec<SopRun>,
@@ -49,7 +68,8 @@ pub struct SopEngine {
     run_notifier: Option<tokio::sync::broadcast::Sender<SopRunSummary>>,
     /// Deterministic capability registry for `kind = "capability"` SOP steps.
     capabilities: Arc<SopCapabilityRegistry>,
-    /// Run IDs parked (`WaitingApproval`/`PausedCheckpoint`) whose exec claim was
+    /// Run IDs parked at an approval, checkpoint, or interactive-input wait whose
+    /// exec claim was
     /// deliberately KEPT because the parked snapshot could not be durably
     /// persisted (`persist_parked_snapshot_then_release_claim`'s fail-closed
     /// branch). `retry_pending_park_persists` retries these each maintenance
@@ -93,6 +113,10 @@ pub struct SopEngine {
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
 const DISPATCH_DEDUP_CAP: usize = 512;
+
+/// Hard ceiling for one operator submission. Interactive input is persisted as
+/// run output, so bound it before allocation, audit, or durable storage.
+const MAX_INTERACTIVE_INPUT_BYTES: usize = 64 * 1024;
 
 /// Composite dedup key: `sop_name` and the transport delivery key joined by a NUL, which
 /// cannot appear in a SOP name, so distinct pairs never collide.
@@ -241,6 +265,7 @@ impl SopEngine {
     pub fn new(config: SopConfig) -> Self {
         Self {
             sops: Vec::new(),
+            builtin_sops: Vec::new(),
             active_runs: HashMap::new(),
             finished_runs: Vec::new(),
             config,
@@ -301,6 +326,46 @@ impl SopEngine {
     pub fn with_capabilities(mut self, capabilities: Arc<SopCapabilityRegistry>) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Register one compiled-in SOP. The reserved namespace is deliberately not
+    /// accepted by the filesystem loader, so an editable SOP cannot replace a
+    /// workflow whose ordering is part of a security boundary.
+    pub fn register_builtin_sop(&mut self, id: SystemSopId, mut sop: Sop) -> Result<()> {
+        if sop.name != id.as_str() {
+            bail!(
+                "built-in SOP name '{}' does not match its typed system id '{}'",
+                sop.name,
+                id.as_str()
+            );
+        }
+        if sop.location.is_some() {
+            bail!(
+                "built-in SOP '{}' cannot have a filesystem location",
+                sop.name
+            );
+        }
+        if self
+            .builtin_sops
+            .iter()
+            .any(|(loaded_id, _)| *loaded_id == id)
+        {
+            bail!("built-in SOP '{}' is already registered", sop.name);
+        }
+        let validation = super::validate_sop_strict(&sop);
+        if !validation.is_ok() {
+            bail!(
+                "built-in SOP '{}' is invalid: {}",
+                sop.name,
+                validation.blocking.join("; ")
+            );
+        }
+        self.capabilities.validate_sop(&sop)?;
+        sop.location = None;
+        self.sops.retain(|loaded| loaded.name != sop.name);
+        self.sops.push(sop.clone());
+        self.builtin_sops.push((id, sop));
+        Ok(())
     }
 
     /// Inject the approval broker (built from `[sop.approval]` config). Defaults to
@@ -387,7 +452,9 @@ impl SopEngine {
                     // logged loudly.
                     let parked = matches!(
                         pr.run.status,
-                        SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+                        SopRunStatus::WaitingApproval
+                            | SopRunStatus::PausedCheckpoint
+                            | SopRunStatus::WaitingInput
                     );
                     if parked {
                         let retained = match self
@@ -871,7 +938,11 @@ impl SopEngine {
                     run.waiting_since = Some(now_iso8601());
                 }
             } else if let Some(run) = self.active_runs.get_mut(&run_id) {
-                run.status = SopRunStatus::WaitingApproval;
+                run.status = if step.kind == SopStepKind::Input {
+                    SopRunStatus::WaitingInput
+                } else {
+                    SopRunStatus::WaitingApproval
+                };
                 run.waiting_since = Some(now_iso8601());
             }
 
@@ -1245,11 +1316,14 @@ impl SopEngine {
     /// Load/reload SOPs from the configured directory, resolved against
     /// `install_root` (the install root, `config_path`'s parent).
     pub fn reload(&mut self, install_root: &Path) {
-        self.sops = load_sops(
+        let mut loaded = load_sops(
             install_root,
             self.config.sops_dir.as_deref(),
             super::parse_execution_mode(&self.config.default_execution_mode),
         );
+        loaded.retain(|sop| !sop.name.starts_with("system."));
+        loaded.extend(self.builtin_sops.iter().map(|(_, sop)| sop.clone()));
+        self.sops = loaded;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -1637,12 +1711,34 @@ impl SopEngine {
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
+        if self
+            .builtin_sops
+            .iter()
+            .any(|(_, sop)| sop.name == sop_name)
+        {
+            bail!("system SOP '{sop_name}' requires its typed start authority");
+        }
+        self.start_run_inner(sop_name, event)
+    }
+
+    pub fn start_system_run(&mut self, id: SystemSopId, event: SopEvent) -> Result<SopRunAction> {
+        if !self
+            .builtin_sops
+            .iter()
+            .any(|(registered, _)| *registered == id)
+        {
+            bail!("system SOP '{}' is not registered", id.as_str());
+        }
+        self.start_run_inner(id.as_str(), event)
+    }
+
+    fn start_run_inner(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
         // A start is a two-phase operation: reserve the exec slot through the
         // authoritative store CAS (no side effect yet), then activate the reserved
         // slot into a live run and dispatch its first step. The phases are split so the
         // AMQP multi-match path can reserve the WHOLE matched batch before activating
         // any of it (see `dispatch`). A single start runs both phases back-to-back.
-        let reservation = self.reserve_run_slot(sop_name)?;
+        let reservation = self.reserve_run_slot_inner(sop_name)?;
         self.activate_reserved_run(reservation, event)
     }
 
@@ -1656,6 +1752,17 @@ impl SopEngine {
     /// never leave a partial start (it makes one reservation fail → release-all +
     /// defer-all), only a safe requeue.
     pub(crate) fn reserve_run_slot(&mut self, sop_name: &str) -> Result<StartReservation> {
+        if self
+            .builtin_sops
+            .iter()
+            .any(|(_, sop)| sop.name == sop_name)
+        {
+            bail!("system SOP '{sop_name}' cannot start through ordinary dispatch");
+        }
+        self.reserve_run_slot_inner(sop_name)
+    }
+
+    fn reserve_run_slot_inner(&mut self, sop_name: &str) -> Result<StartReservation> {
         self.enforce_admission(sop_name)?;
 
         let sop = self
@@ -1782,7 +1889,9 @@ impl SopEngine {
             })?;
             if matches!(
                 run.status,
-                SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+                SopRunStatus::WaitingApproval
+                    | SopRunStatus::PausedCheckpoint
+                    | SopRunStatus::WaitingInput
             ) {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1795,11 +1904,15 @@ impl SopEngine {
                         })),
                     "SOP engine: advance_step rejected — run is paused at a gate"
                 );
+                let paused_at = match run.status {
+                    SopRunStatus::WaitingApproval => "WaitingApproval gate",
+                    SopRunStatus::PausedCheckpoint => "PausedCheckpoint gate",
+                    SopRunStatus::WaitingInput => "WaitingInput step",
+                    _ => "human wait",
+                };
                 bail!(
-                    "Run {run_id} is paused at a {} gate; resolve the gate through \
-                     `resolve_gate` (WaitingApproval) or `approve_step` (PausedCheckpoint) \
-                     before advancing with sop_advance",
-                    run.status
+                    "Run {run_id} is paused at a {paused_at}; use its dedicated resolver before \
+                     advancing with sop_advance"
                 );
             }
             (run.sop_name.clone(), run.current_step)
@@ -2354,6 +2467,12 @@ impl SopEngine {
         let Some(run) = self.get_run(run_id) else {
             return;
         };
+        if !matches!(
+            run.status,
+            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+        ) {
+            return;
+        }
         let (sop_name, step, revision) = (run.sop_name.clone(), run.current_step, run.revision);
         // Edit/Revise resolve ONLY through the deterministic-checkpoint path
         // (`resolve_checkpoint`); a broker-owned approval gate refuses them
@@ -3231,7 +3350,9 @@ impl SopEngine {
                     recorded.status = SopStepStatus::Failed;
                     recorded.output = full_reason;
                 }
-            } else if let Some(run) = self.active_runs.get_mut(run_id) {
+            } else if current_step.kind != SopStepKind::Input
+                && let Some(run) = self.active_runs.get_mut(run_id)
+            {
                 run.llm_calls_saved += 1;
             }
         }
@@ -3455,7 +3576,9 @@ impl SopEngine {
                 if self.active_runs.get(run_id).is_some_and(|run| {
                     matches!(
                         run.status,
-                        SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+                        SopRunStatus::WaitingApproval
+                            | SopRunStatus::PausedCheckpoint
+                            | SopRunStatus::WaitingInput
                     )
                 }) {
                     // The denial ROUTED to another gate and the new parked snapshot
@@ -3745,6 +3868,16 @@ impl SopEngine {
         step_output: serde_json::Value,
         step_timestamps: Option<(String, Option<String>)>,
     ) -> Result<SopRunAction> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if run.status == SopRunStatus::WaitingInput {
+            bail!(
+                "Run {run_id} is waiting for authenticated interactive input; use \
+                 submit_interactive_input"
+            );
+        }
         let (_, sop) = self.resolve_active_run_sop(run_id)?;
         let current_step_number = self
             .active_runs
@@ -3752,6 +3885,12 @@ impl SopEngine {
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
             .current_step;
         let current_step = self.resolve_sop_step(&sop, current_step_number)?;
+        if current_step.kind == SopStepKind::Input {
+            bail!(
+                "Run {run_id} interactive input step cannot advance through the generic \
+                 deterministic path"
+            );
+        }
         let (started_at, completed_at) = match step_timestamps {
             Some((started, completed)) => (started, completed),
             None => {
@@ -3773,6 +3912,184 @@ impl SopEngine {
             started_at,
             completed_at,
         )
+    }
+
+    /// Submit one authenticated human value to a deterministic `kind = "input"`
+    /// step. Interactive input is a distinct wait state, not an approval: this
+    /// method never consults or satisfies the approval broker. The transport must
+    /// construct `principal`; callers must never deserialize it from the request
+    /// body.
+    pub fn submit_interactive_input(
+        &mut self,
+        run_id: &str,
+        expected_revision: u32,
+        expected_fingerprint: &str,
+        value: serde_json::Value,
+        principal: Principal,
+    ) -> Result<SopRunAction> {
+        if matches!(principal.auth_method, AuthMethod::None) {
+            bail!("interactive SOP input requires a transport-authenticated principal");
+        }
+        if self.is_park_persist_pending(run_id) {
+            bail!(
+                "Run {run_id} cannot accept input: its parked snapshot is not yet durably persisted (retrying)"
+            );
+        }
+
+        let serialized = serde_json::to_string(&value)?;
+        if serialized.len() > MAX_INTERACTIVE_INPUT_BYTES {
+            bail!("interactive SOP input exceeds the {MAX_INTERACTIVE_INPUT_BYTES}-byte limit");
+        }
+        if matches!(
+            LeakDetector::new().scan(&serialized),
+            LeakResult::Detected { .. }
+        ) {
+            bail!("interactive SOP input contains credential-like material");
+        }
+        let value_marker = new_marker_id();
+
+        let prior_run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if prior_run.status != SopRunStatus::WaitingInput {
+            bail!(
+                "Run {run_id} is not waiting for interactive input (status: {})",
+                prior_run.status
+            );
+        }
+        if prior_run.revision != expected_revision {
+            bail!(
+                "Run {run_id} input reference is stale: expected revision {}, current revision {}",
+                expected_revision,
+                prior_run.revision
+            );
+        }
+
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        if sop.execution_mode != SopExecutionMode::Deterministic {
+            bail!("interactive SOP input is supported only in deterministic mode");
+        }
+        let step = self.resolve_sop_step(&sop, prior_run.current_step)?;
+        if step.kind != SopStepKind::Input {
+            bail!(
+                "Run {run_id} current step {} is not an interactive input step",
+                step.number
+            );
+        }
+        let current_fingerprint = interactive_input_fingerprint(&prior_run, &step);
+        if current_fingerprint != expected_fingerprint {
+            bail!(
+                "Run {run_id} interactive input request is stale or its definition changed \
+                 (expected {expected_fingerprint}, current {current_fingerprint})"
+            );
+        }
+        let output_schema = step
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.output.as_ref())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Step {} interactive input has no output schema",
+                    step.number
+                ))
+            })?;
+        schema::validate_interactive_schema(output_schema).map_err(|reason| {
+            anyhow::Error::msg(format!(
+                "Step {} interactive input schema is invalid: {reason}",
+                step.number
+            ))
+        })?;
+        schema::validate_value(output_schema, &value).map_err(|reason| {
+            anyhow::Error::msg(format!(
+                "Step {} interactive input schema validation failed: {reason}",
+                step.number
+            ))
+        })?;
+
+        // The first interactive primitive is intentionally narrow: one human
+        // value feeds one externally-driven execute step. This keeps acceptance
+        // free of inline capabilities, nested parks, or terminal side effects so
+        // the run transition and audit event can commit atomically.
+        let next_number = step
+            .routing
+            .next
+            .unwrap_or_else(|| step.number.saturating_add(1));
+        let next_step = self.resolve_sop_step(&sop, next_number)?;
+        if next_step.kind != SopStepKind::Execute {
+            bail!(
+                "Step {} interactive input must route directly to an execute step",
+                step.number
+            );
+        }
+        if let Some(reason) = self.schema_input_failure_reason(&next_step, &value) {
+            bail!(
+                "Step {} input schema validation failed: {reason}",
+                next_step.number
+            );
+        }
+        let mut tentative = prior_run.clone();
+        tentative.status = SopRunStatus::Running;
+        tentative.waiting_since = None;
+        tentative.current_step = next_step.number;
+        let now = now_iso8601();
+        tentative.step_results.push(SopStepResult {
+            step_number: step.number,
+            status: SopStepStatus::Completed,
+            output: format!(
+                "[private interactive input marker:{value_marker}; bytes:{}]",
+                serialized.len()
+            ),
+            started_at: now.clone(),
+            completed_at: Some(now.clone()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        });
+        let run_data = RunData::from_step_results(&tentative.step_results);
+        if !route::eligible(&next_step, &run_data) {
+            bail!(
+                "Step {} dependencies are not satisfied after interactive input",
+                next_step.number
+            );
+        }
+        if !route::guard::within_visit_bound(
+            &tentative,
+            next_step.number,
+            self.config.max_step_visits,
+        ) {
+            bail!("step {} visit limit reached", next_step.number);
+        }
+
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "interactive_input_submitted".to_string(),
+            actor: Some(principal.id.as_str().to_string()),
+            reason: None,
+            payload: ::serde_json::json!({
+                "step": step.number,
+                "reference_revision": expected_revision,
+                "request_fingerprint": current_fingerprint,
+                "auth_method": principal.auth_method,
+                "bytes": serialized.len(),
+                "value_marker": value_marker,
+                "to_step": next_step.number,
+            }),
+        };
+        self.reacquire_claim_on_resume(run_id)?;
+        self.active_runs.insert(run_id.to_string(), tentative);
+        if let Err(error) = self.persist_active_with_gate_event(run_id, &event) {
+            self.active_runs.insert(run_id.to_string(), prior_run);
+            self.release_claim_on_park(run_id);
+            return Err(error);
+        }
+        Ok(SopRunAction::DeterministicStep {
+            run_id: run_id.to_string(),
+            step: next_step,
+            input: value,
+        })
     }
 
     fn forge_comment_authorized_by_prior_checkpoint(
@@ -4228,7 +4545,9 @@ impl SopEngine {
                     recorded.status = SopStepStatus::Failed;
                     recorded.output = full_reason;
                 }
-            } else if let Some(run) = self.active_runs.get_mut(run_id) {
+            } else if current_step.kind != SopStepKind::Input
+                && let Some(run) = self.active_runs.get_mut(run_id)
+            {
                 run.llm_calls_saved += 1;
             }
         }
@@ -4552,6 +4871,64 @@ impl SopEngine {
                     run_id: run_id.to_string(),
                     step: step.clone(),
                     state_file,
+                })
+            }
+            SopStepKind::Input => {
+                if let Some(reason) = self.pending_pool_full_reason(sop) {
+                    Self::log_pending_capacity_full(run_id, &reason);
+                    return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                }
+
+                let reference_revision = if let Some(run) = self.active_runs.get_mut(run_id) {
+                    run.status = SopRunStatus::WaitingInput;
+                    run.waiting_since = Some(now_iso8601());
+                    run.revision = run.revision.saturating_add(1);
+                    run.revision
+                } else {
+                    bail!("Active run not found: {run_id}");
+                };
+                let request_fingerprint = self
+                    .active_runs
+                    .get(run_id)
+                    .map(|run| interactive_input_fingerprint(run, step))
+                    .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+
+                match self.persist_parked_snapshot_then_release_claim(run_id) {
+                    ParkPersistOutcome::Released => {
+                        self.record_transition_event(
+                            run_id,
+                            "interactive_input_requested",
+                            None,
+                            ::serde_json::json!({
+                                "step": step.number,
+                                "reference_revision": reference_revision,
+                                "request_fingerprint": request_fingerprint,
+                            }),
+                        );
+                    }
+                    ParkPersistOutcome::CapacityFull => {
+                        let reason = self.pending_pool_capacity_raced_reason(sop);
+                        Self::log_pending_capacity_full(run_id, &reason);
+                        return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                    }
+                    ParkPersistOutcome::PersistFailed => {
+                        let reason =
+                            format!("SOP '{}' input wait not yet durably persisted", sop.name);
+                        return Ok(SopRunAction::Pending {
+                            run_id: run_id.to_string(),
+                            sop_name: sop.name.clone(),
+                            step: step.number,
+                            reason,
+                        });
+                    }
+                }
+
+                Ok(SopRunAction::InteractiveInputWait {
+                    run_id: run_id.to_string(),
+                    step: step.clone(),
+                    prior_input: input,
+                    reference_revision,
+                    request_fingerprint,
                 })
             }
             SopStepKind::Capability => self.execute_capability_step(sop, run_id, step, input),
@@ -5484,7 +5861,8 @@ fn step_requires_approval_gate(sop: &Sop, step: &SopStep) -> bool {
 }
 
 fn pending_step_blocks_direct_advance(sop: &Sop, step: &SopStep) -> bool {
-    step.kind == SopStepKind::Checkpoint || step_requires_approval_gate(sop, step)
+    matches!(step.kind, SopStepKind::Checkpoint | SopStepKind::Input)
+        || step_requires_approval_gate(sop, step)
 }
 
 /// Determine the action for a step based on the effective execution mode.
@@ -5569,6 +5947,20 @@ pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
         .last()
         .map(step_result_value)
         .unwrap_or(Value::Null)
+}
+
+fn interactive_input_fingerprint(run: &SopRun, step: &SopStep) -> String {
+    let contract = ::serde_json::json!({
+        "run_id": run.run_id,
+        "step": step.number,
+        "revision": run.revision,
+        "title": step.title,
+        "prompt": step.body,
+        "schema": step.schema.as_ref().and_then(|schema| schema.output.as_ref()),
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(contract.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Gate re-presentations per checkpoint a `Revise` may spend before the gate
@@ -5710,14 +6102,15 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 /// A1: whether a run in `active_runs` currently occupies an execution slot (holds
-/// a store CAS claim). A run parked at a HITL approval / deterministic checkpoint
-/// releases its claim on park, so it does NOT hold a slot; every other non-terminal
-/// status does. Keeps the in-memory admission fallback aligned with the store's
-/// `claim_counts`, which counts only live (executing) claims.
+/// a store CAS claim). A run parked at a HITL approval, deterministic checkpoint,
+/// or interactive-input wait releases its claim on park, so it does NOT hold a
+/// slot; every other non-terminal status does. Keeps the in-memory admission
+/// fallback aligned with the store's `claim_counts`, which counts only live
+/// (executing) claims.
 fn holds_exec_claim(status: SopRunStatus) -> bool {
     !matches!(
         status,
-        SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+        SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint | SopRunStatus::WaitingInput
     )
 }
 
@@ -5871,6 +6264,7 @@ mod tests {
             | SopRunAction::WaitApproval { run_id, .. }
             | SopRunAction::DeterministicStep { run_id, .. }
             | SopRunAction::CheckpointWait { run_id, .. }
+            | SopRunAction::InteractiveInputWait { run_id, .. }
             | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
@@ -11793,6 +12187,419 @@ mod tests {
             max_pending_approvals: 0,
             agent: None,
         }
+    }
+
+    fn interactive_input_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Interactive SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Operator input".into(),
+                    body: "Describe the requested result.".into(),
+                    kind: SopStepKind::Input,
+                    schema: Some(StepSchema {
+                        input: None,
+                        output: Some(serde_json::json!({"type": "string"})),
+                    }),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Use input".into(),
+                    body: "Process the submitted value.".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn system_sop_requires_typed_registration_and_start() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        assert!(
+            engine
+                .register_builtin_sop(
+                    SystemSopId::ZERONA_CREATE_AGENT,
+                    interactive_input_sop("system.wrong")
+                )
+                .is_err(),
+            "a reserved-looking name is not typed system provenance"
+        );
+        engine
+            .register_builtin_sop(
+                SystemSopId::ZERONA_CREATE_AGENT,
+                interactive_input_sop(SystemSopId::ZERONA_CREATE_AGENT.as_str()),
+            )
+            .unwrap();
+        assert!(
+            engine
+                .start_run(SystemSopId::ZERONA_CREATE_AGENT.as_str(), manual_event())
+                .is_err(),
+            "ordinary string dispatch cannot start a system workflow"
+        );
+        let action = engine
+            .start_system_run(SystemSopId::ZERONA_CREATE_AGENT, manual_event())
+            .unwrap();
+        assert!(matches!(action, SopRunAction::InteractiveInputWait { .. }));
+    }
+
+    #[test]
+    fn interactive_input_step_parks_then_routes_authenticated_value() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine =
+            engine_with_sops(vec![interactive_input_sop("interactive")]).with_store(store.clone());
+
+        let first = engine.start_run("interactive", manual_event()).unwrap();
+        let (run_id, revision, fingerprint) = match first {
+            SopRunAction::InteractiveInputWait {
+                run_id,
+                step,
+                prior_input,
+                reference_revision,
+                request_fingerprint,
+            } => {
+                assert_eq!(step.number, 1);
+                assert_eq!(prior_input, serde_json::Value::Null);
+                (run_id, reference_revision, request_fingerprint)
+            }
+            other => panic!("expected interactive input wait, got {other:?}"),
+        };
+        assert_eq!(revision, 1);
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingInput
+        );
+        assert!(
+            engine.can_start("interactive"),
+            "parked input releases its slot"
+        );
+
+        let next = engine
+            .submit_interactive_input(
+                &run_id,
+                revision,
+                &fingerprint,
+                serde_json::json!("build a careful reviewer"),
+                Principal::new("operator", "operator", AuthMethod::Peercred),
+            )
+            .unwrap();
+        assert!(matches!(
+            next,
+            SopRunAction::DeterministicStep {
+                ref step,
+                ref input,
+                ..
+            } if step.number == 2 && input == "build a careful reviewer"
+        ));
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::Running);
+        assert_eq!(run.step_results.len(), 1);
+        assert!(run.step_results[0].output.contains("marker:"));
+        assert!(!run.step_results[0].output.contains("careful reviewer"));
+        assert_eq!(
+            run.llm_calls_saved, 0,
+            "human input is not a saved LLM call"
+        );
+        let event = engine
+            .run_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "interactive_input_submitted")
+            .expect("input submission is audited");
+        assert_eq!(event.actor.as_deref(), Some("operator"));
+        assert_eq!(event.payload["auth_method"], "peercred");
+        assert!(
+            event.payload.get("value").is_none(),
+            "audit omits raw input"
+        );
+        assert!(event.payload.get("value_digest").is_none());
+        assert!(event.payload["value_marker"].as_str().is_some());
+        let persisted = store.load_run(&run_id).unwrap().unwrap();
+        let persisted_json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            !persisted_json.contains("careful reviewer"),
+            "durable run state must retain only input metadata"
+        );
+        let event_json = serde_json::to_string(&engine.run_events(&run_id).unwrap()).unwrap();
+        assert!(
+            !event_json.contains("careful reviewer"),
+            "event history must retain only input metadata"
+        );
+    }
+
+    #[test]
+    fn interactive_input_rejects_stale_invalid_agent_and_secret_values_in_place() {
+        let mut engine = engine_with_sops(vec![interactive_input_sop("interactive-guard")]);
+        let first = engine
+            .start_run("interactive-guard", manual_event())
+            .unwrap();
+        let (run_id, revision, fingerprint) = match first {
+            SopRunAction::InteractiveInputWait {
+                run_id,
+                reference_revision,
+                request_fingerprint,
+                ..
+            } => (run_id, reference_revision, request_fingerprint),
+            other => panic!("expected interactive input wait, got {other:?}"),
+        };
+
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision.saturating_sub(1),
+                    &fingerprint,
+                    serde_json::json!("safe"),
+                    Principal::shared_operator(),
+                )
+                .is_err()
+        );
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision,
+                    &fingerprint,
+                    serde_json::json!(7),
+                    Principal::shared_operator(),
+                )
+                .is_err(),
+            "declared output schema validates operator submissions"
+        );
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision,
+                    &fingerprint,
+                    serde_json::json!("safe"),
+                    Principal::new("unbound", "unbound", AuthMethod::None)
+                )
+                .is_err(),
+            "an agent cannot impersonate interactive human input"
+        );
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision,
+                    &fingerprint,
+                    serde_json::json!("token=abcdefghijklmnopqrstuvwx"),
+                    Principal::shared_operator(),
+                )
+                .is_err(),
+            "credential-like values never enter the run store"
+        );
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingInput);
+        assert!(run.step_results.is_empty());
+    }
+
+    #[test]
+    fn interactive_input_cannot_bypass_submit_through_generic_advance() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![interactive_input_sop("interactive-bypass")])
+            .with_store(store.clone());
+        let first = engine
+            .start_run("interactive-bypass", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let sentinel = "raw-value-must-not-persist";
+
+        assert!(
+            engine
+                .advance_deterministic_step(&run_id, serde_json::json!(sentinel), None)
+                .is_err()
+        );
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingInput);
+        assert!(run.step_results.is_empty());
+        assert!(engine.can_start("interactive-bypass"));
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "interactive_input_submitted")
+        );
+        assert!(
+            !serde_json::to_string(&store.load_run(&run_id).unwrap())
+                .unwrap()
+                .contains(sentinel)
+        );
+    }
+
+    #[test]
+    fn interactive_input_state_and_event_roll_back_together_on_store_failure() {
+        let store = Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![interactive_input_sop("interactive-atomic")])
+            .with_store(store.clone());
+        let first = engine
+            .start_run("interactive-atomic", manual_event())
+            .unwrap();
+        let (run_id, revision, fingerprint) = match first {
+            SopRunAction::InteractiveInputWait {
+                run_id,
+                reference_revision,
+                request_fingerprint,
+                ..
+            } => (run_id, reference_revision, request_fingerprint),
+            other => panic!("expected interactive input wait, got {other:?}"),
+        };
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision,
+                    &fingerprint,
+                    serde_json::json!("safe input"),
+                    Principal::shared_operator(),
+                )
+                .is_err()
+        );
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingInput);
+        assert!(run.step_results.is_empty());
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "interactive_input_submitted"),
+            "the atomic store failure must not leave a lying submission event"
+        );
+        assert!(
+            engine.can_start("interactive-atomic"),
+            "rollback must release the reacquired execution claim"
+        );
+    }
+
+    #[test]
+    fn interactive_input_fingerprint_rejects_definition_drift() {
+        let mut engine = engine_with_sops(vec![interactive_input_sop("interactive-drift")]);
+        let first = engine
+            .start_run("interactive-drift", manual_event())
+            .unwrap();
+        let (run_id, revision, fingerprint) = match first {
+            SopRunAction::InteractiveInputWait {
+                run_id,
+                reference_revision,
+                request_fingerprint,
+                ..
+            } => (run_id, reference_revision, request_fingerprint),
+            other => panic!("expected interactive input wait, got {other:?}"),
+        };
+        engine.sops[0].steps[0].body = "A changed operator prompt".to_string();
+
+        assert!(
+            engine
+                .submit_interactive_input(
+                    &run_id,
+                    revision,
+                    &fingerprint,
+                    serde_json::json!("safe input"),
+                    Principal::shared_operator(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingInput
+        );
+    }
+
+    #[test]
+    fn approval_resolver_cannot_clear_interactive_input_wait() {
+        let mut engine = engine_with_sops(vec![interactive_input_sop("interactive-not-gate")]);
+        let first = engine
+            .start_run("interactive-not-gate", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            matches!(&outcome, super::super::approval::BrokerOutcome::NotWaiting),
+            "approval resolver returned {outcome:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingInput
+        );
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| !event.kind.starts_with("gate_"))
+        );
+    }
+
+    #[test]
+    fn durable_restore_keeps_interactive_input_parked_and_resumable() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop = interactive_input_sop("interactive-restore");
+        let mut original = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let first = original
+            .start_run("interactive-restore", manual_event())
+            .unwrap();
+        let (run_id, revision, fingerprint) = match first {
+            SopRunAction::InteractiveInputWait {
+                run_id,
+                reference_revision,
+                request_fingerprint,
+                ..
+            } => (run_id, reference_revision, request_fingerprint),
+            other => panic!("expected interactive input wait, got {other:?}"),
+        };
+
+        let mut restored = engine_with_sops(vec![sop]).with_store(store);
+        restored.restore_runs();
+        assert_eq!(
+            restored.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingInput
+        );
+        let next = restored
+            .submit_interactive_input(
+                &run_id,
+                revision,
+                &fingerprint,
+                serde_json::json!("resume"),
+                Principal::shared_operator(),
+            )
+            .unwrap();
+        assert!(matches!(
+            next,
+            SopRunAction::DeterministicStep { ref step, .. } if step.number == 2
+        ));
     }
 
     #[test]

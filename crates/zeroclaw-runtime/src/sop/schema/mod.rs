@@ -14,6 +14,45 @@ pub fn validate_value(schema: &Value, data: &Value) -> Result<(), SchemaError> {
     validate_node(&node, data, "$")
 }
 
+/// Validate a schema used as an interactive-input enforcement boundary. The
+/// general SOP schema reader historically ignores unknown JSON Schema keywords
+/// for compatibility; an operator-input contract cannot claim constraints the
+/// runtime does not enforce, so unknown behavioral keywords fail closed here.
+pub fn validate_interactive_schema(schema: &Value) -> Result<(), SchemaError> {
+    reject_unsupported_interactive_keywords(schema, "$")?;
+    compile::compile_schema(schema).map(|_| ())
+}
+
+fn reject_unsupported_interactive_keywords(schema: &Value, path: &str) -> Result<(), SchemaError> {
+    let object = schema.as_object().ok_or_else(|| {
+        SchemaError::Malformed(format!("interactive schema at {path} must be an object"))
+    })?;
+    for (key, value) in object {
+        match key.as_str() {
+            "type" | "required" => {}
+            "properties" => {
+                let properties = value.as_object().ok_or_else(|| {
+                    SchemaError::Malformed(format!(
+                        "interactive schema properties at {path} must be an object"
+                    ))
+                })?;
+                for (name, child) in properties {
+                    reject_unsupported_interactive_keywords(child, &format!("{path}.{name}"))?;
+                }
+            }
+            "items" => reject_unsupported_interactive_keywords(value, &format!("{path}[]"))?,
+            // Annotation-only keywords do not promise validation behavior.
+            "description" | "title" | "$comment" | "default" | "examples" => {}
+            unsupported => {
+                return Err(SchemaError::Malformed(format!(
+                    "unsupported interactive schema keyword `{unsupported}` at {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_node(node: &SchemaNode, data: &Value, path: &str) -> Result<(), SchemaError> {
     match node {
         SchemaNode::Any => Ok(()),
@@ -160,5 +199,20 @@ mod tests {
             validate_value(&schema, &json!({})),
             Err(SchemaError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn interactive_schema_rejects_unenforced_keywords() {
+        for keyword in ["enum", "pattern", "additionalProperties", "oneOf"] {
+            let mut schema = json!({"type": "string"});
+            schema
+                .as_object_mut()
+                .unwrap()
+                .insert(keyword.to_string(), json!(["safe"]));
+            assert!(
+                validate_interactive_schema(&schema).is_err(),
+                "accepted unsupported keyword {keyword}"
+            );
+        }
     }
 }

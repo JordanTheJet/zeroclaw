@@ -249,6 +249,7 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::WaitApproval { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
         | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::InteractiveInputWait { run_id, .. }
         | SopRunAction::Pending { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
@@ -262,6 +263,7 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::WaitApproval { .. } => "WaitApproval",
         SopRunAction::DeterministicStep { .. } => "DeterministicStep",
         SopRunAction::CheckpointWait { .. } => "CheckpointWait",
+        SopRunAction::InteractiveInputWait { .. } => "InteractiveInputWait",
         SopRunAction::Pending { .. } => "Pending",
         SopRunAction::Completed { .. } => "Completed",
         SopRunAction::Failed { .. } => "Failed",
@@ -1020,6 +1022,16 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                             step.number,
                             step.title,
                             state_file.display().to_string()
+                        )
+                    );
+                }
+                SopRunAction::InteractiveInputWait { step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "SOP headless dispatch: run {run_id} ('{sop_name}') waiting for authenticated operator input on step {} '{}'",
+                            step.number, step.title
                         )
                     );
                 }

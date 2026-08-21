@@ -13,6 +13,12 @@ Common key patterns:
 - `sop_approval_{run_id}_{step_number}`: operator approval record
 - `sop_timeout_approve_{run_id}_{step_number}`: timeout auto-approval record
 
+Compiled-in interactive steps append `interactive_input_requested` and
+`interactive_input_submitted` run events. These records contain step/revision,
+transport attribution, byte count, and a random correlation marker only. Raw
+operator text and value-derived digests are not copied into run results or
+event payloads.
+
 ## 2. Inspection Paths
 
 ### 2.1 Definition-level CLI
@@ -37,6 +43,9 @@ SOP run state is queried from in-agent tools:
 - `sop_status` with `include_gate_status: true`: trust phase and gate evaluator state (when available)
 - `sop_approve`: approve waiting run step
 - `sop_advance`: submit step result and move run forward
+
+Interactive input currently has no general in-agent submit tool. It is reserved
+for typed system workflows whose authenticated host owns the input surface.
 
 ## 3. Metrics
 

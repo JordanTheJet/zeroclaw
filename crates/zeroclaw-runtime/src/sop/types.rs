@@ -248,6 +248,9 @@ pub enum SopStepKind {
     Checkpoint,
     /// Deterministic capability step - executed by the SOP capability registry.
     Capability,
+    /// Human-input step - parks a deterministic run until an authenticated
+    /// operator supplies one schema-validated value.
+    Input,
 }
 
 impl fmt::Display for SopStepKind {
@@ -256,6 +259,7 @@ impl fmt::Display for SopStepKind {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
             Self::Capability => write!(f, "capability"),
+            Self::Input => write!(f, "input"),
         }
     }
 }
@@ -697,6 +701,8 @@ pub enum SopRunStatus {
     WaitingApproval,
     /// Paused at a checkpoint in a deterministic workflow.
     PausedCheckpoint,
+    /// Paused at an interactive step awaiting authenticated operator input.
+    WaitingInput,
     Completed,
     Failed,
     Cancelled,
@@ -709,6 +715,7 @@ impl fmt::Display for SopRunStatus {
             Self::Running => write!(f, "running"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
             Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
+            Self::WaitingInput => write!(f, "waiting_input"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
@@ -796,18 +803,16 @@ pub struct SopRun {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub step_results: Vec<SopStepResult>,
-    /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
+    /// ISO-8601 timestamp when the run entered a human-wait state.
     #[serde(default)]
     pub waiting_since: Option<String>,
     /// Number of LLM calls saved by deterministic execution in this run.
     #[serde(default)]
     pub llm_calls_saved: u64,
-    /// Gate-presentation counter: bumped on each `Revise` re-presentation AND on
-    /// each new checkpoint park after the first, so EVERY prompt this run ever
-    /// sends has a unique revision-qualified reference (`<run_id>#<rev>`; bare =
-    /// 0, the run's very first gate). An answer on a superseded prompt — an older
-    /// draft, or an earlier GATE's leftover buttons — can never resolve the
-    /// current one.
+    /// Human-presentation counter: bumped on each interactive-input prompt,
+    /// `Revise` re-presentation, and each new checkpoint after the first. Every
+    /// prompt can therefore carry a unique revision-qualified reference. A reply
+    /// to an older prompt cannot resolve the current wait.
     #[serde(default)]
     pub revision: u32,
     /// `revision` as of the CURRENT gate's first presentation. `revision -
@@ -947,6 +952,16 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         state_file: PathBuf,
+    },
+    /// Deterministic workflow hit an interactive input step. The run is already
+    /// durably parked and holds no execution claim. `input` is the value piped
+    /// into the step; the operator's submitted value becomes this step's output.
+    InteractiveInputWait {
+        run_id: String,
+        step: SopStep,
+        prior_input: serde_json::Value,
+        reference_revision: u32,
+        request_fingerprint: String,
     },
     /// Routing selected a step whose dependencies are not yet satisfied.
     Pending {

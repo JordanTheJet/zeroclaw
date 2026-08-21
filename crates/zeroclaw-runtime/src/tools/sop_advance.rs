@@ -253,6 +253,12 @@ impl Tool for SopAdvanceTool {
                             step.title
                         )
                     }
+                    SopRunAction::InteractiveInputWait { run_id, step, .. } => {
+                        format!(
+                            "Step recorded. Run {run_id} is waiting for authenticated operator input: {}",
+                            step.title
+                        )
+                    }
                     SopRunAction::Pending {
                         run_id,
                         step,

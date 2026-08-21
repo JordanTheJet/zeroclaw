@@ -146,7 +146,9 @@ pub(super) fn pending_capacity_member(existing: &PersistedRun, incoming: &Persis
         && existing.run.sop_name == incoming.run.sop_name
         && matches!(
             existing.run.status,
-            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+            SopRunStatus::WaitingApproval
+                | SopRunStatus::PausedCheckpoint
+                | SopRunStatus::WaitingInput
         )
 }
 

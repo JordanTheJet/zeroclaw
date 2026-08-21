@@ -31,6 +31,14 @@ Run persistence is opt-in. With the default `sop.persist_runs = false`, the engi
 
 SOP audit records in the Memory backend are a separate observability surface. They do not replace the run store and must not be used as the authority for whether a run is active, paused, approved, or terminal.
 
+`WaitingInput` is separate from `WaitingApproval` and `PausedCheckpoint`.
+Approval decisions and timeout policy cannot satisfy an input wait. The first
+input-step implementation is reserved for compiled-in system workflows and
+stores only request/value metadata; the raw value is handed directly to its
+host-driven successor. Zerona runs this workflow in a process-local engine, so
+an interrupted private conversation is discarded and restarted rather than
+rehydrated from durable run payloads.
+
 Approval and checkpoint states are durable control states only when the run store is durable. Timeout policy remains fail-closed by default: a timed-out approval escalates and keeps waiting unless config explicitly selects cancellation or the legacy auto-approve behavior.
 
 ## Delegation and subagents

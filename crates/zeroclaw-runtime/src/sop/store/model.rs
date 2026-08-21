@@ -6,7 +6,9 @@ use crate::sop::types::{SopRun, SopTriggerSource};
 
 /// Bump when the persisted envelope layout changes incompatibly. Rehydrate
 /// skips + logs unknown major versions rather than panicking on boot.
-pub const SOP_STORE_VERSION: u32 = 1;
+/// Version 2 adds the `waiting_input` run status. Version 1 rows remain
+/// structurally compatible and deserialize unchanged in newer binaries.
+pub const SOP_STORE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedRun {

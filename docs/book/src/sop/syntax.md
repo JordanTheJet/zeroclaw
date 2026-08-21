@@ -157,7 +157,7 @@ Parser behavior:
 - Leading bold text (`**Title**`) becomes step title.
 - `- tools:` maps to `suggested_tools`.
 - `- requires_confirmation: true` enforces approval for that step.
-- `- kind:` accepts `execute` (default) or `checkpoint`. A checkpoint step
+- `- kind:` accepts `execute` (default), `checkpoint`, or `capability`. A checkpoint step
   pauses deterministic execution at that step. Use `requires_confirmation: true`
   when a step must require approval in any execution mode.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
@@ -177,6 +177,17 @@ Parser behavior:
   it for an unpoliced gate. A step that names a policy absent from
   `[sop.approval].policies` fails closed (the gate stays waiting) rather than
   clearing on a single approval.
+
+The engine also has a metadata-only `input` step for compiled-in system
+workflows such as Zerona. It is intentionally not an authorable SOP surface yet:
+the `system.` namespace is reserved, file-backed saves reject it, and ordinary
+SOP dispatch cannot start a system workflow. An input step is distinct from an
+approval gate. It accepts one transport-authenticated, bounded,
+schema-validated value, records only a random marker and its size, and feeds
+the raw value directly to one externally-driven execute step without writing it
+or a value-derived digest into run history. General user-authored input steps
+remain disabled until dedicated
+authenticated RPC, web, and Zerocode submit/cancel surfaces exist.
 
 ### `[sop.approval]` policies and route delivery
 

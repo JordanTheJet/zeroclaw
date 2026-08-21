@@ -31,7 +31,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use engine::{MaintenanceSummary, SopEngine, SystemSopId, err_is_resume_at_capacity};
 pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -494,6 +494,12 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_pending_approvals,
         agent,
     };
+    if sop.steps.iter().any(|step| step.kind == SopStepKind::Input) {
+        let validation = validate_sop_strict(&sop);
+        if !validation.is_ok() {
+            anyhow::bail!("SOP rejected: {}", validation.blocking.join("; "));
+        }
+    }
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
     Ok(sop)
 }
@@ -772,6 +778,7 @@ fn parse_step_kind(value: &str) -> SopStepKind {
     match value.trim().to_ascii_lowercase().as_str() {
         "checkpoint" | "approval" => SopStepKind::Checkpoint,
         "capability" => SopStepKind::Capability,
+        "input" | "interactive" => SopStepKind::Input,
         _ => SopStepKind::Execute,
     }
 }
@@ -879,8 +886,11 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     if step.requires_confirmation {
         bullets.push("requires_confirmation: true".to_string());
     }
-    if step.kind == SopStepKind::Checkpoint {
-        bullets.push("kind: checkpoint".to_string());
+    match step.kind {
+        SopStepKind::Checkpoint => bullets.push("kind: checkpoint".to_string()),
+        SopStepKind::Capability => bullets.push("kind: capability".to_string()),
+        SopStepKind::Input => bullets.push("kind: input".to_string()),
+        SopStepKind::Execute => {}
     }
     if let Some(schema) = &step.schema {
         if let Some(input) = &schema.input {
@@ -971,6 +981,9 @@ pub fn render_steps(steps: &[SopStep]) -> String {
 /// failure.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     let mut sop = sop.clone();
+    if sop.name.starts_with("system.") {
+        anyhow::bail!("the 'system.' SOP namespace is reserved for compiled-in workflows");
+    }
     normalize_step_numbers(&mut sop);
     let sop = &sop;
     let validation = validate_sop_strict(sop);
@@ -1117,6 +1130,89 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
         }
         if !seen.insert(step.number) {
             blocking.push(format!("Duplicate step number {}", step.number));
+        }
+        if step.kind == SopStepKind::Input {
+            if !sop.name.starts_with("system.") {
+                blocking.push(format!(
+                    "Step {} interactive input is reserved for compiled-in system SOPs",
+                    step.number
+                ));
+            }
+            if sop.execution_mode != SopExecutionMode::Deterministic {
+                blocking.push(format!(
+                    "Step {} is interactive input but the SOP is not deterministic",
+                    step.number
+                ));
+            }
+            if step.body.trim().is_empty() {
+                blocking.push(format!(
+                    "Step {} interactive input has an empty operator prompt",
+                    step.number
+                ));
+            }
+            match step
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.output.as_ref())
+            {
+                None => blocking.push(format!(
+                    "Step {} interactive input must declare an output schema",
+                    step.number
+                )),
+                Some(schema) => {
+                    if let Err(error) = schema::validate_interactive_schema(schema) {
+                        blocking.push(format!(
+                            "Step {} interactive input schema is invalid: {error}",
+                            step.number
+                        ));
+                    }
+                }
+            }
+            if step.requires_confirmation || step.policy.is_some() {
+                blocking.push(format!(
+                    "Step {} interactive input cannot also be an approval gate",
+                    step.number
+                ));
+            }
+            if !step.suggested_tools.is_empty()
+                || step.scope.is_some()
+                || !step.calls.is_empty()
+                || step.capability.is_some()
+            {
+                blocking.push(format!(
+                    "Step {} interactive input cannot execute tools or capabilities",
+                    step.number
+                ));
+            }
+            if step.routing.when.is_some()
+                || !step.routing.switch.is_empty()
+                || step.routing.terminal
+                || !step.on_failure.is_fail()
+            {
+                blocking.push(format!(
+                    "Step {} interactive input must have one unconditional success successor",
+                    step.number
+                ));
+            }
+            let successor = step
+                .routing
+                .next
+                .unwrap_or_else(|| step.number.saturating_add(1));
+            match sop
+                .steps
+                .iter()
+                .find(|candidate| candidate.number == successor)
+            {
+                Some(candidate) if candidate.kind == SopStepKind::Execute => {}
+                Some(_) => blocking.push(format!(
+                    "Step {} interactive input must route directly to an execute step",
+                    step.number
+                )),
+                None => blocking.push(format!(
+                    "Step {} interactive input has no execute successor",
+                    step.number
+                )),
+            }
         }
     }
 
@@ -1280,6 +1376,58 @@ mod tests {
             title: title.to_string(),
             ..SopStep::default()
         }
+    }
+
+    fn system_input_sop() -> Sop {
+        let mut input = titled_step(1, "Ask operator");
+        input.body = "Provide one value.".into();
+        input.kind = SopStepKind::Input;
+        input.schema = Some(StepSchema {
+            input: None,
+            output: Some(serde_json::json!({"type": "string"})),
+        });
+        input.routing.next = Some(2);
+        let mut execute = titled_step(2, "Use value");
+        execute.kind = SopStepKind::Execute;
+        let mut sop = authoring_sop(vec![input, execute]);
+        sop.name = "system.test.input".into();
+        sop.execution_mode = SopExecutionMode::Deterministic;
+        sop.deterministic = true;
+        sop
+    }
+
+    #[test]
+    fn system_input_step_round_trips_but_user_authoring_is_rejected() {
+        let system = system_input_sop();
+        assert!(validate_sop_strict(&system).is_ok());
+        let markdown = render_steps(&system.steps);
+        let parsed = parse_steps(&markdown);
+        assert_eq!(parsed[0].kind, SopStepKind::Input);
+        assert_eq!(parsed[0].schema, system.steps[0].schema);
+
+        let mut user = system;
+        user.name = "user-input".into();
+        assert!(
+            validate_sop_strict(&user)
+                .blocking
+                .iter()
+                .any(|message| message.contains("reserved for compiled-in system SOPs"))
+        );
+    }
+
+    #[test]
+    fn system_input_step_rejects_unenforced_schema_keywords() {
+        let mut sop = system_input_sop();
+        sop.steps[0].schema.as_mut().unwrap().output = Some(serde_json::json!({
+            "type": "string",
+            "enum": ["yes", "no"]
+        }));
+        assert!(
+            validate_sop_strict(&sop)
+                .blocking
+                .iter()
+                .any(|message| message.contains("unsupported interactive schema keyword"))
+        );
     }
 
     #[test]

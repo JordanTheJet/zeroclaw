@@ -156,6 +156,12 @@ impl Tool for SopExecuteTool {
                             step.title
                         )
                     }
+                    SopRunAction::InteractiveInputWait { run_id, step, .. } => {
+                        format!(
+                            "SOP run started: {run_id} (waiting for authenticated operator input: {})",
+                            step.title
+                        )
+                    }
                     SopRunAction::Pending {
                         run_id,
                         step,
@@ -189,6 +195,7 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         | SopRunAction::Failed { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
         | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::InteractiveInputWait { run_id, .. }
         | SopRunAction::Pending { run_id, .. } => Some(run_id),
     }
 }

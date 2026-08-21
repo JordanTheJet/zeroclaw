@@ -2358,6 +2358,18 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
+                crate::sop::SopRunAction::InteractiveInputWait { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused for authenticated operator input"
+                    );
+                    break;
+                }
                 crate::sop::SopRunAction::Pending {
                     run_id,
                     step,
