@@ -3447,10 +3447,12 @@ fn revoke_wss_client_cert(
         anyhow::bail!("provide --fingerprint <hex> or --device <id>");
     };
     if changed {
-        let revoked_path =
-            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&config.data_dir)
-                .display()
-                .to_string();
+        // Report the path the verifier ACTUALLY reads - the same one the ledger
+        // materialized to above. Printing the ledger default here would name a
+        // file the verifier never consults whenever `[wss.client_auth].crl_path`
+        // is set, which is exactly the moment (incident response) the operator
+        // needs the real path.
+        let revoked_path = effective_crl_path(config).display().to_string();
         println!(
             "{}",
             ta(
