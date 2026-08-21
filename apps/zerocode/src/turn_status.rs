@@ -1,6 +1,7 @@
 //! Status of the current agent turn, surfaced in the input-bar title.
 
 use std::time::Instant;
+use zeroclaw_api::lifecycle::{LifecycleActivity, LifecycleState};
 
 /// Public so tests and the input bar can pattern-match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +26,23 @@ pub enum TurnStatus {
 }
 
 impl TurnStatus {
+    /// Classify detailed TUI state through the shared content-free contract.
+    pub(crate) const fn lifecycle_activity(&self) -> LifecycleActivity {
+        match self {
+            Self::Idle => LifecycleActivity::Idle,
+            Self::CallingTool(_) => LifecycleActivity::Tool,
+            Self::WaitingForApproval | Self::WaitingForInput => LifecycleActivity::Approval,
+            Self::Working | Self::Thinking | Self::Responding | Self::Cancelling => {
+                LifecycleActivity::Turn
+            }
+        }
+    }
+
+    /// Canonical state consumed by terminal and future lifecycle projections.
+    pub(crate) const fn lifecycle_state(&self) -> LifecycleState {
+        self.lifecycle_activity().state()
+    }
+
     /// Verb (no parens, no dots) — `None` for states that render without dots.
     pub(crate) fn verb(&self) -> Option<String> {
         match self {
@@ -39,14 +57,6 @@ impl TurnStatus {
             TurnStatus::WaitingForApproval | TurnStatus::WaitingForInput => None,
             TurnStatus::Cancelling => Some(crate::i18n::t("zc-chat-status-cancelling")),
         }
-    }
-
-    /// Whether the turn is stopped at an operator-input boundary.
-    pub(crate) fn is_blocked(&self) -> bool {
-        matches!(
-            self,
-            TurnStatus::WaitingForApproval | TurnStatus::WaitingForInput
-        )
     }
 
     pub fn label(&self, animation_origin: Instant) -> String {
@@ -105,7 +115,10 @@ mod tests {
             TurnStatus::WaitingForInput.label(past),
             format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-input"))
         );
-        assert!(TurnStatus::WaitingForInput.is_blocked());
+        assert_eq!(
+            TurnStatus::WaitingForInput.lifecycle_state(),
+            LifecycleState::Blocked
+        );
     }
 
     #[test]
@@ -132,5 +145,32 @@ mod tests {
         assert_eq!(dots_for(mk(800)), "..");
         assert_eq!(dots_for(mk(1200)), "...");
         assert_eq!(dots_for(mk(1600)), ""); // wraps
+    }
+
+    #[test]
+    fn every_detailed_status_uses_the_shared_lifecycle_mapping() {
+        for status in [
+            TurnStatus::Working,
+            TurnStatus::Thinking,
+            TurnStatus::Responding,
+            TurnStatus::Cancelling,
+        ] {
+            assert_eq!(status.lifecycle_activity(), LifecycleActivity::Turn);
+            assert_eq!(status.lifecycle_state(), LifecycleState::Working);
+        }
+
+        assert_eq!(
+            TurnStatus::CallingTool("git".into()).lifecycle_activity(),
+            LifecycleActivity::Tool
+        );
+        for status in [TurnStatus::WaitingForApproval, TurnStatus::WaitingForInput] {
+            assert_eq!(status.lifecycle_activity(), LifecycleActivity::Approval);
+            assert_eq!(status.lifecycle_state(), LifecycleState::Blocked);
+        }
+        assert_eq!(
+            TurnStatus::Idle.lifecycle_activity(),
+            LifecycleActivity::Idle
+        );
+        assert_eq!(TurnStatus::Idle.lifecycle_state(), LifecycleState::Idle);
     }
 }

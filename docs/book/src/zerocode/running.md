@@ -48,6 +48,10 @@ the terminal using two escape-sequence conventions:
 - OSC 9;4 reports cleared, indeterminate, or warning progress without requiring
   another program to parse the title text.
 
+Both sequences derive idle, working, blocked, and finished semantics from the
+content-free lifecycle contract in `zeroclaw-api`; Zerocode keeps localized
+detail such as thinking, responding, or the current tool only for display.
+
 This is terminal metadata, not a connection to a particular workspace manager.
 Compatible terminals and multiplexers may display, retain, or consume it;
 software that does not support these sequences ignores them. The payload
