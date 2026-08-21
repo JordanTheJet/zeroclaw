@@ -31,6 +31,7 @@
   - [Service management](./setup/service.md)
   - [Platform install files](./setup/dist-files.md)
 - [Architecture](./architecture/overview.md)
+  - [Chat-based management control plane (proposed)](./architecture/chat-management-control-plane.md)
   - [Request lifecycle](./architecture/request-lifecycle.md)
   - [Channel runtime lifecycle](./architecture/channel-runtime-lifecycle.md)
   - [Tool execution lifecycle](./architecture/tool-execution-lifecycle.md)
