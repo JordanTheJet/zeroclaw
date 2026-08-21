@@ -167,6 +167,9 @@ defaults, which reads back as `plugins.enabled = false` with no warning
 # turn the system on
 zeroclaw config set plugins.enabled true
 
+# load auto-discovered tool and skill plugins at runtime (default: false)
+zeroclaw config set plugins.auto_discover true
+
 # where plugins are discovered (default: ~/.zeroclaw/plugins)
 zeroclaw config set plugins.plugins_dir /srv/zeroclaw/plugins
 
@@ -177,6 +180,15 @@ zeroclaw config set plugins.security.signature_mode strict
 zeroclaw config set plugins.limits.call_fuel 1000000000
 zeroclaw config set plugins.limits.max_memory_mb 256
 ```
+
+`plugins.enabled = true` turns the plugin host on, but auto-discovered tool and
+skill capabilities load only when `plugins.auto_discover = true` as well. That
+flag is `false` by default (fail-closed), so `enabled = true` on its own gives
+you the channels you declare under `[channels.plugin.<alias>]` and no plugin
+tools or skills: a tool or skill package can list and `info` cleanly yet
+contribute nothing at runtime. Explicit channel bindings are operator-named
+rather than auto-discovered, so they do not need `auto_discover`; the flag gates
+only auto-discovered tools and skills.
 
 Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
@@ -230,6 +242,10 @@ The sandbox bounds what a loaded plugin can do; the signature policy bounds
 what loads at all. Both are operator decisions, and they compose:
 
 - `plugins.enabled` false (the default): no plugin code runs, ever.
+- `plugins.auto_discover` false (the default): auto-discovered tool and skill
+  capabilities do not load. `plugins.enabled = true` alone activates only the
+  channels you declare under `[channels.plugin.<alias>]`; tools and skills load
+  only when `auto_discover = true` as well.
 - Signature `strict`: only components whose manifest carries a valid Ed25519
   signature from a key in your trusted set load.
 - Loaded plugin: bounded by fuel, memory ceilings, no-preopen WASI, and the

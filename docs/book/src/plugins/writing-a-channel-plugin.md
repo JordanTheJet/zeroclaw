@@ -325,9 +325,9 @@ across all capabilities. Explicit channel bindings rank ahead of
 auto-discovered tools and skills, so a full plugin directory cannot displace a
 channel the operator configured by hand.
 
-The same admitted set drives all three loaders — the channel loader, the tool
-registry, and the plugin-skill loader — so the ceiling is one shared budget
-rather than a per-capability one. A package that provides both a channel and a
+The same admitted set drives all three loaders: the channel loader, the tool
+registry, and the plugin-skill loader. The ceiling is therefore one shared
+budget rather than a per-capability one. A package that provides both a channel and a
 tool really does spend two slots, and a tool or skill over the ceiling is not
 constructed at all. Admission is a pure function of your current config and
 installed packages: it holds no counter, so the tool registries rebuilt per
