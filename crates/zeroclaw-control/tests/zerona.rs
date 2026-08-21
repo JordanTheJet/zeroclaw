@@ -9,7 +9,7 @@ use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::presets::{SelectorChoice, risk_preset};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-use zeroclaw_onboarding::{
+use zeroclaw_control::{
     AgentProposal, ApplyIntegration, CapabilityRestrictedProviderFactory, CurrentProviderFactory,
     GuardCode, IsolatedProvider, MAX_OPERATOR_TURNS, MemoryChoice, PersonalityFileProposal,
     ProfileDisposition, ProposalErrorCode, ProviderError, ProviderErrorCode,

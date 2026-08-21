@@ -24,7 +24,7 @@ The trait definitions are the source of truth for exact methods, defaults, and t
 | [`zeroclaw-api`](/api/zeroclaw_api/index.html) | Shared boundary types and first-party extension traits |
 | [`zeroclaw-config`](/api/zeroclaw_config/index.html) | Config schema, autonomy types, secrets |
 | [`zeroclaw-runtime`](/api/zeroclaw_runtime/index.html) | Agent loop, security, SOP, and Quickstart apply boundary |
-| [`zeroclaw-onboarding`](/api/zeroclaw_onboarding/index.html) | Capability-free Zerona proposal, validation, and preview types |
+| [`zeroclaw-control`](/api/zeroclaw_control/index.html) | Capability-free Zerona proposal, validation, and preview types |
 | [`zeroclaw-providers`](/api/zeroclaw_providers/index.html) | Every LLM-provider implementation |
 | [`zeroclaw-channels`](/api/zeroclaw_channels/index.html) | Messaging integrations |
 | [`zeroclaw-gateway`](/api/zeroclaw_gateway/index.html) | HTTP/WebSocket gateway |

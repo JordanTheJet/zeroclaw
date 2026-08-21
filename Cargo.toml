@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-onboarding", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-control", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -22,7 +22,7 @@ zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.4", defa
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.4" }
 zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.4", default-features = false }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.4", default-features = false }
-zeroclaw-onboarding = { path = "crates/zeroclaw-onboarding", version = "0.8.4" }
+zeroclaw-control = { path = "crates/zeroclaw-control", version = "0.8.4" }
 zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.4" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.4" }
 zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.4" }
@@ -84,7 +84,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
-zeroclaw-onboarding = { workspace = true, optional = true }
+zeroclaw-control = { workspace = true, optional = true }
 zeroclaw-eval = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
@@ -225,7 +225,7 @@ default = [
 # Channels are opt-in via the lean `default-channels` bundle, `channels-full`,
 # or individual `channel-*` features.
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-onboarding", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:zeroclaw-runtime", "dep:zeroclaw-control", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:which",
     "dep:tokio-tungstenite",

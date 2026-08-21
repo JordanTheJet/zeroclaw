@@ -20,7 +20,7 @@ flowchart TB
     end
 
     subgraph Core["Core"]
-        ONB["zeroclaw-onboarding<br/>Zerona proposal · preview · validation"]
+        ONB["zeroclaw-control<br/>Zerona proposal · preview · validation"]
         RT["zeroclaw-runtime<br/>agent loop · security · SOP · cron · subagents"]
         MEM["zeroclaw-memory<br/>SQLite · embeddings · consolidation"]
         CFG["zeroclaw-config<br/>schema · autonomy · secrets"]
@@ -47,7 +47,7 @@ flowchart TB
 | Crate | Role |
 |---|---|
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
-| `zeroclaw-onboarding` | Capability-free Zerona conversation, narrow agent proposal validation, and host-renderable preview |
+| `zeroclaw-control` | Capability-free Zerona conversation, narrow agent proposal validation, and host-renderable preview |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
 | `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, ...) plus hint-based routing, retry, cooldown, and cross-profile fallback |

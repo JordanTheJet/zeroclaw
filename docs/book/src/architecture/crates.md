@@ -19,7 +19,7 @@ Notable submodules:
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
 
-### `zeroclaw-onboarding`
+### `zeroclaw-control`
 
 The capability-free Zerona agent-creation conversation. This crate sits above
 the runtime rather than adding another onboarding subsystem inside it. It:
