@@ -1,8 +1,8 @@
 ---
-id: ADR-XXXX
+id: ADR-016
 title: First control-plane client is registered receipt-exempt inside the genesis ceremony
 date: 2026-08-21
-status: Proposed (direction decided by maintainer 2026-08-21; see issue #25)
+status: accepted (maintainer decision 2026-08-22; see issue #25)
 relates-to:
   - https://github.com/JordanTheJet/zeroclaw/issues/25
   - https://github.com/JordanTheJet/zeroclaw/issues/35
@@ -11,16 +11,14 @@ relates-to:
   - docs/book/src/architecture/chat-management-control-plane.md
 ---
 
-# ADR-XXXX: First Control-Plane Client Is Registered Receipt-Exempt Inside The Genesis Ceremony
+# ADR-016: First Control-Plane Client Is Registered Receipt-Exempt Inside The Genesis Ceremony
 
-> **Decided direction, record still proposed.** The `ADR-XXXX` identifier is a
-> placeholder. ADR-014 is already claimed on an off-`master` branch, so the
-> maintainer allocates the final number when this record is accepted. The
-> maintainer decided the direction in
-> [issue #25 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
-> the Decision section below records that decision rather than a recommendation.
-> The record stays `proposed` until the acceptance gates are met, and it does not
-> by itself authorize implementation.
+> **Accepted.** The maintainer decided the direction in
+> [issue #25 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807)
+> and accepted this record on 2026-08-22, allocating the ADR-016 identifier
+> (ADR-014 is claimed on an off-`master` branch). The Decision section records
+> that decision. Acceptance authorizes phase-3 implementation of the
+> genesis-time bootstrap registration as specified here.
 
 ## Context
 

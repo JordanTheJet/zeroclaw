@@ -1,8 +1,8 @@
 ---
-id: ADR-XXXX
+id: ADR-015
 title: Control-plane approval and audit key derives from the single ADR-013 authority
 date: 2026-08-21
-status: Proposed (direction decided by maintainer 2026-08-21; see issue #24)
+status: accepted (maintainer decision 2026-08-22; see issue #24)
 relates-to:
   - https://github.com/JordanTheJet/zeroclaw/issues/24
   - https://github.com/JordanTheJet/zeroclaw/issues/35
@@ -13,16 +13,14 @@ relates-to:
   - crates/zeroclaw-config/src/secrets.rs
 ---
 
-# ADR-XXXX: Control-Plane Approval And Audit Key Derives From The Single ADR-013 Authority
+# ADR-015: Control-Plane Approval And Audit Key Derives From The Single ADR-013 Authority
 
-> **Decided direction, record still proposed.** The `ADR-XXXX` identifier is a
-> placeholder. ADR-014 is already claimed on an off-`master` branch, so the
-> maintainer allocates the final number when this record is accepted. The
-> maintainer decided the direction in
-> [issue #24 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
-> the Decision section below records that decision rather than a recommendation.
-> The record stays `proposed` until the acceptance gates are met, and it does not
-> by itself authorize implementation.
+> **Accepted.** The maintainer decided the direction in
+> [issue #24 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651)
+> and accepted this record on 2026-08-22, allocating the ADR-015 identifier
+> (ADR-014 is claimed on an off-`master` branch). The Decision section records
+> that decision. Acceptance authorizes phase-3 implementation of the derived
+> approval and audit key as specified here.
 
 ## Context
 
