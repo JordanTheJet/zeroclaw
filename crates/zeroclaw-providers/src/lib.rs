@@ -993,10 +993,16 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         }
         Err(_) => (body.to_ascii_lowercase(), String::new()),
     };
-    error_message_clauses(&message).into_iter().any(|clause| {
-        let mentions_reasoning_effort = parameter == "reasoning_effort"
-            || clause.contains("reasoning_effort")
-            || clause.contains("reasoning effort");
+    let clauses = error_message_clauses(&message);
+    // The structured `param` field is message-global; letting it satisfy an
+    // arbitrary clause would recreate the cross-clause false positive, so it
+    // counts as the reasoning signal only when the message has a single
+    // substantive clause for it to describe.
+    let single_clause = clauses.iter().filter(|c| !c.trim().is_empty()).count() <= 1;
+    clauses.into_iter().any(|clause| {
+        let mentions_reasoning_effort = clause.contains("reasoning_effort")
+            || clause.contains("reasoning effort")
+            || (single_clause && parameter == "reasoning_effort");
         let mentions_tools = mentions_tools_token(clause);
         let reports_incompatibility = [
             "not supported",
@@ -3753,6 +3759,25 @@ mod tests {
         assert!(!rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::BAD_REQUEST,
             "reasoning_effort is unsupported\ntools are not allowed"
+        ));
+
+        // The structured `param` field must not bridge clauses either: it is
+        // message-global, so in a compound error it cannot supply the
+        // reasoning signal for an unrelated tools clause — in either order.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are unsupported; reasoning_effort value is invalid","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid; tools are unsupported","param":"reasoning_effort"}}"#
+        ));
+
+        // A single-clause structured error may rely on `param` alone for the
+        // reasoning signal.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are not supported at the requested effort","param":"reasoning_effort"}}"#
         ));
 
         // A genuine relationship stated in one clause still matches, even
