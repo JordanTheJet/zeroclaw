@@ -98,7 +98,12 @@ enabled = true
 ```
 
 The daemon prints a one-time **pairing code** and a **short-auth-string (SAS)** to
-its console/log on start. Then, on the workstation:
+its console/log on start. The code is **single-use and expires 10 minutes after
+it is minted** - it is the only bearer credential for certificate issuance, and
+it lands in consoles and logs, so a copied code must stop working shortly after
+the operator has used it. An expired code is refused and cleared; mint a
+replacement from the gateway's pairing API when you need a fresh one. Then, on
+the workstation:
 
 ```sh
 # Interactive: a certless client auto-enrolls on first connect.
