@@ -15,7 +15,11 @@
 //! The service holds no configuration of its own. Every step resolves the
 //! canonical on-disk config at use time and proves its source bytes stayed
 //! identical across the whole read; that revision is what the commit is bound
-//! to and what post-apply verification is judged against.
+//! to. Post-apply verification is judged against the revision the commit
+//! produced: the pinned config path is re-read, the read is proven stable
+//! across the verification load, and the committed bytes are proven to be the
+//! bound revision plus exactly the approved effect — so a concurrent writer's
+//! state is refused rather than verified in the commit's name.
 //!
 //! [`apply`]: ControlService::apply
 //! [`preview`]: ControlService::preview
@@ -46,6 +50,13 @@ const CONFIG_LOAD_ATTEMPTS: usize = 3;
 /// The Quickstart error field that marks a config commit whose outcome could
 /// not be determined. Such an operation is never retried.
 const AMBIGUOUS_COMMIT_FIELD: &str = "config_commit_ambiguous";
+
+/// The section holding the Quickstart bookkeeping flag every apply flips, and
+/// the flag itself. Its movement is the commit's own footprint, never evidence
+/// that something else edited the file.
+const ONBOARD_STATE_SECTION: &str = "onboard_state";
+/// See [`ONBOARD_STATE_SECTION`].
+const QUICKSTART_COMPLETED_KEY: &str = "quickstart_completed";
 
 /// Reject a source whose on-disk schema is not the current revision.
 ///
@@ -272,6 +283,12 @@ pub struct ControlService {
     config_path: PathBuf,
     surface: Surface,
     factory: Arc<dyn CapabilityRestrictedProviderFactory>,
+    /// Interposition between the Quickstart commit and the post-apply read, so
+    /// a test can land a foreign write in exactly the window this service is
+    /// supposed to be immune to. Compiled out of every non-test build: the
+    /// production transaction has no such seam.
+    #[cfg(test)]
+    post_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ControlService {
@@ -295,7 +312,17 @@ impl ControlService {
             config_path: config_path.into(),
             surface,
             factory,
+            #[cfg(test)]
+            post_commit_hook: None,
         }
+    }
+
+    /// The same service with a hook that runs after the Quickstart commit and
+    /// before the post-apply revision is read. See [`Self::post_commit_hook`].
+    #[cfg(test)]
+    fn with_post_commit_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.post_commit_hook = Some(hook);
+        self
     }
 
     /// The configuration path this service is pinned to.
@@ -396,8 +423,10 @@ impl ControlService {
     /// Quickstart performs the compare-and-set: if the on-disk source no longer
     /// equals [`BoundProposal::source_revision`], the commit is refused and the
     /// caller must request a fresh preview. Verification then re-reads the
-    /// canonical configuration and proves the installed agent matches the
-    /// approved proposal and that nothing else moved.
+    /// pinned config path, proves those bytes are the revision this commit
+    /// produced (see [`Self::verify_committed_revision`]), and proves the
+    /// installed agent matches the approved proposal and that nothing else
+    /// moved.
     pub async fn apply(&self, bound: BoundProposal) -> Result<ControlApplyOutcome, ControlError> {
         let BoundProposal {
             validated,
@@ -418,16 +447,40 @@ impl ControlService {
             &expected_source,
         ))
         .await;
+        #[cfg(test)]
+        if let Some(hook) = self.post_commit_hook.as_ref() {
+            hook();
+        }
+        // Read the committed revision before the load that verification reads,
+        // so the two can be proven to describe the same bytes. A failed read is
+        // not an error here: the paths that do not verify must keep reporting
+        // exactly what they reported before, and the paths that do verify treat
+        // an unreadable revision as unverifiable.
+        let committed = tokio::fs::read_to_string(&self.config_path).await.ok();
         let reloaded = Box::pin(Config::load_or_init())
             .await
             .map_err(ControlError::Host)?;
         match apply_result {
             Ok(_) => {
+                self.verify_committed_revision(
+                    &expected_source,
+                    committed.as_deref(),
+                    &reloaded,
+                    &approved,
+                )
+                .await?;
                 verify_install(&reloaded, &approved, &alias, &preserved)?;
                 Ok(ControlApplyOutcome::Verified { agent_alias: alias })
             }
             Err(errors) => {
                 if reloaded.agents.contains_key(&alias) {
+                    self.verify_committed_revision(
+                        &expected_source,
+                        committed.as_deref(),
+                        &reloaded,
+                        &approved,
+                    )
+                    .await?;
                     verify_install(&reloaded, &approved, &alias, &preserved)?;
                     return Ok(ControlApplyOutcome::VerifiedAfterReportedFailure {
                         agent_alias: alias,
@@ -444,6 +497,130 @@ impl ControlService {
             }
         }
     }
+
+    /// Prove the state verification is about to judge is the state this
+    /// transaction committed, not whatever happens to be on disk.
+    ///
+    /// `Config::load_or_init` resolves the install from the ambient
+    /// environment and takes no lock, so on its own it can hand verification a
+    /// concurrent writer's revision and let the transaction claim that
+    /// revision as its own result. Four properties close that gap, each of
+    /// which fails the transaction rather than widening what it will accept:
+    ///
+    /// 1. The load resolved *this* service's pinned config path, so the bytes
+    ///    verified and the bytes committed are the same file.
+    /// 2. The pinned path still holds `committed` after the load, so no write
+    ///    slipped between reading the revision and loading it.
+    /// 3. The committed revision is not the revision the commit was bound to:
+    ///    a commit that reported success must have moved the file.
+    /// 4. The committed revision is the bound revision plus exactly this
+    ///    proposal's approved effect and nothing else — the precise form of
+    ///    (3), and the property a foreign edit to any other section breaks.
+    async fn verify_committed_revision(
+        &self,
+        bound_source: &str,
+        committed: Option<&str>,
+        reloaded: &Config,
+        approved: &ValidatedProposal,
+    ) -> Result<(), ControlError> {
+        let Some(committed) = committed else {
+            return Err(ControlError::VerificationFailed);
+        };
+        if reloaded.config_path != self.config_path {
+            return Err(ControlError::VerificationFailed);
+        }
+        let after_load = tokio::fs::read_to_string(&self.config_path).await.ok();
+        if after_load.as_deref() != Some(committed) {
+            return Err(ControlError::VerificationFailed);
+        }
+        if committed == bound_source {
+            return Err(ControlError::VerificationFailed);
+        }
+        if !committed_revision_is_the_approved_post_image(bound_source, committed, approved) {
+            return Err(ControlError::VerificationFailed);
+        }
+        Ok(())
+    }
+}
+
+/// Is `committed` exactly `bound_source` plus the effect this proposal was
+/// approved for?
+///
+/// A strict add-agent commit writes four regions and no others: the new
+/// agent's own table, the Quickstart completion flag, and the two named
+/// profile presets — and a preset only when the bound revision did not already
+/// carry one under that name, because an existing block always wins. Removing
+/// exactly those regions must leave the two documents identical.
+///
+/// The comparison is deliberately made on the on-disk documents rather than on
+/// loaded [`Config`] values: both sides are then the same kind of bytes, so
+/// secret ciphertext, environment-masked values, and formatting cannot make a
+/// faithful commit look like drift. It is also deliberately an allowlist —
+/// anything Quickstart might write in future that this list does not name
+/// fails the transaction loudly instead of passing unnoticed.
+fn committed_revision_is_the_approved_post_image(
+    bound_source: &str,
+    committed: &str,
+    approved: &ValidatedProposal,
+) -> bool {
+    let (Ok(mut bound_doc), Ok(mut committed_doc)) = (
+        toml::from_str::<toml::Value>(bound_source),
+        toml::from_str::<toml::Value>(committed),
+    ) else {
+        return false;
+    };
+    let raw = approved.proposal();
+    // The approved agent is the whole point of the commit: present in what was
+    // written, absent from what it was written against.
+    if !remove_table_entry(&mut committed_doc, "agents", &raw.agent_alias)
+        || table_entry_exists(&bound_doc, "agents", &raw.agent_alias)
+    {
+        return false;
+    }
+    for (section, preset) in [
+        ("risk_profiles", raw.risk.preset_name()),
+        ("runtime_profiles", raw.runtime.preset_name()),
+    ] {
+        if !table_entry_exists(&bound_doc, section, preset) {
+            remove_table_entry(&mut committed_doc, section, preset);
+        }
+    }
+    remove_table_entry(
+        &mut bound_doc,
+        ONBOARD_STATE_SECTION,
+        QUICKSTART_COMPLETED_KEY,
+    );
+    remove_table_entry(
+        &mut committed_doc,
+        ONBOARD_STATE_SECTION,
+        QUICKSTART_COMPLETED_KEY,
+    );
+    bound_doc == committed_doc
+}
+
+/// Remove `<section>.<key>`, and the now-empty `<section>` with it, so a table
+/// one document only has because of the approved effect cannot itself read as
+/// a difference. Reports whether the entry was there to remove.
+fn remove_table_entry(document: &mut toml::Value, section: &str, key: &str) -> bool {
+    let Some(root) = document.as_table_mut() else {
+        return false;
+    };
+    let Some(entries) = root.get_mut(section).and_then(toml::Value::as_table_mut) else {
+        return false;
+    };
+    let removed = entries.remove(key).is_some();
+    if entries.is_empty() {
+        root.remove(section);
+    }
+    removed
+}
+
+/// See [`remove_table_entry`].
+fn table_entry_exists(document: &toml::Value, section: &str, key: &str) -> bool {
+    document
+        .get(section)
+        .and_then(|entries| entries.get(key))
+        .is_some()
 }
 
 /// The configuration sections an add-agent transaction must leave alone.
@@ -530,7 +707,112 @@ fn verify_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inventory::{RiskChoice, RuntimeChoice};
+    use crate::proposal::PersonalityFileProposal;
     use zeroclaw_config::schema::AliasedAgentConfig;
+
+    /// `Config::load_or_init` resolves the install root from the environment,
+    /// so the tests that pin it serialize on this lock and restore the previous
+    /// value before releasing it — the same discipline
+    /// `tests/control_service.rs` follows for the same reason.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The fixture `tests/control_service.rs` seeds, so the concurrent-writer
+    /// test and the behavior-boundary tests judge the same install.
+    const PROVIDER_CONFIG: &str = r#"schema_version = 3
+
+[memory]
+backend = "none"
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+
+[providers.models.custom.fixture]
+api_key = "fixture-placeholder"
+uri = "http://127.0.0.1:1"
+model = "fixture-model"
+wire_api = "chat_completions"
+"#;
+
+    struct ConfigDirGuard {
+        previous: Option<String>,
+    }
+
+    impl ConfigDirGuard {
+        /// # Safety
+        ///
+        /// The caller must hold `ENV_LOCK` for the whole lifetime of the guard.
+        fn pin(dir: &Path) -> Self {
+            let previous = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+            // SAFETY: serialized by ENV_LOCK; restored on drop.
+            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by ENV_LOCK.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) },
+                None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
+            }
+        }
+    }
+
+    fn writer_proposal() -> AgentProposal {
+        AgentProposal {
+            agent_alias: "writer".to_string(),
+            risk: RiskChoice::LockedDown,
+            runtime: RuntimeChoice::Tight,
+            memory: MemoryChoice::Markdown,
+            personality_files: vec![PersonalityFileProposal {
+                filename: "SOUL.md".to_string(),
+                content: "# Soul\nWrite carefully.".to_string(),
+            }],
+        }
+    }
+
+    /// The proposal above, validated against the fixture, so the post-image
+    /// comparison can be driven with the same approved effect an apply carries.
+    fn approved_writer_proposal() -> ValidatedProposal {
+        let mut config: Config = toml::from_str(PROVIDER_CONFIG).expect("parse fixture config");
+        config.config_path = PathBuf::from("/nonexistent/config.toml");
+        validate_proposal(
+            &config,
+            &CurrentProviderFactory,
+            "custom.fixture",
+            &writer_proposal(),
+        )
+        .expect("the fixture proposal validates")
+    }
+
+    /// The revision a faithful commit of [`approved_writer_proposal`] leaves on
+    /// disk: the fixture plus the agent, both named presets, and the Quickstart
+    /// completion flag.
+    fn faithful_post_image() -> String {
+        format!(
+            "{PROVIDER_CONFIG}
+[agents.writer]
+model_provider = \"custom.fixture\"
+risk_profile = \"locked_down\"
+runtime_profile = \"tight\"
+
+[agents.writer.memory]
+backend = \"markdown\"
+
+[risk_profiles.locked_down]
+allow_shell = false
+
+[runtime_profiles.tight]
+max_tokens = 1024
+
+[onboard_state]
+quickstart_completed = true
+"
+        )
+    }
 
     #[test]
     fn post_apply_snapshot_allows_only_the_new_agent_in_preserved_sections() {
@@ -564,5 +846,99 @@ mod tests {
         assert!(!source_schema_is_current("schema_version = 2\n"));
         assert!(!source_schema_is_current("[autonomy]\nlevel = 'full'\n"));
         assert!(!source_schema_is_current("not valid toml = [\n"));
+    }
+
+    #[test]
+    fn the_approved_effect_is_the_only_difference_a_committed_revision_may_carry() {
+        let approved = approved_writer_proposal();
+        assert!(
+            committed_revision_is_the_approved_post_image(
+                PROVIDER_CONFIG,
+                &faithful_post_image(),
+                &approved
+            ),
+            "the agent, both seeded presets, and the completion flag are the approved effect"
+        );
+
+        let foreign = faithful_post_image().replace("provider_retries = 0", "provider_retries = 7");
+        assert!(
+            !committed_revision_is_the_approved_post_image(PROVIDER_CONFIG, &foreign, &approved),
+            "an edit to a section this transaction never touched is not the approved effect"
+        );
+
+        assert!(
+            !committed_revision_is_the_approved_post_image(
+                PROVIDER_CONFIG,
+                PROVIDER_CONFIG,
+                &approved
+            ),
+            "a revision without the approved agent cannot be the revision that added it"
+        );
+    }
+
+    #[test]
+    fn a_preset_the_bound_revision_already_carried_may_not_move() {
+        let bound = format!("{PROVIDER_CONFIG}\n[risk_profiles.locked_down]\nallow_shell = true\n");
+        assert!(
+            !committed_revision_is_the_approved_post_image(
+                &bound,
+                &faithful_post_image(),
+                &approved_writer_proposal()
+            ),
+            "Quickstart never rewrites an existing preset block, so a moved one is drift"
+        );
+    }
+
+    /// The window this service is supposed to be immune to: the commit has
+    /// landed, and someone else rewrites the config before verification reads
+    /// it. The edit is deliberately one every other post-apply check tolerates
+    /// — `reliability` is not the new agent, not one of the preserved sections,
+    /// and not a field `verify_install` reads — so what refuses it can only be
+    /// the committed-revision proof.
+    #[tokio::test]
+    async fn a_writer_that_lands_before_verification_reads_is_refused_not_verified() {
+        let _lock = ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("temporary install root");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, PROVIDER_CONFIG).expect("seed the install");
+        let _guard = ConfigDirGuard::pin(temp.path());
+
+        let foreign_writer = {
+            let config_path = config_path.clone();
+            Arc::new(move || {
+                let committed =
+                    std::fs::read_to_string(&config_path).expect("read the committed revision");
+                assert!(
+                    committed.contains("writer"),
+                    "the hook must run after the commit landed"
+                );
+                let edited = committed.replace("provider_retries = 0", "provider_retries = 7");
+                assert_ne!(edited, committed, "the foreign edit must change the file");
+                std::fs::write(&config_path, edited).expect("land the foreign edit");
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+
+        let service = ControlService::new(config_path.clone(), Surface::Cli)
+            .with_post_commit_hook(foreign_writer);
+        let inspection = service.inspect().await.expect("inspect the seeded install");
+        let bound = service
+            .preview(inspection, "custom.fixture", &writer_proposal())
+            .expect("the contained proposal previews");
+
+        let error = service
+            .apply(bound)
+            .await
+            .expect_err("verification must not judge a concurrent writer's revision");
+        assert!(
+            matches!(error, ControlError::VerificationFailed),
+            "expected the committed-revision proof to refuse, got {error:?}"
+        );
+
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .expect("read config after the refusal")
+                .contains("provider_retries = 7"),
+            "refusing reports the transaction unverified; it does not undo the writer"
+        );
     }
 }
