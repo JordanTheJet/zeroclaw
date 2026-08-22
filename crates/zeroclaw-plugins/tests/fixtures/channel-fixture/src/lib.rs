@@ -2,6 +2,9 @@
 
 #[cfg(target_family = "wasm")]
 mod component {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
         world: "channel-plugin",
@@ -17,6 +20,11 @@ mod component {
     use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
 
     struct FixtureChannel;
+    static HTTP_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    /// Optional handle taken from the host-provided `configure` payload, so
+    /// host tests can observe which config generation an instance was
+    /// configured with (reconstruction must replay the constructor snapshot).
+    static CONFIGURED_HANDLE: Mutex<Option<String>> = Mutex::new(None);
 
     fn current_public_config() -> Result<serde_json::Value, String> {
         let config = config_get().map_err(|_| "expected point-of-use public config".to_string())?;
@@ -57,8 +65,15 @@ mod component {
             {
                 return Err("expected credential_epoch config".to_string());
             }
-            if public.len() != 2 {
-                return Err("expected only public config".to_string());
+            // Public config carries only non-secret properties. `api_token` is
+            // secret and must never surface here. `handle` is an optional
+            // non-secret the reconstruction test supplies; stash it so the
+            // probed `self-handle` can surface it without a live config frame.
+            if public.contains_key("api_token") {
+                return Err("secret property leaked into public config".to_string());
+            }
+            if let Some(handle) = public.get("handle").and_then(serde_json::Value::as_str) {
+                *CONFIGURED_HANDLE.lock().unwrap() = Some(handle.to_string());
             }
             if !matches!(secret_get("retry_count"), Err(SecretError::NotFound)) {
                 return Err("public property was exposed as a secret".to_string());
@@ -73,6 +88,24 @@ mod component {
         }
 
         fn send(message: SendMessage) -> Result<(), String> {
+            // Deadline/interruption path (master): an http:// URL drives a real
+            // outbound request whose duration the host wall-clock deadline
+            // bounds; the in-flight guard proves an interrupted instance is
+            // discarded rather than resumed.
+            if message.content.starts_with("http://") {
+                if HTTP_CALL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                    return Err("interrupted channel instance was resumed".to_string());
+                }
+                waki::Client::new()
+                    .get(&message.content)
+                    .send()
+                    .and_then(waki::Response::body)
+                    .map_err(|error| error.to_string())?;
+                HTTP_CALL_IN_FLIGHT.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+            // Scoped-secret path (this PR): the message must have been composed
+            // from one current config+secret revision resolved at point of use.
             let config = current_public_config()?;
             let epoch = config
                 .get("credential_epoch")
@@ -92,6 +125,15 @@ mod component {
 
         fn poll_message() -> Option<InboundMessage> {
             let message = zeroclaw::plugin::inbound::inbound_poll()?;
+            // Host tests use this to interrupt a poll after the message has
+            // already been dequeued from the host-owned queue: the spin runs
+            // until the host wall-clock deadline discards this instance.
+            if message.content.starts_with("spin") {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
             Some(InboundMessage {
                 id: message.id,
                 sender: message.sender,
@@ -124,9 +166,20 @@ mod component {
         }
 
         fn self_handle() -> Option<String> {
+            // Static discovery runs outside a service frame, so config and
+            // secrets are unavailable here; surfacing either would mean the host
+            // ran this probe in the wrong phase. The handle stashed during
+            // `configure` is replayed so the reconstruction metadata check sees
+            // a stable value across a rebuilt instance.
             (matches!(config_get(), Err(ConfigError::Unavailable))
                 && matches!(secret_get("api_token"), Err(SecretError::Unavailable)))
-            .then(|| "@fixture".to_string())
+            .then(|| {
+                CONFIGURED_HANDLE
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "@fixture".to_string())
+            })
         }
 
         fn self_addressed_mention() -> Option<String> {

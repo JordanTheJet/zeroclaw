@@ -2653,7 +2653,10 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        if state.turn_in_flight {
+        // Approval overlays own input while an agent turn is paused for a
+        // decision. Keep paste aligned with the keyboard-input guard so it
+        // cannot mutate the hidden composer beneath the modal.
+        if state.pending_approval().is_some() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
@@ -12516,6 +12519,52 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    #[tokio::test]
+    async fn active_turn_paste_populates_composer_and_queues_on_submit() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.clear_input();
+        state.turn_in_flight = true;
+
+        chat.handle_paste("pasted while active");
+
+        let state = active_state(&mut chat);
+        assert_eq!(state.input_bar.input(), "pasted while active");
+        assert!(state.turn_in_flight);
+
+        let InputBarAction::Submit { text, attachments } =
+            state.input_bar.submit_current_input_for_test()
+        else {
+            panic!("pasted input must submit normally");
+        };
+        state
+            .enqueue_message(text.unwrap_or_default(), attachments)
+            .expect("pasted input queues during an active turn");
+
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            state.take_next_dispatchable().is_none(),
+            "an active turn must not dispatch the queued pasted input"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_composer_while_approval_is_pending() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+
+        chat.handle_paste(" must not reach the composer");
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
     }
 
     #[tokio::test]
