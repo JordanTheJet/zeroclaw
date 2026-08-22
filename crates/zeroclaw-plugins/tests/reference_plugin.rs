@@ -122,11 +122,6 @@ fn operator_section() -> HashMap<String, String> {
     ])
 }
 
-/// The host-service bundle a store is built with.
-///
-/// The host resolves this plugin's section from canonical state on every call
-/// rather than handing the store a materialized snapshot, so the config a guest
-/// observes is whatever the resolver returns at the moment it executes.
 fn host_services(
     manifest: PluginManifest,
     configured: Option<HashMap<String, String>>,
@@ -292,7 +287,8 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
     }
 
     // The guest is still callable with a valid section, so the rejections above
-    // were the config path failing, not the component.
+    // were the config path failing, not the component. The store's own service
+    // resolves that well-typed section lazily on this call.
     let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");

@@ -114,7 +114,8 @@ impl ResolvedPluginConfig {
 }
 
 /// Host-injected config service. The closure resolves from canonical state on
-/// every call; the service itself carries no config values or schema snapshot.
+/// every call; the service carries only that source handle, not a materialized
+/// resolved view.
 #[derive(Clone)]
 #[cfg(any(feature = "plugins-wasmtime", test))]
 pub struct PluginConfigResolver {

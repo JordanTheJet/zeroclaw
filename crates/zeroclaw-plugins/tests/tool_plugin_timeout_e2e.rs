@@ -63,9 +63,9 @@ fn limits(call_timeout: Duration, call_fuel: u64) -> PluginLimits {
     }
 }
 
-/// A warm fixture plugin. Config now reaches `execute` through the host
-/// service bundle injected at `create_plugin`, resolved live for the store's
-/// own scope, so the instance no longer carries a separate config view.
+/// A warm fixture plugin. `call_execute` resolves the plugin's non-secret
+/// config through the host-service bundle injected at `create_plugin`, so the
+/// test carries only the warm plugin.
 struct Fixture {
     plugin: runtime::Plugin,
 }
@@ -102,11 +102,14 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> Fixture {
     )
     .expect("admit fixture scope");
     // The fixture manifest declares no `config_schema` and does not request
-    // `config_read`, so the resolver yields the empty object the guest expects.
-    let owned_manifest = manifest.clone();
-    let resolver =
-        PluginConfigResolver::new(move |scope| resolve_plugin_config(&owned_manifest, scope, None));
-    let services = PluginHostServices::new(resolver);
+    // `config_read`, so the injected config service resolves to the empty object
+    // the guest expects.
+    let services = {
+        let manifest = manifest.clone();
+        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, None)
+        }))
+    };
     let plugin = runtime::create_plugin(path, &scope, &services, limits(call_timeout, call_fuel))
         .await
         .expect("instantiate timeout fixture");

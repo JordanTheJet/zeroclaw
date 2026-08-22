@@ -214,12 +214,10 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     assert_eq!(section.get("uppercase").map(String::as_str), Some("true"));
     assert_eq!(section.get("max_len").map(String::as_str), Some("5"));
 
-    // The store resolves this section from the discovered manifest on every
-    // call, so the guest observes canonical host state rather than a snapshot
-    // taken at instantiation.
     let resolver_manifest = manifest.clone();
+    let resolver_section = section.clone();
     let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&section))
+        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
     }));
     let mut plugin = runtime::create_plugin(
         wasm_path,
