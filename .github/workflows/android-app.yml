@@ -153,6 +153,7 @@ jobs:
             :app:lintFullRelease \
             :app:assembleLiteDebug \
             :app:assembleFullDebug \
+            -PZERODROID_INCLUDE_FULL=true \
             -PZEROCLAW_REF="$ZEROCLAW_REF" \
             -PZEROCLAW_COMMIT="$ZEROCLAW_COMMIT" \
             --console=plain

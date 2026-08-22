@@ -21,7 +21,7 @@ OEM accessibility, overlay, battery, telephony, sensor, or app-integration behav
 ## 1. Install and preflight
 
 - [ ] For the v0.3.0 signing-line reset, uninstall the debug-signed build and install the signed
-      full APK cleanly. Do not export the old provider credential before uninstalling.
+      default Lite APK cleanly. Do not export the old provider credential before uninstalling.
 - [ ] `dumpsys package org.zerodroid.bridge` reports version name `0.3.0`, version code `3`, and
       the expected build provenance.
 - [ ] `apksigner verify --print-certs` reports the expected release fingerprint managed outside
@@ -31,7 +31,8 @@ OEM accessibility, overlay, battery, telephony, sensor, or app-integration behav
 - [ ] Phone tools, Autonomous control, encrypted remote access, SSH, boot start, and the bubble are all off.
 - [ ] Accessibility, Draw over other apps, and battery exemptions require deliberate re-granting.
 - [ ] After the clean-install baseline, a same-certificate `adb install -r` preserves app data and
-      Android grants. Test lite separately on an API 30 device/emulator when available.
+      Android grants. Test Full separately on an AICore-supported device only when explicitly
+      validating the optional Gemini Nano path.
 - [ ] Starting the agent creates a live `libzeroclaw.so` child and a fresh `<filesDir>/ui.sock`.
 - [ ] `GET <private-path>/health` succeeds through loopback and reports the
       new PID; the unprefixed admin pairing route is not reachable.
@@ -192,8 +193,8 @@ valid summary unless every row was actually configured and exercised.
 APK / Android app commit:
 Embedded ZeroClaw commit:
 Device / Android build:
-Full flavor: PASS / FAIL
-Lite flavor: PASS / FAIL / not run on compatible hardware
+Lite flavor: PASS / FAIL
+Full flavor: PASS / FAIL / not requested
 Configured providers actually tested:
 Representative apps completed:
 Known failures / skipped checks:

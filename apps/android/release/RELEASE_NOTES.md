@@ -10,7 +10,8 @@ CellClaw-derived Accessibility and floating-overlay layer in one APK.
   Unix socket. Every ordinary mutation revalidates its target package at execution time.
 - The CellClaw overlay state palette and capture-hide behavior, with the initial colour derived from
   the live gateway state.
-- A full Android 12+ flavor and a lite Android 11+ flavor.
+- A default Lite Android 11+ flavor and an explicit Full Android 12+ flavor for experimental
+  AICore compatibility testing.
 - Provider and model selection with 19 hosted defaults validated against models.dev.
 - A persistent v0.3 signing certificate, traceable native-source commit, checksums, and signed
   artifact verification.
@@ -50,8 +51,9 @@ fingerprint against `ZEROCLAW_ANDROID_RELEASE_CERT_SHA256`.
 - The stock APK uses Android's `/system/bin`. BusyBox is an optional custom-build payload, not part
   of the v0.3 release; typed Android tools do not depend on it.
 - Provider tests require a credential supplied by the tester. The APK contains no provider key.
-- The lite flavor compiles and lints at API 30, but still needs a physical Android 11 device or
-  emulator sign-off; the physical Android 16 test device validates the full flavor.
+- The default Lite flavor compiles and lints at API 30, but still needs a physical Android 11
+  device or emulator sign-off. Full has physical Android 16 coverage but retains the experimental
+  AICore client pending migration to ML Kit Prompt API.
 - The source commit is checked, but the local release path does not yet consume a repository-wide
   Rust toolchain pin, so byte-for-byte native reproducibility is not claimed.
 - No public GitHub release, tag, Play listing, or update feed is created by the build workflow.

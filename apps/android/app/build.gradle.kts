@@ -9,6 +9,12 @@ val releaseKeyAlias = providers.environmentVariable("ZERODROID_RELEASE_KEY_ALIAS
 val releaseKeyPassword = providers.environmentVariable("ZERODROID_RELEASE_KEY_PASSWORD").orNull
 val androidAppVersion = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION").get()
 val androidAppVersionCode = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION_CODE").get().toInt()
+val includeFullFlavor = providers.gradleProperty("ZERODROID_INCLUDE_FULL")
+    .map { raw ->
+        raw.toBooleanStrictOrNull()
+            ?: error("ZERODROID_INCLUDE_FULL must be true or false")
+    }
+    .orElse(false)
 val provenanceValuePattern = Regex("[A-Za-z0-9._/-]{1,128}")
 val validatedProvenanceProperty = { name: String ->
     val value = providers.gradleProperty(name).getOrElse("unknown")
@@ -61,11 +67,11 @@ android {
         create("full") {
             dimension = "tier"
             minSdk = 31
+            versionNameSuffix = "-full"
         }
         create("lite") {
             dimension = "tier"
             minSdk = 30
-            versionNameSuffix = "-lite"
         }
     }
 
@@ -117,6 +123,17 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+    }
+}
+
+// A generic or no-argument build must not silently pull the experimental AICore client into the
+// sideload artifact. Full is still built and tested when the operator explicitly opts in with
+// `-PZERODROID_INCLUDE_FULL=true`.
+androidComponents {
+    beforeVariants(selector().withFlavor("tier" to "full")) { variantBuilder ->
+        if (!includeFullFlavor.get()) {
+            variantBuilder.enable = false
+        }
     }
 }
 
