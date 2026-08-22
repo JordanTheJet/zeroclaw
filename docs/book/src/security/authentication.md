@@ -189,15 +189,16 @@ cron jobs, attachments, personality files, per-agent cost queries, and SOP
 authoring, `allowed_agents = ["*"]` covers only the agents the
 configuration defines, not any alias a request names.
 
-One current limitation is deliberate: per-tool selectors are not yet
-enforced inside agent sessions, so a principal whose `allowed_tools` is
-constrained (neither `admin` nor `"*"`) is **refused** `session/new`,
-`session/prompt`, `sops/run`, and `sops/decide` rather than silently
-under-enforced. Grant `allowed_tools = ["*"]` until the session-assembly
-change lands.
+Tool selectors compose by intersection at agent assembly: a session
+created by a constrained principal only receives the tools its
+`allowed_tools` names (an empty list yields a tool-less session), on top
+of whatever the agent's own risk profile allows. The narrowing binds when
+the session is created; selector changes apply to new sessions, while
+revoking a principal's session grants cuts off its existing sessions at
+the per-operation gate.
 
-That refusal does not cover every route to an agent's tools. Cron jobs and
-SOP authoring check only the agent selector. A constrained principal
+That composition does not cover every route to an agent's tools. Cron jobs
+and SOP authoring check only the agent selector. A constrained principal
 holding cron grants can create a shell job for its agent, or give an
 existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat

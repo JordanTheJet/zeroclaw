@@ -1717,6 +1717,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1744,6 +1745,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
             None,
             None,
             None,
@@ -1871,6 +1873,7 @@ impl Agent {
             Some(acp_session_store),
             Some(live_config),
             None,
+            None,
         )
         .await
     }
@@ -1905,12 +1908,14 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
     /// Build a daemon-backed TUI Agent whose structured-history cap follows
     /// the shared config after reloads.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
@@ -1920,6 +1925,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
         // (`session/new`, rehydration, plugin agents). The whole incarnation
@@ -1955,6 +1961,7 @@ impl Agent {
                 None,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -1974,6 +1981,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let handle = tokio::runtime::Handle::current();
         let agent_alias = agent_alias.to_string();
@@ -1995,6 +2003,7 @@ impl Agent {
                 Some(acp_session_store),
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -2017,6 +2026,11 @@ impl Agent {
         acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
         live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        // The caller principal's tool selector (RFC 7141 composition by
+        // intersection): `None` = unrestricted, `Some(list)` keeps only the
+        // named tools from the assembled surface (empty = a tool-less
+        // agent). Fed by the RPC dispatcher from the resolved grants.
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -2325,6 +2339,7 @@ impl Agent {
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
             .model_provider(model_provider)
+            .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .observer(observer)
