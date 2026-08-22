@@ -20,6 +20,14 @@
 //! `[dev-dependencies]`. It is not in any crate's default feature set and no
 //! released profile turns it on, so `cargo build --release` compiles none of
 //! the code below that is marked with it.
+//!
+//! That argument is about the build graph, so it is checked against the
+//! artifact rather than trusted. `scripts/ci/control_fixture_absence_gate.sh`
+//! builds the `zeroclaw` binary, asserts the fixture identifiers below are
+//! absent from it, and asserts real control-plane strings are present so the
+//! absence cannot pass vacuously on a wrong or empty file. CI runs it as the
+//! required `Control Fixture Absence` job whenever this crate, the workspace
+//! manifest, or the gate itself changes.
 
 use std::collections::BTreeSet;
 
@@ -42,7 +50,8 @@ pub const PROPOSAL_DOMAIN_AGENT: &str = "agent";
 /// The assurance class a fixture credential carries.
 ///
 /// Compiled only under `fixture-grants`, so this string is absent from a
-/// release artifact. A release-artifact test greps for it.
+/// release artifact. `scripts/ci/control_fixture_absence_gate.sh` searches a
+/// built binary for it and fails when it is present.
 #[cfg(feature = "fixture-grants")]
 pub const FIXTURE_ASSURANCE_CLASS: &str = "test_only";
 
