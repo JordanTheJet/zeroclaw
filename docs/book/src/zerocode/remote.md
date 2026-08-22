@@ -10,9 +10,10 @@ daemon-to-relay, and client-through-relay), see
 > **The WSS plane is mutually authenticated (mTLS).** Every client presents a
 > certificate; there is no server-only / unauthenticated path. The easy way to
 > get a client certificate is **enrollment** (below) - you do not hand-manage
-> certs. The legacy `--tls-skip-verify` flow further down still works for a
-> self-signed dev daemon but only relaxes *server* verification; the client
-> certificate is still required.
+> certs. If you would rather mint one yourself, see the bring-your-own steps
+> in "On your workstation" further down. `--tls-skip-verify` only relaxes
+> *server* certificate verification for a self-signed daemon cert; the client
+> certificate is still required either way.
 
 ## Enrollment (recommended)
 
@@ -32,47 +33,30 @@ auto-renews at ~50% of its lifetime. To enroll non-interactively use
 
 A certless client that reaches the WSS plane without enrolling gets an actionable
 "enroll first" message (and the daemon logs the rejected un-migrated client) -
-never a silent hang.
+never a silent hang. A **revoked** certificate is refused at the handshake
+(driven by the issued-cert ledger), so revoking a lost device takes effect on
+its next connection.
 
-### Migrating an existing fleet
-
-If you already run remote clients and are turning on mTLS, open a time-boxed
-**code-less enrollment window** so they can migrate without distributing pairing
-codes, then let it self-close:
-
-```toml
-[enroll]
-enabled = true
-# Clients may enroll WITHOUT a pairing code until this RFC3339 deadline. The
-# window closes itself by wall-clock; clear this line to close it early.
-allow_unpaired_enrollment = "2026-07-01T00:00:00Z"
-```
-
-While the window is open the daemon logs a loud warning each start. A malformed
-deadline is rejected at startup rather than silently treated as closed. A
-**revoked** certificate is refused at the handshake (driven by the issued-cert
-ledger), so revoking a lost device takes effect on its next connection.
+`allow_unpaired_enrollment` in the `[enroll]` section is reserved for a future
+code-less migration flow. This release rejects any non-empty value at daemon
+startup; leave it empty and use the printed pairing code.
 
 ## On the remote host (daemon side)
 
-1. **Generate a self-signed TLS certificate:**
+1. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`):
 
-   <div class="os-tabs-src">
-
-   #### sh
-
-   ```sh
-   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-     -keyout ~/.zeroclaw/wss.key \
-     -out ~/.zeroclaw/wss.cert \
-     -days 3650 -nodes -subj '/CN=zeroclaw'
+   ```toml
+   [wss]
+   enabled = true
    ```
 
-   </div>
+   Leave `cert_path` / `key_path` empty (the default): the daemon auto-generates
+   its own CA and server certificate under `<data_dir>/tls/` on first boot, so
+   you do not need to run `openssl` yourself. Set them only to bring your own
+   server certificate, and use absolute paths either way; the config does not
+   expand `~`.
 
-2. **Enable WSS.** Set the `wss` config through the [Config](./config.md) pane (or the gateway / `zeroclaw config set`). Use absolute paths; the config does not expand `~`.
-
-3. **Open the firewall port:**
+2. **Open the firewall port:**
 
    <div class="os-tabs-src">
 
@@ -86,7 +70,7 @@ ledger), so revoking a lost device takes effect on its next connection.
 
    The default WSS port is **9781**. Change it with `port = <number>` in the `[wss]` section.
 
-4. **Start (or restart) the daemon:**
+3. **Start (or restart) the daemon:**
 
    <div class="os-tabs-src">
 
@@ -102,19 +86,38 @@ ledger), so revoking a lost device takes effect on its next connection.
 
 ## On your workstation (zerocode side)
 
-1. **Connect with TLS verification skipped:**
+Enrollment (above) is the fastest way to get a client certificate. If you would
+rather bring your own client certificate instead of enrolling interactively:
+
+1. **Issue a client certificate on the daemon host**, from the daemon's mTLS CA:
+
+   ```sh
+   zeroclaw security issue-client-cert --name my-laptop --out-dir /tmp/my-laptop-tls
+   ```
+
+   This writes `ca.crt`, `client.crt`, and `client.key` to `--out-dir`. Add
+   `--force` to overwrite an existing certificate for that name.
+
+2. **Copy the three files to the workstation's `<config-dir>/tls/`** (then
+   `zerocode --connect wss://<remote-ip>:9781` finds them automatically), or
+   point at them explicitly:
 
    <div class="os-tabs-src">
 
    #### sh
 
    ```sh
-   zerocode --connect wss://<remote-ip>:9781 --tls-skip-verify
+   zerocode --connect wss://<remote-ip>:9781 \
+     --tls-ca-cert     /path/ca.crt \
+     --tls-client-cert /path/client.crt \
+     --tls-client-key  /path/client.key
    ```
 
    </div>
 
-   `--tls-skip-verify` is required for self-signed certificates. The HMAC session signing still authenticates the connection.
+   Because `ca.crt` is the same CA that signed the daemon's server certificate,
+   this verifies the server too; `--tls-skip-verify` is only needed if you skip
+   `--tls-ca-cert` against a self-signed daemon cert you have not pinned.
 
 That's it. zerocode reconnects automatically if the connection drops.
 
