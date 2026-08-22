@@ -66,8 +66,15 @@ pub enum Control {
     /// Daemon -> relay: `sig` is base64 of `sign(nonce_bytes, daemon_privkey)`,
     /// proving possession of the private key for the announced pubkey.
     Register { node_id: String, sig: String },
-    /// Relay -> daemon: registration accepted; the daemon must renew (a fresh
-    /// handshake) before `lease_ttl_secs` elapses or the node-id is released.
+    /// Relay -> daemon: registration accepted.
+    ///
+    /// `lease_ttl_secs` is ADVISORY in v1. The relay does not run an expiry
+    /// timer and does not release a node-id when the interval elapses: the
+    /// registration lives exactly as long as the daemon's persistent WebSocket,
+    /// and dropping that link is what frees the node-id. Treat the value as the
+    /// relay's hint for how often to re-register, not as a deadline the relay
+    /// enforces. A coordinated renew-and-expire contract would be a v2 change on
+    /// both ends; a server-only timer would disconnect healthy v1 daemons.
     Registered {
         node_id: String,
         lease_ttl_secs: u64,

@@ -454,7 +454,7 @@ listener; the relay address is only the TCP dial target.
 | `[admission].route_by_client_cert` | `false` | Route by the outer cert CN's node-id |
 | `[limits].max_conns_per_node` | `256` | Simultaneous client conns per node-id |
 | `[limits].idle_timeout_secs` | `300` | Drop idle client conns after N seconds |
-| `[limits].lease_ttl_secs` | `300` | Lease TTL advertised at registration |
+| `[limits].lease_ttl_secs` | `300` | Lease TTL advertised at registration (advisory in v1: WebSocket liveness is the real cleanup rule) |
 | `[limits].accept_burst_per_ip` / `accept_rate_per_ip` | `30` / `10.0` | Per-IP handshake token bucket |
 | `[limits].connect_burst_per_node` / `connect_rate_per_node` | `60` / `20.0` | Per-node connect token bucket |
 | `[limits].max_pending_handshakes` | `256` | Sockets past accept but not yet classified |

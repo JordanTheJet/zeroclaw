@@ -205,3 +205,70 @@ async fn missing_client_cert_is_rejected() {
         "expected a client-certificate rejection at the TLS layer, got: {msg}"
     );
 }
+
+/// BYO-CA authority model (August human review). The WSS verifier authorizes a
+/// certificate that chains to the configured client CA, subject to optional
+/// leaf pins and the revocation list. It does NOT require issued-cert ledger
+/// membership - that is exactly what makes the documented bring-your-own-CA
+/// path work, since certificates minted outside this daemon are legitimate and
+/// never appear in its ledger. Pins this so the `is_revoked` contract cannot
+/// drift back toward implying ledger-membership authorization.
+#[tokio::test]
+async fn ca_issued_cert_absent_from_the_ledger_still_authenticates() {
+    install_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let (mats, client_cert, client_key) = materials(dir.path());
+
+    // The cert was minted straight from the CA, never recorded in the ledger.
+    let ledger = zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+        dir.path(),
+        None,
+        dir.path().join("tls").join("revoked"),
+    )
+    .unwrap();
+    let der = zeroclaw_tls::load_certs(client_cert.path().to_str().unwrap()).unwrap();
+    let fp = zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref());
+    assert!(
+        ledger.status_of(&fp).unwrap().is_none(),
+        "this cert must be unknown to the ledger for the test to mean anything"
+    );
+    assert!(
+        !ledger.is_revoked(&fp).unwrap(),
+        "an unknown cert is not revoked"
+    );
+
+    let acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
+        mats.server_cert_path.to_str().unwrap(),
+        mats.server_key_path.to_str().unwrap(),
+        mats.ca_cert_path.to_str().unwrap(),
+        &[],
+        "",
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await?;
+        let _ws = tokio_tungstenite::accept_async(tls).await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_config(Some((
+        client_cert.path(),
+        client_key.path(),
+    )))));
+    let url = format!("wss://127.0.0.1:{}/", addr.port());
+    let connected =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector)).await;
+    assert!(
+        connected.is_ok(),
+        "a CA-issued cert must authenticate without ledger membership, got {:?}",
+        connected.err()
+    );
+    server
+        .await
+        .unwrap()
+        .expect("server handshake must succeed");
+}

@@ -279,8 +279,16 @@ impl CertLedger {
         Ok(s.map(|s| CertStatus::from_db(&s)))
     }
 
-    /// True iff the cert is known AND revoked. Unknown certs are not "revoked"
-    /// here (the WSS verifier still rejects an unknown cert via CA-chain / pin).
+    /// True iff the cert is known to this ledger AND marked revoked.
+    ///
+    /// A cert this ledger has never seen is NOT revoked here, and that is not a
+    /// gap the verifier closes by ledger membership: the WSS verifier's
+    /// authority model is CA-based. It authorizes any certificate that chains
+    /// to the configured client CA, subject to the optional leaf pins and this
+    /// revocation list. Ledger membership is not required for normal RPC
+    /// initialization - that is what makes the documented bring-your-own-CA
+    /// path work, since certificates minted outside this daemon are legitimate
+    /// and never appear in its issued-cert table.
     pub fn is_revoked(&self, fingerprint: &str) -> Result<bool> {
         Ok(matches!(
             self.status_of(fingerprint)?,

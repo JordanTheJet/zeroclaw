@@ -59,7 +59,9 @@ handshake_timeout_secs = 10
 # socket while it stays connected, and in open / shared-token modes one party
 # can mint unlimited keys and node-ids. The N+1 registration gets `registry_full`.
 max_registered_nodes = 1024
-# Lease TTL (seconds) advertised to daemons at registration.
+# Lease TTL (seconds) advertised to daemons at registration. ADVISORY in v1: the
+# relay runs no expiry timer, so a registration lasts as long as the daemon's
+# WebSocket stays up. This is a re-registration hint, not an enforced deadline.
 lease_ttl_secs = 300
 # Abuse caps (A6). Per-source-IP connection-handshake rate: a burst allowance
 # plus a steady refill per second; excess connections from one IP are dropped

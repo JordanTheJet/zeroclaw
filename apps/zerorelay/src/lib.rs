@@ -115,8 +115,10 @@ pub struct RelayConfig {
     pub deny: HashSet<String>,
     /// Optional shared-secret gate presented in `Hello.relay_token`.
     pub relay_token: Option<String>,
-    /// Lease advertised to daemons; renewal is the persistent WS staying alive
-    /// (with keepalive). Advisory in v1; WS liveness is the real cleanup signal.
+    /// Lease TTL advertised to daemons at registration. ADVISORY in v1: the
+    /// relay runs no expiry timer and never releases a node-id on elapse. A
+    /// registration lives exactly as long as its persistent WebSocket, and
+    /// dropping that link is the only thing that frees the node-id.
     pub lease_ttl: Duration,
     /// Cap on simultaneously-open client connections per node-id.
     pub max_conns_per_node: usize,

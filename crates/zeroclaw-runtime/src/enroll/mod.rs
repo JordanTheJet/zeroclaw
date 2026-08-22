@@ -268,7 +268,7 @@ impl EnrollServer {
 
         // 2. The daemon assigns the device identity (never the client/CSR): a
         //    stable, unguessable id that becomes the cert CN and the ledger key.
-        let device_id = mint_device_id();
+        let device_id = mint_device_id().map_err(|e| (500u16, e))?;
 
         // 3. Sign the CSR. sign_csr reads ONLY the CSR public key and stamps the
         //    daemon's clientAuth-only profile, so CSR-supplied fields are ignored.
@@ -466,16 +466,29 @@ fn http_reason(status: u16) -> &'static str {
 }
 
 /// Mint a daemon-controlled stable device id (`dev_<16 hex>`, 64 bits of entropy).
-fn mint_device_id() -> String {
-    use ring::rand::SecureRandom;
+/// Mint the daemon-assigned device identity.
+///
+/// This id becomes the certificate CN and the ledger key, so it has to be
+/// unguessable. There is no acceptable weaker substitute when the system
+/// CSPRNG fails: the previous fallback seeded the id from the current Unix
+/// SECOND, which is predictable and collides across devices enrolling in the
+/// same second. Security-path entropy failure aborts enrollment instead.
+fn mint_device_id() -> Result<String, String> {
+    mint_device_id_with(|buf| {
+        use ring::rand::SecureRandom;
+        // SystemRandom is the same CSPRNG the relay node-id path uses.
+        ring::rand::SystemRandom::new().fill(buf).map_err(|_| ())
+    })
+}
+
+/// [`mint_device_id`] with the entropy source injected, so the failure path is
+/// testable without breaking the system CSPRNG.
+fn mint_device_id_with(fill: impl FnOnce(&mut [u8]) -> Result<(), ()>) -> Result<String, String> {
     let mut bytes = [0u8; 8];
-    // SystemRandom is the same CSPRNG the relay node-id path uses.
-    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
-        // Extremely unlikely; fall back to a time-seeded id so we never panic.
-        let t = now_unix() as u64;
-        bytes.copy_from_slice(&t.to_be_bytes());
-    }
-    format!("dev_{}", hex::encode(bytes))
+    fill(&mut bytes).map_err(|()| {
+        "system CSPRNG unavailable; refusing to mint a predictable device identity".to_string()
+    })?;
+    Ok(format!("dev_{}", hex::encode(bytes)))
 }
 
 fn now_unix() -> i64 {
@@ -596,11 +609,34 @@ mod tests {
 
     #[test]
     fn mint_device_id_shape() {
-        let id = mint_device_id();
+        let id = mint_device_id().expect("system CSPRNG must be available in tests");
         assert!(id.starts_with("dev_"));
         assert_eq!(id.len(), 4 + 16);
         assert!(id[4..].chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(mint_device_id(), mint_device_id());
+        assert_ne!(mint_device_id().unwrap(), mint_device_id().unwrap());
+    }
+
+    /// Security-path entropy failure must ABORT enrollment, not silently
+    /// downgrade to a predictable identity.
+    #[test]
+    fn mint_device_id_fails_closed_without_entropy() {
+        let err =
+            mint_device_id_with(|_| Err(())).expect_err("entropy failure must not mint an id");
+        assert!(
+            err.contains("CSPRNG"),
+            "the error must name the entropy failure, got: {err}"
+        );
+    }
+
+    /// The happy path still derives the id from the supplied bytes.
+    #[test]
+    fn mint_device_id_uses_the_supplied_entropy() {
+        let id = mint_device_id_with(|buf| {
+            buf.copy_from_slice(&[0xAB; 8]);
+            Ok(())
+        })
+        .expect("a working entropy source must mint an id");
+        assert_eq!(id, "dev_abababababababab");
     }
 
     fn test_server(
