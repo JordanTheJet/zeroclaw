@@ -1825,10 +1825,21 @@ impl AuthProviderFlow for ZerorouterFlow {
             .unwrap_or_else(|| "zeroclaw".to_string());
         // The label leaves this machine, so it is disclosed before it is
         // sent rather than after.
-        println!("Requesting a ZeroRouter key from {issuer}.");
         println!(
-            "The router will store this key under the label \"{key_name}\" (this machine's \
-             hostname) and show it in the portal's key list."
+            "{}",
+            ctx.cli_text(
+                "cli-auth-zerorouter-requesting-key",
+                &[("issuer", &issuer)],
+                "Requesting a ZeroRouter key"
+            )
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-zerorouter-key-label",
+                &[("label", &key_name)],
+                "Key label"
+            )
         );
         let device = crate::auth::zerorouter_device::start_device_flow(
             &client,
@@ -1837,11 +1848,39 @@ impl AuthProviderFlow for ZerorouterFlow {
             &key_name,
         )
         .await?;
-        println!("ZeroRouter device login started (router: {issuer}).");
-        println!("Visit: {}", device.verification_uri);
-        println!("Code:  {}", device.user_code);
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-zerorouter-device-started",
+                &[("issuer", &issuer)],
+                "ZeroRouter device login started"
+            )
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-oauth-visit",
+                &[("uri", &device.verification_uri)],
+                "Visit"
+            )
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-oauth-code",
+                &[("code", &device.user_code)],
+                "Code"
+            )
+        );
         if let Some(uri_complete) = &device.verification_uri_complete {
-            println!("Fast link: {uri_complete}");
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-oauth-fast-link",
+                    &[("uri", uri_complete)],
+                    "Fast link"
+                )
+            );
         }
         let key = crate::auth::zerorouter_device::poll_device_key(
             &client,
@@ -1861,11 +1900,25 @@ impl AuthProviderFlow for ZerorouterFlow {
         ctx.auth_service
             .store_model_provider_token(ZEROROUTER_PROVIDER, profile, &key, metadata, true)
             .await?;
-        println!("Saved profile {profile}");
-        println!("Active profile for zerorouter: {profile}");
         println!(
-            "The stored credential is a permanent ZeroRouter API key; revoke it from the \
-             router portal if this machine is retired."
+            "{}",
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-active-for",
+                &[("provider", ZEROROUTER_PROVIDER), ("profile", profile)],
+                "Active profile"
+            )
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-zerorouter-revoke-hint",
+                &[],
+                "Revoke this key from the router portal if this machine is retired"
+            )
         );
         Ok(())
     }

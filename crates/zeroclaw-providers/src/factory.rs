@@ -1606,6 +1606,10 @@ impl FamilyProviderFactory for ZerorouterModelProviderConfig {
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("ZeroRouter")
             .base_url(api_url.unwrap_or(ZEROROUTER_DEFAULT_URL))
+            // `default_base_url()` reads only the canonical field, so a fixed
+            // family that sets `base_url` alone reports `None` to every
+            // consumer of endpoint metadata.
+            .canonical_base_url(fixed_family_endpoint::<Self>())
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             // ZeroRouter's GET /v1/models is unauthenticated and carries
