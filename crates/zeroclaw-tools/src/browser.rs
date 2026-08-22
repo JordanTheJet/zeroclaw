@@ -586,6 +586,12 @@ impl BrowserTool {
     /// the child when the deadline passes or the awaiting future is dropped.
     /// The error names the action so a hung command is distinguishable from a
     /// hung availability probe.
+    ///
+    /// Containment is scoped to the direct child: `kill_on_drop` does not
+    /// walk the process tree, so descendants the CLI spawned (e.g. a
+    /// browser) are left to the CLI's own lifecycle handling. Bounding the
+    /// agent turn is this seam's contract; tree-wide reaping would need the
+    /// process-group/Job-Object approach used by the coding-CLI runners.
     async fn run_bounded_command(
         mut cmd: Command,
         action: &str,
@@ -3179,7 +3185,7 @@ mod tests {
         // `sh -c 'sleep 60'` ignores the appended `--version` argument, so
         // this models a CLI that accepts the probe but never returns.
         let mut command = Command::new("sh");
-        command.arg("-c").arg("sleep 60");
+        command.arg("-c").arg("exec sleep 60");
 
         let started = std::time::Instant::now();
         let available = BrowserTool::probe_agent_browser(command, Duration::from_millis(20)).await;
@@ -3210,7 +3216,7 @@ mod tests {
     #[tokio::test]
     async fn run_bounded_command_times_out_and_names_action() {
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 60");
+        cmd.arg("-c").arg("exec sleep 60");
 
         let started = std::time::Instant::now();
         let error = BrowserTool::run_bounded_command(cmd, "open", Duration::from_millis(20))
