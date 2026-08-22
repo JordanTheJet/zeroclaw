@@ -68,6 +68,7 @@ fn test_limits() -> PluginLimits {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     }
 }
 
@@ -304,6 +305,7 @@ async fn reference_plugin_rejects_work_past_fuel_budget() {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let (manifest, scope) = context([]);
     let services = host_services(manifest, None);
@@ -329,6 +331,7 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_memory_bytes: 1,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let (manifest, scope) = context([]);
     let services = host_services(manifest, None);

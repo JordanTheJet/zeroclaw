@@ -10,8 +10,8 @@ use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
     ProceduralMessage as WitProceduralMessage,
 };
 use crate::component::{
-    PluginState, PluginStoreSpec, call_plugin, call_store, engine, load_component, wt,
-    wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, engine, load_component,
+    wt, wt_instantiate,
 };
 use crate::instance::PluginInstanceScope;
 use crate::services::PluginHostServices;
@@ -31,7 +31,7 @@ use zeroclaw_api::memory_traits::{
 pub struct WasmMemory {
     scope: PluginInstanceScope,
     capabilities: MemoryCapabilities,
-    state: Arc<Mutex<(Store<PluginState>, MemoryPlugin)>>,
+    state: Arc<Mutex<WarmPluginState<MemoryPlugin>>>,
 }
 
 impl Attributable for WasmMemory {
@@ -81,14 +81,13 @@ impl WasmMemory {
         ));
         let linker = linker()?;
         crate::component::ensure_http_coherent(&store, false)?;
-        let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+        let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
             wt_instantiate(
                 MemoryPlugin::instantiate_async(store, &component, &linker).await,
                 "failed to instantiate memory plugin",
             )
-        });
-        let bindings = bindings?;
-        let capabilities: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+        })?;
+        let capabilities = call_store!(store, async |store: &mut Store<PluginState>| {
             wt(
                 bindings
                     .zeroclaw_plugin_memory()
@@ -96,11 +95,11 @@ impl WasmMemory {
                     .await,
                 "memory.get-memory-capabilities failed",
             )
-        });
+        })?;
         Ok(Self {
             scope,
-            capabilities: capabilities?,
-            state: Arc::new(Mutex::new((store, bindings))),
+            capabilities,
+            state: Arc::new(Mutex::new(Some((store, bindings)))),
         })
     }
 }

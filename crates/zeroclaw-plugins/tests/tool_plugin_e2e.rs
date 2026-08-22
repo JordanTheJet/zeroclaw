@@ -56,6 +56,7 @@ fn limits() -> PluginLimits {
         max_memory_bytes: 64 * 1024 * 1024,
         max_table_elements: 10_000,
         max_instances: 32,
+        call_timeout: std::time::Duration::from_secs(30),
     }
 }
 
