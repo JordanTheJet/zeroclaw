@@ -150,6 +150,12 @@ pub struct RelayConfig {
     /// phase. `idle_timeout` only starts once a connection is admitted; without
     /// this, a socket could sit in setup forever.
     pub handshake_timeout: Duration,
+    /// Ceiling on simultaneously REGISTERED daemons. Admission bounds setup,
+    /// but an admitted daemon then occupies a registry entry, a writer task and
+    /// a socket for as long as it stays connected. In the supported open and
+    /// shared-token modes one permitted party can mint unlimited signing keys
+    /// and node-ids, so the registry needs its own aggregate bound.
+    pub max_registered_nodes: usize,
 }
 
 impl RelayConfig {
@@ -181,6 +187,7 @@ impl Default for RelayConfig {
             route_by_client_cert: false,
             max_pending_handshakes: 256,
             handshake_timeout: Duration::from_secs(10),
+            max_registered_nodes: 1024,
         }
     }
 }
@@ -288,6 +295,21 @@ struct DaemonHandle {
 /// spoofed-source flood.
 const MAX_TRACKED_IPS: usize = 4096;
 
+/// Longest accepted node-id, in bytes. The control-frame ceiling
+/// ([`MAX_CONTROL_FRAME`], 64 KiB) is the only bound a `Register` frame would
+/// otherwise hit, which is far too loose for a registry key that is retained
+/// per live daemon and echoed into status output and logs.
+pub const MAX_NODE_ID_LEN: usize = 128;
+
+/// A node-id is a routing label, not free-form text: bounded, non-empty, and
+/// printable ASCII so it cannot smuggle control characters into operator
+/// surfaces or bloat the registry.
+fn valid_node_id(node_id: &str) -> bool {
+    !node_id.is_empty()
+        && node_id.len() <= MAX_NODE_ID_LEN
+        && node_id.chars().all(|c| c.is_ascii_graphic())
+}
+
 struct Inner {
     /// Hot-reloadable admission slice (swapped on SIGHUP). A `std::sync::RwLock`
     /// is fine: reads are brief and never held across an await.
@@ -307,6 +329,7 @@ struct Inner {
     /// Pre-classification handshake permits (see `RelayConfig::max_pending_handshakes`).
     handshake_permits: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
+    max_registered_nodes: usize,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
@@ -390,6 +413,7 @@ impl RelayServer {
                     cfg.max_pending_handshakes.max(1),
                 )),
                 handshake_timeout: cfg.handshake_timeout,
+                max_registered_nodes: cfg.max_registered_nodes.max(1),
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
@@ -596,6 +620,23 @@ async fn handle_daemon<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Reject a malformed node-id before spending a nonce and a signature
+    // verification on it: it is the registry key, so it must be bounded and
+    // printable regardless of who is asking.
+    if !valid_node_id(&node_id) {
+        let _ = send_control(
+            &mut ws,
+            &Control::error(
+                "bad_node_id",
+                format!(
+                    "node-id must be 1..={MAX_NODE_ID_LEN} bytes of printable ASCII without spaces"
+                ),
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
     // Snapshot the admission policy once so the token gate and the allow/deny
     // check are consistent even if a SIGHUP reload lands mid-registration.
     let policy = inner.admission();
@@ -681,6 +722,24 @@ where
             let _ = send_control(
                 &mut ws,
                 &Control::error("node_taken", "node-id bound to another key"),
+            )
+            .await;
+            return Ok(());
+        }
+        // Aggregate registry bound. A daemon RE-registering its own node-id
+        // replaces the existing entry and so does not grow the registry; only
+        // a genuinely new node-id has to fit under the ceiling.
+        if !daemons.contains_key(&node_id) && daemons.len() >= inner.max_registered_nodes {
+            drop(daemons);
+            let _ = send_control(
+                &mut ws,
+                &Control::error(
+                    "registry_full",
+                    format!(
+                        "relay is at its {} registered-node limit",
+                        inner.max_registered_nodes
+                    ),
+                ),
             )
             .await;
             return Ok(());

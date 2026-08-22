@@ -54,6 +54,11 @@ idle_timeout_secs = 300
 # across many addresses sheds new sockets instead of accumulating state.
 max_pending_handshakes = 256
 handshake_timeout_secs = 10
+# Aggregate ceiling on simultaneously REGISTERED daemons. Admission bounds
+# setup; each admitted daemon then holds a registry entry, a writer task and a
+# socket while it stays connected, and in open / shared-token modes one party
+# can mint unlimited keys and node-ids. The N+1 registration gets `registry_full`.
+max_registered_nodes = 1024
 # Lease TTL (seconds) advertised to daemons at registration.
 lease_ttl_secs = 300
 # Abuse caps (A6). Per-source-IP connection-handshake rate: a burst allowance

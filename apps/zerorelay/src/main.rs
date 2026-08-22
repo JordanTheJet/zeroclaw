@@ -104,6 +104,10 @@ struct Cli {
     #[arg(long)]
     max_pending_handshakes: Option<usize>,
 
+    /// Ceiling on simultaneously registered daemons. [default: 1024]
+    #[arg(long)]
+    max_registered_nodes: Option<usize>,
+
     /// Deadline (seconds) covering TLS accept, the WS upgrade, and the first
     /// control frame. [default: 10]
     #[arg(long)]
@@ -184,6 +188,8 @@ struct LimitsFile {
     /// Global pre-classification handshake bound + deadline (slowloris).
     max_pending_handshakes: Option<usize>,
     handshake_timeout_secs: Option<u64>,
+    /// Aggregate ceiling on simultaneously registered daemons.
+    max_registered_nodes: Option<usize>,
 }
 
 /// The CLI admission overrides, captured so SIGHUP can re-apply them on top of a
@@ -401,6 +407,10 @@ async fn main() -> Result<()> {
                 .or(file.limits.handshake_timeout_secs)
                 .unwrap_or(10),
         ),
+        max_registered_nodes: cli
+            .max_registered_nodes
+            .or(file.limits.max_registered_nodes)
+            .unwrap_or(1024),
     };
 
     // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,

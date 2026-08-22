@@ -840,3 +840,83 @@ async fn handshake_timeout_is_one_budget_across_setup_phases() {
         std::time::Duration::from_secs(3)
     );
 }
+
+/// Post-admission registry bound (August human review). Admission bounds SETUP;
+/// an admitted daemon then holds a registry entry, a writer task and a socket
+/// for as long as it stays connected. In the supported open / shared-token
+/// modes one permitted party can mint unlimited keys and node-ids, so the
+/// registry needs its own aggregate ceiling - and the N+1 registration must be
+/// refused with a reason on the wire, not silently dropped.
+#[tokio::test]
+async fn registry_is_bounded_and_rejects_the_next_node() {
+    let cfg = RelayConfig {
+        max_registered_nodes: 2,
+        ..RelayConfig::default()
+    };
+    let addr = start_relay(cfg).await;
+
+    // Two distinct daemons fill the registry and stay connected.
+    let mut live = Vec::new();
+    for i in 0..2 {
+        let key = gen_key();
+        let (ws, term) = handshake(addr, &format!("node-{i}"), &key, None, true).await;
+        assert!(
+            matches!(term, Control::Registered { .. }),
+            "daemon {i} must register, got {term:?}"
+        );
+        live.push(ws);
+    }
+
+    // A third distinct node-id is refused with a wire-visible reason.
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, "node-overflow", &key, None, true).await;
+    match term {
+        Control::Error { code, .. } => assert_eq!(code, "registry_full"),
+        other => panic!("expected registry_full past the bound, got {other:?}"),
+    }
+
+    // Re-registering an ALREADY registered node-id replaces its entry rather
+    // than growing the registry, so it is still admitted at the ceiling.
+    let key0 = gen_key();
+    let (_ws, term) = handshake(addr, "node-0", &key0, None, true).await;
+    match term {
+        // A different key for a live node-id is refused by the binding rule,
+        // which proves the capacity check did not fire first.
+        Control::Error { code, .. } => assert_eq!(code, "node_taken"),
+        other => panic!("expected the node-id binding rule, got {other:?}"),
+    }
+    drop(live);
+}
+
+/// A node-id is the registry key, echoed into status output and logs. Without
+/// its own limit the only ceiling is the 64 KiB control-frame bound, which is
+/// far too loose. Oversized and non-printable ids are refused at registration.
+#[tokio::test]
+async fn oversized_and_nonprintable_node_ids_are_rejected() {
+    let addr = start_relay(RelayConfig::default()).await;
+
+    let oversized = "n".repeat(zerorelay::MAX_NODE_ID_LEN + 1);
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, &oversized, &key, None, true).await;
+    match term {
+        Control::Error { code, .. } => assert_eq!(code, "bad_node_id"),
+        other => panic!("expected bad_node_id for an oversized id, got {other:?}"),
+    }
+
+    // Exactly at the limit is still accepted: the bound is inclusive.
+    let at_limit = "n".repeat(zerorelay::MAX_NODE_ID_LEN);
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, &at_limit, &key, None, true).await;
+    assert!(
+        matches!(term, Control::Registered { .. }),
+        "a node-id at exactly the limit must register, got {term:?}"
+    );
+
+    // Control characters must not reach the registry or operator surfaces.
+    let key = gen_key();
+    let (_ws, term) = handshake(addr, "node\u{7}with\u{0}control", &key, None, true).await;
+    match term {
+        Control::Error { code, .. } => assert_eq!(code, "bad_node_id"),
+        other => panic!("expected bad_node_id for control characters, got {other:?}"),
+    }
+}

@@ -452,6 +452,9 @@ listener; the relay address is only the TCP dial target.
 | `[limits].lease_ttl_secs` | `300` | Lease TTL advertised at registration |
 | `[limits].accept_burst_per_ip` / `accept_rate_per_ip` | `30` / `10.0` | Per-IP handshake token bucket |
 | `[limits].connect_burst_per_node` / `connect_rate_per_node` | `60` / `20.0` | Per-node connect token bucket |
+| `[limits].max_pending_handshakes` | `256` | Sockets past accept but not yet classified |
+| `[limits].handshake_timeout_secs` | `10` | One deadline over TLS, WS upgrade and signed registration |
+| `[limits].max_registered_nodes` | `1024` | Simultaneously registered daemons (N+1 gets `registry_full`) |
 
 ### zerorelay CLI (overrides `relay.toml`)
 
