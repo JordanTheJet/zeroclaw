@@ -248,7 +248,10 @@ pub async fn run_local_listener(
                         peer,
                         conn_cancel.clone(),
                     )
-                    .with_connection_activity(activity);
+                    .with_connection_activity(activity)
+                    // The transport's kind and kernel-supplied peer credential
+                    // feed principal authentication at `initialize`.
+                    .with_transport(transport.kind(), transport.credential());
                     tokio::select! {
                         _ = dispatcher.run(&mut transport) => {}
                         _ = conn_cancel.cancelled() => {}
@@ -836,6 +839,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
@@ -921,6 +926,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -2275,6 +2282,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         write_half
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())

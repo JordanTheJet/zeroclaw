@@ -13095,6 +13095,121 @@ pub enum OidcValidation {
     Introspection,
 }
 
+impl Config {
+    /// Validate the inbound-authentication sections (`[oidc.<alias>]`,
+    /// `[users]`, `[permission_profiles]`) on their own.
+    ///
+    /// This is the ONE auth-specific validation boundary (RFC 7141). Full
+    /// [`Config::validate`] calls it, but so does authorization-policy
+    /// compilation: `load_or_init` deliberately tolerates a semantically
+    /// invalid config so an operator can boot to repair it, which means the
+    /// resolver cannot assume its input was validated. Running exactly these
+    /// checks again at compile/replace time guarantees that duplicate uids or
+    /// effective principal ids, invalid issuers, and dangling profile
+    /// references can never be installed as a serving policy — without making
+    /// auth activation contingent on every unrelated config field being valid.
+    /// Keys are sorted so the first error reported is deterministic.
+    pub fn validate_auth(&self) -> Result<()> {
+        let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+        oidc_aliases.sort();
+        for alias in oidc_aliases {
+            let oidc = &self.oidc[alias];
+            oidc.validate(alias)?;
+            let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+            claim_values.sort();
+            for claim_value in claim_values {
+                let profile = &oidc.profile_map[claim_value];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.profile_map"),
+                        "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+            // Service mappings reference profiles too: a dangling target
+            // must fail here at load time, not surface later as a
+            // Misconfigured denial when the service first resolves.
+            let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
+            client_ids.sort();
+            for client_id in client_ids {
+                let profile = &oidc.service_profile_map[client_id];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.service_profile_map"),
+                        "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+        }
+
+        let mut user_names: Vec<&String> = self.users.keys().collect();
+        user_names.sort();
+        let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+        let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+        for name in user_names {
+            let user = &self.users[name];
+            user.validate(name)?;
+            for profile in &user.permission_profiles {
+                let trimmed = profile.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !self.permission_profiles.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("users.{name}.permission_profiles"),
+                        "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                    );
+                }
+            }
+            // A uid maps a kernel-reported peer to exactly one
+            // principal; two entries claiming one uid would make
+            // authentication ambiguous.
+            if let Some(uid) = user.uid
+                && let Some(other) = uid_owners.insert(uid, name.as_str())
+            {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.uid"),
+                    "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                );
+            }
+            // Two entries resolving to one durable principal id would
+            // silently link accounts and merge their owned data.
+            let principal_id = user.effective_principal_id(name);
+            if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.principal_id"),
+                    "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                );
+            }
+        }
+
+        let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+        profile_aliases.sort();
+        for alias in profile_aliases {
+            let profile = &self.permission_profiles[alias];
+            for agent in &profile.allowed_agents {
+                let trimmed = agent.trim();
+                if trimmed.is_empty() || trimmed == "*" {
+                    continue;
+                }
+                if !self.agents.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("permission_profiles.{alias}.allowed_agents"),
+                        "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl OidcConfig {
     pub fn validate(&self, alias: &str) -> Result<()> {
         if !is_valid_auth_section_name(alias) {
@@ -22466,107 +22581,28 @@ impl Config {
             }
         }
 
-        // Inbound authentication & principals (RFC 7141): each auth section
-        // must be internally valid, reference only configured entries, and
-        // map credentials and principal ids unambiguously. Keys are sorted
-        // so the first error reported is deterministic.
+        // Inbound authentication & principals (RFC 7141): one auth-specific
+        // validation boundary, shared with policy compilation so an invalid
+        // auth section can never be compiled into a serving policy even when
+        // the boot path tolerates other config errors.
+        self.validate_auth()?;
+
+        // A remote WSS listener with no possible credential path must fail
+        // validation rather than start: before enforcement that meant
+        // silently accepting unauthenticated clients, after it an
+        // enforced-but-unusable listener. gateway.require_pairing keeps a
+        // recoverable path (pair, then authenticate) even with no tokens
+        // yet.
+        if self.wss.enabled
+            && self.oidc.is_empty()
+            && self.gateway.paired_tokens.is_empty()
+            && !self.gateway.require_pairing
         {
-            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
-            oidc_aliases.sort();
-            for alias in oidc_aliases {
-                let oidc = &self.oidc[alias];
-                oidc.validate(alias)?;
-                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
-                claim_values.sort();
-                for claim_value in claim_values {
-                    let profile = &oidc.profile_map[claim_value];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.profile_map"),
-                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-                // Service mappings reference profiles too: a dangling target
-                // must fail here at load time, not surface later as a
-                // Misconfigured denial when the service first resolves.
-                let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
-                client_ids.sort();
-                for client_id in client_ids {
-                    let profile = &oidc.service_profile_map[client_id];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.service_profile_map"),
-                            "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-            }
-
-            let mut user_names: Vec<&String> = self.users.keys().collect();
-            user_names.sort();
-            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
-            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
-            for name in user_names {
-                let user = &self.users[name];
-                user.validate(name)?;
-                for profile in &user.permission_profiles {
-                    let trimmed = profile.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if !self.permission_profiles.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("users.{name}.permission_profiles"),
-                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
-                        );
-                    }
-                }
-                // A uid maps a kernel-reported peer to exactly one
-                // principal; two entries claiming one uid would make
-                // authentication ambiguous.
-                if let Some(uid) = user.uid
-                    && let Some(other) = uid_owners.insert(uid, name.as_str())
-                {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.uid"),
-                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
-                    );
-                }
-                // Two entries resolving to one durable principal id would
-                // silently link accounts and merge their owned data.
-                let principal_id = user.effective_principal_id(name);
-                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.principal_id"),
-                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
-                    );
-                }
-            }
-
-            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
-            profile_aliases.sort();
-            for alias in profile_aliases {
-                let profile = &self.permission_profiles[alias];
-                for agent in &profile.allowed_agents {
-                    let trimmed = agent.trim();
-                    if trimmed.is_empty() || trimmed == "*" {
-                        continue;
-                    }
-                    if !self.agents.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("permission_profiles.{alias}.allowed_agents"),
-                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
-                        );
-                    }
-                }
-            }
+            validation_bail!(
+                ValidationFailed,
+                "wss.enabled",
+                "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
         }
 
         // Security OTP / estop
@@ -26686,6 +26722,26 @@ zeroclaw-operators = "operator"
             "operator"
         );
         assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn wss_without_any_credential_path_fails_validation() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("remote credential path"), "got: {err}");
+
+        config.gateway.require_pairing = true;
+        config
+            .validate()
+            .expect("pairing-capable wss config is startable");
+
+        config.gateway.require_pairing = false;
+        config.gateway.paired_tokens = vec!["zc_tok".into()];
+        config
+            .validate()
+            .expect("an existing paired token is a path");
     }
 
     #[::core::prelude::v1::test]
