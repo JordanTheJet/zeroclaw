@@ -901,8 +901,8 @@ mod connection_tests {
         assert!(daemon.try_wait().expect("poll reaped helper").is_some());
     }
 
-    /// Recovery-path regression for #9503: when a different daemon answers
-    /// the reconnect, the spawned replacement must be terminated and reaped
+    /// Recovery-path regression: when a different daemon answers the
+    /// reconnect, the spawned replacement must be terminated and reaped
     /// rather than surviving the TUI.
     #[test]
     fn recovery_handoff_terminates_and_reaps_mismatched_replacement() {
