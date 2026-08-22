@@ -425,6 +425,12 @@ channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$c
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-telegram-cmd-new-desc = Start a new conversation session
+channel-telegram-cmd-clear-desc = Clear this conversation session
+channel-telegram-cmd-stop-desc = Cancel the current in-flight task
+channel-telegram-cmd-model-desc = Show or switch the current model
+channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
+channel-telegram-cmd-config-desc = Show current configuration
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -944,6 +950,7 @@ channel-runtime-progress-waiting-on-model = Waiting on model
 channel-runtime-progress-running-tool = Running tool
 channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
+channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
