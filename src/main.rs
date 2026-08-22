@@ -5006,12 +5006,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        let wss_limits = zeroclaw_runtime::rpc::wss::WssLimits {
+                            max_pending_handshakes: wss_cfg.max_pending_handshakes,
+                            handshake_timeout: std::time::Duration::from_secs(
+                                wss_cfg.handshake_timeout_secs,
+                            ),
+                            max_sessions: wss_cfg.max_sessions,
+                        };
                         zeroclaw_runtime::rpc::wss::run_wss_listener(
                             ctx,
                             cancel,
                             client_count,
                             tls_acceptor,
                             bind_addr,
+                            wss_limits,
                         )
                         .await
                     })

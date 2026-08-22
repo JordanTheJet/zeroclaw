@@ -7304,6 +7304,22 @@ pub struct WssConfig {
     #[serde(default)]
     #[nested]
     pub client_auth: Option<WssClientAuthConfig>,
+    /// Ceiling on sockets past `accept()` that have not yet finished the TLS
+    /// handshake and WebSocket upgrade (default: 256). The remote plane is
+    /// Internet-facing, so this bounds the state an UNAUTHENTICATED peer can
+    /// hold; beyond it, new sockets are dropped at accept rather than queued.
+    #[serde(default = "default_wss_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// One absolute deadline, in seconds, covering TLS accept AND the
+    /// WebSocket upgrade (default: 10). A single budget for the whole setup
+    /// sequence, not a fresh window per phase; the heartbeat only starts once
+    /// a session is established.
+    #[serde(default = "default_wss_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Ceiling on concurrently established WSS sessions (default: 512). Bounds
+    /// the steady state that survives authentication.
+    #[serde(default = "default_wss_max_sessions")]
+    pub max_sessions: usize,
 }
 
 impl Default for WssConfig {
@@ -7316,6 +7332,9 @@ impl Default for WssConfig {
             key_path: String::new(),
             sans: Vec::new(),
             client_auth: None,
+            max_pending_handshakes: default_wss_max_pending_handshakes(),
+            handshake_timeout_secs: default_wss_handshake_timeout_secs(),
+            max_sessions: default_wss_max_sessions(),
         }
     }
 }
@@ -7391,6 +7410,18 @@ fn default_wss_bind() -> String {
 
 fn default_wss_port() -> u16 {
     9781
+}
+
+fn default_wss_max_pending_handshakes() -> usize {
+    256
+}
+
+fn default_wss_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_wss_max_sessions() -> usize {
+    512
 }
 
 fn default_enroll_bind() -> String {
