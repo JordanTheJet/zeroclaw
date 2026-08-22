@@ -793,6 +793,16 @@ mod tests {
             server.pairing.pairing_code().is_some(),
             "ledger/audit failure must not consume the one-time pairing code"
         );
+        // The audit event is written BEFORE the ledger row, so a failed audit
+        // leaves no active certificate behind. Committing the row first left an
+        // orphan, and because the retry carries a fresh CSR (a different
+        // fingerprint) it would multiply active credentials rather than replace
+        // the first.
+        assert_eq!(
+            server.ledger.list_active().unwrap().len(),
+            0,
+            "an audit failure must not strand an active ledger row"
+        );
     }
 
     #[tokio::test]

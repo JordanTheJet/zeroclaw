@@ -802,6 +802,12 @@ async fn run() -> anyhow::Result<()> {
         // A WSS route is chosen when a direct address OR a relay is available;
         // otherwise the local IPC socket.
         if direct_url.is_some() || relay.is_some() {
+            // Repair a publication interrupted mid-rename before resolving any
+            // path, so we never load a new cert beside an old key.
+            if let Err(e) = enroll::finish_pending_publish(&config_dir) {
+                eprintln!("warning: could not complete a pending credential publish: {e:#}");
+            }
+
             // Mutual-TLS material: CLI flag -> config -> conventional default path
             // under <config_dir>/tls, so a provisioned client needs no --tls-* flags.
             let tls = client::ClientTls {

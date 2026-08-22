@@ -471,6 +471,58 @@ fn single_ca_cert_der(ca_chain_pem: &str) -> Result<rustls::pki_types::Certifica
     }
 }
 
+/// Marker written immediately before the first publication rename and removed
+/// after the last. Its presence means a publication was interrupted part-way.
+const PUBLISH_MARKER: &str = ".publish.pending";
+
+/// The staged files and their published names, in publication order.
+const STAGED_MATERIALS: [(&str, &str); 4] = [
+    (".client.crt.tmp", "client.crt"),
+    (".ca.crt.tmp", "ca.crt"),
+    (".client.key.tmp", "client.key"),
+    (".profile.json.tmp", "profile.json"),
+];
+
+/// Complete a publication interrupted between the first and last rename.
+///
+/// The credential set is four files published with four renames, which is not
+/// one atomic step. A crash in between leaves a mixed set - most damagingly a
+/// NEW `client.crt` beside the OLD `client.key`, which authenticates as
+/// neither. Making the swap genuinely atomic needs a directory-swap or symlink
+/// layout that changes the published `<config_dir>/tls/` contract and does not
+/// port cleanly to Windows, so this is the recovery contract instead:
+///
+/// - Staged `.tmp` files are written and fsynced BEFORE the marker exists, so a
+///   crash during staging leaves no marker and the stale `.tmp` files are
+///   ignored and overwritten by the next attempt.
+/// - The marker is written only once every staged file is complete. From that
+///   point the staged set is known-good, so finishing the renames is always the
+///   correct recovery - each rename is idempotent and a rename already applied
+///   simply has no `.tmp` left to move.
+/// - The marker is removed only after the last rename, so the window is closed
+///   exactly when the set is consistent.
+///
+/// Callers run this before READING the materials and before staging new ones,
+/// so an interrupted publication is repaired rather than observed.
+pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
+    let tls_dir = config_dir.join("tls");
+    let marker = tls_dir.join(PUBLISH_MARKER);
+    if !marker.exists() {
+        return Ok(());
+    }
+    for (tmp_name, final_name) in STAGED_MATERIALS {
+        let staged = tls_dir.join(tmp_name);
+        if staged.exists() {
+            let published = tls_dir.join(final_name);
+            std::fs::rename(&staged, &published).with_context(|| {
+                format!("completing interrupted publish of {}", published.display())
+            })?;
+        }
+    }
+    std::fs::remove_file(&marker).with_context(|| format!("clearing {}", marker.display()))?;
+    Ok(())
+}
+
 /// Write the cert, key, CA, and cached profile under `<config_dir>/tls`. The key
 /// is written `0600` on Unix; the cert/CA/profile are public.
 fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> Result<()> {
@@ -481,6 +533,8 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
 
     let tls_dir = config_dir.join("tls");
     std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
+    // Repair an interrupted earlier publication before staging over it.
+    finish_pending_publish(config_dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -511,8 +565,18 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     std::fs::write(&profile_json_tmp, json)
         .with_context(|| format!("writing {}", profile_json_tmp.display()))?;
 
-    // Only publish after every replacement has been durably written. A failed key
-    // write leaves the previous cert/key/CA/profile set untouched.
+    // Only publish after every replacement has been durably written. A failed
+    // staging write leaves the previous cert/key/CA/profile set untouched, and
+    // leaves no marker, so the stale staged files are ignored.
+    //
+    // The marker opens the recovery window: from here the staged set is known
+    // complete, so if the process dies mid-rename the next run finishes the
+    // publication rather than leaving a new cert beside an old key. See
+    // `finish_pending_publish`.
+    let marker = tls_dir.join(PUBLISH_MARKER);
+    std::fs::write(&marker, b"publishing\n")
+        .with_context(|| format!("writing {}", marker.display()))?;
+
     std::fs::rename(&client_crt_tmp, &client_crt)
         .with_context(|| format!("installing {}", client_crt.display()))?;
     std::fs::rename(&ca_crt_tmp, &ca_crt)
@@ -521,6 +585,8 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
         .with_context(|| format!("installing {}", client_key.display()))?;
     std::fs::rename(&profile_json_tmp, &profile_json)
         .with_context(|| format!("installing {}", profile_json.display()))?;
+
+    std::fs::remove_file(&marker).with_context(|| format!("clearing {}", marker.display()))?;
     Ok(())
 }
 
@@ -618,6 +684,87 @@ impl rustls::client::danger::ServerCertVerifier for AcceptProvisional {
 
 #[cfg(test)]
 mod tests {
+    /// Recovery contract for the four-rename credential publication (August
+    /// human review). A crash between renames must not leave a NEW cert beside
+    /// an OLD key: the marker makes the interrupted state recoverable, and the
+    /// next run finishes the publication.
+    #[test]
+    fn interrupted_publish_is_completed_from_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+
+        // Previous generation, already published.
+        std::fs::write(tls.join("client.crt"), b"OLD-CERT").unwrap();
+        std::fs::write(tls.join("ca.crt"), b"OLD-CA").unwrap();
+        std::fs::write(tls.join("client.key"), b"OLD-KEY").unwrap();
+        std::fs::write(tls.join("profile.json"), b"OLD-PROFILE").unwrap();
+
+        // Simulate a crash after the FIRST rename: client.crt is the new one,
+        // the remaining three are still staged, and the marker is present.
+        std::fs::write(tls.join("client.crt"), b"NEW-CERT").unwrap();
+        std::fs::write(tls.join(".ca.crt.tmp"), b"NEW-CA").unwrap();
+        std::fs::write(tls.join(".client.key.tmp"), b"NEW-KEY").unwrap();
+        std::fs::write(tls.join(".profile.json.tmp"), b"NEW-PROFILE").unwrap();
+        std::fs::write(tls.join(PUBLISH_MARKER), b"publishing\n").unwrap();
+
+        finish_pending_publish(dir.path()).expect("recovery must succeed");
+
+        // The whole set is now the new generation: no cert/key mismatch.
+        assert_eq!(std::fs::read(tls.join("client.crt")).unwrap(), b"NEW-CERT");
+        assert_eq!(std::fs::read(tls.join("ca.crt")).unwrap(), b"NEW-CA");
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"NEW-KEY");
+        assert_eq!(
+            std::fs::read(tls.join("profile.json")).unwrap(),
+            b"NEW-PROFILE"
+        );
+        assert!(
+            !tls.join(PUBLISH_MARKER).exists(),
+            "the marker must be cleared once the set is consistent"
+        );
+    }
+
+    /// Staged files WITHOUT a marker are the residue of a crash during staging:
+    /// that set is not known-good, so recovery must ignore it rather than
+    /// publish a half-written credential.
+    #[test]
+    fn staged_files_without_a_marker_are_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        std::fs::write(tls.join("client.crt"), b"OLD-CERT").unwrap();
+        std::fs::write(tls.join(".client.crt.tmp"), b"HALF-WRITTEN").unwrap();
+
+        finish_pending_publish(dir.path()).expect("no marker is not an error");
+
+        assert_eq!(
+            std::fs::read(tls.join("client.crt")).unwrap(),
+            b"OLD-CERT",
+            "an unmarked staged file must never be published"
+        );
+    }
+
+    /// A completed publication leaves no marker, so recovery is a no-op and the
+    /// published set is untouched.
+    #[test]
+    fn cache_materials_leaves_no_marker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let resp = EnrollResponse {
+            cert_pem: "new-cert".into(),
+            ca_chain_pem: daemon_ca,
+            device_id: "dev_test".into(),
+            not_after: 0,
+            relay_profile: RelayProfile::default(),
+        };
+        cache_materials(dir.path(), &resp, "new-key").expect("publish must succeed");
+        assert!(
+            !dir.path().join("tls").join(PUBLISH_MARKER).exists(),
+            "a completed publish must clear its marker"
+        );
+        assert!(dir.path().join("tls").join("client.key").exists());
+    }
+
     use super::*;
 
     #[test]

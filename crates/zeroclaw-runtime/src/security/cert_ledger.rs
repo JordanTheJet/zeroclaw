@@ -237,7 +237,28 @@ impl CertLedger {
 
     /// Record a freshly issued (or renewed) certificate and write the matching
     /// append-only audit event. `renewal` selects `CertRenewed` vs `CertIssued`.
+    /// Record an issuance across both durable surfaces.
+    ///
+    /// SQLite and the append-only audit file cannot share one transaction, so
+    /// the ORDER is the correctness argument. The audit event is written first:
+    /// if it fails, no active row exists, the caller returns an error and
+    /// restores the one-time pairing code, and the retry issues exactly one
+    /// certificate. Committing the row first left an orphaned ACTIVE row behind
+    /// on an audit failure, and because the retry carries a fresh CSR - and so
+    /// a different fingerprint - it created a SECOND active credential rather
+    /// than replacing the first.
+    ///
+    /// The residue of the safe order is a recorded attempt with no issued
+    /// certificate, which is what an append-only attempt log is for. The row
+    /// write itself is keyed on the fingerprint via INSERT OR REPLACE, so
+    /// re-recording the same certificate is idempotent.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
+        let kind = if renewal {
+            AuditEventType::CertRenewed
+        } else {
+            AuditEventType::CertIssued
+        };
+        self.audit_cert(kind, entry)?;
         {
             let conn = self.conn.lock();
             conn.execute(
@@ -257,12 +278,7 @@ impl CertLedger {
             )
             .context("insert issued cert")?;
         }
-        let kind = if renewal {
-            AuditEventType::CertRenewed
-        } else {
-            AuditEventType::CertIssued
-        };
-        self.audit_cert(kind, entry)
+        Ok(())
     }
 
     /// The status of a cert by fingerprint, or `None` if unknown to the ledger.
