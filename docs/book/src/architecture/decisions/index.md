@@ -29,10 +29,10 @@ Accepted ADRs are immutable. If the architecture changes, write a new ADR and ma
 | [ADR-011](./ADR-011-multi-agent-runtime-boundaries.md) | accepted | Configured agents have explicit runtime boundaries under one daemon. |
 | [ADR-012](./ADR-012-generation-scoped-live-config-apply.md) | proposed | Live config application uses canonical generations and target-specific results. |
 | [ADR-013](./ADR-013-key-source-authority.md) | proposed | Master key acquisition uses one configured key-source authority. |
-| [ADR-XXXX (draft)](./ADR-XXXX-control-plane-approval-audit-key.md) | proposed (draft) | The control-plane approval and audit key derives from the single ADR-013 authority. |
-| [ADR-XXXX (draft)](./ADR-XXXX-control-plane-registration-bootstrap.md) | proposed (draft) | The first control-plane client is registered receipt-exempt inside the genesis ceremony. |
+| [ADR-XXXX (draft)](./ADR-XXXX-control-plane-approval-audit-key.md) | proposed (direction decided) | The control-plane approval and audit key derives from the single ADR-013 authority. |
+| [ADR-XXXX (draft)](./ADR-XXXX-control-plane-registration-bootstrap.md) | proposed (direction decided) | The first control-plane client is registered receipt-exempt inside the genesis ceremony. |
 
-The two `ADR-XXXX (draft)` rows are unaccepted decision drafts for the control-plane initiative (issues #24 and #25). Their identifiers are placeholders: ADR-014 is already claimed on an off-`master` branch, so the maintainer allocates the final numbers, and renames the files, when the records are accepted.
+The two `ADR-XXXX (draft)` rows are control-plane initiative records whose direction the maintainer decided on 2026-08-21, in the decision comments on issues #24 and #25. Each record states the decided direction rather than a recommendation, and each remains `proposed` until the acceptance gates in the record are met and a real ADR number is allocated. Their identifiers are placeholders: ADR-014 is already claimed on an off-`master` branch, so the maintainer allocates the final numbers, and renames the files, when the records are accepted.
 
 ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.
 

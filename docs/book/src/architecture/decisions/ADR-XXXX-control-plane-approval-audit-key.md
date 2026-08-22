@@ -2,7 +2,7 @@
 id: ADR-XXXX
 title: Control-plane approval and audit key derives from the single ADR-013 authority
 date: 2026-08-21
-status: proposed
+status: Proposed (direction decided by maintainer 2026-08-21; see issue #24)
 relates-to:
   - https://github.com/JordanTheJet/zeroclaw/issues/24
   - https://github.com/JordanTheJet/zeroclaw/issues/35
@@ -15,12 +15,14 @@ relates-to:
 
 # ADR-XXXX: Control-Plane Approval And Audit Key Derives From The Single ADR-013 Authority
 
-> **Draft decision record.** The `ADR-XXXX` identifier is a placeholder. ADR-014
-> is already claimed on an off-`master` branch, so the maintainer allocates the
-> final number when this record is accepted. Drafted for issue
-> [#24](https://github.com/JordanTheJet/zeroclaw/issues/24); it proposes options
-> and a recommendation for a human to decide, and does not authorize
-> implementation.
+> **Decided direction, record still proposed.** The `ADR-XXXX` identifier is a
+> placeholder. ADR-014 is already claimed on an off-`master` branch, so the
+> maintainer allocates the final number when this record is accepted. The
+> maintainer decided the direction in
+> [issue #24 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
+> the Decision section below records that decision rather than a recommendation.
+> The record stays `proposed` until the acceptance gates are met, and it does not
+> by itself authorize implementation.
 
 ## Context
 
@@ -123,12 +125,32 @@ raw bytes.
 
 ## Decision
 
-Adopt **option 1 (a domain-separated subkey derived under the single ADR-013
-authority) as the default, with the receipt interface specified as
-operation-based per option 3** so raw approval-key bytes never reach the
-requester surface.
+**Option 1 is decided.** The maintainer decided this direction on 2026-08-21 in
+the [issue #24 decision comment](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651).
 
-Rationale:
+The control-plane approval and audit key is an HKDF-SHA256 subkey derived from
+the single ADR-013 key-source authority, under the fixed domain-separation label
+`zeroclaw/control-plane/approval-audit/v1`. The derived key is never exportable,
+and it is exposed only through sign and verify operations, so raw approval-key
+bytes never reach the requester surface and a later move to a separate key
+source (option 2) would not change the interface. The operation-based interface
+of option 3 is therefore required, not merely preferred.
+
+The tradeoff is accepted explicitly: rotating the master key re-derives, and so
+rotates, the approval key. Independent approval-key rotation is out of scope
+until a deployment needs it, at which point option 2 is the recorded path and the
+receipt contract does not change.
+
+Rationale, as decided:
+
+- It honors ADR-013's single-authority rule through domain separation rather than
+  by adding a second key source.
+- It adds no operational surface for solo and headless deployments, which have no
+  second source to provision, make available, or fail closed on.
+- Domain-separated HKDF derivation is the standard pattern used by TLS 1.3 and
+  AWS request signing, so the construction is auditable against known practice.
+
+Supporting rationale from the option analysis:
 
 - It is the smallest deviation from ADR-013. It honors "one configured source is
   authoritative per deployment" and satisfies exactly the deferred clause: the

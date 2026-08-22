@@ -2,7 +2,7 @@
 id: ADR-XXXX
 title: First control-plane client is registered receipt-exempt inside the genesis ceremony
 date: 2026-08-21
-status: proposed
+status: Proposed (direction decided by maintainer 2026-08-21; see issue #25)
 relates-to:
   - https://github.com/JordanTheJet/zeroclaw/issues/25
   - https://github.com/JordanTheJet/zeroclaw/issues/35
@@ -13,12 +13,14 @@ relates-to:
 
 # ADR-XXXX: First Control-Plane Client Is Registered Receipt-Exempt Inside The Genesis Ceremony
 
-> **Draft decision record.** The `ADR-XXXX` identifier is a placeholder. ADR-014
-> is already claimed on an off-`master` branch, so the maintainer allocates the
-> final number when this record is accepted. Drafted for issue
-> [#25](https://github.com/JordanTheJet/zeroclaw/issues/25); it proposes options
-> and a recommendation for a human to decide, and does not authorize
-> implementation.
+> **Decided direction, record still proposed.** The `ADR-XXXX` identifier is a
+> placeholder. ADR-014 is already claimed on an off-`master` branch, so the
+> maintainer allocates the final number when this record is accepted. The
+> maintainer decided the direction in
+> [issue #25 on 2026-08-21](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
+> the Decision section below records that decision rather than a recommendation.
+> The record stays `proposed` until the acceptance gates are met, and it does not
+> by itself authorize implementation.
 
 ## Context
 
@@ -95,13 +97,17 @@ meta-authority operation requires a receipt.
 
 ## Decision
 
-Adopt **option 1 (genesis-time bootstrap registration), specified as the minimal
-case of option 3's bootstrap window**: the receipt exemption is limited to
-registrations performed inside the genesis and mutation-enablement ceremony, each
-recorded in the audit chain with its own anchor, and no registration is
-receipt-exempt after mutation enablement.
+**Option 1 is decided.** The maintainer approved this direction on 2026-08-21 in
+the [issue #25 decision comment](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807).
 
-Rationale:
+The genesis ceremony may register the first client or clients receipt-exempt,
+specified as the minimal case of option 3's bootstrap window: the receipt
+exemption is limited to registrations performed inside the genesis and
+mutation-enablement ceremony, each recorded in the audit chain with its own
+anchor, and the exception closes the moment mutation enablement completes. No
+registration is receipt-exempt after mutation enablement.
+
+Rationale, as decided:
 
 - It resolves the circularity with the least new trust surface. It reuses the
   exemption the design already grants genesis, under which the first operator is
