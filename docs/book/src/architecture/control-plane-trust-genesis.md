@@ -1,6 +1,6 @@
 # Design: control-plane trust genesis and recovery ceremonies
 
-> **Status: proposed.** Nothing on this page is implemented. There is no
+> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented. There is no
 > control-plane genesis record, no trust epoch, no target registry, and no
 > recovery ceremony anywhere on `master`. This page describes what the trust
 > half of phase 3 of the parent architecture would have to build in order to be
@@ -48,7 +48,7 @@ mutation enablement completes. See "Bootstrap client registration" below. The
 maintainer decided this on 2026-08-21 in
 [issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
 the decision record is drafted as
-`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`
+`docs/book/src/architecture/decisions/ADR-016-control-plane-registration-bootstrap.md`
 on the `docs/control-plane-decision-drafts` branch.
 
 Two consequences are absolute:
@@ -116,7 +116,7 @@ requester-facing surface. Rotating the master key re-derives, and therefore
 rotates, the approval key; that tradeoff is accepted, and independent
 approval-key rotation is out of scope until a deployment needs it. The decision
 record is drafted as
-`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`
+`docs/book/src/architecture/decisions/ADR-015-control-plane-approval-audit-key.md`
 on the `docs/control-plane-decision-drafts` branch.
 
 Genesis therefore does not select a second key source. It derives the approval
@@ -490,7 +490,7 @@ the maintainer to settle and are deliberately not resolved here.
    verify operations. Decided by the maintainer on 2026-08-21 in
    [issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
    see "Key material and ADR-013" above and the draft record
-   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`.
+   `docs/book/src/architecture/decisions/ADR-015-control-plane-approval-audit-key.md`.
    The parent document's "changing management or audit key sources" wording still
    needs the matching amendment, which is tracked with that record.
 2. **Open: the deployment trust root has no defined provenance.** Headless

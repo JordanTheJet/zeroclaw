@@ -1,6 +1,6 @@
 # Design: control-plane principals, client registration, and approval receipts
 
-> **Status: proposed.** Nothing on this page is implemented. There is no
+> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented. There is no
 > control-plane principal model, no client registration ceremony, and no
 > approval receipt anywhere on `master`. This page describes what phases 3 and 4
 > of the parent architecture would have to build in order to be reviewable. It
@@ -79,7 +79,7 @@ exposed only through sign and verify operations, which is what lets the broker
 authenticate a receipt with a key the requester surface cannot read. Rotating
 the master key re-derives, and therefore rotates, the approval key; that
 tradeoff is accepted. The decision record is drafted as
-`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`
+`docs/book/src/architecture/decisions/ADR-015-control-plane-approval-audit-key.md`
 on the `docs/control-plane-decision-drafts` branch.
 
 ADR-013 also records that configured-source acquisition failure "must not
@@ -242,7 +242,7 @@ or clients receipt-exempt, as a minimal bounded exception that closes when
 mutation enablement completes. The bounds are specified in
 `control-plane-trust-genesis.md` under "Bootstrap client registration", and the
 decision record is drafted as
-`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`
+`docs/book/src/architecture/decisions/ADR-016-control-plane-registration-bootstrap.md`
 on the `docs/control-plane-decision-drafts` branch.
 
 Three consequences are normative here. A bootstrap-registered client receives no
@@ -596,7 +596,7 @@ the maintainer to settle and are deliberately not resolved here.
    [issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
    see "What ADR-013 constrains here" and "Authentication of the receipt" above,
    and the draft record
-   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`.
+   `docs/book/src/architecture/decisions/ADR-015-control-plane-approval-audit-key.md`.
 2. **Resolved: the agent requester row does not say "never approve".** The
    principal table
    says an external requester may "Inspect, propose, and request review only
@@ -632,7 +632,7 @@ the maintainer to settle and are deliberately not resolved here.
    [issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
    see "Client registration" above, the bounds in
    `control-plane-trust-genesis.md`, and the draft record
-   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`.
+   `docs/book/src/architecture/decisions/ADR-016-control-plane-registration-bootstrap.md`.
 4. **Resolved: quorum when a second operator exists but is ineligible.**
    Meta-authority
    requires two distinct operator principals "when at least two eligible

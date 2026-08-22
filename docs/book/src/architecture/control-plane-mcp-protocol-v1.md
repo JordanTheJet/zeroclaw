@@ -1,6 +1,6 @@
 # Specification: read-only control MCP protocol v1
 
-> **Status: proposed.** Nothing on this page is implemented. There is no
+> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented. There is no
 > `zeroclaw control` subcommand, no control MCP server, and no
 > `zeroclaw-control` crate on `master`. This specification describes the
 > surface that a future phase-2 implementation would have to build in order to

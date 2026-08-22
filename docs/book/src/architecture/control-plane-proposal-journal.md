@@ -1,6 +1,6 @@
 # Design: durable proposal journal and crash recovery
 
-> **Status: proposed.** Nothing on this page is implemented. There is no
+> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented. There is no
 > proposal journal, no transaction worker, and no control-plane recovery service
 > anywhere on `master`. This page describes what phase 5 of the parent
 > architecture would have to build in order to be reviewable. It is not an
