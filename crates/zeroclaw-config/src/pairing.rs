@@ -272,9 +272,7 @@ impl PairingGuard {
         let mut pairing_code = self.pairing_code.lock();
         // An expired code is cleared here, not merely ignored, so it cannot be
         // redeemed later and does not linger in memory.
-        let Some(pending) = take_live(&mut pairing_code) else {
-            return None;
-        };
+        let pending = take_live(&mut pairing_code)?;
         if constant_time_eq(code.trim(), pending.code.trim()) {
             let reservation = PairingReservation {
                 guard: self.clone(),

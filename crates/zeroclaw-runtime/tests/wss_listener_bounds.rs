@@ -143,8 +143,10 @@ async fn start_listener(
     )
     .unwrap();
 
-    let mut config = zeroclaw_config::schema::Config::default();
-    config.data_dir = dir.to_path_buf();
+    let config = zeroclaw_config::schema::Config {
+        data_dir: dir.to_path_buf(),
+        ..Default::default()
+    };
     let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
         4, 10, 60,
     ));
