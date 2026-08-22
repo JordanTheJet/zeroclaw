@@ -16,6 +16,11 @@ fixture-grants = []
 [dependencies]
 anyhow = "1.0"
 hex = "0.4"
+# RFC 5869 HKDF-SHA256 for the ADR-015 approval and audit key is implemented in
+# `keys.rs` over `hmac` + `sha2`. Both already build in this workspace (channels,
+# gateway, providers), so no new crate enters the dependency graph and there is
+# no `hkdf` crate to add.
+hmac = "0.12"
 # Already an unconditional dependency of the `zeroclaw` binary, so the control
 # protocol's request and response schemas are generated from the compiled types
 # rather than hand written without adding anything to a shipped build.

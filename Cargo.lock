@@ -13671,6 +13671,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "hex",
+ "hmac 0.12.1",
  "schemars 1.2.1",
  "serde",
  "serde_json",

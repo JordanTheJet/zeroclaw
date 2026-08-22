@@ -18,6 +18,7 @@
 
 mod guard;
 mod inventory;
+pub mod keys;
 mod preview;
 mod principal;
 mod proposal;
