@@ -468,8 +468,8 @@ pub fn persist_model_cache(
     // sequence. The publish itself is collision-safe (exclusive temp file +
     // atomic rename), but without serialization two concurrent refreshes can
     // both read the same pre-refresh snapshot and the second rename silently
-    // discards the first one's provider entry — the lost-update window left
-    // open by #9075. Blocking (rather than failing) lets overlapping
+    // discards the first one's provider entry — the lost-update window the
+    // collision-safe publish left open. Blocking (rather than failing) lets overlapping
     // refreshes complete in sequence; the lock releases when the guard drops.
     let lock_path = cache_dir.join(format!("{MODEL_CACHE_FILE}.lock"));
     let cache_lock = std::fs::OpenOptions::new()
