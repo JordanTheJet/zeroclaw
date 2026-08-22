@@ -15,6 +15,7 @@ fixture-grants = []
 
 [dependencies]
 anyhow = "1.0"
+hex = "0.4"
 # Already an unconditional dependency of the `zeroclaw` binary, so the control
 # protocol's request and response schemas are generated from the compiled types
 # rather than hand written without adding anything to a shipped build.

@@ -22,6 +22,7 @@ mod preview;
 mod principal;
 mod proposal;
 pub mod protocol;
+pub mod registry;
 mod service;
 mod session;
 
