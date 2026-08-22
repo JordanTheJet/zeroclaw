@@ -41,6 +41,16 @@ plane is authorized by a receipt issued under an existing trust epoch, and a
 receipt requires a trust root that only genesis can create. That circularity is
 why genesis is a ceremony rather than an operation.
 
+The genesis and mutation-enablement ceremony may additionally register the first
+client or clients receipt-exempt. That is a bounded exception performed inside
+the ceremony rather than a third exempt transition, and it closes the moment
+mutation enablement completes. See "Bootstrap client registration" below. The
+maintainer decided this on 2026-08-21 in
+[issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
+the decision record is drafted as
+`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`
+on the `docs/control-plane-decision-drafts` branch.
+
 Two consequences are absolute:
 
 1. **Neither ceremony is reachable through the control plane.** Genesis and
@@ -92,8 +102,26 @@ Three ADR-013 rules constrain this ceremony directly:
 ADR-013 also defers whether a non-encryption consumer receives scoped access or
 a derived subkey, and states that until that decision exists such a consumer
 must not silently reuse the raw encryption master key. The approval and audit
-key is a non-encryption consumer. That unresolved intersection is recorded in
-"Open questions" and is a genuine blocker for phase 3.
+key is a non-encryption consumer, so that intersection had to be decided before
+phase 3 could be implemented.
+
+It is now decided. The maintainer decided on 2026-08-21 in
+[issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651)
+that the control-plane approval and audit key is an HKDF-SHA256 subkey derived
+from the single ADR-013 key-source authority, under the fixed
+domain-separation label `zeroclaw/control-plane/approval-audit/v1`. The derived
+key is never exportable and is exposed only through sign and verify operations,
+so no raw approval-key bytes cross the `KeySource` boundary and none reach a
+requester-facing surface. Rotating the master key re-derives, and therefore
+rotates, the approval key; that tradeoff is accepted, and independent
+approval-key rotation is out of scope until a deployment needs it. The decision
+record is drafted as
+`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`
+on the `docs/control-plane-decision-drafts` branch.
+
+Genesis therefore does not select a second key source. It derives the approval
+and audit key under the deployment's single authority and commits to it through
+`host_key_commitment` in the genesis record.
 
 ## Interactive genesis
 
@@ -148,6 +176,38 @@ deployment trust root attests on their behalf, with the private key never
 arriving on the host at all. Neither substitutes for the other, and a host that
 can offer neither remains read-only.
 
+## Bootstrap client registration
+
+Client registration is a meta-authority operation and normally consumes an
+approval receipt issued under the existing trust epoch. The receipt broker
+arrives in phase 4, so the first client could not otherwise be registered in
+phase 3 at all. The maintainer decided on 2026-08-21 in
+[issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807)
+that the ceremony may register the first client or clients receipt-exempt, as a
+minimal bounded exception.
+
+The exception is bounded by all of the following, and an implementation that
+relaxes any one of them is outside the decision:
+
+- it applies only to registrations performed inside the genesis or
+  mutation-enablement ceremony, under the same user-presence assurance
+  (interactive host) or deployment-trust-root assurance (headless host) that
+  establishes the first operator. There is no lower-assurance path;
+- the bootstrap-registered client receives no approval authority, consistent
+  with the rule that registration never grants approval;
+- each bootstrap registration is recorded in the audit chain with its own
+  anchor, and the registration record's `created_by` references the genesis or
+  enablement operation digest rather than a receipt;
+- the exception closes when mutation enablement completes. After that point no
+  registration is receipt-exempt, and a registration attempted outside the
+  ceremony fails closed until the phase-4 broker exists; and
+- recovery invalidates bootstrap-registered clients unless they are
+  re-established, as stated under "What recovery invalidates".
+
+This does not widen who may register a client. A requester still cannot run
+genesis, register a client, or reach the ceremony, and the ceremony remains
+unreachable through `ControlService`, native tools, or MCP.
+
 ## The genesis record
 
 The genesis record is the root of trust for later operator, client, target, and
@@ -198,6 +258,12 @@ rather than an open-ended one.
 Rules:
 
 - the genesis record establishes the initial epoch;
+- a trust epoch is a monotonic counter scoped to one instance. It is recorded in
+  the genesis record and repeated in every audit row;
+- epoch values are per instance, never per host. A child instance's epoch is
+  independent of its parent's, and two epoch values are comparable only within
+  one instance's audit chain, so an inherited trust root never implies a shared
+  epoch sequence;
 - every audit row carries a monotonic sequence, trust epoch, operation
   identifier, previous-row digest, and host-key authentication tag;
 - the journal transaction commits the audit row with the state transition it
@@ -279,6 +345,21 @@ Recovery invalidates all pending proposals, client credentials, approval
 receipts, and resume secrets. Nothing issued under the prior epoch survives into
 the new one. A registered client must be registered again, and a parked proposal
 must be proposed again with a fresh preview.
+
+Bootstrap-registered clients are covered by that rule. A client registered
+receipt-exempt inside a genesis or mutation-enablement ceremony does not survive
+recovery, and is re-established only through the recovery ceremony's own
+bootstrap step or, once mutations are re-enabled, through an ordinary
+registration that consumes a receipt.
+
+Recovery also resets mutation enablement to disabled. Genesis leaves mutations
+disabled until a separate ceremony, and recovery replaces the operator set and
+the host key, so the recovered instance is in the same position: it holds a
+trust root and no enabled mutation authority. Re-enabling mutations is a
+separate post-recovery ceremony with the same prerequisites as the original one,
+namely a configured high-assurance operator backchannel, a usable approval and
+audit key source, and explicit user-presence confirmation of the canonical
+target instance.
 
 ## Why deleting files never re-enables first genesis
 
@@ -368,6 +449,9 @@ that this design owns:
   invalid deployment manifest;
 - a managed root with a missing genesis record enters recovery-only mode and
   cannot run first genesis;
+- bootstrap client registration happens only inside the genesis or
+  mutation-enablement ceremony, grants the registered client no approval
+  authority, and no registration is receipt-exempt after mutation enablement;
 - recovery requires genesis-equivalent assurance, links audit epochs, and is
   unreachable through native tools or MCP;
 - child creation inherits approved operators by default, previews any
@@ -382,10 +466,13 @@ that this design owns:
 ## Open questions
 
 These are gaps or ambiguities in the parent architecture document or its
-interaction with existing records. They are recorded for the maintainer to
-settle and are deliberately not resolved here.
+interaction with existing records. Items marked **Resolved** carry a maintainer
+decision recorded on 2026-08-21; they are kept here rather than deleted so the
+question and its answer stay together. Items marked **Open** are recorded for
+the maintainer to settle and are deliberately not resolved here.
 
-1. **ADR-013's single-authority rule versus a separate control-plane key.**
+1. **Resolved: ADR-013's single-authority rule versus a separate control-plane
+   key.**
    ADR-013 records that one configured key source is authoritative for a
    deployment at a time, and that the assembly layer constructs one shared
    source authority per process generation. The parent architecture requires
@@ -393,10 +480,21 @@ settle and are deliberately not resolved here.
    "changing management or audit key sources" its own meta-authority operation,
    which implies the management key source is independently selectable. Whether
    the control plane uses the deployment's single authority, or introduces a
-   second authority that ADR-013 does not contemplate, is unresolved. It needs a
-   decision record before phase 3 can be implemented. This gap is also recorded
-   in `control-plane-principals-and-approvals.md`.
-2. **The deployment trust root has no defined provenance.** Headless genesis is
+   second authority that ADR-013 does not contemplate, was unresolved. This gap
+   is also recorded in `control-plane-principals-and-approvals.md`.
+
+   **Resolution.** The control plane uses the deployment's single authority. The
+   approval and audit key is a never-exportable HKDF-SHA256 subkey derived under
+   it, with the domain-separation label
+   `zeroclaw/control-plane/approval-audit/v1`, exposed only through sign and
+   verify operations. Decided by the maintainer on 2026-08-21 in
+   [issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
+   see "Key material and ADR-013" above and the draft record
+   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`.
+   The parent document's "changing management or audit key sources" wording still
+   needs the matching amendment, which is tracked with that record.
+2. **Open: the deployment trust root has no defined provenance.** Headless
+   genesis is
    authorized by "an administrator signature or platform attestation" verified
    against a deployment trust root, and headless recovery by a
    deployment-trust-root-signed manifest. The parent document never says how the
@@ -404,18 +502,25 @@ settle and are deliberately not resolved here.
    what prevents the same process that writes the manifest from also writing the
    trust root it is verified against. Without that, headless genesis assurance is
    asserted rather than derived.
-3. **Child instances and the single key-source authority.** A child inherits the
+3. **Open: child instances and the single key-source authority.** A child
+   inherits the
    parent's deployment trust root while generating a distinct host key. If
    parent and child run on the same host, ADR-013's rule that one source is
    authoritative per deployment appears to be in tension with two instances
    holding distinct host keys. Whether "deployment" means the host, the install
    root, or the instance is not defined anywhere.
-4. **Trust epoch values are unspecified.** The parent document requires epochs to
-   be monotonic and to appear in every audit row, but does not define their
-   representation, whether they are per instance or per host, or how a child's
-   epoch relates to its parent's. Two instances comparing epoch values across an
-   inherited trust root would need that rule.
-5. **Recovery's effect on the target registry is unstated.** Recovery
+4. **Resolved: trust epoch values are unspecified.** The parent document requires
+   epochs to be monotonic and to appear in every audit row, but does not define
+   their representation, whether they are per instance or per host, or how a
+   child's epoch relates to its parent's. Two instances comparing epoch values
+   across an inherited trust root would need that rule.
+
+   **Resolution.** A trust epoch is a monotonic per-instance counter, recorded in
+   the genesis record and in every audit row. A child's epoch is independent of
+   its parent's, and epochs are compared only within one instance's chain. See
+   "Trust epochs" above. Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 17.
+5. **Open: recovery's effect on the target registry is unstated.** Recovery
    invalidates all pending proposals, client credentials, approval receipts, and
    resume secrets. It does not say whether registered target roots and approved
    creation parents survive recovery. Preserving them is convenient but means a
@@ -423,12 +528,19 @@ settle and are deliberately not resolved here.
    contain that compromise. Discarding them is safer but leaves a recovered host
    unable to reach previously registered instances until an operator
    re-registers each one.
-6. **Mutation enablement after recovery.** Genesis explicitly leaves mutations
-   disabled until a separate ceremony. The parent document does not say whether
-   recovery also resets mutation enablement to disabled. The conservative
+6. **Resolved: mutation enablement after recovery.** Genesis explicitly leaves
+   mutations disabled until a separate ceremony. The parent document does not say
+   whether recovery also resets mutation enablement to disabled. The conservative
    reading is that it does, since recovery replaces the operator set and host
-   key, but this is not stated and the difference is observable.
-7. **The managed-instance marker is not specified.** The anti-reset rule depends
+   key, but this was not stated and the difference is observable.
+
+   **Resolution.** Recovery resets mutation enablement to disabled, and
+   re-enabling is a separate post-recovery ceremony with the original
+   prerequisites. See "What recovery invalidates" above. Adopted from the
+   gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 19.
+7. **Open: the managed-instance marker is not specified.** The anti-reset rule
+   depends
    on "the durable instance identity and prior genesis record" plus a
    "managed-instance marker", but the marker's location, format, and protection
    are undefined. Since the entire anti-reset property rests on it, its identity

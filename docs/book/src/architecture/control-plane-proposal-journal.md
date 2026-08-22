@@ -81,15 +81,26 @@ operation, and no requester-facing tool accepts a receipt.
 
 ## Request apply and durable parking
 
-Conversational drafts may remain process-local. Once Request apply succeeds,
-the immutable proposal, owner binding, dependency digest, and expiration are
-durable.
+Pre-review conversational drafts stay non-durable in the read-only phase: they
+remain process-local, write no journal row, and consume no parked-byte or entry
+quota. If drafts are ever made durable, they acquire per-client durable state
+and come under the same per-client parked-byte and entry quotas as proposals,
+because a durable draft outside those quotas would be an unbounded write path
+that bypasses the Request apply quota. Adopted from the gap-sweep resolution
+proposed in [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26),
+item 14.
+
+Once Request apply succeeds, the immutable proposal, owner binding, dependency
+digest, and expiration are durable.
 
 The proposal is immutable and bound to:
 
 - target instance identity and pinned roots;
 - exact source-config revision;
-- registered requester identity, client session attribution, and owner token;
+- registered requester identity, client session attribution, and the owner
+  token, which is the client's `registration_id`. All three are attribution
+  only: none of them conveys approval authority, and the owner token is not the
+  resume secret;
 - canonical operation payload and digest;
 - host-derived dependency set and pinned external facts;
 - declared effects and verification plan; and
@@ -275,6 +286,15 @@ Derived rules:
 - **Ambiguity expires, never extends.** Clock rollback, an unsynchronized
   source, or any state the host cannot resolve into a trustworthy current time
   expires the affected proposal, receipt, and resume secret.
+- **An ambiguous time source is defined concretely.** The host treats the time
+  source as ambiguous when any of these holds: the system clock is
+  unsynchronized; the current wall-clock reading steps backwards below the last
+  recorded journal timestamp; or the host is on a first boot with no reliable
+  time. Detection uses the monotonic journal timestamp as the comparison point,
+  and any one of these conditions expires the affected credential. Stating the
+  signals is what makes the rule above testable rather than aspirational.
+  Adopted from the gap-sweep resolution proposed in
+  [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 11.
 - **Expiration is host-evaluated.** No client-supplied timestamp, no
   `server_time` value previously returned to a client, and no
   backchannel-supplied time participates in the decision.
@@ -319,6 +339,17 @@ and are stated so an implementer does not have to infer them:
   not enumerable across owners; and
 - a quota refusal is not an expiry. It leaves existing entries untouched and
   does not consume, invalidate, or reorder them.
+
+Quota release on invalidation is stated so that an implementer does not leave a
+requester permanently charged for entries that no longer exist. Recovery
+invalidates all pending proposals, client credentials, approval receipts, and
+resume secrets, and it releases the parked-byte and entry quota those entries
+held at the moment of invalidation. The same rule covers a requester whose grant
+collapses while entries remain parked: those entries are invalidated, their
+quota is freed, and it is charged to nobody. Releasing quota never authorizes
+anything; the invalidated entries are gone, and a new proposal still has to pass
+authorization from the start. Adopted from the gap-sweep resolution proposed in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 12.
 
 ## Status reporting
 
@@ -366,10 +397,14 @@ that this design owns:
 
 ## Open questions
 
-These are gaps or ambiguities in the parent architecture document. They are
-recorded for the maintainer to settle and are deliberately not resolved here.
+These are gaps or ambiguities in the parent architecture document. Items marked
+**Resolved** carry a maintainer decision recorded on 2026-08-21; they are kept
+here rather than deleted so the question and its answer stay together. Items
+marked **Open** are recorded for the maintainer to settle and are deliberately
+not resolved here.
 
-1. **The state machine has no verification-failure state.** The diagram ends
+1. **Open: the state machine has no verification-failure state.** The diagram
+   ends
    `applied -> verified` with no transition out of `verified` or out of
    `applied` when verification fails. The required verification list separately
    demands that "verification detects partial or ineffective configuration". If
@@ -379,37 +414,64 @@ recorded for the maintainer to settle and are deliberately not resolved here.
    confirmed-but-ineffective result. A `verification_failed` state, or an
    explicit rule routing that case into `recovery_required`, appears to be
    missing.
-2. **`recovery_required` has no defined exit.** The parent document says an
+2. **Open: `recovery_required` has no defined exit.** The parent document says an
    ambiguous result "parks in `recovery_required` for operator resolution" but
    never defines what operator resolution is. It is unclear whether resolution
    is a meta-authority operation, whether it consumes a new receipt, which
    states it may transition to, and whether an operator may declare an
    ambiguous effect applied or not applied on their own judgement. Without that,
    an implementation has a state it can enter and never leave.
-3. **`owner token` is undefined.** The proposal binding set includes "registered
-   requester identity, client session attribution, and owner token", but `owner
-   token` appears nowhere else in the parent document. It is unclear whether it
-   is the resume secret, a distinct value, or a synonym for the registration
-   identifier. It cannot be implemented as written. This gap is also recorded in
+3. **Resolved: `owner token` is undefined.** The proposal binding set includes
+   "registered requester identity, client session attribution, and owner token",
+   but `owner token` appears nowhere else in the parent document. It was unclear
+   whether it is the resume secret, a distinct value, or a synonym for the
+   registration identifier. This gap is also recorded in
    `control-plane-principals-and-approvals.md`.
-4. **"Ambiguous time source" is not defined.** The clock rule says an ambiguous
+
+   **Resolution.** `owner_token` is the client's `registration_id`, and is
+   attribution only. It is not the resume secret, and none of the three bound
+   values conveys approval authority. See "Request apply and durable parking"
+   above. Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 6.
+4. **Resolved: "ambiguous time source" is not defined.** The clock rule says an
+   ambiguous
    time source expires a credential, but does not say what makes a source
    ambiguous. Candidate signals include an unsynchronized system clock, a
    backwards step since the last recorded journal timestamp, or a first boot
    with no reliable time. Which of these the host must detect, and with what,
    determines whether this rule is testable.
-5. **Quota interaction with recovery and epoch change.** Recovery invalidates
-   all pending proposals, client credentials, approval receipts, and resume
-   secrets. The parent document does not say whether parked-byte and entry
+
+   **Resolution.** All three signals count, and detection compares against the
+   monotonic journal timestamp. Any one of them expires the affected credential.
+   See "Expiration and clock rules" above. Adopted from the gap-sweep resolution
+   proposed in [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26),
+   item 11.
+5. **Resolved: quota interaction with recovery and epoch change.** Recovery
+   invalidates all pending proposals, client credentials, approval receipts, and
+   resume secrets. The parent document does not say whether parked-byte and entry
    quotas are released at that moment, nor how quota is accounted for a
    requester whose grant collapsed while entries remain parked.
-6. **Draft durability is an open decision with a quota consequence.** The parent
+
+   **Resolution.** Recovery releases the parked-byte and entry quota held by the
+   proposals and credentials it invalidates, at the moment of invalidation. A
+   collapsed requester's remaining parked entries are freed the same way and
+   charged to nobody. See "Per-requester quotas" above. Adopted from the
+   gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 12.
+6. **Resolved: draft durability is an open decision with a quota consequence.**
+   The parent
    document lists "whether pre-review conversational drafts survive restart" as
    an open decision while stating that parked mutation proposals are durable
    regardless. If drafts later become durable, they acquire per-client durable
    state and must be brought under the quota rules above; otherwise drafts
    become an unbounded write path that bypasses the Request apply quota.
-7. **Rejection retention.** A rejection is a durable state, but the parent
+
+   **Resolution.** Pre-review drafts stay non-durable in the read-only phase, and
+   if they ever become durable they come under the same per-client parked-byte
+   and entry quotas as proposals. See "Request apply and durable parking" above.
+   Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 14.
+7. **Open: rejection retention.** A rejection is a durable state, but the parent
    document does not say how long a `rejected` or `expired` entry is retained,
    whether it counts against quota, or whether a requester may resubmit an
    identical proposal immediately after rejection. Without a rule, a requester

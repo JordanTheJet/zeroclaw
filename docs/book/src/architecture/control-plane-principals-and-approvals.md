@@ -68,10 +68,19 @@ authenticated by a host key. Two of its recorded rules constrain this design:
   non-encryption consumer must not silently reuse the raw encryption master
   key".
 
-The approval and audit key is a non-encryption consumer. ADR-013 therefore does
-not currently authorize the control plane to obtain it, and the parent
-architecture assumes such a source exists. This is a real gap and is recorded in
-"Open questions" rather than resolved here.
+The approval and audit key is a non-encryption consumer, so ADR-013 did not
+authorize the control plane to obtain it until the deferred derivation decision
+was made. That decision now exists. The maintainer decided on 2026-08-21 in
+[issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651)
+that the approval and audit key is an HKDF-SHA256 subkey derived from the single
+ADR-013 authority, under the fixed domain-separation label
+`zeroclaw/control-plane/approval-audit/v1`. It is never exportable and is
+exposed only through sign and verify operations, which is what lets the broker
+authenticate a receipt with a key the requester surface cannot read. Rotating
+the master key re-derives, and therefore rotates, the approval key; that
+tradeoff is accepted. The decision record is drafted as
+`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`
+on the `docs/control-plane-decision-drafts` branch.
 
 ADR-013 also records that configured-source acquisition failure "must not
 implicitly select unsigned TUI identity" and must fail closed. The same posture
@@ -82,14 +91,24 @@ mode, an unsigned receipt, or a locally generated replacement key.
 ## Principal classes
 
 The parent document defines exactly four principal classes. They are reproduced
-here verbatim because the whole authorization model depends on them:
+here because the whole authorization model depends on them, with one deliberate
+correction noted immediately below the table:
 
 | Principal class | Source | Authority |
 |---|---|---|
-| Agent requester | Runtime-derived agent identity | Inspect, propose, and request review only when granted |
+| Agent requester | Runtime-derived agent identity | Inspect, propose, and request review only when granted; never approve |
 | External requester | Registered MCP client identity | Inspect, propose, and request review only within its grant; never approve |
 | Operator | Paired or user-presence-authenticated human identity | Approve within configured policy |
 | Recovery service | Host startup recovery worker | Resume or classify an already-authorized journal entry; never approve a new proposal |
+
+The table reproduces the parent document with one deliberate correction, made so
+that no implementer reads an omission as permission: the agent-requester row
+carries the explicit "never approve" clause that the parent document states only
+on the external-requester row. No principal type in a requester class can
+approve, which non-escalation rule 5 already states normatively. The parent
+document should be amended to match. Adopted from the gap-sweep resolution
+proposed in [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26),
+item 3.
 
 There is no fifth class. In particular there is no "local", "trusted", "admin",
 "root", or "same-user" class, and no class that a process acquires by how it was
@@ -213,6 +232,25 @@ instances, read domains, and proposal domains. It never grants approval.
 Registration is a meta-authority operation, as are grant widening, revocation,
 and credential rotation.
 
+Meta-authority operations consume an approval receipt issued under the existing
+trust epoch, and the receipt broker arrives in phase 4, so the first client
+cannot be registered that way in phase 3. The maintainer decided on 2026-08-21
+in
+[issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807)
+that the genesis and mutation-enablement ceremony may register the first client
+or clients receipt-exempt, as a minimal bounded exception that closes when
+mutation enablement completes. The bounds are specified in
+`control-plane-trust-genesis.md` under "Bootstrap client registration", and the
+decision record is drafted as
+`docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`
+on the `docs/control-plane-decision-drafts` branch.
+
+Three consequences are normative here. A bootstrap-registered client receives no
+approval authority, exactly like every other registered client. Any registration
+attempted outside the ceremony requires a receipt and fails closed with a
+"receipt broker not present" refusal until phase 4 exists. After mutation
+enablement no registration is receipt-exempt at all.
+
 ### Registration record contents
 
 | Field | Contents | Notes |
@@ -228,7 +266,7 @@ and credential rotation.
 | `approval_authority` | Structurally absent | There is no field whose value could grant approval |
 | `trust_epoch` | Epoch at issuance | Recovery invalidates credentials issued under a prior epoch |
 | `rotation_generation` | Monotonic counter | Incremented by a meta-authority rotation |
-| `created_by` | Digest of the approving meta-authority operation | Links the record to the receipt that authorized it |
+| `created_by` | Digest of the approving meta-authority operation | Links the record to the receipt that authorized it. For a bootstrap registration made inside the genesis or mutation-enablement ceremony, it is the ceremony operation digest instead, because no receipt exists yet |
 | `created_at`, `not_after` | Wall-clock bounds | Subject to the clock rules in the journal design |
 | `status` | `active`, `suspended`, or `revoked` | Revocation is immediate and fails closed |
 | `reachability_evaluation` | Timestamp, sandbox policy digest, enumerated reachable principals, and the resulting effective collapse | Re-evaluated on the triggers below |
@@ -283,6 +321,19 @@ Re-evaluation is a host action, not a client request. A client cannot trigger,
 suppress, or observe the outcome beyond discovering that its own effective
 grant changed.
 
+A re-evaluation can collapse an effective grant to nothing. At the moment of
+collapse the host expires that client's parked proposals, expires its issued but
+unconsumed approval receipts, and aborts its in-flight applies that have not yet
+passed the atomic receipt-consumption commit described in
+`control-plane-proposal-journal.md`. A client keeps no authority it has just
+lost, and letting outstanding state proceed on a collapsed grant would be
+exactly that. Adopted from the gap-sweep resolution proposed in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 7.
+
+What happens to an operation that is already past that commit, so the receipt is
+consumed and the entry is `applying` or later, is a separate question and is
+still open. See open question 7.
+
 ## Approval receipts
 
 The broker emits a single-use authenticated approval receipt. The parent
@@ -328,9 +379,14 @@ to the requester tool surface. Concretely:
   weaker approval mode, an unsigned receipt, or a generated replacement key,
   matching the ADR-013 posture that a source failure must not implicitly
   downgrade to an unsigned identity; and
-- the approval and audit key is a non-encryption consumer of key material,
-  which ADR-013 explicitly defers to a separate security decision. See "Open
-  questions".
+- the approval and audit key is a non-encryption consumer of key material.
+  ADR-013 deferred that case to a separate security decision, and that decision
+  is now made: the key is a never-exportable HKDF-SHA256 subkey of the single
+  ADR-013 authority, derived under the label
+  `zeroclaw/control-plane/approval-audit/v1`. The broker asks the key source to
+  sign or authenticate the canonical receipt fields and never receives key
+  bytes, so the receipt contract does not change if a deployment later moves the
+  signing key to a separate source or a secure element.
 
 ### Single-use consumption semantics
 
@@ -464,9 +520,19 @@ Confirmation tier rules:
 
 - meta-authority changes always use the strongest confirmation tier;
 - when at least two eligible operators exist, they require at least two
-  distinct operator principals and no fewer than the configured quorum; and
+  distinct operator principals and no fewer than the configured quorum;
 - a single-operator installation requires one user-presence-authenticated
-  operator distinct from the requesting agent or MCP session.
+  operator distinct from the requesting agent or MCP session; and
+- an operator that the reachability analysis makes ineligible for this requester
+  does not lower the required quorum. A host configured with two operators, one
+  of which is ineligible for this requester, does not fall back to the
+  single-operator path. It fails closed until the configured quorum of eligible
+  operators is available. The single-operator rule describes an installation
+  configured with one operator, never a multi-operator installation reduced to
+  one by reachability, because the latter would let a requester reduce the
+  required quorum by becoming able to reach an operator. Adopted from the
+  gap-sweep resolution proposed in
+  [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 4.
 
 The first stable protocol has no unapproved mutation class at all. Introducing
 one later requires a new architecture decision and cannot include capability
@@ -503,10 +569,13 @@ required verification list that this design owns:
 ## Open questions
 
 These are gaps or ambiguities in the parent architecture document or its
-interaction with accepted records. They are recorded for the maintainer to
-settle and are deliberately not resolved here.
+interaction with accepted records. Items marked **Resolved** carry a maintainer
+decision recorded on 2026-08-21; they are kept here rather than deleted so the
+question and its answer stay together. Items marked **Open** are recorded for
+the maintainer to settle and are deliberately not resolved here.
 
-1. **ADR-013 does not authorize the approval and audit key.** The parent
+1. **Resolved: ADR-013 does not authorize the approval and audit key.** The
+   parent
    document requires the broker to authenticate receipts "with a host key source
    unavailable to the requester tool surface" and requires genesis to "generate
    and seal the host approval/audit key in a platform key source". ADR-013
@@ -515,18 +584,36 @@ settle and are deliberately not resolved here.
    derived subkey, stating that until that decision is recorded "a
    non-encryption consumer must not silently reuse the raw encryption master
    key". The control plane's approval and audit key is exactly such a consumer.
-   Either the control plane needs its own key-source authority, which appears to
+   Either the control plane needed its own key-source authority, which appears to
    conflict with ADR-013's one-source rule, or the deferred derived-subkey
-   decision has to be made first. This blocks phase 3 and needs its own decision
-   record.
-2. **The agent requester row does not say "never approve".** The principal table
+   decision had to be made first.
+
+   **Resolution.** The deferred decision was made. The approval and audit key is
+   a never-exportable HKDF-SHA256 subkey of the single ADR-013 authority, derived
+   under the label `zeroclaw/control-plane/approval-audit/v1` and exposed only
+   through sign and verify operations. No second key-source authority is
+   introduced. Decided by the maintainer on 2026-08-21 in
+   [issue #24](https://github.com/JordanTheJet/zeroclaw/issues/24#issuecomment-5376601651);
+   see "What ADR-013 constrains here" and "Authentication of the receipt" above,
+   and the draft record
+   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-approval-audit-key.md`.
+2. **Resolved: the agent requester row does not say "never approve".** The
+   principal table
    says an external requester may "Inspect, propose, and request review only
    within its grant; never approve", but the agent requester row omits the
    "never approve" clause. Every other statement in the parent document implies
    agent requesters cannot approve either, and this page assumes that reading.
    The asymmetry in the table should be corrected so no implementer reads the
    omission as permission.
-3. **Phase 3 and phase 4 appear circularly ordered.** Phase 3 adds external
+
+   **Resolution.** The agent-requester row on this page now carries the same
+   explicit "never approve" clause as the external-requester row, and the
+   correction is called out under "Principal classes" above. No principal type in
+   a requester class can approve. The parent document still needs the matching
+   amendment. Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 3.
+3. **Resolved: phase 3 and phase 4 appear circularly ordered.** Phase 3 adds
+   external
    client registration, but the parent document also states that client
    registration is a meta-authority operation, and meta-authority operations
    require a receipt issued under the existing trust epoch. Receipts arrive in
@@ -536,7 +623,18 @@ settle and are deliberately not resolved here.
    phase 3 ships registration without an approval path and phase 4 retrofits
    one, or whether the two phases must land together. This affects what a
    phase-3 pull request can honestly claim.
-4. **Quorum when a second operator exists but is ineligible.** Meta-authority
+
+   **Resolution.** Registration in phase 3 rides on the genesis ceremony. The
+   ceremony may register the first client or clients receipt-exempt, as a
+   bounded exception that closes at mutation enablement; every later registration
+   consumes a phase-4 receipt and fails closed until the broker exists. Decided
+   by the maintainer on 2026-08-21 in
+   [issue #25](https://github.com/JordanTheJet/zeroclaw/issues/25#issuecomment-5376560807);
+   see "Client registration" above, the bounds in
+   `control-plane-trust-genesis.md`, and the draft record
+   `docs/book/src/architecture/decisions/ADR-XXXX-control-plane-registration-bootstrap.md`.
+4. **Resolved: quorum when a second operator exists but is ineligible.**
+   Meta-authority
    requires two distinct operator principals "when at least two eligible
    operators exist", and a single-operator installation requires one. The
    parent document does not say what happens when a host has two configured
@@ -544,20 +642,44 @@ settle and are deliberately not resolved here.
    requester. Falling back to the single-operator path would let a requester
    reduce the required quorum by becoming able to reach one operator, which
    looks like an escalation path. Failing closed is the conservative reading but
-   is not stated.
-5. **`owner token` is undefined.** The proposal binding set includes "registered
+   was not stated.
+
+   **Resolution.** Fail closed. An ineligible operator does not lower the
+   required quorum, and a multi-operator installation reduced to one eligible
+   operator by reachability does not fall back to the single-operator path. See
+   "Permanently meta-authority operations" above. Adopted from the gap-sweep
+   resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 4.
+5. **Resolved: `owner token` is undefined.** The proposal binding set includes
+   "registered
    requester identity, client session attribution, and owner token". The term
    `owner token` does not appear anywhere else in the parent document. It is
    unclear whether it is the resume secret, a separate value, or a synonym for
    the registration identifier. It cannot be implemented as written.
-6. **Effect of re-evaluation on outstanding state.** Delivery assurance is
+
+   **Resolution.** `owner_token` is the client's `registration_id` and is
+   attribution only. The proposal binding is the registered requester identity,
+   the client session attribution, and the `registration_id`, none of which
+   conveys approval authority. It is not the resume secret. The binding list is
+   updated in `control-plane-proposal-journal.md`. Adopted from the gap-sweep
+   resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 6.
+6. **Resolved: effect of re-evaluation on outstanding state.** Delivery assurance
+   is
    re-evaluated when sandboxes, shell grants, helpers, or credential locations
    change, and a collapse can reduce an effective grant to nothing. The parent
    document does not say what happens to that client's already-parked
    proposals, already-issued receipts, or in-flight applies at the moment of
    collapse. Expiring them is the conservative reading; silently continuing
    them would let a requester keep authority it has just lost.
-7. **Registration revocation versus an in-flight apply.** Related to the
+
+   **Resolution.** Expire them. On collapse the host expires that client's parked
+   proposals and issued unconsumed receipts and aborts its in-flight applies that
+   have not yet passed the atomic receipt-consumption commit. See "Re-evaluation
+   triggers" above. Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 7. The
+   post-commit case is item 7 below and remains open.
+7. **Open: registration revocation versus an in-flight apply.** Related to the
    previous item and not covered: whether revoking a client registration
    interrupts an apply already in `applying` for a proposal that client
    submitted, or whether the approved operation completes because the operator

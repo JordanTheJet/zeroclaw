@@ -195,9 +195,15 @@ to every code in the table above.
 
 `initialize` is the MCP lifecycle request rather than a tool. The parent
 document names Initialize alongside three tools in its always-available list;
-this specification maps that name onto the lifecycle method and flags the
-mismatch as an open question rather than inventing a second initialization
-path.
+this specification maps that name onto the lifecycle method rather than
+inventing a second initialization path.
+
+That mapping is confirmed: Initialize is the MCP lifecycle method and is not a
+callable tool. There is no `control.initialize`. Parity with the native
+transport is met by the shared advertisement block, which both transports return
+from the same canonical source, so nothing is lost by not exposing a second
+initialization entry point. Adopted from the gap-sweep resolution proposed in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 22.
 
 Request parameters relevant to the control protocol:
 
@@ -247,18 +253,29 @@ document:
 | `capability_digest` | string | `sha256:` digest over the canonical capability set, bound into every proposal |
 
 The example above is the parent document's illustration, not a phase-2
-inventory. A phase-2 server implements contained agent creation only and would
-advertise `["agents"]`. The parent document does not say whether `capabilities`
-enumerates implemented capabilities or product-supported ones; see "Open
-questions".
+inventory. A phase-2 server implements contained agent creation only and
+advertises `["agents"]`.
+
+`capabilities` enumerates what the running server implements, never what the
+product supports. That is confirmed, and only that reading is safe for
+negotiation: a client that trusted a product-level list would attempt an
+operation this server cannot perform, and the failure would surface as a
+protocol error rather than as an honest capability mismatch. Adopted from the
+gap-sweep resolution proposed in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 24.
 
 The block is returned in two places and the two must be byte-identical:
 
 1. the `initialize` result, under `_meta.zeroclaw_control`; and
 2. the `control.server_info` tool result.
 
-The carrier location inside the `initialize` result is a protocol-design detail
-the parent document does not settle; see "Open questions".
+The carrier location inside the `initialize` result is confirmed as
+`_meta.zeroclaw_control`. The advertisement does not ride in
+`capabilities.experimental`, which reads poorly for a protocol intended to
+become stable and would suggest the block is optional or provisional. The two
+carriers stay byte-identical after canonical serialization, and a CI test
+enforces that byte identity. Adopted from the gap-sweep resolution proposed in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 23.
 
 ### Version negotiation
 
@@ -429,6 +446,15 @@ Request:
 
 `domains` is an optional filter. Omitting it returns every operation the grant
 covers.
+
+Catalog output is filtered by the grant's proposal domains, which is confirmed
+rather than merely proposed. A narrowly granted client learns only about the
+operations it could actually propose. This is compatible with the parent
+document's rule that Catalog carries no configured instance state: the filter is
+a function of the grant, which the client already knows, not of the host's
+configuration, so two clients holding the same grant still see identical output
+on differently configured hosts. Adopted from the gap-sweep resolution proposed
+in [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 25.
 
 Response:
 
@@ -803,27 +829,43 @@ phase 2 can satisfy on its own. The remaining items depend on phases 3 through
 ## Open questions
 
 These are gaps or ambiguities in the parent architecture document that this
-specification cannot resolve on its own authority. They are recorded here for
-the maintainer to settle.
+specification cannot resolve on its own authority. Items marked **Resolved**
+carry a maintainer decision recorded on 2026-08-21; they are kept here rather
+than deleted so the question and its answer stay together. Items marked **Open**
+are still for the maintainer to settle.
 
-1. **Exact tool names are unsettled.** The parent document says exact names
+1. **Open: exact tool names are unsettled.** The parent document says exact names
    remain a protocol-design decision, and separately lists the final product and
    protocol name (`control`, `management`, or another term) as an open decision.
    The `control.` prefix used throughout this page is a proposal. A rename after
    v1 ships would be a major-version protocol change, so the name should be
    settled before any client package is generated.
-2. **Initialize is a lifecycle method, not a tool.** The parent document lists
+2. **Resolved: Initialize is a lifecycle method, not a tool.** The parent
+   document lists
    Initialize alongside Ping, ServerInfo, and RegistrationHelp as things an
    unregistered stdio endpoint "exposes". MCP models initialization as a
    lifecycle request rather than a tool. This page maps it to the lifecycle
    method. If the intent was a callable tool for parity with the native
    transport, the parent document should say so.
-3. **Carrier for the advertisement block.** The parent document specifies the
-   advertisement contents but not where they sit in the MCP `initialize`
-   result. This page proposes `_meta.zeroclaw_control`. The alternatives include
-   `capabilities.experimental`, which reads poorly for a protocol intended to
-   become stable.
-4. **`capabilities` semantics.** The parent document's example advertises
+
+   **Resolution.** Confirmed as the lifecycle method. There is no callable
+   `control.initialize`, and native-transport parity is met by the shared
+   advertisement block. See "Initialization" above. Adopted from the gap-sweep
+   resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 22.
+3. **Resolved: carrier for the advertisement block.** The parent document
+   specifies the advertisement contents but not where they sit in the MCP
+   `initialize` result. This page proposes `_meta.zeroclaw_control`. The
+   alternatives include `capabilities.experimental`, which reads poorly for a
+   protocol intended to become stable.
+
+   **Resolution.** Confirmed as `_meta.zeroclaw_control`, byte-identical to the
+   `control.server_info` result and enforced by a byte-identity test. Not
+   `capabilities.experimental`. See "Advertisement block" above. Adopted from the
+   gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 23.
+4. **Resolved: `capabilities` semantics.** The parent document's example
+   advertises
    `["agents", "providers", "plugins"]` at `control_protocol_version` 1.0, but
    phase 2 implements contained agent creation only, and the provider, service,
    and plugin adapters arrive in phases 7 through 9. It is unclear whether
@@ -831,7 +873,12 @@ the maintainer to settle.
    capabilities the product supports. Only the former is safe for negotiation,
    because a client that trusts the latter would attempt an operation the server
    cannot perform. This page assumes the former.
-5. **Preview durability in read-only mode.** The parent document lists
+
+   **Resolution.** Confirmed as the capabilities the running server implements,
+   which is `["agents"]` at phase 2. See "Advertisement block" above. Adopted
+   from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 24.
+5. **Resolved: preview durability in read-only mode.** The parent document lists
    "whether pre-review conversational drafts survive restart" as an open
    decision, while stating that parked mutation proposals are durable
    regardless. v1 has no parked proposals, so this page makes `preview_id`
@@ -839,7 +886,16 @@ the maintainer to settle.
    `control-plane-proposal-journal.md` must extend to cover them, and a
    read-only release would then acquire durable per-client state that it does
    not have today.
-6. **Backchannel capability declaration before backchannels exist.** The parent
+
+   **Resolution.** Pre-review drafts stay non-durable in the read-only phase, so
+   `preview_id` remains process-local and `durable` stays `false` in v1. If
+   drafts are ever made durable they come under the per-client parked-byte and
+   entry quotas in `control-plane-proposal-journal.md`. Adopted from the
+   gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 14,
+   which answers the same question on the journal side.
+6. **Open: backchannel capability declaration before backchannels exist.** The
+   parent
    document requires an operation to declare required operator-backchannel
    capabilities and to be rejected rather than downgraded when either side
    cannot represent every effect. In a read-only phase-2 release there is no
@@ -847,12 +903,17 @@ the maintainer to settle.
    parity, but the parent document does not say whether a phase-2 server should
    report those requirements at all, or whether doing so leaks anything about
    the intended operator configuration.
-7. **Catalog and grant interaction.** The parent document says Catalog contains
-   no configured instance state, but also that Catalog requires a registered
-   requester grant. Whether Catalog output is filtered by the grant's proposal
-   domains, or is the full product catalog once any grant exists, changes what a
-   narrowly granted client learns about the product. This page filters by grant
-   as the conservative reading; the parent document should confirm.
+7. **Resolved: Catalog and grant interaction.** The parent document says Catalog
+   contains no configured instance state, but also that Catalog requires a
+   registered requester grant. Whether Catalog output is filtered by the grant's
+   proposal domains, or is the full product catalog once any grant exists,
+   changes what a narrowly granted client learns about the product. This page
+   filters by grant as the conservative reading.
+
+   **Resolution.** Confirmed: Catalog is filtered by the grant's proposal
+   domains, so a narrowly granted client learns only what it could propose. See
+   "`control.catalog`" above. Adopted from the gap-sweep resolution proposed in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 25.
 
 ## Governance status
 
