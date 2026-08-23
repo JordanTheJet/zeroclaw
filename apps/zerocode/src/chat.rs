@@ -13318,7 +13318,9 @@ mod tests {
             request_id: "request-1".to_string(),
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
+            retry_replacement: None,
             timeout_secs: 30,
+            received_at: Instant::now(),
         });
 
         chat.handle_paste(" must not reach the composer");
