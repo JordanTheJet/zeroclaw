@@ -215,8 +215,13 @@ sans = ["relay.example.com"]
 mode = "open"
 allow = []
 deny  = []
-# Optional shared-secret gate a daemon must present at registration:
-# relay_token = "change-me"
+# A public (non-loopback) relay MUST gate registration: set a shared secret here
+# (each daemon presents it via [relay] relay_token) or use mode = "allowlist".
+# Otherwise an OPEN, tokenless relay on a public bind refuses to start, because
+# any daemon on the internet could register and squat unclaimed node-ids. (A
+# loopback bind for local development is exempt; a deliberate open public relay
+# can override with allow_public_open = true.)
+relay_token = "change-me-to-a-long-random-secret"
 
 [limits]
 max_conns_per_node     = 256
@@ -232,8 +237,10 @@ Run it:
 
 ```sh
 zerorelay --config /etc/zerorelay/relay.toml
-# equivalently, flags only:
-zerorelay --bind 0.0.0.0:8443 --tls-san relay.example.com
+# equivalently, flags only (a public bind needs a token or an allowlist, else the
+# relay refuses to start):
+zerorelay --bind 0.0.0.0:8443 --tls-san relay.example.com \
+  --relay-token change-me-to-a-long-random-secret
 ```
 
 When `--tls-cert`/`--tls-key` are omitted the relay self-provisions a CA + server
