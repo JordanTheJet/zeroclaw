@@ -220,6 +220,30 @@ impl Evidence {
         }
     }
 
+    /// Isolation-proving evidence for the `fixture-grants` test seam.
+    ///
+    /// # Test-only
+    ///
+    /// Compiled only under the `fixture-grants` feature, which no released
+    /// profile enables, so it exists in no shipped build and is covered by the
+    /// same `control_fixture_absence_gate.sh` that pins every other fixture
+    /// symbol out of the binary. It is the cross-crate analogue of
+    /// [`Self::fully_isolated`]: the phase-5 operator-approve path cannot mint a
+    /// receipt without an operator the reachability analysis clears, and no such
+    /// analysis exists yet, so an out-of-crate test needs a way to construct the
+    /// eligible branch. A production apply path that has really proven isolation
+    /// must construct `Evidence` from discharged proofs, never from this.
+    #[cfg(feature = "fixture-grants")]
+    #[must_use]
+    pub const fn fixture_isolated() -> Self {
+        Self {
+            distinct_os_account: Some(true),
+            sandbox_excludes_backchannel: Some(true),
+            outside_host_process: Some(true),
+            no_shell_or_filesystem_grant: Some(true),
+        }
+    }
+
     /// This host's answer to one question.
     #[must_use]
     pub const fn answer(&self, question: IsolationQuestion) -> Option<bool> {

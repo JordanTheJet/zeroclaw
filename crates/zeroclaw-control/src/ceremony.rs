@@ -146,6 +146,29 @@ impl PresenceAttestation {
         }
     }
 
+    /// Build an attestation for the `fixture-grants` test seam.
+    ///
+    /// # Test-only
+    ///
+    /// Compiled only under the `fixture-grants` feature, which no released
+    /// profile enables, so it is absent from every shipped build and covered by
+    /// `control_fixture_absence_gate.sh`. It is the cross-crate analogue of
+    /// [`Self::for_test`]: an out-of-crate test that drives the operator-approve
+    /// or mutation-enablement ceremony needs a `UserPresence` that succeeds, and
+    /// this type's fields are otherwise unreachable outside this module. A
+    /// production adapter still attests only the class it actually achieved.
+    #[cfg(feature = "fixture-grants")]
+    #[must_use]
+    pub const fn fixture(
+        class: PresenceClass,
+        operator_identity: Option<FirstOperatorIdentity>,
+    ) -> Self {
+        Self {
+            class,
+            operator_identity,
+        }
+    }
+
     /// The assurance class actually achieved.
     #[must_use]
     pub const fn class(&self) -> PresenceClass {
