@@ -22729,6 +22729,14 @@ impl Config {
             &toml::to_string_pretty(&new_table).context("Failed to serialize pruned config")?,
         );
 
+        // Take the write lock before the comment-preservation read below, not
+        // inside the replacement helper. The read is this save's merge base:
+        // acquiring afterwards would leave a read-modify-write window in which
+        // another writer's committed revision is read, discarded, and
+        // overwritten. `save_dirty` and `save_dirty_if_source_unchanged`
+        // already read under the lock; this closes the same gap for full saves.
+        let write_lock = acquire_config_write_lock(&config_path).await?;
+
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
         let toml_str = if config_path.exists() {
@@ -22749,7 +22757,7 @@ impl Config {
             new_toml
         };
 
-        write_config_atomically(&config_path, &toml_str).await
+        write_config_atomically_under_lock(&config_path, &toml_str, &write_lock).await
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -22825,7 +22833,7 @@ impl Config {
         config_path: &Path,
         source: &str,
         expected_current: Option<&str>,
-        _write_lock: &ConfigWriteLock,
+        write_lock: &ConfigWriteLock,
     ) -> Result<bool> {
         let mut config_to_save = self.clone();
         let zeroclaw_dir = config_path
@@ -22896,12 +22904,7 @@ impl Config {
             }
         }
 
-        resolve_atomic_write_result(
-            config_path,
-            &toml_str,
-            write_config_atomically_locked(config_path, &toml_str).await,
-        )
-        .await?;
+        write_config_atomically_under_lock(config_path, &toml_str, write_lock).await?;
         self.clear_dirty();
         Ok(true)
     }
@@ -22943,7 +22946,28 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
-struct ConfigWriteLock(std::fs::File);
+/// Held guard for the cross-process config write lock — an advisory
+/// `flock(2)` on `<config_dir>/.config.toml.lock`. Released on drop.
+///
+/// Every writer that replaces `config.toml` must hold this for its whole
+/// read-modify-write section, otherwise it can land between another writer's
+/// merge-base read and its atomic rename and be silently discarded.
+///
+/// The lock is per open file description, so a second acquisition inside the
+/// same process blocks just like one from another process: never acquire it
+/// while one is already held on this task, and never call a helper that
+/// acquires it internally (`Config::save`, `Config::save_dirty`,
+/// `Config::save_dirty_if_source_unchanged`, `comment_writer::apply_comments`,
+/// `migration::migrate_file_in_place`) from inside a held section.
+///
+/// Where an in-process mutex also guards a config write (the gateway's
+/// `AppState::config_write_lock`, the runtime RPC context's, or
+/// `config_patch`'s per-path map), the ordering is mutex first, then this
+/// lock. No production path acquires one of those mutexes while holding this
+/// guard, so the ordering cannot invert. Tests that drive a whole handler
+/// while holding this guard are the exception, and are safe only because the
+/// mutex is uncontended there.
+pub struct ConfigWriteLock(std::fs::File);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigWriteDisposition {
@@ -22991,7 +23015,10 @@ impl Drop for ConfigWriteLock {
     }
 }
 
-async fn acquire_config_write_lock(config_path: &Path) -> Result<ConfigWriteLock> {
+/// Acquire the config write lock for `config_path`, blocking on a worker
+/// thread until it is available. See [`ConfigWriteLock`] for the ordering
+/// and re-entrancy rules.
+pub async fn acquire_config_write_lock(config_path: &Path) -> Result<ConfigWriteLock> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -23004,7 +23031,12 @@ async fn acquire_config_write_lock(config_path: &Path) -> Result<ConfigWriteLock
     Ok(lock)
 }
 
-fn acquire_config_write_lock_blocking(config_path: &Path) -> std::io::Result<ConfigWriteLock> {
+/// Blocking sibling of [`acquire_config_write_lock`], for the synchronous
+/// write paths (`migration::migrate_file_in_place`). Never call this from a
+/// future without `spawn_blocking`: it parks the calling thread.
+pub(crate) fn acquire_config_write_lock_blocking(
+    config_path: &Path,
+) -> std::io::Result<ConfigWriteLock> {
     use fs2::FileExt as _;
     let parent_dir = config_path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -23065,9 +23097,19 @@ async fn resolve_atomic_write_result(
     }
 }
 
-/// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
-    let _write_lock = acquire_config_write_lock(config_path).await?;
+/// Atomic write for a caller that already holds the config write lock, so the
+/// caller's merge-base read and this replacement are one critical section.
+/// Every config writer reads before it writes, so there is deliberately no
+/// lock-acquiring variant: acquiring here instead of at the caller's read
+/// would leave that read outside the critical section.
+///
+/// `_write_lock` is never read; it is the witness that the guard is live for
+/// the whole call.
+pub(crate) async fn write_config_atomically_under_lock(
+    config_path: &Path,
+    toml_str: &str,
+    _write_lock: &ConfigWriteLock,
+) -> Result<()> {
     resolve_atomic_write_result(
         config_path,
         toml_str,
@@ -32705,6 +32747,78 @@ group_policy = "disabled"
             .join()
             .expect("lock thread should join")
             .expect("second lock should succeed");
+    }
+
+    /// A full `save()` keeps existing comments by merging onto whatever it
+    /// reads from disk. That read used to happen before the lock was taken,
+    /// so a revision another writer committed in between was read, discarded,
+    /// and overwritten. The read must now be inside the same hold as the
+    /// replacement, as it already is for `save_dirty`.
+    #[test]
+    async fn save_holds_the_lock_across_its_comment_preservation_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut edited = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        edited.save().await.unwrap();
+        edited.gateway.port = 4242;
+
+        let held_lock = acquire_config_write_lock(&config_path).await.unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let save_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = done_tx.send(runtime.block_on(async move { edited.save().await }));
+        });
+
+        // Polling the future in place with a no-op waker would prove nothing:
+        // the lock is acquired via `spawn_blocking`, which a no-op waker never
+        // reschedules, so the future reports Pending whether or not the lock
+        // was taken. Drive the save on a real runtime and require a bounded
+        // wait to elapse instead — an unlocked save completes orders of
+        // magnitude inside this window, and a loaded machine can only lengthen
+        // the wait, never turn a real failure into a pass.
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(500)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "save must park on the config write lock before its \
+             comment-preservation read, not read a revision another writer \
+             is still replacing"
+        );
+
+        // Commit a revision from inside the held section. A save that had
+        // already read would still be holding the undecorated bytes and would
+        // write them back over this comment.
+        let committed = format!(
+            "# committed under the lock\n{}",
+            std::fs::read_to_string(&config_path).unwrap()
+        );
+        std::fs::write(&config_path, &committed).unwrap();
+        drop(held_lock);
+
+        done_rx
+            .recv()
+            .expect("the save thread reports its result")
+            .expect("save succeeds once the lock is free");
+        save_thread.join().expect("save thread joins");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("# committed under the lock"),
+            "the comment committed under the lock must survive — no lost \
+             update: {written}"
+        );
+        let parsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(
+            parsed.gateway.port, 4242,
+            "save's own change must land as well"
+        );
     }
 
     #[test]
