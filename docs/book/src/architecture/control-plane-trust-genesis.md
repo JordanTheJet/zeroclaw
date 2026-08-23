@@ -1,8 +1,12 @@
 # Design: control-plane trust genesis and recovery ceremonies
 
-> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented. There is no
+> **Status: accepted** (maintainer decision, 2026-08-22; remaining open questions are tracked on the fork issue #26). Nothing on this page is implemented on `master`. There is no
 > control-plane genesis record, no trust epoch, no target registry, and no
-> recovery ceremony anywhere on `master`. This page describes what the trust
+> recovery ceremony anywhere on `master`. The genesis record, its fixed
+> data-root path, its authentication tag, the target-registry data model, and
+> the eligible / managed / recovery-only classification are implemented on the
+> staged, unmerged `feat/control-trust-genesis` branch; the recovery ceremony
+> itself is not implemented anywhere. This page describes what the trust
 > half of phase 3 of the parent architecture would have to build in order to be
 > reviewable. It is not an accepted design and it does not authorize
 > implementation.
@@ -123,6 +127,30 @@ Genesis therefore does not select a second key source. It derives the approval
 and audit key under the deployment's single authority and commits to it through
 `host_key_commitment` in the genesis record.
 
+### What a deployment is
+
+ADR-013's rule that one configured key source is authoritative "for a
+deployment" cannot be checked until `deployment` has a referent. The maintainer
+decided on 2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800)
+that a deployment is the canonical install root: the config-root and data-root
+pair that the genesis record names in `canonical_roots`. Each instance root is
+its own deployment, and therefore its own key authority.
+
+Two consequences follow directly:
+
+- a child instance on the same host is a distinct deployment, because it has
+  distinct canonical roots. Parent and child holding distinct host keys is the
+  single-authority rule applied once per deployment, not a violation of it; and
+- a deployment is never the host and never the operating-system user. Two
+  install roots under one login are two deployments, and one install root
+  reached by two processes is still one deployment with one authority.
+
+This closes the residual ADR-013 tension recorded as open question 3 below, and
+it agrees with ADR-015, which derives the approval and audit key under whichever
+single authority the deployment already has rather than introducing a second
+one.
+
 ## Interactive genesis
 
 An interactive installation uses an OS-mediated user-presence ceremony to
@@ -175,6 +203,43 @@ the OS attests to that presence; on a headless host the human is absent and the
 deployment trust root attests on their behalf, with the private key never
 arriving on the host at all. Neither substitutes for the other, and a host that
 can offer neither remains read-only.
+
+### Where the deployment trust root comes from
+
+Headless assurance rests entirely on the deployment trust root, so its own
+provenance cannot be left to the installer's discretion. The maintainer decided
+on 2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800)
+that the root is established in exactly two ways and no others:
+
+1. **At interactive genesis**, under the same OS-mediated user-presence
+   ceremony that establishes the first operator. A host that can run interactive
+   genesis can establish its own root while the human is attested present.
+2. **Out of band, before first boot.** The administrator places the root on the
+   host through whichever provisioning channel already owns that host, such as a
+   machine image, configuration management, or a platform secret store. This is
+   the path a headless host uses, and it completes before ZeroClaw first runs.
+
+The load-bearing half of that decision is the exclusion. **ZeroClaw has no code
+path that writes the deployment trust root.** No daemon, `ControlService`
+operation, `zeroclaw onboard` step, native tool, MCP method, or recovery
+ceremony creates, replaces, or extends it. Every ZeroClaw component is a reader
+and verifier of the root and never a writer of it.
+
+That is what answers the question the parent document left open, namely what
+prevents the process that writes a manifest from also writing the trust root the
+manifest is verified against. The separation is structural rather than a policy
+the implementation must remember to enforce: the writer is the administrator or
+the interactive genesis ceremony, the verifier is ZeroClaw, and the two are
+different processes with different authority because ZeroClaw is not a writer at
+all. A verification gate that finds any ZeroClaw write path to the root has
+found a defect, not a configuration choice.
+
+Changing an established root is therefore an out-of-band administrative act on
+the host, carrying the same assurance as placing it, plus platform attestation
+where the platform offers one. A host that can offer neither user presence nor
+an administrator-placed root has no way to obtain one from ZeroClaw and remains
+read-only, per the ADR-013 fail-closed rule above.
 
 ## Bootstrap client registration
 
@@ -231,6 +296,39 @@ registration, or key change is an ordinary meta-authority operation that does
 require a receipt issued under the existing trust epoch. Those changes are
 recorded in the audit chain anchored to this record; they do not rewrite it.
 
+### The record is the managed-instance marker
+
+The anti-reset rule below rests entirely on a durable marker, so the marker's
+identity, location, and protection are pinned here rather than left to the
+implementation. The maintainer decided on 2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800)
+that the durable genesis record is itself the managed-instance marker. There is
+no second marker file, and therefore no second artifact that can drift out of
+agreement with the record it is supposed to mirror.
+
+| Property | Decision |
+|---|---|
+| Identity | The genesis record is the marker. No other artifact marks a root as managed |
+| Location | A fixed path under the canonical data root, outside every agent sandbox and not a path a requester can name in a proposal |
+| Format | The record fields above, in a sealed envelope carrying a format version and a domain-separation label |
+| Protection | Authenticated by the host key chain: an authentication tag over the record's canonical encoding produced by the ADR-015 approval and audit key, with `host_key_commitment` binding the record to that key |
+| Verification | Recomputed on every startup and every audit read, before any mutation path is offered |
+| Present but invalid | Recovery-only mode, never eligibility for first genesis |
+
+The present-but-invalid row carries the most weight, because a damaged record is
+far cheaper for an attacker to produce than a forged one. A record that exists
+and fails its tag, its key commitment, its domain, its format version, or its
+canonical-roots check is evidence that this root is managed and that its trust
+material is damaged. That is recovery-only mode. An unreadable record is treated
+the same way: a root the host cannot inspect is not a root the host may
+re-initialize.
+
+This much is built. The record format, the fixed data-root path, the
+authentication tag, and the eligible, managed, and recovery-only classification
+are implemented on the `feat/control-trust-genesis` branch, which is staged and
+unmerged. None of it is on `master`, and nothing on this page should be read as
+a description of shipped behavior.
+
 ### Relationship to the target registry
 
 Genesis registers the default instance in the signed target registry. Each
@@ -242,6 +340,11 @@ Registering another existing root, or an approved creation parent, is a
 meta-authority operation rather than part of genesis. Apply resolves the target
 ID from this registry under the registry and instance locks, and the caller
 never supplies a path at apply time.
+
+The registry is scoped to the trust epoch under which its entries were
+registered. It does not survive a trust-root recovery: recovery discards every
+registered target root and approved creation parent, and the operator registers
+them again under the new epoch. See "What recovery invalidates" below.
 
 The instance fingerprint commits to the instance ID, genesis-record digest,
 trust epoch, canonical roots, filesystem object identity where available, owner,
@@ -352,6 +455,26 @@ recovery, and is re-established only through the recovery ceremony's own
 bootstrap step or, once mutations are re-enabled, through an ordinary
 registration that consumes a receipt.
 
+The target registry does not survive either. The maintainer decided on
+2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800)
+that recovery discards the registered target roots and the approved creation
+parents, and that the operator re-registers them afterwards. The reason is
+containment: a target root or creation parent registered under a compromised
+epoch must not outlive the recovery whose purpose is to contain that compromise.
+A registration is authority to reach and mutate another root, so preserving it
+across an epoch break would preserve exactly the authority the break is meant to
+withdraw.
+
+The cost is accepted rather than hidden. A recovered host cannot reach
+previously registered instances, and cannot create children under a previously
+approved creation parent, until an operator registers each one again. Each of
+those re-registrations is an ordinary meta-authority operation consuming a
+receipt issued under the new epoch, so none of them is available until the
+post-recovery mutation-enablement ceremony below has completed. Recovery
+therefore returns the instance to a state where it holds a trust root, no
+enabled mutation authority, and no reach beyond itself.
+
 Recovery also resets mutation enablement to disabled. Genesis leaves mutations
 disabled until a separate ceremony, and recovery replaces the operator set and
 the host key, so the recovered instance is in the same position: it holds a
@@ -408,6 +531,37 @@ nothing short of that level of access resets the trust root, and that a reset
 that does occur is visible as a recovery event rather than indistinguishable
 from an ordinary first run.
 
+### One tension this page does not resolve
+
+Making the genesis record the sole marker, as decided in item 20, costs the last
+clause of the paragraph above, and the loss is recorded here rather than papered
+over.
+
+While the record is present, the decision is coherent and strictly stronger than
+the alternative: present-but-invalid, present-but-unreadable, present with a
+mismatched key commitment, and present with mismatched canonical roots all land
+in recovery-only mode. The gap is deletion. With no second durable artifact,
+nothing under the data root remembers that the root was ever managed once the
+record is gone, so deleting it does not produce a visible recovery event. It
+produces a root that is indistinguishable from one that never ran genesis, which
+is the outcome the quoted parent rule, covering a "missing or invalid genesis
+record", says must not happen. The decision answers the invalid half of that
+rule and narrows the missing half.
+
+The staged implementation on `feat/control-trust-genesis` reaches the same
+conclusion and pins it deliberately: one test asserts that deleting the genesis
+record re-enables first genesis by design, and a sibling test asserts that
+deleting the config, the target registry, or the key file never does. So the
+containment argument that survives is the threat-model one in the paragraph
+above, that only a process with write access to the data root can do this, and
+not the stronger visibility claim.
+
+Closing this needs one of two things the maintainer has not chosen between: a
+second durable identity artifact, which item 20 deliberately rejected as a
+sync hazard, or an amendment to the parent document's anti-reset wording so it
+claims only what a single-artifact marker can deliver. It is flagged for the
+maintainer and is not resolved on this page.
+
 ## Child instance genesis
 
 Creating a new instance is a proposal against an already registered creation
@@ -463,13 +617,31 @@ that this design owns:
 - concurrent daemon and local-host startup leaves exactly one lock owner; and
 - default-enabled management remains read-only until the operator ceremony.
 
+One gate in that list is not currently satisfiable as written. "A managed root
+with a missing genesis record enters recovery-only mode" presumes something
+durable still identifies the root as managed after the record is gone, and the
+item 20 decision leaves no such artifact. The gate holds for an invalid,
+unreadable, or mismatched record and does not hold for a deleted one. The gate
+text is left unchanged rather than quietly narrowed, because which way it should
+be closed is the maintainer's call; see "One tension this page does not resolve"
+above.
+
 ## Open questions
 
 These are gaps or ambiguities in the parent architecture document or its
 interaction with existing records. Items marked **Resolved** carry a maintainer
-decision recorded on 2026-08-21; they are kept here rather than deleted so the
-question and its answer stay together. Items marked **Open** are recorded for
-the maintainer to settle and are deliberately not resolved here.
+decision recorded on 2026-08-21 or 2026-08-22; they are kept here rather than
+deleted so the question and its answer stay together. Items marked **Open** are
+recorded for the maintainer to settle and are deliberately not resolved here.
+
+Every item on this page is now resolved. The four trust-root items of the
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800)
+gap sweep were decided on 2026-08-22 and folded into the body above; they appear
+below as items 2 (sweep item 15), 3 (sweep item 16), 5 (sweep item 18), and 7
+(sweep item 20). Sweep items 8, 9, 10, 13, and 26 remain open against the other
+design pages and are phase 4 and 5 shaping rather than phase-3 blockers. Item 7
+below carries a residual tension that its decision does not close, recorded
+under "One tension this page does not resolve" above.
 
 1. **Resolved: ADR-013's single-authority rule versus a separate control-plane
    key.**
@@ -493,7 +665,7 @@ the maintainer to settle and are deliberately not resolved here.
    `docs/book/src/architecture/decisions/ADR-015-control-plane-approval-audit-key.md`.
    The parent document's "changing management or audit key sources" wording still
    needs the matching amendment, which is tracked with that record.
-2. **Open: the deployment trust root has no defined provenance.** Headless
+2. **Resolved: the deployment trust root has no defined provenance.** Headless
    genesis is
    authorized by "an administrator signature or platform attestation" verified
    against a deployment trust root, and headless recovery by a
@@ -502,13 +674,33 @@ the maintainer to settle and are deliberately not resolved here.
    what prevents the same process that writes the manifest from also writing the
    trust root it is verified against. Without that, headless genesis assurance is
    asserted rather than derived.
-3. **Open: child instances and the single key-source authority.** A child
+
+   **Resolution.** The root is established at interactive genesis under the
+   OS-mediated user-presence ceremony, or placed out of band by the
+   administrator before first boot. There is no third path, and ZeroClaw has no
+   code path that writes it: every ZeroClaw component reads and verifies the root
+   and none writes it, so writer and verifier are separated structurally rather
+   than by policy. Decided by the maintainer on 2026-08-22 in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800),
+   sweep item 15; see "Where the deployment trust root comes from" above.
+3. **Resolved: child instances and the single key-source authority.** A child
    inherits the
    parent's deployment trust root while generating a distinct host key. If
    parent and child run on the same host, ADR-013's rule that one source is
    authoritative per deployment appears to be in tension with two instances
    holding distinct host keys. Whether "deployment" means the host, the install
    root, or the instance is not defined anywhere.
+
+   **Resolution.** A deployment is the canonical install root, the config-root
+   and data-root pair named in `canonical_roots`. Each instance root is its own
+   deployment and its own key authority, so a child instance is a distinct
+   deployment and the apparent tension disappears: parent and child holding
+   distinct host keys is the single-authority rule applied once per deployment.
+   Decided by the maintainer on 2026-08-22 in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800),
+   sweep item 16; see "What a deployment is" above. This agrees with ADR-015 and
+   is mirrored in `control-plane-principals-and-approvals.md`. The parent
+   document and ADR-013 still need the matching wording.
 4. **Resolved: trust epoch values are unspecified.** The parent document requires
    epochs to be monotonic and to appear in every audit row, but does not define
    their representation, whether they are per instance or per host, or how a
@@ -520,7 +712,7 @@ the maintainer to settle and are deliberately not resolved here.
    its parent's, and epochs are compared only within one instance's chain. See
    "Trust epochs" above. Adopted from the gap-sweep resolution proposed in
    [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 17.
-5. **Open: recovery's effect on the target registry is unstated.** Recovery
+5. **Resolved: recovery's effect on the target registry is unstated.** Recovery
    invalidates all pending proposals, client credentials, approval receipts, and
    resume secrets. It does not say whether registered target roots and approved
    creation parents survive recovery. Preserving them is convenient but means a
@@ -528,6 +720,16 @@ the maintainer to settle and are deliberately not resolved here.
    contain that compromise. Discarding them is safer but leaves a recovered host
    unable to reach previously registered instances until an operator
    re-registers each one.
+
+   **Resolution.** Recovery discards them. Registered target roots and approved
+   creation parents do not survive an epoch break, and the operator re-registers
+   each one afterwards through an ordinary meta-authority operation consuming a
+   receipt under the new epoch. Containment was chosen over convenience
+   deliberately, and the re-registration work is the accepted cost. Decided by
+   the maintainer on 2026-08-22 in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800),
+   sweep item 18; see "What recovery invalidates" and "Relationship to the target
+   registry" above.
 6. **Resolved: mutation enablement after recovery.** Genesis explicitly leaves
    mutations disabled until a separate ceremony. The parent document does not say
    whether recovery also resets mutation enablement to disabled. The conservative
@@ -539,12 +741,32 @@ the maintainer to settle and are deliberately not resolved here.
    prerequisites. See "What recovery invalidates" above. Adopted from the
    gap-sweep resolution proposed in
    [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26), item 19.
-7. **Open: the managed-instance marker is not specified.** The anti-reset rule
+7. **Resolved: the managed-instance marker is not specified.** The anti-reset
+   rule
    depends
    on "the durable instance identity and prior genesis record" plus a
    "managed-instance marker", but the marker's location, format, and protection
    are undefined. Since the entire anti-reset property rests on it, its identity
    and the checks applied to it need to be pinned before implementation.
+
+   **Resolution.** The durable genesis record is itself the marker. It lives at a
+   fixed path under the canonical data root, is authenticated by the host key
+   chain through an authentication tag and the `host_key_commitment` binding, is
+   re-verified on every startup and audit read, and a record that is present but
+   invalid enters recovery-only mode rather than becoming eligible for first
+   genesis. There is no second marker file. Decided by the maintainer on
+   2026-08-22 in
+   [issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800),
+   sweep item 20; see "The record is the managed-instance marker" above. This is
+   implemented on the staged, unmerged `feat/control-trust-genesis` branch and is
+   not on `master`.
+
+   **Residual tension, not resolved.** A single-artifact marker cannot answer
+   "has this root ever been managed?" once that artifact is deleted, so the
+   parent document's rule covering a "missing or invalid genesis record" is
+   narrowed to the invalid case. See "One tension this page does not resolve"
+   above; closing it needs either a second durable artifact or an amendment to
+   the parent wording, and neither has been chosen.
 
 ## Governance status
 

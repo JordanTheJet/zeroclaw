@@ -68,6 +68,14 @@ authenticated by a host key. Two of its recorded rules constrain this design:
   non-encryption consumer must not silently reuse the raw encryption master
   key".
 
+`deployment` in that first rule means the canonical install root: the
+config-root and data-root pair that a genesis record names. Each instance root
+is its own deployment and therefore its own key authority, so a child instance
+on the same host holds its own authority instead of sharing its parent's. The
+maintainer decided this on 2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800);
+`control-plane-trust-genesis.md` carries the definition and its consequences.
+
 The approval and audit key is a non-encryption consumer, so ADR-013 did not
 authorize the control plane to obtain it until the deferred derivation decision
 was made. That decision now exists. The maintainer decided on 2026-08-21 in
@@ -515,6 +523,15 @@ one of these into a weaker class.
 - widening policy or granting management to the requester;
 - trusting a plugin publisher or enabling the external WASM plugin system; and
 - changing the rule that classifies an operation as requiring approval.
+
+Registering target roots and approved creation parents recurs after every
+trust-root recovery. Recovery discards the registered target roots and the
+approved creation parents rather than carrying them into the new epoch, so an
+operator registers each one again, and each re-registration is a meta-authority
+operation consuming a receipt exactly like the original. The maintainer decided
+this on 2026-08-22 in
+[issue #26](https://github.com/JordanTheJet/zeroclaw/issues/26#issuecomment-5383167800);
+see "What recovery invalidates" in `control-plane-trust-genesis.md`.
 
 Confirmation tier rules:
 
