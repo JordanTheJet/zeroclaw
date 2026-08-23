@@ -543,6 +543,12 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
 }
+impl CompatFamilySpec for ZerorouterModelProviderConfig {
+    const DISPLAY: &'static str = "ZeroRouter";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::ZEROROUTER_DEFAULT_URL;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
     const DEFAULT_URL: &'static str = "https://api.synthetic.new/openai/v1";
@@ -1578,70 +1584,6 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
 // ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
 
-// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ───────────
-
-/// No hosted deployment is the default: the router container's own bind
-/// (ZEROROUTER_BIND=0.0.0.0:8080); remote routers are reached via
-/// `base.uri`. Must stay in lockstep with ZerorouterEndpoint in
-/// zeroclaw-config — see `zerorouter_default_url_matches_schema_endpoint`.
-pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
-
-/// Direct factory impl rather than the CompatFamilySpec blanket: the
-/// device-flow login stores the minted `zcr_` key as a Token-kind auth
-/// profile, and consuming it needs the auth-service bridge that only the
-/// full `create_provider` signature can reach (the xai pattern). Without
-/// this, `zeroclaw auth login --model-provider zerorouter` would store a
-/// credential the factory then ignores — caught by the first end-to-end
-/// device-flow run.
-impl FamilyProviderFactory for ZerorouterModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(ZEROROUTER_DEFAULT_URL);
-
-    fn create_provider(
-        &self,
-        alias: &str,
-        key: Option<&str>,
-        api_url: Option<&str>,
-        opts: &ModelProviderRuntimeOptions,
-    ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = OpenAiCompatibleModelProvider::builder(alias)
-            .display_name("ZeroRouter")
-            .base_url(api_url.unwrap_or(ZEROROUTER_DEFAULT_URL))
-            // `default_base_url()` reads only the canonical field, so a fixed
-            // family that sets `base_url` alone reports `None` to every
-            // consumer of endpoint metadata.
-            .canonical_base_url(fixed_family_endpoint::<Self>())
-            .credential(key)
-            .auth_style(AuthStyle::Bearer)
-            // ZeroRouter's GET /v1/models is unauthenticated and carries
-            // pricing (OpenRouter-shaped per-token decimal strings), so live
-            // pricing works before any key is configured.
-            .public_model_listing();
-
-        if !has_api_key(key) {
-            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
-                directories::UserDirs::new().map_or_else(
-                    || std::path::PathBuf::from(".zeroclaw"),
-                    |dirs| dirs.home_dir().join(".zeroclaw"),
-                )
-            });
-            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-            b = b.auth_profile(
-                "zerorouter",
-                auth_service,
-                opts.auth_profile_override.clone(),
-            );
-        }
-
-        Ok(apply_compat_options(b, opts))
-    }
-
-    /// A device-flow profile can supply the credential when config has no
-    /// api_key, so a keyless slot is still viable.
-    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
-        true
-    }
-}
-
 impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
     // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
@@ -2115,7 +2057,7 @@ mod tests {
     fn zerorouter_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
         assert_eq!(
-            ZEROROUTER_DEFAULT_URL,
+            <ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
             ZerorouterEndpoint::default().uri(),
             "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
         );
@@ -2123,6 +2065,91 @@ mod tests {
             ZerorouterEndpoint::default().uri(),
             "http://localhost:8080/v1"
         );
+        assert!(
+            !ZerorouterModelProviderConfig::default()
+                .fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()),
+            "keyless inference must not be viable without the deferred login flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn zerorouter_public_catalog_needs_no_credential() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let with_header = Arc::clone(&authorized);
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen);
+                let with_header = Arc::clone(&with_header);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                        with_header.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "router/model-1",
+                            "pricing": {
+                                "prompt": "0.000001",
+                                "completion": "0.000002"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public catalog fixture");
+        let addr = listener.local_addr().expect("read fixture address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve public catalog fixture");
+        });
+
+        let provider = ZerorouterModelProviderConfig::default()
+            .create_provider(
+                "public",
+                None,
+                Some(&format!("http://{addr}/v1")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("construct a keyless ZeroRouter catalog client");
+
+        assert_eq!(
+            provider.list_models().await.expect("list public models"),
+            vec!["router/model-1".to_string()]
+        );
+        let priced = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list public model pricing");
+        assert_eq!(priced.len(), 1);
+        assert_eq!(priced[0].id, "router/model-1");
+        let pricing = priced[0]
+            .pricing
+            .as_ref()
+            .expect("the public catalog pricing must be preserved");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.000001"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.000002"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            authorized.load(Ordering::SeqCst),
+            0,
+            "public ZeroRouter catalog requests must omit Authorization"
+        );
+
+        server.abort();
     }
 
     #[test]

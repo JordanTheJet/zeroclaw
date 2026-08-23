@@ -3240,8 +3240,8 @@ impl FamilyEndpoint for KiloModelProviderConfig {
 /// (`ZEROROUTER_BIND=0.0.0.0:8080`). A hosted deployment does run at
 /// `https://zerorouter.ai`, but it is one deployment among many rather than
 /// the family default, so operators reaching it — or any other remote
-/// router — set `base.uri`. Kept in lockstep with the factory constant by
-/// `zerorouter_default_url_matches_schema_endpoint`.
+/// router — set `base.uri`. [`ZEROROUTER_DEFAULT_URL`] is the canonical
+/// family default consumed by both schema and provider construction.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -3251,10 +3251,14 @@ pub enum ZerorouterEndpoint {
     #[default]
     Default,
 }
+
+/// Default API base for a locally running ZeroRouter.
+pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
 impl ModelEndpoint for ZerorouterEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "http://localhost:8080/v1",
+            Self::Default => ZEROROUTER_DEFAULT_URL,
         }
     }
 }
