@@ -69,21 +69,29 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroclaw_api::jsonrpc::error_codes;
+use zeroclaw_control::genesis::{GenesisRecord, InstanceTrustState, classify};
+use zeroclaw_control::journal::{JournalErrorCode, JournalState, OperationId, ParkRequest, Quotas};
+use zeroclaw_control::keys::ApprovalAuditKey;
+use zeroclaw_control::meta_authority::ControlOperation;
 use zeroclaw_control::protocol::{
     Advertisement, CONTROL_PROTOCOL_MAJOR, CatalogRequest, ControlErrorCode, DescribeRequest,
     Diagnostic, Envelope, ErrorPayload, InspectRequest, InspectResult, LOCAL_TARGET_ID,
     OPERATION_AGENT_CREATE_CONTAINED, PingResult, PreviewRequest, PreviewResult, ProtocolError,
-    STARTUP_REFUSAL_META_KEY, ServerInfoResult, SessionInfo, StartupRefusal, StartupRefusalCode,
-    TOOL_CATALOG, TOOL_DESCRIBE, TOOL_INSPECT, TOOL_PING, TOOL_PREVIEW, TOOL_REGISTRATION_HELP,
-    TOOL_SERVER_INFO, TOOL_VALIDATE, TOOLS, TargetRef, TargetSelector, ValidateRequest,
-    ValidateResult, canonical_json, catalog, dependency_digest, describe, diagnostic_for,
-    inspect_view, instance_fingerprint, operation_digest, operation_digest_for, preview_effects,
-    preview_risks, protocol_error_for, sha256_hex, source_revision_id, verification_plan,
+    RequestApplyRequest, RequestApplyResult, STARTUP_REFUSAL_META_KEY, ServerInfoResult,
+    SessionInfo, StartupRefusal, StartupRefusalCode, StatusRequest, StatusResult, TOOL_CATALOG,
+    TOOL_DESCRIBE, TOOL_INSPECT, TOOL_PING, TOOL_PREVIEW, TOOL_REGISTRATION_HELP,
+    TOOL_REQUEST_APPLY, TOOL_SERVER_INFO, TOOL_STATUS, TOOL_VALIDATE, TOOL_VERIFY, TOOLS,
+    TargetRef, TargetSelector, ValidateRequest, ValidateResult, VerifyRequest, VerifyResult,
+    canonical_json, catalog, dependency_digest, describe, diagnostic_for, inspect_view,
+    instance_fingerprint, operation_digest, operation_digest_for, preview_effects, preview_risks,
+    protocol_error_for, sha256_hex, source_revision_id, verification_plan,
 };
+use zeroclaw_control::registry::{InstanceFingerprint, RootIdentity};
 use zeroclaw_control::{
-    ClientCredential, ControlError, ControlInspection, ControlPaths, ControlService,
-    ControlSession, CredentialDelivery, PROPOSAL_DOMAIN_AGENT, ProposalPreview,
-    authenticate_client, registration_help,
+    ApplyWorker, ClientCredential, ControlError, ControlInspection, ControlPaths, ControlService,
+    ControlSession, CredentialDelivery, Evidence, PROPOSAL_DOMAIN_AGENT, ProposalJournal,
+    ProposalPreview, RequesterContext, RequesterSubject, WorkerError, authenticate_client,
+    management, operator, recovery, registration_help,
 };
 use zeroclaw_runtime::quickstart::Surface;
 
@@ -100,6 +108,11 @@ const SERVER_NAME: &str = "zeroclaw-control";
 /// How long a preview stays fresh. Process-local and advisory: v1 parks no
 /// proposal, so nothing durable expires.
 const PREVIEW_TTL_SECONDS: i64 = 900;
+
+/// How long a parked proposal stays valid before it expires unreviewed. Durable:
+/// the journal records the expiry and the receipt broker enforces the tighter
+/// receipt TTL inside it.
+const PROPOSAL_TTL_SECONDS: u64 = 900;
 
 /// Frames larger than this end the session rather than being buffered further.
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -136,12 +149,18 @@ const HOST_LOCK_FILE: &str = "host.lock";
 /// for diagnostics is not isolated in any sense the design would recognize.
 const LOWEST_ACCEPTED_CREDENTIAL_FD: i32 = 3;
 
-/// One read-only control session over a stdio JSON-RPC channel.
+/// One control session over a stdio JSON-RPC channel.
 pub struct ControlMcpServer {
     service: ControlService,
     session: ControlSession,
     advertisement: Advertisement,
     process_nonce: String,
+    /// The registered client's `registration_id`, when this session presented a
+    /// credential. It is the host-derived requester subject: the owner token a
+    /// parked proposal is attributed to and the identity every owner-scoped read
+    /// is fingerprinted against. `None` for an unregistered session, which can
+    /// reach no tool that needs it.
+    requester_subject: Option<String>,
 }
 
 impl ControlMcpServer {
@@ -187,7 +206,22 @@ impl ControlMcpServer {
             session,
             advertisement: Advertisement::current(zeroclaw_version),
             process_nonce: process_nonce(),
+            requester_subject: None,
         }
+    }
+
+    /// Attach the registered client's `registration_id` as this session's
+    /// requester subject.
+    ///
+    /// [`start`] sets it from the verified credential; this builder lets a test
+    /// construct a session with the same subject a real registration would
+    /// carry. A subject conveys no authority — it is attribution and
+    /// owner-scoping only — but the phase-5 tools that write or read a proposal
+    /// refuse without one, because a proposal with no owner cannot be scoped.
+    #[must_use]
+    pub fn with_requester_subject(mut self, subject: impl Into<String>) -> Self {
+        self.requester_subject = Some(subject.into());
+        self
     }
 
     /// Read newline-delimited JSON-RPC frames from `reader` until end of input,
@@ -324,9 +358,13 @@ impl ControlMcpServer {
     /// primary control; the refusal in [`ControlMcpServer::tools_call`] is the
     /// backstop for a client that calls a name it was never shown.
     fn tools_list(&self) -> Value {
+        // Read the durable mutation-enablement fact once for the whole listing.
+        let mutations_enabled = self.mutations_enabled();
         let tools: Vec<Value> = TOOLS
             .iter()
-            .filter(|tool| self.session.can_see(tool))
+            .filter(|tool| {
+                self.session.can_see(tool) && self.tool_reachable(tool, mutations_enabled)
+            })
             .map(|tool| {
                 json!({
                     "name": tool.name,
@@ -337,6 +375,32 @@ impl ControlMcpServer {
             })
             .collect();
         json!({ "tools": tools })
+    }
+
+    /// The transport-level half of a tool's visibility, above the grant's
+    /// read-domain gate in [`ControlSession::can_see`].
+    ///
+    /// `control.request_apply` is a durable-effect tool. It is absent from the
+    /// surface entirely unless mutations are enabled **and** this session holds
+    /// the proposal grant — so a read-only session, and any session on a
+    /// mutations-disabled instance, sees no way to write anything durable. Its
+    /// authorization is re-checked in the handler, so calling a hidden name still
+    /// refuses; absence is the primary control and the refusal is the backstop.
+    /// Every other tool's transport reachability is unconditional.
+    fn tool_reachable(
+        &self,
+        tool: &zeroclaw_control::protocol::ToolDescriptor,
+        mutations_enabled: bool,
+    ) -> bool {
+        if tool.name == TOOL_REQUEST_APPLY {
+            mutations_enabled
+                && self
+                    .session
+                    .grant()
+                    .is_some_and(|grant| grant.covers_proposal_domain(PROPOSAL_DOMAIN_AGENT))
+        } else {
+            true
+        }
     }
 
     async fn tools_call(&self, params: &Value) -> Value {
@@ -362,6 +426,9 @@ impl ControlMcpServer {
             TOOL_INSPECT => Box::pin(self.inspect(&arguments)).await,
             TOOL_VALIDATE => Box::pin(self.validate(&arguments)).await,
             TOOL_PREVIEW => Box::pin(self.preview(&arguments)).await,
+            TOOL_REQUEST_APPLY => Box::pin(self.request_apply(&arguments)).await,
+            TOOL_STATUS => self.status(&arguments),
+            TOOL_VERIFY => Box::pin(self.verify(&arguments)).await,
             // Unreachable: the registry lookup above already rejected every
             // name this version does not define. Refusing rather than
             // panicking keeps a future registry entry without a handler
@@ -382,6 +449,20 @@ impl ControlMcpServer {
     }
 
     fn server_info(&self) -> Result<Value, ProtocolError> {
+        // The instance's real enablement is a configured-instance fact and stays
+        // behind a grant: an unregistered session is told `false` unconditionally
+        // and learns nothing about the instance.
+        let instance_mutations_enabled = self.mutations_enabled();
+        let can_request_apply = instance_mutations_enabled
+            && self
+                .session
+                .grant()
+                .is_some_and(|grant| grant.covers_proposal_domain(PROPOSAL_DOMAIN_AGENT));
+        let mutation_tools = if can_request_apply {
+            vec![TOOL_REQUEST_APPLY.to_string()]
+        } else {
+            Vec::new()
+        };
         envelope(&ServerInfoResult {
             advertisement: self.advertisement.clone(),
             session: SessionInfo {
@@ -394,9 +475,11 @@ impl ControlMcpServer {
                     .grant()
                     .map(|grant| grant.assurance_class().to_string()),
             },
-            // A statement about the protocol version, not about this instance.
-            mutation_tools: Vec::new(),
-            read_only: true,
+            // The durable-effect tools this session can actually reach: at most
+            // `control.request_apply`, and only when it can park a proposal.
+            mutation_tools,
+            read_only: !can_request_apply,
+            mutations_enabled: self.session.is_registered() && instance_mutations_enabled,
         })
     }
 
@@ -540,6 +623,235 @@ impl ControlMcpServer {
         let result = self.project_preview(bound.preview(), &source_revision);
         // `bound` is dropped without ever reaching `ControlService::apply`.
         envelope(&result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase-5 tools: request apply (durable journal only), status, verify
+    // -----------------------------------------------------------------------
+
+    /// Park a preview-bound proposal for operator review. **Durable journal
+    /// only: this changes no config.**
+    ///
+    /// The one durable-effect tool on this surface, and every guard that makes it
+    /// safe runs before a single durable byte is written:
+    ///
+    /// 1. **Proposal-domain gate.** [`Self::authorize_proposal`] refuses a
+    ///    read-only grant with `grant_required`; a read grant is not enough to
+    ///    park. This is the confused-deputy boundary, and it is first so a
+    ///    read-only session never advances past it.
+    /// 2. **Read-only boundary.** A mutations-disabled instance refuses with
+    ///    `mutations_disabled` and writes nothing.
+    /// 3. Only then is a proposal reconstructed against the current revision and
+    ///    parked with [`ProposalJournal::park`], which enforces per-requester
+    ///    quotas, binds the owner token to the `registration_id`, mints a
+    ///    single-proposal resume secret returned exactly once, and stores only
+    ///    its verifier.
+    ///
+    /// It reaches no approval and no apply. There is no code path from here to
+    /// `ControlService::apply`: the config mutation happens only when a separate
+    /// eligible operator approves at the terminal backchannel and the host worker
+    /// consumes the receipt through the phase-5 apply path.
+    async fn request_apply(&self, arguments: &Value) -> Result<Value, ProtocolError> {
+        let request = parse_arguments::<RequestApplyRequest>(arguments, TOOL_REQUEST_APPLY)?;
+        // Guard 1: proposal-domain gate. Refuses before anything durable.
+        self.authorize_proposal(
+            request.target.as_ref(),
+            &request.operation_id,
+            request.capability_digest.as_deref(),
+            TOOL_REQUEST_APPLY,
+        )?;
+        // Guard 2: read-only boundary. Refuses before any journal row exists.
+        if !self.mutations_enabled() {
+            return Err(ProtocolError::new(
+                ControlErrorCode::MutationsDisabled,
+                TOOL_REQUEST_APPLY,
+            ));
+        }
+        let subject = self.requester_subject.clone().ok_or_else(|| {
+            ProtocolError::new(ControlErrorCode::InternalError, TOOL_REQUEST_APPLY)
+        })?;
+        let grant = self.session.grant().ok_or_else(|| {
+            ProtocolError::new(ControlErrorCode::UnregisteredClient, TOOL_REQUEST_APPLY)
+        })?;
+        let (paths, record, key) =
+            self.resolve_trust(TOOL_REQUEST_APPLY, ControlErrorCode::MutationsDisabled)?;
+
+        let inspection = self.inspect_now(TOOL_REQUEST_APPLY).await?;
+        let source_revision = source_revision_id(inspection.source_revision());
+        self.check_revision_pin(
+            request.source_revision.as_deref(),
+            &source_revision,
+            TOOL_REQUEST_APPLY,
+        )?;
+
+        // Reconstruct and re-verify the bound proposal against the current
+        // revision. A stale or newly-invalid operation fails here, not at park.
+        let proposal = request.operation.to_proposal();
+        let bound = self
+            .service
+            .preview(inspection, &request.operation.provider_alias, &proposal)
+            .map_err(|error| protocol_error_for(&error, TOOL_REQUEST_APPLY))?;
+
+        let requester = RequesterContext::external(
+            RequesterSubject::new(&subject).map_err(|_| {
+                ProtocolError::new(ControlErrorCode::InternalError, TOOL_REQUEST_APPLY)
+            })?,
+            RequesterContext::proposal_domains_from_grant(grant),
+            // Honest in production: no host-presence prober exists this phase, so
+            // the requester's isolation from the operator backchannel is
+            // unproven. It is bound for attribution and owner-scoping; the
+            // eligibility it would feed is evaluated only at approval time.
+            Evidence::unknown(),
+        );
+        let fingerprint = instance_fingerprint_for(&record, &paths).ok_or_else(|| {
+            ProtocolError::new(ControlErrorCode::InternalError, TOOL_REQUEST_APPLY)
+        })?;
+        let now = now_unix_secs()
+            .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, TOOL_REQUEST_APPLY))?;
+        let mut journal = ProposalJournal::load(&paths, &key)
+            .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, TOOL_REQUEST_APPLY))?;
+        let park = ParkRequest {
+            operation: ControlOperation::ProposeAgentProfile,
+            bound: &bound,
+            agent_proposal: &proposal,
+            selected_provider_ref: &request.operation.provider_alias,
+            target_instance: record.instance_id.clone(),
+            instance_fingerprint: fingerprint,
+            requester: &requester,
+            owner_token: subject.clone(),
+            client_session: self.process_nonce.clone(),
+            proposal_ttl_secs: PROPOSAL_TTL_SECONDS,
+        };
+        let (operation_id, resume_secret) = journal
+            .park(&park, now, &Quotas::default(), &paths, &key)
+            .map_err(|error| park_error(&error, TOOL_REQUEST_APPLY))?;
+        envelope(&RequestApplyResult {
+            operation_id: operation_id.as_str().to_string(),
+            resume_secret: resume_secret.as_str().to_string(),
+            state: JournalState::AwaitingApproval.wire().to_string(),
+            expires_at: unix_to_rfc3339(now.saturating_add(PROPOSAL_TTL_SECONDS)),
+            durable: true,
+        })
+    }
+
+    /// The durable journal state and bounded progress of one of the requester's
+    /// own operations, reported by name. No host effect.
+    ///
+    /// Scoped to the caller: [`ProposalJournal::status`] resolves the entry
+    /// through the requester fingerprint, so an operation another client owns is
+    /// `unknown_operation` — the journal is not an enumeration surface.
+    fn status(&self, arguments: &Value) -> Result<Value, ProtocolError> {
+        let request = parse_arguments::<StatusRequest>(arguments, TOOL_STATUS)?;
+        self.authorize_target(request.target.as_ref(), TOOL_STATUS)?;
+        let requester = self.requester_context(TOOL_STATUS)?;
+        let (paths, _record, key) =
+            self.resolve_trust(TOOL_STATUS, ControlErrorCode::UnknownOperation)?;
+        let operation_id = OperationId::new(request.operation_id.clone())
+            .map_err(|_| ProtocolError::new(ControlErrorCode::UnknownOperation, TOOL_STATUS))?;
+        let journal = ProposalJournal::load(&paths, &key)
+            .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, TOOL_STATUS))?;
+        let report = journal
+            .status(&operation_id, &requester)
+            .map_err(|_| ProtocolError::new(ControlErrorCode::UnknownOperation, TOOL_STATUS))?;
+        envelope(&StatusResult {
+            operation_id: operation_id.as_str().to_string(),
+            state: report.state.wire().to_string(),
+            operation: operation_wire(report.operation),
+            expires_at: unix_to_rfc3339(report.expires_at_unix_secs),
+            effects_total: report.effects_total,
+            effects_reached_post_image: report.effects_reached_post_image,
+            disposition: report.disposition,
+        })
+    }
+
+    /// Bounded, redacted verification reads for one of the requester's own
+    /// completed operations. No host effect.
+    async fn verify(&self, arguments: &Value) -> Result<Value, ProtocolError> {
+        let request = parse_arguments::<VerifyRequest>(arguments, TOOL_VERIFY)?;
+        self.authorize_target(request.target.as_ref(), TOOL_VERIFY)?;
+        let requester = self.requester_context(TOOL_VERIFY)?;
+        let (paths, record, key) =
+            self.resolve_trust(TOOL_VERIFY, ControlErrorCode::UnknownOperation)?;
+        let operation_id = OperationId::new(request.operation_id.clone())
+            .map_err(|_| ProtocolError::new(ControlErrorCode::UnknownOperation, TOOL_VERIFY))?;
+        let operators = operator::load_view(&paths, &record, &key)
+            .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, TOOL_VERIFY))?;
+        let journal = ProposalJournal::load(&paths, &key)
+            .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, TOOL_VERIFY))?;
+        let worker = ApplyWorker::new(&paths, &key, &operators, &self.service, &record);
+        // Boxed: the verification future re-inspects, so it carries a `Config`.
+        let report = Box::pin(recovery::verify(
+            &worker,
+            &journal,
+            &operation_id,
+            &requester,
+        ))
+        .await
+        .map_err(|error| verify_error(&error, TOOL_VERIFY))?;
+        envelope(&VerifyResult {
+            operation_id: operation_id.as_str().to_string(),
+            state: report.state.wire().to_string(),
+            agent_present: report.agent_present,
+            personality_files_ok: report.personality_files_ok,
+            effective: report.effective,
+        })
+    }
+
+    /// The install root this process is pinned to: the directory holding
+    /// `config.toml`.
+    fn install_root(&self) -> Option<&Path> {
+        self.service.config_path().parent()
+    }
+
+    /// Whether management mutations are enabled on this instance. Fail-closed:
+    /// an unresolvable root, an unmanaged instance, or an unauthenticated record
+    /// all read as `false`.
+    fn mutations_enabled(&self) -> bool {
+        self.install_root()
+            .is_some_and(management::mutations_enabled)
+    }
+
+    /// Resolve this instance's trust material, or refuse with `on_unavailable`.
+    ///
+    /// A non-managed or key-unusable instance is not one a proposal can be parked
+    /// on or read from, and the code the caller supplies keeps the refusal from
+    /// disclosing more than it should: `request_apply` collapses it into
+    /// `mutations_disabled`; the two owner-scoped reads into `unknown_operation`.
+    fn resolve_trust(
+        &self,
+        operation: &str,
+        on_unavailable: ControlErrorCode,
+    ) -> Result<(ControlPaths, GenesisRecord, ApprovalAuditKey), ProtocolError> {
+        let refuse = || ProtocolError::new(on_unavailable, operation);
+        let install_root = self.install_root().ok_or_else(refuse)?;
+        let paths = ControlPaths::resolve(install_root).map_err(|_| refuse())?;
+        let key_source = paths.key_source();
+        let record = match classify(&paths, &key_source) {
+            InstanceTrustState::Managed(record) => *record,
+            InstanceTrustState::EligibleForFirstGenesis
+            | InstanceTrustState::RecoveryOnly { .. } => return Err(refuse()),
+        };
+        let key =
+            ApprovalAuditKey::derive(&key_source, record.trust_epoch).map_err(|_| refuse())?;
+        Ok((paths, record, key))
+    }
+
+    /// Build the requester context for an owner-scoped read.
+    fn requester_context(&self, operation: &str) -> Result<RequesterContext, ProtocolError> {
+        let subject = self
+            .requester_subject
+            .as_deref()
+            .ok_or_else(|| ProtocolError::new(ControlErrorCode::UnregisteredClient, operation))?;
+        let grant = self
+            .session
+            .grant()
+            .ok_or_else(|| ProtocolError::new(ControlErrorCode::UnregisteredClient, operation))?;
+        Ok(RequesterContext::external(
+            RequesterSubject::new(subject)
+                .map_err(|_| ProtocolError::new(ControlErrorCode::InternalError, operation))?,
+            RequesterContext::proposal_domains_from_grant(grant),
+            Evidence::unknown(),
+        ))
     }
 
     /// Project a `ControlService` preview onto the wire type.
@@ -761,6 +1073,77 @@ fn process_nonce() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     sha256_hex(format!("{}:{now}", std::process::id()).as_bytes())
+}
+
+/// The host wall clock in seconds since the Unix epoch, host-evaluated.
+fn now_unix_secs() -> Result<u64, zeroclaw_control::StoreError> {
+    zeroclaw_control::genesis::now_unix_secs()
+}
+
+/// Render a Unix timestamp as RFC 3339 UTC.
+fn unix_to_rfc3339(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(i64::try_from(secs).unwrap_or(i64::MAX), 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// Recompute the instance fingerprint over the roots this record names.
+///
+/// The same inputs the design pins: instance id, genesis digest, trust epoch,
+/// canonical roots, and each root's filesystem object identity, owner, and
+/// permissions. A replaced or symlinked root produces a different fingerprint,
+/// which the apply worker re-derives under lock and expires the proposal on.
+fn instance_fingerprint_for(
+    record: &GenesisRecord,
+    paths: &ControlPaths,
+) -> Option<InstanceFingerprint> {
+    let roots = paths.canonical_roots().ok()?;
+    let config_identity = RootIdentity::probe(&roots.config_root).ok()?;
+    let data_identity = RootIdentity::probe(&roots.data_root).ok()?;
+    Some(InstanceFingerprint::compute(
+        &record.instance_id,
+        &record.digest(),
+        record.trust_epoch,
+        &roots,
+        &config_identity,
+        &data_identity,
+    ))
+}
+
+/// The wire operation identifier a journalled operation reports as. In v1 the
+/// only parkable operation is contained-agent creation.
+fn operation_wire(operation: ControlOperation) -> String {
+    match operation {
+        ControlOperation::ProposeAgentProfile => OPERATION_AGENT_CREATE_CONTAINED.to_string(),
+        // No other operation kind is parkable through this transport in v1.
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Map a `park` failure onto a typed, redacted refusal. A quota refusal is a
+/// requester-facing error and never evicts or discloses another client's state.
+fn park_error(error: &zeroclaw_control::JournalError, operation: &str) -> ProtocolError {
+    let code = match error.code {
+        JournalErrorCode::QuotaExceeded => ControlErrorCode::QuotaExceeded,
+        // A backward clock step expires rather than extends: the client's pinned
+        // view of the instance is effectively stale.
+        JournalErrorCode::ClockUntrustworthy => ControlErrorCode::StaleSourceRevision,
+        _ => ControlErrorCode::InternalError,
+    };
+    ProtocolError::new(code, operation)
+}
+
+/// Map a verification failure onto a typed, redacted refusal. A mismatched owner
+/// is `unknown_operation`, so verify discloses nothing across owners.
+fn verify_error(error: &WorkerError, operation: &str) -> ProtocolError {
+    let code = match error {
+        WorkerError::UnknownOperation => ControlErrorCode::UnknownOperation,
+        WorkerError::Journal(inner) if inner.code == JournalErrorCode::UnknownOperation => {
+            ControlErrorCode::UnknownOperation
+        }
+        _ => ControlErrorCode::InternalError,
+    };
+    ProtocolError::new(code, operation)
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,7 +1555,11 @@ pub async fn start(
             ControlService::new(config_path, Surface::Cli),
             authenticated.session,
             zeroclaw_version,
-        ),
+        )
+        // The verified `registration_id` is this session's requester subject: the
+        // owner token a parked proposal is attributed to and the identity every
+        // owner-scoped read is fingerprinted against. It carries no authority.
+        .with_requester_subject(client_id),
         _lock: Some(lock),
     })
 }

@@ -62,7 +62,7 @@ const ALWAYS_AVAILABLE: [&str; 3] = [
     "control.registration_help",
 ];
 
-/// The five tools a registered grant adds, in registry order.
+/// The five read tools a registered grant adds, in registry order.
 const GRANT_GATED: [&str; 5] = [
     "control.catalog",
     "control.describe",
@@ -70,6 +70,12 @@ const GRANT_GATED: [&str; 5] = [
     "control.validate",
     "control.preview",
 ];
+
+/// The two owner-scoped read tools a registered grant adds, in registry order.
+/// They are visible to any session holding the preview read domain, on a managed
+/// or unmanaged instance and whether or not mutations are enabled — they change
+/// nothing and each answer is scoped to the caller's own operations.
+const OWNER_SCOPED_READS: [&str; 2] = ["control.status", "control.verify"];
 
 /// Verbs that name a change to host state.
 ///
@@ -436,6 +442,67 @@ fn writer_operation() -> AgentCreateContainedOperation {
     }
 }
 
+/// A scripted user-presence adapter for the phase-5 ceremony paths.
+///
+/// This test binary enables the control crate's `fixture-grants` feature, which
+/// exposes `PresenceAttestation::fixture` — the seam that lets a test attest a
+/// fixed operator identity without a real controlling terminal. It is absent
+/// from every shipped build and covered by the fixture-absence CI gate.
+struct FixturePresence {
+    operator: FirstOperatorIdentity,
+}
+
+impl FixturePresence {
+    fn new(operator: &str) -> Self {
+        Self {
+            operator: FirstOperatorIdentity::new(operator).expect("operator identity"),
+        }
+    }
+}
+
+impl zeroclaw_control::UserPresence for FixturePresence {
+    fn confirm(
+        &self,
+        _request: &zeroclaw_control::ceremony::PresenceRequest,
+    ) -> Result<zeroclaw_control::ceremony::PresenceAttestation, zeroclaw_control::PresenceError>
+    {
+        Ok(zeroclaw_control::ceremony::PresenceAttestation::fixture(
+            PresenceClass::Terminal,
+            Some(self.operator.clone()),
+        ))
+    }
+}
+
+/// Enable mutations on `install` through the fixture presence ceremony, naming
+/// the genesis first operator. This is the host-side enablement `zeroclaw
+/// control enable-mutations` performs; nothing an MCP session can reach.
+fn enable_mutations(install: &ManagedInstall) {
+    zeroclaw_control::management::enable_mutations(
+        install.root(),
+        &FixturePresence::new("operator"),
+        "confirm".to_string(),
+        "operator".to_string(),
+    )
+    .expect("the ceremony enables mutations");
+}
+
+/// The durable journal file for this install, whose absence proves no proposal
+/// was parked.
+fn journal_path(install: &ManagedInstall) -> PathBuf {
+    install
+        .paths
+        .control_dir()
+        .join(zeroclaw_control::journal::JOURNAL_FILE)
+}
+
+/// The `control.request_apply` arguments for the standard writer proposal.
+fn request_apply_args() -> Value {
+    json!({
+        "operation_id": "agent.create_contained",
+        "operation": serde_json::to_value(writer_operation()).expect("operation serializes"),
+    })
+}
+
 fn request(id: u64, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
@@ -614,9 +681,14 @@ async fn no_session_can_see_a_tool_that_changes_host_state() {
         (
             "fixture-granted",
             ControlSession::fixture_granted(RequesterGrant::fixture_full()),
+            // Mutations are disabled on this bare install, so `control.request_apply`
+            // — the one tool whose name carries a mutation verb — is absent from
+            // the surface entirely. The two owner-scoped reads are present and
+            // name no mutation verb.
             ALWAYS_AVAILABLE
                 .iter()
                 .chain(GRANT_GATED.iter())
+                .chain(OWNER_SCOPED_READS.iter())
                 .copied()
                 .collect(),
         ),
@@ -1102,6 +1174,64 @@ async fn every_error_code_in_the_v1_table_is_producible_and_carries_no_host_deta
         seen.push((*expected).to_string());
     }
 
+    // `mutations_disabled` is a phase-5 refusal: a registered session on a
+    // mutations-disabled instance (this bare install) parks nothing.
+    {
+        let response = exchange(
+            &granted,
+            &call(
+                200,
+                "control.request_apply",
+                json!({ "operation_id": "agent.create_contained", "operation": operation }),
+            ),
+        )
+        .await;
+        assert_eq!(error_code(&response), "mutations_disabled");
+        let serialized = serde_json::to_string(&response).expect("response serializes");
+        assert!(
+            !serialized.contains(&root),
+            "mutations_disabled disclosed the install root"
+        );
+        seen.push("mutations_disabled".to_string());
+    }
+
+    // `quota_exceeded` needs a managed, mutations-enabled instance parked to its
+    // per-requester quota. `Quotas::default().max_awaiting_approval` is 8, so the
+    // ninth concurrent park is refused without evicting any prior entry.
+    {
+        let install = ManagedInstall::new();
+        let inner_guard = ConfigDirGuard::pin(install.root());
+        enable_mutations(&install);
+        let (id, credential_path) = install.register(
+            &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+            "quota.cred",
+        );
+        let host = start_with_descriptor(&install, &id, &credential_path)
+            .await
+            .expect("the credential authenticates");
+        let server = host.server();
+        let mut last = json!(null);
+        for n in 0..9u64 {
+            last = exchange(
+                server,
+                &call(300 + n, "control.request_apply", request_apply_args()),
+            )
+            .await;
+        }
+        assert_eq!(
+            error_code(&last),
+            "quota_exceeded",
+            "the ninth concurrent park exceeds the quota"
+        );
+        let serialized = serde_json::to_string(&last).expect("response serializes");
+        assert!(
+            !serialized.contains(&install.root().display().to_string()),
+            "quota_exceeded disclosed the install root"
+        );
+        seen.push("quota_exceeded".to_string());
+        drop(inner_guard);
+    }
+
     // `unsupported_protocol_version` is a lifecycle refusal, so it arrives as a
     // JSON-RPC error carrying the same typed payload rather than as a tool
     // result.
@@ -1155,13 +1285,18 @@ async fn an_unknown_tool_name_is_an_unknown_operation_rather_than_a_partial_beha
         TEST_VERSION,
     );
 
+    // `control.request_apply`, `control.status`, and `control.verify` now exist,
+    // so they are covered by the phase-5 tests. The names that must still NOT
+    // exist are the config-mutating and approval verbs: there is no
+    // model-callable apply, approve, reject, finalize, or registration.
     for name in [
         "control.apply",
-        "control.request_apply",
-        "control.status",
-        "control.verify",
-        "control.register",
         "control.approve",
+        "control.reject",
+        "control.finalize",
+        "control.commit",
+        "control.enable_mutations",
+        "control.register",
     ] {
         let response = exchange(&server, &call(1, name, json!({}))).await;
         assert_eq!(
@@ -1512,9 +1647,11 @@ async fn a_registered_client_walks_the_whole_read_only_surface_and_leaks_no_secr
         ALWAYS_AVAILABLE
             .iter()
             .chain(GRANT_GATED.iter())
+            .chain(OWNER_SCOPED_READS.iter())
             .copied()
             .collect::<Vec<_>>(),
-        "a full registration lists the three always tools plus every granted read tool"
+        "a full registration on a mutations-disabled instance lists the read tools \
+         and the two owner-scoped reads, but not control.request_apply"
     );
 
     let info_frame = exchange(server, &call(3, "control.server_info", json!({}))).await;
@@ -2202,4 +2339,441 @@ fn the_transport_module_never_writes_to_stdout_outside_the_frame_writer() {
             "src/control_mcp.rs names `{forbidden}`; the transport must not be able to reach it"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: request apply (durable journal only), status, verify, and the
+// operator approve/reject backchannel
+// ---------------------------------------------------------------------------
+
+/// Whether the effective config on disk names an agent alias.
+fn config_names_agent(install: &ManagedInstall, alias: &str) -> bool {
+    std::fs::read_to_string(&install.config_path)
+        .expect("read the config")
+        .contains(alias)
+}
+
+#[tokio::test]
+async fn request_apply_parks_a_proposal_and_changes_no_config() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    // With mutations enabled and the proposal grant held, the durable-effect tool
+    // is now on the surface.
+    let listed = listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+    assert!(
+        listed.contains(&"control.request_apply".to_string()),
+        "request_apply is listed once mutations are enabled for a proposal-granted client"
+    );
+
+    let config_before = std::fs::read(&install.config_path).expect("read config before");
+
+    let parked = tool_ok(
+        &exchange(
+            server,
+            &call(2, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    let operation_id = parked["operation_id"].as_str().expect("op id").to_string();
+    let resume_secret = parked["resume_secret"]
+        .as_str()
+        .expect("resume secret")
+        .to_string();
+    assert!(operation_id.starts_with("op-"));
+    assert!(resume_secret.starts_with("resume-"));
+    assert_eq!(parked["state"], json!("awaiting_approval"));
+    assert_eq!(parked["durable"], json!(true));
+
+    // The invariant: parking is durable-journal-only and changes no config.
+    let config_after = std::fs::read(&install.config_path).expect("read config after");
+    assert_eq!(
+        config_before, config_after,
+        "request_apply must change no config"
+    );
+
+    // A durable journal row exists, and the owner can read it back by name.
+    assert!(
+        journal_path(&install).exists(),
+        "request_apply must have written one journal row"
+    );
+    let status = tool_ok(
+        &exchange(
+            server,
+            &call(3, "control.status", json!({ "operation_id": operation_id })),
+        )
+        .await,
+    );
+    assert_eq!(status["state"], json!("awaiting_approval"));
+    assert_eq!(status["operation"], json!("agent.create_contained"));
+    assert_eq!(status["effects_reached_post_image"], json!(0));
+}
+
+#[tokio::test]
+async fn no_mcp_call_can_approve_or_apply_a_proposal() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    // The full phase-5 surface is listed, but no tool approves, applies, or
+    // finalizes: there is no model-callable approve.
+    let listed = listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+    for present in ["control.request_apply", "control.status", "control.verify"] {
+        assert!(
+            listed.contains(&present.to_string()),
+            "{present} must be listed"
+        );
+    }
+    for forbidden in [
+        "control.approve",
+        "control.reject",
+        "control.apply",
+        "control.finalize",
+        "control.commit",
+        "control.enable_mutations",
+    ] {
+        assert!(
+            !listed.contains(&forbidden.to_string()),
+            "{forbidden} must never appear in tools/list"
+        );
+        let response = exchange(
+            server,
+            &call(2, forbidden, json!({ "operation_id": "op-x" })),
+        )
+        .await;
+        assert_eq!(
+            error_code(&response),
+            "unknown_operation",
+            "{forbidden} must not exist as a callable tool"
+        );
+    }
+
+    // The one durable-effect tool the same client can call only parks — it
+    // cannot approve its own proposal.
+    let parked = exchange(
+        server,
+        &call(3, "control.request_apply", request_apply_args()),
+    )
+    .await;
+    assert_eq!(
+        parked["result"]["isError"],
+        json!(false),
+        "request_apply only parks"
+    );
+    assert!(
+        !config_names_agent(&install, "writer"),
+        "no MCP call applied the parked proposal"
+    );
+}
+
+#[tokio::test]
+async fn an_operator_approves_via_the_cli_path_and_config_changes_through_the_cas() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    // 1. The client PARKS a proposal. No config changes yet.
+    let parked = tool_ok(
+        &exchange(
+            server,
+            &call(1, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    let operation_id = parked["operation_id"].as_str().expect("op id").to_string();
+    assert!(
+        !config_names_agent(&install, "writer"),
+        "no agent exists before approval"
+    );
+
+    // 2. A registered operator approves via the CLI composition — the ONLY path
+    //    that changes config. It authenticates through the terminal backchannel
+    //    (scripted here), the broker mints a single-use receipt, and the
+    //    ApplyWorker drives the six-step claim + CAS. The operator ("operator",
+    //    the genesis first operator) is distinct from the requester (the
+    //    registration id), so it is eligible.
+    let outcome = zeroclaw::control_operator::approve_operation_blocking(
+        install.config_path.clone(),
+        &operation_id,
+        "operator",
+        &FixturePresence::new("operator"),
+        // Isolation-proving fixture evidence. Production passes Evidence::unknown(),
+        // which is conservatively ineligible, so the shipped path fails closed
+        // until a reachability prober exists.
+        zeroclaw_control::Evidence::fixture_isolated(),
+        "confirm".to_string(),
+        "operator".to_string(),
+    )
+    .expect("the operator approval applies through the CAS");
+    assert_eq!(outcome.agent_alias, "writer");
+    assert_eq!(outcome.state, "verified");
+
+    // 3. Config changed through the CAS, and Status reports verified by name.
+    assert!(
+        config_names_agent(&install, "writer"),
+        "the agent exists in effective config after approval"
+    );
+    let status = tool_ok(
+        &exchange(
+            server,
+            &call(2, "control.status", json!({ "operation_id": operation_id })),
+        )
+        .await,
+    );
+    assert_eq!(status["state"], json!("verified"));
+
+    // Verify confirms effective state, not merely a successful write.
+    let verified = tool_ok(
+        &exchange(
+            server,
+            &call(3, "control.verify", json!({ "operation_id": operation_id })),
+        )
+        .await,
+    );
+    assert_eq!(verified["state"], json!("verified"));
+    assert_eq!(verified["agent_present"], json!(true));
+    assert_eq!(verified["effective"], json!(true));
+}
+
+#[tokio::test]
+async fn request_apply_refuses_and_writes_nothing_while_mutations_are_disabled() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    // Deliberately NOT enabling mutations: a registered read grant, read-only mode.
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    // The read-only surface is fully usable, and request_apply does not appear.
+    let listed = listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+    assert!(
+        !listed.contains(&"control.request_apply".to_string()),
+        "request_apply must not appear usable while mutations are disabled"
+    );
+    assert!(listed.contains(&"control.preview".to_string()));
+    let preview = exchange(server, &call(2, "control.preview", request_apply_args())).await;
+    assert_eq!(
+        preview["result"]["isError"],
+        json!(false),
+        "preview still works"
+    );
+
+    // Calling request_apply by name is a hard read-only boundary: it refuses and
+    // writes nothing durable.
+    let response = exchange(
+        server,
+        &call(3, "control.request_apply", request_apply_args()),
+    )
+    .await;
+    assert_eq!(error_code(&response), "mutations_disabled");
+    assert!(
+        !journal_path(&install).exists(),
+        "read-only mode must create no parked proposal"
+    );
+}
+
+#[tokio::test]
+async fn request_apply_refuses_a_read_grant_without_the_proposal_domain() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    // Every read domain, but no proposal domain: a read grant is not enough.
+    let read_only = ClientGrant {
+        client_label: ClientLabel::new("read-only").expect("label"),
+        delivery_assurance: CredentialDelivery::IsolatedDescriptor,
+        granted_instances: [install.instance_id.clone()].into_iter().collect(),
+        granted_read_domains: client_registry::READ_DOMAINS_V1
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect(),
+        proposal_domains: std::collections::BTreeSet::new(),
+    };
+    let (id, credential_path) = install.register(&read_only, "read-only.cred");
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    // Not usable: hidden from tools/list even with mutations enabled.
+    let listed = listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+    assert!(
+        !listed.contains(&"control.request_apply".to_string()),
+        "a read-only grant must not see request_apply"
+    );
+    // And calling by name refuses on the proposal-domain gate, writing nothing.
+    let response = exchange(
+        server,
+        &call(2, "control.request_apply", request_apply_args()),
+    )
+    .await;
+    assert_eq!(error_code(&response), "grant_required");
+    assert!(
+        !journal_path(&install).exists(),
+        "a read grant must park nothing"
+    );
+}
+
+#[tokio::test]
+async fn status_and_verify_are_scoped_to_the_owning_requester() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    let (id_a, cred_a) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "a.cred",
+    );
+    let host_a = start_with_descriptor(&install, &id_a, &cred_a)
+        .await
+        .expect("client A authenticates");
+    let server_a = host_a.server();
+    let _ = initialize(server_a).await;
+    let parked = tool_ok(
+        &exchange(
+            server_a,
+            &call(1, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    let operation_id = parked["operation_id"].as_str().expect("op id").to_string();
+
+    // Client A reads its own operation.
+    let own = exchange(
+        server_a,
+        &call(2, "control.status", json!({ "operation_id": operation_id })),
+    )
+    .await;
+    assert_eq!(
+        own["result"]["isError"],
+        json!(false),
+        "the owner can read its own operation"
+    );
+
+    // Client B — a different requester subject on the same instance — cannot see
+    // it. Owner-scoping is by requester fingerprint, which the subject
+    // determines; a fixture session with a distinct subject models a second
+    // client without taking a second host lock.
+    let server_b = ControlMcpServer::with_service_and_session(
+        service_with(&Arc::new(RecordingFactory::new()), &install.config_path),
+        ControlSession::fixture_granted(RequesterGrant::fixture_full()),
+        TEST_VERSION,
+    )
+    .with_requester_subject("reg-a-different-client");
+    assert_eq!(
+        error_code(
+            &exchange(
+                &server_b,
+                &call(3, "control.status", json!({ "operation_id": operation_id }))
+            )
+            .await
+        ),
+        "unknown_operation",
+        "status must not disclose another owner's operation"
+    );
+    assert_eq!(
+        error_code(
+            &exchange(
+                &server_b,
+                &call(4, "control.verify", json!({ "operation_id": operation_id }))
+            )
+            .await
+        ),
+        "unknown_operation",
+        "verify must not disclose another owner's operation"
+    );
+}
+
+#[tokio::test]
+async fn the_resume_secret_is_returned_once_and_stored_only_as_a_verifier() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+
+    let parked = tool_ok(
+        &exchange(
+            server,
+            &call(1, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    let resume_secret = parked["resume_secret"]
+        .as_str()
+        .expect("resume secret")
+        .to_string();
+    assert!(resume_secret.starts_with("resume-"));
+
+    // The durable journal stores only a verifier, never the secret — exactly as
+    // a client credential is stored.
+    let sealed = std::fs::read_to_string(journal_path(&install)).expect("read the sealed journal");
+    assert!(
+        !sealed.contains(&resume_secret),
+        "the plaintext resume secret must never be persisted"
+    );
+
+    // It is single-proposal: a second park mints a different secret.
+    let parked2 = tool_ok(
+        &exchange(
+            server,
+            &call(2, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    let resume_secret2 = parked2["resume_secret"]
+        .as_str()
+        .expect("second resume secret")
+        .to_string();
+    assert_ne!(
+        resume_secret, resume_secret2,
+        "each parked proposal gets its own resume secret"
+    );
 }

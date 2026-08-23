@@ -91,6 +91,12 @@ pub const TOOL_INSPECT: &str = "control.inspect";
 pub const TOOL_VALIDATE: &str = "control.validate";
 /// Canonical effects, risks, and verification plan.
 pub const TOOL_PREVIEW: &str = "control.preview";
+/// Park a preview-bound proposal for operator review. Durable journal only.
+pub const TOOL_REQUEST_APPLY: &str = "control.request_apply";
+/// Read the durable journal state of one of the requester's own operations.
+pub const TOOL_STATUS: &str = "control.status";
+/// Verify effective state for one of the requester's own completed operations.
+pub const TOOL_VERIFY: &str = "control.verify";
 
 /// Whether a tool is reachable without a registered requester grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +249,40 @@ pub const TOOLS: &[ToolDescriptor] = &[
         required_read_domains: &[TOOL_PREVIEW],
         input_schema: preview_request_schema,
     },
+    // The three phase-5 tools below share the `control.preview` read domain for
+    // visibility, because the whole request/status/verify lifecycle belongs to a
+    // client that first previewed the operation. Their *authorization* is
+    // stronger than that read domain and is enforced in the transport handlers:
+    // `control.request_apply` additionally requires the PROPOSAL domain (a read
+    // grant is not enough) plus a mutations-enabled, managed instance, and it is
+    // absent from `tools/list` entirely while mutations are disabled; the two
+    // read tools scope every answer to the caller's own operations. None of the
+    // three applies anything — `control.request_apply` writes the durable
+    // journal only, and there is no model-callable approve, apply, or finalize.
+    ToolDescriptor {
+        name: TOOL_REQUEST_APPLY,
+        title: "Request apply",
+        description: "Park a preview-bound proposal for operator review. Durable journal only: it changes no config and conveys no approval authority. Refused while mutations are disabled.",
+        gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_PREVIEW],
+        input_schema: request_apply_request_schema,
+    },
+    ToolDescriptor {
+        name: TOOL_STATUS,
+        title: "Status",
+        description: "The exact durable journal state and bounded progress of one of the requester's own operations, reported by name. No host effect.",
+        gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_PREVIEW],
+        input_schema: status_request_schema,
+    },
+    ToolDescriptor {
+        name: TOOL_VERIFY,
+        title: "Verify",
+        description: "Bounded, redacted verification reads for one of the requester's own completed operations. No host effect.",
+        gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_PREVIEW],
+        input_schema: verify_request_schema,
+    },
 ];
 
 /// The registry entry for `name`, if this protocol version defines one.
@@ -279,6 +319,18 @@ fn validate_request_schema() -> Value {
 
 fn preview_request_schema() -> Value {
     schema_value::<PreviewRequest>()
+}
+
+fn request_apply_request_schema() -> Value {
+    schema_value::<RequestApplyRequest>()
+}
+
+fn status_request_schema() -> Value {
+    schema_value::<StatusRequest>()
+}
+
+fn verify_request_schema() -> Value {
+    schema_value::<VerifyRequest>()
 }
 
 /// The generated JSON Schema for `T` as a JSON value.
@@ -521,6 +573,12 @@ pub enum ControlErrorCode {
     ValidationFailed,
     /// The pinned source revision no longer matches.
     StaleSourceRevision,
+    /// Management mutations are not enabled on this instance, so a proposal
+    /// cannot be parked. A read-only refusal that writes nothing durable.
+    MutationsDisabled,
+    /// A per-requester parking quota would be exceeded. No entry is evicted and
+    /// nothing durable is written.
+    QuotaExceeded,
     /// Unclassified host failure.
     InternalError,
 }
@@ -538,6 +596,8 @@ impl ControlErrorCode {
             Self::TargetNotRegistered => "target_not_registered",
             Self::ValidationFailed => "validation_failed",
             Self::StaleSourceRevision => "stale_source_revision",
+            Self::MutationsDisabled => "mutations_disabled",
+            Self::QuotaExceeded => "quota_exceeded",
             Self::InternalError => "internal_error",
         }
     }
@@ -564,6 +624,8 @@ impl ControlErrorCode {
             Self::TargetNotRegistered => "The requested target is not registered on this host.",
             Self::ValidationFailed => "The typed operation did not validate.",
             Self::StaleSourceRevision => "The pinned source revision no longer matches.",
+            Self::MutationsDisabled => "Management mutations are not enabled on this instance.",
+            Self::QuotaExceeded => "A per-requester parking quota would be exceeded.",
             Self::InternalError => "The host could not complete this operation.",
         }
     }
@@ -575,7 +637,7 @@ impl ControlErrorCode {
     }
 
     /// Every code in the v1 table, for exhaustive tests.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::UnregisteredClient,
         Self::GrantRequired,
         Self::UnknownOperation,
@@ -584,6 +646,8 @@ impl ControlErrorCode {
         Self::TargetNotRegistered,
         Self::ValidationFailed,
         Self::StaleSourceRevision,
+        Self::MutationsDisabled,
+        Self::QuotaExceeded,
         Self::InternalError,
     ];
 }
@@ -953,6 +1017,50 @@ pub struct PreviewRequest {
     pub source_revision: Option<String>,
 }
 
+/// `control.request_apply` arguments. Identical in shape to [`PreviewRequest`]:
+/// the client re-submits the operation it previewed, and the host reconstructs
+/// and re-verifies the bound proposal against the current revision before
+/// parking it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestApplyRequest {
+    /// The instance to park against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetSelector>,
+    /// The operation kind being proposed.
+    pub operation_id: String,
+    /// The typed operation, conforming to Describe's `request_schema`.
+    pub operation: AgentCreateContainedOperation,
+    /// Optional pin: refuse if the server no longer advertises this digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_digest: Option<String>,
+    /// Optional pin: refuse if the instance is no longer at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+/// `control.status` arguments. Addresses one operation the caller owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatusRequest {
+    /// The instance the operation lives on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetSelector>,
+    /// The operation id returned by `control.request_apply`.
+    pub operation_id: String,
+}
+
+/// `control.verify` arguments. Addresses one operation the caller owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyRequest {
+    /// The instance the operation lives on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetSelector>,
+    /// The operation id returned by `control.request_apply`.
+    pub operation_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
@@ -987,11 +1095,19 @@ pub struct ServerInfoResult {
     pub advertisement: Advertisement,
     /// Facts about the calling session only.
     pub session: SessionInfo,
-    /// Always empty in v1: this protocol version defines no mutation tool. A
-    /// statement about the protocol, not about the instance.
+    /// The durable-effect tools reachable by *this* session — at most
+    /// `control.request_apply`, and only when this registered session can park a
+    /// proposal. Empty for an unregistered session, a session without the
+    /// proposal grant, and any session while mutations are disabled.
     pub mutation_tools: Vec<String>,
-    /// Always `true` in v1.
+    /// Whether this session can reach no durable-effect tool. `true` unless the
+    /// session can park a proposal.
     pub read_only: bool,
+    /// Whether management mutations are enabled on this instance. A
+    /// configured-instance fact that stays behind a grant: it is always `false`
+    /// for an unregistered session and never discloses the instance's real value
+    /// to one, matching the read-only server_info disclosure rule.
+    pub mutations_enabled: bool,
 }
 
 /// `control.registration_help` result.
@@ -1210,6 +1326,69 @@ pub struct PreviewResult {
     pub risks: Vec<Risk>,
     /// Checks the host would run after an apply.
     pub verification_plan: Vec<VerificationStep>,
+}
+
+/// `control.request_apply` result.
+///
+/// A successful call has written exactly one immutable `awaiting_approval`
+/// journal entry and changed **no** config. It conveys no approval authority:
+/// the config mutation happens only when a separate eligible operator approves
+/// at the terminal backchannel and the host worker consumes the receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestApplyResult {
+    /// The durable operation identifier. Addresses `control.status` and
+    /// `control.verify` for this operation.
+    pub operation_id: String,
+    /// The opaque single-proposal resume secret, returned exactly once. The host
+    /// stores only its verifier, never the secret. It conveys no approval
+    /// authority and expires with the proposal.
+    pub resume_secret: String,
+    /// The durable state the proposal was parked in, reported by name.
+    pub state: String,
+    /// RFC 3339 UTC instant after which the parked proposal expires.
+    pub expires_at: String,
+    /// Always `true`: a parked proposal is durable. Distinguishes this from a
+    /// `control.preview`, which is process-local.
+    pub durable: bool,
+}
+
+/// `control.status` result: the exact durable state and bounded progress of one
+/// operation the caller owns, reported by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResult {
+    /// The operation addressed.
+    pub operation_id: String,
+    /// The durable journal state, by its verbatim name. Never collapsed into a
+    /// generic pending result.
+    pub state: String,
+    /// The operation kind being decided and applied.
+    pub operation: String,
+    /// Expiry, RFC 3339 UTC.
+    pub expires_at: String,
+    /// How many effects the proposal declares.
+    pub effects_total: usize,
+    /// How many declared effects have reached their expected post-image, as
+    /// bounded progress — never a substitute for the state name.
+    pub effects_reached_post_image: usize,
+    /// A short, non-secret note on why a terminal or parked state was entered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+}
+
+/// `control.verify` result: bounded, redacted verification reads for one
+/// completed operation the caller owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyResult {
+    /// The operation addressed.
+    pub operation_id: String,
+    /// The durable journal state, by name.
+    pub state: String,
+    /// Whether the created agent is present in effective configuration.
+    pub agent_present: bool,
+    /// Whether the declared personality files are present and correct.
+    pub personality_files_ok: bool,
+    /// Whether the operation's effect is confirmed effective, not merely written.
+    pub effective: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,7 +1830,7 @@ mod tests {
         );
         assert_eq!(
             capability_digest(&baseline),
-            "sha256:1c3d71e0285b682f2bae4f3339e53be0efc953c5baacf4a7975a36e9c5df34a5",
+            "sha256:835c3c0815a6f29d6ad52917eb04023823e0dce775f9bbeec243f87abeb42065",
             "a change here is a protocol change and must be deliberate"
         );
 
@@ -1680,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_defines_exactly_the_v1_surface_and_no_mutation_tool() {
+    fn the_registry_defines_exactly_the_phase5_surface_and_no_model_callable_approve() {
         assert_eq!(
             tool_names(),
             vec![
@@ -1692,6 +1871,9 @@ mod tests {
                 "control.inspect",
                 "control.validate",
                 "control.preview",
+                "control.request_apply",
+                "control.status",
+                "control.verify",
             ]
         );
         let always: Vec<&str> = TOOLS
@@ -1707,6 +1889,24 @@ mod tests {
                 "control.registration_help"
             ]
         );
+        // The invariant the whole architecture exists to protect: no tool
+        // approves, applies config, or otherwise finalizes a mutation. The one
+        // durable-effect tool, `control.request_apply`, parks a proposal and
+        // nothing more. Adding any of these names is the confused-deputy tool
+        // this test forbids.
+        for forbidden in [
+            "control.approve",
+            "control.reject",
+            "control.apply",
+            "control.finalize",
+            "control.commit",
+            "control.enable_mutations",
+        ] {
+            assert!(
+                tool(forbidden).is_none(),
+                "{forbidden} must never be a model-callable tool"
+            );
+        }
     }
 
     #[test]

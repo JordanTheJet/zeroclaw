@@ -751,6 +751,12 @@ mod tests {
             .filter(|entry| session.can_see(entry))
             .map(|entry| entry.name)
             .collect();
+        // A full grant covers the `control.preview` read domain, which also
+        // gates the three phase-5 tools' visibility. Their stronger
+        // authorization (the proposal domain for request_apply, owner-scoping for
+        // status and verify) and the mutations-enabled visibility gate live in
+        // the transport, above `can_see`; at the grant level a full grant can see
+        // all eleven.
         assert_eq!(
             visible,
             vec![
@@ -762,6 +768,9 @@ mod tests {
                 "control.inspect",
                 "control.validate",
                 "control.preview",
+                "control.request_apply",
+                "control.status",
+                "control.verify",
             ]
         );
     }
