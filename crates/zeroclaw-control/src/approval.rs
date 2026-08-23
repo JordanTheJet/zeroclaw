@@ -16,11 +16,18 @@
 //!    field a caller can set.
 //! 2. The receipt is authenticated with the ADR-015 approval and audit key,
 //!    which is derived inside the `KeySource` boundary and exposed only through
-//!    sign and verify. No requester-facing tool, adapter, plugin, or agent can
-//!    resolve, read, or proxy it, so a requester cannot mint a tag even if it
-//!    could construct the struct. [`AuthenticatedReceipt::seal_new`] is
-//!    `pub(crate)`, so no other crate — including the binary and the MCP
-//!    transport — can mint one at all.
+//!    sign and verify. **The real boundary is key-source confidentiality**: the
+//!    key is an HKDF subkey of the single ADR-013 authority, whose backend is a
+//!    0600 host secret no requester-facing tool, adapter, plugin, or agent can
+//!    resolve, read, or proxy. A party that *did* hold the derived key could
+//!    authenticate the exact wire bytes of any receipt regardless of any Rust
+//!    visibility modifier — [`AuthenticatedReceipt::seal_new`] and
+//!    [`crate::keys::ApprovalAuditKey::sign`] being `pub(crate)` gates the
+//!    minting *type* against an in-crate mistake and stops another crate reaching
+//!    the signer, but it is defense-in-depth layered on the key-source secret,
+//!    not the guarantee itself. Because the threat model excludes a process that
+//!    can read that host key, a requester cannot mint a tag even though it can
+//!    construct the plain [`ApprovalReceipt`] struct.
 //! 3. **No tool accepts a receipt, because no tool exists that consumes one.**
 //!    Phase 4 adds no mutating tool and no apply path. A receipt in this phase
 //!    authorizes nothing yet; it is a verifiable fact awaiting the phase-5

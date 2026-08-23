@@ -249,8 +249,18 @@ impl ApprovalAuditKey {
     }
 
     /// Authenticate `message`.
+    ///
+    /// `pub(crate)` deliberately: a holder of this derived key can authenticate
+    /// *any* byte string, so exposing `sign` outside the crate would let another
+    /// crate mint the exact wire bytes of a receipt, an operator registry, or a
+    /// genesis record without going through the type that gates minting. The
+    /// unforgeability of every sealed artefact rests on the confidentiality of
+    /// the key source behind [`KeySource`] (the 0600 host secret), not on this
+    /// visibility modifier; keeping `sign` in-crate is defense-in-depth against
+    /// an in-crate mistake, not the boundary itself. The only in-crate callers
+    /// are `store::seal`, `genesis`, and `client_registry`.
     #[must_use]
-    pub fn sign(&self, message: &[u8]) -> Tag {
+    pub(crate) fn sign(&self, message: &[u8]) -> Tag {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.key)
             .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts a key of any length"));
         mac.update(message);

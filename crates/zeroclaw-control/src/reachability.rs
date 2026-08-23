@@ -161,16 +161,26 @@ impl std::fmt::Display for IsolationQuestion {
 /// `Some(false)` is a proof of reach, and `None` is *the host does not know* —
 /// which the conservative rule treats exactly like `Some(false)`. There is no
 /// constructor that fills unknowns with optimistic defaults.
+///
+/// The fields are **private**. Production code builds an `Evidence` only through
+/// [`Self::unknown`] (equivalently `Default`), and the single value that answers
+/// every question affirmatively — [`Self::fully_isolated`] — is `#[cfg(test)]`,
+/// so it exists in no shipped build and no workspace crate can flip an operator
+/// from ineligible to eligible by hand. When a real host-presence prober arrives
+/// it will construct this type from discharged proofs through a new constructor
+/// in this module, never from a free-standing "isolated" literal. This mirrors
+/// [`crate::ceremony::PresenceAttestation`], whose fields are likewise private
+/// and whose only direct constructor is test-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Evidence {
     /// See [`IsolationQuestion::DistinctOsAccount`].
-    pub distinct_os_account: Option<bool>,
+    distinct_os_account: Option<bool>,
     /// See [`IsolationQuestion::SandboxExcludesBackchannel`].
-    pub sandbox_excludes_backchannel: Option<bool>,
+    sandbox_excludes_backchannel: Option<bool>,
     /// See [`IsolationQuestion::OutsideHostProcess`].
-    pub outside_host_process: Option<bool>,
+    outside_host_process: Option<bool>,
     /// See [`IsolationQuestion::NoShellOrFilesystemGrant`].
-    pub no_shell_or_filesystem_grant: Option<bool>,
+    no_shell_or_filesystem_grant: Option<bool>,
 }
 
 impl Evidence {
@@ -190,11 +200,18 @@ impl Evidence {
 
     /// Evidence answering every question affirmatively.
     ///
-    /// A host may only build this when it has actually discharged all four
-    /// proofs. Nothing in this phase can, which is why the only callers are
-    /// tests that need to exercise the eligible branch.
+    /// # Test-only
+    ///
+    /// `#[cfg(test)]` and `pub(crate)`, like
+    /// [`crate::ceremony::PresenceAttestation::for_test`]: it exists in no
+    /// shipped build and is reachable from no other crate. Nothing in this phase
+    /// can actually discharge all four proofs, so the only callers are tests that
+    /// need to exercise the eligible branch. A production path that has really
+    /// proven isolation must construct `Evidence` from those proofs, never from
+    /// this constructor.
+    #[cfg(test)]
     #[must_use]
-    pub const fn fully_isolated() -> Self {
+    pub(crate) const fn fully_isolated() -> Self {
         Self {
             distinct_os_account: Some(true),
             sandbox_excludes_backchannel: Some(true),
