@@ -738,6 +738,34 @@ impl ProposalJournal {
         self.high_water_unix_secs
     }
 
+    /// Advance the durable high-water mark to `now_unix_secs` and persist it as
+    /// its own durable fact, refusing a clock that stepped backwards.
+    ///
+    /// This is the apply-time half of the clock rule. The claim path observes a
+    /// trusted `now` and records it durably here **before** it judges receipt
+    /// expiry or consumes a receipt, so an apply-time forward excursion survives
+    /// a crash and a later wall-clock rollback is checked against it. It is
+    /// monotonic (never moves the high-water backward — a rollback is refused
+    /// rather than recorded) and durable (fsync'd through [`Self::persist`] like
+    /// every other journal mutation). It only tightens the freshness guarantee:
+    /// a `now` at or above the recorded high-water is recorded, and one below it
+    /// is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalErrorCode::ClockUntrustworthy`] when `now_unix_secs` is
+    /// below the recorded high-water (a backward clock step), leaving the journal
+    /// unwritten, and a store/encode error on a failed durable write.
+    pub fn advance_clock_durably(
+        &mut self,
+        now_unix_secs: u64,
+        paths: &ControlPaths,
+        key: &ApprovalAuditKey,
+    ) -> Result<(), JournalError> {
+        self.advance_clock(now_unix_secs)?;
+        self.persist(paths, key)
+    }
+
     /// An immutable view of one entry, scoped to the requester that owns it.
     ///
     /// Returns [`JournalErrorCode::UnknownOperation`] rather than disclosing that
@@ -986,6 +1014,17 @@ impl ProposalJournal {
                 operation_id.as_str().to_owned(),
             )
         })?;
+        // F1-secondary: refuse to record an approval against a proposal that is
+        // already past its own park-TTL, even when a sweeper has not yet expired
+        // it. The receipt remains the tighter gate by default (receipt TTL <
+        // proposal TTL); this only closes the no-sweeper case where the entry's
+        // own expiry has passed.
+        if now_unix_secs >= entry.expires_at_unix_secs {
+            return Err(JournalError::new(
+                JournalErrorCode::Expired,
+                "the proposal is past its own expiry",
+            ));
+        }
         let recorded = receipt.receipt();
         if recorded.proposal_digest != entry.proposal_digest
             || recorded.target_instance != entry.target_instance
@@ -1487,6 +1526,45 @@ mod tests {
             );
         }
         assert!(JournalState::RecoveryRequired.is_terminal());
+    }
+
+    #[test]
+    fn advance_clock_durably_is_monotonic_and_durable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_root, paths, record) = genesis_instance(&tmp);
+        let key = key_for(&paths, &record);
+
+        // A forward observation is recorded and survives a reload (durable).
+        let mut journal = ProposalJournal::default();
+        journal
+            .advance_clock_durably(NOW + 10_000, &paths, &key)
+            .expect("a forward advance is recorded");
+        assert_eq!(journal.high_water_unix_secs(), NOW + 10_000);
+        let reloaded = ProposalJournal::load(&paths, &key).expect("reload");
+        assert_eq!(
+            reloaded.high_water_unix_secs(),
+            NOW + 10_000,
+            "the advance is durable across a reload"
+        );
+
+        // A backward step is refused, never moves the high-water back
+        // (monotonic), and persists nothing.
+        let mut journal = reloaded;
+        let error = journal
+            .advance_clock_durably(NOW + 30, &paths, &key)
+            .expect_err("a backward clock step is refused");
+        assert_eq!(error.code, JournalErrorCode::ClockUntrustworthy);
+        assert_eq!(
+            journal.high_water_unix_secs(),
+            NOW + 10_000,
+            "the high-water never moves backward"
+        );
+        let reloaded = ProposalJournal::load(&paths, &key).expect("reload");
+        assert_eq!(
+            reloaded.high_water_unix_secs(),
+            NOW + 10_000,
+            "a refused advance persists nothing"
+        );
     }
 
     #[test]

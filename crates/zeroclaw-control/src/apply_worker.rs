@@ -153,6 +153,10 @@ impl From<JournalError> for WorkerError {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FaultPoint {
+    /// Crash after the durable high-water advance but before the receipt is
+    /// verified or consumed. The durable journal stays `approved`, the receipt
+    /// unconsumed, but the high-water durably records the observed `now`.
+    PostHighWaterPreVerify,
     /// Crash after the in-memory claim mutation but before the step-6 commit.
     /// The durable journal stays `approved`, the receipt unconsumed.
     PreApplyingCommit,
@@ -398,12 +402,55 @@ impl<'a> ApplyWorker<'a> {
         // Reload the journal under the lock: the state every later step observes
         // is one no other writer can move.
         let mut journal = ProposalJournal::load(self.paths, self.key)?;
+        // Read the pre-check facts as owned/Copy values so the immutable borrow
+        // is released before the durable high-water advance, which needs `&mut`.
+        let (entry_state, entry_expires_at_unix_secs) = {
+            let entry = journal
+                .entry(operation_id)
+                .ok_or(WorkerError::UnknownOperation)?;
+            (entry.state, entry.expires_at_unix_secs)
+        };
+        if entry_state != JournalState::Approved {
+            return Err(WorkerError::NotApproved { state: entry_state });
+        }
+
+        // F1: advance and PERSIST the durable high-water to the observed `now`
+        // BEFORE this claim judges receipt expiry or consumes the receipt. The
+        // advance is its own durable fact: a crash after it but before the apply
+        // still leaves a high-water that a later wall-clock rollback is checked
+        // against, so a rolled-back retry is refused rather than resurrecting an
+        // approval that expired in real time. A `now` below the recorded
+        // high-water is itself a rollback — the advance refuses it and the
+        // proposal expires. This only makes the existing consumption clock check
+        // strictly stricter.
+        if let Err(error) = journal.advance_clock_durably(now_unix_secs, self.paths, self.key) {
+            return self.expire(&mut journal, operation_id, error.detail);
+        }
+
+        // F1-secondary: refuse a proposal past its own park-TTL even when the
+        // receipt — the tighter gate by default — has not expired and no sweeper
+        // ran. Checked after the durable high-water advance so the observed `now`
+        // is recorded first.
+        if now_unix_secs >= entry_expires_at_unix_secs {
+            return self.expire(
+                &mut journal,
+                operation_id,
+                "the proposal is past its own expiry",
+            );
+        }
+
+        #[cfg(test)]
+        if self.fault_at == Some(FaultPoint::PostHighWaterPreVerify) {
+            // Simulate a crash after the durable high-water advance but before
+            // the receipt is verified or consumed. On disk the entry is still
+            // `approved`, the receipt unconsumed, and the high-water durably
+            // records this observed `now`.
+            return Err(WorkerError::InjectedCrash);
+        }
+
         let entry = journal
             .entry(operation_id)
             .ok_or(WorkerError::UnknownOperation)?;
-        if entry.state != JournalState::Approved {
-            return Err(WorkerError::NotApproved { state: entry.state });
-        }
 
         // Reconstruct the requester binding from the durable entry. No live
         // requester input reaches the claim; this is what makes "no requester
@@ -1246,6 +1293,183 @@ mod tests {
             assert!(
                 second.try_lock_exclusive().is_ok(),
                 "released lock is re-acquirable"
+            );
+        });
+    }
+
+    // -- F1: a durable apply-time high-water refuses a later rollback --------
+
+    #[test]
+    fn a_rolled_back_claim_after_a_durable_high_water_is_refused() {
+        run_async(|| async {
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            // Approved at NOW: the receipt is valid for 300s (until NOW + 300);
+            // the proposal's own park-TTL is 900s.
+            let (op_id, _issued) = harness.arrange_approved(&service, NOW).await;
+
+            // A claim observes a real time past the receipt's expiry but within
+            // the proposal's park-TTL, then crashes after the durable high-water
+            // advance but before the receipt is verified or consumed. The entry
+            // stays `approved` and the receipt unconsumed, but the forward
+            // excursion is now durable.
+            let forward = NOW + 600;
+            let crash = harness
+                .worker(&service)
+                .with_fault(FaultPoint::PostHighWaterPreVerify)
+                .apply_approved(&op_id, forward)
+                .await
+                .expect_err("injected crash after the high-water advance");
+            assert!(matches!(crash, WorkerError::InjectedCrash));
+
+            let reloaded = harness.load_journal();
+            let entry = reloaded.entry(&op_id).expect("entry");
+            assert_eq!(entry.state, JournalState::Approved, "still approved");
+            assert!(
+                entry.consumed_receipt_id.is_none(),
+                "the crashed claim consumed no receipt"
+            );
+            assert!(
+                reloaded.high_water_unix_secs() >= forward,
+                "the forward excursion is durably recorded"
+            );
+
+            // The wall clock rolls back into the receipt's original validity
+            // window and a restart re-claims. The durable high-water records the
+            // forward excursion, so the rolled-back retry is refused and nothing
+            // is written to config.
+            let rolled_back = NOW + 30;
+            let error = harness
+                .worker(&service)
+                .apply_approved(&op_id, rolled_back)
+                .await
+                .expect_err("a rolled-back retry must be refused");
+            assert!(matches!(error, WorkerError::Expired { .. }), "got {error}");
+            assert!(
+                !harness.config_text().contains("[agents.writer]"),
+                "no config write under a resurrected receipt"
+            );
+        });
+    }
+
+    #[test]
+    fn a_claim_past_the_proposals_own_expiry_is_refused() {
+        run_async(|| async {
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            let (op_id, _issued) = harness.arrange_approved(&service, NOW).await;
+            // NOW + 901 is past the proposal's own 900s park-TTL. The claim path
+            // refuses on the proposal's own expiry — distinct from the receipt's.
+            let error = harness
+                .worker(&service)
+                .apply_approved(&op_id, NOW + 901)
+                .await
+                .expect_err("a claim past the proposal's own expiry is refused");
+            match error {
+                WorkerError::Expired { detail } => assert!(
+                    detail.contains("past its own expiry"),
+                    "refused on the proposal's own expiry, got {detail}"
+                ),
+                other => panic!("expected Expired, got {other}"),
+            }
+            assert!(!harness.config_text().contains("[agents.writer]"));
+            assert_eq!(
+                harness.load_journal().entry(&op_id).expect("entry").state,
+                JournalState::Expired
+            );
+        });
+    }
+
+    #[test]
+    fn recording_an_approval_past_the_proposals_own_expiry_is_refused() {
+        run_async(|| async {
+            use crate::approval::{ApprovalBroker, ApprovalRequest, InMemoryReceiptLedger};
+            use crate::operator::authenticate_operator;
+            use crate::test_support::{ScriptedPresence, operator};
+
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            let proposal = harness.proposal();
+            let inspection = service.inspect().await.expect("inspect");
+            let bound = service
+                .preview(inspection, "custom.fixture", &proposal)
+                .expect("preview");
+            let digest = ProposalDigest::of_bound_proposal(&bound).expect("digest");
+            let request = ApprovalRequest {
+                operation: ControlOperation::ProposeAgentProfile,
+                proposal_digest: digest,
+                target_instance: harness.record.instance_id.clone(),
+                instance_fingerprint: harness.fingerprint(),
+                source_revision: SourceRevisionDigest::of(bound.source_revision()),
+            };
+            let requester = isolated_requester("reg-abc123");
+            // Mint the receipt in the future so the receipt itself is valid at the
+            // recording time — the proposal's own park-TTL is what has passed.
+            let mint_now = NOW + 1000;
+            let auth = authenticate_operator(
+                &ScriptedPresence::affirming("jordan"),
+                "Approve? ".to_string(),
+                "Operator identity: ".to_string(),
+                &operator("jordan"),
+                &harness.operators,
+                harness.record.trust_epoch,
+                &requester,
+                &request.proposal_digest,
+                &request.target_instance,
+                mint_now,
+            )
+            .expect("operator authenticates");
+            let mint_ledger = InMemoryReceiptLedger::new();
+            let broker = ApprovalBroker::new(
+                &harness.key,
+                &harness.trust,
+                &harness.operators,
+                &mint_ledger,
+            );
+            let issued = broker
+                .request_approval(&request, &requester, auth, mint_now)
+                .expect("issue receipt");
+
+            let mut journal = harness.load_journal();
+            let (op_id, _secret) = journal
+                .park(
+                    &ParkRequest {
+                        operation: ControlOperation::ProposeAgentProfile,
+                        bound: &bound,
+                        agent_proposal: &proposal,
+                        selected_provider_ref: "custom.fixture",
+                        target_instance: harness.record.instance_id.clone(),
+                        instance_fingerprint: harness.fingerprint(),
+                        requester: &requester,
+                        owner_token: "reg-abc123".to_string(),
+                        client_session: "sess-1".to_string(),
+                        proposal_ttl_secs: 900,
+                    },
+                    NOW,
+                    &Quotas::default(),
+                    &harness.paths,
+                    &harness.key,
+                )
+                .expect("park");
+            // Parked at NOW with a 900s park-TTL, so the proposal is past its own
+            // expiry at NOW + 1000 even though the minted receipt is valid.
+            let error = journal
+                .record_approval(&op_id, &issued, NOW + 1000, &harness.paths, &harness.key)
+                .expect_err("recording an approval past the proposal's own expiry is refused");
+            assert_eq!(error.code, crate::journal::JournalErrorCode::Expired);
+            assert_eq!(
+                harness.load_journal().entry(&op_id).expect("entry").state,
+                JournalState::AwaitingApproval,
+                "no approval recorded; the entry stays awaiting_approval"
             );
         });
     }
