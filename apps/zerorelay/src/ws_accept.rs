@@ -246,11 +246,14 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(4096);
         let accept = tokio::spawn(async move { accept_websocket(server_io).await });
         // In-memory duplex stream (no real network / TLS); asserts the WS upgrade
-        // path. The request URL is assembled from parts so no `ws://` literal
-        // appears in source: the hosted Semgrep scanner flags the literal even
-        // with an inline suppression (there is no real insecure transport here).
-        let url = format!("{}://relay.test/relay", "ws");
-        let ws = tokio_tungstenite::client_async(url, client_io).await;
+        // path. Suppressed inline with the repo's convention for this rule (see
+        // crates/zeroclaw-gateway/src/ws.rs); a `#[cfg(test)]` fixture inside a
+        // src file cannot be excluded via .semgrepignore paths.
+        let ws = tokio_tungstenite::client_async(
+            "ws://relay.test/relay", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            client_io,
+        )
+        .await;
         assert!(ws.is_ok(), "WS upgrade must succeed");
         assert!(matches!(accept.await.unwrap(), Ok(Accepted::WebSocket(_))));
     }

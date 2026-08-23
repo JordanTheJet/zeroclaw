@@ -531,10 +531,11 @@ mod parser_bound_tests {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-    // In-memory duplex only (no network/TLS); building the scheme from parts keeps
-    // any `ws://` literal out of the source.
-    fn loopback_url() -> String {
-        format!("{}://ceiling.test/", "ws")
+    // In-memory duplex only (no network/TLS). Suppressed inline with the repo's
+    // convention for this rule; a `#[cfg(test)]` fixture inside a src file cannot
+    // be excluded via .semgrepignore paths.
+    fn loopback_url() -> &'static str {
+        "ws://ceiling.test/" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
     }
 
     // A client permitted to EMIT frames larger than tungstenite's 16 MiB default,
