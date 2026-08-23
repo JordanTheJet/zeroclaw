@@ -501,20 +501,26 @@ fn absorb_identity(hasher: &mut Sha256, identity: &RootIdentity) {
 }
 
 /// Encode an `OsStr` deterministically on every platform.
+///
+/// `pub(crate)` because the genesis record binds the same canonical roots and
+/// must encode them the same way; two encodings of one path would be two
+/// sources of truth for what the fingerprint and the record each committed to.
 #[cfg(unix)]
-fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+pub(crate) fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     use std::os::unix::ffi::OsStrExt;
     Cow::Borrowed(value.as_bytes())
 }
 
+/// See the Unix variant.
 #[cfg(windows)]
-fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+pub(crate) fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     use std::os::windows::ffi::OsStrExt;
     Cow::Owned(value.encode_wide().flat_map(u16::to_be_bytes).collect())
 }
 
+/// See the Unix variant.
 #[cfg(not(any(unix, windows)))]
-fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+pub(crate) fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     Cow::Owned(value.to_string_lossy().into_owned().into_bytes())
 }
 

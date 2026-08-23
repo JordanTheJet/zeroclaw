@@ -21,6 +21,12 @@ hex = "0.4"
 # gateway, providers), so no new crate enters the dependency graph and there is
 # no `hkdf` crate to add.
 hmac = "0.12"
+# `rand::rngs::SysRng` is the operating system's random source (a re-export of
+# `getrandom`), used for client credentials and instance identifiers. `rand
+# = "0.10"` is already declared verbatim by zeroclaw-config, zeroclaw-runtime,
+# and zeroclaw-providers — all three already in this crate's dependency graph —
+# so the resolved version is unchanged and Cargo.lock does not move.
+rand = "0.10"
 # Already an unconditional dependency of the `zeroclaw` binary, so the control
 # protocol's request and response schemas are generated from the compiled types
 # rather than hand written without adding anything to a shipped build.

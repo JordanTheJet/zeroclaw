@@ -16,6 +16,7 @@
 //!
 //! This crate deliberately sits above `zeroclaw-runtime`.
 
+pub mod genesis;
 mod guard;
 mod inventory;
 pub mod keys;
@@ -26,7 +27,11 @@ pub mod protocol;
 pub mod registry;
 mod service;
 mod session;
+pub mod store;
 
+pub use genesis::{
+    GenesisRecord, InstanceTrustState, KeyCommitment, PresenceClass, RecoveryReason,
+};
 pub use guard::{
     EffectivePosture, GuardCode, GuardError, assess_effective_posture, validate_operator_input,
 };
@@ -54,6 +59,7 @@ pub use service::{
     source_schema_is_current,
 };
 pub use session::{MAX_OPERATOR_TURNS, SessionError, SessionErrorCode, SessionTurn, ZeronaSession};
+pub use store::{ControlPaths, StoreError, StoreErrorCode};
 
 /// A user-facing localization request. The CLI owns the Fluent catalogue and
 /// renders this key with these non-secret arguments.
