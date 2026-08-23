@@ -20,10 +20,8 @@ DEPENDENCY = re.compile(
     r"---\s+([^:\s]+):([^:\s]+):([^\s]+)(?:\s+->\s+([^\s]+))?"
 )
 RUNTIME_CONFIGURATIONS = (
-    "liteDebugRuntimeClasspath",
-    "fullDebugRuntimeClasspath",
-    "liteReleaseRuntimeClasspath",
-    "fullReleaseRuntimeClasspath",
+    "debugRuntimeClasspath",
+    "releaseRuntimeClasspath",
 )
 
 
@@ -103,11 +101,6 @@ def query_osv(components: set[tuple[str, str]]) -> list[dict]:
 
 
 def gradle_report(android_dir: Path, configuration: str) -> str:
-    full_opt_in = (
-        ["-PZERODROID_INCLUDE_FULL=true"]
-        if configuration.startswith("full")
-        else []
-    )
     result = subprocess.run(
         [
             str(android_dir / "gradlew"),
@@ -115,7 +108,6 @@ def gradle_report(android_dir: Path, configuration: str) -> str:
             ":app:dependencies",
             "--configuration",
             configuration,
-            *full_opt_in,
             "--console=plain",
         ],
         cwd=android_dir,

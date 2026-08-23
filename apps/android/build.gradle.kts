@@ -3,6 +3,5 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.0.21" apply false
 }
 
-// The broadly compatible sideload is the safe default. Running `./gradlew` with no task builds
-// only Lite; Full remains available through its explicit flavor task and opt-in property.
-defaultTasks(":app:assembleLiteDebug")
+// Running `./gradlew` with no task produces the single supported debug APK.
+defaultTasks(":app:assembleDebug")

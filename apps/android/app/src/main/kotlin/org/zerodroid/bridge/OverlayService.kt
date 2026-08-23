@@ -40,7 +40,7 @@ import androidx.core.content.ContextCompat
  *    is dropped. This bubble does exactly one thing: POST the text to the local gateway's `/webhook`
  *    ([GatewayClient]) and render the `response`.
  *  - no Hilt: plain foreground [Service], no `@AndroidEntryPoint`/`@Inject`.
- *  - no coroutines (the `lite` flavor has none): a [Handler] drives the auto-restore + submit
+ *  - no coroutines: a [Handler] drives the auto-restore + submit
  *    hand-back instead of `CoroutineScope`/`delay`.
  *
  * Kept from the reference: the WindowManager bubble on TYPE_APPLICATION_OVERLAY, drag via

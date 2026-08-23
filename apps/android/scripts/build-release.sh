@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the signed Lite APK for sideload distribution. Full is an explicit opt-in.
+# Build the signed Android APK for sideload distribution.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,34 +7,26 @@ REPO_ROOT="$(git -C "$ROOT" rev-parse --show-toplevel)"
 ANDROID_DIR="$ROOT"
 DECLARED_VERSION="$(awk -F= '$1 == "ZEROCLAW_ANDROID_VERSION" { print $2; exit }' "$ROOT/gradle.properties")"
 VERSION="$DECLARED_VERSION"
-VERSION_SEEN=false
-INCLUDE_FULL=false
 
 usage() {
   cat <<'USAGE'
-Usage: apps/android/scripts/build-release.sh [VERSION] [--include-full]
+Usage: apps/android/scripts/build-release.sh [VERSION]
 
-Builds the signed Lite sideload APK by default. Pass --include-full to also
-build the experimental Google AICore flavor.
+Builds one signed zerodroid sideload APK.
 USAGE
 }
 
-for arg in "$@"; do
-  case "$arg" in
-    --include-full) INCLUDE_FULL=true ;;
-    -h|--help) usage; exit 0 ;;
-    --*) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
-    *)
-      if [ "$VERSION_SEEN" = true ]; then
-        echo "unexpected argument: $arg" >&2
-        usage >&2
-        exit 2
-      fi
-      VERSION="$arg"
-      VERSION_SEEN=true
-      ;;
-  esac
-done
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+      *) VERSION="$1" ;;
+    esac
+    ;;
+  *) echo "too many arguments" >&2; usage >&2; exit 2 ;;
+esac
 
 case "$VERSION" in
   *[!0-9A-Za-z._-]*|'') echo "invalid version: $VERSION" >&2; exit 2 ;;
@@ -118,23 +110,14 @@ esac
 }
 
 GRADLE_TASKS=(
-  :app:testLiteReleaseUnitTest
-  :app:lintLiteRelease
-  :app:assembleLiteRelease
+  :app:testReleaseUnitTest
+  :app:lintRelease
+  :app:assembleRelease
 )
 GRADLE_PROPERTIES=(
   "-PZEROCLAW_REF=$ZEROCLAW_REF"
   "-PZEROCLAW_COMMIT=$ZEROCLAW_COMMIT"
 )
-if [ "$INCLUDE_FULL" = true ]; then
-  GRADLE_TASKS+=(
-    :app:testFullReleaseUnitTest
-    :app:lintFullRelease
-    :app:assembleFullRelease
-  )
-  GRADLE_PROPERTIES+=("-PZERODROID_INCLUDE_FULL=true")
-fi
-
 (
   cd "$ANDROID_DIR"
   ./gradlew --no-daemon \
@@ -144,14 +127,8 @@ fi
     --console=plain
 )
 
-LITE_APK="$ANDROID_DIR/app/build/outputs/apk/lite/release/app-lite-release.apk"
-[ -f "$LITE_APK" ] || { echo "signed lite APK missing: $LITE_APK" >&2; exit 1; }
-APKS=("$LITE_APK")
-if [ "$INCLUDE_FULL" = true ]; then
-  FULL_APK="$ANDROID_DIR/app/build/outputs/apk/full/release/app-full-release.apk"
-  [ -f "$FULL_APK" ] || { echo "signed full APK missing: $FULL_APK" >&2; exit 1; }
-  APKS+=("$FULL_APK")
-fi
+APK="$ANDROID_DIR/app/build/outputs/apk/release/app-release.apk"
+[ -f "$APK" ] || { echo "signed APK missing: $APK" >&2; exit 1; }
 
 ANDROID_BUILD_TOOLS_VERSION="${ANDROID_BUILD_TOOLS_VERSION:-36.1.0}"
 APKSIGNER="${APKSIGNER:-$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner}"
@@ -168,6 +145,7 @@ EXPECTED_CERT="$(printf '%s' "$ZEROCLAW_ANDROID_RELEASE_CERT_SHA256" | tr -d '[:
 VERIFY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/zerodroid-elf-verify.XXXXXX")"
 trap 'rm -rf "$VERIFY_TMP"' EXIT
 
+APKS=("$APK")
 for apk in "${APKS[@]}"; do
   "$ZIPALIGN" -c -P 16 4 "$apk" >/dev/null
   "$APKSIGNER" verify --verbose "$apk" >/dev/null
@@ -221,20 +199,9 @@ for apk in "${APKS[@]}"; do
 done
 
 mkdir -p "$ROOT/dist"
-LITE_OUT="$ROOT/dist/zerodroid-v$VERSION.apk"
-FULL_OUT="$ROOT/dist/zerodroid-full-v$VERSION.apk"
-LEGACY_LITE_OUT="$ROOT/dist/zerodroid-lite-v$VERSION.apk"
-# Keep dist authoritative for this invocation. A default Lite-only run must not leave an older
-# optional Full artifact or the pre-default legacy Lite name available for accidental publication.
-rm -f "$LITE_OUT" "$FULL_OUT" "$LEGACY_LITE_OUT"
-cp "$LITE_APK" "$LITE_OUT"
-DIST_APKS=("$(basename "$LITE_OUT")")
-DIST_OUTPUTS=("$LITE_OUT")
-if [ "$INCLUDE_FULL" = true ]; then
-  cp "$FULL_APK" "$FULL_OUT"
-  DIST_APKS+=("$(basename "$FULL_OUT")")
-  DIST_OUTPUTS+=("$FULL_OUT")
-fi
+OUT="$ROOT/dist/zerodroid-v$VERSION.apk"
+rm -f "$OUT"
+cp "$APK" "$OUT"
 cp "$ROOT/release/README.md" "$ROOT/dist/INSTALL.md"
 cp "$ROOT/release/RELEASE_NOTES.md" "$ROOT/dist/RELEASE_NOTES.md"
 printf '%s\n' "$EXPECTED_CERT" > "$ROOT/dist/SIGNING_CERT_SHA256"
@@ -247,12 +214,12 @@ cp "$REPO_ROOT/LICENSE-MIT" "$ROOT/dist/LICENSE-MIT"
 } > "$ROOT/dist/NOTICE"
 (
   cd "$ROOT/dist"
-  shasum -a 256 "${DIST_APKS[@]}" > SHA256SUMS
+  shasum -a 256 "$(basename "$OUT")" > SHA256SUMS
 )
 
 echo ">> signed sideload artifacts"
 ls -lh \
-  "${DIST_OUTPUTS[@]}" \
+  "$OUT" \
   "$ROOT/dist/SHA256SUMS" \
   "$ROOT/dist/INSTALL.md" \
   "$ROOT/dist/RELEASE_NOTES.md" \

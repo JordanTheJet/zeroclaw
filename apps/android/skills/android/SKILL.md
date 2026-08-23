@@ -110,9 +110,6 @@ curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" "http:/
 curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" "http://127.0.0.1:8470/ml/ocr?path=<image_dir-from-caps>/x.jpg"
 curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" "http://127.0.0.1:8470/ml/entities?text=meet+me+at+5pm"
 curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" "http://127.0.0.1:8470/ml/barcode?path=<image_dir-from-caps>/qr.jpg"
-# on-device Gemini Nano (Google AI Edge SDK / AICore — Pixel 8 Pro/9, S24+ only):
-curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" http://127.0.0.1:8470/ai/status
-curl -s -H "Authorization: Bearer $(cat "$HOME/.zeroclaw/bridge-token")" "http://127.0.0.1:8470/ai/generate?prompt=Summarize:+..."
 ```
 For OCR or barcode input, first read `image_dir` from `/caps` and place the image under that exact
 app-owned directory; arbitrary `/sdcard` paths are intentionally rejected. URL-encode query

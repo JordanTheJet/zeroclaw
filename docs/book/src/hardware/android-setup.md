@@ -23,12 +23,7 @@ The APK is a sideload build, not a Play Store package. Fresh installs keep phone
 control, encrypted remote access, SSH, boot start, and the overlay off. Accessibility and overlay access still
 require explicit grants in Android Settings.
 
-| Flavor | Minimum Android | Difference |
-|---|---:|---|
-| `full` | Android 12 / API 31 | Includes Google AI Edge/AICore support for on-device Gemini Nano. |
-| `lite` | Android 11 / API 30 | Omits AI Edge; cloud providers and Android-native tools are unchanged. |
-
-Both flavors are arm64-only and use the same application ID, so install one at a time. Follow
+The APK requires Android 11 / API 30 or newer and a 64-bit ARM device. Follow
 `apps/android/README.md` when building from source, then use
 [Android-native tools](../tools/android.md) for tool configuration and security behavior.
 

@@ -50,18 +50,10 @@ Optional paired client ── pubkey SSH tunnel ── loopback gateway + pairin
 The Unix socket is intentionally phone-local. Network clients talk to the paired gateway; they do
 not receive direct access to Accessibility or the socket.
 
-## Full and lite flavors
+## Compatibility
 
-| Flavor | Minimum Android | Difference |
-|---|---:|---|
-| `lite` (default) | Android 11 / API 30 | Omits experimental AICore; cloud providers and every Android tool remain available |
-| `full` (opt-in) | Android 12 / API 31 | Adds the experimental Google AI Edge/AICore client for on-device Gemini Nano |
-
-Both flavors are arm64-only, use application ID `org.zerodroid.bridge`, and cannot be installed
-side by side. Lite is the default sideload because it supports more devices and does not make an
-experimental, OEM-dependent model runtime part of the normal install. Full remains available for
-explicit compatibility testing while the app migrates to ML Kit's supported Prompt API. See the
-[Gemini Nano migration plan](docs/07-ml-kit-gemini-nano-migration.md).
+The APK requires Android 11 / API 30 or newer and a 64-bit ARM device. It uses application ID
+`org.zerodroid.bridge` so updates signed by the same release key preserve app data and grants.
 
 ## Safe first run
 
@@ -101,31 +93,20 @@ cd apps/android
 ./gradlew --no-daemon
 ```
 
-The no-argument Gradle build intentionally produces only the default Lite debug APK:
+The no-argument Gradle build produces the debug APK:
 
 ```text
-apps/android/app/build/outputs/apk/lite/debug/app-lite-debug.apk
+apps/android/app/build/outputs/apk/debug/app-debug.apk
 ```
-
-Opt in to Full explicitly when testing AICore compatibility:
-
-```sh
-./gradlew --no-daemon \
-  -PZERODROID_INCLUDE_FULL=true \
-  :app:testFullDebugUnitTest :app:lintFullDebug :app:assembleFullDebug
-```
-
-CI passes the same property and continues to compile, lint, and test both flavors.
 
 ## Signed sideload build
 
-`scripts/build-release.sh` builds the signed Lite sideload by default and fails closed unless
-release signing and the expected public certificate fingerprint are supplied. Pass
-`--include-full` to additionally build the experimental Full APK. It verifies:
+`scripts/build-release.sh` builds the signed sideload and fails closed unless release signing and
+the expected public certificate fingerprint are supplied. It verifies:
 
 - a clean checkout, then builds the dashboard and Rust binary from that exact revision;
 - 16/64 KiB ELF LOAD alignment for every bundled arm64 library and APK 16 KiB zip alignment;
-- Lite unit tests, lint, and release assembly, plus Full when explicitly requested;
+- unit tests, lint, and the release assembly;
 - signing certificate, embedded binary hash, arm64-only native payload;
 - bundled dashboard and the generic Android skill allowlist.
 

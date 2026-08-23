@@ -9,12 +9,6 @@ val releaseKeyAlias = providers.environmentVariable("ZERODROID_RELEASE_KEY_ALIAS
 val releaseKeyPassword = providers.environmentVariable("ZERODROID_RELEASE_KEY_PASSWORD").orNull
 val androidAppVersion = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION").get()
 val androidAppVersionCode = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION_CODE").get().toInt()
-val includeFullFlavor = providers.gradleProperty("ZERODROID_INCLUDE_FULL")
-    .map { raw ->
-        raw.toBooleanStrictOrNull()
-            ?: error("ZERODROID_INCLUDE_FULL must be true or false")
-    }
-    .orElse(false)
 val provenanceValuePattern = Regex("[A-Za-z0-9._/-]{1,128}")
 val validatedProvenanceProperty = { name: String ->
     val value = providers.gradleProperty(name).getOrElse("unknown")
@@ -58,21 +52,6 @@ android {
 
     buildFeatures {
         buildConfig = true
-    }
-
-    // full = modern devices (API 31+) with on-device Gemini Nano (AI Edge SDK).
-    // lite = Android 11+ without AI Edge; full raises the floor to API 31 for AICore.
-    flavorDimensions += "tier"
-    productFlavors {
-        create("full") {
-            dimension = "tier"
-            minSdk = 31
-            versionNameSuffix = "-full"
-        }
-        create("lite") {
-            dimension = "tier"
-            minSdk = 30
-        }
     }
 
     // The bundled zeroclaw + busybox ride in jniLibs as lib*.so. They must be EXTRACTED to the
@@ -126,17 +105,6 @@ android {
     }
 }
 
-// A generic or no-argument build must not silently pull the experimental AICore client into the
-// sideload artifact. Full is still built and tested when the operator explicitly opts in with
-// `-PZERODROID_INCLUDE_FULL=true`.
-androidComponents {
-    beforeVariants(selector().withFlavor("tier" to "full")) { variantBuilder ->
-        if (!includeFullFlavor.get()) {
-            variantBuilder.enable = false
-        }
-    }
-}
-
 dependencies {
     implementation("androidx.core:core-ktx:1.18.0")
     implementation("androidx.appcompat:appcompat:1.8.0")
@@ -145,7 +113,7 @@ dependencies {
     // Local HTTP bridge the agent's shell talks to (curl localhost:8470/...)
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.json:json:20240303")
-    // GMS — FusedLocation now; Maps/Drive/Auth slot in here for full capabilities.
+    // GMS — FusedLocation now; Maps/Drive/Auth slot in here for additional capabilities.
     // 21.4.0 is compiled with Kotlin metadata 2.3; keep the latest line compatible with KGP 2.0.
     implementation("com.google.android.gms:play-services-location:21.3.0")
     implementation("com.google.android.gms:play-services-auth:21.6.0")  // Google Sign-In
@@ -153,7 +121,7 @@ dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")        // OCR
     implementation("com.google.mlkit:language-id:17.0.6")             // language detection
     implementation("com.google.mlkit:translate:17.0.3")              // offline translation
-    // Keep the validated entity-extraction line; both APK flavors now start at API 30.
+    // Keep the validated entity-extraction line; the APK starts at API 30.
     implementation("com.google.mlkit:entity-extraction:16.0.0-beta6") // addresses/dates/phones from text
     implementation("com.google.mlkit:barcode-scanning:17.3.0")        // QR / barcodes
     // In-process SSH server (Apache MINA SSHD) — replaces the dropbear native binary. No setuid/
@@ -174,14 +142,7 @@ dependencies {
         implementation("com.squareup.okio:okio:3.6.0") {
             because("Okio < 3.4.0 is affected by GHSA-w33c-445m-f8w7")
         }
-        "fullImplementation"("com.google.guava:guava:33.4.8-android") {
-            because("AICore exp02 declares vulnerable Guava 31.1-android")
-        }
     }
-
-    // Gemini Nano on-device via Google AI Edge SDK (needs AICore) — FULL flavor only (forces API 31).
-    "fullImplementation"("com.google.ai.edge.aicore:aicore:0.0.1-exp02")
-    "fullImplementation"("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     testImplementation("junit:junit:4.13.2")
 }
@@ -216,19 +177,16 @@ val verifyBundledPayload by tasks.registering {
 }
 
 tasks.matching {
-    it.name.matches(Regex("^(assemble|bundle|package)(Full|Lite)(Debug|Release)$"))
+    it.name.matches(Regex("^(assemble|bundle|package)(Debug|Release)$"))
 }.configureEach {
     dependsOn(verifyBundledPayload)
 }
 
 tasks.matching {
     it.name in setOf(
-        "assembleFullRelease",
-        "assembleLiteRelease",
-        "bundleFullRelease",
-        "bundleLiteRelease",
-        "packageFullRelease",
-        "packageLiteRelease",
+        "assembleRelease",
+        "bundleRelease",
+        "packageRelease",
     )
 }.configureEach {
     dependsOn(verifyReleaseSigning)

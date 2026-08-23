@@ -21,7 +21,7 @@ OEM accessibility, overlay, battery, telephony, sensor, or app-integration behav
 ## 1. Install and preflight
 
 - [ ] For the v0.3.0 signing-line reset, uninstall the debug-signed build and install the signed
-      default Lite APK cleanly. Do not export the old provider credential before uninstalling.
+      APK cleanly. Do not export the old provider credential before uninstalling.
 - [ ] `dumpsys package org.zerodroid.bridge` reports version name `0.3.0`, version code `3`, and
       the expected build provenance.
 - [ ] `apksigner verify --print-certs` reports the expected release fingerprint managed outside
@@ -31,13 +31,14 @@ OEM accessibility, overlay, battery, telephony, sensor, or app-integration behav
 - [ ] Phone tools, Autonomous control, encrypted remote access, SSH, boot start, and the bubble are all off.
 - [ ] Accessibility, Draw over other apps, and battery exemptions require deliberate re-granting.
 - [ ] After the clean-install baseline, a same-certificate `adb install -r` preserves app data and
-      Android grants. Test Full separately on an AICore-supported device only when explicitly
-      validating the optional Gemini Nano path.
+      Android grants. Test the API 30 floor separately on an Android 11 device or emulator when
+      available.
 - [ ] Starting the agent creates a live `libzeroclaw.so` child and a fresh `<filesDir>/ui.sock`.
 - [ ] `GET <private-path>/health` succeeds through loopback and reports the
       new PID; the unprefixed admin pairing route is not reachable.
 - [ ] Turning Autonomous control off while running changes the gateway PID and removes mutating
-      Android tools from the effective session; the UI must never show OFF over a stale Full profile.
+      Android tools from the effective session; the UI must never show OFF over a stale autonomous
+      profile.
 
 ## 2. Floating overlay
 
@@ -66,8 +67,8 @@ Query the gateway; do not ask the model which tools it has.
 
 - [ ] `android_action`
 - [ ] `android_device`
-- [ ] `android_dialog` is present only under a profile that will prompt; it is absent under Full or
-      wildcard auto-approval.
+- [ ] `android_dialog` is present only under a profile that will prompt; it is absent under a
+      full-autonomy or wildcard auto-approval profile.
 - [ ] `android_launch`
 - [ ] `android_screenshot`
 - [ ] `android_ui_read`
@@ -193,8 +194,7 @@ valid summary unless every row was actually configured and exercised.
 APK / Android app commit:
 Embedded ZeroClaw commit:
 Device / Android build:
-Lite flavor: PASS / FAIL
-Full flavor: PASS / FAIL / not requested
+Android APK: PASS / FAIL
 Configured providers actually tested:
 Representative apps completed:
 Known failures / skipped checks:

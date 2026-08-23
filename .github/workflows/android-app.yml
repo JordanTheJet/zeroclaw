@@ -136,34 +136,26 @@ jobs:
       - name: Scan resolved Android dependencies with OSV
         run: apps/android/scripts/check-gradle-osv.py
 
-      - name: Run full and lite Android matrix
+      - name: Run Android matrix
         working-directory: apps/android
         env:
           ZEROCLAW_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
           ZEROCLAW_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           ./gradlew --no-daemon \
-            :app:testLiteDebugUnitTest \
-            :app:testFullDebugUnitTest \
-            :app:testLiteReleaseUnitTest \
-            :app:testFullReleaseUnitTest \
-            :app:lintLiteDebug \
-            :app:lintFullDebug \
-            :app:lintLiteRelease \
-            :app:lintFullRelease \
-            :app:assembleLiteDebug \
-            :app:assembleFullDebug \
-            -PZERODROID_INCLUDE_FULL=true \
+            :app:testDebugUnitTest \
+            :app:testReleaseUnitTest \
+            :app:lintDebug \
+            :app:lintRelease \
+            :app:assembleDebug \
             -PZEROCLAW_REF="$ZEROCLAW_REF" \
             -PZEROCLAW_COMMIT="$ZEROCLAW_COMMIT" \
             --console=plain
 
-      - name: Upload non-release debug APKs
+      - name: Upload non-release debug APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zerodroid-debug-apks
+          name: zerodroid-debug-apk
           if-no-files-found: error
           retention-days: 7
-          path: |
-            apps/android/app/build/outputs/apk/full/debug/*.apk
-            apps/android/app/build/outputs/apk/lite/debug/*.apk
+          path: apps/android/app/build/outputs/apk/debug/*.apk

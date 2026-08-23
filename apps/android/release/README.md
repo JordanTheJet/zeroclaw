@@ -3,10 +3,8 @@
 This release starts a new permanent Android signing lineage. It does not update the debug-signed
 `v0.2.0` prerelease in place; users uninstall that build and install `v0.3.0` cleanly.
 
-This is an experimental sideload release, not a Play Store package. The default Lite flavor
-supports Android 11+ without the experimental AI Edge dependency. The opt-in Full flavor is for
-Android 12+ devices being used to test AICore compatibility. Both APKs are arm64-v8a only because
-the bundled ZeroClaw executable is built for arm64.
+This is an experimental sideload release, not a Play Store package. It supports Android 11+ and is
+arm64-v8a only because the bundled ZeroClaw executable is built for arm64.
 
 Required trusted local release inputs:
 
@@ -25,23 +23,14 @@ It validates the source commit, but the repository does not yet expose one canon
 build-toolchain pin for the script to consume. Byte-for-byte native reproducibility is therefore
 not claimed.
 
-Build the default Lite artifact only; this does not publish:
+Build the artifact; this does not publish:
 
 ```sh
 ANDROID_HOME=/absolute/path/to/Android/sdk \
 apps/android/scripts/build-release.sh 0.3.0
 ```
 
-Explicitly include the experimental Full artifact when validating a compatible device:
-
-```sh
-ANDROID_HOME=/absolute/path/to/Android/sdk \
-apps/android/scripts/build-release.sh 0.3.0 --include-full
-```
-
-The default output is `dist/zerodroid-v0.3.0.apk`. The opt-in build also emits
-`dist/zerodroid-full-v0.3.0.apk`. Full is not the general sideload recommendation until the
-[ML Kit Prompt API migration](../docs/07-ml-kit-gemini-nano-migration.md) is complete and validated.
+The output is `dist/zerodroid-v0.3.0.apk`.
 
 Back up the permanent keystore in an encrypted offline location before publishing the first RC.
 Losing it means future APKs cannot update installed `v0.3+` builds.

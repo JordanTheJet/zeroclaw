@@ -108,8 +108,6 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
                 "/ml/translate" -> mlTranslate(q["text"], q["to"] ?: "en")
                 "/ml/entities" -> mlEntities(q["text"])
                 "/ml/barcode" -> mlBarcode(q["path"])
-                "/ai/status" -> NanoAi.status(ctx)
-                "/ai/generate" -> NanoAi.generate(ctx, q["prompt"])
                 "/auth/signin" -> authSignin()
                 "/auth/status" -> authStatus()
                 "/drive/list" -> driveList()
@@ -402,9 +400,6 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
             .put("count", r.optJSONArray("mediaItems")?.length() ?: 0)
             .put("media", r.optJSONArray("mediaItems") ?: JSONArray()).put("error", r.opt("error") ?: r.opt("raw"))
     }
-
-    // Gemini Nano (Google AI Edge SDK) lives in the `full` flavor's NanoAi; the `lite` flavor
-    // (minSdk 30, no AI Edge SDK) provides a stub for devices that use cloud providers instead.
 
     companion object {
         const val PORT = 8470

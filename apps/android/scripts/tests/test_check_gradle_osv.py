@@ -92,35 +92,14 @@ class GradleOsvCheckTest(unittest.TestCase):
             ],
         )
 
-    def test_runtime_configurations_cover_all_flavors_and_build_types(self):
+    def test_runtime_configurations_cover_both_build_types(self):
         self.assertEqual(
             MODULE.RUNTIME_CONFIGURATIONS,
             (
-                "liteDebugRuntimeClasspath",
-                "fullDebugRuntimeClasspath",
-                "liteReleaseRuntimeClasspath",
-                "fullReleaseRuntimeClasspath",
+                "debugRuntimeClasspath",
+                "releaseRuntimeClasspath",
             ),
         )
-
-    def test_full_dependency_report_explicitly_enables_full_flavor(self):
-        completed = mock.Mock(returncode=0, stdout="report")
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
-            self.assertEqual(
-                MODULE.gradle_report(Path("/android"), "fullDebugRuntimeClasspath"),
-                "report",
-            )
-
-        command = run.call_args.args[0]
-        self.assertIn("-PZERODROID_INCLUDE_FULL=true", command)
-
-    def test_lite_dependency_report_does_not_enable_full_flavor(self):
-        completed = mock.Mock(returncode=0, stdout="report")
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
-            MODULE.gradle_report(Path("/android"), "liteDebugRuntimeClasspath")
-
-        command = run.call_args.args[0]
-        self.assertNotIn("-PZERODROID_INCLUDE_FULL=true", command)
 
 
 if __name__ == "__main__":

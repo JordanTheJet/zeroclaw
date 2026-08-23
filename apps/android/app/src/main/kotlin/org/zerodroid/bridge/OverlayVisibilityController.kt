@@ -15,8 +15,8 @@ import android.os.Looper
  * changes:
  *  - a plain Kotlin `object` (no Hilt `@Singleton`/`@Inject`) — zerodroid wires singletons as
  *    objects (see [RuntimeState], [UiBridge]);
- *  - a main-thread [Handler] callback instead of a coroutine `MutableSharedFlow` — the base/`lite`
- *    flavor carries no kotlinx-coroutines dependency, so flows aren't available here.
+ *  - a main-thread [Handler] callback instead of a coroutine `MutableSharedFlow`; the app carries
+ *    no kotlinx-coroutines dependency, so flows aren't available here.
  *
  * There is at most one overlay observer (a single bubble), so a lone volatile listener slot is
  * enough; no fan-out is needed.
