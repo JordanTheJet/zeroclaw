@@ -16,6 +16,7 @@
 //!
 //! This crate deliberately sits above `zeroclaw-runtime`.
 
+pub mod ceremony;
 pub mod client_registry;
 pub mod genesis;
 mod guard;
@@ -31,10 +32,14 @@ mod service;
 mod session;
 pub mod store;
 
+pub use ceremony::{
+    CeremonyError, CeremonyErrorCode, GenesisOutcome, GenesisRequest, PresenceError,
+    TerminalConfirmation, UserPresence, run_genesis, run_register_client,
+};
 pub use client_registry::{
-    ClientCredential, ClientGrant, ClientRegistration, ClientRegistry, ClientRegistryError,
-    ClientRegistryErrorCode, CredentialDelivery, CredentialVerifier, RegistrationId,
-    RegistrationStatus,
+    ClientCredential, ClientGrant, ClientLabel, ClientRegistration, ClientRegistry,
+    ClientRegistryError, ClientRegistryErrorCode, CredentialDelivery, CredentialVerifier,
+    RegistrationId, RegistrationStatus,
 };
 pub use genesis::{
     GenesisRecord, InstanceTrustState, KeyCommitment, PresenceClass, RecoveryReason,

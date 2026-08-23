@@ -1120,13 +1120,295 @@ requester: it sees only control.ping, control.server_info, and
 control.registration_help. Registration is an operator ceremony on the host and
 cannot be performed through this session.
 
+Ceremonies establish this installation's control-plane trust root. They are
+host-side only: no agent, tool, or MCP session can reach them, and they make no
+model-provider request and no network request.
+
 Examples:
-  zeroclaw control --mcp")]
+  zeroclaw control --mcp
+  zeroclaw control genesis
+  zeroclaw control register-client --name claude-code \\
+      --credential-out ~/.zeroclaw-clients/claude-code.cred \\
+      --delivery isolated_descriptor")]
     Control {
         /// Serve the read-only control protocol over stdio as an MCP server.
         #[arg(long)]
         mcp: bool,
+        #[command(subcommand)]
+        control_command: Option<ControlCommands>,
     },
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum ControlCommands {
+    /// Establish this installation's control-plane trust root.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Establish this installation's control-plane trust root.
+
+Runs the user-presence ceremony on this terminal, derives the approval and audit
+key from the deployment's single key source, writes the immutable genesis record
+under the data root, and registers this instance in the signed target registry.
+
+Genesis establishes who may approve. It does not enable approving: mutation
+enablement is a separate ceremony that this release does not implement.
+
+Refuses when the instance already has a genesis record, when the record is
+present but invalid (recovery-only mode), when a config or data root is a
+symlink, and when there is no controlling terminal.
+
+--register-client registers a first client inside the same presence session and
+writes its one-time credential to --credential-out with owner-only permissions.
+The credential is shown nowhere else and cannot be reissued.")]
+    Genesis {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Register a first control client in the same ceremony.
+        #[arg(long, value_name = "NAME")]
+        register_client: Option<String>,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Where the client's one-time credential is written (mode 0600).
+        #[arg(long, value_name = "PATH")]
+        credential_out: Option<PathBuf>,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Credential delivery assurance: isolated_descriptor or sandbox_isolated_store.
+        #[arg(long, value_name = "CLASS")]
+        delivery: Option<String>,
+    },
+
+    /// Register an external control client on an initialized instance.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(
+        name = "register-client",
+        long_about = "\
+Register an external control client on an initialized instance.
+
+Verifies the genesis record and the signed target registry first, then runs the
+same user-presence ceremony genesis uses. Refuses on an uninitialized instance
+and in recovery-only mode.
+
+The credential is written to --credential-out with owner-only permissions, once.
+It is shown nowhere else and cannot be reissued; register again to replace it.
+
+--delivery is required rather than defaulted. The assurance class is a claim
+about how the credential reaches the client, and only the operator can make it."
+    )]
+    RegisterClient {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Display name for the client.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Where the client's one-time credential is written (mode 0600).
+        #[arg(long, value_name = "PATH")]
+        credential_out: PathBuf,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Credential delivery assurance: isolated_descriptor or sandbox_isolated_store.
+        #[arg(long, value_name = "CLASS")]
+        delivery: String,
+    },
+}
+
+/// Every directory a control-client credential must not be written into.
+///
+/// Best effort by construction: it enumerates the workspace roots the *loaded*
+/// configuration knows about, so a workspace added later, a bind mount, or a
+/// sandbox root this binary is not told about is not covered. The control crate
+/// documents the same limitation on `refuse_credential_path_inside`. This is one
+/// input to the host's proof obligation about credential delivery, not the
+/// proof.
+#[cfg(feature = "agent-runtime")]
+fn agent_workspace_roots(config: &Config) -> Vec<PathBuf> {
+    let mut roots = vec![
+        // The shared instance data directory, and the whole per-agent tree,
+        // including aliases that do not exist yet.
+        config.data_dir.clone(),
+        config.shared_workspace_dir(),
+        config.install_root_dir().join("agents"),
+    ];
+    roots.extend(
+        config
+            .agents
+            .keys()
+            .map(|alias| config.agent_workspace_dir(alias)),
+    );
+    roots
+}
+
+/// Parse a credential-delivery assurance class.
+///
+/// Deliberately has no default. The class is a claim about how the credential
+/// reaches the client — through an inherited descriptor unavailable to agent
+/// subprocesses, or through a helper reading a store outside every enforced
+/// sandbox root. The host cannot discharge that proof obligation on the
+/// operator's behalf, so it refuses rather than guessing.
+#[cfg(feature = "agent-runtime")]
+fn parse_delivery_class(value: &str) -> Result<zeroclaw_control::CredentialDelivery> {
+    zeroclaw_control::CredentialDelivery::from_wire(value).ok_or_else(|| {
+        anyhow::Error::msg(ta(
+            "cli-control-delivery-unknown",
+            &[
+                ("value", value),
+                (
+                    "accepted",
+                    &zeroclaw_control::CredentialDelivery::ALL
+                        .iter()
+                        .map(|class| class.wire())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ],
+            // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+            "Unknown credential delivery assurance class.",
+        ))
+    })
+}
+
+/// Run one host-side control-plane ceremony.
+///
+/// Everything printed here is a non-secret summary. The credential itself is
+/// written to its file inside the ceremony and dropped; it never reaches this
+/// function, so it cannot reach stdout, a log, or a process argument.
+#[cfg(feature = "agent-runtime")]
+fn run_control_ceremony(config: &Config, command: ControlCommands) -> Result<()> {
+    let install_root = config
+        .config_path
+        .parent()
+        .context("Config path must have a parent directory")?
+        .to_path_buf();
+    let presence = zeroclaw_control::TerminalConfirmation::new();
+
+    match command {
+        ControlCommands::Genesis {
+            register_client,
+            credential_out,
+            delivery,
+        } => {
+            let registration = match (register_client, credential_out, delivery) {
+                (None, None, None) => None,
+                (Some(name), Some(path), Some(class)) => {
+                    Some(zeroclaw_control::ceremony::ClientRegistrationRequest {
+                        client_label: zeroclaw_control::ClientLabel::new(name)
+                            .map_err(|e| anyhow::Error::msg(e.to_string()))?,
+                        credential_path: path,
+                        delivery_assurance: parse_delivery_class(&class)?,
+                        forbidden_credential_roots: agent_workspace_roots(config),
+                    })
+                }
+                _ => {
+                    // Partial registration flags are a refusal, not a default:
+                    // guessing a credential path or an assurance class would be
+                    // guessing about a secret and about a security claim.
+                    return Err(anyhow::Error::msg(t(
+                        "cli-control-genesis-client-flags",
+                        // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                        "Registering a client at genesis needs --register-client, \
+                         --credential-out, and --delivery together.",
+                    )));
+                }
+            };
+
+            let request = zeroclaw_control::GenesisRequest {
+                prompt: t(
+                    "cli-control-genesis-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Establish this installation's control-plane trust root? Type yes to confirm: ",
+                ),
+                operator_prompt: t(
+                    "cli-control-genesis-operator",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "First operator identity (a label you will recognize later): ",
+                ),
+                register_client: registration,
+            };
+
+            let outcome = zeroclaw_control::run_genesis(&install_root, &presence, &request)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+
+            println!(
+                "{}",
+                ta(
+                    "cli-control-genesis-done",
+                    &[
+                        ("instance", outcome.instance_id.as_str()),
+                        ("epoch", &outcome.trust_epoch.to_string()),
+                        ("digest", &outcome.genesis_digest.to_hex()),
+                        ("config_root", &outcome.config_root.display().to_string()),
+                        ("data_root", &outcome.data_root.display().to_string()),
+                        ("presence", outcome.presence_class.wire()),
+                        ("operator", outcome.first_operator.as_str()),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Control-plane trust root established.",
+                )
+            );
+            println!(
+                "{}",
+                t(
+                    "cli-control-mutations-disabled",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Mutations remain disabled. Genesis establishes who may approve; \
+                     enabling approval is a separate ceremony this release does not implement.",
+                )
+            );
+            if let Some(client) = outcome.registered_client {
+                print_registered_client(&client);
+            }
+            Ok(())
+        }
+
+        ControlCommands::RegisterClient {
+            name,
+            credential_out,
+            delivery,
+        } => {
+            let request = zeroclaw_control::ceremony::ClientRegistrationRequest {
+                client_label: zeroclaw_control::ClientLabel::new(name)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?,
+                credential_path: credential_out,
+                delivery_assurance: parse_delivery_class(&delivery)?,
+                forbidden_credential_roots: agent_workspace_roots(config),
+            };
+            let prompt = t(
+                "cli-control-register-confirm",
+                // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                "Register this control client? Type yes to confirm: ",
+            );
+            let client =
+                zeroclaw_control::run_register_client(&install_root, &presence, prompt, &request)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            print_registered_client(&client);
+            Ok(())
+        }
+    }
+}
+
+/// Print the non-secret summary of a bootstrap registration.
+#[cfg(feature = "agent-runtime")]
+fn print_registered_client(client: &zeroclaw_control::ceremony::RegisteredClient) {
+    println!(
+        "{}",
+        ta(
+            "cli-control-client-registered",
+            &[
+                ("registration", client.registration_id.as_str()),
+                ("label", client.client_label.as_str()),
+                ("path", &client.credential_path.display().to_string()),
+                ("delivery", client.delivery_assurance.wire()),
+            ],
+            // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+            "Control client registered.",
+        )
+    );
+    println!(
+        "{}",
+        t(
+            "cli-control-credential-once",
+            // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+            "The credential was written once, owner-only. It is stored nowhere else \
+             and cannot be reissued; register again to replace it.",
+        )
+    );
 }
 
 #[derive(Subcommand, Debug)]
@@ -3496,7 +3778,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
         // recording floor is kept high even though the fmt layer already
         // writes to stderr rather than stdout.
         #[cfg(feature = "agent-runtime")]
-        Commands::Control { mcp: true } => "warn",
+        Commands::Control { mcp: true, .. } => "warn",
         _ => "info",
     };
 
@@ -5304,7 +5586,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
         // framer and never returns until the client closes stdin; without it
         // the subcommand only explains itself, because there is nothing else a
         // read-only control surface does from a terminal.
-        Commands::Control { mcp } => {
+        Commands::Control {
+            mcp,
+            control_command,
+        } => {
+            // A ceremony is host-side and synchronous: no transport, no model
+            // provider, no network. It is checked before `--mcp` so the two can
+            // never be conflated.
+            if let Some(control_command) = control_command {
+                return run_control_ceremony(&config, control_command);
+            }
             if !mcp {
                 let mut command = Cli::command();
                 if let Some(control) = command.find_subcommand_mut("control") {

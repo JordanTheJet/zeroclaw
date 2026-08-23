@@ -1233,3 +1233,27 @@ cli-zerona-error-provider-missing-model = Model provider {$provider} has no conf
 cli-zerona-error-provider-invalid-reference = Model provider reference {$provider} is invalid.
 cli-zerona-error-provider-construction-failed = Model provider {$provider} could not be constructed for the restricted session.
 cli-zerona-error-provider-target-changed = Model provider {$provider} changed while Zerona was running.
+
+# ── Control-plane trust genesis ──
+cli-control-genesis-confirm = Establish this installation's control-plane trust root? Type yes to confirm:{" "}
+cli-control-genesis-operator = First operator identity (a label you will recognize later):{" "}
+cli-control-register-confirm = Register this control client? Type yes to confirm:{" "}
+cli-control-genesis-client-flags = Registering a client at genesis needs --register-client, --credential-out, and --delivery together.
+cli-control-delivery-unknown = `{$value}` is not a credential delivery assurance class. Accepted: {$accepted}.
+cli-control-genesis-done =
+    Control-plane trust root established.
+      instance:    {$instance}
+      trust epoch: {$epoch}
+      record:      {$digest}
+      config root: {$config_root}
+      data root:   {$data_root}
+      presence:    {$presence}
+      operator:    {$operator}
+cli-control-mutations-disabled = Mutations remain disabled. Genesis establishes who may approve; enabling approval is a separate ceremony this release does not implement.
+cli-control-client-registered =
+    Control client registered.
+      registration: {$registration}
+      label:        {$label}
+      credential:   {$path}
+      delivery:     {$delivery}
+cli-control-credential-once = The credential was written once, owner-only. It is stored nowhere else and cannot be reissued; register again to replace it.
