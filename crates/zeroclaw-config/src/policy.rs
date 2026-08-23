@@ -3507,6 +3507,39 @@ impl SecurityPolicy {
             .push(config.shared_workspace_dir().join("skills"));
 
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
+            // `<install>/shared/`, the host-wide shared directory. Deny by
+            // default: absent the flag this branch is skipped and the
+            // agent's reach is byte-for-byte what it was before the flag
+            // existed — only the code-enforced `shared/skills/` read-only
+            // wire pushed above. Opting in saves the operator from
+            // hand-writing absolute `allowed_roots` entries that encode
+            // the install layout and break when the install moves.
+            //
+            // The grant is READ-ONLY by design, not by omission. Allowlist
+            // matching is a path-prefix test, and `is_resolved_path_allowed`
+            // consults the explicit allowed roots BEFORE `forbidden_paths`.
+            // A read+write entry on the whole of `shared/` would therefore
+            // shadow the narrower `shared/skills/` read-only wire pushed
+            // above and let an opted-in agent overwrite skills that other
+            // agents execute — with no way for `forbidden_paths` to claw
+            // it back. Write access to `shared/`, if ever wanted, needs a
+            // narrower surface than this flag.
+            //
+            // Scope: the file tools honor this grant because they consult
+            // these allowlists. The shell tool's OS sandbox
+            // (Landlock/Seatbelt) is built from `security.workspace_dir`
+            // alone and does not yet receive the allowed-root tiers, so
+            // shell commands touching `shared/` are denied under an active
+            // sandbox even with this flag on. That mismatch is
+            // fail-closed — an availability inconsistency, not a widening.
+            // Propagating allowlist tiers into the sandbox backends is a
+            // separate runtime change.
+            if agent_cfg.can_use_shared_workspace {
+                policy
+                    .allowed_roots_read_only
+                    .push(config.shared_workspace_dir());
+            }
+
             for (sibling_alias, mode) in &agent_cfg.workspace.access {
                 let sibling_dir = config.agent_workspace_dir(sibling_alias.as_str());
                 match mode {
@@ -6255,6 +6288,240 @@ mod tests {
             !policy.workspace_only,
             "unrestricted_filesystem=true must flip workspace_only off at the policy level"
         );
+    }
+
+    // ── for_agent: can_use_shared_workspace capability flag ──
+
+    /// Build a config rooted at a real, canonical temp install dir.
+    /// The path predicates call `canonicalize()` on every allowlist root,
+    /// so the install root has to exist and already be canonical for the
+    /// assertions to compare equal (`/tmp` is a symlink to `/private/tmp`
+    /// on macOS). Returns the config and the root to clean up.
+    fn shared_flag_test_config(tag: &str) -> (crate::schema::Config, PathBuf) {
+        use crate::schema::{Config, RiskProfileConfig};
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-shared-flag-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                workspace_only: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        // `<install>/shared/skills/` is the code-enforced read-only wire;
+        // create it so its canonicalized form matches the pushed path.
+        std::fs::create_dir_all(cfg.shared_workspace_dir().join("skills")).unwrap();
+        (cfg, root)
+    }
+
+    #[test]
+    fn for_agent_without_shared_flag_grants_no_shared_workspace_access() {
+        use crate::schema::AliasedAgentConfig;
+
+        let (mut cfg, root) = shared_flag_test_config("deny");
+        cfg.agents.insert(
+            "test_agent".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert!(
+            !cfg.agents
+                .get("test_agent")
+                .unwrap()
+                .can_use_shared_workspace,
+            "precondition: can_use_shared_workspace is deny-by-default"
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "test_agent").unwrap();
+        let shared = cfg.shared_workspace_dir();
+
+        assert!(
+            !policy.allowed_roots.contains(&shared),
+            "flag absent must NOT put <install>/shared/ on the read+write tier; got {:?}",
+            policy.allowed_roots
+        );
+        assert!(
+            !policy.allowed_roots_read_only.contains(&shared),
+            "flag absent must NOT put <install>/shared/ on the read-only tier; got {:?}",
+            policy.allowed_roots_read_only
+        );
+
+        // Behavioral: a scratch path directly under shared/ is reachable
+        // neither for read nor for write.
+        let scratch = shared.join("scratch.txt");
+        assert!(
+            !policy.is_resolved_path_readable(&scratch),
+            "flag absent must leave <install>/shared/scratch.txt unreadable"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(&scratch),
+            "flag absent must leave <install>/shared/scratch.txt unwritable"
+        );
+
+        // The code-enforced skills wire is unrelated to this flag and
+        // stays installed for every agent.
+        assert!(
+            policy
+                .allowed_roots_read_only
+                .contains(&shared.join("skills")),
+            "the shared/skills read-only wire must still be installed when the flag is off"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_shared_flag_adds_shared_root_to_the_read_only_tier() {
+        use crate::schema::AliasedAgentConfig;
+
+        let (mut cfg, root) = shared_flag_test_config("grant");
+        let mut test_agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        test_agent.can_use_shared_workspace = true;
+        cfg.agents.insert("test_agent".into(), test_agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "test_agent").unwrap();
+        let shared = cfg.shared_workspace_dir();
+
+        assert!(
+            policy.allowed_roots_read_only.contains(&shared),
+            "can_use_shared_workspace=true must put <install>/shared/ on the READ-ONLY tier; \
+             got {:?}",
+            policy.allowed_roots_read_only
+        );
+        assert!(
+            !policy.allowed_roots.contains(&shared),
+            "the shared grant must NOT reach the read+write tier — a writable root on the \
+             whole of shared/ would shadow the narrower shared/skills/ read-only wire; got {:?}",
+            policy.allowed_roots
+        );
+        assert!(
+            !policy.allowed_roots_write_only.contains(&shared),
+            "the shared grant must NOT reach the write-only tier; got {:?}",
+            policy.allowed_roots_write_only
+        );
+
+        let scratch = shared.join("scratch.txt");
+        assert!(
+            policy.is_resolved_path_readable(&scratch),
+            "flag on must make <install>/shared/scratch.txt readable"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(&scratch),
+            "flag on must NOT make <install>/shared/scratch.txt writable — the grant is read-only"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_shared_flag_and_workspace_escape_are_independent() {
+        use crate::schema::AliasedAgentConfig;
+
+        // Direction 1: the shared grant must not widen the workspace
+        // boundary — it adds one allowlist root, it does not un-jail.
+        let (mut cfg, root) = shared_flag_test_config("indep-shared");
+        let mut shared_only = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        shared_only.can_use_shared_workspace = true;
+        cfg.agents.insert("shared_only".into(), shared_only);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "shared_only").unwrap();
+        assert!(
+            policy.workspace_only,
+            "can_use_shared_workspace must NOT flip workspace_only off — \
+             workspace escape is a separate, independently gated capability"
+        );
+        let outside = root.join("not-shared").join("secret.txt");
+        assert!(
+            !policy.is_resolved_path_readable(&outside),
+            "the shared grant must not make unrelated install paths readable"
+        );
+
+        // Direction 2: the escape hatch must not smuggle in a shared
+        // allowlist entry.
+        let mut escape_only = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        escape_only.workspace.unrestricted_filesystem = true;
+        cfg.agents.insert("escape_only".into(), escape_only);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "escape_only").unwrap();
+        let shared = cfg.shared_workspace_dir();
+        assert!(
+            !policy.workspace_only,
+            "precondition: unrestricted_filesystem=true flips workspace_only off"
+        );
+        assert!(
+            !policy.allowed_roots.contains(&shared)
+                && !policy.allowed_roots_read_only.contains(&shared)
+                && !policy.allowed_roots_write_only.contains(&shared),
+            "workspace escape must NOT add an explicit <install>/shared/ allowlist root on ANY \
+             tier; rw={:?} ro={:?} wo={:?}",
+            policy.allowed_roots,
+            policy.allowed_roots_read_only,
+            policy.allowed_roots_write_only
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_agent_shared_flag_does_not_make_the_skills_wire_writable() {
+        use crate::schema::AliasedAgentConfig;
+
+        // The load-bearing security assertion for this flag. Allowlist
+        // matching is a path-prefix test and explicit allowed roots are
+        // consulted before `forbidden_paths`, so routing `shared/` into a
+        // writable tier would shadow the narrower `shared/skills/`
+        // read-only wire and let an opted-in agent overwrite skills that
+        // OTHER agents execute — a cross-agent code-execution vector that
+        // `forbidden_paths` could not mitigate. Opting in must widen reads
+        // only.
+        let (mut cfg, root) = shared_flag_test_config("skills-wire");
+        let mut test_agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        test_agent.can_use_shared_workspace = true;
+        cfg.agents.insert("test_agent".into(), test_agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "test_agent").unwrap();
+        let skill_doc = cfg
+            .shared_workspace_dir()
+            .join("skills")
+            .join("bundle")
+            .join("SKILL.md");
+
+        assert!(
+            !policy.is_resolved_path_allowed(&skill_doc),
+            "an agent opted into shared/ must NOT be able to write under shared/skills/ — \
+             that would let it rewrite skills other agents execute"
+        );
+        assert!(
+            policy.is_resolved_path_readable(&skill_doc),
+            "shared/skills/ must remain readable (the code-enforced wire already grants this)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Edge cases: from_config preserves tracker ────────────
