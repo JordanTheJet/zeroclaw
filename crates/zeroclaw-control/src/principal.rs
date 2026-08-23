@@ -6,23 +6,36 @@
 //! *registered* only by presenting a credential minted by an operator
 //! registration ceremony.
 //!
-//! That ceremony is phase 3 work and does not exist yet, which is why
-//! [`RequesterGrant`] has **no constructor outside the `fixture-grants`
-//! feature**. In any build that a user could install, the only inhabited
-//! session is [`ControlSession::Unregistered`], so every grant-gated tool is
-//! absent from the tool list and refuses when called by name. That is a
-//! property of the type, not of a runtime check that could be misconfigured:
-//! there is no config value, environment variable, CLI flag, MCP argument, or
-//! file on disk that can produce a grant, because nothing in a default build
-//! can produce the value a grant is made of.
+//! # The two ways a [`RequesterGrant`] can exist, and why they cannot meet
 //!
-//! The `fixture-grants` feature is enabled only by this workspace's
-//! `[dev-dependencies]`. It is not in any crate's default feature set and no
-//! released profile turns it on, so `cargo build --release` compiles none of
-//! the code below that is marked with it.
+//! [`authenticate_client`] is the **production** path and the only one a
+//! released build compiles. It reaches a grant only by reading this instance's
+//! sealed, key-authenticated client registry and finding a record whose ADR-015
+//! verifier reproduces over a presented secret. Nothing a caller supplies —
+//! a config value, an environment value, a CLI flag, an MCP argument, a TTY, a
+//! loopback address, the process parent, the OS account — participates in that
+//! answer. Presenting a credential that does not verify is a
+//! [`crate::protocol::StartupRefusal`], never an unregistered session:
+//! downgrading would turn a revoked registration and a mistyped option into the
+//! same silent symptom.
 //!
-//! That argument is about the build graph, so it is checked against the
-//! artifact rather than trusted. `scripts/ci/control_fixture_absence_gate.sh`
+//! [`RequesterGrant::fixture`] is the **test** path, kept for the phase-2 tests
+//! that predate registration. It is compiled only under the `fixture-grants`
+//! feature, which is enabled only by this workspace's `[dev-dependencies]`; it
+//! is in no crate's default feature set and no released profile turns it on, so
+//! `cargo build --release` compiles none of the code marked with it.
+//!
+//! The two share no constructor, no verifier, and no assurance vocabulary. A
+//! production grant's class comes from
+//! [`crate::client_registry::CredentialDelivery`], which has exactly two
+//! variants and no way to spell the fixture's own class; the fixture's class is
+//! a string literal that the delivery enum refuses to parse. That is a property
+//! of the types rather than of a runtime check that could be misconfigured, and
+//! it is the specification's fixture-contract point 7 — the production and
+//! fixture verifier paths stay disjoint — expressed in the type system.
+//!
+//! The compile-out argument is about the build graph, so it is checked against
+//! the artifact rather than trusted. `scripts/ci/control_fixture_absence_gate.sh`
 //! builds the `zeroclaw` binary, asserts the fixture identifiers below are
 //! absent from it, and asserts real control-plane strings are present so the
 //! absence cannot pass vacuously on a wrong or empty file. CI runs it as the
@@ -30,16 +43,33 @@
 //! manifest, or the gate itself changes.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use crate::protocol::{ControlErrorCode, RegistrationHelpResult, ToolDescriptor, ToolGate};
+use crate::client_registry::{
+    self, ClientCredential, ClientRegistration, CredentialDelivery, RegistrationId,
+};
+use crate::genesis::{InstanceTrustState, classify};
+use crate::keys::ApprovalAuditKey;
+use crate::protocol::{
+    ControlErrorCode, LOCAL_TARGET_ID, RegistrationHelpResult, StartupRefusal, StartupRefusalCode,
+    ToolDescriptor, ToolGate,
+};
+use crate::registry_store;
+use crate::store::ControlPaths;
 
 /// Credential-delivery assurance classes an operator registration ceremony may
 /// use.
 ///
-/// Deliberately an allowlist. `test_only` is not a member and must never
-/// become one: the fixture path in this module is replaced by phase 3
-/// registration, not extended by it.
-pub const ACCEPTED_ASSURANCE_CLASSES: &[&str] = &["isolated_descriptor", "sandbox_isolated_store"];
+/// Deliberately an allowlist, and no longer independently spelled: each entry
+/// is a [`CredentialDelivery`] variant's own wire spelling, so the classes this
+/// protocol advertises and the classes a registration can actually be created
+/// under cannot drift apart by a typo. `CredentialDelivery` has no third
+/// variant, which is what keeps `uid_ambient` and the fixture path's own class
+/// out of this list structurally rather than by review.
+pub const ACCEPTED_ASSURANCE_CLASSES: &[&str] = &[
+    CredentialDelivery::IsolatedDescriptor.wire(),
+    CredentialDelivery::SandboxIsolatedStore.wire(),
+];
 
 /// Assurance classes an operator registration ceremony refuses.
 pub const REJECTED_ASSURANCE_CLASSES: &[&str] = &["uid_ambient"];
@@ -81,6 +111,37 @@ pub struct RequesterGrant {
 }
 
 impl RequesterGrant {
+    /// The grant a verified [`ClientRegistration`] resolves to.
+    ///
+    /// The only production constructor, and the only one anywhere that a
+    /// released build compiles. It takes the registration by reference rather
+    /// than loose fields so the grant cannot be assembled with a wider domain
+    /// set than the record carries, and it derives the assurance class from the
+    /// record's typed [`CredentialDelivery`] rather than from a string, so the
+    /// class a session reports is a class a registration could be created
+    /// under.
+    ///
+    /// `target_id` becomes [`LOCAL_TARGET_ID`]. A phase-2 process pins one
+    /// config root and can address no other instance, so the target registry
+    /// degenerates to that constant on the wire; the caller has already
+    /// established that the registration covers *this* instance's real
+    /// identifier, which is the check that means anything.
+    #[must_use]
+    fn registered(registration: &ClientRegistration) -> Self {
+        Self {
+            assurance_class: registration.delivery_assurance.wire().to_string(),
+            // Empty, never the fixture marker. In a fixture-enabled test build
+            // the field still exists, and a production grant carrying the
+            // marker would make the two paths indistinguishable; a disjointness
+            // test below pins that it stays empty.
+            #[cfg(feature = "fixture-grants")]
+            credential_marker: String::new(),
+            target_id: LOCAL_TARGET_ID.to_string(),
+            read_domains: registration.granted_read_domains.clone(),
+            proposal_domains: registration.proposal_domains.clone(),
+        }
+    }
+
     /// The credential-delivery assurance class this grant was issued under.
     #[must_use]
     pub fn assurance_class(&self) -> &str {
@@ -109,11 +170,12 @@ impl RequesterGrant {
     ///
     /// # Test-only
     ///
-    /// This is the sole constructor of a [`RequesterGrant`] anywhere in the
-    /// workspace, and it exists only when the `fixture-grants` feature is on.
-    /// No released profile enables that feature, so a shipped binary contains
-    /// no way to construct this type and therefore no way to reach a
-    /// grant-gated tool.
+    /// This exists only when the `fixture-grants` feature is on, and no
+    /// released profile enables that feature. The other constructor,
+    /// [`RequesterGrant::registered`], is private to this module and reachable
+    /// only through [`authenticate_client`], which demands a verified
+    /// registration. A shipped binary therefore has exactly one way to reach a
+    /// grant-gated tool, and it runs through the client registry.
     #[cfg(feature = "fixture-grants")]
     #[must_use]
     pub fn fixture(read_domains: &[&str], proposal_domains: &[&str]) -> Self {
@@ -132,8 +194,14 @@ impl RequesterGrant {
         }
     }
 
-    /// A test-only grant covering every read view and proposal domain v1
+    /// A test-only grant covering every read domain and proposal domain v1
     /// defines.
+    ///
+    /// Reads `READ_DOMAINS_V1` rather than re-spelling a list, so "everything"
+    /// keeps meaning everything when a domain is added. That constant is the
+    /// six-member vocabulary — both Inspect views plus the four read-only tool
+    /// names — and a grant holding all six is what makes every gated tool
+    /// visible.
     ///
     /// # Test-only
     ///
@@ -141,7 +209,7 @@ impl RequesterGrant {
     #[cfg(feature = "fixture-grants")]
     #[must_use]
     pub fn fixture_full() -> Self {
-        Self::fixture(crate::protocol::VIEWS, &[PROPOSAL_DOMAIN_AGENT])
+        Self::fixture(client_registry::READ_DOMAINS_V1, &[PROPOSAL_DOMAIN_AGENT])
     }
 
     /// The marker proving this grant came from the fixture path.
@@ -156,8 +224,9 @@ impl RequesterGrant {
 
 /// One control session's principal state.
 ///
-/// [`ControlSession::Registered`] is uninhabited in a released build because
-/// [`RequesterGrant`] has no constructor there.
+/// [`ControlSession::Registered`] is inhabited only by [`authenticate_client`],
+/// which reaches it only from a verified client registration, and by the
+/// test-only fixture path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlSession {
     /// No registered client credential was presented.
@@ -167,11 +236,14 @@ pub enum ControlSession {
 }
 
 impl ControlSession {
-    /// The session every launched control process starts in.
+    /// The session a launched control process gets when it presents no
+    /// credential.
     ///
-    /// This is the only session constructor reachable from production code, and
-    /// the transport calls nothing else. Registration is an operator ceremony
-    /// on the host; it is not something an MCP session can perform on itself.
+    /// Registration is an operator ceremony on the host; it is not something an
+    /// MCP session can perform on itself. This constructor never *becomes*
+    /// registered, and no failure elsewhere falls back to it — a launch that
+    /// presented a credential either produces a registered session or refuses
+    /// to serve.
     #[must_use]
     pub fn unregistered() -> Self {
         Self::Unregistered
@@ -215,32 +287,52 @@ impl ControlSession {
 
     /// Whether `tool` appears in this session's `tools/list`.
     ///
-    /// Absence is the primary control. A grant-gated tool is not listed for an
-    /// unregistered session at all, and calling it by name is refused
-    /// separately by [`ControlSession::authorize_tool`].
+    /// Absence is the primary control, and it is defined as *exactly* the
+    /// negation of the refusal: a tool is listed when
+    /// [`ControlSession::authorize_tool`] would let this session call it, and
+    /// not otherwise. Deriving one from the other is deliberate — two
+    /// independent predicates could drift, and a tool that is listed but
+    /// refuses (or refuses but is listed) is precisely the confusion the
+    /// specification's "absence is the primary control and the error is the
+    /// backstop" rule exists to prevent.
     #[must_use]
     pub fn can_see(&self, tool: &ToolDescriptor) -> bool {
-        match tool.gate {
-            ToolGate::Always => true,
-            ToolGate::RegisteredGrant => self.is_registered(),
-        }
+        self.authorize_tool(tool).is_ok()
     }
 
     /// The refusal a session gets for calling `tool` by name, if any.
     ///
-    /// Registration is checked before anything else, so an unregistered caller
-    /// learns only that it is unregistered — never whether the target exists,
-    /// whether a view is defined, or whether some other client is registered.
+    /// Registration is checked before the grant's contents, so an unregistered
+    /// caller learns only that it is unregistered — never whether the target
+    /// exists, whether a view is defined, or whether some other client is
+    /// registered.
+    ///
+    /// A registered session that does not hold any of the tool's read domains
+    /// gets [`ControlErrorCode::GrantRequired`]: authorization is an
+    /// intersection, so a narrow registration reaches a narrow surface. That is
+    /// the same code an ungranted *view* produces, which keeps an ungranted
+    /// tool and an ungranted view indistinguishable from the outside.
     ///
     /// # Errors
     ///
     /// Returns [`ControlErrorCode::UnregisteredClient`] when the session holds
-    /// no grant.
+    /// no grant, and [`ControlErrorCode::GrantRequired`] when it holds one that
+    /// covers none of `tool.required_read_domains`.
     pub fn authorize_tool(&self, tool: &ToolDescriptor) -> Result<(), ControlErrorCode> {
         match tool.gate {
             ToolGate::Always => Ok(()),
-            ToolGate::RegisteredGrant if self.is_registered() => Ok(()),
-            ToolGate::RegisteredGrant => Err(ControlErrorCode::UnregisteredClient),
+            ToolGate::RegisteredGrant => {
+                let grant = self.grant().ok_or(ControlErrorCode::UnregisteredClient)?;
+                if tool
+                    .required_read_domains
+                    .iter()
+                    .any(|domain| grant.covers_read_domain(domain))
+                {
+                    Ok(())
+                } else {
+                    Err(ControlErrorCode::GrantRequired)
+                }
+            }
         }
     }
 
@@ -297,6 +389,148 @@ impl ControlSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Production client authentication
+// ---------------------------------------------------------------------------
+
+/// A verified registered client and the instance it was verified against.
+///
+/// The resolved [`ControlPaths`] travel with the session so a caller that needs
+/// the same instance again — to take the host lock, say — uses the roots this
+/// authentication actually ran against rather than resolving them a second time
+/// and possibly getting a different answer.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedClient {
+    /// The registered session.
+    pub session: ControlSession,
+    /// The instance roots the registry was read from.
+    pub paths: ControlPaths,
+}
+
+/// Verify a presented client credential and resolve the session it entitles.
+///
+/// This is the production counterpart of the fixture path, and it shares
+/// nothing with it: no constructor, no type, no verifier. A fixture grant is
+/// minted from string literals inside a test process; a registered session
+/// exists only when a sealed, key-authenticated registry on this instance holds
+/// a record whose ADR-015 verifier reproduces over the presented secret.
+///
+/// # The order of the checks, and why
+///
+/// 1. **Resolve the instance roots.** A root that is missing, not a directory,
+///    or a symlink is [`StartupRefusalCode::InstanceNotManaged`]: a redirected
+///    root is exactly the substitution the genesis record's root binding exists
+///    to catch.
+/// 2. **Classify the trust root.** Only [`InstanceTrustState::Managed`]
+///    continues. Recovery-only and never-initialized both refuse, fused into
+///    one code — see [`StartupRefusalCode`].
+/// 3. **Derive the ADR-015 key at the record's epoch**, from the deployment's
+///    single key-source authority. A failure here is not a rejected credential,
+///    it is a host that cannot authenticate anything.
+/// 4. **Intersect with target registration.** The signed target registry must
+///    list this instance as operable. This runs before any credential is looked
+///    at, because an instance that is not servable is not servable for anyone.
+/// 5. **Load and re-validate the client registry.** A registry that is absent
+///    reports as a rejected credential; a registry that is present but fails
+///    its tag or its grant re-validation reports as
+///    [`StartupRefusalCode::RegistryUnverifiable`], because a host whose sealed
+///    state has been tampered with must say so loudly.
+/// 6. **Look up the named registration**, then **authenticate the secret**.
+///    Unknown identifier, wrong secret, revoked status, and a registration
+///    issued under a superseded epoch are one code.
+/// 7. **Only then, compare the delivery class.** Deliberately last of the
+///    credential checks: a caller who cannot produce the secret must not be
+///    able to learn which assurance class a real registration was created
+///    under by probing.
+/// 8. **Require the registration to cover this instance.** A record that grants
+///    some other instance grants nothing here, because this process can address
+///    no other instance.
+///
+/// # What this never does
+///
+/// It never consults a TTY, a loopback address, the process parent, the OS
+/// account, or an environment *value*. It never widens a grant, never falls
+/// back to an unregistered session, and never returns a partial result: every
+/// branch is a session or a refusal.
+///
+/// # Errors
+///
+/// Returns a [`StartupRefusal`] whose text is fixed and carries no path, client
+/// identifier, or presented value.
+pub fn authenticate_client(
+    install_root: &Path,
+    client_id: &str,
+    credential: &ClientCredential,
+    presented_delivery: CredentialDelivery,
+) -> Result<AuthenticatedClient, StartupRefusal> {
+    let refuse = |code: StartupRefusalCode| StartupRefusal::new(code);
+
+    let paths = ControlPaths::resolve(install_root)
+        .map_err(|_| refuse(StartupRefusalCode::InstanceNotManaged))?;
+    let key_source = paths.key_source();
+
+    let record = match classify(&paths, &key_source) {
+        InstanceTrustState::Managed(record) => record,
+        InstanceTrustState::EligibleForFirstGenesis | InstanceTrustState::RecoveryOnly { .. } => {
+            return Err(refuse(StartupRefusalCode::InstanceNotManaged));
+        }
+    };
+
+    let key = ApprovalAuditKey::derive(&key_source, record.trust_epoch)
+        .map_err(|_| refuse(StartupRefusalCode::RegistryUnverifiable))?;
+
+    // Intersect with target registration before looking at any credential. An
+    // instance whose signed target record is absent, revoked, or suspended is
+    // not one this process may serve, whatever a client presents.
+    let targets = registry_store::load(&paths, &key)
+        .map_err(|_| refuse(StartupRefusalCode::RegistryUnverifiable))?;
+    if targets.get_operable(&record.instance_id).is_none() {
+        return Err(refuse(StartupRefusalCode::InstanceNotManaged));
+    }
+
+    let registry = client_registry::load(&paths, &key).map_err(|error| {
+        use crate::client_registry::ClientRegistryErrorCode as Code;
+        match error.code {
+            // A host with no registry is indistinguishable from a host that has
+            // one without this client. Anything else means the sealed state is
+            // present and wrong, which an operator has to be told.
+            Code::NotPresent => refuse(StartupRefusalCode::CredentialRejected),
+            _ => refuse(StartupRefusalCode::RegistryUnverifiable),
+        }
+    })?;
+
+    let registration_id = RegistrationId::new(client_id)
+        .map_err(|_| refuse(StartupRefusalCode::CredentialRejected))?;
+    let Some(registration) = registry.get(&registration_id) else {
+        return Err(refuse(StartupRefusalCode::CredentialRejected));
+    };
+
+    // `authenticate` answers "is this the secret" and "may this record still
+    // authenticate" together, so a revoked registration refuses even for the
+    // correct credential. The epoch check is separate because a record carried
+    // forward across a recovery would otherwise be judged only by a tag that a
+    // re-derived key would already have failed; checking it explicitly means
+    // the refusal does not depend on that coincidence.
+    if registration.trust_epoch != record.trust_epoch
+        || !registration.authenticate(credential, &key)
+    {
+        return Err(refuse(StartupRefusalCode::CredentialRejected));
+    }
+
+    if registration.delivery_assurance != presented_delivery {
+        return Err(refuse(StartupRefusalCode::DeliveryClassMismatch));
+    }
+
+    if !registration.covers_instance(&record.instance_id) {
+        return Err(refuse(StartupRefusalCode::CredentialRejected));
+    }
+
+    Ok(AuthenticatedClient {
+        session: ControlSession::Registered(RequesterGrant::registered(registration)),
+        paths,
+    })
+}
+
 /// The static operator guidance `control.registration_help` returns.
 ///
 /// Generated from the constants above rather than maintained in a skill or a
@@ -332,7 +566,540 @@ pub fn registration_help(session: &ControlSession) -> RegistrationHelpResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{LOCAL_TARGET_ID, TOOLS, VIEW_AGENT_SUMMARY, tool};
+    use crate::client_registry::{
+        ClientGrant, ClientLabel, ClientRegistry, IssuedRegistration, READ_DOMAINS_V1,
+        RegistrationStatus,
+    };
+    use crate::genesis::{
+        FirstOperatorIdentity, GenesisRecord, KeyCommitment, PresenceClass, generate_instance_id,
+        now_unix_secs,
+    };
+    use crate::protocol::{
+        LOCAL_TARGET_ID, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_INSPECT, TOOL_PREVIEW, TOOL_VALIDATE,
+        TOOLS, VIEW_AGENT_SUMMARY, VIEW_PROVIDER_ALIAS_LIST, tool,
+    };
+    use crate::registry::{GenesisDigest, InstanceId, TargetRecord, TargetRegistry, TrustEpoch};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use zeroclaw_config::secrets::KeySource as _;
+
+    // -- a real managed instance, built from the public durable-state API ----
+
+    /// One initialized instance on disk: a sealed genesis record, a signed
+    /// target registry naming it, and a deployment key source.
+    ///
+    /// Built from `genesis::write_record`, `registry_store`, and
+    /// `client_registry` rather than by running `ceremony::run_genesis`,
+    /// because the ceremony needs a `UserPresence` adapter and
+    /// `PresenceAttestation` has no constructor outside `ceremony`. The durable
+    /// state written here is the state that ceremony writes — the same records,
+    /// through the same publishers, sealed under the same key.
+    struct ManagedInstance {
+        _temp: tempfile::TempDir,
+        install_root: PathBuf,
+        paths: ControlPaths,
+        instance_id: InstanceId,
+        genesis_digest: GenesisDigest,
+    }
+
+    impl ManagedInstance {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temporary install root");
+            let install_root = temp.path().join("install");
+            std::fs::create_dir_all(install_root.join("data")).expect("create install root");
+            let paths = ControlPaths::resolve(&install_root).expect("resolve control paths");
+
+            let key_source = paths.key_source();
+            key_source
+                .initialize()
+                .expect("initialize the deployment key");
+            let key =
+                ApprovalAuditKey::derive(&key_source, TrustEpoch::GENESIS).expect("derive the key");
+
+            let instance_id = generate_instance_id().expect("instance id");
+            let record = GenesisRecord {
+                instance_id: instance_id.clone(),
+                trust_epoch: TrustEpoch::GENESIS,
+                canonical_roots: paths.canonical_roots().expect("canonical roots"),
+                created_at_unix_secs: now_unix_secs().expect("clock"),
+                user_presence_class: PresenceClass::Terminal,
+                first_operator: FirstOperatorIdentity::new("operator").expect("operator"),
+                host_key_commitment: KeyCommitment::compute(&key),
+            };
+            let genesis_digest =
+                crate::genesis::write_record(&paths, &record, &key).expect("write genesis record");
+
+            let target = TargetRecord::register(
+                instance_id.clone(),
+                paths.canonical_roots().expect("canonical roots"),
+                None,
+                TrustEpoch::GENESIS,
+                genesis_digest,
+            )
+            .expect("target record");
+            let mut targets = TargetRegistry::new();
+            targets.insert(target).expect("insert target");
+            registry_store::save_new(&paths, &targets, &key).expect("save target registry");
+
+            Self {
+                _temp: temp,
+                install_root,
+                paths,
+                instance_id,
+                genesis_digest,
+            }
+        }
+
+        fn key(&self) -> ApprovalAuditKey {
+            ApprovalAuditKey::derive(&self.paths.key_source(), TrustEpoch::GENESIS)
+                .expect("derive the key")
+        }
+
+        /// Register one client and return its identifier and the one copy of
+        /// its credential, in the delivery encoding the credential file uses.
+        fn register(&self, grant: &ClientGrant) -> (RegistrationId, String) {
+            let key = self.key();
+            let issued: IssuedRegistration = ClientRegistration::issue(
+                grant,
+                TrustEpoch::GENESIS,
+                now_unix_secs().expect("clock"),
+                self.genesis_digest,
+                PresenceClass::Terminal,
+                &key,
+            )
+            .expect("issue a registration");
+            let id = issued.registration.registration_id.clone();
+            let secret = issued.credential.to_delivery_hex();
+            self.save(|registry| {
+                registry
+                    .insert(issued.registration.clone())
+                    .expect("insert the registration");
+            });
+            (id, secret)
+        }
+
+        /// Read the client registry, let `edit` change it, and write it back.
+        fn save(&self, edit: impl FnOnce(&mut ClientRegistry)) {
+            let key = self.key();
+            let mut registry = if client_registry::is_present(&self.paths) {
+                client_registry::load(&self.paths, &key).expect("load the client registry")
+            } else {
+                ClientRegistry::new()
+            };
+            edit(&mut registry);
+            client_registry::save(&self.paths, &registry, &key).expect("save the client registry");
+        }
+
+        fn full_grant(&self, delivery: CredentialDelivery) -> ClientGrant {
+            ClientGrant::full_v1(
+                ClientLabel::new("component-client").expect("label"),
+                delivery,
+                self.instance_id.clone(),
+            )
+        }
+
+        fn authenticate(
+            &self,
+            client_id: &str,
+            secret: &str,
+            delivery: CredentialDelivery,
+        ) -> Result<AuthenticatedClient, StartupRefusal> {
+            let credential = ClientCredential::from_delivery_hex(secret).expect("parse credential");
+            authenticate_client(&self.install_root, client_id, &credential, delivery)
+        }
+    }
+
+    fn refusal_code(
+        result: Result<AuthenticatedClient, StartupRefusal>,
+        what: &str,
+    ) -> StartupRefusalCode {
+        match result {
+            Ok(_) => panic!("{what} must not authenticate"),
+            Err(refusal) => refusal.code,
+        }
+    }
+
+    // -- the production path ------------------------------------------------
+
+    #[test]
+    fn a_registered_client_resolves_to_a_grant_over_its_recorded_domains() {
+        let instance = ManagedInstance::new();
+        let (id, secret) =
+            instance.register(&instance.full_grant(CredentialDelivery::IsolatedDescriptor));
+
+        let authenticated = instance
+            .authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor)
+            .expect("the issued credential authenticates");
+        let session = authenticated.session;
+        assert!(session.is_registered());
+        assert_eq!(session.registration_state(), "registered");
+
+        let grant = session.grant().expect("a registered session holds a grant");
+        assert_eq!(grant.assurance_class(), "isolated_descriptor");
+        assert!(grant.covers_target(LOCAL_TARGET_ID));
+        assert!(!grant.covers_target("inst-elsewhere"));
+        for domain in READ_DOMAINS_V1 {
+            assert!(
+                grant.covers_read_domain(domain),
+                "a full grant must cover {domain}"
+            );
+        }
+        assert!(grant.covers_proposal_domain(PROPOSAL_DOMAIN_AGENT));
+
+        let visible: Vec<&str> = TOOLS
+            .iter()
+            .filter(|entry| session.can_see(entry))
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                "control.ping",
+                "control.server_info",
+                "control.registration_help",
+                "control.catalog",
+                "control.describe",
+                "control.inspect",
+                "control.validate",
+                "control.preview",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_narrow_registration_reaches_a_narrow_tool_surface() {
+        let instance = ManagedInstance::new();
+        let narrow = ClientGrant {
+            client_label: ClientLabel::new("narrow").expect("label"),
+            delivery_assurance: CredentialDelivery::SandboxIsolatedStore,
+            granted_instances: [instance.instance_id.clone()].into_iter().collect(),
+            granted_read_domains: [VIEW_AGENT_SUMMARY.to_string(), TOOL_CATALOG.to_string()]
+                .into_iter()
+                .collect(),
+            proposal_domains: [PROPOSAL_DOMAIN_AGENT.to_string()].into_iter().collect(),
+        };
+        let (id, secret) = instance.register(&narrow);
+
+        let session = instance
+            .authenticate(
+                id.as_str(),
+                &secret,
+                CredentialDelivery::SandboxIsolatedStore,
+            )
+            .expect("the issued credential authenticates")
+            .session;
+
+        let visible: Vec<&str> = TOOLS
+            .iter()
+            .filter(|entry| session.can_see(entry))
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                "control.ping",
+                "control.server_info",
+                "control.registration_help",
+                "control.catalog",
+                "control.inspect",
+            ],
+            "a registration granting two domains lists two gated tools"
+        );
+
+        for absent in [TOOL_DESCRIBE, TOOL_VALIDATE, TOOL_PREVIEW] {
+            let entry = tool(absent).expect("registry entry");
+            assert!(!session.can_see(entry), "{absent} must not be listed");
+            assert_eq!(
+                session.authorize_tool(entry),
+                Err(ControlErrorCode::GrantRequired),
+                "{absent} must refuse a registered caller that does not hold it"
+            );
+        }
+        // The tool it does hold still filters views inside itself.
+        let inspect = tool(TOOL_INSPECT).expect("registry entry");
+        assert_eq!(session.authorize_tool(inspect), Ok(()));
+        assert_eq!(session.authorize_read_domain(VIEW_AGENT_SUMMARY), Ok(()));
+        assert_eq!(
+            session.authorize_read_domain(VIEW_PROVIDER_ALIAS_LIST),
+            Err(ControlErrorCode::GrantRequired)
+        );
+    }
+
+    #[test]
+    fn every_way_a_credential_can_fail_is_a_refusal_and_never_a_downgrade() {
+        let instance = ManagedInstance::new();
+        let (id, secret) =
+            instance.register(&instance.full_grant(CredentialDelivery::IsolatedDescriptor));
+
+        // A different 32-byte secret.
+        let other = ClientCredential::issue().expect("issue").to_delivery_hex();
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(id.as_str(), &other, CredentialDelivery::IsolatedDescriptor),
+                "a wrong secret",
+            ),
+            StartupRefusalCode::CredentialRejected
+        );
+
+        // One flipped bit.
+        let mut near_miss = secret.clone().into_bytes();
+        near_miss[0] = if near_miss[0] == b'0' { b'1' } else { b'0' };
+        let near_miss = String::from_utf8(near_miss).expect("hex stays ASCII");
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(
+                    id.as_str(),
+                    &near_miss,
+                    CredentialDelivery::IsolatedDescriptor
+                ),
+                "a near-miss secret",
+            ),
+            StartupRefusalCode::CredentialRejected
+        );
+
+        // A client identifier no registration carries, and one that is not even
+        // a well-formed identifier. Both are the same refusal, so probing
+        // cannot enumerate registrations.
+        for unknown in ["reg-0000000000000000", "not/an/id"] {
+            assert_eq!(
+                refusal_code(
+                    instance.authenticate(unknown, &secret, CredentialDelivery::IsolatedDescriptor),
+                    "an unknown client identifier",
+                ),
+                StartupRefusalCode::CredentialRejected
+            );
+        }
+
+        // The right secret through the wrong mechanism.
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(
+                    id.as_str(),
+                    &secret,
+                    CredentialDelivery::SandboxIsolatedStore
+                ),
+                "a delivery-class mismatch",
+            ),
+            StartupRefusalCode::DeliveryClassMismatch
+        );
+
+        // And the correct presentation still works, so none of the above passed
+        // for the wrong reason.
+        assert!(
+            instance
+                .authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_revoked_registration_refuses_its_own_credential() {
+        let instance = ManagedInstance::new();
+        let (id, secret) =
+            instance.register(&instance.full_grant(CredentialDelivery::IsolatedDescriptor));
+        assert!(
+            instance
+                .authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor)
+                .is_ok()
+        );
+
+        instance.save(|registry| {
+            let mut revoked = registry.get(&id).expect("the registration").clone();
+            revoked.status = RegistrationStatus::Revoked;
+            *registry = {
+                let mut replacement = ClientRegistry::new();
+                replacement.insert(revoked).expect("insert");
+                replacement
+            };
+        });
+
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor),
+                "a revoked registration",
+            ),
+            StartupRefusalCode::CredentialRejected,
+            "revocation fails closed, and looks exactly like a wrong secret"
+        );
+    }
+
+    #[test]
+    fn a_registration_that_covers_another_instance_grants_nothing_here() {
+        let instance = ManagedInstance::new();
+        let elsewhere = ClientGrant {
+            client_label: ClientLabel::new("elsewhere").expect("label"),
+            delivery_assurance: CredentialDelivery::IsolatedDescriptor,
+            granted_instances: [InstanceId::new("inst-elsewhere").expect("id")]
+                .into_iter()
+                .collect(),
+            granted_read_domains: READ_DOMAINS_V1.iter().map(|d| (*d).to_string()).collect(),
+            proposal_domains: BTreeSet::new(),
+        };
+        let (id, secret) = instance.register(&elsewhere);
+
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor),
+                "a registration over another instance",
+            ),
+            StartupRefusalCode::CredentialRejected
+        );
+    }
+
+    #[test]
+    fn an_uninitialized_or_unverifiable_instance_authenticates_nobody() {
+        // No genesis record at all.
+        let bare = tempfile::tempdir().expect("temporary install root");
+        let root = bare.path().join("install");
+        std::fs::create_dir_all(root.join("data")).expect("create install root");
+        let credential = ClientCredential::issue().expect("issue");
+        assert_eq!(
+            refusal_code(
+                authenticate_client(
+                    &root,
+                    "reg-0000000000000000",
+                    &credential,
+                    CredentialDelivery::IsolatedDescriptor,
+                ),
+                "an instance that never ran genesis",
+            ),
+            StartupRefusalCode::InstanceNotManaged
+        );
+
+        // A root that does not exist is the same refusal, and discloses no more.
+        assert_eq!(
+            refusal_code(
+                authenticate_client(
+                    &bare.path().join("absent"),
+                    "reg-0000000000000000",
+                    &credential,
+                    CredentialDelivery::IsolatedDescriptor,
+                ),
+                "a root that does not exist",
+            ),
+            StartupRefusalCode::InstanceNotManaged
+        );
+
+        // A managed instance with no client registry looks exactly like one
+        // whose registry does not hold this client.
+        let instance = ManagedInstance::new();
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(
+                    "reg-0000000000000000",
+                    &credential.to_delivery_hex(),
+                    CredentialDelivery::IsolatedDescriptor,
+                ),
+                "a managed instance with no client registry",
+            ),
+            StartupRefusalCode::CredentialRejected
+        );
+
+        // A registry that is present but does not authenticate is loud.
+        let (id, secret) =
+            instance.register(&instance.full_grant(CredentialDelivery::IsolatedDescriptor));
+        let path = instance.paths.client_registry();
+        let mut sealed = std::fs::read(&path).expect("read the client registry");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        std::fs::write(&path, &sealed).expect("write the tampered registry");
+        assert_eq!(
+            refusal_code(
+                instance.authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor),
+                "a tampered client registry",
+            ),
+            StartupRefusalCode::RegistryUnverifiable
+        );
+    }
+
+    #[test]
+    fn a_startup_refusal_carries_fixed_text_and_no_host_detail() {
+        for code in StartupRefusalCode::ALL {
+            let refusal = StartupRefusal::new(code);
+            assert_eq!(refusal.message, code.message());
+            assert!(
+                !refusal.message.contains('/') && !refusal.message.contains('\\'),
+                "{} carries a path separator",
+                code.as_str()
+            );
+            let rendered = serde_json::to_string(&refusal).expect("serializes");
+            assert!(rendered.contains(code.as_str()));
+        }
+        assert!(!StartupRefusalCode::CredentialRejected.retryable());
+        assert!(StartupRefusalCode::HostAlreadyServing.retryable());
+    }
+
+    /// Spec point 7, extended to the production path this phase adds: the
+    /// production registration path and the fixture path share no verifier, no
+    /// constructor, and no assurance vocabulary.
+    #[test]
+    fn the_production_registration_path_and_the_fixture_path_stay_disjoint() {
+        // 1. The classes a production session can report are exactly the two
+        //    the delivery enum defines, and the enum has no third variant.
+        assert_eq!(
+            ACCEPTED_ASSURANCE_CLASSES,
+            CredentialDelivery::ALL
+                .iter()
+                .map(|class| class.wire())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        for rejected in REJECTED_ASSURANCE_CLASSES {
+            assert!(CredentialDelivery::from_wire(rejected).is_none());
+        }
+
+        // 2. `authenticate_client` takes a `CredentialDelivery` by value, so no
+        //    caller can name a class outside that enum. The only classes a
+        //    real session can carry are therefore these two.
+        let instance = ManagedInstance::new();
+        for delivery in CredentialDelivery::ALL.iter().copied() {
+            let grant = instance.full_grant(delivery);
+            let (id, secret) = instance.register(&grant);
+            let session = instance
+                .authenticate(id.as_str(), &secret, delivery)
+                .expect("the issued credential authenticates")
+                .session;
+            let class = session
+                .grant()
+                .expect("a registered session holds a grant")
+                .assurance_class()
+                .to_string();
+            assert_eq!(class, delivery.wire());
+            assert!(
+                ACCEPTED_ASSURANCE_CLASSES.contains(&class.as_str()),
+                "a production session reported an unacceptable class"
+            );
+            assert!(
+                CredentialDelivery::from_wire(&class).is_some(),
+                "a production session's class must round-trip through the enum"
+            );
+        }
+    }
+
+    /// The half of spec point 7 that only a fixture build can check.
+    #[cfg(feature = "fixture-grants")]
+    #[test]
+    fn a_production_grant_never_carries_the_fixture_marker() {
+        let instance = ManagedInstance::new();
+        let (id, secret) =
+            instance.register(&instance.full_grant(CredentialDelivery::IsolatedDescriptor));
+        let session = instance
+            .authenticate(id.as_str(), &secret, CredentialDelivery::IsolatedDescriptor)
+            .expect("authenticates")
+            .session;
+        let grant = session.grant().expect("grant");
+        assert_eq!(
+            grant.credential_marker(),
+            "",
+            "a production grant must not carry the fixture marker"
+        );
+        assert_ne!(grant.assurance_class(), FIXTURE_ASSURANCE_CLASS);
+        assert_ne!(
+            RequesterGrant::fixture_full().assurance_class(),
+            grant.assurance_class(),
+            "the two paths must not converge on one class"
+        );
+    }
 
     #[test]
     fn an_unregistered_session_sees_only_the_always_available_tools() {

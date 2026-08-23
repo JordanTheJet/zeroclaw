@@ -113,6 +113,20 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     /// Whether a registered grant is required.
     pub gate: ToolGate,
+    /// The read domains that make this tool reachable for a registered
+    /// session, in **any** semantics: the grant must cover at least one.
+    ///
+    /// Empty for a [`ToolGate::Always`] tool, which no grant gates.
+    ///
+    /// The vocabulary is `client_registry::READ_DOMAINS_V1`, whose six members
+    /// are the two Inspect views plus the four read-only tool names. Each gated
+    /// tool other than `control.inspect` names exactly one domain — its own
+    /// name — so for those "any" and "all" coincide. `control.inspect` names
+    /// both views, because a registration granting either view has a view to
+    /// resolve and Inspect is how it resolves it; the per-view check in
+    /// [`crate::ControlSession::authorize_read_domain`] still refuses the view
+    /// the grant does not cover.
+    pub required_read_domains: &'static [&'static str],
     /// Generated JSON Schema for this tool's arguments.
     pub input_schema: fn() -> Value,
 }
@@ -156,12 +170,21 @@ pub struct ToolDescriptor {
 /// 7. **No mutation tool exists at any gate.** `ControlService::apply` is not
 ///    wired into this registry and cannot be reached from a transport that only
 ///    knows these names.
+/// 8. **A registered session's tool list is the intersection of this registry
+///    and the registration's read domains.** The specification fixes the
+///    unregistered surface at exactly the three always-available tools and says
+///    the rest "require a registered requester grant"; it does not say a grant
+///    is all-or-nothing. The principals design does: a grant carries *explicit*
+///    read domains and authorization is an intersection, never a union. So a
+///    registration granting fewer domains lists fewer tools, and absence stays
+///    the primary control.
 pub const TOOLS: &[ToolDescriptor] = &[
     ToolDescriptor {
         name: TOOL_PING,
         title: "Ping",
         description: "Liveness check. Discloses no configured state, target identity, or registration status.",
         gate: ToolGate::Always,
+        required_read_domains: &[],
         input_schema: empty_request_schema,
     },
     ToolDescriptor {
@@ -169,6 +192,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Server info",
         description: "The protocol advertisement block plus the bounded session facts an unregistered client needs to decide what to do next.",
         gate: ToolGate::Always,
+        required_read_domains: &[],
         input_schema: empty_request_schema,
     },
     ToolDescriptor {
@@ -176,6 +200,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Registration help",
         description: "Static operator guidance describing how a human registers this client. Initiates nothing and returns no credential material.",
         gate: ToolGate::Always,
+        required_read_domains: &[],
         input_schema: empty_request_schema,
     },
     ToolDescriptor {
@@ -183,6 +208,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Catalog",
         description: "Product-supported operation kinds. Contains no configured instance state.",
         gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_CATALOG],
         input_schema: catalog_request_schema,
     },
     ToolDescriptor {
@@ -190,6 +216,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Describe",
         description: "Current typed requirements and generated JSON Schemas for one operation.",
         gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_DESCRIBE],
         input_schema: describe_request_schema,
     },
     ToolDescriptor {
@@ -197,6 +224,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Inspect",
         description: "A redacted view of current relevant state, filtered by the requester's target and domain grant.",
         gate: ToolGate::RegisteredGrant,
+        required_read_domains: VIEWS,
         input_schema: inspect_request_schema,
     },
     ToolDescriptor {
@@ -204,6 +232,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Validate",
         description: "Validate a proposed typed operation. No host effect and no durable state.",
         gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_VALIDATE],
         input_schema: validate_request_schema,
     },
     ToolDescriptor {
@@ -211,6 +240,7 @@ pub const TOOLS: &[ToolDescriptor] = &[
         title: "Preview",
         description: "Canonical effects, risks, and verification plan for a proposed typed operation. No host effect.",
         gate: ToolGate::RegisteredGrant,
+        required_read_domains: &[TOOL_PREVIEW],
         input_schema: preview_request_schema,
     },
 ];
@@ -627,6 +657,174 @@ impl From<ProtocolError> for ErrorPayload {
         Self { error }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Startup refusals
+// ---------------------------------------------------------------------------
+
+/// Where a startup refusal rides inside a JSON-RPC `error.data` object.
+///
+/// Deliberately **not** `data.error`, which carries [`ErrorPayload`] and
+/// therefore a code from the frozen v1 table. A client that reads
+/// `data.error.code` and finds an unknown string would be right to call the
+/// server non-conformant; a client that finds this key instead learns
+/// unambiguously that the process refused to serve at all.
+pub const STARTUP_REFUSAL_META_KEY: &str = "control_startup_refusal";
+
+/// Why a control process refused to serve.
+///
+/// A **lifecycle** vocabulary, disjoint from [`ControlErrorCode`] by
+/// construction. Nothing here is a tool result: a process that emits one of
+/// these answers exactly one request and exits nonzero. The v1 error table is
+/// frozen and describes what a *running* session can refuse; adding a startup
+/// condition to it would change the meaning of a table the specification
+/// enumerates.
+///
+/// # What each code may disclose
+///
+/// A caller reaches these by launching the binary with credential-delivery
+/// options, so every one of them is read by whoever controls that launch. They
+/// are still written to the redaction rule: fixed text, no path, no client
+/// identifier, no enumeration of who else is registered.
+///
+/// Two fusions are deliberate rather than incidental:
+///
+/// - [`Self::CredentialRejected`] covers an unknown client identifier, a wrong
+///   secret, a revoked registration, a registration issued under a superseded
+///   trust epoch, **and a host with no client registry at all**. Splitting the
+///   last one out would let anyone who can launch the binary learn whether the
+///   host has ever registered a client, by presenting a fabricated credential.
+/// - [`Self::InstanceNotManaged`] covers both "genesis never ran" and
+///   "recovery-only". `zeroclaw control genesis` reports the precise state to
+///   an operator on the host, which is where that detail belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupRefusalCode {
+    /// The credential-delivery options are contradictory, incomplete, or
+    /// malformed. Nothing was read and no credential was presented.
+    CredentialMechanismInvalid,
+    /// A delivery mechanism was named but produced no usable credential.
+    CredentialUnavailable,
+    /// The presented credential does not authenticate.
+    CredentialRejected,
+    /// The mechanism used is not the delivery assurance class the registration
+    /// was created under.
+    DeliveryClassMismatch,
+    /// The instance has no verified genesis record.
+    InstanceNotManaged,
+    /// The client registry is present but could not be authenticated or
+    /// re-validated under this deployment's key.
+    RegistryUnverifiable,
+    /// Another control process already holds this instance's host lock.
+    HostAlreadyServing,
+}
+
+impl StartupRefusalCode {
+    /// The wire spelling of this code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialMechanismInvalid => "credential_mechanism_invalid",
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::CredentialRejected => "credential_rejected",
+            Self::DeliveryClassMismatch => "delivery_class_mismatch",
+            Self::InstanceNotManaged => "instance_not_managed",
+            Self::RegistryUnverifiable => "registry_unverifiable",
+            Self::HostAlreadyServing => "host_already_serving",
+        }
+    }
+
+    /// The only text this code ever puts on the wire, or in a process exit
+    /// message.
+    ///
+    /// Fixed and static exactly as [`ControlErrorCode::message`] is, so no host
+    /// error, path, client label, or presented value can reach a reader.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::CredentialMechanismInvalid => {
+                "The control credential delivery options are contradictory, incomplete, or malformed."
+            }
+            Self::CredentialUnavailable => {
+                "The named credential delivery mechanism produced no usable credential."
+            }
+            Self::CredentialRejected => "The presented control client credential was rejected.",
+            Self::DeliveryClassMismatch => {
+                "The credential was presented through a delivery mechanism this registration was not created under."
+            }
+            Self::InstanceNotManaged => {
+                "This instance has no verified control-plane trust root, so no client can be authenticated."
+            }
+            Self::RegistryUnverifiable => {
+                "This instance's client registry could not be authenticated under its own key."
+            }
+            Self::HostAlreadyServing => {
+                "Another control process already holds this instance's host lock."
+            }
+        }
+    }
+
+    /// Whether relaunching unchanged could succeed.
+    ///
+    /// Only the host lock: every other code describes a durable condition that
+    /// an operator has to change.
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::HostAlreadyServing)
+    }
+
+    /// Every startup refusal code, for exhaustive tests.
+    pub const ALL: [Self; 7] = [
+        Self::CredentialMechanismInvalid,
+        Self::CredentialUnavailable,
+        Self::CredentialRejected,
+        Self::DeliveryClassMismatch,
+        Self::InstanceNotManaged,
+        Self::RegistryUnverifiable,
+        Self::HostAlreadyServing,
+    ];
+}
+
+impl std::fmt::Display for StartupRefusalCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A refusal to serve at all.
+///
+/// [`StartupRefusal::new`] is the only constructor and takes no message, so —
+/// exactly as with [`ProtocolError`] — there is no code path that can format a
+/// host error, a path, or a presented value into the text a client reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupRefusal {
+    /// The stable code.
+    pub code: StartupRefusalCode,
+    /// Fixed text from [`StartupRefusalCode::message`].
+    pub message: String,
+    /// Whether relaunching unchanged could succeed.
+    pub retryable: bool,
+}
+
+impl StartupRefusal {
+    /// A refusal carrying `code`.
+    #[must_use]
+    pub fn new(code: StartupRefusalCode) -> Self {
+        Self {
+            code,
+            message: code.message().to_string(),
+            retryable: code.retryable(),
+        }
+    }
+}
+
+impl std::fmt::Display for StartupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for StartupRefusal {}
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -1509,6 +1707,61 @@ mod tests {
                 "control.registration_help"
             ]
         );
+    }
+
+    #[test]
+    fn the_read_domains_that_gate_tools_are_exactly_the_grantable_ones() {
+        use std::collections::BTreeSet;
+
+        let grantable: BTreeSet<&str> = crate::client_registry::READ_DOMAINS_V1
+            .iter()
+            .copied()
+            .collect();
+        let mut gating: BTreeSet<&str> = BTreeSet::new();
+        for entry in TOOLS {
+            match entry.gate {
+                ToolGate::Always => assert!(
+                    entry.required_read_domains.is_empty(),
+                    "{} is always available and must name no read domain",
+                    entry.name
+                ),
+                ToolGate::RegisteredGrant => {
+                    assert!(
+                        !entry.required_read_domains.is_empty(),
+                        "{} is grant-gated and must name the domains that reach it",
+                        entry.name
+                    );
+                    for domain in entry.required_read_domains {
+                        assert!(
+                            grantable.contains(domain),
+                            "{} names {domain}, which no registration can grant",
+                            entry.name
+                        );
+                        gating.insert(domain);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            gating, grantable,
+            "every grantable read domain must gate something, or a registration \
+             could name a domain that changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_startup_refusal_vocabulary_is_disjoint_from_the_v1_error_table() {
+        let tool_codes: Vec<&str> = ControlErrorCode::ALL.iter().map(|c| c.as_str()).collect();
+        for code in StartupRefusalCode::ALL {
+            assert!(
+                !tool_codes.contains(&code.as_str()),
+                "{} collides with a v1 tool error code",
+                code.as_str()
+            );
+            assert_eq!(StartupRefusal::new(code).code, code);
+        }
+        assert_eq!(StartupRefusalCode::ALL.len(), 7);
+        assert_eq!(STARTUP_REFUSAL_META_KEY, "control_startup_refusal");
     }
 
     #[test]

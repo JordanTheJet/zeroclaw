@@ -57,8 +57,8 @@ pub use preview::{
     ProposalPreview, RevisionBinding, build_preview,
 };
 pub use principal::{
-    ACCEPTED_ASSURANCE_CLASSES, ControlSession, PROPOSAL_DOMAIN_AGENT, REJECTED_ASSURANCE_CLASSES,
-    RequesterGrant, registration_help,
+    ACCEPTED_ASSURANCE_CLASSES, AuthenticatedClient, ControlSession, PROPOSAL_DOMAIN_AGENT,
+    REJECTED_ASSURANCE_CLASSES, RequesterGrant, authenticate_client, registration_help,
 };
 #[cfg(feature = "fixture-grants")]
 pub use principal::{FIXTURE_ASSURANCE_CLASS, FIXTURE_CREDENTIAL_MARKER};
