@@ -18991,6 +18991,23 @@ impl ConfigResolutionSource {
     }
 }
 
+/// Log-field value for a root the caller pinned explicitly.
+///
+/// Deliberately not a [`ConfigResolutionSource`] variant: that enum describes
+/// how *environment resolution* chose a root, and a pinned root never goes
+/// through it.
+const EXPLICIT_PATH_SOURCE: &str = "explicit";
+
+/// Whether a pinned load may create a configuration that is not there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitPolicy {
+    /// Write a default configuration when the install root has none.
+    CreateIfMissing,
+    /// Fail when the install root has no configuration, rather than
+    /// materializing one as a side effect of reading.
+    RequireExisting,
+}
+
 /// Expand tilde in paths, falling back to `UserDirs` when HOME is unset.
 ///
 /// In non-TTY environments (e.g. cron), HOME may not be set, causing
@@ -19730,6 +19747,14 @@ impl Config {
         self.env_overridden_paths.contains(path)
     }
 
+    /// Load the configuration from the environment-resolved install root,
+    /// initializing it on first run.
+    ///
+    /// This is the **ambient** entry point. It resolves the install root from
+    /// `ZEROCLAW_CONFIG_DIR` / `ZEROCLAW_DATA_DIR` / `ZEROCLAW_WORKSPACE` and
+    /// the platform defaults, then delegates to the same pinned loader
+    /// [`Config::load_or_init_at`] uses. Resolution is all this function
+    /// decides; there is exactly one load implementation beneath both.
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_data_dirs()?;
 
@@ -19740,6 +19765,91 @@ impl Config {
         // `ZEROCLAW_WORKSPACE`.
         let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+
+        Self::load_pinned(
+            zeroclaw_dir,
+            resolution_source.as_str(),
+            InitPolicy::CreateIfMissing,
+        )
+        .await
+    }
+
+    /// Load the configuration from an **explicit** install root, initializing
+    /// it on first run.
+    ///
+    /// `install_root` is the directory that holds `config.toml`, `data/`, and
+    /// `shared/` — the same layout [`Config::load_or_init`] resolves from the
+    /// environment. The root is used exactly as given: no `ZEROCLAW_CONFIG_DIR`,
+    /// `ZEROCLAW_DATA_DIR`, or `ZEROCLAW_WORKSPACE` lookup takes place, so two
+    /// roots can be loaded in one process without the callers racing over
+    /// shared process environment.
+    ///
+    /// # Environment is pinned for the *location* only
+    ///
+    /// `ZEROCLAW_<path>` value overrides still apply to the loaded
+    /// configuration, exactly as they do on the ambient path. Those express
+    /// process-wide operator intent rather than the target's identity, and
+    /// suppressing them here would make this function's result differ from
+    /// what the same install serves under [`Config::load_or_init`]. A caller
+    /// serving several targets from one process should be aware that a
+    /// `ZEROCLAW_*` value override applies to every one of them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates directory creation, parse, decryption, and env-override
+    /// failures exactly as [`Config::load_or_init`] does.
+    pub async fn load_or_init_at(install_root: PathBuf) -> Result<Self> {
+        Self::load_pinned(
+            install_root,
+            EXPLICIT_PATH_SOURCE,
+            InitPolicy::CreateIfMissing,
+        )
+        .await
+    }
+
+    /// Load an **existing** configuration from an explicit install root.
+    ///
+    /// Identical to [`Config::load_or_init_at`] except that an install root
+    /// with no `config.toml` is an error instead of a trigger to write one.
+    /// Use this where materializing a fresh install as a side effect of a read
+    /// would be wrong — inspecting a target that is supposed to already exist,
+    /// for instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `install_root` holds no `config.toml`, plus every
+    /// failure [`Config::load_or_init_at`] propagates.
+    pub async fn load_at(install_root: PathBuf) -> Result<Self> {
+        Self::load_pinned(
+            install_root,
+            EXPLICIT_PATH_SOURCE,
+            InitPolicy::RequireExisting,
+        )
+        .await
+    }
+
+    /// The single load implementation, against an already-decided root.
+    ///
+    /// `resolution_source` names how the root was chosen, for the "Config
+    /// loaded" log line only; it has no effect on what is loaded.
+    async fn load_pinned(
+        zeroclaw_dir: PathBuf,
+        resolution_source: &str,
+        init_policy: InitPolicy,
+    ) -> Result<Self> {
+        // Refuse a missing configuration BEFORE anything touches the
+        // filesystem. Everything below creates directories and may run the
+        // V<3 → V3 move, so checking later would leave a half-built install
+        // root behind on a read that was never allowed to create one.
+        if init_policy == InitPolicy::RequireExisting && !zeroclaw_dir.join("config.toml").is_file()
+        {
+            anyhow::bail!(
+                "No ZeroClaw configuration at {}. Reading a target must not create \
+                 one; run `zeroclaw quickstart` against that install root first, or \
+                 use the load-or-init entry point if creating it is intended.",
+                zeroclaw_dir.join("config.toml").display()
+            );
+        }
 
         // One-time, V<3 → V3 ONLY move of `<install>/workspace/` into
         // `<install>/agents/default/workspace/`. The "default" alias is
@@ -20082,9 +20192,13 @@ impl Config {
             // configuration before any runtime client or tool is constructed.
             // Interactive proxy_config updates use the same live state.
             set_runtime_proxy_config(config.proxy.clone());
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source, "initialized": true})), "Config loaded");
             Ok(config)
         } else {
+            // Unreachable under `RequireExisting`: the guard at the top of this
+            // function already refused a root with no `config.toml`, before any
+            // directory was created.
+            debug_assert_eq!(init_policy, InitPolicy::CreateIfMissing);
             let mut config = Config {
                 config_path: config_path.clone(),
                 data_dir: workspace_dir,
@@ -20120,7 +20234,7 @@ impl Config {
                 );
             }
             set_runtime_proxy_config(config.proxy.clone());
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source, "initialized": true})), "Config loaded");
             Ok(config)
         }
     }
@@ -31045,6 +31159,195 @@ scope = "zeroclaw"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    // ---- path-pinned loading -------------------------------------------
+    //
+    // `load_or_init()` resolves its install root from the process
+    // environment. That makes a second target unserviceable in the same
+    // process and forces tests to mutate env under a lock. `load_or_init_at`
+    // and `load_at` take the root as an argument instead; the ambient entry
+    // point delegates to them, so there is still one load implementation.
+
+    /// A temp install root that is removed when the test finishes.
+    fn pinned_test_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("zeroclaw_pinned_{tag}_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn write_config_with_proxy(root: &Path, proxy_host: &str) {
+        fs::create_dir_all(root).await.unwrap();
+        fs::write(
+            root.join("config.toml"),
+            format!(
+                r#"
+schema_version = 3
+
+[proxy]
+enabled = true
+http_proxy = "http://{proxy_host}:3128"
+scope = "zeroclaw"
+"#
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    async fn load_or_init_at_pins_the_root_and_ignores_ambient_env() {
+        let _env_guard = env_override_lock().await;
+        let ambient = pinned_test_root("ambient");
+        let pinned = pinned_test_root("pinned");
+
+        // Point every ambient knob at a *different* root than the pinned one.
+        let prev_config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        let prev_workspace = std::env::var("ZEROCLAW_WORKSPACE").ok();
+        set_or_clear_env("ZEROCLAW_CONFIG_DIR", ambient.to_str());
+        set_or_clear_env("ZEROCLAW_WORKSPACE", ambient.to_str());
+
+        let config = Box::pin(Config::load_or_init_at(pinned.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.config_path,
+            pinned.join("config.toml"),
+            "the pinned root must win over ZEROCLAW_CONFIG_DIR"
+        );
+        assert_eq!(config.data_dir, pinned.join("data"));
+        assert!(
+            !ambient.exists(),
+            "a pinned load must not touch the ambient root at all"
+        );
+
+        set_or_clear_env("ZEROCLAW_CONFIG_DIR", prev_config_dir.as_deref());
+        set_or_clear_env("ZEROCLAW_WORKSPACE", prev_workspace.as_deref());
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _ = fs::remove_dir_all(&pinned).await;
+    }
+
+    #[test]
+    async fn load_or_init_at_creates_the_install_layout_at_the_pinned_root() {
+        let _env_guard = env_override_lock().await;
+        let root = pinned_test_root("fresh");
+
+        let config = Box::pin(Config::load_or_init_at(root.clone()))
+            .await
+            .unwrap();
+
+        assert!(root.join("config.toml").exists());
+        assert!(root.join("data").is_dir());
+        assert!(root.join("shared").is_dir());
+        assert_eq!(config.config_path, root.join("config.toml"));
+        assert_eq!(config.data_dir, root.join("data"));
+        assert!(
+            !root.join("agents").exists(),
+            "fresh init must not create the agents/ tree"
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _ = fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
+    async fn pinned_and_ambient_loaders_agree_on_the_same_root() {
+        // The delegation is the point: the ambient path must be the pinned
+        // path plus environment resolution, never a second implementation.
+        let _env_guard = env_override_lock().await;
+        let root = pinned_test_root("agree");
+        write_config_with_proxy(&root, "agree.example").await;
+
+        let prev_config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        set_or_clear_env("ZEROCLAW_CONFIG_DIR", root.to_str());
+        let ambient = Box::pin(Config::load_or_init()).await.unwrap();
+        set_or_clear_env("ZEROCLAW_CONFIG_DIR", prev_config_dir.as_deref());
+
+        let pinned = Box::pin(Config::load_or_init_at(root.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(ambient.config_path, pinned.config_path);
+        assert_eq!(ambient.data_dir, pinned.data_dir);
+        assert_eq!(ambient.proxy.http_proxy, pinned.proxy.http_proxy);
+        assert_eq!(
+            pinned.proxy.http_proxy.as_deref(),
+            Some("http://agree.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _ = fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
+    async fn two_targets_load_independently_from_one_process() {
+        // The phase-1 finding: with only the env-resolved loader, serving two
+        // install roots from one process is impossible.
+        let _env_guard = env_override_lock().await;
+        let root_a = pinned_test_root("target_a");
+        let root_b = pinned_test_root("target_b");
+        write_config_with_proxy(&root_a, "target-a.example").await;
+        write_config_with_proxy(&root_b, "target-b.example").await;
+
+        let a = Box::pin(Config::load_or_init_at(root_a.clone()))
+            .await
+            .unwrap();
+        let b = Box::pin(Config::load_or_init_at(root_b.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(a.config_path, root_a.join("config.toml"));
+        assert_eq!(b.config_path, root_b.join("config.toml"));
+        assert_eq!(
+            a.proxy.http_proxy.as_deref(),
+            Some("http://target-a.example:3128"),
+            "loading the second target must not disturb the first"
+        );
+        assert_eq!(
+            b.proxy.http_proxy.as_deref(),
+            Some("http://target-b.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _ = fs::remove_dir_all(&root_a).await;
+        let _ = fs::remove_dir_all(&root_b).await;
+    }
+
+    #[test]
+    async fn load_at_reads_an_existing_pinned_config() {
+        let _env_guard = env_override_lock().await;
+        let root = pinned_test_root("existing");
+        write_config_with_proxy(&root, "existing.example").await;
+
+        let config = Box::pin(Config::load_at(root.clone())).await.unwrap();
+
+        assert_eq!(config.config_path, root.join("config.toml"));
+        assert_eq!(
+            config.proxy.http_proxy.as_deref(),
+            Some("http://existing.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _ = fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
+    async fn load_at_refuses_a_missing_config_without_creating_anything() {
+        let _env_guard = env_override_lock().await;
+        let root = pinned_test_root("absent");
+
+        let err = Box::pin(Config::load_at(root.clone()))
+            .await
+            .expect_err("reading an uninitialized root must fail");
+        assert!(
+            format!("{err:#}").contains("No ZeroClaw configuration at"),
+            "got {err:#}"
+        );
+        assert!(
+            !root.exists(),
+            "a refused read must not leave a half-built install root behind"
+        );
+
+        let _ = fs::remove_dir_all(&root).await;
     }
 
     #[test]
