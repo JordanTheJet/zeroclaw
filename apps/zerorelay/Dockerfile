@@ -24,7 +24,7 @@ COPY . .
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zerorelay-target,target=/app/target,sharing=locked \
-    cargo build --release -p zerorelay \
+    cargo build --release --locked -p zerorelay \
     && cp target/release/zerorelay /usr/local/bin/zerorelay
 # Seed an empty /data owned by the runtime UID. The runtime stage is distroless
 # (no shell), so the directory cannot be created there. Docker copies an image

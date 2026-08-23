@@ -132,6 +132,11 @@ jobs:
       pinned: ${{ steps.tags.outputs.pinned }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Build the relay image from the SAME immutable ref as the main image
+          # matrix, so a workflow_call release publishes the requested source ref
+          # rather than the caller/default ref.
+          ref: ${{ inputs.release_ref || github.ref }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
@@ -144,8 +149,14 @@ jobs:
 
       - name: Compute relay image tags
         id: tags
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ -n "${RELEASE_REF}" ]; then
+            # workflow_call release: pin to the immutable release ref the caller
+            # requested (matching the main image matrix), not the triggering ref.
+            pinned="${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:${RELEASE_REF}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             pinned="${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:${GITHUB_REF_NAME}"
           else
             pinned="${{ env.REGISTRY }}/${{ env.IMAGE }}-zerorelay:sha-${GITHUB_SHA::12}"
