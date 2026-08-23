@@ -1266,6 +1266,69 @@ establishes who may approve; it does not enable approving."
         #[arg(long, value_name = "NAME")]
         name: String,
     },
+
+    /// Enable management mutations on an initialized instance.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(
+        name = "enable-mutations",
+        long_about = "\
+Enable management mutations on an initialized instance.
+
+The default-installed release is read-only: Request apply, approval, and apply
+are all refused until this ceremony runs. It writes one durable, sealed fact
+under the data root and grants no tool to any agent — enablement lifts a
+refusal, it does not widen a grant.
+
+Host-side only, like genesis: no agent, tool, or MCP session can reach it. It
+runs the user-presence ceremony on this terminal and records the enabling
+operator, who must already be a registered operator. Refuses on an uninitialized
+instance and in recovery-only mode."
+    )]
+    EnableMutations,
+
+    /// Approve a parked proposal, applying it through the control-plane CAS.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Approve a parked proposal an external client requested, applying it.
+
+This is the only path that changes config. It is host-side only and never an MCP
+tool: a client can only PARK a proposal; the mutation happens here, when a
+registered operator distinct from and unreachable by the requester confirms
+presence at this terminal. The approved change is applied through the same
+revision-bound transaction every other apply uses.
+
+Refuses when mutations are disabled, on an uninitialized or recovery-only
+instance, when the operator is the requester or reachable by it, and when the
+parked proposal no longer previews cleanly.")]
+    Approve {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// The operation id the client's request-apply returned.
+        #[arg(long, value_name = "ID")]
+        operation_id: String,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// The operator identity approving. Confirmed at the terminal, not trusted from this flag.
+        #[arg(long, value_name = "NAME")]
+        operator: String,
+    },
+
+    /// Reject a parked proposal. Records a durable rejection; changes no config.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Reject a parked proposal an external client requested.
+
+Host-side only, like approve. A rejection is a durable fact, not an absence, so
+it too requires a registered operator to confirm presence at this terminal — a
+requester cannot reject on an operator's behalf. It changes no config.")]
+    Reject {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// The operation id the client's request-apply returned.
+        #[arg(long, value_name = "ID")]
+        operation_id: String,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// The operator identity rejecting. Confirmed at the terminal, not trusted from this flag.
+        #[arg(long, value_name = "NAME")]
+        operator: String,
+    },
 }
 
 /// Every directory a control-client credential must not be written into.
@@ -1475,6 +1538,117 @@ fn run_control_ceremony(config: &Config, command: ControlCommands) -> Result<()>
                     "Operators hold no credential. This one approves by being present at a \
                      controlling terminal and naming this identity; there is no token to store, \
                      lose, or capture.",
+                )
+            );
+            Ok(())
+        }
+
+        ControlCommands::EnableMutations => {
+            let outcome = zeroclaw_control::management::enable_mutations(
+                &install_root,
+                &presence,
+                t(
+                    "cli-control-enable-mutations-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Enable management mutations on this instance? Type yes to confirm: ",
+                ),
+                t(
+                    "cli-control-enable-mutations-operator",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Enabling operator identity (a registered operator): ",
+                ),
+            )
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            println!(
+                "{}",
+                ta(
+                    "cli-control-mutations-enabled",
+                    &[
+                        ("instance", outcome.instance_id.as_str()),
+                        ("epoch", &outcome.trust_epoch.to_string()),
+                        ("operator", &outcome.enabling_operator),
+                        ("assurance", &outcome.assurance_class),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Management mutations enabled. Enablement grants no tool to any agent.",
+                )
+            );
+            Ok(())
+        }
+
+        ControlCommands::Approve {
+            operation_id,
+            operator,
+        } => {
+            let outcome = zeroclaw::control_operator::approve_operation_blocking(
+                config.config_path.clone(),
+                &operation_id,
+                &operator,
+                &presence,
+                // Production: the host has no reachability prober this phase, so
+                // the requester's isolation from the operator backchannel is
+                // unproven and this fails closed. That is the correct v1 state.
+                zeroclaw_control::Evidence::unknown(),
+                t(
+                    "cli-control-approve-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Approve and apply this parked operation? Type yes to confirm: ",
+                ),
+                t(
+                    "cli-control-approve-operator",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Operator identity (the label you registered as): ",
+                ),
+            )
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            println!(
+                "{}",
+                ta(
+                    "cli-control-approved",
+                    &[
+                        ("operation", &outcome.operation_id),
+                        ("agent", &outcome.agent_alias),
+                        ("state", &outcome.state),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Approved and applied through the control-plane transaction.",
+                )
+            );
+            Ok(())
+        }
+
+        ControlCommands::Reject {
+            operation_id,
+            operator,
+        } => {
+            let outcome = zeroclaw::control_operator::reject_operation_blocking(
+                config.config_path.clone(),
+                &operation_id,
+                &operator,
+                &presence,
+                zeroclaw_control::Evidence::unknown(),
+                t(
+                    "cli-control-reject-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Reject this parked operation? Type yes to confirm: ",
+                ),
+                t(
+                    "cli-control-reject-operator",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Operator identity (the label you registered as): ",
+                ),
+            )
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            println!(
+                "{}",
+                ta(
+                    "cli-control-rejected",
+                    &[
+                        ("operation", &outcome.operation_id),
+                        ("state", &outcome.state),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Rejection recorded. No config changed.",
                 )
             );
             Ok(())
