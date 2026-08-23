@@ -754,15 +754,57 @@ fn open_route_target<'a>(
     }
 }
 
-/// Minimal drop guard: remove `port` from `set` when the returned value drops.
-fn scopeguard_deregister(set: crate::enroll::BridgePortSet, port: u16) -> impl Drop {
-    struct Guard(crate::enroll::BridgePortSet, u16);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            self.0.lock().expect("bridge port set lock").remove(&self.1);
-        }
+/// Drop guard that removes a registered bridge source port from the shared set
+/// when the bridged connection ends, however it ends.
+struct PortGuard(crate::enroll::BridgePortSet, u16);
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        self.0.lock().expect("bridge port set lock").remove(&self.1);
     }
-    Guard(set, port)
+}
+
+/// Bind the outbound loopback source socket and, when `bridge_ports` is set,
+/// register its OS-assigned ephemeral source port in the set BEFORE the caller
+/// connects. Binding first lets us learn and publish the source port while
+/// `connect()` has not yet run: the enrollment listener can only accept a
+/// connection that `connect()` has already initiated, so registering before the
+/// connect call guarantees the accept/classify step observes the port and
+/// classifies the peer as relay-routed rather than `Direct`. Registering AFTER
+/// `connect()` returned (the previous ordering) left a race window in which the
+/// accept task could classify a relay-routed client as `Direct` (B2). Returns
+/// the bound socket, the resolved remote to connect to, and the deregister guard
+/// (held for the connection's lifetime).
+fn bind_and_register(
+    local_addr: &str,
+    bridge_ports: Option<crate::enroll::BridgePortSet>,
+) -> std::io::Result<(
+    tokio::net::TcpSocket,
+    std::net::SocketAddr,
+    Option<PortGuard>,
+)> {
+    let remote: std::net::SocketAddr = local_addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let (socket, bind_addr): (tokio::net::TcpSocket, std::net::SocketAddr) = match remote {
+        std::net::SocketAddr::V4(_) => (
+            tokio::net::TcpSocket::new_v4()?,
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+        ),
+        std::net::SocketAddr::V6(_) => (
+            tokio::net::TcpSocket::new_v6()?,
+            (std::net::Ipv6Addr::LOCALHOST, 0).into(),
+        ),
+    };
+    socket.bind(bind_addr)?;
+    let guard = match bridge_ports {
+        Some(ports) => {
+            let port = socket.local_addr()?.port();
+            ports.lock().expect("bridge port set lock").insert(port);
+            Some(PortGuard(ports, port))
+        }
+        None => None,
+    };
+    Ok((socket, remote, guard))
 }
 
 /// Bridge one logical connection: dial the selected loopback listener, accept the
@@ -779,9 +821,19 @@ async fn bridge_conn(
     // A drop guard deregisters it however this task ends.
     bridge_ports: Option<crate::enroll::BridgePortSet>,
 ) {
-    let local = match TcpStream::connect(local_addr).await {
-        Ok(s) => s,
-        Err(_) => {
+    // Bind the outbound source socket and register its ephemeral source port in
+    // BridgePortSet BEFORE connecting, so the enrollment listener cannot accept
+    // and classify this loopback peer before the port is visible. Registering
+    // after `connect()` returned (the previous ordering) left a window in which
+    // the accept task could classify a relay-routed client as `Direct` (B2).
+    // `_port_guard` deregisters the port on every exit path.
+    let local_and_guard = match bind_and_register(local_addr, bridge_ports) {
+        Ok((socket, remote, guard)) => socket.connect(remote).await.ok().map(|s| (s, guard)),
+        Err(_) => None,
+    };
+    let (local, _port_guard) = match local_and_guard {
+        Some(v) => v,
+        None => {
             let _ = to_relay
                 .send(tungstenite_text(&Control::Close {
                     conn_id,
@@ -792,18 +844,6 @@ async fn bridge_conn(
             return;
         }
     };
-
-    // Register our loopback source port so the enrollment endpoint can classify
-    // this connection as relay-routed. Race-free: the port is live the moment
-    // `connect` returned, and we register before shuttling any bytes. `_port_guard`
-    // deregisters on every exit path.
-    let _port_guard = bridge_ports.and_then(|ports| {
-        local.local_addr().ok().map(|a| {
-            let port = a.port();
-            ports.lock().expect("bridge port set lock").insert(port);
-            scopeguard_deregister(ports, port)
-        })
-    });
     // Accept the connection to the relay (it tells the waiting client).
     let _ = to_relay
         .send(tungstenite_text(&Control::Opened { conn_id }))
@@ -1225,5 +1265,78 @@ mod control_frame_tests {
 
         assert!(oversized.len() > MAX_CONTROL_FRAME);
         assert!(parse_control_text(&oversized).is_none());
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here (the
+// `zeroclaw_spawn::spawn!` attribution rule is for production daemon tasks).
+#[allow(clippy::disallowed_methods)]
+mod bridge_classification_race_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn empty_port_set() -> crate::enroll::BridgePortSet {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    // B2: the outbound source port must be registered in BridgePortSet BEFORE the
+    // connection is established, so the enrollment listener's accept/classify step
+    // can never observe the loopback peer before its port is present (which would
+    // misclassify a relay-routed client as Direct). `bind_and_register` publishes
+    // the port at bind time, strictly before the caller's connect() runs.
+    #[tokio::test]
+    async fn bind_and_register_publishes_source_port_before_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let set = empty_port_set();
+
+        let (socket, remote, _guard) =
+            bind_and_register(&addr, Some(set.clone())).expect("bind+register");
+        let bound_port = socket.local_addr().unwrap().port();
+
+        // Registered at bind time, before any connect() has run.
+        assert!(
+            set.lock().unwrap().contains(&bound_port),
+            "source port must be registered before connect()"
+        );
+
+        // The eventual connection uses exactly that source port, so the
+        // accept-side classification keys on the registered value.
+        let _stream = socket.connect(remote).await.unwrap();
+        let (_srv, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.port(), bound_port);
+        assert!(set.lock().unwrap().contains(&peer.port()));
+    }
+
+    // End-to-end: with bind-register-connect ordering the enrollment listener's
+    // accept always observes the source port already registered, so it classifies
+    // the peer as RelayBridge. Holds by happens-before: register() is sequenced
+    // before connect(), and accept() can only return a connection that connect()
+    // has already initiated.
+    #[tokio::test]
+    async fn accept_side_classifies_relay_before_any_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let set = empty_port_set();
+        let set_dialer = set.clone();
+
+        let dialer = tokio::spawn(async move {
+            let (socket, remote, guard) =
+                bind_and_register(&addr, Some(set_dialer)).expect("bind+register");
+            let stream = socket.connect(remote).await.expect("connect");
+            // Hold the connection (and its port registration) open.
+            (stream, guard)
+        });
+
+        let (_srv, peer) = listener.accept().await.unwrap();
+        // Mirror the enrollment accept-loop classification predicate.
+        let is_relay_class = peer.ip().is_loopback() && set.lock().unwrap().contains(&peer.port());
+        assert!(
+            is_relay_class,
+            "relay-routed peer {peer} must classify as RelayBridge at accept time"
+        );
+
+        let _held = dialer.await.unwrap();
     }
 }
