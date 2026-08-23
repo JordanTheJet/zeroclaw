@@ -447,14 +447,32 @@ impl RequesterSubject {
 
     /// Whether this subject and `identity` name the same principal.
     ///
-    /// Both sides normalize identically (see [`Self::new`]), so this is a
-    /// straight comparison rather than a fuzzy match. A fuzzy match here would
-    /// be a vulnerability in the other direction: it would let an operator be
-    /// declared "the requester" and refused when it is not.
+    /// Compared under a case fold ([`fold_identity`]), so `Jordan` and `jordan`
+    /// are the same principal and the capitalised form cannot slip the
+    /// "approver is the requester" check. Folding is the safe direction here:
+    /// it can only make *more* pairings count as the same principal, which means
+    /// *more* self-approvals are refused, never fewer. The stored identity is
+    /// untouched — this normalizes for the comparison only.
     #[must_use]
     pub fn is(&self, identity: &OperatorIdentity) -> bool {
-        self.0 == identity.as_str()
+        fold_identity(&self.0) == fold_identity(identity.as_str())
     }
+}
+
+/// Fold an identity for a distinctness comparison only.
+///
+/// Applies Unicode simple case folding through [`char::to_lowercase`], which is
+/// enough to unify `Jordan`/`jordan` and other case variants. Comparison only:
+/// no stored identity is ever mutated by this.
+///
+/// Limitation: this is case folding, not NFC normalization. Canonically
+/// equivalent but differently composed strings — a precomposed `é` versus `e`
+/// plus a combining accent — still compare distinct. Closing that gap needs
+/// `unicode-normalization`, which is not a direct dependency of this crate;
+/// adding it is out of scope here, so the residual is documented rather than
+/// fixed.
+fn fold_identity(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
 }
 
 impl std::fmt::Display for RequesterSubject {
@@ -812,9 +830,21 @@ impl OperatorRegistry {
     /// load. If a later registration somehow recorded the same identity, the
     /// genesis entry wins and the duplicate is dropped — the trust root outranks
     /// a file written after it.
+    ///
+    /// One exception, so the first operator is revocable like any other: if the
+    /// loaded registry — authenticated under the ADR-015 key, so this is a
+    /// host-written fact, not an attacker's — already records this identity as
+    /// [`OperatorStatus::Revoked`], that sealed revocation is honored over the
+    /// genesis default. Only the status is taken from the sealed record; origin,
+    /// epoch, and provenance still come from genesis, so a later file cannot
+    /// retarget the first operator's provenance, only revoke it.
     #[must_use]
     pub fn with_genesis_operator(mut self, record: &GenesisRecord) -> Self {
         let identity = OperatorIdentity::from(record.first_operator.clone());
+        let status = match self.operators.get(&identity) {
+            Some(existing) if existing.status == OperatorStatus::Revoked => OperatorStatus::Revoked,
+            _ => OperatorStatus::Active,
+        };
         self.operators.insert(
             identity.clone(),
             OperatorRecord {
@@ -824,7 +854,7 @@ impl OperatorRegistry {
                 created_at_unix_secs: record.created_at_unix_secs,
                 created_by_genesis_digest: record.digest(),
                 ceremony_presence_class: record.user_presence_class,
-                status: OperatorStatus::Active,
+                status,
             },
         );
         self
@@ -1334,13 +1364,19 @@ fn load_clients_for_collision_check(
 }
 
 /// Refuse an operator identity that names a known requester subject.
+///
+/// The comparison is case-folded ([`fold_identity`]), so registering an operator
+/// `Jordan` is refused when a client `jordan` already exists — the confusable
+/// pair the byte-exact check would have let through. Comparison only; the stored
+/// identities and registrations are untouched.
 fn refuse_requester_collision(
     identity: &OperatorIdentity,
     clients: &ClientRegistry,
 ) -> Result<(), OperatorError> {
+    let folded = fold_identity(identity.as_str());
     for registration in clients.iter() {
-        if registration.registration_id.as_str() == identity.as_str()
-            || registration.client_label.as_str() == identity.as_str()
+        if fold_identity(registration.registration_id.as_str()) == folded
+            || fold_identity(registration.client_label.as_str()) == folded
         {
             return Err(OperatorError::new(
                 OperatorErrorCode::IdentityCollidesWithRequester,
@@ -2086,6 +2122,111 @@ mod tests {
             assert_eq!(err.code, OperatorErrorCode::IdentityCollidesWithRequester);
             assert_eq!(presence.prompts(), 0);
         }
+    }
+
+    #[test]
+    fn requester_subject_distinctness_is_case_insensitive() {
+        // 'Jordan' and 'jordan' are the same principal for the
+        // approver-is-the-requester check. A byte-exact comparison let the
+        // capitalised form slip it.
+        let subject = RequesterSubject::new("Jordan").expect("subject");
+        assert!(
+            subject.is(&operator("jordan")),
+            "case must not distinguish a requester from an operator"
+        );
+        assert!(
+            subject.is(&operator("JORDAN")),
+            "an all-caps operator is still the same principal"
+        );
+        assert!(
+            !subject.is(&operator("morgan")),
+            "distinct names remain distinct"
+        );
+    }
+
+    #[test]
+    fn a_case_variant_of_the_requester_cannot_authenticate_as_operator() {
+        // The distinctness check is re-applied at authentication under the fold,
+        // so a requester 'Jordan' cannot use operator 'jordan'.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_root, _paths, record) = genesis_instance(&tmp);
+        let operators = OperatorRegistry::new().with_genesis_operator(&record);
+        let requester = RequesterContext::external(
+            RequesterSubject::new("Jordan").expect("subject"),
+            agent_domain(),
+            Evidence::fully_isolated(),
+        );
+        let err = authenticate(
+            &ScriptedPresence::affirming("jordan"),
+            &operator("jordan"),
+            &operators,
+            record.trust_epoch,
+            &requester,
+        )
+        .expect_err("a case variant of the requester is still the requester");
+        assert_eq!(err.code, OperatorErrorCode::OperatorIsTheRequester);
+    }
+
+    #[test]
+    fn an_operator_identity_that_case_collides_with_a_client_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_root, paths, record) = genesis_instance(&tmp);
+        let key = key_for(&paths, &record);
+
+        let issued = crate::client_registry::ClientRegistration::issue(
+            &ClientGrant::full_v1(
+                ClientLabel::new("claude-code").expect("label"),
+                CredentialDelivery::IsolatedDescriptor,
+                record.instance_id.clone(),
+            ),
+            TrustEpoch::GENESIS,
+            1,
+            record.digest(),
+            PresenceClass::Terminal,
+            &key,
+        )
+        .expect("issue");
+        let mut clients = ClientRegistry::new();
+        clients.insert(issued.registration).expect("insert");
+
+        // The exact label and its case variants all collide.
+        for candidate in ["claude-code", "Claude-Code", "CLAUDE-CODE"] {
+            let err = refuse_requester_collision(&operator(candidate), &clients)
+                .expect_err("an operator must not case-collide with a client label");
+            assert_eq!(err.code, OperatorErrorCode::IdentityCollidesWithRequester);
+        }
+    }
+
+    #[test]
+    fn a_sealed_revocation_of_the_genesis_operator_is_honored() {
+        // The genesis first operator must be revocable. A sealed Revoked record
+        // for its identity outranks the Active genesis default, so
+        // `with_genesis_operator` does not resurrect it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_root, _paths, record) = genesis_instance(&tmp);
+        let mut registry = OperatorRegistry::new();
+        registry
+            .insert(OperatorRecord {
+                identity: operator("jordan"),
+                origin: OperatorOrigin::Registered,
+                trust_epoch: record.trust_epoch,
+                created_at_unix_secs: 1,
+                created_by_genesis_digest: record.digest(),
+                ceremony_presence_class: PresenceClass::Terminal,
+                status: OperatorStatus::Revoked,
+            })
+            .expect("insert");
+
+        let view = registry.with_genesis_operator(&record);
+        assert!(
+            view.get(&operator("jordan")).is_some(),
+            "the record is still present"
+        );
+        assert!(
+            view.get_active(&operator("jordan")).is_none(),
+            "a sealed revocation of the genesis operator is honored"
+        );
+        assert_eq!(view.active_count(), 0, "no operator remains active");
     }
 
     #[test]
