@@ -50,6 +50,8 @@ pub mod config;
 #[cfg(feature = "agent-runtime")]
 pub mod control_mcp;
 #[cfg(feature = "agent-runtime")]
+pub mod control_operator;
+#[cfg(feature = "agent-runtime")]
 pub(crate) mod cost;
 #[cfg(feature = "agent-runtime")]
 pub mod cron;
