@@ -19766,11 +19766,17 @@ impl Config {
         let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
-        Self::load_pinned(
+        // Boxed deliberately. `load_pinned`'s state machine holds several
+        // `Config` values and is very large; embedding it inline here would
+        // make every `Config::load_or_init()` future that large too, and a
+        // caller doing `Box::pin(Config::load_or_init())` materializes the
+        // future on the stack before it reaches the heap. That combination
+        // overflowed a 2 MiB worker stack. Keep the delegation boxed.
+        Box::pin(Self::load_pinned(
             zeroclaw_dir,
             resolution_source.as_str(),
             InitPolicy::CreateIfMissing,
-        )
+        ))
         .await
     }
 
@@ -19799,11 +19805,12 @@ impl Config {
     /// Propagates directory creation, parse, decryption, and env-override
     /// failures exactly as [`Config::load_or_init`] does.
     pub async fn load_or_init_at(install_root: PathBuf) -> Result<Self> {
-        Self::load_pinned(
+        // Boxed for the same reason as `load_or_init`; see the note there.
+        Box::pin(Self::load_pinned(
             install_root,
             EXPLICIT_PATH_SOURCE,
             InitPolicy::CreateIfMissing,
-        )
+        ))
         .await
     }
 
@@ -19820,11 +19827,12 @@ impl Config {
     /// Returns an error when `install_root` holds no `config.toml`, plus every
     /// failure [`Config::load_or_init_at`] propagates.
     pub async fn load_at(install_root: PathBuf) -> Result<Self> {
-        Self::load_pinned(
+        // Boxed for the same reason as `load_or_init`; see the note there.
+        Box::pin(Self::load_pinned(
             install_root,
             EXPLICIT_PATH_SOURCE,
             InitPolicy::RequireExisting,
-        )
+        ))
         .await
     }
 
@@ -31191,6 +31199,41 @@ scope = "zeroclaw"
         )
         .await
         .unwrap();
+    }
+
+    /// Regression guard for a stack overflow.
+    ///
+    /// When `load_or_init` delegated to `load_pinned` with a bare `.await`,
+    /// it embedded that very large state machine inline. Callers that write
+    /// `Box::pin(Config::load_or_init())` materialize the future on the stack
+    /// before it reaches the heap, and the combination aborted
+    /// `zeroclaw-control`'s `control_service` tests with
+    /// "has overflowed its stack". The delegation is boxed to keep these
+    /// futures pointer-sized; this test fails if that boxing is removed.
+    #[test]
+    async fn loader_futures_stay_small_enough_for_callers_to_box() {
+        const MAX: usize = 4096;
+        for (name, size) in [
+            (
+                "load_or_init",
+                std::mem::size_of_val(&Config::load_or_init()),
+            ),
+            (
+                "load_or_init_at",
+                std::mem::size_of_val(&Config::load_or_init_at(PathBuf::from("/nonexistent"))),
+            ),
+            (
+                "load_at",
+                std::mem::size_of_val(&Config::load_at(PathBuf::from("/nonexistent"))),
+            ),
+        ] {
+            assert!(
+                size <= MAX,
+                "`Config::{name}()` returns a {size}-byte future; over {MAX} bytes it \
+                 risks overflowing a caller's stack at `Box::pin(...)`. Keep the \
+                 delegation to `load_pinned` boxed."
+            );
+        }
     }
 
     #[test]
