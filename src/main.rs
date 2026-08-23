@@ -1115,10 +1115,24 @@ With --mcp, serve the read-only control protocol as an MCP server over stdio
 process pins this install's config root at startup, exposes no tool that
 changes host state, and makes no model-provider request.
 
-Until client registration ships, a launched session is an unregistered
-requester: it sees only control.ping, control.server_info, and
-control.registration_help. Registration is an operator ceremony on the host and
-cannot be performed through this session.
+A launched session with no credential is an unregistered requester: it sees
+only control.ping, control.server_info, and control.registration_help. A
+registered client presents the credential its registration ceremony issued, and
+sees the read tools its grant covers.
+
+The credential never travels on the command line or in an environment value.
+Present it one of two ways, matching the assurance class the registration was
+created under:
+
+  isolated_descriptor    Open the credential file yourself and pass the
+                         descriptor number in ZEROCLAW_CONTROL_CREDENTIAL_FD.
+                         The variable carries a number, not a secret.
+  sandbox_isolated_store Name a command with --credential-helper. It is run
+                         directly, with no shell and no arguments, and must
+                         print the credential on standard output.
+
+Presenting a credential that does not verify is a refusal, never a downgrade to
+an unregistered session.
 
 Ceremonies establish this installation's control-plane trust root. They are
 host-side only: no agent, tool, or MCP session can reach them, and they make no
@@ -1126,6 +1140,10 @@ model-provider request and no network request.
 
 Examples:
   zeroclaw control --mcp
+  zeroclaw control --mcp --client-id reg-0123abcd 3<~/.zeroclaw-clients/cc.cred \\
+      ZEROCLAW_CONTROL_CREDENTIAL_FD=3
+  zeroclaw control --mcp --client-id reg-0123abcd \\
+      --credential-helper ~/.zeroclaw-clients/read-cc-credential
   zeroclaw control genesis
   zeroclaw control register-client --name claude-code \\
       --credential-out ~/.zeroclaw-clients/claude-code.cred \\
@@ -1134,6 +1152,14 @@ Examples:
         /// Serve the read-only control protocol over stdio as an MCP server.
         #[arg(long)]
         mcp: bool,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Registration id of the client presenting a credential (attribution, not a secret).
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Command that prints this client's credential on stdout. No shell, no arguments.
+        #[arg(long, value_name = "COMMAND")]
+        credential_helper: Option<PathBuf>,
         #[command(subcommand)]
         control_command: Option<ControlCommands>,
     },
@@ -5588,6 +5614,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
         // read-only control surface does from a terminal.
         Commands::Control {
             mcp,
+            client_id,
+            credential_helper,
             control_command,
         } => {
             // A ceremony is host-side and synchronous: no transport, no model
@@ -5603,7 +5631,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 return Ok(());
             }
-            Box::pin(zeroclaw::control_mcp::run(config.config_path.clone())).await
+            // Credential options are read by the transport, which decides
+            // whether they yield a registered session. Nothing here inspects,
+            // logs, or defaults them.
+            Box::pin(zeroclaw::control_mcp::run(
+                config.config_path.clone(),
+                client_id,
+                credential_helper,
+            ))
+            .await
         }
 
         Commands::Update {

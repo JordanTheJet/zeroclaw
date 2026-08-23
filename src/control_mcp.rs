@@ -21,9 +21,39 @@
 //!   `CapabilityRestrictedProviderFactory::create_isolated_model_provider_for_alias`,
 //!   which only `ZeronaSession` calls and which this transport never reaches.
 //! - **It cannot register itself.** Launching the command creates a requester
-//!   principal. `ControlSession::unregistered()` is the only session
-//!   constructor production code can reach, so a released build has no
-//!   inhabited grant at all.
+//!   principal. A session becomes registered only by *presenting* a credential
+//!   an operator ceremony already minted, and only the control crate decides
+//!   whether that credential authenticates. This module carries the secret from
+//!   the operator's chosen delivery mechanism to `authenticate_client` and
+//!   holds no opinion about the answer.
+//!
+//! # Credential delivery
+//!
+//! The principals design allows exactly two delivery assurance classes, and
+//! this transport implements exactly one mechanism for each. Which mechanism
+//! was used *is* the presented class: it is not a value the caller states, so a
+//! client cannot claim an assurance it did not achieve.
+//!
+//! | Mechanism | Presented class |
+//! |---|---|
+//! | An inherited descriptor named by `ZEROCLAW_CONTROL_CREDENTIAL_FD` | `isolated_descriptor` |
+//! | A helper command named by `--credential-helper` | `sandbox_isolated_store` |
+//!
+//! Neither mechanism puts secret material on `argv` or in an environment
+//! *value*:
+//!
+//! - `ZEROCLAW_CONTROL_CREDENTIAL_FD` carries a **descriptor number**, not a
+//!   credential. The number is meaningless outside this process's descriptor
+//!   table: anyone reading the environment of this process learns "fd 3", which
+//!   is not a secret and cannot be redeemed anywhere. The secret itself travels
+//!   through the descriptor, which the supervising client opened and which an
+//!   agent subprocess does not inherit. This is the mechanism the design calls
+//!   an inherited descriptor, and reading a number out of the environment to
+//!   find it is not the thing the design forbids — passing the credential
+//!   *itself* through "an ordinary environment variable" is.
+//! - `--credential-helper` carries a **command name**. The command is executed
+//!   directly, with no shell, no arguments, and no interpretation, so no part
+//!   of a secret can be spliced into it.
 //!
 //! # stdout discipline
 //!
@@ -32,26 +62,28 @@
 //! so two responses can never interleave bytes, and every diagnostic goes
 //! through `zeroclaw_log`, which writes to stderr.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroclaw_api::jsonrpc::error_codes;
 use zeroclaw_control::protocol::{
     Advertisement, CONTROL_PROTOCOL_MAJOR, CatalogRequest, ControlErrorCode, DescribeRequest,
     Diagnostic, Envelope, ErrorPayload, InspectRequest, InspectResult, LOCAL_TARGET_ID,
     OPERATION_AGENT_CREATE_CONTAINED, PingResult, PreviewRequest, PreviewResult, ProtocolError,
-    ServerInfoResult, SessionInfo, TOOL_CATALOG, TOOL_DESCRIBE, TOOL_INSPECT, TOOL_PING,
-    TOOL_PREVIEW, TOOL_REGISTRATION_HELP, TOOL_SERVER_INFO, TOOL_VALIDATE, TOOLS, TargetRef,
-    TargetSelector, ValidateRequest, ValidateResult, canonical_json, catalog, dependency_digest,
-    describe, diagnostic_for, inspect_view, instance_fingerprint, operation_digest,
-    operation_digest_for, preview_effects, preview_risks, protocol_error_for, sha256_hex,
-    source_revision_id, verification_plan,
+    STARTUP_REFUSAL_META_KEY, ServerInfoResult, SessionInfo, StartupRefusal, StartupRefusalCode,
+    TOOL_CATALOG, TOOL_DESCRIBE, TOOL_INSPECT, TOOL_PING, TOOL_PREVIEW, TOOL_REGISTRATION_HELP,
+    TOOL_SERVER_INFO, TOOL_VALIDATE, TOOLS, TargetRef, TargetSelector, ValidateRequest,
+    ValidateResult, canonical_json, catalog, dependency_digest, describe, diagnostic_for,
+    inspect_view, instance_fingerprint, operation_digest, operation_digest_for, preview_effects,
+    preview_risks, protocol_error_for, sha256_hex, source_revision_id, verification_plan,
 };
 use zeroclaw_control::{
-    ControlError, ControlInspection, ControlService, ControlSession, PROPOSAL_DOMAIN_AGENT,
-    ProposalPreview, registration_help,
+    ClientCredential, ControlError, ControlInspection, ControlPaths, ControlService,
+    ControlSession, CredentialDelivery, PROPOSAL_DOMAIN_AGENT, ProposalPreview,
+    authenticate_client, registration_help,
 };
 use zeroclaw_runtime::quickstart::Surface;
 
@@ -72,6 +104,38 @@ const PREVIEW_TTL_SECONDS: i64 = 900;
 /// Frames larger than this end the session rather than being buffered further.
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
+/// Names the descriptor the credential arrives on. Carries a **number**, never
+/// secret material — see the module documentation.
+const CREDENTIAL_FD_ENV: &str = "ZEROCLAW_CONTROL_CREDENTIAL_FD";
+
+/// Upper bound on what a delivery mechanism may hand back.
+///
+/// A credential is 64 hex characters plus a newline. The cap is generous enough
+/// to tolerate a helper that adds trailing whitespace and small enough that a
+/// runaway or hostile helper cannot make this process buffer without bound. The
+/// read stops at the cap rather than after it, so oversize input is refused
+/// rather than truncated into something that might parse.
+const MAX_CREDENTIAL_BYTES: u64 = 4096;
+
+/// How long a credential helper may take.
+///
+/// Short on purpose: a helper is expected to read a local file or query an
+/// already-unlocked store. A helper that blocks on a prompt has not achieved
+/// the sandbox-isolated-store class this mechanism claims, and hanging the
+/// server on it would turn a misconfiguration into an unexplained stall.
+const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The exclusive host lock, under the control state directory.
+const HOST_LOCK_FILE: &str = "host.lock";
+
+/// The lowest descriptor number the inherited-descriptor mechanism accepts.
+///
+/// 0, 1, and 2 are refused. Standard input and standard output *are* the
+/// protocol channel, so reading a credential from one would consume the client's
+/// frames; and a credential delivered on a descriptor the client is also using
+/// for diagnostics is not isolated in any sense the design would recognize.
+const LOWEST_ACCEPTED_CREDENTIAL_FD: i32 = 3;
+
 /// One read-only control session over a stdio JSON-RPC channel.
 pub struct ControlMcpServer {
     service: ControlService,
@@ -81,12 +145,16 @@ pub struct ControlMcpServer {
 }
 
 impl ControlMcpServer {
-    /// The server a launched `zeroclaw control --mcp` process runs.
+    /// The server a launched `zeroclaw control --mcp` process runs when it
+    /// presents no credential.
     ///
     /// The config root is pinned here, at startup, and no tool accepts a target
-    /// path afterwards. The session is unregistered because registration is an
-    /// operator ceremony on the host that phase 3 introduces; nothing this
-    /// process can observe about itself upgrades that classification.
+    /// path afterwards. The session is unregistered because nothing was
+    /// presented: registration is an operator ceremony on the host, and nothing
+    /// this process can observe about itself — a TTY, a loopback address, its
+    /// parent, its OS account, an environment value — upgrades that
+    /// classification. A session that *did* present a credential is built by
+    /// [`start`] instead, from a grant the control crate verified.
     ///
     /// `Surface::Cli` attributes commits this transport cannot perform. It is
     /// required to build a `ControlService` and is never consulted, because
@@ -102,10 +170,12 @@ impl ControlMcpServer {
 
     /// The same server over an explicitly constructed service and session.
     ///
-    /// A caller can only supply a registered session if it can construct a
-    /// `RequesterGrant`, which is possible only under the control crate's
-    /// test-only `fixture-grants` feature. In a released build this constructor
-    /// is therefore equivalent to [`ControlMcpServer::new`].
+    /// A caller can supply a registered session only if it holds a
+    /// `ControlSession::Registered`, and the only two things that produce one
+    /// are `zeroclaw_control::authenticate_client` — which demands a verified
+    /// registration on this instance — and the control crate's test-only
+    /// `fixture-grants` constructors. Passing a session in does not create
+    /// authority; it carries authority that was already established.
     #[must_use]
     pub fn with_service_and_session(
         service: ControlService,
@@ -693,14 +763,522 @@ fn process_nonce() -> String {
     sha256_hex(format!("{}:{now}", std::process::id()).as_bytes())
 }
 
-/// Run the read-only control MCP server on this process's stdin and stdout.
+// ---------------------------------------------------------------------------
+// Credential delivery
+// ---------------------------------------------------------------------------
+
+/// How a launched process was told to obtain its client credential.
+///
+/// One variant per delivery assurance class the principals design accepts.
+/// There is no third variant, so there is no mechanism this transport can use
+/// that resolves to `uid_ambient` or to anything the fixture path spells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialMechanism {
+    /// A descriptor the supervising client opened and this process inherited.
+    #[cfg(unix)]
+    InheritedDescriptor(i32),
+    /// A command that prints the credential on its standard output.
+    Helper(PathBuf),
+}
+
+impl CredentialMechanism {
+    /// The delivery assurance class using this mechanism *is*.
+    ///
+    /// Derived from the mechanism rather than declared by the caller: a client
+    /// cannot present a credential one way and claim the other class, because
+    /// no input names the class.
+    #[must_use]
+    pub const fn delivery_class(&self) -> CredentialDelivery {
+        match self {
+            #[cfg(unix)]
+            Self::InheritedDescriptor(_) => CredentialDelivery::IsolatedDescriptor,
+            Self::Helper(_) => CredentialDelivery::SandboxIsolatedStore,
+        }
+    }
+}
+
+/// What the command line and environment said about credential delivery.
+///
+/// Either both a client identifier and a mechanism, or neither. There is no
+/// third shape, which is what makes "no credential was offered" and "a
+/// credential was offered and failed" impossible to confuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlLaunch {
+    client_id: Option<String>,
+    mechanism: Option<CredentialMechanism>,
+}
+
+impl ControlLaunch {
+    /// The launch a process with no credential options has.
+    ///
+    /// Serves an unregistered session: exactly the surface, framing, and
+    /// responses of a build with no registration support at all.
+    #[must_use]
+    pub const fn unregistered() -> Self {
+        Self {
+            client_id: None,
+            mechanism: None,
+        }
+    }
+
+    /// Resolve the launch from the two CLI options and the descriptor
+    /// environment variable.
+    ///
+    /// Every incoherent combination is a refusal rather than a fallback,
+    /// because the failure mode a fallback creates is the dangerous one: an
+    /// operator who mistypes an option and silently gets an unregistered
+    /// session sees "my client lost its tools" and has no way to tell that from
+    /// a revoked registration.
+    ///
+    /// Refused combinations:
+    ///
+    /// - **Both mechanisms.** Which class was presented would be a coin toss.
+    /// - **A mechanism with no `--client-id`.** The registration identifier is
+    ///   attribution, not authentication, but without it the host would have to
+    ///   guess which registration a secret belongs to, and "try them all" turns
+    ///   one client's credential into a lookup across every registration.
+    /// - **`--client-id` with no mechanism.** The operator asked for a
+    ///   registered session and offered nothing to authenticate it with.
+    /// - **A descriptor that is not a number, or is 0, 1, or 2.**
+    /// - **A descriptor on a platform with no descriptor inheritance.**
+    ///
+    /// An absent environment variable is absent. An empty or blank one is
+    /// present and malformed, and refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupRefusalCode::CredentialMechanismInvalid`] for every
+    /// combination above.
+    pub fn resolve(
+        client_id: Option<String>,
+        credential_helper: Option<PathBuf>,
+    ) -> Result<Self, StartupRefusal> {
+        let invalid = || StartupRefusal::new(StartupRefusalCode::CredentialMechanismInvalid);
+        let descriptor = std::env::var_os(CREDENTIAL_FD_ENV);
+
+        let mechanism = match (descriptor, credential_helper) {
+            (None, None) => None,
+            (Some(_), Some(_)) => return Err(invalid()),
+            (Some(raw), None) => Some(parse_descriptor_mechanism(&raw)?),
+            (None, Some(command)) => {
+                if command.as_os_str().is_empty() {
+                    return Err(invalid());
+                }
+                Some(CredentialMechanism::Helper(command))
+            }
+        };
+
+        let client_id = match client_id {
+            Some(id) if id.trim().is_empty() => return Err(invalid()),
+            other => other,
+        };
+
+        match (client_id, mechanism) {
+            (None, None) => Ok(Self::unregistered()),
+            (Some(client_id), Some(mechanism)) => Ok(Self {
+                client_id: Some(client_id),
+                mechanism: Some(mechanism),
+            }),
+            _ => Err(invalid()),
+        }
+    }
+
+    /// Whether this launch presents a credential at all.
+    #[must_use]
+    pub const fn presents_credential(&self) -> bool {
+        self.mechanism.is_some()
+    }
+}
+
+/// Parse the descriptor environment value into a mechanism.
+#[cfg(unix)]
+fn parse_descriptor_mechanism(
+    raw: &std::ffi::OsStr,
+) -> Result<CredentialMechanism, StartupRefusal> {
+    let invalid = || StartupRefusal::new(StartupRefusalCode::CredentialMechanismInvalid);
+    let number: i32 = raw
+        .to_str()
+        .ok_or_else(invalid)?
+        .trim()
+        .parse()
+        .map_err(|_| invalid())?;
+    if number < LOWEST_ACCEPTED_CREDENTIAL_FD {
+        return Err(invalid());
+    }
+    Ok(CredentialMechanism::InheritedDescriptor(number))
+}
+
+/// Descriptor inheritance is a POSIX contract. A platform without it has no
+/// isolated-descriptor mechanism to offer, and pretending otherwise would let a
+/// registration claim an assurance class the host cannot deliver.
+#[cfg(not(unix))]
+fn parse_descriptor_mechanism(
+    _raw: &std::ffi::OsStr,
+) -> Result<CredentialMechanism, StartupRefusal> {
+    Err(StartupRefusal::new(
+        StartupRefusalCode::CredentialMechanismInvalid,
+    ))
+}
+
+/// Obtain the credential the mechanism names.
+///
+/// Bounded in size and, for the helper, in time. The bytes are parsed into a
+/// [`ClientCredential`] — which has no `Serialize`, no `Display`, and a
+/// redacted `Debug` — and the intermediate buffer is zeroed before this
+/// function returns, so the only copy that outlives it is the one the control
+/// crate will consume and drop.
+async fn obtain_credential(
+    mechanism: &CredentialMechanism,
+) -> Result<ClientCredential, StartupRefusal> {
+    let unavailable = || StartupRefusal::new(StartupRefusalCode::CredentialUnavailable);
+    let mut raw = match mechanism {
+        #[cfg(unix)]
+        CredentialMechanism::InheritedDescriptor(fd) => read_inherited_descriptor(*fd)?,
+        CredentialMechanism::Helper(command) => run_credential_helper(command).await?,
+    };
+    if raw.len() as u64 > MAX_CREDENTIAL_BYTES {
+        raw.fill(0);
+        return Err(unavailable());
+    }
+    let parsed = std::str::from_utf8(&raw)
+        .ok()
+        .and_then(|text| ClientCredential::from_delivery_hex(text).ok());
+    raw.fill(0);
+    parsed.ok_or_else(unavailable)
+}
+
+/// Read the credential from an inherited descriptor and close it.
+///
+/// Closing matters: a descriptor left open is a live handle on the credential
+/// source for the whole life of the process, and this transport spawns nothing
+/// that should ever be able to reach it.
+#[cfg(unix)]
+fn read_inherited_descriptor(fd: i32) -> Result<Vec<u8>, StartupRefusal> {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: the launching client's contract is that this descriptor number
+    // names an open description it transferred to this process. Taking
+    // ownership is what lets the read close it. A number that names nothing
+    // fails the read below and refuses; 0, 1, and 2 were refused before this
+    // point, so the protocol channel cannot be consumed here.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut out = Vec::new();
+    file.take(MAX_CREDENTIAL_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| StartupRefusal::new(StartupRefusalCode::CredentialUnavailable))?;
+    Ok(out)
+}
+
+/// Run the credential helper and read its standard output.
+///
+/// The command is the program, and only the program: it is passed to
+/// `Command::new` with no arguments and no shell, so nothing in it is word
+/// split, glob expanded, or substituted. An operator who needs arguments wraps
+/// the invocation in a script and names the script here — which also gives the
+/// approved-helper identity the design wants to record a single stable name.
+///
+/// The child gets a null standard input and a null standard error. Null stderr
+/// is not tidiness: an inherited stderr on a helper that echoes what it read
+/// would print a credential to the operator's terminal, and an inherited stdout
+/// would interleave it with this server's JSON-RPC frames.
+async fn run_credential_helper(command: &Path) -> Result<Vec<u8>, StartupRefusal> {
+    let unavailable = || StartupRefusal::new(StartupRefusalCode::CredentialUnavailable);
+
+    let collect = async {
+        let mut child = tokio::process::Command::new(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            // Dropping this future on timeout must not leave the helper
+            // running against a credential store.
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| unavailable())?;
+
+        let mut out = Vec::new();
+        {
+            let stdout = child.stdout.take().ok_or_else(unavailable)?;
+            // Capped before buffering, not after: a helper that emits without
+            // bound must not be able to exhaust this process's memory.
+            stdout
+                .take(MAX_CREDENTIAL_BYTES + 1)
+                .read_to_end(&mut out)
+                .await
+                .map_err(|_| unavailable())?;
+        }
+        let status = child.wait().await.map_err(|_| unavailable())?;
+        if !status.success() {
+            out.fill(0);
+            return Err(unavailable());
+        }
+        Ok(out)
+    };
+
+    match tokio::time::timeout(CREDENTIAL_HELPER_TIMEOUT, collect).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(unavailable()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The exclusive host lock
+// ---------------------------------------------------------------------------
+
+/// Exclusive ownership of one instance's control host.
+///
+/// # Why there is no stale-lock policy
+///
+/// The lock is an advisory whole-file lock on an open file description, taken
+/// with [`std::fs::File::try_lock`]. The kernel releases it when the holding
+/// description is closed, which includes every way a process can die — clean
+/// exit, panic, signal, power loss followed by a reboot. There is therefore no
+/// such thing as a stale control host lock: a lock that is held is held by a
+/// living process, and the file left on disk between runs is an empty
+/// placeholder that carries no state and needs no cleanup. That is the whole
+/// reason to use a file lock here rather than a lock *file* whose existence
+/// means ownership, which would need a policy for deciding when to break it —
+/// and a wrong policy there is how two hosts end up sharing an instance.
+///
+/// # Which sessions take it
+///
+/// Registered sessions only, and this is a deliberate narrowing of the design's
+/// "daemonless hosting requires exclusive host and instance locks":
+///
+/// 1. An unregistered session reads no control-plane durable state, holds no
+///    grant, and can reach nothing a second unregistered session could race it
+///    for. There is nothing to serialize.
+/// 2. Taking the lock requires the control state directory, which exists only
+///    on an instance that has run genesis. Creating it for an unregistered
+///    session would mean a read-only surface writing durable state onto an
+///    uninitialized instance.
+/// 3. It would newly refuse a second unregistered `zeroclaw control --mcp`,
+///    which is a behavior change to the exact surface the phase-2 tests pin.
+///
+/// When the exclusive *instance* lock arrives with the mutation surface, it
+/// will cover more than this. This lock covers what this phase has.
+struct HostLock {
+    /// Held for the lifetime of the process. The lock is a property of this
+    /// open file description, so dropping the handle releases it.
+    _file: std::fs::File,
+}
+
+impl HostLock {
+    /// Take the exclusive host lock for the instance at `paths`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupRefusalCode::HostAlreadyServing`] when another process
+    /// holds it, and when the lock file cannot be opened or locked at all — a
+    /// host whose lock cannot be evaluated must not be served, because the
+    /// alternative is serving it twice.
+    fn acquire(paths: &ControlPaths) -> Result<Self, StartupRefusal> {
+        let refused = || StartupRefusal::new(StartupRefusalCode::HostAlreadyServing);
+        let path = paths.control_dir().join(HOST_LOCK_FILE);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|_| refused())?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(_) => Err(refused()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+/// A control server that has finished starting, plus whatever it holds.
+pub struct ControlHost {
+    server: ControlMcpServer,
+    /// Present exactly when the session is registered. Dropped with the host,
+    /// which is what releases the lock.
+    _lock: Option<HostLock>,
+}
+
+impl ControlHost {
+    /// The server this host runs.
+    #[must_use]
+    pub fn server(&self) -> &ControlMcpServer {
+        &self.server
+    }
+
+    /// The server this host runs, mutably, for driving the serve loop.
+    pub fn server_mut(&mut self) -> &mut ControlMcpServer {
+        &mut self.server
+    }
+}
+
+/// Start a control host: obtain and verify a credential if one was offered,
+/// take the host lock if the session is registered, and build the server.
+///
+/// # No downgrade
+///
+/// A launch that presents no credential yields an unregistered host and touches
+/// nothing else — no path resolution, no registry read, no lock. A launch that
+/// presents one either yields a registered host or fails. There is no branch
+/// that offers a credential, fails to make it work, and continues unregistered.
 ///
 /// # Errors
 ///
-/// Propagates a failure to write a response frame.
-pub async fn run(config_path: impl Into<PathBuf>) -> Result<()> {
-    let mut server = ControlMcpServer::new(config_path, env!("CARGO_PKG_VERSION"));
+/// Returns a [`StartupRefusal`] whose text is fixed and discloses no path,
+/// client identifier, or presented value.
+pub async fn start(
+    config_path: impl Into<PathBuf>,
+    zeroclaw_version: &str,
+    launch: ControlLaunch,
+) -> Result<ControlHost, StartupRefusal> {
+    let config_path = config_path.into();
+    let Some(mechanism) = launch.mechanism else {
+        return Ok(ControlHost {
+            server: ControlMcpServer::new(config_path, zeroclaw_version),
+            _lock: None,
+        });
+    };
+    // `ControlLaunch::resolve` is the only constructor that can produce a
+    // mechanism, and it refuses a mechanism without an identifier, so this is
+    // unreachable rather than a real branch. It refuses instead of unwrapping.
+    let Some(client_id) = launch.client_id else {
+        return Err(StartupRefusal::new(
+            StartupRefusalCode::CredentialMechanismInvalid,
+        ));
+    };
+
+    let credential = obtain_credential(&mechanism).await?;
+    let install_root = config_path
+        .parent()
+        .ok_or_else(|| StartupRefusal::new(StartupRefusalCode::InstanceNotManaged))?;
+    let authenticated = authenticate_client(
+        install_root,
+        &client_id,
+        &credential,
+        mechanism.delivery_class(),
+    )?;
+    // Zeroed here rather than at end of scope, so the secret is gone before
+    // anything else runs.
+    drop(credential);
+
+    let lock = HostLock::acquire(&authenticated.paths)?;
+    Ok(ControlHost {
+        server: ControlMcpServer::with_service_and_session(
+            ControlService::new(config_path, Surface::Cli),
+            authenticated.session,
+            zeroclaw_version,
+        ),
+        _lock: Some(lock),
+    })
+}
+
+/// The one JSON-RPC frame a refusing process emits.
+///
+/// Carried under `error.data.control_startup_refusal` rather than
+/// `error.data.error`, which is where a *tool* refusal from the frozen v1 table
+/// lives. A client that reads one key or the other always knows which kind of
+/// refusal it is holding.
+#[must_use]
+pub fn startup_refusal_frame(id: &Value, refusal: &StartupRefusal) -> Value {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        STARTUP_REFUSAL_META_KEY.to_string(),
+        serde_json::to_value(refusal).unwrap_or(Value::Null),
+    );
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": error_codes::INVALID_REQUEST,
+            "message": refusal.message,
+            "data": Value::Object(data),
+        },
+    })
+}
+
+/// Answer the first request with a startup refusal, then stop.
+///
+/// The alternative — exiting before writing anything — is worse for exactly the
+/// reason the refusal exists: an MCP client whose server closes the pipe during
+/// `initialize` reports a crashed server, and an operator who has just mistyped
+/// a credential option learns nothing. One typed frame turns that into a
+/// readable message, and the nonzero exit still tells a supervisor the process
+/// did not serve. This mirrors how a control-protocol major-version mismatch is
+/// already delivered at `initialize`.
+///
+/// Exactly one frame is written. The session is over either way.
+///
+/// # Errors
+///
+/// Propagates a failure to write the refusal frame.
+pub async fn serve_refusal<R, W>(
+    mut reader: R,
+    writer: &mut W,
+    refusal: &StartupRefusal,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::new();
+    loop {
+        frame.clear();
+        let read = match reader.read_until(b'\n', &mut frame).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(read) => read,
+        };
+        if read > MAX_FRAME_BYTES {
+            return Ok(());
+        }
+        let trimmed = trim_frame(&frame);
+        if trimmed.is_empty() {
+            continue;
+        }
+        // An unparseable first frame still gets the refusal, with a null id.
+        // The reason this process is going away matters more than whose
+        // request it was.
+        let id = serde_json::from_slice::<Value>(trimmed)
+            .ok()
+            .and_then(|request| request.get("id").cloned())
+            .unwrap_or(Value::Null);
+        write_frame(writer, &startup_refusal_frame(&id, refusal)).await?;
+        return Ok(());
+    }
+}
+
+/// Run the read-only control MCP server on this process's stdin and stdout.
+///
+/// A refused start answers one request and returns the refusal, which the
+/// binary reports on stderr and turns into a nonzero exit. It never serves an
+/// unregistered session in place of a registered one it could not establish.
+///
+/// # Errors
+///
+/// Propagates a failure to write a response frame, and returns the
+/// [`StartupRefusal`] when the process refused to serve.
+pub async fn run(
+    config_path: impl Into<PathBuf>,
+    client_id: Option<String>,
+    credential_helper: Option<PathBuf>,
+) -> Result<()> {
+    let config_path = config_path.into();
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    server.serve(stdin, &mut stdout).await
+
+    let started = match ControlLaunch::resolve(client_id, credential_helper) {
+        Ok(launch) => start(config_path, env!("CARGO_PKG_VERSION"), launch).await,
+        Err(refusal) => Err(refusal),
+    };
+    match started {
+        Ok(mut host) => host.server_mut().serve(stdin, &mut stdout).await,
+        Err(refusal) => {
+            serve_refusal(stdin, &mut stdout, &refusal).await?;
+            Err(anyhow::Error::new(refusal))
+        }
+    }
 }
