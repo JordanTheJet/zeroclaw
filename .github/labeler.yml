@@ -510,12 +510,6 @@
           - "src/service/**"
           - "crates/zeroclaw-runtime/src/service/**"
 
-"skillforge":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/skillforge/**"
-          - "crates/zeroclaw-runtime/src/skillforge/**"
-
 "skills":
   - changed-files:
       - any-glob-to-any-file:

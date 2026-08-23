@@ -126,7 +126,6 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
 | `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
-| `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
 | `skills` | `src/skills/**`, `crates/zeroclaw-runtime/src/skills/**` |
 | `tool` | `src/tools/**`, `crates/zeroclaw-tools/src/**` |
 | `tunnel` | `src/tunnel/**`, `crates/zeroclaw-runtime/src/tunnel/**` |
