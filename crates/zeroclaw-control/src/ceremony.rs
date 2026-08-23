@@ -581,11 +581,9 @@ pub fn run_register_client(
         ));
     }
 
-    let existing = match crate::client_registry::is_present(&paths) {
-        true => crate::client_registry::load(&paths, &key)
-            .map_err(|e| CeremonyError::from_client_registry(&e))?,
-        false => ClientRegistry::new(),
-    };
+    // Verify the existing client registry before prompting, so an unverifiable
+    // one refuses without troubling the operator.
+    drop(load_client_registry(&paths, &key)?);
 
     let attestation = presence
         .confirm(&PresenceRequest {
@@ -593,6 +591,12 @@ pub fn run_register_client(
             operator_prompt: None,
         })
         .map_err(|e| CeremonyError::from_presence(&e))?;
+
+    // Re-read after the prompt rather than reusing the pre-prompt copy. A human
+    // typing is an unbounded window, and this crate has no registry lock yet
+    // (see the concurrency note on `issue_and_deliver`), so the read-modify-write
+    // is kept as short as it can be made without one.
+    let (existing, first_write) = load_client_registry(&paths, &key)?;
 
     issue_and_deliver(
         &paths,
@@ -603,8 +607,25 @@ pub fn run_register_client(
         record.digest(),
         attestation.class(),
         &key,
-        !crate::client_registry::is_present(&paths),
+        first_write,
     )
+}
+
+/// Load the client registry, or an empty one when there is none.
+///
+/// Returns the registry and whether this would be the first write, so the two
+/// answers come from one presence check rather than two.
+fn load_client_registry(
+    paths: &ControlPaths,
+    key: &ApprovalAuditKey,
+) -> Result<(ClientRegistry, bool), CeremonyError> {
+    if crate::client_registry::is_present(paths) {
+        let registry = crate::client_registry::load(paths, key)
+            .map_err(|e| CeremonyError::from_client_registry(&e))?;
+        Ok((registry, false))
+    } else {
+        Ok((ClientRegistry::new(), true))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +715,24 @@ fn register_default_instance(
 /// the registry save then fails, the delivered file is removed, because a
 /// credential that authenticates nothing is a live-looking secret sitting on
 /// disk.
+///
+/// # Not serialized against a concurrent ceremony
+///
+/// Saving a registration is a read-modify-write and **this crate has no
+/// registry lock**. Two `register-client` runs racing on one instance can both
+/// read the same registry and the later save wins, dropping the earlier
+/// registration while its delivered credential file survives on disk,
+/// authenticating nothing.
+///
+/// Genesis itself is safe from this: the genesis record is published with an
+/// exclusive create, so concurrent first-genesis attempts resolve to exactly one
+/// winner and the loser refuses. Only the append path is exposed.
+///
+/// The design calls for a registry lock and an exclusive bootstrap lock. Neither
+/// is implemented here, and implementing one is a separate piece of work — it
+/// needs a stale-lock policy, which is a decision rather than a mechanism. The
+/// window is narrowed to the span between the post-prompt re-read and the save,
+/// but it is not closed.
 #[allow(clippy::too_many_arguments)]
 fn issue_and_deliver(
     paths: &ControlPaths,
@@ -1333,6 +1372,37 @@ mod tests {
         )
         .expect_err("an unverifiable registry must refuse registration");
         assert_eq!(err.code, CeremonyErrorCode::RegistryUnusable);
+    }
+
+    #[test]
+    fn register_client_refuses_when_the_client_registry_does_not_verify() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = install_root(&tmp);
+        let mut request = genesis_request();
+        request.register_client = Some(client_request(tmp.path().join("first.cred")));
+        run_genesis(&root, &ScriptedPresence::affirming("jordan"), &request).expect("genesis");
+
+        let paths = ControlPaths::resolve(&root).expect("resolve");
+        std::fs::write(paths.client_registry(), b"{ tampered").expect("tamper");
+
+        let credential_path = tmp.path().join("second.cred");
+        let presence = ScriptedPresence::affirming("jordan");
+        let err = run_register_client(
+            &root,
+            &presence,
+            "Authorize? ".to_string(),
+            &client_request(credential_path.clone()),
+        )
+        .expect_err("an unverifiable client registry must refuse");
+        assert_eq!(err.code, CeremonyErrorCode::ClientRegistryUnusable);
+        assert!(
+            presence.requests().is_empty(),
+            "an unverifiable registry must refuse before prompting anyone"
+        );
+        assert!(
+            !credential_path.exists(),
+            "no credential may be delivered against a registry that will not load"
+        );
     }
 
     #[test]
