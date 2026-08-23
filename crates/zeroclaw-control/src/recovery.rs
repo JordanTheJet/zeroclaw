@@ -43,6 +43,7 @@ use crate::journal::{
 };
 use crate::operator::RequesterContext;
 use crate::service::{ControlError, ControlInspection};
+use zeroclaw_config::multi_agent::MemoryBackendKind;
 
 /// What recovery did with one interrupted operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,8 +383,9 @@ fn classify_personality(
 /// present and complete.
 fn verify_effective(entry: &JournalEntry, inspection: &ControlInspection) -> VerifyReport {
     let alias = &entry.verification_plan.expected_agent_alias;
-    let agent_present = inspection.config().agents.contains_key(alias);
-    let workspace = inspection.config().agent_workspace_dir(alias);
+    let config = inspection.config();
+    let agent_present = config.agents.contains_key(alias);
+    let workspace = config.agent_workspace_dir(alias);
     let personality_files_ok = entry
         .effects
         .iter()
@@ -397,11 +399,42 @@ fn verify_effective(entry: &JournalEntry, inspection: &ControlInspection) -> Ver
             ),
             ArtifactKind::Config { .. } => true,
         });
+    // F3: alias presence plus matching personality bytes can be satisfied by a
+    // same-alias FOREIGN agent — a different provider, risk, runtime, or memory
+    // backend — whose files happen to match. That must not be blessed as
+    // `verified` after a crash. Mirror the live apply path's `verify_install`
+    // (crate::service): the installed agent must be bound to exactly the approved
+    // provider and named risk/runtime profiles, carry the approved memory
+    // backend, and hold no channels. A mismatch reports `effective = false`, so
+    // recovery parks the operation in `recovery_required` rather than reporting a
+    // verified install.
+    let agent_profile_ok = match config.agents.get(alias) {
+        Some(agent) => {
+            let proposal = &entry.agent_proposal;
+            entry.selected_provider_ref == agent.model_provider.as_str()
+                && agent.risk_profile.as_str() == proposal.risk.preset_name()
+                && agent.runtime_profile.as_str() == proposal.runtime.preset_name()
+                && agent.channels.is_empty()
+                && agent.memory.backend == expected_memory_backend(proposal.memory)
+        }
+        None => false,
+    };
     VerifyReport {
         state: entry.state,
         agent_present,
         personality_files_ok,
-        effective: agent_present && personality_files_ok,
+        effective: agent_present && agent_profile_ok && personality_files_ok,
+    }
+}
+
+/// The memory backend an approved [`crate::inventory::MemoryChoice`] must
+/// materialize as, mirroring the mapping the live apply path's `verify_install`
+/// uses so the recovery audit judges the same fact.
+fn expected_memory_backend(choice: crate::inventory::MemoryChoice) -> MemoryBackendKind {
+    match choice {
+        crate::inventory::MemoryChoice::Sqlite => MemoryBackendKind::Sqlite,
+        crate::inventory::MemoryChoice::Markdown => MemoryBackendKind::Markdown,
+        crate::inventory::MemoryChoice::None => MemoryBackendKind::None,
     }
 }
 
@@ -706,6 +739,83 @@ mod tests {
             assert!(
                 !harness.config_text().contains("[agents.writer]"),
                 "no config write under a receipt-less continuation"
+            );
+            assert_eq!(
+                harness.load_journal().entry(&op_id).expect("entry").state,
+                JournalState::RecoveryRequired
+            );
+        });
+    }
+
+    // -- F3: a foreign same-alias agent is not blessed as verified ----------
+
+    #[test]
+    fn a_foreign_same_alias_agent_with_matching_files_is_not_verified() {
+        run_async(|| async {
+            // A same-alias agent bound to a DIFFERENT memory backend than the
+            // approved proposal, but with the approved personality bytes on disk.
+            const FOREIGN_WRITER_CONFIG: &str = r#"schema_version = 3
+
+[memory]
+backend = "none"
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+
+[providers.models.custom.fixture]
+api_key = "fixture-placeholder"
+uri = "http://127.0.0.1:1"
+model = "fixture-model"
+wire_api = "chat_completions"
+
+[agents.writer]
+model_provider = "custom.fixture"
+risk_profile = "locked_down"
+runtime_profile = "tight"
+
+[agents.writer.memory]
+backend = "none"
+
+[risk_profiles.locked_down]
+allow_shell = false
+
+[runtime_profiles.tight]
+max_tokens = 1024
+"#;
+
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            let (op_id, _issued) = harness.arrange_approved(&service, NOW).await;
+            // Crash after the commit, before the config write: applying, receipt
+            // consumed, config not yet written.
+            harness
+                .worker(&service)
+                .with_fault(FaultPoint::PostCommitPreConfig)
+                .apply_approved(&op_id, NOW)
+                .await
+                .expect_err("injected crash");
+
+            std::fs::write(&harness.config_path, FOREIGN_WRITER_CONFIG).expect("foreign config");
+            let inspection = service.inspect().await.expect("inspect foreign config");
+            let workspace = inspection.config().agent_workspace_dir("writer");
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            std::fs::write(workspace.join("SOUL.md"), "# Soul\nWrite carefully.")
+                .expect("matching personality file");
+
+            // Every effect classifies as applied, but the effective check now
+            // sees a foreign profile and refuses to bless it: it parks
+            // recovery_required rather than reporting verified.
+            let report = recover(&harness.worker(&service), NOW)
+                .await
+                .expect("recovery");
+            assert!(
+                matches!(report.actions[0].1, RecoveryAction::Parked(_)),
+                "a foreign same-alias agent must not be verified, got {:?}",
+                report.actions[0].1
             );
             assert_eq!(
                 harness.load_journal().entry(&op_id).expect("entry").state,
