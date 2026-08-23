@@ -25,6 +25,7 @@ mod guard;
 mod inventory;
 pub mod journal;
 pub mod keys;
+pub mod management;
 pub mod meta_authority;
 pub mod operator;
 mod preview;
@@ -73,6 +74,10 @@ pub use journal::{
     EffectImage, JournalEntry, JournalError, JournalErrorCode, JournalState, OperationId,
     ParkRequest, ProposalJournal, Quotas, ResumeSecret, RollbackDeclaration, StatusReport,
     VerificationPlan,
+};
+pub use management::{
+    ManagementError, ManagementErrorCode, ManagementRecord, MutationEnablement, enable_mutations,
+    mutations_enabled, mutations_enabled_with,
 };
 pub use meta_authority::{
     AuthorityTier, ConfirmationTier, ControlOperation, RequiredQuorum, required_quorum,
