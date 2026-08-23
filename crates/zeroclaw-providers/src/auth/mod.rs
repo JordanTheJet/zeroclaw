@@ -766,11 +766,25 @@ fn resolve_requested_profile_id(model_provider: &str, requested: &str) -> String
 
 /// The token a ZeroRouter profile carries, but only when that profile is
 /// bound to `want_issuer`. `None` covers every fail-closed case: a profile
-/// minted by a different router — including one that merely shares an
-/// origin with this request's router — a profile with no issuer recorded at
-/// all (so its provenance cannot be established), and a profile holding no
-/// usable token.
+/// belonging to another provider family, a profile that is not the Token
+/// kind this flow stores, a profile minted by a different router —
+/// including one that merely shares an origin with this request's router —
+/// a profile with no issuer recorded at all (so its provenance cannot be
+/// established), and a profile holding no usable token.
 fn zerorouter_profile_token(profile: &AuthProfile, want_issuer: &str) -> Option<String> {
+    // The family gate belongs here rather than at the call sites: a
+    // namespaced `--auth-profile openai-codex:default` override survives
+    // `resolve_requested_profile_id` verbatim and would otherwise reach this
+    // reader with another family's profile. Issuer metadata cannot
+    // distinguish it, because any family's profile may carry any metadata.
+    if profile.model_provider != ZEROROUTER_PROVIDER {
+        return None;
+    }
+    // The device flow stores a Token-kind profile; an OAuth profile here
+    // would mean a shape this reader was never designed to consume.
+    if profile.kind != AuthProfileKind::Token {
+        return None;
+    }
     let bound_issuer = profile.metadata.get(ZEROROUTER_ISSUER_METADATA_KEY)?;
     if !zerorouter_device::issuer_identities_match(bound_issuer, want_issuer) {
         return None;
@@ -2406,6 +2420,73 @@ mod tests {
         assert_eq!(
             ZerorouterFlow::resolve_issuer(&empty, "default").expect("family default applies"),
             "http://localhost:8080",
+        );
+    }
+
+    /// `resolve_requested_profile_id` passes a namespaced override through
+    /// verbatim, so `--auth-profile openai-codex:default` reaches this
+    /// family's credential reader and selects another family's profile. The
+    /// issuer check alone cannot catch it, because any family's profile may
+    /// carry any metadata, so the family itself must be part of the
+    /// fail-closed decision.
+    #[tokio::test]
+    async fn a_namespaced_override_cannot_escape_the_zerorouter_family() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+
+        // Another family's profile that happens to carry issuer metadata
+        // matching the ZeroRouter destination.
+        let mut foreign_metadata = HashMap::new();
+        foreign_metadata.insert(
+            ZEROROUTER_ISSUER_METADATA_KEY.to_string(),
+            "https://router-a.example.com".to_string(),
+        );
+        auth.store_model_provider_token(
+            "openai-codex",
+            "default",
+            "sk-not-a-zerorouter-key",
+            foreign_metadata,
+            true,
+        )
+        .await
+        .expect("store foreign profile");
+
+        let error = auth
+            .get_zerorouter_bearer_token(
+                "https://router-a.example.com/v1",
+                Some("openai-codex:default"),
+            )
+            .await
+            .expect_err("a non-zerorouter profile must never answer for zerorouter");
+        assert!(
+            !error.to_string().contains("sk-not-a-zerorouter-key"),
+            "the foreign key leaked into the error text: {error}"
+        );
+
+        // A genuine ZeroRouter profile still resolves, and the namespaced
+        // override stays rejected even once one exists.
+        store_zerorouter_key(
+            &auth,
+            "router-a",
+            "https://router-a.example.com",
+            "zcr_key_for_a",
+        )
+        .await;
+        assert_eq!(
+            auth.get_zerorouter_bearer_token("https://router-a.example.com/v1", None)
+                .await
+                .expect("the real zerorouter profile still answers")
+                .as_deref(),
+            Some("zcr_key_for_a"),
+        );
+        assert!(
+            auth.get_zerorouter_bearer_token(
+                "https://router-a.example.com/v1",
+                Some("openai-codex:default"),
+            )
+            .await
+            .is_err(),
+            "the namespaced override must stay rejected even once a real profile exists",
         );
     }
 
