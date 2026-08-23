@@ -153,6 +153,10 @@ impl SqliteSessionBackend {
                 "trim_breadcrumb",
                 "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER",
             ),
+            (
+                "principal_id",
+                "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
+            ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
@@ -176,6 +180,11 @@ impl SqliteSessionBackend {
                 "idx_session_metadata_sender_id",
                 "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
                  ON session_metadata(sender_id)",
+            ),
+            (
+                "idx_session_metadata_principal_id",
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_principal_id \
+                 ON session_metadata(principal_id)",
             ),
         ] {
             conn.execute(ddl, [])
@@ -1045,7 +1054,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -1062,6 +1071,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -1081,6 +1091,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1174,6 +1185,33 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn delete_session_owned(
+        &self,
+        session_key: &str,
+        owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        // The predicated metadata delete IS the ownership check: zero rows
+        // means not-owned (or missing) and nothing else is touched.
+        let owned_rows = conn
+            .execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
+                params![session_key, owner_principal_id],
+            )
+            .map_err(std::io::Error::other)?;
+        if owned_rows == 0 {
+            return Ok(false);
+        }
+        // Ownership proven and consumed; clean up the message rows (the
+        // FTS5 trigger handles sessions_fts).
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
         let rows = conn
@@ -1244,7 +1282,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -1257,6 +1295,7 @@ impl SessionBackend for SqliteSessionBackend {
                 let channel_id: Option<String> = row.get(6)?;
                 let room_id: Option<String> = row.get(7)?;
                 let sender_id: Option<String> = row.get(8)?;
+                let principal_id: Option<String> = row.get(9)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -1276,6 +1315,7 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    principal_id,
                 })
             },
         )
@@ -1335,7 +1375,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -1352,6 +1392,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1369,6 +1410,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1383,7 +1425,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -1402,6 +1444,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1419,6 +1462,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
             })
         }) {
             Ok(r) => r,
@@ -1464,7 +1508,7 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
@@ -1475,6 +1519,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let channel_id: Option<String> = row.get(5)?;
                         let room_id: Option<String> = row.get(6)?;
                         let sender_id: Option<String> = row.get(7)?;
+                        let principal_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -1490,6 +1535,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            principal_id,
                         })
                     },
                 )
@@ -1511,6 +1557,24 @@ impl SessionBackend for SqliteSessionBackend {
              VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
             params![session_key, now, now, alias_val],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let principal_val = if principal_id.is_empty() {
+            None
+        } else {
+            Some(principal_id)
+        };
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, principal_id)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET principal_id = excluded.principal_id",
+            params![session_key, now, now, principal_val],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
