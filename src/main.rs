@@ -1147,7 +1147,8 @@ Examples:
   zeroclaw control genesis
   zeroclaw control register-client --name claude-code \\
       --credential-out ~/.zeroclaw-clients/claude-code.cred \\
-      --delivery isolated_descriptor")]
+      --delivery isolated_descriptor
+  zeroclaw control register-operator --name morgan")]
     Control {
         /// Serve the read-only control protocol over stdio as an MCP server.
         #[arg(long)]
@@ -1232,6 +1233,38 @@ about how the credential reaches the client, and only the operator can make it."
         /// Credential delivery assurance: isolated_descriptor or sandbox_isolated_store.
         #[arg(long, value_name = "CLASS")]
         delivery: String,
+    },
+
+    /// Register an additional control-plane operator on an initialized instance.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(
+        name = "register-operator",
+        long_about = "\
+Register an additional control-plane operator on an initialized instance.
+
+Genesis establishes the first operator. This adds another, inside the same
+user-presence ceremony genesis uses. Refuses on an uninitialized instance, in
+recovery-only mode, on a duplicate identity, and on an identity that names a
+registered client.
+
+An operator holds no credential. There is no token to write out, because a
+token an operator holds can be captured by anything that can read its files or
+terminal — and whoever captured it could then approve an operation it had
+requested itself. An operator authenticates by being present at a controlling
+terminal and naming this identity, which cannot be replayed.
+
+Registering an operator is a meta-authority operation. It is host-side only: no
+agent, tool, or MCP session can reach it, and it makes no model-provider request
+and no network request.
+
+This release adds no way to apply an approved change. Registering an operator
+establishes who may approve; it does not enable approving."
+    )]
+    RegisterOperator {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// The identity this operator will authenticate as.
+        #[arg(long, value_name = "NAME")]
+        name: String,
     },
 }
 
@@ -1404,6 +1437,46 @@ fn run_control_ceremony(config: &Config, command: ControlCommands) -> Result<()>
                 zeroclaw_control::run_register_client(&install_root, &presence, prompt, &request)
                     .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             print_registered_client(&client);
+            Ok(())
+        }
+
+        ControlCommands::RegisterOperator { name } => {
+            let request = zeroclaw_control::RegisterOperatorRequest {
+                identity: zeroclaw_control::OperatorIdentity::new(name)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?,
+                prompt: t(
+                    "cli-control-register-operator-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Register this control-plane operator? Type yes to confirm: ",
+                ),
+            };
+            let operator =
+                zeroclaw_control::run_register_operator(&install_root, &presence, &request)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            println!(
+                "{}",
+                ta(
+                    "cli-control-operator-registered",
+                    &[
+                        ("operator", operator.identity.as_str()),
+                        ("epoch", &operator.trust_epoch.to_string()),
+                        ("presence", operator.presence_class.wire()),
+                        ("operators", &operator.active_operator_count.to_string()),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Control-plane operator registered.",
+                )
+            );
+            println!(
+                "{}",
+                t(
+                    "cli-control-operator-no-credential",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Operators hold no credential. This one approves by being present at a \
+                     controlling terminal and naming this identity; there is no token to store, \
+                     lose, or capture.",
+                )
+            );
             Ok(())
         }
     }

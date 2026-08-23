@@ -1257,3 +1257,11 @@ cli-control-client-registered =
       credential:   {$path}
       delivery:     {$delivery}
 cli-control-credential-once = The credential was written once, owner-only. It is stored nowhere else and cannot be reissued; register again to replace it.
+cli-control-register-operator-confirm = Register this control-plane operator? Type yes to confirm:{" "}
+cli-control-operator-registered =
+    Control-plane operator registered.
+      operator:    {$operator}
+      trust epoch: {$epoch}
+      presence:    {$presence}
+      operators:   {$operators}
+cli-control-operator-no-credential = Operators hold no credential. This one approves by being present at a controlling terminal and naming this identity; there is no token to store, lose, or capture.
