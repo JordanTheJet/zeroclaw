@@ -25,6 +25,19 @@
 //! - **No genesis.** [`GenesisDigest`] is accepted as an opaque input. Writing
 //!   the genesis record is the ceremony's job, not this module's.
 //!
+//! ## The registry does not survive an epoch break
+//!
+//! The maintainer decided on issue #26 (question 18) that **recovery discards
+//! registered target roots and approved creation parents**: a registration made
+//! under a compromised epoch must not survive the recovery meant to contain it,
+//! so operators re-register afterwards. Containment over convenience.
+//!
+//! Nothing here implements recovery, but the choice shapes this data model.
+//! Every [`TargetRecord`] carries the [`TrustEpoch`] it was written under, so a
+//! record from a superseded epoch is recognizable rather than silently
+//! inherited, and a registry is per-epoch state rather than durable inventory.
+//! Whoever implements recovery must drop these records, not migrate them.
+//!
 //! ## Why the fingerprint probes without following symlinks
 //!
 //! [`RootIdentity::probe`] uses `symlink_metadata`, so a root that has been
