@@ -5,14 +5,38 @@
 
 use std::path::Path;
 
-pub async fn apply_comments(
-    config_path: &Path,
-    annotations: &[(String, String)],
-) -> Result<(), std::io::Error> {
+use anyhow::{Context as _, Result};
+
+/// Decorate the keys named in `annotations` with `# {comment}` lines.
+///
+/// This is a read-modify-write of `config.toml`, so it runs under the same
+/// cross-process [`ConfigWriteLock`](crate::schema::ConfigWriteLock) as every
+/// other config writer and replaces the file through the shared atomic
+/// tmp-write-plus-rename pipeline. Before that it did neither, which made it
+/// the one in-tree writer able to land inside another writer's compare-then-
+/// rename window (notably the `config_patch` tool's own expected-source
+/// compare-and-swap, which calls this immediately after committing), and made
+/// an interrupted comment write able to truncate `config.toml`.
+///
+/// Callers must not already hold a `ConfigWriteLock`: the lock is per open
+/// file description, so a nested acquisition blocks forever. Every current
+/// caller applies comments only after its save has returned and released.
+pub async fn apply_comments(config_path: &Path, annotations: &[(String, String)]) -> Result<()> {
     if annotations.is_empty() {
         return Ok(());
     }
-    let raw = tokio::fs::read_to_string(config_path).await?;
+    let write_lock = crate::schema::acquire_config_write_lock(config_path).await?;
+    // Read under the lock: this content is the merge base for the decorated
+    // document written below, so a read outside the lock would let a writer
+    // that commits in between be silently reverted by our write.
+    let raw = tokio::fs::read_to_string(config_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read config for comment annotation: {}",
+                config_path.display()
+            )
+        })?;
     let mut doc: toml_edit::DocumentMut = match raw.parse() {
         Ok(d) => d,
         Err(_) => return Ok(()), // unparseable; bail without touching file
@@ -20,7 +44,8 @@ pub async fn apply_comments(
     for (path, comment) in annotations {
         decorate_key(doc.as_table_mut(), path, comment);
     }
-    tokio::fs::write(config_path, doc.to_string()).await
+    crate::schema::write_config_atomically_under_lock(config_path, &doc.to_string(), &write_lock)
+        .await
 }
 
 /// Walk to the leaf key for `dotted` and decorate it with `# {comment}\n`,

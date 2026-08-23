@@ -344,3 +344,122 @@ async fn apply_comments_preserves_unrelated_content() {
     );
     drop(dir);
 }
+
+// ─────────────────────────────────────────────────────────────
+// Concurrency and crash safety
+//
+// `apply_comments` is a read-modify-write of `config.toml`. It used to take
+// no lock and write in place, which made it the one in-tree writer able to
+// land between another writer's merge-base read and its atomic rename — the
+// deterministic lost update recorded on issue #41 — and left an interrupted
+// comment write able to truncate the live file.
+// ─────────────────────────────────────────────────────────────
+
+/// Require that nothing has arrived on `rx` within a bounded window, i.e. the
+/// writer running on the other thread is still parked on the config lock.
+///
+/// Polling the future in place with a no-op waker does NOT test this: the lock
+/// is acquired via `spawn_blocking`, and a no-op waker never reschedules that
+/// blocking task, so the future reports Pending whether or not the lock was
+/// ever taken. Driving the writer on a real runtime and waiting a bounded
+/// window does discriminate — an unlocked writer completes a sub-kilobyte read
+/// and rename orders of magnitude inside this window, and a loaded machine can
+/// only lengthen the wait, never turn a real failure into a pass.
+fn assert_still_blocked<T>(rx: &std::sync::mpsc::Receiver<T>, message: &str) {
+    assert!(
+        matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn apply_comments_waits_for_the_config_write_lock_before_reading() {
+    let (dir, path) = write_temp_config("host = \"localhost\"\nport = 8080\n").await;
+
+    // Stand in for another writer's critical section — the same advisory
+    // `flock` every config writer takes, from an independent handle.
+    let held = zeroclaw_config::schema::acquire_config_write_lock(&path)
+        .await
+        .expect("the test may hold the config write lock");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let annotate_path = path.clone();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(apply_comments(
+            &annotate_path,
+            &[(String::from("port"), String::from("why"))],
+        ));
+        let _ = done_tx.send(outcome);
+    });
+
+    assert_still_blocked(
+        &done_rx,
+        "apply_comments must park on the config write lock for as long as \
+         another writer holds it, not race ahead and read a revision that \
+         writer is still replacing",
+    );
+
+    // Commit a revision from inside the held section. An `apply_comments`
+    // that had already read would still be holding `port = 8080` and would
+    // write it back over this line.
+    tokio::fs::write(&path, "host = \"localhost\"\nport = 4242\n")
+        .await
+        .unwrap();
+    drop(held);
+
+    done_rx
+        .recv()
+        .expect("the annotate thread reports its result")
+        .expect("apply_comments succeeds once the lock is free");
+    worker.join().expect("annotate thread joins");
+
+    let result = read_config(&path).await;
+    assert!(
+        result.contains("# why"),
+        "the comment must still be applied: {result}"
+    );
+    assert!(
+        result.contains("port = 4242"),
+        "the revision committed under the lock must survive — no lost update: {result}"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
+async fn apply_comments_replaces_the_file_instead_of_writing_in_place() {
+    let (dir, path) = write_temp_config("host = \"localhost\"\nport = 8080\n").await;
+    let original = read_config(&path).await;
+
+    // A hard link pins the pre-write inode. A tmp-write-plus-rename leaves
+    // that inode untouched and swaps a fresh one into `config.toml`; a
+    // truncating in-place write rewrites the bytes both names share, and a
+    // crash partway through that write is what leaves a truncated config on
+    // disk. Asserting the pinned content is intact is the observable form of
+    // "an interrupted comment write cannot destroy the live config".
+    let pinned = dir.path().join("pinned.toml");
+    std::fs::hard_link(&path, &pinned).expect("hard link on the temp filesystem");
+
+    apply_comments(&path, &[(String::from("port"), String::from("why"))])
+        .await
+        .unwrap();
+
+    let result = read_config(&path).await;
+    assert!(
+        result.contains("# why"),
+        "the comment must be applied to config.toml: {result}"
+    );
+    assert_eq!(
+        read_config(&pinned).await,
+        original,
+        "the pre-write inode must be byte-identical — apply_comments must \
+         replace config.toml by rename, never edit it in place"
+    );
+    drop(dir);
+}

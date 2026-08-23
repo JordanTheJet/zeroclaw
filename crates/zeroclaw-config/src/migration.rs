@@ -595,8 +595,31 @@ fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool 
     toml::Value::Table(channels).try_into::<Config>().is_err()
 }
 
+/// Migrate the config file at `path` to the current schema version, replacing
+/// it atomically and leaving a `.backup` beside it. Returns `Ok(None)` when
+/// the file is already current.
+///
+/// Runs under the same cross-process
+/// [`ConfigWriteLock`](crate::schema::ConfigWriteLock) as every other config
+/// writer, held across the read below and the rename at the end so the whole
+/// read-migrate-replace section is one critical section. Without it a
+/// concurrent save could commit between the read and the rename and be
+/// discarded by the migrated bytes.
+///
+/// Synchronous by design (`zeroclaw config migrate` is a one-shot CLI path),
+/// so it parks the calling thread while another writer holds the lock. Do not
+/// call it from a future without `spawn_blocking`, and do not call it while a
+/// `ConfigWriteLock` is already held — the lock is per open file description,
+/// so a nested acquisition blocks forever.
 pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
+    let _write_lock =
+        crate::schema::acquire_config_write_lock_blocking(path).with_context(|| {
+            format!(
+                "failed to acquire the config write lock for migration of {}",
+                path.display().to_string()
+            )
+        })?;
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display().to_string()))?;
     let migrated = match migrate_file(&raw)? {
@@ -1441,6 +1464,64 @@ enabled = "not-a-bool"
             !backup.exists(),
             "no `.backup` should be created on the no-op path; got {}",
             backup.display()
+        );
+    }
+
+    /// `migrate_file_in_place` is a read-migrate-replace section that used to
+    /// carry no lock at all, so a save committing between its read and its
+    /// rename was silently discarded (issue #41). It must now wait for the
+    /// same advisory `flock` every other config writer takes.
+    #[test]
+    fn migrate_file_in_place_waits_for_the_config_write_lock() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        // Minimal V1 input (no schema_version) so a migration would run.
+        std::fs::write(&path, "default_model_provider = \"openai\"\nfoo = 1\n").unwrap();
+
+        // Stand in for another writer's critical section, from an
+        // independent handle.
+        let held = crate::schema::acquire_config_write_lock_blocking(&path)
+            .expect("the test may hold the config write lock");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let migrate_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = done_tx.send(migrate_file_in_place(&migrate_path));
+        });
+
+        // Bounded wait, not a race. The migration is a sub-kilobyte read plus
+        // a rename, so an unlocked one completes orders of magnitude inside
+        // this window; a loaded machine can only make the wait longer, never
+        // turn a real failure into a pass.
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(500)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "migrate_file_in_place must park on the config write lock for as \
+             long as another writer holds it"
+        );
+
+        // Commit an already-current revision from inside the held section.
+        let committed = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n");
+        std::fs::write(&path, &committed).unwrap();
+        drop(held);
+
+        let report = done_rx
+            .recv()
+            .expect("the migration thread reports its result")
+            .expect("migration succeeds once the lock is free");
+        worker.join().expect("migration thread joins");
+
+        assert!(
+            report.is_none(),
+            "the migration must read the revision committed under the lock, \
+             not the pre-lock snapshot it would otherwise have migrated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            committed,
+            "the revision committed under the lock must survive — no lost update"
         );
     }
 }
