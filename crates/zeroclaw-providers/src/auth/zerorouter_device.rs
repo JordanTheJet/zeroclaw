@@ -308,6 +308,32 @@ async fn read_bounded_body(mut response: reqwest::Response) -> String {
     String::from_utf8_lossy(&body).into_owned()
 }
 
+/// Parse a *successful* JSON response under the same byte bound the error
+/// paths use. `Response::json()` buffers whatever the router sends, so a
+/// compromised or misbehaving issuer could force an unbounded allocation on
+/// the success path even though every error path is already capped. Reads
+/// at most one byte past the cap, which is enough to tell "at the limit"
+/// from "over it" without buffering the overflow.
+async fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    label: &str,
+) -> Result<T> {
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() <= MAX_REMOTE_BODY_BYTES {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        let room = (MAX_REMOTE_BODY_BYTES + 1).saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..room.min(chunk.len())]);
+    }
+    if body.len() > MAX_REMOTE_BODY_BYTES {
+        anyhow::bail!(
+            "ZeroRouter {label} response exceeded {MAX_REMOTE_BODY_BYTES} bytes; refusing to buffer it"
+        );
+    }
+    serde_json::from_slice(&body).with_context(|| format!("Failed to parse ZeroRouter {label}"))
+}
+
 /// How long this authorization may run, clamped to `max_lifetime`. Uses no
 /// unchecked arithmetic: `expires_in` is server-controlled and
 /// `Duration::from_secs(u64::MAX)` added to an `Instant` panics.
@@ -349,10 +375,7 @@ pub async fn fetch_device_discovery(
             sanitize_remote_detail(&body)
         );
     }
-    let parsed: DiscoveryResponse = response
-        .json()
-        .await
-        .context("Failed to parse ZeroRouter OAuth discovery")?;
+    let parsed: DiscoveryResponse = read_bounded_json(response, "OAuth discovery").await?;
     let device_authorization_endpoint = require_issuer_origin(
         issuer,
         parsed
@@ -404,10 +427,7 @@ pub async fn start_device_flow(
             sanitize_remote_detail(&body)
         );
     }
-    let parsed: DeviceCodeResponse = response
-        .json()
-        .await
-        .context("Failed to parse ZeroRouter device-code response")?;
+    let parsed: DeviceCodeResponse = read_bounded_json(response, "device-code response").await?;
     Ok(ZerorouterDeviceStart {
         device_code: parsed.device_code,
         // Printed for the operator to read back, so it is validated here
@@ -496,10 +516,8 @@ pub(crate) async fn poll_device_key_within(
         reject_redirect(response.status(), issuer, "token endpoint")?;
 
         if response.status().is_success() {
-            let parsed: TokenResponse = response
-                .json()
-                .await
-                .context("Failed to parse ZeroRouter device token response")?;
+            let parsed: TokenResponse =
+                read_bounded_json(response, "device token response").await?;
             return Ok(parsed.access_token);
         }
 
@@ -904,6 +922,69 @@ mod tests {
                 "{label} carried a control character to the terminal: {printed:?}"
             );
         }
+
+        server.abort();
+    }
+
+    /// The error paths were capped first; a router that answers `200` with a
+    /// multi-megabyte document must hit the same wall rather than being
+    /// buffered whole by `Response::json()`. A well-formed body under the
+    /// cap must still parse, so the bound cannot be satisfied by refusing
+    /// everything.
+    #[tokio::test]
+    async fn an_oversized_success_body_is_refused_rather_than_buffered() {
+        let oversized = MAX_REMOTE_BODY_BYTES * 8;
+        let padding = "a".repeat(oversized);
+        let (issuer, server) = spawn_test_server(
+            Router::new()
+                .route(
+                    "/fat",
+                    post(move || {
+                        let padding = padding.clone();
+                        async move {
+                            (
+                                StatusCode::OK,
+                                serde_json::json!({ "access_token": padding }).to_string(),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/lean",
+                    post(|| async {
+                        (
+                            StatusCode::OK,
+                            serde_json::json!({ "access_token": "zcr_small" }).to_string(),
+                        )
+                    }),
+                ),
+        )
+        .await;
+
+        let client = device_flow_client().expect("device-flow client");
+
+        let response = client
+            .post(format!("{issuer}/fat"))
+            .send()
+            .await
+            .expect("the flooding endpoint answers");
+        let error = read_bounded_json::<TokenResponse>(response, "device token response")
+            .await
+            .expect_err("an oversized success body must not be buffered");
+        assert!(
+            error.to_string().contains("exceeded"),
+            "expected a size-bound error, got: {error}"
+        );
+
+        let response = client
+            .post(format!("{issuer}/lean"))
+            .send()
+            .await
+            .expect("the small endpoint answers");
+        let parsed: TokenResponse = read_bounded_json(response, "device token response")
+            .await
+            .expect("a body under the cap still parses");
+        assert_eq!(parsed.access_token, "zcr_small");
 
         server.abort();
     }
