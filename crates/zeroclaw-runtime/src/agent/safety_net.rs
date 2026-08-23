@@ -1829,13 +1829,14 @@ fn approval_agent(
     tools_vec: Vec<Box<dyn Tool>>,
     manager: Option<Arc<ApprovalManager>>,
     channel: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> TestAgent {
     let workspace = test_workspace();
     let mut builder = Agent::builder()
         .model_provider(provider)
         .tools(tools_vec)
         .memory(mem_none(workspace.path()))
-        .observer(Arc::from(observability::NoopObserver {}))
+        .observer(observer.unwrap_or_else(|| Arc::new(observability::NoopObserver {})))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(workspace.path().to_path_buf());
     if let Some(mgr) = manager {
@@ -1858,6 +1859,7 @@ fn approval_agent(
 async fn safety_net_loop_approval_requested_then_executed_on_approve() {
     let exec = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(EventCapture::default());
     let risk = zeroclaw_config::schema::RiskProfileConfig {
         always_ask: vec!["echo".into()],
         ..zeroclaw_config::schema::RiskProfileConfig::default()
@@ -1875,6 +1877,7 @@ async fn safety_net_loop_approval_requested_then_executed_on_approve() {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&requests),
         })),
+        Some(capture.clone()),
     );
     let (tx, _rx) = mpsc::channel(256);
     agent
@@ -1887,12 +1890,35 @@ async fn safety_net_loop_approval_requested_then_executed_on_approve() {
         "back-channel asked once"
     );
     assert_eq!(exec.load(Ordering::SeqCst), 1, "approved tool executed");
+    let events = capture.events.lock();
+    let approvals = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ObserverEvent::AuthorizationRequested { .. }
+                    | ObserverEvent::AuthorizationResponded { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        approvals.as_slice(),
+        [
+            ObserverEvent::AuthorizationRequested { tool_name, .. },
+            ObserverEvent::AuthorizationResponded {
+                tool_name: response_tool,
+                granted: true,
+                ..
+            }
+        ] if tool_name == "echo" && response_tool == "echo"
+    ));
 }
 
 #[tokio::test]
 async fn safety_net_loop_approval_denied_blocks_execution() {
     let exec = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(EventCapture::default());
     let risk = zeroclaw_config::schema::RiskProfileConfig {
         always_ask: vec!["echo".into()],
         ..zeroclaw_config::schema::RiskProfileConfig::default()
@@ -1910,6 +1936,7 @@ async fn safety_net_loop_approval_denied_blocks_execution() {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&requests),
         })),
+        Some(capture.clone()),
     );
     let (tx, _rx) = mpsc::channel(256);
     agent
@@ -1926,6 +1953,14 @@ async fn safety_net_loop_approval_denied_blocks_execution() {
         0,
         "denied tool must not execute"
     );
+    assert!(capture.events.lock().iter().any(|event| matches!(
+        event,
+        ObserverEvent::AuthorizationResponded {
+            tool_name,
+            granted: false,
+            ..
+        } if tool_name == "echo"
+    )));
 }
 
 #[tokio::test]
@@ -1954,6 +1989,7 @@ async fn safety_net_loop_shell_does_not_trust_model_supplied_approved_arg() {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&requests),
         })),
+        None,
     );
     let (tx, _rx) = mpsc::channel(256);
     agent
@@ -2002,6 +2038,7 @@ async fn safety_net_loop_shell_marks_args_approved_after_backchannel_approval() 
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&requests),
         })),
+        None,
     );
     let (tx, _rx) = mpsc::channel(256);
     agent
@@ -2048,6 +2085,7 @@ async fn safety_net_loop_shell_keeps_runtime_approval_from_always_allowlist() {
             response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
             requests: Arc::clone(&requests),
         })),
+        None,
     );
     let (tx, _rx) = mpsc::channel(256);
     agent
@@ -2084,6 +2122,7 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
             calls: Arc::clone(&exec),
             last_args: Arc::clone(&captured),
         })],
+        None,
         None,
         None,
     );
