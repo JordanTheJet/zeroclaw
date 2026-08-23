@@ -6,7 +6,7 @@
 //! definition — a scripted presence adapter that drifted between two test
 //! modules would let one of them pass for the wrong reason.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::ceremony::{
@@ -150,4 +150,43 @@ pub(crate) fn unprovable_requester(subject: &str) -> RequesterContext {
         agent_domain(),
         Evidence::unknown(),
     )
+}
+
+/// The one process-wide lock every test that pins `ZEROCLAW_CONFIG_DIR` must
+/// hold. `Config::load_or_init` resolves the install root from that environment
+/// variable, so two tests pinning it concurrently in the shared lib-test process
+/// would each see the other's directory. A single lock — defined once here
+/// rather than copied per module — is what keeps them serialized.
+pub(crate) fn config_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+/// Pins `ZEROCLAW_CONFIG_DIR` for the lifetime of the guard and restores the
+/// previous value on drop.
+pub(crate) struct ConfigDirGuard {
+    previous: Option<String>,
+}
+
+impl ConfigDirGuard {
+    /// # Safety
+    ///
+    /// The caller must hold [`config_env_lock`] for the whole lifetime of the
+    /// guard, so no other test reads or writes the variable concurrently.
+    pub(crate) fn pin(dir: &Path) -> Self {
+        let previous = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        // SAFETY: serialized by `config_env_lock`; restored on drop.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
+        Self { previous }
+    }
+}
+
+impl Drop for ConfigDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized by `config_env_lock`.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) },
+            None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
+        }
+    }
 }

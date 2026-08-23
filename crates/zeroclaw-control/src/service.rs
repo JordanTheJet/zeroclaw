@@ -711,11 +711,7 @@ mod tests {
     use crate::proposal::PersonalityFileProposal;
     use zeroclaw_config::schema::AliasedAgentConfig;
 
-    /// `Config::load_or_init` resolves the install root from the environment,
-    /// so the tests that pin it serialize on this lock and restore the previous
-    /// value before releasing it — the same discipline
-    /// `tests/control_service.rs` follows for the same reason.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::test_support::{ConfigDirGuard, config_env_lock};
 
     /// The fixture `tests/control_service.rs` seeds, so the concurrent-writer
     /// test and the behavior-boundary tests judge the same install.
@@ -734,32 +730,6 @@ uri = "http://127.0.0.1:1"
 model = "fixture-model"
 wire_api = "chat_completions"
 "#;
-
-    struct ConfigDirGuard {
-        previous: Option<String>,
-    }
-
-    impl ConfigDirGuard {
-        /// # Safety
-        ///
-        /// The caller must hold `ENV_LOCK` for the whole lifetime of the guard.
-        fn pin(dir: &Path) -> Self {
-            let previous = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
-            // SAFETY: serialized by ENV_LOCK; restored on drop.
-            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for ConfigDirGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by ENV_LOCK.
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", value) },
-                None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
-            }
-        }
-    }
 
     fn writer_proposal() -> AgentProposal {
         AgentProposal {
@@ -897,7 +867,7 @@ quickstart_completed = true
     /// the committed-revision proof.
     #[tokio::test]
     async fn a_writer_that_lands_before_verification_reads_is_refused_not_verified() {
-        let _lock = ENV_LOCK.lock().await;
+        let _lock = config_env_lock().lock().await;
         let temp = tempfile::tempdir().expect("temporary install root");
         let config_path = temp.path().join("config.toml");
         std::fs::write(&config_path, PROVIDER_CONFIG).expect("seed the install");
