@@ -300,10 +300,16 @@ async fn pending_handshake_budget_sheds_then_admits_a_valid_peer() {
     cancel.cancel();
 }
 
-/// (c) The session budget bounds the steady state that survives
-/// authentication: with one session established, a second is shed.
+/// (c) The session ceiling bounds the steady state that survives
+/// authentication. With one established session, a second FULLY-AUTHENTICATED
+/// client is dropped right after its handshakes rather than occupying a second
+/// session slot. The session permit is taken only after both handshakes succeed
+/// (setup itself is bounded separately by `max_pending_handshakes`), so an
+/// unauthenticated stall can never consume the established-session ceiling.
 #[tokio::test]
 async fn session_budget_sheds_beyond_its_bound() {
+    use futures_util::StreamExt;
+
     let dir = tempfile::tempdir().unwrap();
     let (addr, cancel, cc, ck) = start_listener(
         dir.path(),
@@ -321,18 +327,82 @@ async fn session_budget_sheds_beyond_its_bound() {
     };
 
     // First session occupies the only permit and stays open.
-    let (_first, _resp) =
+    let (mut _first, _resp) =
         tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector()))
             .await
             .expect("the first session must be admitted");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // The second connection is shed at accept, before TLS.
-    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let closed = time_to_close(&mut second, Duration::from_millis(1500)).await;
+    // A second authenticated client completes TLS + the WS upgrade but is dropped
+    // immediately: the one established-session slot is taken.
+    let second =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector()))
+            .await;
+    // Being shed during the upgrade (Err) is equally acceptable; if the upgrade
+    // completes, the server must drop the connection right after.
+    if let Ok((mut ws, _)) = second {
+        let closed = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
+        match closed {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(msg))) if msg.is_close() => {}
+            other => panic!(
+                "a client beyond the session ceiling must be dropped after its \
+                 handshakes, got {other:?}"
+            ),
+        }
+    }
+    cancel.cancel();
+}
+
+/// (e) B4 regression: unauthenticated setup stalls are bounded by
+/// `max_pending_handshakes`, NOT by the established-session ceiling. With the
+/// ceiling at 1, stalls that occupy pending-handshake slots must still leave a
+/// valid mTLS client able to establish the one authenticated session. Before the
+/// fix a session permit was taken at accept and held through setup, so a single
+/// pre-auth staller consumed the only session slot and blocked a valid client.
+#[tokio::test]
+async fn pending_stalls_do_not_consume_session_capacity() {
+    use futures_util::StreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cancel, cc, ck) = start_listener(
+        dir.path(),
+        WssLimits {
+            max_pending_handshakes: 4,
+            handshake_timeout: Duration::from_secs(10),
+            max_sessions: 1,
+        },
+    )
+    .await;
+
+    // Three unauthenticated stalls: TCP connected, never sending a ClientHello.
+    // Each holds a pending-handshake permit but must NOT touch a session slot.
+    let mut stalls = Vec::new();
+    for _ in 0..3 {
+        stalls.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A valid mTLS + WebSocket client must still get the one established session.
+    let url = format!("wss://127.0.0.1:{}/", addr.port());
+    let connector =
+        tokio_tungstenite::Connector::Rustls(Arc::new(client_config(Some((cc.path(), ck.path())))));
+    let connected =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector)).await;
     assert!(
-        closed.is_some(),
-        "a connection arriving at the session bound must be shed"
+        connected.is_ok(),
+        "pending unauthenticated stalls must not consume the session ceiling, got {:?}",
+        connected.err()
     );
+
+    // And it stays up: an established (not shed) session sends no immediate close.
+    let (mut ws, _resp) = connected.unwrap();
+    let early = tokio::time::timeout(Duration::from_secs(1), ws.next()).await;
+    assert!(
+        early.is_err(),
+        "the established session must stay open, but the server closed it: {early:?}"
+    );
+
+    drop(stalls);
     cancel.cancel();
 }
