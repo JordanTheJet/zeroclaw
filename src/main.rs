@@ -5757,7 +5757,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Migrate { json } => {
-                match crate::config::migration::migrate_file_in_place(&config.config_path)? {
+                let migrate_path = config.config_path.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::config::migration::migrate_file_in_place(&migrate_path)
+                })
+                .await
+                .context("config migration task failed")??;
+                match outcome {
                     Some(report) => {
                         let to = report.to_version;
                         if json {
