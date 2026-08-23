@@ -17,22 +17,36 @@
 //! every test here serializes on `ENV_LOCK` and restores the previous value
 //! before releasing it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use zeroclaw::control_mcp::ControlMcpServer;
+use zeroclaw::control_mcp::{ControlHost, ControlLaunch, ControlMcpServer};
 use zeroclaw_config::schema::Config;
+use zeroclaw_config::secrets::KeySource as _;
+use zeroclaw_control::client_registry::{
+    ClientGrant, ClientLabel, ClientRegistration, ClientRegistry, RegistrationStatus,
+};
+use zeroclaw_control::genesis::{
+    FirstOperatorIdentity, GenesisRecord, KeyCommitment, PresenceClass, generate_instance_id,
+    now_unix_secs,
+};
+use zeroclaw_control::keys::ApprovalAuditKey;
 use zeroclaw_control::protocol::{
-    AgentCreateContainedOperation, CapabilitySet, ControlErrorCode, PreviewResult, canonical_json,
+    AgentCreateContainedOperation, CapabilitySet, ControlErrorCode, PreviewResult,
+    STARTUP_REFUSAL_META_KEY, StartupRefusal, StartupRefusalCode, canonical_json,
     capability_digest, operation_digest, operation_digest_for, source_revision_id,
 };
+use zeroclaw_control::registry::{
+    GenesisDigest, InstanceId, TargetRecord, TargetRegistry, TrustEpoch,
+};
 use zeroclaw_control::{
-    CapabilityRestrictedProviderFactory, ControlService, ControlSession, IsolatedProvider,
-    MemoryChoice, PROPOSAL_DOMAIN_AGENT, PersonalityFileProposal, ProviderError, ProviderErrorCode,
-    ProviderTarget, RequesterGrant, RiskChoice, RuntimeChoice,
+    CapabilityRestrictedProviderFactory, ControlPaths, ControlService, ControlSession,
+    CredentialDelivery, IsolatedProvider, MemoryChoice, PROPOSAL_DOMAIN_AGENT,
+    PersonalityFileProposal, ProviderError, ProviderErrorCode, ProviderTarget, RegistrationId,
+    RequesterGrant, RiskChoice, RuntimeChoice, client_registry, registry_store,
 };
 use zeroclaw_runtime::quickstart::Surface;
 
@@ -175,6 +189,227 @@ fn seed_install(dir: &Path) -> std::path::PathBuf {
     let config_path = dir.join("config.toml");
     std::fs::write(&config_path, PROVIDER_CONFIG).expect("write provider config");
     config_path
+}
+
+/// Restores an arbitrary environment variable when the test that pinned it
+/// finishes.
+///
+/// The credential descriptor is named by an environment variable, so a test
+/// that sets one and leaves it set would silently arm every later test in this
+/// binary with a stale descriptor number.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    /// # Safety
+    ///
+    /// The caller must hold `ENV_LOCK` for the whole lifetime of the guard.
+    fn pin(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: serialized by ENV_LOCK; restored on drop.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized by ENV_LOCK.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+/// The environment variable the inherited-descriptor mechanism reads.
+const CREDENTIAL_FD_ENV: &str = "ZEROCLAW_CONTROL_CREDENTIAL_FD";
+
+/// One initialized instance on disk, with a real config, a sealed genesis
+/// record, and a signed target registry naming it.
+///
+/// Built from the control crate's public durable-state API rather than by
+/// running `ceremony::run_genesis`: the ceremony needs a `UserPresence`
+/// adapter and `PresenceAttestation` has no constructor outside the `ceremony`
+/// module, so no test outside that crate can drive it. What is written here is
+/// what the ceremony writes — the same records, through the same publishers,
+/// sealed under the same deployment key — so the server under test reads state
+/// it cannot distinguish from ceremony output.
+struct ManagedInstall {
+    temp: tempfile::TempDir,
+    config_path: PathBuf,
+    paths: ControlPaths,
+    instance_id: InstanceId,
+    genesis_digest: GenesisDigest,
+}
+
+impl ManagedInstall {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("temporary install root");
+        let config_path = seed_install(temp.path());
+        std::fs::create_dir_all(temp.path().join("data")).expect("create the data root");
+        let paths = ControlPaths::resolve(temp.path()).expect("resolve control paths");
+
+        let key_source = paths.key_source();
+        key_source
+            .initialize()
+            .expect("initialize the deployment key source");
+        let key =
+            ApprovalAuditKey::derive(&key_source, TrustEpoch::GENESIS).expect("derive the key");
+
+        let instance_id = generate_instance_id().expect("instance id");
+        let record = GenesisRecord {
+            instance_id: instance_id.clone(),
+            trust_epoch: TrustEpoch::GENESIS,
+            canonical_roots: paths.canonical_roots().expect("canonical roots"),
+            created_at_unix_secs: now_unix_secs().expect("clock"),
+            user_presence_class: PresenceClass::Terminal,
+            first_operator: FirstOperatorIdentity::new("operator").expect("operator identity"),
+            host_key_commitment: KeyCommitment::compute(&key),
+        };
+        let genesis_digest = zeroclaw_control::genesis::write_record(&paths, &record, &key)
+            .expect("write the genesis record");
+
+        let target = TargetRecord::register(
+            instance_id.clone(),
+            paths.canonical_roots().expect("canonical roots"),
+            None,
+            TrustEpoch::GENESIS,
+            genesis_digest,
+        )
+        .expect("build the target record");
+        let mut targets = TargetRegistry::new();
+        targets.insert(target).expect("insert the target record");
+        registry_store::save_new(&paths, &targets, &key).expect("save the target registry");
+
+        Self {
+            temp,
+            config_path,
+            paths,
+            instance_id,
+            genesis_digest,
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.temp.path()
+    }
+
+    fn key(&self) -> ApprovalAuditKey {
+        ApprovalAuditKey::derive(&self.paths.key_source(), TrustEpoch::GENESIS)
+            .expect("derive the key")
+    }
+
+    fn full_grant(&self, delivery: CredentialDelivery) -> ClientGrant {
+        ClientGrant::full_v1(
+            ClientLabel::new("component-client").expect("label"),
+            delivery,
+            self.instance_id.clone(),
+        )
+    }
+
+    /// Register one client and write its one-time credential to a file, exactly
+    /// as the ceremony's `--credential-out` does.
+    ///
+    /// Returns the registration id and the path of the credential file. The
+    /// secret is never returned as a value a later assertion could accidentally
+    /// print; tests that need to compare against it read the file.
+    fn register(&self, grant: &ClientGrant, filename: &str) -> (RegistrationId, PathBuf) {
+        let key = self.key();
+        let issued = ClientRegistration::issue(
+            grant,
+            TrustEpoch::GENESIS,
+            now_unix_secs().expect("clock"),
+            self.genesis_digest,
+            PresenceClass::Terminal,
+            &key,
+        )
+        .expect("issue a registration");
+        let id = issued.registration.registration_id.clone();
+
+        let credential_path = self.temp.path().join(filename);
+        client_registry::write_credential_file(&credential_path, &issued.credential)
+            .expect("deliver the credential");
+
+        let mut registry = if client_registry::is_present(&self.paths) {
+            client_registry::load(&self.paths, &key).expect("load the client registry")
+        } else {
+            ClientRegistry::new()
+        };
+        registry
+            .insert(issued.registration)
+            .expect("insert the registration");
+        client_registry::save(&self.paths, &registry, &key).expect("save the client registry");
+        (id, credential_path)
+    }
+
+    fn revoke(&self, id: &RegistrationId) {
+        let key = self.key();
+        let existing = client_registry::load(&self.paths, &key).expect("load the client registry");
+        let mut replacement = ClientRegistry::new();
+        for registration in existing.iter() {
+            let mut copy = registration.clone();
+            if &copy.registration_id == id {
+                copy.status = RegistrationStatus::Revoked;
+            }
+            replacement.insert(copy).expect("insert");
+        }
+        client_registry::save(&self.paths, &replacement, &key).expect("save the client registry");
+    }
+
+    /// The credential as it sits in its delivery file.
+    fn secret(&self, credential_path: &Path) -> String {
+        std::fs::read_to_string(credential_path)
+            .expect("read the credential file")
+            .trim()
+            .to_string()
+    }
+}
+
+/// Hand an open descriptor on `path` to the process and name it in the
+/// environment.
+///
+/// `into_raw_fd` deliberately leaks ownership: the server takes the descriptor
+/// and closes it, which is the behavior under test. The guard restores the
+/// environment either way.
+fn present_descriptor(path: &Path) -> (EnvVarGuard, i32) {
+    use std::os::fd::IntoRawFd as _;
+    let fd = std::fs::File::open(path)
+        .expect("open the credential file")
+        .into_raw_fd();
+    (EnvVarGuard::pin(CREDENTIAL_FD_ENV, &fd.to_string()), fd)
+}
+
+/// Write an executable credential helper that prints `body` to stdout.
+#[cfg(unix)]
+fn write_helper(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the helper");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the helper executable");
+    path
+}
+
+/// Start a host with the inherited-descriptor mechanism.
+async fn start_with_descriptor(
+    install: &ManagedInstall,
+    id: &RegistrationId,
+    credential_path: &Path,
+) -> Result<ControlHost, StartupRefusal> {
+    let (_env, _fd) = present_descriptor(credential_path);
+    let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), None)?;
+    assert!(launch.presents_credential());
+    zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch).await
+}
+
+fn refusal_code(result: &Result<ControlHost, StartupRefusal>, what: &str) -> StartupRefusalCode {
+    match result {
+        Ok(_) => panic!("{what} must not start a registered session"),
+        Err(refusal) => refusal.code,
+    }
 }
 
 fn service_with(factory: &Arc<RecordingFactory>, config_path: &Path) -> ControlService {
@@ -1245,6 +1480,680 @@ async fn what_a_client_declares_at_initialize_cannot_widen_the_surface_it_gets()
             "negotiation must not remove the registration check"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production client authentication
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_registered_client_walks_the_whole_read_only_surface_and_leaks_no_secret() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let secret = install.secret(&credential_path);
+
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the issued credential authenticates over the real transport");
+    let server = host.server();
+    let operation = serde_json::to_value(writer_operation()).expect("operation serializes");
+
+    // Every frame of the session is kept, so the secret check at the end covers
+    // the whole conversation rather than one hand-picked response.
+    let initialized = initialize(server).await;
+    let listed = exchange(server, &request(2, "tools/list", json!({}))).await;
+    assert_eq!(
+        listed_tool_names(&listed),
+        ALWAYS_AVAILABLE
+            .iter()
+            .chain(GRANT_GATED.iter())
+            .copied()
+            .collect::<Vec<_>>(),
+        "a full registration lists the three always tools plus every granted read tool"
+    );
+
+    let info_frame = exchange(server, &call(3, "control.server_info", json!({}))).await;
+    let info = tool_ok(&info_frame);
+    assert_eq!(info["session"]["registration_state"], json!("registered"));
+    assert_eq!(
+        info["session"]["requester_class"],
+        json!("external_requester"),
+        "a verified credential creates a requester, never anything stronger"
+    );
+    assert_eq!(
+        info["session"]["assurance_class"],
+        json!("isolated_descriptor"),
+        "the reported class is the mechanism that was actually used"
+    );
+    assert_eq!(info["read_only"], json!(true));
+    assert_eq!(info["mutation_tools"], json!([]));
+
+    let help_frame = exchange(server, &call(4, "control.registration_help", json!({}))).await;
+    assert_eq!(
+        tool_ok(&help_frame)["registration_state"],
+        json!("registered")
+    );
+
+    let catalog_frame = exchange(server, &call(5, "control.catalog", json!({}))).await;
+    assert_eq!(
+        tool_ok(&catalog_frame)["operations"][0]["operation_id"],
+        json!("agent.create_contained")
+    );
+
+    let describe_frame = exchange(
+        server,
+        &call(
+            6,
+            "control.describe",
+            json!({ "operation_id": "agent.create_contained" }),
+        ),
+    )
+    .await;
+    assert!(tool_ok(&describe_frame)["request_schema"]["properties"]["provider_alias"].is_object());
+
+    let agents_frame = exchange(
+        server,
+        &call(7, "control.inspect", json!({ "view": "agent.summary" })),
+    )
+    .await;
+    assert_eq!(
+        tool_ok(&agents_frame)["target"]["target_id"],
+        json!("local")
+    );
+
+    let providers_frame = exchange(
+        server,
+        &call(
+            8,
+            "control.inspect",
+            json!({ "view": "provider.alias_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        tool_ok(&providers_frame)["items"][0]["alias"],
+        json!("custom.fixture")
+    );
+
+    let validate_frame = exchange(
+        server,
+        &call(
+            9,
+            "control.validate",
+            json!({ "operation_id": "agent.create_contained", "operation": operation }),
+        ),
+    )
+    .await;
+    assert_eq!(tool_ok(&validate_frame)["valid"], json!(true));
+
+    let preview_frame = exchange(
+        server,
+        &call(
+            10,
+            "control.preview",
+            json!({ "operation_id": "agent.create_contained", "operation": operation }),
+        ),
+    )
+    .await;
+    let previewed: PreviewResult =
+        serde_json::from_value(tool_ok(&preview_frame)).expect("the preview deserializes");
+    assert!(!previewed.durable);
+
+    let ping_frame = exchange(server, &call(11, "control.ping", json!({}))).await;
+    let session: Vec<Value> = vec![
+        initialized,
+        listed,
+        info_frame,
+        help_frame,
+        catalog_frame,
+        describe_frame,
+        agents_frame,
+        providers_frame,
+        validate_frame,
+        preview_frame,
+        ping_frame,
+    ];
+
+    // Transport parity: the same operation submitted straight to
+    // `ControlService`, projected through the same shared projection.
+    let native = ControlService::new(install.config_path.clone(), Surface::Cli);
+    let inspection = native.inspect().await.expect("inspect the managed install");
+    let revision = source_revision_id(inspection.source_revision());
+    let operation_typed = writer_operation();
+    let bound = native
+        .preview(
+            inspection,
+            &operation_typed.provider_alias,
+            &operation_typed.to_proposal(),
+        )
+        .expect("preview the writer proposal");
+    let directly = server.project_preview(bound.preview(), &revision);
+    assert_eq!(previewed.operation_digest, directly.operation_digest);
+    assert_eq!(previewed.dependency_digest, directly.dependency_digest);
+    assert_eq!(previewed.source_revision, directly.source_revision);
+    assert_eq!(previewed.target, directly.target);
+    assert_eq!(previewed.effects, directly.effects);
+    assert_eq!(previewed.apply_order, directly.apply_order);
+    assert_eq!(previewed.risks, directly.risks);
+    assert_eq!(previewed.verification_plan, directly.verification_plan);
+    assert_eq!(
+        operation_digest_for(&operation_typed),
+        operation_digest(bound.preview())
+    );
+
+    // The whole conversation, checked for the secret in every encoding a frame
+    // could carry it in.
+    let transcript = serde_json::to_string(&session).expect("the session serializes");
+    assert_eq!(secret.len(), 64, "the credential file holds 64 hex bytes");
+    assert!(
+        !transcript.contains(&secret),
+        "a frame carried the credential"
+    );
+    assert!(
+        !transcript.contains(&secret.to_uppercase()),
+        "a frame carried the credential in another case"
+    );
+    assert!(
+        !transcript.contains(id.as_str()),
+        "a frame carried the registration id, which server_info has no field for"
+    );
+    assert!(
+        !transcript.contains(&install.root().display().to_string()),
+        "a frame carried the install root"
+    );
+    assert!(
+        !transcript.contains("component-client"),
+        "a frame carried the client label"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_registration_lists_partial_tools_and_refuses_the_rest() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+
+    let partial = ClientGrant {
+        client_label: ClientLabel::new("partial").expect("label"),
+        delivery_assurance: CredentialDelivery::IsolatedDescriptor,
+        granted_instances: [install.instance_id.clone()].into_iter().collect(),
+        granted_read_domains: ["agent.summary".to_string(), "control.catalog".to_string()]
+            .into_iter()
+            .collect(),
+        proposal_domains: [PROPOSAL_DOMAIN_AGENT.to_string()].into_iter().collect(),
+    };
+    let (id, credential_path) = install.register(&partial, "partial.cred");
+
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the issued credential authenticates");
+    let server = host.server();
+
+    let listed = exchange(server, &request(1, "tools/list", json!({}))).await;
+    assert_eq!(
+        listed_tool_names(&listed),
+        vec![
+            "control.ping",
+            "control.server_info",
+            "control.registration_help",
+            "control.catalog",
+            "control.inspect",
+        ],
+        "a registration granting two read domains lists two gated tools"
+    );
+
+    // The granted ones answer.
+    assert_eq!(
+        exchange(server, &call(2, "control.catalog", json!({}))).await["result"]["isError"],
+        json!(false)
+    );
+    assert_eq!(
+        exchange(
+            server,
+            &call(3, "control.inspect", json!({ "view": "agent.summary" }))
+        )
+        .await["result"]["isError"],
+        json!(false)
+    );
+
+    // The ungranted ones refuse by name, even though they were never listed.
+    for name in ["control.describe", "control.validate", "control.preview"] {
+        let response = exchange(server, &call(4, name, json!({ "operation_id": "x" }))).await;
+        assert_eq!(
+            error_code(&response),
+            "grant_required",
+            "{name} must refuse a registered client that was not granted it"
+        );
+    }
+    // And so does the view inside a tool it does hold.
+    assert_eq!(
+        error_code(
+            &exchange(
+                server,
+                &call(
+                    5,
+                    "control.inspect",
+                    json!({ "view": "provider.alias_list" })
+                )
+            )
+            .await
+        ),
+        "grant_required"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_that_does_not_verify_refuses_loudly_instead_of_downgrading() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+
+    // A syntactically perfect credential that is not this client's.
+    let wrong = install.root().join("wrong.cred");
+    std::fs::write(&wrong, format!("{}\n", "ab".repeat(32))).expect("write a wrong credential");
+    let refused = start_with_descriptor(&install, &id, &wrong).await;
+    assert_eq!(
+        refusal_code(&refused, "a wrong secret"),
+        StartupRefusalCode::CredentialRejected,
+    );
+
+    // The refusal is a refusal, not a quieter session: nothing about it yields
+    // a server at all, so there is no unregistered surface to fall back to.
+    assert!(refused.is_err());
+
+    // A client identifier that names no registration.
+    let unknown = ControlLaunch::resolve(Some("reg-00000000000000000000".to_string()), None);
+    let unknown = match unknown {
+        Ok(_) => panic!("no descriptor is set, so this must not resolve"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(
+        unknown.code,
+        StartupRefusalCode::CredentialMechanismInvalid,
+        "an identifier with no mechanism is a launch error, not a rejected credential"
+    );
+
+    // And the correct presentation still works, so nothing above passed for the
+    // wrong reason.
+    assert!(
+        start_with_descriptor(&install, &id, &credential_path)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_registration_refuses() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    assert!(
+        start_with_descriptor(&install, &id, &credential_path)
+            .await
+            .is_ok(),
+        "the registration authenticates before revocation"
+    );
+
+    install.revoke(&id);
+
+    let refused = start_with_descriptor(&install, &id, &credential_path).await;
+    assert_eq!(
+        refusal_code(&refused, "a revoked registration"),
+        StartupRefusalCode::CredentialRejected,
+        "revocation fails closed and is indistinguishable from a wrong secret"
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_class_mismatch_refuses() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    // Registered for the inherited descriptor...
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+
+    // ...but presented through a helper, which is the other class.
+    #[cfg(unix)]
+    {
+        let helper = write_helper(
+            install.root(),
+            "read-credential",
+            &format!("cat {}", credential_path.display()),
+        );
+        let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), Some(helper))
+            .expect("the helper launch resolves");
+        let refused =
+            zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch).await;
+        assert_eq!(
+            refusal_code(
+                &refused,
+                "a credential presented through the wrong mechanism"
+            ),
+            StartupRefusalCode::DeliveryClassMismatch,
+            "the mechanism used is the class presented; it is not a claim the client makes"
+        );
+    }
+
+    // The descriptor mechanism still works for the same registration.
+    assert!(
+        start_with_descriptor(&install, &id, &credential_path)
+            .await
+            .is_ok()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credential_helper_delivers_the_sandbox_isolated_store_class() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::SandboxIsolatedStore),
+        "client.cred",
+    );
+    let secret = install.secret(&credential_path);
+
+    let helper = write_helper(
+        install.root(),
+        "read-credential",
+        &format!("cat {}", credential_path.display()),
+    );
+    let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), Some(helper))
+        .expect("the helper launch resolves");
+    let host = zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch)
+        .await
+        .expect("the helper's credential authenticates");
+
+    let info = tool_ok(&exchange(host.server(), &call(1, "control.server_info", json!({}))).await);
+    assert_eq!(info["session"]["registration_state"], json!("registered"));
+    assert_eq!(
+        info["session"]["assurance_class"],
+        json!("sandbox_isolated_store")
+    );
+    let serialized = serde_json::to_string(&info).expect("serializes");
+    assert!(
+        !serialized.contains(&secret),
+        "server_info carried the secret"
+    );
+
+    // A helper that fails is a refusal, not a downgrade.
+    let broken = write_helper(install.root(), "broken-helper", "exit 3");
+    let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), Some(broken))
+        .expect("the helper launch resolves");
+    let refused =
+        zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch).await;
+    assert_eq!(
+        refusal_code(&refused, "a helper that exits nonzero"),
+        StartupRefusalCode::CredentialUnavailable
+    );
+
+    // So is one that prints something that is not a credential.
+    let noisy = write_helper(install.root(), "noisy-helper", "echo not-a-credential");
+    let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), Some(noisy))
+        .expect("the helper launch resolves");
+    let refused =
+        zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch).await;
+    assert_eq!(
+        refusal_code(&refused, "a helper that prints garbage"),
+        StartupRefusalCode::CredentialUnavailable
+    );
+}
+
+/// Costs one real timeout. The bound is a wall-clock property of the startup
+/// path, and a test that mocked the clock would not prove the child is actually
+/// abandoned.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credential_helper_that_hangs_is_refused_rather_than_waited_on() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, _credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::SandboxIsolatedStore),
+        "client.cred",
+    );
+
+    let slow = write_helper(install.root(), "slow-helper", "sleep 120");
+    let launch = ControlLaunch::resolve(Some(id.as_str().to_string()), Some(slow))
+        .expect("the helper launch resolves");
+    let started = std::time::Instant::now();
+    let refused =
+        zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        refusal_code(&refused, "a helper that never returns"),
+        StartupRefusalCode::CredentialUnavailable
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "the helper timeout must bound startup, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_control_process_is_refused_while_one_holds_the_host_lock() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, credential_path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+
+    let first = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the first registered host starts");
+
+    let second = start_with_descriptor(&install, &id, &credential_path).await;
+    assert_eq!(
+        refusal_code(&second, "a second host on one instance"),
+        StartupRefusalCode::HostAlreadyServing,
+    );
+
+    // The lock is a property of the live open file description, not of a file
+    // on disk: drop the holder and the next host starts, with no cleanup step
+    // in between.
+    //
+    // Retried because the lock is scoped to an open file description and
+    // `fork()` duplicates a whole descriptor table. Any other test in this
+    // binary that spawns a subprocess at the instant our descriptor is open
+    // hands that child an inherited reference that outlives our `drop`. The
+    // children involved are short-lived, so a bounded retry distinguishes "the
+    // lock was never released" from "someone else briefly held a copy".
+    drop(first);
+    let mut third = start_with_descriptor(&install, &id, &credential_path).await;
+    for _ in 0..20 {
+        if third.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        third = start_with_descriptor(&install, &id, &credential_path).await;
+    }
+    assert!(
+        third.is_ok(),
+        "releasing the lock must not need a stale-lock policy"
+    );
+    assert!(
+        install.paths.control_dir().join("host.lock").exists(),
+        "the placeholder file survives, and carries no state"
+    );
+}
+
+#[tokio::test]
+async fn a_launch_with_no_credential_options_is_the_unchanged_unregistered_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    // A registered client exists on this instance and is not being presented.
+    install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+
+    let launch = ControlLaunch::resolve(None, None).expect("an empty launch resolves");
+    assert!(!launch.presents_credential());
+    let host = zeroclaw::control_mcp::start(install.config_path.clone(), TEST_VERSION, launch)
+        .await
+        .expect("an unregistered host always starts");
+    let server = host.server();
+
+    let listed = exchange(server, &request(1, "tools/list", json!({}))).await;
+    assert_eq!(
+        listed_tool_names(&listed),
+        ALWAYS_AVAILABLE,
+        "an initialized instance with a registered client still serves an \
+         unregistered launch exactly the always-available surface"
+    );
+    let info = tool_ok(&exchange(server, &call(2, "control.server_info", json!({}))).await);
+    assert_eq!(info["session"]["registration_state"], json!("unregistered"));
+    assert_eq!(info["session"]["assurance_class"], Value::Null);
+    assert_eq!(
+        error_code(
+            &exchange(
+                server,
+                &call(3, "control.inspect", json!({ "view": "agent.summary" }))
+            )
+            .await
+        ),
+        "unregistered_client"
+    );
+    assert!(
+        !install.paths.control_dir().join("host.lock").exists(),
+        "an unregistered session takes no host lock and writes no lock file"
+    );
+}
+
+#[tokio::test]
+async fn an_incoherent_credential_launch_refuses_before_anything_is_read() {
+    let _lock = ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temporary dir");
+    let credential = temp.path().join("client.cred");
+    std::fs::write(&credential, format!("{}\n", "cd".repeat(32))).expect("write");
+
+    // An identifier with no mechanism.
+    assert!(matches!(
+        ControlLaunch::resolve(Some("reg-abc".to_string()), None),
+        Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+    ));
+
+    // Both mechanisms at once.
+    {
+        let (_env, _fd) = present_descriptor(&credential);
+        assert!(matches!(
+            ControlLaunch::resolve(Some("reg-abc".to_string()), Some(temp.path().join("helper"))),
+            Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+        ));
+        // A mechanism with no identifier.
+        assert!(matches!(
+            ControlLaunch::resolve(None, None),
+            Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+        ));
+    }
+
+    // The reserved descriptors, and a value that is not a number at all.
+    for value in ["0", "1", "2", "-1", "", "  ", "three"] {
+        let _env = EnvVarGuard::pin(CREDENTIAL_FD_ENV, value);
+        assert!(
+            matches!(
+                ControlLaunch::resolve(Some("reg-abc".to_string()), None),
+                Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+            ),
+            "descriptor {value:?} must be refused"
+        );
+    }
+
+    // An empty helper path.
+    assert!(matches!(
+        ControlLaunch::resolve(Some("reg-abc".to_string()), Some(PathBuf::new())),
+        Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+    ));
+    // A blank client id.
+    {
+        let (_env, _fd) = present_descriptor(&credential);
+        assert!(matches!(
+            ControlLaunch::resolve(Some("   ".to_string()), None),
+            Err(refusal) if refusal.code == StartupRefusalCode::CredentialMechanismInvalid
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_refused_start_answers_one_typed_frame_and_ends_the_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    let (id, _path) = install.register(
+        &install.full_grant(CredentialDelivery::IsolatedDescriptor),
+        "client.cred",
+    );
+    let wrong = install.root().join("wrong.cred");
+    std::fs::write(&wrong, format!("{}\n", "ef".repeat(32))).expect("write");
+    let refusal = match start_with_descriptor(&install, &id, &wrong).await {
+        Ok(_) => panic!("a wrong secret must refuse"),
+        Err(refusal) => refusal,
+    };
+
+    let script = [
+        serde_json::to_string(&request(1, "initialize", json!({}))).expect("serializes"),
+        serde_json::to_string(&request(2, "tools/list", json!({}))).expect("serializes"),
+        serde_json::to_string(&call(3, "control.ping", json!({}))).expect("serializes"),
+    ]
+    .join("\n");
+
+    let mut stdout: Vec<u8> = Vec::new();
+    zeroclaw::control_mcp::serve_refusal(script.as_bytes(), &mut stdout, &refusal)
+        .await
+        .expect("the refusal frame is written");
+
+    let text = String::from_utf8(stdout).expect("stdout is valid UTF-8");
+    let frames: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a JSON-RPC frame"))
+        .collect();
+    assert_eq!(
+        frames.len(),
+        1,
+        "a refusing process answers once and stops, whatever the client sends next"
+    );
+    let frame = &frames[0];
+    assert_eq!(frame["jsonrpc"], json!("2.0"));
+    assert_eq!(frame["id"], json!(1));
+    assert!(
+        frame["result"].is_null(),
+        "a refusal is never a successful result"
+    );
+    assert_eq!(frame["error"]["code"], json!(-32600));
+    let carried = &frame["error"]["data"][STARTUP_REFUSAL_META_KEY];
+    assert_eq!(carried["code"], json!("credential_rejected"));
+    assert_eq!(carried["retryable"], json!(false));
+    assert!(
+        frame["error"]["data"]["error"].is_null(),
+        "a startup refusal must not impersonate a v1 tool error payload"
+    );
+
+    // Redaction: fixed text only.
+    assert!(!text.contains(&install.root().display().to_string()));
+    assert!(!text.contains(id.as_str()));
+    assert!(!text.contains("component-client"));
+    assert!(!text.contains(&install.secret(&wrong)));
 }
 
 #[test]
