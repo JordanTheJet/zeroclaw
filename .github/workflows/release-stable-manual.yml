@@ -328,11 +328,14 @@ jobs:
           else
             BUILD_CMD="cargo build"
           fi
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            $BUILD_CMD --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
-          else
-            $BUILD_CMD --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
-          fi
+          # Always build --no-default-features against the generator's explicit
+          # per-target list: FEATURES already carries the default leaves for the
+          # target, so this applies the canonical per-target exclusions with no
+          # implicit feature drift. Unioning the root crate's defaults back in
+          # (by omitting --no-default-features) would silently re-enable a
+          # feature the generator excludes for this target (e.g. the Prometheus
+          # exporter on ARM).
+          $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
           # Build the zerocode TUI and the zerorelay nominated relay alongside the
           # main binary so they ship in the release archive. Skipped on Android,
           # which lacks the terminal deps.
