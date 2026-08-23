@@ -535,9 +535,14 @@ pub enum InstanceTrustState {
 impl InstanceTrustState {
     /// Whether first genesis may run against this root.
     ///
-    /// The single predicate the ceremony consults. Fail-closed by
-    /// construction: only the one state that means "never managed" is
-    /// eligible, so a state added later is ineligible until it is listed here.
+    /// Fail-closed by construction: only the one state that means "never
+    /// managed" is eligible, so a state added later is ineligible until it is
+    /// listed here.
+    ///
+    /// The ceremony does not call this; it matches the variants exhaustively so
+    /// it can report *why* it refused. This predicate is for callers that only
+    /// need the yes-or-no answer, and for tests that pin the anti-reset
+    /// property directly.
     #[must_use]
     pub const fn is_eligible_for_first_genesis(&self) -> bool {
         matches!(self, Self::EligibleForFirstGenesis)
@@ -1178,20 +1183,32 @@ mod tests {
             .expect("write key file");
 
         let source = FixedKeySource([0x11; 32]);
-        assert!(classify(&paths, &source).is_managed());
+        let state = classify(&paths, &source);
+        assert!(state.is_managed());
+        assert!(!state.is_eligible_for_first_genesis());
 
         // Delete the configuration.
         std::fs::remove_file(root.join("config.toml")).expect("remove config");
+        let state = classify(&paths, &source);
         assert!(
-            classify(&paths, &source).is_managed(),
+            state.is_managed(),
             "deleting config.toml must not un-manage the instance"
+        );
+        assert!(
+            !state.is_eligible_for_first_genesis(),
+            "deleting config.toml must not re-enable first genesis"
         );
 
         // Delete the target registry.
         std::fs::remove_file(paths.target_registry()).expect("remove registry");
+        let state = classify(&paths, &source);
         assert!(
-            classify(&paths, &source).is_managed(),
+            state.is_managed(),
             "deleting the registry must not un-manage the instance"
+        );
+        assert!(
+            !state.is_eligible_for_first_genesis(),
+            "deleting the registry must not re-enable first genesis"
         );
 
         // Delete the deployment key file. The record can no longer be
