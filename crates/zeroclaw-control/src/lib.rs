@@ -16,6 +16,7 @@
 //!
 //! This crate deliberately sits above `zeroclaw-runtime`.
 
+pub mod client_registry;
 pub mod genesis;
 mod guard;
 mod inventory;
@@ -30,6 +31,11 @@ mod service;
 mod session;
 pub mod store;
 
+pub use client_registry::{
+    ClientCredential, ClientGrant, ClientRegistration, ClientRegistry, ClientRegistryError,
+    ClientRegistryErrorCode, CredentialDelivery, CredentialVerifier, RegistrationId,
+    RegistrationStatus,
+};
 pub use genesis::{
     GenesisRecord, InstanceTrustState, KeyCommitment, PresenceClass, RecoveryReason,
 };
