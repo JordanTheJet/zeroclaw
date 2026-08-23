@@ -545,6 +545,20 @@ pub(crate) fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     }
 }
 
+/// Atomically replace whatever is at `path` with `bytes`.
+///
+/// Used for state a ceremony adds to — the target and client registries. The
+/// genesis record is never published this way; it has no rewrite path at all.
+///
+/// # Errors
+///
+/// Returns [`StoreErrorCode::PathIsSymlink`] when the path is a symlink and
+/// [`StoreErrorCode::Io`] for any filesystem failure.
+pub(crate) fn publish_replace(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    prepare_publication(path)?;
+    write_then_rename(path, bytes)
+}
+
 /// Create the parent directory and refuse a symlinked destination.
 fn prepare_publication(path: &Path) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
@@ -658,6 +672,24 @@ pub(crate) fn read_state_file(path: &Path) -> Result<Vec<u8>, StoreError> {
         ));
     }
     std::fs::read(path).map_err(|e| StoreError::io(&format!("read {}", path.display()), &e))
+}
+
+/// Read a control-plane state file that may legitimately be absent.
+///
+/// `Ok(None)` means "not there"; every other condition, including a symlinked
+/// path or an unreadable file, is an error. Absence and unreadability must not
+/// collapse into one answer, because one of them is a normal first-run state
+/// and the other is a trust failure.
+///
+/// # Errors
+///
+/// See [`read_state_file`].
+pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::io(&format!("stat {}", path.display()), &e)),
+        Ok(_) => read_state_file(path).map(Some),
+    }
 }
 
 /// 32 bytes from the operating system random source.

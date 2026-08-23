@@ -25,6 +25,7 @@ mod principal;
 mod proposal;
 pub mod protocol;
 pub mod registry;
+pub mod registry_store;
 mod service;
 mod session;
 pub mod store;
@@ -54,6 +55,7 @@ pub use proposal::{
     AgentProposal, PROPOSAL_MARKER, PersonalityFileProposal, ProposalError, ProposalErrorCode,
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
 };
+pub use registry_store::{RegistryStoreError, RegistryStoreErrorCode};
 pub use service::{
     BoundProposal, ControlApplyOutcome, ControlError, ControlInspection, ControlService,
     source_schema_is_current,
