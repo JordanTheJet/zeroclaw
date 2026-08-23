@@ -1140,8 +1140,8 @@ model-provider request and no network request.
 
 Examples:
   zeroclaw control --mcp
-  zeroclaw control --mcp --client-id reg-0123abcd 3<~/.zeroclaw-clients/cc.cred \\
-      ZEROCLAW_CONTROL_CREDENTIAL_FD=3
+  ZEROCLAW_CONTROL_CREDENTIAL_FD=3 zeroclaw control --mcp \\
+      --client-id reg-0123abcd 3<~/.zeroclaw-clients/cc.cred
   zeroclaw control --mcp --client-id reg-0123abcd \\
       --credential-helper ~/.zeroclaw-clients/read-cc-credential
   zeroclaw control genesis
