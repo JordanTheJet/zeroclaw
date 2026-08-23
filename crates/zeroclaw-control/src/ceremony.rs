@@ -124,6 +124,28 @@ pub struct PresenceAttestation {
 }
 
 impl PresenceAttestation {
+    /// Build an attestation directly, for a scripted adapter in a sibling
+    /// module's tests.
+    ///
+    /// # Test-only
+    ///
+    /// `#[cfg(test)]` and `pub(crate)`: it exists in no shipped build and is
+    /// reachable from no other crate. The fields are otherwise private to this
+    /// module, which is what stops a caller anywhere from fabricating an
+    /// attestation for a ceremony that did not happen — sibling modules such as
+    /// [`crate::operator`] need a way to script presence in *their* tests
+    /// without that guarantee being weakened for production.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        class: PresenceClass,
+        operator_identity: Option<FirstOperatorIdentity>,
+    ) -> Self {
+        Self {
+            class,
+            operator_identity,
+        }
+    }
+
     /// The assurance class actually achieved.
     #[must_use]
     pub const fn class(&self) -> PresenceClass {

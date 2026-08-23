@@ -22,10 +22,12 @@ pub mod genesis;
 mod guard;
 mod inventory;
 pub mod keys;
+pub mod operator;
 mod preview;
 mod principal;
 mod proposal;
 pub mod protocol;
+pub mod reachability;
 pub mod registry;
 pub mod registry_store;
 mod service;
@@ -52,6 +54,12 @@ pub use inventory::{
     ProviderError, ProviderErrorCode, ProviderPickerInventory, ProviderTarget, RiskChoice,
     RuntimeChoice, SafeInventory, eligible_provider_refs,
 };
+pub use operator::{
+    OperatorAuthentication, OperatorError, OperatorErrorCode, OperatorIdentity, OperatorOrigin,
+    OperatorRecord, OperatorRegistry, OperatorStatus, PrincipalClass, RegisterOperatorRequest,
+    RegisteredOperator, RequesterContext, RequesterFingerprint, RequesterSubject,
+    authenticate_operator, run_register_operator,
+};
 pub use preview::{
     ApplyIntegration, PersistencePreview, PersonalityFilePreview, ProfileDisposition,
     ProposalPreview, RevisionBinding, build_preview,
@@ -66,6 +74,7 @@ pub use proposal::{
     AgentProposal, PROPOSAL_MARKER, PersonalityFileProposal, ProposalError, ProposalErrorCode,
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
 };
+pub use reachability::{Evidence, IsolationQuestion, Reachability};
 pub use registry_store::{RegistryStoreError, RegistryStoreErrorCode};
 pub use service::{
     BoundProposal, ControlApplyOutcome, ControlError, ControlInspection, ControlService,
