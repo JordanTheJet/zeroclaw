@@ -988,6 +988,42 @@ impl OpenAiCompatibleModelProvider {
             .await
     }
 
+    /// Credential for a catalog request.
+    ///
+    /// A public catalog is reachable with no credential at all, so for those
+    /// providers a credential that cannot be resolved for *this* destination
+    /// means "send none" rather than "fail". ZeroRouter is the case that
+    /// forces the distinction: its credential reader deliberately errors when
+    /// stored keys belong to a different router, which is correct for
+    /// inference but would otherwise block the unauthenticated
+    /// `GET /v1/models` that `public_model_listing` promises.
+    ///
+    /// Inference keeps calling [`Self::resolve_credential`] and keeps failing
+    /// closed. This path never widens what may be sent — it only ever sends
+    /// less.
+    async fn resolve_listing_credential(&self) -> anyhow::Result<Option<String>> {
+        if !self.public_model_listing {
+            return self.resolve_credential().await;
+        }
+        match self.resolve_credential().await {
+            Ok(credential) => Ok(credential),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "alias": &self.alias,
+                            "phase": "public_model_list_credential",
+                            "error": format!("{error:#}"),
+                        })),
+                    "compatible: no credential for this destination; listing the public catalog unauthenticated"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     fn assistant_reasoning_value(value: &serde_json::Value) -> Option<&str> {
         value
             .get("reasoning_content")
@@ -2657,7 +2693,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
         // servers with a public catalog use the same path without an Authorization header.
-        let list_credential = self.resolve_credential().await?;
+        let list_credential = self.resolve_listing_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
@@ -2729,7 +2765,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         // When a credential is present, hit the provider's native /models
         // endpoint — this returns pricing data that we can capture.
-        let list_credential = self.resolve_credential().await?;
+        let list_credential = self.resolve_listing_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
@@ -3791,6 +3827,107 @@ mod tests {
                 "the key leaked into the error text: {error}"
             ),
         }
+    }
+
+    /// A ZeroRouter catalog is public: `GET /v1/models` needs no credential.
+    /// Once router A has a stored key, a keyless alias for router B used to
+    /// die on A's issuer-binding error before it could issue that
+    /// unauthenticated request. Listing must degrade to "no credential" and
+    /// send no `Authorization` at all, while inference keeps failing closed.
+    #[tokio::test]
+    async fn a_public_catalog_still_lists_when_a_stored_key_belongs_to_another_router() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let with_header = Arc::clone(&authorized);
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen);
+                let with_header = Arc::clone(&with_header);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                        with_header.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "router-b/model-1",
+                            "pricing": { "prompt": "0.000001", "completion": "0.000002" }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "issuer".to_string(),
+            "https://router-a.example.com".to_string(),
+        );
+        auth.store_model_provider_token("zerorouter", "router-a", "zcr_key_for_a", metadata, true)
+            .await
+            .expect("store router A's key");
+
+        let base_url = format!("http://{addr}/v1");
+        let alias_b = OpenAiCompatibleModelProvider::builder("zr-b")
+            .display_name("ZeroRouter")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .public_model_listing()
+            .auth_profile("zerorouter", auth.clone(), None)
+            .build();
+
+        let models = alias_b
+            .list_models()
+            .await
+            .expect("a public catalog lists without a credential");
+        assert_eq!(models, vec!["router-b/model-1".to_string()]);
+
+        let priced = alias_b
+            .list_models_with_pricing()
+            .await
+            .expect("the priced catalog lists without a credential too");
+        assert_eq!(
+            priced.len(),
+            1,
+            "pricing rows should survive the public path"
+        );
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "both listing methods should have reached router B"
+        );
+        assert_eq!(
+            authorized.load(Ordering::SeqCst),
+            0,
+            "router B received an Authorization header it must never see"
+        );
+
+        // Inference still fails closed rather than borrowing router A's key.
+        assert!(
+            alias_b.resolve_credential().await.is_err(),
+            "the inference credential path must keep failing closed",
+        );
+
+        server.abort();
     }
 
     /// Empty / whitespace arguments must collapse to `"{}"` so OpenAI-style
