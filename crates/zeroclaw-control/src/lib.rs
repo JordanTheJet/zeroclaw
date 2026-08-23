@@ -16,12 +16,14 @@
 //!
 //! This crate deliberately sits above `zeroclaw-runtime`.
 
+pub mod apply_worker;
 pub mod approval;
 pub mod ceremony;
 pub mod client_registry;
 pub mod genesis;
 mod guard;
 mod inventory;
+pub mod journal;
 pub mod keys;
 pub mod meta_authority;
 pub mod operator;
@@ -30,6 +32,7 @@ mod principal;
 mod proposal;
 pub mod protocol;
 pub mod reachability;
+pub mod recovery;
 pub mod registry;
 pub mod registry_store;
 mod service;
@@ -38,6 +41,7 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 
+pub use apply_worker::{ApplyWorker, WorkerError, WorkerOutcome};
 pub use approval::{
     ApprovalBroker, ApprovalError, ApprovalErrorCode, ApprovalReceipt, ApprovalRequest,
     AuthenticatedReceipt, ConsumptionMarker, Decision, Expectations, InMemoryReceiptLedger,
@@ -64,6 +68,12 @@ pub use inventory::{
     ProviderError, ProviderErrorCode, ProviderPickerInventory, ProviderTarget, RiskChoice,
     RuntimeChoice, SafeInventory, eligible_provider_refs,
 };
+pub use journal::{
+    ArtifactKind, DeclaredEffect, DurableReceiptLedger, EffectClassification, EffectId,
+    EffectImage, JournalEntry, JournalError, JournalErrorCode, JournalState, OperationId,
+    ParkRequest, ProposalJournal, Quotas, ResumeSecret, RollbackDeclaration, StatusReport,
+    VerificationPlan,
+};
 pub use meta_authority::{
     AuthorityTier, ConfirmationTier, ControlOperation, RequiredQuorum, required_quorum,
 };
@@ -88,6 +98,7 @@ pub use proposal::{
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
 };
 pub use reachability::{Evidence, IsolationQuestion, Reachability};
+pub use recovery::{RecoveryAction, RecoveryReport, VerifyReport, recover, verify};
 pub use registry_store::{RegistryStoreError, RegistryStoreErrorCode};
 pub use service::{
     BoundProposal, ControlApplyOutcome, ControlError, ControlInspection, ControlService,

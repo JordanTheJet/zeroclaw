@@ -15,6 +15,13 @@ fixture-grants = []
 
 [dependencies]
 anyhow = "1.0"
+# Advisory file locking for the control-plane transaction lock the durable
+# apply worker holds while it claims and applies one approved proposal. `fs2
+# = "0.4"` is already declared verbatim by zeroclaw-config — which this crate's
+# dependency graph already pulls in — so the resolved version (0.4.3) is
+# unchanged and Cargo.lock does not move. It is the same primitive the
+# revision-bound config write lock (finding #41) uses.
+fs2 = "0.4"
 hex = "0.4"
 # RFC 5869 HKDF-SHA256 for the ADR-015 approval and audit key is implemented in
 # `keys.rs` over `hmac` + `sha2`. Both already build in this workspace (channels,

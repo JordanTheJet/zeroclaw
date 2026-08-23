@@ -13670,6 +13670,7 @@ version = "0.8.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "fs2",
  "hex",
  "hmac 0.12.1",
  "rand 0.10.1",
