@@ -880,6 +880,18 @@ pub struct Expectations<'a> {
     pub trust_epoch: TrustEpoch,
     /// The current wall-clock time, seconds since the Unix epoch.
     pub now_unix_secs: u64,
+    /// The highest wall-clock time the host has ever trusted — the last recorded
+    /// journal timestamp, in the phase-5 journal's terms.
+    ///
+    /// A high-water mark, so a receipt refused once because the clock had passed
+    /// its expiry stays refused after the wall clock steps back: if
+    /// `now_unix_secs` reads below this, the time source is ambiguous and every
+    /// affected credential expires rather than extends. The proposal-journal
+    /// clock rule fixes this direction — clock rollback shortens, never extends,
+    /// validity. In this phase the caller supplies the mark; the durable journal
+    /// will maintain it. Set it to `now_unix_secs` when there is no earlier
+    /// observation to compare against.
+    pub high_water_unix_secs: u64,
 }
 
 /// Verify a sealed receipt against the operation in hand.
@@ -1020,12 +1032,27 @@ pub fn verify_for_consumption(
         ));
     }
 
-    // Clock rules: expiry fails closed, and a clock that moved backwards past
-    // the issue time shortens validity rather than extending it.
+    // Clock rules: expiry fails closed, and a clock that moved backwards
+    // shortens validity rather than extending it.
+    //
+    // Two backward-step guards. The first catches a clock before this receipt's
+    // own issue time. The second catches a clock that stepped below the last
+    // recorded journal timestamp (the high-water mark): a receipt already past
+    // its expiry at a later observed time must not become valid again once the
+    // wall clock rolls back into its window. Detecting the step against a
+    // monotonic high-water mark is what makes "rollback expires, never extends"
+    // hold — it is the proposal-journal clock rule, checked here so an expired
+    // receipt stays expired.
     if expectations.now_unix_secs < receipt.issued_at_unix_secs {
         return Err(ApprovalError::new(
             ApprovalErrorCode::ClockRollback,
             "the host clock is before this receipt's issue time",
+        ));
+    }
+    if expectations.now_unix_secs < expectations.high_water_unix_secs {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::ClockRollback,
+            "the host clock stepped back below the last recorded time",
         ));
     }
     if expectations.now_unix_secs >= receipt.expires_at_unix_secs {
@@ -1514,6 +1541,9 @@ mod tests {
                 source_revision: &request.source_revision,
                 trust_epoch: self.record.trust_epoch,
                 now_unix_secs: now,
+                // No earlier observation than `now` in these fixtures: the
+                // high-water mark equals the current time unless a test sets it.
+                high_water_unix_secs: now,
             }
         }
 
@@ -1813,6 +1843,59 @@ mod tests {
             &requester,
         )
         .expect_err("a clock before the issue time must not extend validity");
+        assert_eq!(err.code, ApprovalErrorCode::ClockRollback);
+    }
+
+    #[test]
+    fn an_expired_receipt_stays_expired_after_a_clock_rollback() {
+        // The receipt is valid on [NOW, NOW + 300). The host observes a time
+        // past its expiry (recording a high-water mark), then the wall clock
+        // steps back into the validity window. The receipt must not re-validate.
+        //
+        // Guarded by mutation check (4): reverting the high-water guard lets the
+        // rolled-back verification succeed, and this test regresses.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger)
+            .with_receipt_ttl_secs(300);
+        let requester = isolated_requester("reg-abc123");
+        let request = fixture.request();
+        let auth = fixture.authenticate(&requester);
+        let issued = broker
+            .request_approval(&request, &requester, auth, NOW)
+            .expect("approve");
+
+        // Control: within the window, with no earlier observation, it verifies.
+        let mut ok = fixture.expectations(&request, NOW + 30);
+        ok.high_water_unix_secs = NOW + 30;
+        assert!(
+            verify_for_consumption(
+                issued.as_sealed_bytes(),
+                &key,
+                &ok,
+                &ledger,
+                &fixture.operators,
+                &requester,
+            )
+            .is_ok(),
+            "within the window and with no rollback, the receipt verifies"
+        );
+
+        // The host observed a time past expiry: the journal's high-water mark is
+        // NOW + 10_000. The wall clock then rolls back to NOW + 30, inside the
+        // window. It must fail closed rather than re-validate.
+        let mut rolled_back = fixture.expectations(&request, NOW + 30);
+        rolled_back.high_water_unix_secs = NOW + 10_000;
+        let err = verify_for_consumption(
+            issued.as_sealed_bytes(),
+            &key,
+            &rolled_back,
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("an expired receipt must not re-validate after a clock rollback");
         assert_eq!(err.code, ApprovalErrorCode::ClockRollback);
     }
 
