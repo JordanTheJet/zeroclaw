@@ -290,6 +290,12 @@ struct DaemonHandle {
     metrics: Arc<NodeMetrics>,
     /// Per-node client-connect rate limiter (A6).
     connect_bucket: Arc<Mutex<TokenBucket>>,
+    /// Fires when this link is superseded by a newer registration of the same
+    /// node-id, so the old link's reader/writer tasks and conn map are reclaimed
+    /// instead of lingering under one registry slot. Without it, one key could
+    /// re-register the same node-id repeatedly and accumulate live links while
+    /// `max_registered_nodes` stayed at a single map entry.
+    supersede: Arc<tokio::sync::Notify>,
 }
 
 /// How many distinct source IPs the accept-rate map tracks before it prunes idle
@@ -715,6 +721,10 @@ where
     let (to_daemon, mut from_clients) = mpsc::channel::<Message>(256);
     let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // Owner cancellation for THIS link. A same-key re-registration will fire the
+    // superseded link's own `supersede` so it tears down; this link parks on its
+    // fresh one in the reader loop below.
+    let supersede = Arc::new(tokio::sync::Notify::new());
     {
         let mut daemons = inner.daemons.lock().await;
         if let Some(existing) = daemons.get(&node_id)
@@ -746,6 +756,14 @@ where
             .await;
             return Ok(());
         }
+        // Same-key re-registration replaces the map entry; reclaim the superseded
+        // link first so its reader/writer tasks and conn map are torn down instead
+        // of lingering. Otherwise one key could re-register repeatedly and grow
+        // live links/tasks while `max_registered_nodes` stayed at one entry. The
+        // teardown epoch guard keeps the old link from evicting this replacement.
+        if let Some(existing) = daemons.get(&node_id) {
+            existing.supersede.notify_one();
+        }
         daemons.insert(
             node_id.clone(),
             DaemonHandle {
@@ -758,6 +776,7 @@ where
                     inner.connect_burst_per_node,
                     inner.connect_rate_per_node,
                 ))),
+                supersede: supersede.clone(),
             },
         );
     }
@@ -790,8 +809,17 @@ where
     // Reader loop: demultiplex daemon -> client. Every delivery clones the
     // conn's sender under the map lock, drops the guard, and hands off
     // non-blocking (see `deliver_conn_event`), so one stalled client can never
-    // freeze delivery or teardown for the other conns on this node.
-    while let Some(msg) = stream.next().await {
+    // freeze delivery or teardown for the other conns on this node. The loop also
+    // breaks when this link is superseded by a newer same-key registration, so
+    // the old link is reclaimed rather than accumulating.
+    loop {
+        let msg = tokio::select! {
+            _ = supersede.notified() => break,
+            m = stream.next() => match m {
+                Some(m) => m,
+                None => break,
+            },
+        };
         match msg {
             Ok(Message::Text(t)) => match Control::from_json(&t) {
                 Ok(Control::Opened { conn_id }) => {

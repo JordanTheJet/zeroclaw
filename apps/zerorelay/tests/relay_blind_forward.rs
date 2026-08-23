@@ -920,3 +920,32 @@ async fn oversized_and_nonprintable_node_ids_are_rejected() {
         other => panic!("expected bad_node_id for control characters, got {other:?}"),
     }
 }
+
+/// B3: re-registering the SAME node-id with the SAME key supersedes the old link,
+/// so its reader/writer tasks and conn map are reclaimed instead of accumulating
+/// live links under a single registry slot. The relay closes the superseded
+/// connection once the replacement registers. Before the fix the old link's
+/// tasks and conns lingered while `max_registered_nodes` stayed at one entry.
+#[tokio::test]
+async fn same_key_reregistration_reclaims_the_old_link() {
+    let addr = start_relay(RelayConfig::default()).await;
+    let key = gen_key();
+
+    // First registration for node-x.
+    let (mut first, term1) = handshake(addr, "node-x", &key, None, true).await;
+    assert!(matches!(term1, Control::Registered { .. }), "got {term1:?}");
+
+    // Second registration: SAME node-id + SAME key. Admitted (replaces the entry).
+    let (_second, term2) = handshake(addr, "node-x", &key, None, true).await;
+    assert!(matches!(term2, Control::Registered { .. }), "got {term2:?}");
+
+    // The superseded link must be torn down: the relay closes it, so a read on the
+    // first connection completes (EOF/close) rather than hanging open. This also
+    // proves the old serve task ran its teardown, which drains its conn map.
+    let closed =
+        tokio::time::timeout(std::time::Duration::from_secs(5), next_control(&mut first)).await;
+    assert!(
+        matches!(closed, Ok(None)),
+        "the superseded link must be closed after same-key re-registration, got {closed:?}"
+    );
+}
