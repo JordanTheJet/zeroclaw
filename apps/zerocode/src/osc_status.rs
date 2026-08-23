@@ -39,15 +39,16 @@
 //! OSC 2. Zerocode therefore never treats `Write::is_ok()` as proof of support.
 //! It records a restore obligation before the first overwrite, pairs every
 //! graceful teardown with a neutral title followed by XTPOPTITLE, and lets only
-//! one teardown path claim a successful pop. A failed pop re-arms the
-//! obligation so a later path can retry. A stack-capable terminal restores its
-//! saved title; a stack-less terminal keeps the neutral fallback instead of a
-//! stale working or blocked title.
+//! one teardown path atomically claim the neutralize and pop obligations. A
+//! failed operation re-arms only its own obligation, so a failed neutral write
+//! can be retried without popping the saved title twice. A stack-capable
+//! terminal restores its saved title; a stack-less terminal keeps the neutral
+//! fallback instead of a stale working or blocked title.
 
 use std::io::Write;
 use std::sync::{
     Mutex, TryLockError,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use zeroclaw_api::lifecycle::{LifecycleActivity, LifecycleState};
 
@@ -56,6 +57,13 @@ use crate::turn_status::TurnStatus;
 /// Terminal tabs are narrow and titles can contain model-influenced tool
 /// names. Bound the payload as defense in depth even after controls are removed.
 const MAX_TITLE_CHARS: usize = 120;
+
+/// Independent terminal cleanup obligations, claimed together through one
+/// atomic state so concurrent teardown paths cannot split neutralize-before-pop
+/// ordering between threads.
+const CLEANUP_NEUTRALIZE: u8 = 1 << 0;
+const CLEANUP_POP: u8 = 1 << 1;
+const CLEANUP_ALL: u8 = CLEANUP_NEUTRALIZE | CLEANUP_POP;
 
 /// Status glyph for a turn state. Leading character of the title.
 fn glyph(status: &TurnStatus) -> char {
@@ -164,7 +172,7 @@ impl StatusReporter {
     fn sync_to(
         &mut self,
         out: &mut impl Write,
-        restore_needed: &AtomicBool,
+        cleanup_needed: &AtomicU8,
         release_epoch: &AtomicUsize,
         expected_release_epoch: usize,
         status: Option<&TurnStatus>,
@@ -191,7 +199,8 @@ impl StatusReporter {
             // A successful write cannot prove title-stack support, and a
             // failed write may be partial. Record cleanup ownership before
             // sending either sequence, then always pair it with a later pop.
-            if !restore_needed.swap(true, Ordering::AcqRel) {
+            let previous_cleanup = cleanup_needed.fetch_or(CLEANUP_ALL, Ordering::AcqRel);
+            if previous_cleanup & CLEANUP_POP == 0 {
                 let _ = push_title(out);
             }
             // Cache only a write that landed: a failed or partial write leaves
@@ -203,7 +212,7 @@ impl StatusReporter {
         }
 
         if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
-            self.reconcile_concurrent_release(out, restore_needed, title_write_attempted);
+            self.reconcile_concurrent_release(out, cleanup_needed, title_write_attempted);
             return;
         }
 
@@ -213,7 +222,7 @@ impl StatusReporter {
         }
 
         if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
-            self.reconcile_concurrent_release(out, restore_needed, title_write_attempted);
+            self.reconcile_concurrent_release(out, cleanup_needed, title_write_attempted);
         }
     }
 
@@ -227,20 +236,9 @@ impl StatusReporter {
         self.last_progress = None;
     }
 
-    fn release_to(&mut self, out: &mut impl Write, restore_needed: &AtomicBool) {
+    fn release_to(&mut self, out: &mut impl Write, cleanup_needed: &AtomicU8) {
         let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-        if restore_needed.swap(false, Ordering::AcqRel) {
-            // Neutralize attention state before pop. Terminals with a title
-            // stack restore the prior title; terminals that ignored the push
-            // retain this harmless fallback instead of stale busy text.
-            let _ = write_title(out, "zerocode");
-            if pop_title(out).is_err() {
-                // A failed or partial pop is ambiguous. Re-arm so a later
-                // teardown path can retry, while a successful emergency pop
-                // cannot be repeated by the normal path.
-                restore_needed.store(true, Ordering::Release);
-            }
-        }
+        release_title_obligations(out, cleanup_needed, false);
         self.invalidate();
     }
 
@@ -254,17 +252,11 @@ impl StatusReporter {
     fn reconcile_concurrent_release(
         &mut self,
         out: &mut impl Write,
-        restore_needed: &AtomicBool,
+        cleanup_needed: &AtomicU8,
         title_write_attempted: bool,
     ) {
         let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-        let should_pop = restore_needed.swap(false, Ordering::AcqRel);
-        if title_write_attempted || should_pop {
-            let _ = write_title(out, "zerocode");
-        }
-        if should_pop && pop_title(out).is_err() {
-            restore_needed.store(true, Ordering::Release);
-        }
+        release_title_obligations(out, cleanup_needed, title_write_attempted);
         self.invalidate();
     }
 }
@@ -273,7 +265,7 @@ impl StatusReporter {
 static REPORTER: Mutex<Option<StatusReporter>> = Mutex::new(None);
 /// Cleanup ownership lives outside `REPORTER` so a panic hook can claim it
 /// without waiting for the mutex that the panicking write may still hold.
-static TITLE_RESTORE_NEEDED: AtomicBool = AtomicBool::new(false);
+static TITLE_CLEANUP_NEEDED: AtomicU8 = AtomicU8::new(0);
 /// Every teardown advances the epoch before touching the reporter mutex. A
 /// queued sync aborts when its captured epoch is stale; an in-flight sync
 /// neutralizes any bytes that could have landed after nonblocking cleanup.
@@ -300,7 +292,7 @@ pub(crate) fn sync(status: Option<&TurnStatus>, agent: Option<&str>) {
     with_reporter(|r| {
         r.sync_to(
             &mut std::io::stdout(),
-            &TITLE_RESTORE_NEEDED,
+            &TITLE_CLEANUP_NEEDED,
             &RELEASE_EPOCH,
             expected_release_epoch,
             status,
@@ -325,7 +317,7 @@ pub(crate) fn invalidate() {
 pub(crate) fn release() {
     release_reporter_to(
         &REPORTER,
-        &TITLE_RESTORE_NEEDED,
+        &TITLE_CLEANUP_NEEDED,
         &RELEASE_EPOCH,
         &mut std::io::stdout(),
     );
@@ -339,7 +331,7 @@ pub(crate) fn release() {
 /// neutralize any bytes that land after that cleanup.
 fn release_reporter_to(
     reporter: &Mutex<Option<StatusReporter>>,
-    restore_needed: &AtomicBool,
+    cleanup_needed: &AtomicU8,
     release_epoch: &AtomicUsize,
     out: &mut impl Write,
 ) {
@@ -347,22 +339,42 @@ fn release_reporter_to(
     match reporter.try_lock() {
         Ok(mut guard) => guard
             .get_or_insert_with(StatusReporter::default)
-            .release_to(out, restore_needed),
+            .release_to(out, cleanup_needed),
         Err(TryLockError::Poisoned(poisoned)) => poisoned
             .into_inner()
             .get_or_insert_with(StatusReporter::default)
-            .release_to(out, restore_needed),
-        Err(TryLockError::WouldBlock) => emergency_release_to(out, restore_needed),
+            .release_to(out, cleanup_needed),
+        Err(TryLockError::WouldBlock) => emergency_release_to(out, cleanup_needed),
     }
 }
 
-fn emergency_release_to(out: &mut impl Write, restore_needed: &AtomicBool) {
+fn emergency_release_to(out: &mut impl Write, cleanup_needed: &AtomicU8) {
     let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-    if restore_needed.swap(false, Ordering::AcqRel) {
-        let _ = write_title(out, "zerocode");
-        if pop_title(out).is_err() {
-            restore_needed.store(true, Ordering::Release);
-        }
+    release_title_obligations(out, cleanup_needed, false);
+}
+
+/// Claim all currently pending title work in one atomic operation, then re-arm
+/// only the operation whose write was unsuccessful. `force_neutralize` covers
+/// a title write that landed after a concurrent panic cleanup already claimed
+/// the saved-title pop.
+fn release_title_obligations(
+    out: &mut impl Write,
+    cleanup_needed: &AtomicU8,
+    force_neutralize: bool,
+) {
+    let claimed = cleanup_needed.swap(0, Ordering::AcqRel);
+    let should_neutralize = force_neutralize || claimed & CLEANUP_NEUTRALIZE != 0;
+    let should_pop = claimed & CLEANUP_POP != 0;
+    let mut retry = 0;
+
+    if should_neutralize && write_title(out, "zerocode").is_err() {
+        retry |= CLEANUP_NEUTRALIZE;
+    }
+    if should_pop && pop_title(out).is_err() {
+        retry |= CLEANUP_POP;
+    }
+    if retry != 0 {
+        cleanup_needed.fetch_or(retry, Ordering::AcqRel);
     }
 }
 
@@ -447,7 +459,7 @@ mod tests {
     #[derive(Default)]
     struct TestReporter {
         inner: StatusReporter,
-        restore_needed: AtomicBool,
+        cleanup_needed: AtomicU8,
         release_epoch: AtomicUsize,
     }
 
@@ -461,7 +473,7 @@ mod tests {
             let expected_release_epoch = self.release_epoch.load(Ordering::Acquire);
             self.inner.sync_to(
                 out,
-                &self.restore_needed,
+                &self.cleanup_needed,
                 &self.release_epoch,
                 expected_release_epoch,
                 status,
@@ -470,11 +482,15 @@ mod tests {
         }
 
         fn release_to(&mut self, out: &mut impl Write) {
-            self.inner.release_to(out, &self.restore_needed);
+            self.inner.release_to(out, &self.cleanup_needed);
         }
 
         fn needs_restore(&self) -> bool {
-            self.restore_needed.load(Ordering::Acquire)
+            self.cleanup_needed.load(Ordering::Acquire) != 0
+        }
+
+        fn cleanup_bits(&self) -> u8 {
+            self.cleanup_needed.load(Ordering::Acquire)
         }
     }
 
@@ -891,9 +907,65 @@ mod tests {
         let mut out = FailFirstPop::default();
         r.release_to(&mut out);
         assert!(r.needs_restore(), "failed pop must remain retryable");
+        assert_eq!(r.cleanup_bits(), CLEANUP_POP);
         r.release_to(&mut out);
         assert!(!r.needs_restore());
         assert!(out.bytes.ends_with(b"\x1b[23;0t"));
+    }
+
+    /// A stack-less terminal needs the neutral OSC 2 fallback even when its
+    /// title-stack pop write succeeds. Retrying that failed fallback must not
+    /// pop a second title from a stack-capable terminal.
+    #[test]
+    fn failed_neutral_title_is_retried_without_a_second_pop() {
+        #[derive(Default)]
+        struct FailFirstNeutralTitle {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for FailFirstNeutralTitle {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.failed && buf == b"\x1b]2;zerocode\x07" {
+                    self.failed = true;
+                    return Err(std::io::Error::other("neutral title failed"));
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        let mut initial = Vec::new();
+        r.sync_to(&mut initial, Some(&TurnStatus::Working), Some("herder"));
+
+        let mut out = FailFirstNeutralTitle::default();
+        r.release_to(&mut out);
+        assert_eq!(r.cleanup_bits(), CLEANUP_NEUTRALIZE);
+        assert_eq!(
+            out.bytes
+                .windows(b"\x1b[23;0t".len())
+                .filter(|window| *window == b"\x1b[23;0t")
+                .count(),
+            1,
+            "the saved title should still be popped once"
+        );
+
+        r.release_to(&mut out);
+        assert_eq!(r.cleanup_bits(), 0);
+        assert!(out.bytes.ends_with(b"\x1b]2;zerocode\x07"));
+        assert_eq!(
+            out.bytes
+                .windows(b"\x1b[23;0t".len())
+                .filter(|window| *window == b"\x1b[23;0t")
+                .count(),
+            1,
+            "retrying neutralization must not pop an outer title"
+        );
     }
 
     /// Panic cleanup must not wait on the same reporter lock whose critical
@@ -901,14 +973,14 @@ mod tests {
     #[test]
     fn reentrant_release_uses_nonblocking_emergency_cleanup() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
-        let restore_needed = AtomicBool::new(true);
+        let cleanup_needed = AtomicU8::new(CLEANUP_ALL);
         let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
-            release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
+            release_reporter_to(&reporter, &cleanup_needed, &release_epoch, &mut out);
         });
         assert_eq!(out, b"\x1b]9;4;0;0\x07\x1b]2;zerocode\x07\x1b[23;0t");
-        assert!(!restore_needed.load(Ordering::Acquire));
+        assert_eq!(cleanup_needed.load(Ordering::Acquire), 0);
         assert_eq!(release_epoch.load(Ordering::Acquire), 1);
     }
 
@@ -918,13 +990,13 @@ mod tests {
     #[test]
     fn emergency_then_normal_release_pops_exactly_once() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
-        let restore_needed = AtomicBool::new(true);
+        let cleanup_needed = AtomicU8::new(CLEANUP_ALL);
         let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
-            release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
+            release_reporter_to(&reporter, &cleanup_needed, &release_epoch, &mut out);
         });
-        release_reporter_to(&reporter, &restore_needed, &release_epoch, &mut out);
+        release_reporter_to(&reporter, &cleanup_needed, &release_epoch, &mut out);
 
         assert_eq!(
             out.windows(b"\x1b[23;0t".len())
@@ -940,13 +1012,13 @@ mod tests {
     #[test]
     fn queued_sync_from_before_release_emits_nothing() {
         let mut status = StatusReporter::default();
-        let restore_needed = AtomicBool::new(false);
+        let cleanup_needed = AtomicU8::new(0);
         let release_epoch = AtomicUsize::new(1);
         let mut out = Vec::new();
 
         status.sync_to(
             &mut out,
-            &restore_needed,
+            &cleanup_needed,
             &release_epoch,
             0,
             Some(&TurnStatus::Working),
@@ -954,7 +1026,7 @@ mod tests {
         );
 
         assert!(out.is_empty());
-        assert!(!restore_needed.load(Ordering::Acquire));
+        assert_eq!(cleanup_needed.load(Ordering::Acquire), 0);
     }
 
     /// A process-wide panic hook cannot wait for a different worker to release
@@ -986,14 +1058,14 @@ mod tests {
         }
 
         let reporter = std::sync::Arc::new(Mutex::new(Some(StatusReporter::default())));
-        let restore_needed = std::sync::Arc::new(AtomicBool::new(false));
+        let cleanup_needed = std::sync::Arc::new(AtomicU8::new(0));
         let release_epoch = std::sync::Arc::new(AtomicUsize::new(0));
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
 
         let writer_reporter = std::sync::Arc::clone(&reporter);
-        let writer_restore = std::sync::Arc::clone(&restore_needed);
+        let writer_cleanup = std::sync::Arc::clone(&cleanup_needed);
         let writer_epoch = std::sync::Arc::clone(&release_epoch);
         let writer = std::thread::spawn(move || {
             let expected_release_epoch = writer_epoch.load(Ordering::Acquire);
@@ -1005,7 +1077,7 @@ mod tests {
             with_reporter_mutex(&writer_reporter, |status| {
                 status.sync_to(
                     &mut sink,
-                    &writer_restore,
+                    &writer_cleanup,
                     &writer_epoch,
                     expected_release_epoch,
                     Some(&TurnStatus::Working),
@@ -1017,14 +1089,14 @@ mod tests {
         locked_rx.recv().unwrap();
 
         let release_reporter = std::sync::Arc::clone(&reporter);
-        let release_restore = std::sync::Arc::clone(&restore_needed);
+        let release_cleanup = std::sync::Arc::clone(&cleanup_needed);
         let release_epoch = std::sync::Arc::clone(&release_epoch);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
             let mut out = Vec::new();
             release_reporter_to(
                 &release_reporter,
-                &release_restore,
+                &release_cleanup,
                 &release_epoch,
                 &mut out,
             );
@@ -1057,7 +1129,7 @@ mod tests {
         let pop_count = release_out.windows(pop.len()).filter(|w| *w == pop).count()
             + writer_out.windows(pop.len()).filter(|w| *w == pop).count();
         assert_eq!(pop_count, 1, "concurrent cleanup must pop exactly once");
-        assert!(!restore_needed.load(Ordering::Acquire));
+        assert_eq!(cleanup_needed.load(Ordering::Acquire), 0);
     }
 
     /// A blocked pane wins even when it is not the visible one — the whole

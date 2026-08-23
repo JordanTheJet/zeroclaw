@@ -58,6 +58,11 @@ software that does not support these sequences ignores them. The payload
 includes only the selected agent alias and a bounded status or tool name. It
 never includes the prompt, tool arguments, tool output, or response text.
 
+If the daemon connection is lost, zerocode immediately clears progress and
+publishes the neutral `✓ zerocode` title instead of retaining a cached working
+or blocked state. Session state remains available for reconnection, and live
+pane status is projected again only after the daemon reconnects.
+
 On normal exit and supported termination signals, zerocode clears progress and
 restores the terminal title when the terminal supports a title stack. It writes
 a neutral `zerocode` fallback for terminals without one. Like all terminal

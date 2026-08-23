@@ -57,6 +57,21 @@ enum QuickstartChatDrain {
     AfterReconnect,
 }
 
+/// Project cached pane state only while the daemon connection is authoritative.
+/// A disconnect keeps session state available for reconnection, but externally
+/// visible terminal state must become neutral instead of advertising a cached
+/// working or blocked turn indefinitely.
+fn terminal_status_for_connection<'a>(
+    connection: &ConnectionState,
+    panes: impl IntoIterator<Item = (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>)>,
+) -> (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>) {
+    if matches!(connection, ConnectionState::Disconnected { .. }) {
+        (None, None)
+    } else {
+        crate::osc_status::most_urgent(panes)
+    }
+}
+
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -807,10 +822,13 @@ pub async fn run(
         // visible: the terminal status exists to be read from outside this
         // window, so it has to answer "does anything here need me?". Emitted
         // before `term.draw` so the OSC write never lands inside a frame.
-        let (status, agent) = crate::osc_status::most_urgent([
-            (chat_pane.turn_status(), chat_pane.selected_agent()),
-            (acp_pane.turn_status(), acp_pane.selected_agent()),
-        ]);
+        let (status, agent) = terminal_status_for_connection(
+            &conn_state,
+            [
+                (chat_pane.turn_status(), chat_pane.selected_agent()),
+                (acp_pane.turn_status(), acp_pane.selected_agent()),
+            ],
+        );
         crate::osc_status::sync(status, agent);
 
         term.draw(|frame| {
@@ -2240,6 +2258,46 @@ mod tests {
             .chars()
             .map(|character| key_event(KeyCode::Char(character)))
             .collect()
+    }
+
+    #[test]
+    fn disconnected_terminal_projection_is_neutral() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+        let disconnected = ConnectionState::Disconnected {
+            reason: "test disconnect".to_string(),
+        };
+
+        let (status, agent) = terminal_status_for_connection(
+            &disconnected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(status.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn connected_terminal_projection_keeps_urgent_pane() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+
+        let (status, agent) = terminal_status_for_connection(
+            &ConnectionState::Connected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(matches!(
+            status,
+            Some(crate::turn_status::TurnStatus::WaitingForApproval)
+        ));
+        assert_eq!(agent, Some("code"));
     }
 
     #[test]
