@@ -330,9 +330,22 @@ impl<'a> ApplyWorker<'a> {
         if entry.state != JournalState::Applying {
             return Err(WorkerError::NotApproved { state: entry.state });
         }
+        // F2 (defense-in-depth): a consumed receipt is what authorizes an
+        // `applying` continuation. State `applying` alone is not enough. If a
+        // future trusted-writer bug ever set `applying` without consuming a
+        // receipt, refuse rather than re-drive the CAS under no authority — park
+        // in `recovery_required` rather than become a receipt-less apply.
+        let has_consumed_receipt = entry.consumed_receipt_id.is_some();
         let expected_agent_alias = entry.verification_plan.expected_agent_alias.clone();
         let agent_proposal = entry.agent_proposal.clone();
         let selected_provider_ref = entry.selected_provider_ref.clone();
+        if !has_consumed_receipt {
+            return self.park_recovery(
+                &mut journal,
+                operation_id,
+                "an applying entry has no consumed receipt; refusing a receipt-less continuation",
+            );
+        }
 
         let inspection = match self.service.inspect().await {
             Ok(inspection) => inspection,

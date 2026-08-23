@@ -130,6 +130,19 @@ async fn recover_one(
         _ => return Ok(RecoveryAction::Parked("no longer applying".to_owned())),
     };
 
+    // F2 (defense-in-depth): an `applying` entry is authorized to be continued
+    // or confirmed only because a receipt was consumed to reach `applying`. If a
+    // future trusted-writer bug ever produced `applying` with no consumed
+    // receipt, refuse across every branch — do not continue, verify, or bless
+    // it. Park in `recovery_required` for operator resolution.
+    if entry.consumed_receipt_id.is_none() {
+        let detail = "an applying entry has no consumed receipt; refusing recovery".to_owned();
+        return match worker.park_recovery(&mut journal, operation_id, detail.clone()) {
+            Ok(_) | Err(WorkerError::RecoveryRequired { .. }) => Ok(RecoveryAction::Parked(detail)),
+            Err(other) => Err(other),
+        };
+    }
+
     let inspection = match worker.service().inspect().await {
         Ok(inspection) => inspection,
         Err(error) => {
@@ -606,6 +619,97 @@ mod tests {
             assert!(
                 !harness.config_text().contains("[agents.writer]"),
                 "recovery never wrote the agent for an ambiguous config"
+            );
+        });
+    }
+
+    // -- F2: recovery refuses a receipt-less `applying` entry ---------------
+
+    #[test]
+    fn recovery_refuses_a_receipt_less_applying_entry_and_never_verifies_it() {
+        run_async(|| async {
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            // A faithful apply reaches `verified`: config carries the agent bound
+            // to the approved profile, with the personality files on disk.
+            let (op_id, _issued) = harness.arrange_approved(&service, NOW).await;
+            let outcome = harness
+                .worker(&service)
+                .apply_approved(&op_id, NOW)
+                .await
+                .expect("apply reaches verified");
+            assert!(matches!(outcome, WorkerOutcome::Verified { .. }));
+
+            // Simulate a trusted-writer bug: the entry is back in `applying` with
+            // no consumed receipt, even though config already carries the agent.
+            let mut journal = harness.load_journal();
+            {
+                let entry = journal.entry_mut(&op_id).expect("entry");
+                entry.state = JournalState::Applying;
+                entry.consumed_receipt_id = None;
+            }
+            journal
+                .persist(&harness.paths, &harness.key)
+                .expect("persist");
+
+            // Recovery must refuse to bless it. Even the all-applied branch that
+            // would otherwise confirm+verify parks in recovery_required.
+            let report = recover(&harness.worker(&service), NOW)
+                .await
+                .expect("recovery");
+            assert_eq!(report.actions.len(), 1);
+            assert!(
+                matches!(report.actions[0].1, RecoveryAction::Parked(_)),
+                "got {:?}",
+                report.actions[0].1
+            );
+            assert_eq!(
+                harness.load_journal().entry(&op_id).expect("entry").state,
+                JournalState::RecoveryRequired
+            );
+        });
+    }
+
+    #[test]
+    fn resume_refuses_a_receipt_less_applying_entry_and_never_applies() {
+        run_async(|| async {
+            let _lock = config_env_lock().lock().await;
+            let harness = ApplyHarness::new();
+            let _guard = ConfigDirGuard::pin(&harness.root);
+            let service = harness.service();
+
+            // Approved but never applied: config is clean (no agent).
+            let (op_id, _issued) = harness.arrange_approved(&service, NOW).await;
+            // Trusted-writer bug: force `applying` with no consumed receipt.
+            let mut journal = harness.load_journal();
+            {
+                let entry = journal.entry_mut(&op_id).expect("entry");
+                entry.state = JournalState::Applying;
+                entry.consumed_receipt_id = None;
+            }
+            journal
+                .persist(&harness.paths, &harness.key)
+                .expect("persist");
+
+            let error = harness
+                .worker(&service)
+                .resume_applying_locked(&op_id, NOW)
+                .await
+                .expect_err("a receipt-less applying entry cannot be continued");
+            assert!(
+                matches!(error, WorkerError::RecoveryRequired { .. }),
+                "got {error}"
+            );
+            assert!(
+                !harness.config_text().contains("[agents.writer]"),
+                "no config write under a receipt-less continuation"
+            );
+            assert_eq!(
+                harness.load_journal().entry(&op_id).expect("entry").state,
+                JournalState::RecoveryRequired
             );
         });
     }
