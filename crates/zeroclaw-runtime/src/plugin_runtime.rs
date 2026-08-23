@@ -247,6 +247,7 @@ pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::Plu
             .saturating_mul(1024 * 1024),
         max_table_elements: config.plugins.limits.max_table_elements,
         max_instances: config.plugins.limits.max_instances,
+        call_timeout: std::time::Duration::from_millis(config.plugins.limits.call_timeout_ms),
     }
 }
 
@@ -300,11 +301,8 @@ pub async fn configured_plugin_channels(
                 return Vec::new();
             }
         };
-        let config_resolver = crate::tools::plugin_config_resolver(
-            Arc::clone(&host),
-            Arc::clone(&config),
-            live_config,
-        );
+        let host_services =
+            crate::tools::plugin_host_services(Arc::clone(&host), Arc::clone(&config), live_config);
         let limits = plugin_limits(&config);
         let details = host.channel_plugin_details();
         let scopes: Vec<_> = plan.scopes(PluginCapability::Channel).collect();
@@ -344,7 +342,7 @@ pub async fn configured_plugin_channels(
             match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
                 endpoint,
                 wasm_path,
-                &config_resolver,
+                &host_services,
                 limits,
             )
             .await

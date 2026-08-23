@@ -240,6 +240,9 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -591,15 +594,15 @@ fn plugin_config_values(
 }
 
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn plugin_config_resolver(
+pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
-) -> zeroclaw_plugins::config::PluginConfigResolver {
+) -> zeroclaw_plugins::services::PluginHostServices {
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
     let fallback_config = live_config.is_none().then_some(config);
-    zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+    let config = zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
         let package = scope.id().package();
         let config_entry_key = scope.id().config_entry_key()?;
         let manifest = host
@@ -622,7 +625,8 @@ pub(crate) fn plugin_config_resolver(
                 plugin_config_values(config, &config_entry_key, package)
             })
         }
-    })
+    });
+    zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
 /// Create full tool registry including memory tools and optional Composio.
@@ -1630,7 +1634,7 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let host = Arc::new(host);
-                    let config_resolver = plugin_config_resolver(
+                    let host_services = plugin_host_services(
                         Arc::clone(&host),
                         Arc::clone(&config),
                         live_config.clone(),
@@ -1651,11 +1655,14 @@ pub fn all_tools_with_runtime(
                             .saturating_mul(1024 * 1024),
                         max_table_elements: config.plugins.limits.max_table_elements,
                         max_instances: config.plugins.limits.max_instances,
+                        call_timeout: std::time::Duration::from_millis(
+                            config.plugins.limits.call_timeout_ms,
+                        ),
                     };
                     register_plugin_tools(
                         &config,
                         &host,
-                        &config_resolver,
+                        &host_services,
                         plugin_limits,
                         &mut registered_names,
                         &mut tool_arcs,
@@ -1739,7 +1746,7 @@ fn claim_plugin_tool_name(
 fn register_plugin_tools(
     config: &Config,
     host: &zeroclaw_plugins::host::PluginHost,
-    config_resolver: &zeroclaw_plugins::config::PluginConfigResolver,
+    services: &zeroclaw_plugins::services::PluginHostServices,
     plugin_limits: zeroclaw_plugins::component::PluginLimits,
     registered_names: &mut std::collections::HashSet<String>,
     tool_arcs: &mut Vec<Arc<dyn Tool>>,
@@ -1795,7 +1802,7 @@ fn register_plugin_tools(
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
             wasm_path.to_path_buf(),
             scope,
-            config_resolver.clone(),
+            services.clone(),
             plugin_limits,
         );
         match tool {
@@ -1884,7 +1891,7 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
-    fn plugin_config_service_uses_live_instance_owned_values() {
+    fn plugin_host_services_isolate_live_instance_keys() {
         let plugins_dir = TempDir::new().unwrap();
         let plugin_dir = plugins_dir.path().join("fixture-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -1919,7 +1926,15 @@ const = true
             [zeroclaw_plugins::PluginPermission::ConfigRead],
         )
         .unwrap();
+        let backup_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            "backup",
+            [zeroclaw_plugins::PluginPermission::ConfigRead],
+        )
+        .unwrap();
         let instance_key = scope.id().config_entry_key().unwrap();
+        let backup_instance_key = backup_scope.id().config_entry_key().unwrap();
         let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
             name: name.to_string(),
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
@@ -1927,42 +1942,48 @@ const = true
             egress_allow_private: Vec::new(),
         };
         let mut snapshot = Config::default();
-        snapshot.plugins.entries = vec![entry(&instance_key, "false")];
+        snapshot.plugins.entries = vec![
+            entry(&instance_key, "false"),
+            entry(&backup_instance_key, "false"),
+        ];
         let mut current = Config::default();
         current.plugins.entries = vec![
             entry("fixture-plugin", "true"),
             entry("work", "true"),
+            entry("backup", "true"),
             entry(&instance_key, "true"),
+            entry(&backup_instance_key, "false"),
         ];
         let live = Arc::new(parking_lot::RwLock::new(current));
-        let resolver = plugin_config_resolver(
+        let services = plugin_host_services(
             Arc::clone(&host),
             Arc::new(snapshot),
             Some(Arc::clone(&live)),
         );
 
-        assert!(resolver.resolve(&scope).is_ok());
-        live.write()
-            .plugins
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == instance_key)
-            .unwrap()
-            .config
-            .insert("enabled".to_string(), "false".to_string());
+        assert!(services.resolve_config(&scope).is_ok());
         assert!(
-            resolver.resolve(&scope).is_err(),
-            "a raw package or binding entry must not bypass the canonical key"
+            services.resolve_config(&backup_scope).is_err(),
+            "backup must use its invalid canonical entry, not a valid raw-name decoy"
         );
-        live.write()
-            .plugins
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == instance_key)
-            .unwrap()
-            .config
-            .insert("enabled".to_string(), "true".to_string());
-        assert!(resolver.resolve(&scope).is_ok());
+        for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
+            live.write()
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key.as_str())
+                .unwrap()
+                .config
+                .insert("enabled".to_string(), enabled.to_string());
+        }
+        assert!(
+            services.resolve_config(&scope).is_err(),
+            "work must observe its own canonical key's live update"
+        );
+        assert!(
+            services.resolve_config(&backup_scope).is_ok(),
+            "backup must resolve independently through the shared service"
+        );
     }
 
     #[test]
@@ -2047,6 +2068,7 @@ const = true
             max_memory_bytes: 16 * 1024 * 1024,
             max_table_elements: 10_000,
             max_instances: 8,
+            call_timeout: std::time::Duration::from_secs(30),
         }
     }
 
@@ -2101,13 +2123,14 @@ const = true
         reserved: &[&str],
     ) -> Vec<String> {
         let (resolver, probed) = recording_resolver(host);
+        let services = zeroclaw_plugins::services::PluginHostServices::new(resolver);
         let mut registered_names: std::collections::HashSet<String> =
             reserved.iter().map(|name| (*name).to_string()).collect();
         let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
         register_plugin_tools(
             config,
             host,
-            &resolver,
+            &services,
             test_plugin_limits(),
             &mut registered_names,
             &mut tool_arcs,

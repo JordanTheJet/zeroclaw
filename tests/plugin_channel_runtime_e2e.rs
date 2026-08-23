@@ -131,12 +131,20 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
         manifest.permissions.iter().copied(),
     )
     .expect("admit configured logical channel");
+    // The strict fixture requires a typed retry_count, a non-empty
+    // credential_epoch, and a scoped api_token secret, all resolved from this
+    // instance-owned entry. The send below must present the current
+    // `{credential_epoch}:{api_token}` revision.
     config.plugins.entries.push(PluginEntryConfig {
         name: scope
             .id()
             .config_entry_key()
             .expect("derive canonical fixture config key"),
-        config: HashMap::from([("retry_count".to_string(), retry_count.to_string())]),
+        config: HashMap::from([
+            ("retry_count".to_string(), retry_count.to_string()),
+            ("credential_epoch".to_string(), "v1".to_string()),
+            ("api_token".to_string(), "channel-secret".to_string()),
+        ]),
         ..PluginEntryConfig::default()
     });
 
@@ -164,8 +172,10 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     );
     assert_eq!(channel.self_handle().as_deref(), Some("@fixture"));
     assert!(channel.health_check().await);
+    // The strict guest accepts a send only when its content is the current
+    // `{credential_epoch}:{api_token}` revision resolved at point of use.
     channel
-        .send(&SendMessage::new("hello", "room"))
+        .send(&SendMessage::new("v1:channel-secret", "room"))
         .await
         .expect("the real guest accepts an outbound message");
 

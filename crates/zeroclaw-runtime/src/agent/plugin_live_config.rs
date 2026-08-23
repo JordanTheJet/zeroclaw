@@ -126,7 +126,7 @@ fn install_fixture_plugin(plugins_root: &std::path::Path) -> String {
     let manifest: PluginManifest =
         toml::from_str(FIXTURE_MANIFEST).expect("fixture manifest parses");
     // The same admission the production registry performs, so the key below is
-    // the one `plugin_config_resolver` will look up.
+    // the one `plugin_host_services` will look up.
     let scope = PluginInstanceScope::for_package_binding(
         &manifest,
         PluginCapability::Tool,
