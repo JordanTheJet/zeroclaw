@@ -81,6 +81,7 @@ use crate::keys::ApprovalAuditKey;
 use crate::meta_authority::{AuthorityTier, ControlOperation, RequiredQuorum, required_quorum};
 use crate::operator::{
     OperatorAuthentication, OperatorIdentity, OperatorRegistry, RequesterContext,
+    RequesterFingerprint,
 };
 use crate::registry::{InstanceFingerprint, InstanceId, TrustEpoch};
 use crate::service::BoundProposal;
@@ -108,6 +109,16 @@ pub const SOURCE_REVISION_DIGEST_LABEL: &str = "zeroclaw/control-plane/source-re
 /// a stolen journal would expose.
 pub const DEFAULT_RECEIPT_TTL_SECS: u64 = 300;
 
+/// The smallest quorum any receipt may claim.
+///
+/// One, never zero. A zero-quorum receipt would be an unapproved operation,
+/// which this protocol version does not have. [`RequiredQuorum`] is a
+/// `#[serde(transparent)]` `u32` with no lower bound of its own, so a party that
+/// could write receipt bytes could otherwise set it to zero and have an empty
+/// decision set "satisfy" it; [`verify_for_consumption`] re-checks this floor
+/// rather than trusting the value the receipt states.
+pub const MINIMUM_QUORUM: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -132,6 +143,12 @@ pub enum ApprovalErrorCode {
     GrantRequired,
     /// The operator authentication was produced for a different requester.
     AuthenticationNotForThisRequester,
+    /// The operator authentication was produced for a different proposal.
+    AuthenticationProposalMismatch,
+    /// The operator authentication was produced for a different instance.
+    AuthenticationInstanceMismatch,
+    /// The operator authentication expired before a receipt was minted.
+    AuthenticationExpired,
     /// The authenticated party is not an operator.
     NotAnOperator,
     /// The operator is not registered and active in the trust root.
@@ -152,6 +169,14 @@ pub enum ApprovalErrorCode {
     NotAnApproval,
     /// The receipt is bound to a different proposal.
     ProposalDigestMismatch,
+    /// The receipt is bound to a different operation than the one in hand.
+    OperationMismatch,
+    /// The receipt's authority tier does not match the operation's tier.
+    AuthorityTierMismatch,
+    /// The receipt was authorized for a different requester than the one in hand.
+    RequesterMismatch,
+    /// The receipt's stated quorum is below the protocol minimum.
+    RequiredQuorumTooLow,
     /// The receipt is bound to a different target instance.
     TargetInstanceMismatch,
     /// The registered root moved or changed identity under the receipt.
@@ -182,6 +207,9 @@ impl ApprovalErrorCode {
             Self::MetaAuthorityNotProposable => "meta_authority_not_proposable",
             Self::GrantRequired => "grant_required",
             Self::AuthenticationNotForThisRequester => "authentication_not_for_this_requester",
+            Self::AuthenticationProposalMismatch => "authentication_proposal_mismatch",
+            Self::AuthenticationInstanceMismatch => "authentication_instance_mismatch",
+            Self::AuthenticationExpired => "authentication_expired",
             Self::NotAnOperator => "not_an_operator",
             Self::OperatorNotRegistered => "operator_not_registered",
             Self::OperatorIsTheRequester => "operator_is_the_requester",
@@ -192,6 +220,10 @@ impl ApprovalErrorCode {
             Self::AuthenticationFailed => "authentication_failed",
             Self::NotAnApproval => "not_an_approval",
             Self::ProposalDigestMismatch => "proposal_digest_mismatch",
+            Self::OperationMismatch => "operation_mismatch",
+            Self::AuthorityTierMismatch => "authority_tier_mismatch",
+            Self::RequesterMismatch => "requester_mismatch",
+            Self::RequiredQuorumTooLow => "required_quorum_too_low",
             Self::TargetInstanceMismatch => "target_instance_mismatch",
             Self::InstanceFingerprintMismatch => "instance_fingerprint_mismatch",
             Self::SourceRevisionMismatch => "source_revision_mismatch",
@@ -516,6 +548,13 @@ pub struct ApprovalReceipt {
     pub proposal_digest: ProposalDigest,
     /// The registered instance this decision is for.
     pub target_instance: InstanceId,
+    /// The requester this decision authorizes, as a binding fingerprint.
+    ///
+    /// Copied from the operator authentication's `issued_for`, so the
+    /// per-requester binding that the authentication carried survives into the
+    /// audit artefact and a consumer can prove the receipt authorizes exactly
+    /// one requester.
+    pub requester_fingerprint: RequesterFingerprint,
     /// The instance fingerprint recomputed under lock at decision time.
     pub instance_fingerprint: InstanceFingerprint,
     /// Digest of the source revision the preview was computed against.
@@ -551,6 +590,7 @@ impl CanonicalBytes for ApprovalReceipt {
             receipt_id,
             proposal_digest,
             target_instance,
+            requester_fingerprint,
             instance_fingerprint,
             source_revision,
             operation,
@@ -565,6 +605,7 @@ impl CanonicalBytes for ApprovalReceipt {
         absorb_str(out, receipt_id.as_str());
         absorb_field(out, proposal_digest.as_bytes());
         absorb_str(out, target_instance.as_str());
+        absorb_field(out, requester_fingerprint.as_bytes());
         absorb_field(out, instance_fingerprint.as_bytes());
         absorb_field(out, source_revision.as_bytes());
         absorb_str(out, operation.wire());
@@ -687,6 +728,7 @@ impl AuthenticatedReceipt {
 pub struct ConsumptionMarker {
     receipt_id: ReceiptId,
     proposal_digest: ProposalDigest,
+    operation: ControlOperation,
 }
 
 impl ConsumptionMarker {
@@ -700,6 +742,17 @@ impl ConsumptionMarker {
     #[must_use]
     pub const fn proposal_digest(&self) -> &ProposalDigest {
         &self.proposal_digest
+    }
+
+    /// The operation the consumed receipt authorized.
+    ///
+    /// Carried onto the marker because this is the phase-5 hand-off type: the
+    /// journal transaction that consumes a receipt must apply exactly the
+    /// operation the receipt was verified against, and can re-derive the
+    /// authority tier from it without re-opening the receipt.
+    #[must_use]
+    pub const fn operation(&self) -> ControlOperation {
+        self.operation
     }
 }
 
@@ -809,6 +862,12 @@ impl ReceiptLedger for InMemoryReceiptLedger {
 /// expectation and believe it checked more than it did.
 #[derive(Debug, Clone, Copy)]
 pub struct Expectations<'a> {
+    /// The operation being applied.
+    ///
+    /// The receipt must be bound to exactly this operation, and its recorded
+    /// authority tier must match this operation's tier — both re-derived here
+    /// rather than trusted from the receipt.
+    pub operation: ControlOperation,
     /// The proposal being applied, digested.
     pub proposal_digest: &'a ProposalDigest,
     /// The instance being applied to.
@@ -830,23 +889,50 @@ pub struct Expectations<'a> {
 /// authorizes, inside the phase-5 journal transaction, and doing it here would
 /// split one durable fact into two.
 ///
+/// This verifier **independently re-derives** every claim rather than restating
+/// the receipt's own fields: it recomputes the authority tier from the
+/// operation, re-checks the quorum floor and that the recorded decisions meet
+/// it, and re-checks every approver against `operators` and `requester` — it
+/// does not trust the mint-time checks, because the registry or the requester
+/// context may differ at consumption. It stays a **pure verifier**: it returns a
+/// decision and consumes nothing. Consumption must be atomic with the state
+/// transition it authorizes, inside the phase-5 journal transaction.
+///
 /// Every check is a refusal. In order: the tag must verify under the
-/// current-epoch key; the epoch, proposal digest, target, fingerprint, and
-/// source revision must all match; the decision must be an approval; the
+/// current-epoch key; the requester must be a requester class; the epoch,
+/// proposal digest, operation, target, fingerprint, and source revision must all
+/// match; the receipt's authority tier must equal the operation's tier; the
+/// receipt must be bound to this requester; the decision must be an approval; the
 /// proposal must not carry a terminal rejection; the receipt must be within its
-/// validity window; the recorded decisions must meet the stated quorum; and the
-/// receipt must not already be consumed.
+/// validity window; the stated quorum must meet the protocol floor; every
+/// approver must be a registered, active operator distinct from the requester;
+/// the distinct approvals must meet the stated quorum; and the receipt must not
+/// already be consumed.
 ///
 /// # Errors
 ///
 /// See [`ApprovalErrorCode`]. Forged, modified, expired, replayed,
-/// wrong-epoch, wrong-digest, and rejection receipts all fail closed.
+/// wrong-epoch, wrong-digest, wrong-operation, wrong-requester, tier-mismatched,
+/// zero-quorum, unregistered-approver, and rejection receipts all fail closed.
 pub fn verify_for_consumption(
     sealed: &[u8],
     key: &ApprovalAuditKey,
     expectations: &Expectations<'_>,
     ledger: &dyn ReceiptLedger,
+    operators: &OperatorRegistry,
+    requester: &RequesterContext,
 ) -> Result<ConsumptionMarker, ApprovalError> {
+    // A requester class can never sit on the approving side. The context type
+    // already makes this true; re-checking it means a future widening of the
+    // class rule fails closed here rather than consuming a receipt for a
+    // principal that should never have one.
+    if requester.can_approve() {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::RequesterCannotApprove,
+            format!("{} claimed approval authority", requester.class()),
+        ));
+    }
+
     // Authenticity first. Nothing about an unauthenticated receipt's contents
     // is worth comparing, and comparing them would leak which field an attacker
     // guessed wrong.
@@ -873,10 +959,39 @@ pub fn verify_for_consumption(
             "the receipt authorizes a different proposal",
         ));
     }
+    if receipt.operation != expectations.operation {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::OperationMismatch,
+            "the receipt authorizes a different operation",
+        ));
+    }
+    // Recompute the authority tier from the operation and refuse a receipt that
+    // states a weaker tier than the operation actually carries. The tier on the
+    // receipt is a claim; `operation.authority_tier()` is the fact.
+    if receipt.authority_tier != receipt.operation.authority_tier() {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::AuthorityTierMismatch,
+            format!(
+                "receipt tier {}, operation {} is {}",
+                receipt.authority_tier,
+                receipt.operation,
+                receipt.operation.authority_tier()
+            ),
+        ));
+    }
     if &receipt.target_instance != expectations.target_instance {
         return Err(ApprovalError::new(
             ApprovalErrorCode::TargetInstanceMismatch,
             "the receipt authorizes a different instance",
+        ));
+    }
+    // The receipt must authorize exactly this requester. The mint copied the
+    // authentication's `issued_for` onto the receipt; re-derive the expected
+    // fingerprint from the requester in hand rather than trusting the receipt.
+    if receipt.requester_fingerprint != requester.fingerprint() {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::RequesterMismatch,
+            "the receipt authorizes a different requester",
         ));
     }
     if &receipt.instance_fingerprint != expectations.instance_fingerprint {
@@ -920,6 +1035,39 @@ pub fn verify_for_consumption(
         ));
     }
 
+    // The quorum floor. A `#[serde(transparent)]` `RequiredQuorum` has no lower
+    // bound, so a receipt could state zero and let an empty decision set
+    // "satisfy" it. Re-check the floor before trusting the value.
+    if receipt.required_quorum.get() < MINIMUM_QUORUM {
+        return Err(ApprovalError::new(
+            ApprovalErrorCode::RequiredQuorumTooLow,
+            format!(
+                "receipt requires a quorum of {}, the minimum is {MINIMUM_QUORUM}",
+                receipt.required_quorum
+            ),
+        ));
+    }
+
+    // Every approver, re-derived against the registry and the requester in hand
+    // rather than trusted from the mint. An approver absent from the active
+    // registry, or one that is the requester's own subject, refuses — the
+    // distinct set is what `quorum_is_satisfied` counts, so a duplicate cannot
+    // pad the quorum either.
+    for approver in receipt.distinct_approving_operators() {
+        if operators.get_active(approver).is_none() {
+            return Err(ApprovalError::new(
+                ApprovalErrorCode::OperatorNotRegistered,
+                approver.as_str().to_owned(),
+            ));
+        }
+        if requester.subject().is(approver) {
+            return Err(ApprovalError::new(
+                ApprovalErrorCode::OperatorIsTheRequester,
+                approver.as_str().to_owned(),
+            ));
+        }
+    }
+
     if !receipt.quorum_is_satisfied() {
         return Err(ApprovalError::new(
             ApprovalErrorCode::QuorumNotSatisfied,
@@ -941,6 +1089,7 @@ pub fn verify_for_consumption(
     Ok(ConsumptionMarker {
         receipt_id: receipt.receipt_id.clone(),
         proposal_digest: receipt.proposal_digest,
+        operation: receipt.operation,
     })
 }
 
@@ -1017,7 +1166,9 @@ impl<'a> ApprovalBroker<'a> {
     /// The requester supplies no decision, no nonce, and no token. The only
     /// input that can produce a receipt is `operator_auth`, which exists only
     /// because a human answered at a controlling terminal as a registered
-    /// operator distinct from, and unreachable by, this requester.
+    /// operator distinct from, and unreachable by, this requester. It is
+    /// **consumed by value**, and the type is non-`Clone`, so one ceremony mints
+    /// at most one receipt.
     ///
     /// # Errors
     ///
@@ -1026,7 +1177,7 @@ impl<'a> ApprovalBroker<'a> {
         &self,
         request: &ApprovalRequest,
         requester: &RequesterContext,
-        operator_auth: &OperatorAuthentication,
+        operator_auth: OperatorAuthentication,
         now_unix_secs: u64,
     ) -> Result<AuthenticatedReceipt, ApprovalError> {
         self.decide(
@@ -1051,7 +1202,7 @@ impl<'a> ApprovalBroker<'a> {
         &self,
         request: &ApprovalRequest,
         requester: &RequesterContext,
-        operator_auth: &OperatorAuthentication,
+        operator_auth: OperatorAuthentication,
         now_unix_secs: u64,
     ) -> Result<AuthenticatedReceipt, ApprovalError> {
         self.decide(
@@ -1067,7 +1218,7 @@ impl<'a> ApprovalBroker<'a> {
         &self,
         request: &ApprovalRequest,
         requester: &RequesterContext,
-        operator_auth: &OperatorAuthentication,
+        operator_auth: OperatorAuthentication,
         decision: Decision,
         now_unix_secs: u64,
     ) -> Result<AuthenticatedReceipt, ApprovalError> {
@@ -1147,6 +1298,33 @@ impl<'a> ApprovalBroker<'a> {
             ));
         }
 
+        // 7a. The authentication is bound to one proposal, one instance, and a
+        //     wall-clock expiry. An authentication obtained for a different
+        //     proposal, on a different instance, or after its window closed
+        //     cannot mint this receipt — this is what stops one presence
+        //     ceremony from authorising a second proposal or a cross-instance
+        //     decision. `OperatorAuthentication` being non-`Clone` and consumed
+        //     by value already limits it to one receipt; these checks bind
+        //     *which* one.
+        if operator_auth.instance() != &record.instance_id {
+            return Err(ApprovalError::new(
+                ApprovalErrorCode::AuthenticationInstanceMismatch,
+                "the operator authenticated for a different instance",
+            ));
+        }
+        if operator_auth.proposal_digest() != &request.proposal_digest {
+            return Err(ApprovalError::new(
+                ApprovalErrorCode::AuthenticationProposalMismatch,
+                "the operator authenticated for a different proposal",
+            ));
+        }
+        if now_unix_secs >= operator_auth.expires_at_unix_secs() {
+            return Err(ApprovalError::new(
+                ApprovalErrorCode::AuthenticationExpired,
+                "the operator authentication expired before a receipt was minted",
+            ));
+        }
+
         // 8. Only an operator approves.
         if !operator_auth.principal_class().can_approve() {
             return Err(ApprovalError::new(
@@ -1193,6 +1371,11 @@ impl<'a> ApprovalBroker<'a> {
             receipt_id: ReceiptId::generate()?,
             proposal_digest: request.proposal_digest,
             target_instance: request.target_instance.clone(),
+            // Copy the authentication's requester binding onto the receipt, so
+            // the per-requester analysis survives into the artefact rather than
+            // being dropped at mint. Step 7 has already proved this equals
+            // `requester.fingerprint()`.
+            requester_fingerprint: *operator_auth.issued_for(),
             instance_fingerprint: request.instance_fingerprint,
             source_revision: request.source_revision,
             operation: request.operation,
@@ -1324,6 +1507,7 @@ mod tests {
 
         fn expectations<'a>(&self, request: &'a ApprovalRequest, now: u64) -> Expectations<'a> {
             Expectations {
+                operation: request.operation,
                 proposal_digest: &request.proposal_digest,
                 target_instance: &request.target_instance,
                 instance_fingerprint: &request.instance_fingerprint,
@@ -1334,8 +1518,19 @@ mod tests {
         }
 
         /// An operator authentication for `requester`, through a real presence
-        /// ceremony against the real trust root.
+        /// ceremony against the real trust root, bound to the canonical request.
         fn authenticate(&self, requester: &RequesterContext) -> OperatorAuthentication {
+            let request = self.request();
+            self.authenticate_for(requester, &request, NOW)
+        }
+
+        /// An operator authentication bound to a specific request and clock.
+        fn authenticate_for(
+            &self,
+            requester: &RequesterContext,
+            request: &ApprovalRequest,
+            now: u64,
+        ) -> OperatorAuthentication {
             authenticate_operator(
                 &ScriptedPresence::affirming("jordan"),
                 "Approve? ".to_string(),
@@ -1344,6 +1539,9 @@ mod tests {
                 &self.operators,
                 self.record.trust_epoch,
                 requester,
+                &request.proposal_digest,
+                &request.target_instance,
+                now,
             )
             .expect("the genesis operator must authenticate for an isolated requester")
         }
@@ -1372,7 +1570,7 @@ mod tests {
         let auth = fixture.authenticate(&requester);
 
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("an authenticated operator must be able to approve");
 
         let receipt = issued.receipt();
@@ -1397,6 +1595,8 @@ mod tests {
             &key,
             &fixture.expectations(&request, NOW),
             &ledger,
+            &fixture.operators,
+            &requester,
         )
         .expect("a freshly issued receipt must verify");
         assert_eq!(marker.receipt_id(), &receipt.receipt_id);
@@ -1419,7 +1619,7 @@ mod tests {
         let auth = fixture.authenticate(&requester);
 
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
         let rendered = String::from_utf8(issued.as_sealed_bytes().to_vec()).expect("utf8");
         assert!(
@@ -1446,7 +1646,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let genuine = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
 
         // An attacker key: a different epoch derives a different subkey.
@@ -1454,9 +1654,15 @@ mod tests {
             .expect("derive");
         let forged = seal_receipt(genuine.receipt().clone(), &attacker);
 
-        let err =
-            verify_for_consumption(&forged, &key, &fixture.expectations(&request, NOW), &ledger)
-                .expect_err("a receipt this host did not authenticate must fail closed");
+        let err = verify_for_consumption(
+            &forged,
+            &key,
+            &fixture.expectations(&request, NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("a receipt this host did not authenticate must fail closed");
         assert_eq!(err.code, ApprovalErrorCode::AuthenticationFailed);
 
         assert!(
@@ -1475,7 +1681,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
 
         let raw = String::from_utf8(issued.as_sealed_bytes().to_vec()).expect("utf8");
@@ -1488,6 +1694,8 @@ mod tests {
             &key,
             &fixture.expectations(&request, NOW),
             &ledger,
+            &fixture.operators,
+            &requester,
         )
         .expect_err("a modified receipt must fail closed");
         assert_eq!(err.code, ApprovalErrorCode::AuthenticationFailed);
@@ -1507,7 +1715,7 @@ mod tests {
             let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
             let auth = fixture.authenticate(&requester);
             broker
-                .request_approval(&request, &requester, &auth, NOW)
+                .request_approval(&request, &requester, auth, NOW)
                 .expect("approve")
         };
 
@@ -1516,6 +1724,8 @@ mod tests {
             &key,
             &fixture.expectations(&request, NOW),
             &ledger,
+            &fixture.operators,
+            &requester,
         )
         .expect("the first verification succeeds");
         ledger.mark_consumed(&marker).expect("consume once");
@@ -1525,6 +1735,8 @@ mod tests {
             &key,
             &fixture.expectations(&request, NOW),
             &ledger,
+            &fixture.operators,
+            &requester,
         )
         .expect_err("a consumed receipt must never verify again");
         assert_eq!(err.code, ApprovalErrorCode::AlreadyConsumed);
@@ -1549,7 +1761,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
 
         // Valid one second before expiry.
@@ -1559,6 +1771,8 @@ mod tests {
                 &key,
                 &fixture.expectations(&request, NOW + 59),
                 &ledger,
+                &fixture.operators,
+                &requester,
             )
             .is_ok()
         );
@@ -1569,6 +1783,8 @@ mod tests {
                 &key,
                 &fixture.expectations(&request, now),
                 &ledger,
+                &fixture.operators,
+                &requester,
             )
             .expect_err("an expired receipt must fail closed");
             assert_eq!(err.code, ApprovalErrorCode::Expired);
@@ -1585,7 +1801,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
 
         let err = verify_for_consumption(
@@ -1593,6 +1809,8 @@ mod tests {
             &key,
             &fixture.expectations(&request, NOW - 1),
             &ledger,
+            &fixture.operators,
+            &requester,
         )
         .expect_err("a clock before the issue time must not extend validity");
         assert_eq!(err.code, ApprovalErrorCode::ClockRollback);
@@ -1608,7 +1826,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
         let sealed = issued.as_sealed_bytes();
 
@@ -1617,9 +1835,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.proposal_digest = &other_digest;
         assert_eq!(
-            verify_for_consumption(sealed, &key, &expectations, &ledger)
-                .expect_err("wrong proposal")
-                .code,
+            verify_for_consumption(
+                sealed,
+                &key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester
+            )
+            .expect_err("wrong proposal")
+            .code,
             ApprovalErrorCode::ProposalDigestMismatch
         );
 
@@ -1628,9 +1853,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.target_instance = &other_instance;
         assert_eq!(
-            verify_for_consumption(sealed, &key, &expectations, &ledger)
-                .expect_err("wrong target")
-                .code,
+            verify_for_consumption(
+                sealed,
+                &key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester
+            )
+            .expect_err("wrong target")
+            .code,
             ApprovalErrorCode::TargetInstanceMismatch
         );
 
@@ -1639,9 +1871,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.instance_fingerprint = &moved;
         assert_eq!(
-            verify_for_consumption(sealed, &key, &expectations, &ledger)
-                .expect_err("moved root")
-                .code,
+            verify_for_consumption(
+                sealed,
+                &key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester
+            )
+            .expect_err("moved root")
+            .code,
             ApprovalErrorCode::InstanceFingerprintMismatch
         );
 
@@ -1650,9 +1889,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.source_revision = &changed;
         assert_eq!(
-            verify_for_consumption(sealed, &key, &expectations, &ledger)
-                .expect_err("stale revision")
-                .code,
+            verify_for_consumption(
+                sealed,
+                &key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester
+            )
+            .expect_err("stale revision")
+            .code,
             ApprovalErrorCode::SourceRevisionMismatch
         );
     }
@@ -1667,7 +1913,7 @@ mod tests {
         let request = fixture.request();
         let auth = fixture.authenticate(&requester);
         let issued = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect("approve");
 
         // Verifying under the next epoch's key: the tag was minted under the
@@ -1677,9 +1923,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.trust_epoch = TrustEpoch::new(2);
         assert_eq!(
-            verify_for_consumption(issued.as_sealed_bytes(), &next_key, &expectations, &ledger)
-                .expect_err("a receipt must not survive an epoch transition")
-                .code,
+            verify_for_consumption(
+                issued.as_sealed_bytes(),
+                &next_key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester,
+            )
+            .expect_err("a receipt must not survive an epoch transition")
+            .code,
             ApprovalErrorCode::AuthenticationFailed
         );
 
@@ -1688,9 +1941,16 @@ mod tests {
         let mut expectations = fixture.expectations(&request, NOW);
         expectations.trust_epoch = TrustEpoch::new(2);
         assert_eq!(
-            verify_for_consumption(issued.as_sealed_bytes(), &key, &expectations, &ledger)
-                .expect_err("epoch binding")
-                .code,
+            verify_for_consumption(
+                issued.as_sealed_bytes(),
+                &key,
+                &expectations,
+                &ledger,
+                &fixture.operators,
+                &requester,
+            )
+            .expect_err("epoch binding")
+            .code,
             ApprovalErrorCode::TrustEpochMismatch
         );
     }
@@ -1717,7 +1977,7 @@ mod tests {
             Evidence::fully_isolated(),
         );
         let err = broker
-            .request_approval(&request, &self_requester, &auth, NOW)
+            .request_approval(&request, &self_requester, auth, NOW)
             .expect_err("a requester must not approve itself");
         // The authentication was made for a different requester, which is the
         // first thing that fails; the distinctness check backstops it below.
@@ -1736,6 +1996,9 @@ mod tests {
             &fixture.operators,
             fixture.record.trust_epoch,
             &self_requester,
+            &request.proposal_digest,
+            &request.target_instance,
+            NOW,
         )
         .expect_err("no authentication exists for a self-approving requester");
         assert_eq!(
@@ -1757,7 +2020,7 @@ mod tests {
 
         let second = isolated_requester("reg-def456");
         let err = broker
-            .request_approval(&request, &second, &auth, NOW)
+            .request_approval(&request, &second, auth, NOW)
             .expect_err("an authentication is bound to one requester");
         assert_eq!(
             err.code,
@@ -1798,7 +2061,7 @@ mod tests {
         );
 
         let err = broker
-            .request_approval(&request, &now_unprovable, &auth, NOW)
+            .request_approval(&request, &now_unprovable, auth, NOW)
             .expect_err("an operator the requester may reach must be ineligible");
         assert_eq!(err.code, ApprovalErrorCode::OperatorIneligible);
 
@@ -1813,6 +2076,9 @@ mod tests {
                 &fixture.operators,
                 fixture.record.trust_epoch,
                 &unprovable_requester("agent-alpha"),
+                &request.proposal_digest,
+                &request.target_instance,
+                NOW,
             )
             .expect_err("no authentication for an unprovable requester")
             .code,
@@ -1835,7 +2101,7 @@ mod tests {
         let empty = OperatorRegistry::new();
         let broker = ApprovalBroker::new(&key, &fixture.trust, &empty, &ledger);
         let err = broker
-            .request_approval(&request, &requester, &auth, NOW)
+            .request_approval(&request, &requester, auth, NOW)
             .expect_err("an operator absent from the trust root cannot approve");
         assert_eq!(err.code, ApprovalErrorCode::OperatorNotRegistered);
     }
@@ -1852,14 +2118,17 @@ mod tests {
         let ledger = InMemoryReceiptLedger::new();
         let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
         let requester = isolated_requester("reg-abc123");
-        let auth = fixture.authenticate(&requester);
 
         for operation in ControlOperation::PERMANENTLY_META_AUTHORITY {
             let request = ApprovalRequest {
                 operation: *operation,
                 ..fixture.request()
             };
-            match broker.request_approval(&request, &requester, &auth, NOW) {
+            // A fresh authentication per iteration: it is non-`Clone` and
+            // consumed by value. The refusal here is `MetaAuthorityNotProposable`
+            // at step 5, before the authentication's own bindings are read.
+            let auth = fixture.authenticate(&requester);
+            match broker.request_approval(&request, &requester, auth, NOW) {
                 Ok(_) => panic!("{operation} is meta-authority and must never yield a receipt"),
                 Err(err) => assert_eq!(
                     err.code,
@@ -1885,7 +2154,7 @@ mod tests {
         );
         let auth = fixture.authenticate(&ungranted);
         let err = broker
-            .request_approval(&request, &ungranted, &auth, NOW)
+            .request_approval(&request, &ungranted, auth, NOW)
             .expect_err("a grant that does not cover the domain reaches nothing");
         assert_eq!(err.code, ApprovalErrorCode::GrantRequired);
     }
@@ -1901,11 +2170,13 @@ mod tests {
         let key = fixture.key();
         let ledger = InMemoryReceiptLedger::new();
         let request = fixture.request();
+        let requester = isolated_requester("reg-abc123");
 
         let receipt = ApprovalReceipt {
             receipt_id: ReceiptId::generate().expect("id"),
             proposal_digest: request.proposal_digest,
             target_instance: request.target_instance.clone(),
+            requester_fingerprint: requester.fingerprint(),
             instance_fingerprint: request.instance_fingerprint,
             source_revision: request.source_revision,
             operation: ControlOperation::ProposeAgentProfile,
@@ -1925,9 +2196,15 @@ mod tests {
         assert_eq!(receipt.required_quorum.get(), 2);
         let sealed = seal_receipt(receipt, &key);
 
-        let err =
-            verify_for_consumption(&sealed, &key, &fixture.expectations(&request, NOW), &ledger)
-                .expect_err("one decision must not satisfy a quorum of two");
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&request, NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("one decision must not satisfy a quorum of two");
         assert_eq!(err.code, ApprovalErrorCode::QuorumNotSatisfied);
     }
 
@@ -1937,6 +2214,7 @@ mod tests {
         let key = fixture.key();
         let ledger = InMemoryReceiptLedger::new();
         let request = fixture.request();
+        let requester = isolated_requester("reg-abc123");
 
         let decision = OperatorDecision {
             operator: operator("jordan"),
@@ -1948,6 +2226,7 @@ mod tests {
             receipt_id: ReceiptId::generate().expect("id"),
             proposal_digest: request.proposal_digest,
             target_instance: request.target_instance.clone(),
+            requester_fingerprint: requester.fingerprint(),
             instance_fingerprint: request.instance_fingerprint,
             source_revision: request.source_revision,
             operation: ControlOperation::ProposeAgentProfile,
@@ -1961,9 +2240,15 @@ mod tests {
         };
         let sealed = seal_receipt(receipt, &key);
 
-        let err =
-            verify_for_consumption(&sealed, &key, &fixture.expectations(&request, NOW), &ledger)
-                .expect_err("a repeated operator is one operator");
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&request, NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("a repeated operator is one operator");
         assert_eq!(err.code, ApprovalErrorCode::QuorumNotSatisfied);
     }
 
@@ -2004,7 +2289,7 @@ mod tests {
             let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
             let auth = fixture.authenticate(&requester);
             broker
-                .reject(&request, &requester, &auth, NOW)
+                .reject(&request, &requester, auth, NOW)
                 .expect("an operator may reject")
         };
         assert_eq!(rejection.receipt().decision, Decision::Reject);
@@ -2018,6 +2303,8 @@ mod tests {
                 &key,
                 &fixture.expectations(&request, NOW),
                 &ledger,
+                &fixture.operators,
+                &requester,
             )
             .expect_err("a rejection authorizes nothing")
             .code,
@@ -2031,7 +2318,7 @@ mod tests {
         let auth = fixture.authenticate(&requester);
         assert_eq!(
             broker
-                .request_approval(&request, &requester, &auth, NOW)
+                .request_approval(&request, &requester, auth, NOW)
                 .expect_err("a rejected proposal cannot later be approved")
                 .code,
             ApprovalErrorCode::ProposalRejected
@@ -2049,10 +2336,10 @@ mod tests {
         let (approval, rejection) = {
             let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
             let approval = broker
-                .request_approval(&request, &requester, &fixture.authenticate(&requester), NOW)
+                .request_approval(&request, &requester, fixture.authenticate(&requester), NOW)
                 .expect("approve");
             let rejection = broker
-                .reject(&request, &requester, &fixture.authenticate(&requester), NOW)
+                .reject(&request, &requester, fixture.authenticate(&requester), NOW)
                 .expect("reject");
             (approval, rejection)
         };
@@ -2063,6 +2350,8 @@ mod tests {
                 &key,
                 &fixture.expectations(&request, NOW),
                 &ledger,
+                &fixture.operators,
+                &requester,
             )
             .is_ok(),
             "before the rejection is recorded the approval still verifies"
@@ -2076,6 +2365,8 @@ mod tests {
                 &key,
                 &fixture.expectations(&request, NOW),
                 &ledger,
+                &fixture.operators,
+                &requester,
             )
             .expect_err("a terminal rejection outranks an outstanding approval")
             .code,
@@ -2093,7 +2384,7 @@ mod tests {
         let approval = {
             let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
             broker
-                .request_approval(&request, &requester, &fixture.authenticate(&requester), NOW)
+                .request_approval(&request, &requester, fixture.authenticate(&requester), NOW)
                 .expect("approve")
         };
 
@@ -2115,7 +2406,6 @@ mod tests {
         let ledger = InMemoryReceiptLedger::new();
         let requester = isolated_requester("reg-abc123");
         let request = fixture.request();
-        let auth = fixture.authenticate(&requester);
 
         for trust in [
             InstanceTrustState::EligibleForFirstGenesis,
@@ -2125,8 +2415,11 @@ mod tests {
             },
         ] {
             let broker = ApprovalBroker::new(&key, &trust, &fixture.operators, &ledger);
+            // Fresh per iteration: the authentication is non-`Clone`. The refusal
+            // is `InstanceNotManaged` at step 2, before its bindings are read.
+            let auth = fixture.authenticate(&requester);
             let err = broker
-                .request_approval(&request, &requester, &auth, NOW)
+                .request_approval(&request, &requester, auth, NOW)
                 .expect_err("only a managed instance brokers approvals");
             assert_eq!(err.code, ApprovalErrorCode::InstanceNotManaged);
         }
@@ -2147,7 +2440,7 @@ mod tests {
         };
         assert_eq!(
             broker
-                .request_approval(&request, &requester, &auth, NOW)
+                .request_approval(&request, &requester, auth, NOW)
                 .expect_err("another instance is not this one")
                 .code,
             ApprovalErrorCode::TargetMismatch
@@ -2172,7 +2465,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .request_approval(&request, &requester, &auth, NOW)
+                .request_approval(&request, &requester, auth, NOW)
                 .expect_err("the record, key, and authentication must agree on the epoch")
                 .code,
             ApprovalErrorCode::TrustEpochMismatch
@@ -2216,6 +2509,7 @@ mod tests {
             receipt_id: ReceiptId::new("rcpt-fixed").expect("id"),
             proposal_digest: request.proposal_digest,
             target_instance: request.target_instance.clone(),
+            requester_fingerprint: isolated_requester("reg-abc123").fingerprint(),
             instance_fingerprint: request.instance_fingerprint,
             source_revision: request.source_revision,
             operation: ControlOperation::ProposeAgentProfile,
@@ -2259,6 +2553,14 @@ mod tests {
         changed.operation = ControlOperation::WidenPolicy;
         assert_ne!(baseline, encode(&changed), "the operation must be covered");
 
+        let mut changed = base.clone();
+        changed.requester_fingerprint = isolated_requester("reg-different").fingerprint();
+        assert_ne!(
+            baseline,
+            encode(&changed),
+            "the requester fingerprint must be covered"
+        );
+
         let mut changed = base;
         changed.operator_decisions.clear();
         assert_ne!(
@@ -2281,10 +2583,326 @@ mod tests {
                 &fixture.operators,
                 fixture.record.trust_epoch,
                 &requester,
+                &ProposalDigest::from_bytes([0x11; 32]),
+                &fixture.record.instance_id,
+                NOW,
             )
             .expect_err("a decline authenticates nobody")
             .code,
             crate::operator::OperatorErrorCode::PresenceDeclined
         );
+    }
+
+    // -- F1: verify_for_consumption re-derives, it does not restate -----------
+
+    /// A hand-built approval receipt for a given operation, sealed under `key`.
+    /// The review's exploit shapes need receipts the broker would never mint, so
+    /// these are built directly and signed. Fields not overridden are consistent
+    /// with `fixture.request()`.
+    fn hand_signed_receipt(
+        fixture: &Fixture,
+        key: &ApprovalAuditKey,
+        requester: &RequesterContext,
+        operation: ControlOperation,
+        authority_tier: AuthorityTier,
+        required_quorum: RequiredQuorum,
+        operator_decisions: Vec<OperatorDecision>,
+    ) -> Vec<u8> {
+        let request = fixture.request();
+        let receipt = ApprovalReceipt {
+            receipt_id: ReceiptId::generate().expect("id"),
+            proposal_digest: request.proposal_digest,
+            target_instance: request.target_instance.clone(),
+            requester_fingerprint: requester.fingerprint(),
+            instance_fingerprint: request.instance_fingerprint,
+            source_revision: request.source_revision,
+            operation,
+            authority_tier,
+            decision: Decision::Approve,
+            required_quorum,
+            operator_decisions,
+            trust_epoch: fixture.record.trust_epoch,
+            issued_at_unix_secs: NOW,
+            expires_at_unix_secs: NOW + 300,
+        };
+        seal_receipt(receipt, key)
+    }
+
+    fn approving_decision(name: &str) -> OperatorDecision {
+        OperatorDecision {
+            operator: operator(name),
+            decision: Decision::Approve,
+            presence_class: PresenceClass::Terminal,
+            decided_at_unix_secs: NOW,
+        }
+    }
+
+    #[test]
+    fn a_zero_quorum_receipt_with_no_decisions_is_refused() {
+        // required_quorum:0 with an empty decision set. `RequiredQuorum` is a
+        // transparent u32 with no lower bound, so this shape is expressible by
+        // anyone who can write receipt bytes. Guarded by mutation check (1):
+        // reverting the quorum-floor guard makes this test regress.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let requester = isolated_requester("reg-abc123");
+
+        let zero: RequiredQuorum =
+            serde_json::from_str("0").expect("a transparent u32 deserializes zero");
+        assert_eq!(zero.get(), 0);
+        let sealed = hand_signed_receipt(
+            &fixture,
+            &key,
+            &requester,
+            ControlOperation::ProposeAgentProfile,
+            AuthorityTier::Ordinary,
+            zero,
+            vec![],
+        );
+
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&fixture.request(), NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("a zero-quorum receipt authorizes nothing");
+        assert_eq!(err.code, ApprovalErrorCode::RequiredQuorumTooLow);
+    }
+
+    #[test]
+    fn a_receipt_whose_tier_understates_its_operation_is_refused() {
+        // operation:GrantManagementToRequester with authority_tier:Ordinary — a
+        // meta-authority operation wearing an ordinary tier. The verifier
+        // recomputes the tier from the operation. Guarded by mutation check (2):
+        // reverting the tier recompute makes this test regress.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let requester = isolated_requester("reg-abc123");
+
+        let sealed = hand_signed_receipt(
+            &fixture,
+            &key,
+            &requester,
+            ControlOperation::GrantManagementToRequester,
+            AuthorityTier::Ordinary,
+            RequiredQuorum::MINIMUM,
+            vec![approving_decision("jordan")],
+        );
+
+        let request = ApprovalRequest {
+            operation: ControlOperation::GrantManagementToRequester,
+            ..fixture.request()
+        };
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&request, NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("a meta-authority operation cannot wear an ordinary tier");
+        assert_eq!(err.code, ApprovalErrorCode::AuthorityTierMismatch);
+    }
+
+    #[test]
+    fn a_receipt_for_a_different_operation_is_refused() {
+        // The receipt is a genuine, broker-signed approval of ProposeAgentProfile;
+        // the operation in hand is a different one.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
+        let requester = isolated_requester("reg-abc123");
+        let request = fixture.request();
+        let issued = broker
+            .request_approval(&request, &requester, fixture.authenticate(&requester), NOW)
+            .expect("approve");
+
+        let mut expectations = fixture.expectations(&request, NOW);
+        expectations.operation = ControlOperation::WidenPolicy;
+        let err = verify_for_consumption(
+            issued.as_sealed_bytes(),
+            &key,
+            &expectations,
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("a receipt authorizes exactly one operation");
+        assert_eq!(err.code, ApprovalErrorCode::OperationMismatch);
+    }
+
+    #[test]
+    fn a_receipt_for_a_different_requester_is_refused() {
+        // The per-requester binding must survive into the artefact and be
+        // re-checked. A receipt issued for one requester cannot be consumed on
+        // behalf of another.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
+        let requester_a = isolated_requester("reg-abc123");
+        let request = fixture.request();
+        let issued = broker
+            .request_approval(
+                &request,
+                &requester_a,
+                fixture.authenticate(&requester_a),
+                NOW,
+            )
+            .expect("approve");
+
+        let requester_b = isolated_requester("reg-zzz999");
+        let err = verify_for_consumption(
+            issued.as_sealed_bytes(),
+            &key,
+            &fixture.expectations(&request, NOW),
+            &ledger,
+            &fixture.operators,
+            &requester_b,
+        )
+        .expect_err("a receipt authorizes exactly one requester");
+        assert_eq!(err.code, ApprovalErrorCode::RequesterMismatch);
+    }
+
+    #[test]
+    fn a_receipt_whose_approver_is_not_registered_is_refused() {
+        // An approver absent from the active registry, re-checked at consumption
+        // rather than trusted from the mint.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let requester = isolated_requester("reg-abc123");
+
+        let sealed = hand_signed_receipt(
+            &fixture,
+            &key,
+            &requester,
+            ControlOperation::ProposeAgentProfile,
+            AuthorityTier::Ordinary,
+            RequiredQuorum::MINIMUM,
+            vec![approving_decision("ghost")],
+        );
+
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&fixture.request(), NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("an unregistered approver authorizes nothing");
+        assert_eq!(err.code, ApprovalErrorCode::OperatorNotRegistered);
+    }
+
+    #[test]
+    fn a_receipt_whose_approver_is_the_requester_is_refused_at_consumption() {
+        // Non-escalation rule 4, re-checked at consumption. The approver is
+        // jordan, and so is the requester's subject.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let requester = RequesterContext::external(
+            RequesterSubject::new("jordan").expect("subject"),
+            agent_domain(),
+            Evidence::fully_isolated(),
+        );
+
+        let sealed = hand_signed_receipt(
+            &fixture,
+            &key,
+            &requester,
+            ControlOperation::ProposeAgentProfile,
+            AuthorityTier::Ordinary,
+            RequiredQuorum::MINIMUM,
+            vec![approving_decision("jordan")],
+        );
+
+        let err = verify_for_consumption(
+            &sealed,
+            &key,
+            &fixture.expectations(&fixture.request(), NOW),
+            &ledger,
+            &fixture.operators,
+            &requester,
+        )
+        .expect_err("an approver that is the requester authorizes nothing");
+        assert_eq!(err.code, ApprovalErrorCode::OperatorIsTheRequester);
+    }
+
+    // -- F2: an authentication is bound to its request ------------------------
+
+    #[test]
+    fn an_authentication_for_one_proposal_cannot_mint_another_proposals_receipt() {
+        // g1: one presence ceremony must not authorise a different proposal.
+        // Guarded by mutation check (3): reverting the proposal binding makes
+        // this test regress.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
+        let requester = isolated_requester("reg-abc123");
+
+        // Authenticate for the canonical proposal, then present a request for a
+        // different proposal digest.
+        let auth = fixture.authenticate(&requester);
+        let other = ApprovalRequest {
+            proposal_digest: ProposalDigest::from_bytes([0xB9; 32]),
+            ..fixture.request()
+        };
+        let err = broker
+            .request_approval(&other, &requester, auth, NOW)
+            .expect_err("an authentication is bound to one proposal");
+        assert_eq!(err.code, ApprovalErrorCode::AuthenticationProposalMismatch);
+    }
+
+    #[test]
+    fn an_authentication_for_one_instance_cannot_mint_a_receipt_on_another() {
+        // g7: an authentication against instance A must not mint a receipt on
+        // instance B's broker. Guarded by mutation check (3): reverting the
+        // instance binding makes this test regress.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
+        let requester = isolated_requester("reg-abc123");
+
+        // Authenticate bound to a different instance, then present it to this
+        // instance's broker for the canonical (this-instance) request.
+        let elsewhere = ApprovalRequest {
+            target_instance: InstanceId::new("inst-elsewhere").expect("id"),
+            ..fixture.request()
+        };
+        let auth = fixture.authenticate_for(&requester, &elsewhere, NOW);
+        let err = broker
+            .request_approval(&fixture.request(), &requester, auth, NOW)
+            .expect_err("an authentication is bound to one instance");
+        assert_eq!(err.code, ApprovalErrorCode::AuthenticationInstanceMismatch);
+    }
+
+    #[test]
+    fn an_expired_authentication_cannot_mint_a_receipt() {
+        // g2: an authentication valid an unbounded time later must not mint a
+        // receipt. The authentication's own expiry closes the window.
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let ledger = InMemoryReceiptLedger::new();
+        let broker = ApprovalBroker::new(&key, &fixture.trust, &fixture.operators, &ledger);
+        let requester = isolated_requester("reg-abc123");
+        let request = fixture.request();
+
+        let auth = fixture.authenticate_for(&requester, &request, NOW);
+        let mint_at = NOW + crate::operator::OPERATOR_AUTHENTICATION_TTL_SECS + 1;
+        let err = broker
+            .request_approval(&request, &requester, auth, mint_at)
+            .expect_err("an expired authentication mints nothing");
+        assert_eq!(err.code, ApprovalErrorCode::AuthenticationExpired);
     }
 }

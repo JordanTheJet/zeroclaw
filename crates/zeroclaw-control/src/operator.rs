@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::approval::ProposalDigest;
 use crate::ceremony::{PresenceError, PresenceRequest, UserPresence};
 use crate::client_registry::ClientRegistry;
 use crate::genesis::{
@@ -72,11 +73,20 @@ use crate::genesis::{
 use crate::keys::ApprovalAuditKey;
 use crate::principal::RequesterGrant;
 use crate::reachability::{self, Analysis, Evidence};
-use crate::registry::{GenesisDigest, TrustEpoch};
+use crate::registry::{GenesisDigest, InstanceId, TrustEpoch};
 use crate::store::{
     CanonicalBytes, ControlPaths, StoreError, absorb_field, absorb_str, absorb_u64, open_sealed,
-    publish_new, publish_replace, read_optional, seal,
+    os_random_32, publish_new, publish_replace, read_optional, seal,
 };
+
+/// How long an operator authentication stays usable to mint a receipt, in
+/// seconds.
+///
+/// Short on purpose, and bounded independently of the receipt lifetime: the
+/// authentication is consumed by the broker moments after the ceremony
+/// completes, and binding an expiry to it is what stops one presence ceremony
+/// from authorising a decision an unbounded time later.
+pub const OPERATOR_AUTHENTICATION_TTL_SECS: u64 = 300;
 
 /// Domain-separation label for the sealed operator registry.
 pub const OPERATOR_REGISTRY_DOMAIN: &str = "zeroclaw/control-plane/operator-registry/v1";
@@ -471,11 +481,42 @@ impl RequesterFingerprint {
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
+
+    /// Parse a 64-character hex fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperatorErrorCode::InvalidIdentity`] when the input is not
+    /// exactly 32 hex-encoded bytes. Needed because a receipt binds this value
+    /// and is deserialized when it is opened.
+    pub fn from_hex(value: &str) -> Result<Self, OperatorError> {
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(value, &mut bytes).map_err(|e| {
+            OperatorError::new(
+                OperatorErrorCode::InvalidIdentity,
+                format!("requester fingerprint: {e}"),
+            )
+        })?;
+        Ok(Self(bytes))
+    }
 }
 
 impl std::fmt::Display for RequesterFingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.to_hex())
+    }
+}
+
+impl Serialize for RequesterFingerprint {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for RequesterFingerprint {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::from_hex(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -924,15 +965,29 @@ pub fn load_view(
 /// receipt either.
 ///
 /// It is also bound to the requester it was produced for
-/// ([`Self::issued_for`]), so it cannot be carried across to a different
-/// requester whose reachability was never analysed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ([`Self::issued_for`]), the exact proposal digest and target instance the
+/// decision is about ([`Self::proposal_digest`], [`Self::instance`]), a wall-
+/// clock expiry ([`Self::expires_at_unix_secs`]), and a fresh random nonce
+/// ([`Self::nonce`]). Those bindings are what stop one presence ceremony from
+/// authorising a *different* proposal, a decision on a *different* instance, or a
+/// decision an unbounded time later.
+///
+/// It is deliberately **not** `Clone`, and
+/// [`crate::approval::ApprovalBroker::request_approval`] consumes it **by
+/// value**: a single ceremony can therefore mint at most one receipt, closing
+/// the "one presence ceremony minted five receipts for five proposals" finding
+/// structurally rather than by a runtime check that could be forgotten.
+#[derive(Debug, PartialEq, Eq)]
 pub struct OperatorAuthentication {
     identity: OperatorIdentity,
     presence_class: PresenceClass,
     trust_epoch: TrustEpoch,
     issued_for: RequesterFingerprint,
+    proposal_digest: ProposalDigest,
+    instance: InstanceId,
     authenticated_at_unix_secs: u64,
+    expires_at_unix_secs: u64,
+    nonce: [u8; 32],
 }
 
 impl OperatorAuthentication {
@@ -940,6 +995,31 @@ impl OperatorAuthentication {
     #[must_use]
     pub const fn identity(&self) -> &OperatorIdentity {
         &self.identity
+    }
+
+    /// The proposal digest this authentication is bound to.
+    #[must_use]
+    pub const fn proposal_digest(&self) -> &ProposalDigest {
+        &self.proposal_digest
+    }
+
+    /// The target instance this authentication is bound to.
+    #[must_use]
+    pub const fn instance(&self) -> &InstanceId {
+        &self.instance
+    }
+
+    /// When this authentication expires, seconds since the Unix epoch. A broker
+    /// that mints a receipt after this instant refuses.
+    #[must_use]
+    pub const fn expires_at_unix_secs(&self) -> u64 {
+        self.expires_at_unix_secs
+    }
+
+    /// The fresh random nonce bound at authentication time.
+    #[must_use]
+    pub const fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
     }
 
     /// The assurance class actually achieved by the ceremony.
@@ -991,6 +1071,13 @@ impl OperatorAuthentication {
 /// 4. **Only then, the presence ceremony.** The human present types the identity
 ///    they are acting as, and it must equal the claimed identity.
 ///
+/// The resulting authentication is bound to `proposal_digest`, `instance`, a
+/// wall-clock expiry (`now_unix_secs` plus
+/// [`OPERATOR_AUTHENTICATION_TTL_SECS`]), and a fresh random nonce, in addition
+/// to the requester it was produced for. The broker re-checks the proposal,
+/// instance, and expiry before it will mint a receipt, so an authentication
+/// obtained for one request cannot authorise another.
+///
 /// # Errors
 ///
 /// See [`OperatorErrorCode`]. Every failure is a refusal; none downgrades to a
@@ -1003,6 +1090,9 @@ pub fn authenticate_operator(
     operators: &OperatorRegistry,
     trust_epoch: TrustEpoch,
     requester: &RequesterContext,
+    proposal_digest: &ProposalDigest,
+    instance: &InstanceId,
+    now_unix_secs: u64,
 ) -> Result<OperatorAuthentication, OperatorError> {
     // A requester class can never be on the approving side of this call. The
     // context type already makes this unreachable; checking it anyway means a
@@ -1073,13 +1163,19 @@ pub fn authenticate_operator(
         ));
     }
 
+    let nonce = os_random_32()
+        .map_err(|e| OperatorError::new(OperatorErrorCode::RegistryUnusable, e.detail))?;
+
     Ok(OperatorAuthentication {
         identity: claimed.clone(),
         presence_class: attestation.class(),
         trust_epoch,
         issued_for: requester.fingerprint(),
-        authenticated_at_unix_secs: now_unix_secs()
-            .map_err(|e| OperatorError::new(OperatorErrorCode::RegistryUnusable, e.detail))?,
+        proposal_digest: *proposal_digest,
+        instance: instance.clone(),
+        authenticated_at_unix_secs: now_unix_secs,
+        expires_at_unix_secs: now_unix_secs.saturating_add(OPERATOR_AUTHENTICATION_TTL_SECS),
+        nonce,
     })
 }
 
@@ -1264,6 +1360,16 @@ mod tests {
         key_for, operator, unprovable_requester,
     };
 
+    /// A fixed proposal digest for tests that only exercise authentication.
+    fn test_proposal_digest() -> ProposalDigest {
+        ProposalDigest::from_bytes([0x11; 32])
+    }
+
+    /// A fixed target instance for tests that only exercise authentication.
+    fn test_instance() -> InstanceId {
+        InstanceId::new("inst-operator-test").expect("instance id")
+    }
+
     fn authenticate(
         presence: &dyn UserPresence,
         claimed: &OperatorIdentity,
@@ -1279,6 +1385,9 @@ mod tests {
             operators,
             epoch,
             requester,
+            &test_proposal_digest(),
+            &test_instance(),
+            1_700_000_000,
         )
     }
 
