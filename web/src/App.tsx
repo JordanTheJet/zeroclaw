@@ -311,7 +311,7 @@ function PairingDialog({
             }}
           >
             <div
-              className="text-4xl font-mono font-bold tracking-[0.4em] py-2"
+              className="text-2xl font-mono font-bold tracking-widest break-all py-2"
               style={{ color: "var(--pc-text-primary)" }}
             >
               {displayCode}
@@ -330,9 +330,9 @@ function PairingDialog({
             type="text"
             value={code}
             onChange={(e) => setCode(e.target.value)}
-            placeholder="6-digit code"
-            className="input-electric w-full px-4 py-4 text-center text-2xl tracking-[0.3em] font-medium mb-4"
-            maxLength={6}
+            placeholder="pairing code"
+            className="input-electric w-full px-4 py-4 text-center text-xl tracking-widest font-medium mb-4"
+            maxLength={128}
             autoFocus
           />
           {error && (
