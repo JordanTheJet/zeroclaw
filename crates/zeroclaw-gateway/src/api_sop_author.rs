@@ -878,6 +878,7 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &[member_token.to_string(), other_token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ));
         (tmp, state, run_id)
     }
@@ -978,6 +979,7 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &[first_member.to_string(), second_member.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ));
 
         let resp = handle_sop_decide(
@@ -1048,7 +1050,11 @@ mod tests {
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         let mut state = crate::api::test_state(config);
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let resp = handle_sop_decide(
             State(state.clone()),

@@ -1226,9 +1226,13 @@ pub async fn run_gateway(
     };
 
     // ── Pairing guard ──────────────────────────────────────
+    // The pairing-code policy is resolved from config here and nowhere
+    // else: startup pairing, `gateway get-paircode --new`, the dashboard
+    // pairing flow, and rotate-device all issue through this guard (#6613).
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -1373,11 +1377,14 @@ pub async fn run_gateway(
         );
     }
     if let Some(code) = pairing.pairing_code() {
+        // The box is sized from the code, not from a literal: since #6613
+        // the code length is operator-configurable (6..=128 chars).
+        let rule = "─".repeat(code.chars().count() + 4);
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
+        println!("     ┌{rule}┐");
         println!("     │  {code}  │");
-        println!("     └──────────────┘");
+        println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         for line in already_paired_pairing_notice(host, actual_port, pfx) {
@@ -4455,7 +4462,8 @@ mod tests {
     fn already_paired_notice_states_no_code_was_generated() {
         // the banner must say plainly that NO code exists
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
-        // hits the dashboard's 6-digit prompt with no code printed anywhere.
+        // hits the dashboard's pairing-code prompt with no code printed
+        // anywhere.
         let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
         let joined = lines.join("\n");
         assert!(
@@ -4551,7 +4559,11 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                require_pairing,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -5460,7 +5472,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -5546,7 +5562,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -5749,7 +5769,11 @@ path = "{trigger_path}"
         };
         config.save().await.unwrap();
 
-        let guard = PairingGuard::new(true, &[]);
+        let guard = PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        );
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -5805,7 +5829,11 @@ path = "{trigger_path}"
         };
         config.save().await.unwrap();
 
-        let guard = PairingGuard::new(true, &[]);
+        let guard = PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        );
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -6219,7 +6247,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7057,7 +7089,11 @@ path = "{trigger_path}"
         // bare 64-hex-char value as an already-hashed token, so a "zc_"
         // prefix keeps this one unambiguously plaintext.
         let token = format!("zc_{}", generate_test_secret());
-        state.pairing = Arc::new(PairingGuard::new(true, std::slice::from_ref(&token)));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            std::slice::from_ref(&token),
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let response = api_sop_webhook::handle_sop_webhook(
             State(state),
@@ -7125,7 +7161,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7244,7 +7284,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7343,7 +7387,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: true,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7548,7 +7596,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7634,7 +7686,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7725,7 +7781,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7821,7 +7881,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7915,7 +7979,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -8065,7 +8133,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -8652,7 +8724,11 @@ path = "{trigger_path}"
     ) -> AppState {
         let mut state = admin_paircode_state(tmp, require_pairing, false);
         state.config.write().gateway.allow_remote_admin = allow_remote_admin;
-        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.pairing = Arc::new(PairingGuard::new(
+            require_pairing,
+            tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.reload_tx = Some(tokio::sync::watch::channel(false).0);
         state
     }
@@ -8917,7 +8993,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9002,7 +9082,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9322,7 +9406,11 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),

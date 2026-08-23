@@ -1,8 +1,10 @@
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+use zeroclaw_macros::Configurable;
 
 /// Maximum failed pairing attempts before lockout.
 const MAX_PAIR_ATTEMPTS: u32 = 5;
@@ -14,6 +16,219 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 const FAILED_ATTEMPT_RETENTION_SECS: u64 = 900; // 15 min
 /// Minimum interval between full sweeps of the failed-attempt map.
 const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
+
+/// Smallest pairing-code length any configuration may select.
+///
+/// Six is the pre-#6613 shipped length, so no configuration can produce a
+/// code weaker (in length) than what the gateway used to generate.
+pub const PAIRING_CODE_MIN_LENGTH: usize = 6;
+
+/// Largest pairing-code length any configuration may select. Bounds the
+/// terminal banner, the `X-Pairing-Code` header, and dashboard input.
+pub const PAIRING_CODE_MAX_LENGTH: usize = 128;
+
+/// Default pairing-code length. See [`PairingCodePolicy`] for the rationale.
+pub const PAIRING_CODE_DEFAULT_LENGTH: usize = 32;
+
+const NUMERIC_ALPHABET: &[u8] = b"0123456789";
+const ALPHANUMERIC_ALPHABET: &[u8] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+/// Crockford Base32: the digits plus the uppercase letters, minus `I`, `L`,
+/// `O`, and `U`. Removing those kills the `0`/`O` and `1`/`I`/`l` confusions
+/// that make a code painful to read aloud or retype.
+const UNAMBIGUOUS_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Character family a pairing code is drawn from.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCodeCharset {
+    /// `0-9`. Compatibility mode for demos and retyping-heavy flows.
+    /// Paired with `length = 6` this reproduces the pre-#6613 code exactly.
+    Numeric,
+    /// `0-9A-Za-z`, case-sensitive (62 symbols). The default: densest
+    /// entropy per character for a code that is copied and pasted.
+    #[default]
+    Alphanumeric,
+    /// Crockford Base32 (32 symbols): no `I`, `L`, `O`, or `U`. Slightly
+    /// longer for the same entropy, but safe to read aloud or retype.
+    Unambiguous,
+}
+
+impl PairingCodeCharset {
+    /// The symbols a code of this family is drawn from.
+    pub fn alphabet(self) -> &'static [u8] {
+        match self {
+            Self::Numeric => NUMERIC_ALPHABET,
+            Self::Alphanumeric => ALPHANUMERIC_ALPHABET,
+            Self::Unambiguous => UNAMBIGUOUS_ALPHABET,
+        }
+    }
+
+    /// Entropy contributed by a single character of this family.
+    pub fn bits_per_char(self) -> f64 {
+        (self.alphabet().len() as f64).log2()
+    }
+}
+
+/// Why a [`PairingCodePolicy`] is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PairingCodePolicyError {
+    /// Configured length is below [`PAIRING_CODE_MIN_LENGTH`].
+    #[error(
+        "pairing code length {length} is below the minimum of {PAIRING_CODE_MIN_LENGTH}; \
+         a shorter code would be weaker than the gateway default"
+    )]
+    TooShort {
+        /// The rejected length.
+        length: usize,
+    },
+    /// Configured length is above [`PAIRING_CODE_MAX_LENGTH`].
+    #[error("pairing code length {length} exceeds the maximum of {PAIRING_CODE_MAX_LENGTH}")]
+    TooLong {
+        /// The rejected length.
+        length: usize,
+    },
+}
+
+/// The one pairing-code generation policy.
+///
+/// Every code the gateway issues — the startup code, `zeroclaw gateway
+/// get-paircode --new`, `POST /api/pairing/initiate`, and the rotate-device
+/// flow — comes from this policy via [`PairingGuard`]. There is no second
+/// pairing-code setting anywhere in the schema.
+///
+/// # Default
+///
+/// 32 case-sensitive alphanumeric characters ≈ **190.6 bits** of entropy,
+/// against ≈19.9 bits for the six-digit numeric code shipped before #6613.
+/// Pairing codes are pasted far more often than they are retyped, and a
+/// pairing code is the gateway's front door: getting it wrong is an
+/// authentication bypass, while getting it long is a paste.
+///
+/// Operators who transfer the code by hand have two supported alternatives,
+/// both still far stronger than the old default:
+///
+/// ```toml
+/// # Read-aloud friendly: 24 Crockford-Base32 chars ≈ 120 bits.
+/// [gateway.pairing_code]
+/// length = 24
+/// charset = "unambiguous"
+///
+/// # Exact pre-#6613 behaviour. Only for local, short-lived pairing.
+/// [gateway.pairing_code]
+/// length = 6
+/// charset = "numeric"
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.pairing_code"]
+pub struct PairingCodePolicy {
+    /// Number of characters in a generated pairing code
+    /// (`6..=128`, default: 32).
+    #[serde(default = "default_pairing_code_length")]
+    #[credential_class = "public_value"]
+    pub length: usize,
+    /// Character family: `numeric`, `alphanumeric` (default), or
+    /// `unambiguous`.
+    #[serde(default)]
+    #[credential_class = "public_value"]
+    pub charset: PairingCodeCharset,
+}
+
+fn default_pairing_code_length() -> usize {
+    PAIRING_CODE_DEFAULT_LENGTH
+}
+
+impl Default for PairingCodePolicy {
+    fn default() -> Self {
+        Self {
+            length: default_pairing_code_length(),
+            charset: PairingCodeCharset::default(),
+        }
+    }
+}
+
+impl PairingCodePolicy {
+    /// Build a validated policy.
+    pub fn new(length: usize, charset: PairingCodeCharset) -> Result<Self, PairingCodePolicyError> {
+        let policy = Self { length, charset };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// The exact pre-#6613 policy: six numeric digits.
+    ///
+    /// Kept as a named constructor so the compatibility shape is testable
+    /// and greppable rather than a magic pair of literals.
+    pub const fn numeric_compat() -> Self {
+        Self {
+            length: 6,
+            charset: PairingCodeCharset::Numeric,
+        }
+    }
+
+    /// Reject lengths outside `PAIRING_CODE_MIN_LENGTH..=PAIRING_CODE_MAX_LENGTH`.
+    pub fn validate(&self) -> Result<(), PairingCodePolicyError> {
+        if self.length < PAIRING_CODE_MIN_LENGTH {
+            return Err(PairingCodePolicyError::TooShort {
+                length: self.length,
+            });
+        }
+        if self.length > PAIRING_CODE_MAX_LENGTH {
+            return Err(PairingCodePolicyError::TooLong {
+                length: self.length,
+            });
+        }
+        Ok(())
+    }
+
+    /// The length actually used for generation.
+    ///
+    /// `Config::validate` rejects an out-of-range length at load, so this
+    /// clamp is defence in depth for a policy built by other means — a
+    /// generator must never panic or emit a zero-length code.
+    pub fn effective_length(&self) -> usize {
+        self.length
+            .clamp(PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH)
+    }
+
+    /// Shannon entropy of a code generated under this policy, in bits.
+    ///
+    /// Reported so a security-posture surface can state the active strength
+    /// rather than restating the raw length and charset.
+    pub fn entropy_bits(&self) -> f64 {
+        self.effective_length() as f64 * self.charset.bits_per_char()
+    }
+
+    /// Generate one pairing code using cryptographically secure randomness.
+    ///
+    /// Each character is drawn by rejection sampling so every symbol in the
+    /// alphabet is equally likely — a plain `%` would bias the low symbols
+    /// for any alphabet size that does not divide `u32::MAX + 1`.
+    pub fn generate(&self) -> String {
+        let alphabet = self.charset.alphabet();
+        let n = alphabet.len() as u32;
+        // Largest multiple of `n` that fits in u32; draws at or above it are
+        // rejected to keep the modulo unbiased.
+        let reject_threshold = (u32::MAX / n) * n;
+
+        let length = self.effective_length();
+        let mut code = String::with_capacity(length);
+        for _ in 0..length {
+            loop {
+                let raw: u32 = rand::random();
+                if raw < reject_threshold {
+                    code.push(alphabet[(raw % n) as usize] as char);
+                    break;
+                }
+            }
+        }
+        code
+    }
+}
 
 /// Per-client failed attempt state with optional absolute lockout deadline.
 #[derive(Debug, Clone, Copy)]
@@ -43,10 +258,21 @@ pub struct PairingGuard {
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
+    /// The shared policy every code this guard issues is drawn from.
+    code_policy: PairingCodePolicy,
 }
 
 impl PairingGuard {
-    pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
+    /// Build a guard that issues codes under `code_policy`.
+    ///
+    /// The policy is a required argument rather than a defaulted one so that
+    /// every construction site — production wiring and tests alike — states
+    /// which pairing-code strength it means.
+    pub fn new(
+        require_pairing: bool,
+        existing_tokens: &[String],
+        code_policy: PairingCodePolicy,
+    ) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
             .map(|t| {
@@ -58,7 +284,7 @@ impl PairingGuard {
             })
             .collect();
         let code = if require_pairing && tokens.is_empty() {
-            Some(generate_code())
+            Some(code_policy.generate())
         } else {
             None
         };
@@ -67,7 +293,13 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
+            code_policy,
         }
+    }
+
+    /// The pairing-code policy in force for this guard.
+    pub fn code_policy(&self) -> PairingCodePolicy {
+        self.code_policy
     }
 
     /// The one-time pairing code (generated only on first startup when no tokens exist).
@@ -229,7 +461,7 @@ impl PairingGuard {
         if !self.require_pairing {
             return None;
         }
-        let new_code = generate_code();
+        let new_code = self.code_policy.generate();
         *self.pairing_code.lock() = Some(new_code.clone());
         Some(new_code)
     }
@@ -242,7 +474,7 @@ impl PairingGuard {
         if slot.is_some() {
             return Err(GeneratePairingCodeError::Pending);
         }
-        let new_code = generate_code();
+        let new_code = self.code_policy.generate();
         *slot = Some(new_code.clone());
         Ok(new_code)
     }
@@ -278,22 +510,6 @@ fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Ins
     map.retain(|_, state| {
         now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
     });
-}
-
-/// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
-fn generate_code() -> String {
-    const UPPER_BOUND: u32 = 1_000_000;
-    const REJECT_THRESHOLD: u32 = (u32::MAX / UPPER_BOUND) * UPPER_BOUND;
-
-    loop {
-        let uuid = uuid::Uuid::new_v4();
-        let bytes = uuid.as_bytes();
-        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-
-        if raw < REJECT_THRESHOLD {
-            return format!("{:06}", raw % UPPER_BOUND);
-        }
-    }
 }
 
 fn generate_token() -> String {
@@ -347,31 +563,41 @@ mod tests {
     use super::*;
     use tokio::test;
 
+    /// A guard under the shipped default policy. Behaviour tests that are
+    /// not about code shape use this so the default stays exercised.
+    fn new_guard(require_pairing: bool, existing_tokens: &[String]) -> PairingGuard {
+        PairingGuard::new(
+            require_pairing,
+            existing_tokens,
+            PairingCodePolicy::default(),
+        )
+    }
+
     // ── PairingGuard ─────────────────────────────────────────
 
     #[test]
     async fn new_guard_generates_code_when_no_tokens() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert!(guard.pairing_code().is_some());
         assert!(!guard.is_paired());
     }
 
     #[test]
     async fn new_guard_no_code_when_tokens_exist() {
-        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        let guard = new_guard(true, &["zc_existing".into()]);
         assert!(guard.pairing_code().is_none());
         assert!(guard.is_paired());
     }
 
     #[test]
     async fn new_guard_no_code_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = new_guard(false, &[]);
         assert!(guard.pairing_code().is_none());
     }
 
     #[test]
     async fn try_pair_correct_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "test_client").await.unwrap();
         assert!(token.is_some());
@@ -381,7 +607,7 @@ mod tests {
 
     #[test]
     async fn try_pair_wrong_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let result = guard.try_pair("000000", "test_client").await.unwrap();
         // Might succeed if code happens to be 000000, but extremely unlikely
         // Just check it returns Ok(None) normally
@@ -390,14 +616,14 @@ mod tests {
 
     #[test]
     async fn try_pair_empty_code() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert!(guard.try_pair("", "test_client").await.unwrap().is_none());
     }
 
     #[test]
     async fn is_authenticated_with_valid_token() {
         // Pass plaintext token — PairingGuard hashes it on load
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = new_guard(true, &["zc_valid".into()]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
@@ -405,26 +631,26 @@ mod tests {
     async fn is_authenticated_with_prehashed_token() {
         // Pass an already-hashed token (64 hex chars)
         let hashed = hash_token("zc_valid");
-        let guard = PairingGuard::new(true, &[hashed]);
+        let guard = new_guard(true, &[hashed]);
         assert!(guard.is_authenticated("zc_valid"));
     }
 
     #[test]
     async fn is_authenticated_with_invalid_token() {
-        let guard = PairingGuard::new(true, &["zc_valid".into()]);
+        let guard = new_guard(true, &["zc_valid".into()]);
         assert!(!guard.is_authenticated("zc_invalid"));
     }
 
     #[test]
     async fn is_authenticated_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = new_guard(false, &[]);
         assert!(guard.is_authenticated("anything"));
         assert!(guard.is_authenticated(""));
     }
 
     #[test]
     async fn tokens_returns_hashes() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let tokens = guard.tokens();
         assert_eq!(tokens.len(), 2);
         // Tokens should be stored as 64-char hex hashes, not plaintext
@@ -437,7 +663,7 @@ mod tests {
 
     #[test]
     async fn pair_then_authenticate() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -507,26 +733,236 @@ mod tests {
         assert!(!constant_time_eq("a", ""));
     }
 
-    // ── generate helpers ─────────────────────────────────────
+    // ── Pairing-code policy: default shape ───────────────────
 
+    /// #6613 acceptance criterion: the default is chosen deliberately and is
+    /// materially stronger than the six-digit numeric code master shipped.
     #[test]
-    async fn generate_code_is_6_digits() {
-        let code = generate_code();
-        assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
+    async fn default_policy_is_32_char_case_sensitive_alphanumeric() {
+        let policy = PairingCodePolicy::default();
+        assert_eq!(policy.length, 32, "default length");
+        assert_eq!(
+            policy.charset,
+            PairingCodeCharset::Alphanumeric,
+            "default charset"
+        );
+        assert_eq!(
+            policy.charset.alphabet().len(),
+            62,
+            "case-sensitive 0-9A-Za-z"
+        );
+        assert!(
+            policy.entropy_bits() > 190.0,
+            "default must clear 190 bits, got {}",
+            policy.entropy_bits()
+        );
+    }
+
+    /// The old-vs-new discriminator: a default code is no longer something
+    /// the pre-#6613 generator could ever have produced.
+    #[test]
+    async fn default_generated_code_is_not_a_six_digit_numeric_code() {
+        let policy = PairingCodePolicy::default();
+        // One sample settles the length; the charset claim needs a few
+        // draws because an all-digit 32-char code is possible in principle
+        // (p ≈ (10/62)^32 ≈ 10^-25) but not across 8 independent samples.
+        let mut saw_non_digit = false;
+        for _ in 0..8 {
+            let code = policy.generate();
+            assert_eq!(code.len(), 32, "default code length");
+            assert!(
+                code.len() > 6,
+                "default code must be longer than the old six-digit code"
+            );
+            if code.chars().any(|c| !c.is_ascii_digit()) {
+                saw_non_digit = true;
+            }
+        }
+        assert!(
+            saw_non_digit,
+            "default codes must draw from letters as well as digits"
+        );
+    }
+
+    /// The default alphabet really is case-sensitive: both cases and digits
+    /// all appear across a sample. Guards against silently upper-casing the
+    /// alphabet and quartering the keyspace.
+    #[test]
+    async fn default_charset_uses_digits_and_both_letter_cases() {
+        let policy = PairingCodePolicy::default();
+        let sample: String = (0..16).map(|_| policy.generate()).collect();
+        assert!(sample.chars().any(|c| c.is_ascii_digit()), "digits");
+        assert!(sample.chars().any(|c| c.is_ascii_uppercase()), "uppercase");
+        assert!(sample.chars().any(|c| c.is_ascii_lowercase()), "lowercase");
+    }
+
+    // ── Pairing-code policy: configured shapes ───────────────
+
+    /// Numeric compatibility mode reproduces the pre-#6613 code exactly.
+    #[test]
+    async fn numeric_compat_policy_reproduces_six_digit_numeric_code() {
+        let policy = PairingCodePolicy::numeric_compat();
+        assert_eq!(policy.length, 6);
+        assert_eq!(policy.charset, PairingCodeCharset::Numeric);
+        for _ in 0..16 {
+            let code = policy.generate();
+            assert_eq!(code.len(), 6, "compat code length");
+            assert!(
+                code.chars().all(|c| c.is_ascii_digit()),
+                "compat code must be all digits, got {code}"
+            );
+        }
     }
 
     #[test]
-    async fn generate_code_is_not_deterministic() {
-        // Two codes should differ with overwhelming probability. We try
-        // multiple pairs so a single 1-in-10^6 collision doesn't cause
-        // a flaky CI failure. All 10 pairs colliding is ~1-in-10^60.
+    async fn custom_length_and_charset_are_honoured() {
+        let policy = PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous)
+            .expect("20 is inside the supported range");
+        let code = policy.generate();
+        assert_eq!(code.len(), 20);
+        assert!(
+            code.bytes().all(|b| UNAMBIGUOUS_ALPHABET.contains(&b)),
+            "code {code} must stay inside the unambiguous alphabet"
+        );
+    }
+
+    /// The unambiguous family exists to be read aloud, so the confusable
+    /// glyphs must be absent by construction, not by luck.
+    #[test]
+    async fn unambiguous_charset_excludes_confusable_glyphs() {
+        let alphabet = PairingCodeCharset::Unambiguous.alphabet();
+        assert_eq!(alphabet.len(), 32, "Crockford Base32 is 32 symbols");
+        for confusable in [b'I', b'L', b'O', b'U', b'l', b'o'] {
+            assert!(
+                !alphabet.contains(&confusable),
+                "{} must not appear in the unambiguous alphabet",
+                confusable as char
+            );
+        }
+    }
+
+    #[test]
+    async fn entropy_bits_tracks_length_and_charset() {
+        let numeric = PairingCodePolicy::numeric_compat();
+        // The pre-#6613 code: log2(10^6) ≈ 19.93 bits.
+        assert!(
+            (numeric.entropy_bits() - 19.93).abs() < 0.01,
+            "six numeric digits ≈ 19.93 bits, got {}",
+            numeric.entropy_bits()
+        );
+        let unambiguous = PairingCodePolicy::new(24, PairingCodeCharset::Unambiguous).unwrap();
+        assert!(
+            (unambiguous.entropy_bits() - 120.0).abs() < 0.01,
+            "24 Crockford chars = 120 bits, got {}",
+            unambiguous.entropy_bits()
+        );
+        assert!(
+            PairingCodePolicy::default().entropy_bits() > numeric.entropy_bits(),
+            "the default must beat the code it replaces"
+        );
+    }
+
+    // ── Pairing-code policy: invalid settings ────────────────
+
+    #[test]
+    async fn policy_rejects_length_below_minimum() {
+        let err = PairingCodePolicy::new(5, PairingCodeCharset::Numeric)
+            .expect_err("5 is below the floor");
+        assert_eq!(err, PairingCodePolicyError::TooShort { length: 5 });
+        // The floor is the old shipped length: no config may be weaker.
+        assert_eq!(PAIRING_CODE_MIN_LENGTH, 6);
+        assert!(
+            PairingCodePolicy::new(PAIRING_CODE_MIN_LENGTH, PairingCodeCharset::Numeric).is_ok()
+        );
+    }
+
+    #[test]
+    async fn policy_rejects_length_above_maximum() {
+        let too_long = PAIRING_CODE_MAX_LENGTH + 1;
+        let err = PairingCodePolicy::new(too_long, PairingCodeCharset::Alphanumeric)
+            .expect_err("above the ceiling");
+        assert_eq!(err, PairingCodePolicyError::TooLong { length: too_long });
+        assert!(
+            PairingCodePolicy::new(PAIRING_CODE_MAX_LENGTH, PairingCodeCharset::Alphanumeric)
+                .is_ok(),
+            "the documented ceiling itself must be accepted"
+        );
+    }
+
+    /// An out-of-range policy built by other means must still produce a
+    /// usable code rather than panicking or returning an empty string.
+    #[test]
+    async fn generate_clamps_an_out_of_range_length() {
+        let degenerate = PairingCodePolicy {
+            length: 0,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(degenerate.generate().len(), PAIRING_CODE_MIN_LENGTH);
+        let oversized = PairingCodePolicy {
+            length: usize::MAX,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(oversized.generate().len(), PAIRING_CODE_MAX_LENGTH);
+    }
+
+    #[test]
+    async fn charset_round_trips_through_toml_and_rejects_unknown_families() {
+        for (text, expected) in [
+            ("numeric", PairingCodeCharset::Numeric),
+            ("alphanumeric", PairingCodeCharset::Alphanumeric),
+            ("unambiguous", PairingCodeCharset::Unambiguous),
+        ] {
+            let parsed: PairingCodePolicy =
+                toml::from_str(&format!("length = 8\ncharset = \"{text}\"\n"))
+                    .expect("documented charset name parses");
+            assert_eq!(parsed.charset, expected, "charset {text}");
+        }
+        assert!(
+            toml::from_str::<PairingCodePolicy>("length = 8\ncharset = \"hex\"\n").is_err(),
+            "an unknown charset family must be rejected, not silently defaulted"
+        );
+    }
+
+    #[test]
+    async fn policy_omitting_fields_falls_back_to_the_shared_default() {
+        let parsed: PairingCodePolicy = toml::from_str("").expect("empty section parses");
+        assert_eq!(parsed, PairingCodePolicy::default());
+    }
+
+    // ── generate helpers ─────────────────────────────────────
+
+    #[test]
+    async fn generated_codes_are_not_deterministic() {
+        // Two codes should differ with overwhelming probability. Tried over
+        // several pairs so one unlucky draw cannot flake CI. Uses the
+        // narrowest supported keyspace (6 numeric digits) — if that is
+        // non-deterministic, every wider policy is too.
+        let policy = PairingCodePolicy::numeric_compat();
         for _ in 0..10 {
-            if generate_code() != generate_code() {
+            if policy.generate() != policy.generate() {
                 return; // Pass: found a non-matching pair.
             }
         }
         panic!("Generated 10 pairs of codes and all were collisions — CSPRNG failure");
+    }
+
+    /// Rejection sampling must not skew the alphabet. Over a large sample of
+    /// the smallest alphabet, every symbol should appear and no symbol
+    /// should dominate.
+    #[test]
+    async fn generation_covers_the_whole_alphabet_without_gross_bias() {
+        let policy = PairingCodePolicy::new(64, PairingCodeCharset::Numeric).unwrap();
+        let sample: String = (0..100).map(|_| policy.generate()).collect();
+        let total = sample.len() as f64;
+        for symbol in NUMERIC_ALPHABET {
+            let hits = sample.bytes().filter(|b| b == symbol).count() as f64;
+            let share = hits / total;
+            assert!(
+                (0.06..0.14).contains(&share),
+                "symbol {} took {share:.3} of a uniform-0.1 sample — biased draw",
+                *symbol as char
+            );
+        }
     }
 
     #[test]
@@ -549,7 +985,7 @@ mod tests {
 
     #[test]
     async fn brute_force_lockout_after_max_attempts() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let client = "attacker_client";
         // Exhaust all attempts with wrong codes
         for i in 0..MAX_PAIR_ATTEMPTS {
@@ -572,7 +1008,7 @@ mod tests {
 
     #[test]
     async fn correct_code_resets_failed_attempts() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let client = "test_client";
         // Fail a few times
@@ -586,7 +1022,7 @@ mod tests {
 
     #[test]
     async fn lockout_returns_remaining_seconds() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let client = "test_client";
         for _ in 0..MAX_PAIR_ATTEMPTS {
             let _ = guard.try_pair("wrong", client).await;
@@ -601,7 +1037,7 @@ mod tests {
 
     #[test]
     async fn successful_pair_resets_only_requesting_client_state() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let client_a = "client_a";
         let client_b = "client_b";
@@ -635,7 +1071,7 @@ mod tests {
 
     #[test]
     async fn failed_attempt_state_is_bounded_by_max_clients() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
 
         // Fill the map to MAX_TRACKED_CLIENTS with stale entries
         {
@@ -675,7 +1111,7 @@ mod tests {
 
     #[test]
     async fn failed_attempt_sweep_prunes_expired_clients() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
 
         // Seed a stale entry and set last_sweep to long ago so sweep triggers
         {
@@ -717,7 +1153,7 @@ mod tests {
 
     #[test]
     async fn lockout_is_per_client() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let attacker = "attacker_ip";
         let legitimate = "legitimate_ip";
 
@@ -740,7 +1176,7 @@ mod tests {
 
     #[test]
     async fn revoked_token_no_longer_authenticates() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -752,7 +1188,7 @@ mod tests {
 
     #[test]
     async fn revoked_token_is_dropped_from_persistence_view() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let code = guard.pairing_code().unwrap().to_string();
         let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
         let expected_hash = hash_token(&token);
@@ -764,7 +1200,7 @@ mod tests {
 
     #[test]
     async fn revoke_token_hash_matches_revoke_token() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let hash_a = hash_token("zc_a");
         assert!(guard.revoke_token_hash(&hash_a));
         assert!(!guard.is_authenticated("zc_a"));
@@ -773,14 +1209,14 @@ mod tests {
 
     #[test]
     async fn revoke_unknown_token_is_noop() {
-        let guard = PairingGuard::new(true, &["zc_a".into()]);
+        let guard = new_guard(true, &["zc_a".into()]);
         assert!(!guard.revoke_token("zc_never_paired"));
         assert!(guard.is_authenticated("zc_a"));
     }
 
     #[test]
     async fn revoke_is_scoped_to_target_token() {
-        let guard = PairingGuard::new(true, &["zc_keep".into(), "zc_drop".into()]);
+        let guard = new_guard(true, &["zc_keep".into(), "zc_drop".into()]);
         assert!(guard.revoke_token("zc_drop"));
         assert!(guard.is_authenticated("zc_keep"));
         assert!(!guard.is_authenticated("zc_drop"));
@@ -788,7 +1224,7 @@ mod tests {
 
     #[test]
     async fn revoke_all_tokens_invalidates_every_token() {
-        let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
+        let guard = new_guard(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
         assert_eq!(guard.revoke_all_tokens(), 3);
         assert!(!guard.is_authenticated("zc_a"));
         assert!(!guard.is_authenticated("zc_b"));
@@ -799,7 +1235,7 @@ mod tests {
 
     #[test]
     async fn revoke_all_tokens_on_empty_set_returns_zero() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         assert_eq!(guard.revoke_all_tokens(), 0);
     }
 
@@ -807,7 +1243,7 @@ mod tests {
 
     #[test]
     async fn generate_pairing_code_if_vacant_succeeds_when_slot_empty() {
-        let guard = PairingGuard::new(true, &["zc_existing".into()]);
+        let guard = new_guard(true, &["zc_existing".into()]);
         // `new()` does not issue a code once paired; slot is empty here.
         assert!(guard.pairing_code().is_none());
         let code = guard.generate_pairing_code_if_vacant().unwrap();
@@ -816,7 +1252,7 @@ mod tests {
 
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_slot_occupied() {
-        let guard = PairingGuard::new(true, &[]);
+        let guard = new_guard(true, &[]);
         let pre_existing = guard.pairing_code().expect("startup code");
         let err = guard.generate_pairing_code_if_vacant().unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::Pending);
@@ -829,8 +1265,113 @@ mod tests {
 
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_pairing_disabled() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = new_guard(false, &[]);
         let err = guard.generate_pairing_code_if_vacant().unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
+    }
+
+    // ── One shared policy across every issuing path ──────────
+
+    fn assert_matches_policy(code: &str, policy: PairingCodePolicy) {
+        assert_eq!(
+            code.len(),
+            policy.length,
+            "code {code} has the wrong length"
+        );
+        let alphabet = policy.charset.alphabet();
+        assert!(
+            code.bytes().all(|b| alphabet.contains(&b)),
+            "code {code} strayed outside the configured alphabet"
+        );
+    }
+
+    /// #6613: startup pairing, on-demand regeneration, and the atomic
+    /// dashboard/API issue path must all draw from the same policy. A
+    /// non-default shape is used so a hardcoded generator cannot pass.
+    #[test]
+    async fn every_issuing_path_uses_the_configured_policy() {
+        let policy = PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous).unwrap();
+
+        // 1. Startup code (`PairingGuard::new` with no existing tokens).
+        let guard = PairingGuard::new(true, &[], policy);
+        assert_eq!(guard.code_policy(), policy);
+        let startup = guard.pairing_code().expect("startup code is issued");
+        assert_matches_policy(&startup, policy);
+
+        // 2. On-demand regeneration (`gateway get-paircode --new`,
+        //    `POST /api/pairing/initiate`).
+        let regenerated = guard
+            .generate_new_pairing_code()
+            .expect("regeneration is allowed when pairing is required");
+        assert_matches_policy(&regenerated, policy);
+        assert_ne!(startup, regenerated, "regeneration must issue a fresh code");
+
+        // 3. Atomic issue-if-vacant (rotate-device flow).
+        let paired = PairingGuard::new(true, &["zc_existing".into()], policy);
+        let vacant = paired
+            .generate_pairing_code_if_vacant()
+            .expect("slot is empty once paired");
+        assert_matches_policy(&vacant, policy);
+    }
+
+    /// A guard configured for numeric compatibility keeps issuing exactly
+    /// the pre-#6613 shape, so the old flow is preserved, not merely
+    /// tolerated.
+    #[test]
+    async fn numeric_compat_guard_still_issues_six_digit_codes() {
+        let policy = PairingCodePolicy::numeric_compat();
+        let guard = PairingGuard::new(true, &[], policy);
+        let code = guard.pairing_code().expect("startup code");
+        assert_matches_policy(&code, policy);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// #6613 acceptance criterion: a successful pair using the configured
+    /// code shape. Exercised for every charset family so none of them
+    /// breaks the constant-time comparison or the trim on submit.
+    #[test]
+    async fn pairing_succeeds_with_every_configured_code_shape() {
+        for policy in [
+            PairingCodePolicy::default(),
+            PairingCodePolicy::numeric_compat(),
+            PairingCodePolicy::new(20, PairingCodeCharset::Unambiguous).unwrap(),
+            PairingCodePolicy::new(PAIRING_CODE_MAX_LENGTH, PairingCodeCharset::Alphanumeric)
+                .unwrap(),
+        ] {
+            let guard = PairingGuard::new(true, &[], policy);
+            let code = guard.pairing_code().expect("startup code");
+            assert_matches_policy(&code, policy);
+
+            let token = guard
+                .try_pair(&code, "client")
+                .await
+                .expect("not locked out")
+                .unwrap_or_else(|| panic!("code of shape {policy:?} should pair"));
+            assert!(guard.is_authenticated(&token));
+            // One-time consumption survives the longer code.
+            assert!(guard.pairing_code().is_none(), "code must be consumed");
+            assert!(
+                guard.try_pair(&code, "client").await.expect("ok").is_none(),
+                "a consumed code must not pair a second time"
+            );
+        }
+    }
+
+    /// A code from one policy must not pair a guard running another. Cheap
+    /// regression net against a generator that ignores its policy.
+    #[test]
+    async fn a_code_from_a_different_policy_does_not_pair() {
+        let weak = PairingGuard::new(true, &[], PairingCodePolicy::numeric_compat());
+        let strong = PairingGuard::new(true, &[], PairingCodePolicy::default());
+        let weak_code = weak.pairing_code().expect("startup code");
+        assert!(
+            strong
+                .try_pair(&weak_code, "client")
+                .await
+                .expect("not locked out")
+                .is_none(),
+            "a six-digit code must not open a 32-char guard"
+        );
+        assert!(!strong.is_paired());
     }
 }

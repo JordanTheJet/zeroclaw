@@ -79,7 +79,11 @@ fn test_state(config: Config) -> AppState {
             ),
         ),
         auto_save: false,
-        pairing: Arc::new(PairingGuard::new(false, &[])),
+        pairing: Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100)),
         auth_limiter: Arc::new(gateway::auth_rate_limit::AuthRateLimiter::new()),
