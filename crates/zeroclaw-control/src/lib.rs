@@ -22,6 +22,7 @@ pub mod genesis;
 mod guard;
 mod inventory;
 pub mod keys;
+pub mod meta_authority;
 pub mod operator;
 mod preview;
 mod principal;
@@ -53,6 +54,9 @@ pub use inventory::{
     CapabilityRestrictedProviderFactory, CurrentProviderFactory, IsolatedProvider, MemoryChoice,
     ProviderError, ProviderErrorCode, ProviderPickerInventory, ProviderTarget, RiskChoice,
     RuntimeChoice, SafeInventory, eligible_provider_refs,
+};
+pub use meta_authority::{
+    AuthorityTier, ConfirmationTier, ControlOperation, RequiredQuorum, required_quorum,
 };
 pub use operator::{
     OperatorAuthentication, OperatorError, OperatorErrorCode, OperatorIdentity, OperatorOrigin,
