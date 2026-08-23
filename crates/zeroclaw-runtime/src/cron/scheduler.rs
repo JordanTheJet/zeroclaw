@@ -137,7 +137,7 @@ pub struct CronDeliveryOutcome {
 /// pre_hook", and an ordinary job failure distinguishable in run history
 /// instead of collapsing into one boolean.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CronRunOutcome {
+pub(crate) enum CronRunOutcome {
     /// The gate (if any) passed and the job body ran. `success` is the body's
     /// own result.
     Executed { success: bool, output: String },
@@ -157,7 +157,7 @@ impl CronRunOutcome {
     /// `true` unless the run actually failed. A clean precondition skip counts
     /// as a success: the gate did exactly what it was asked to do.
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         match self {
             Self::Executed { success, .. } => *success,
             Self::SkippedByPrecondition { .. } => true,
@@ -167,22 +167,13 @@ impl CronRunOutcome {
 
     /// `true` when the job body ran; `false` when the gate short-circuited it.
     #[must_use]
-    pub fn ran_body(&self) -> bool {
+    pub(crate) fn ran_body(&self) -> bool {
         matches!(self, Self::Executed { .. })
-    }
-
-    #[must_use]
-    pub fn output(&self) -> &str {
-        match self {
-            Self::Executed { output, .. }
-            | Self::SkippedByPrecondition { output }
-            | Self::PreconditionFailed { output } => output,
-        }
     }
 
     /// Run-history status before delivery classification adjusts it.
     #[must_use]
-    pub fn base_status(&self) -> &'static str {
+    pub(crate) fn base_status(&self) -> &'static str {
         match self {
             Self::Executed { success: true, .. } => "ok",
             Self::Executed { success: false, .. } => "error",
@@ -208,7 +199,7 @@ struct ScheduledRunReport {
     output: String,
 }
 
-pub async fn deliver_and_classify_run_result(
+pub(crate) async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
     outcome: CronRunOutcome,
@@ -295,6 +286,57 @@ pub async fn deliver_and_classify_run_result(
     }
 }
 
+/// Status recorded when a manual trigger is refused because the job already
+/// has an in-flight claim.
+pub const STATUS_ALREADY_IN_FLIGHT: &str = "already_in_flight";
+
+/// Holds a cron job's in-flight claim for one run and releases it on every
+/// exit path, including an early return, a panic, or a dropped future.
+///
+/// The scheduled path releases explicitly after `persist_job_result`. The
+/// manual path has more exit points than an explicit release can cover, so it
+/// uses this guard instead: construct it only after a successful claim, and
+/// never before, or a refused trigger would release the claim its competitor
+/// is holding.
+struct ClaimGuard<'a> {
+    config: &'a Config,
+    job_id: &'a str,
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = release_job(self.config, self.job_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": self.job_id, "error": format!("{}", e)})
+                    ),
+                "manual cron trigger: failed to release in-flight lock"
+            );
+        }
+    }
+}
+
+/// Build the result returned when a manual trigger never started a run.
+fn manual_refusal(
+    job: &CronJob,
+    at: DateTime<Utc>,
+    status: &str,
+    output: String,
+) -> ManualCronRunResult {
+    ManualCronRunResult {
+        job_id: job.id.clone(),
+        success: false,
+        status: status.to_string(),
+        output,
+        duration_ms: 0,
+        started_at: at,
+        finished_at: at,
+    }
+}
+
 pub async fn run_manual_job(
     config: &Config,
     job: &CronJob,
@@ -324,6 +366,61 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
+
+    // Claim before the precondition, not just before the body: the claim is
+    // the single owner of an execution window, gate included. Without it a due
+    // scheduled run and a manual trigger could both pass the same gate and run
+    // the body concurrently, which is exactly the non-determinism the gate
+    // exists to remove.
+    match claim_job(config, &job.id, started_at) {
+        Ok(true) => {}
+        // The row is locked by another run, or it is gone (a one-shot deleted
+        // between the caller's lookup and here). Either way there is no window
+        // to own, so refuse instead of starting a second one.
+        Ok(false) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"job_id": job.id})),
+                "manual cron trigger refused: job already in flight"
+            );
+            return manual_refusal(
+                job,
+                started_at,
+                STATUS_ALREADY_IN_FLIGHT,
+                format!(
+                    "cron job {id:?} is already in flight; manual trigger refused",
+                    id = job.id
+                ),
+            );
+        }
+        // Fail closed: if the claim cannot be recorded, exclusivity cannot be
+        // proven, so do not run.
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "manual cron trigger refused: failed to claim in-flight lock"
+            );
+            return manual_refusal(
+                job,
+                started_at,
+                "error",
+                format!(
+                    "failed to claim cron job {id:?} for a manual run: {e}",
+                    id = job.id
+                ),
+            );
+        }
+    }
+    // Every path below this point releases the claim when `_claim` drops.
+    let _claim = ClaimGuard {
+        config,
+        job_id: &job.id,
+    };
+
     let run = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -351,6 +448,10 @@ async fn run_manual_job_inner(
         let _ = tx.send(serde_json::json!({
             "type": "cron_result",
             "job_id": job.id,
+            // `status` is what distinguishes a precondition skip (which is
+            // deliberately `success: true`) from an ordinary successful run.
+            // The scheduled broadcast carries it too; both must agree.
+            "status": outcome.status,
             "success": outcome.success,
             "output": &outcome.output,
             "manual": true,
@@ -619,10 +720,6 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
         ),
         "Scheduler startup skip: advanced overdue jobs without executing",
     );
-}
-
-pub async fn execute_job_now(config: &Config, job: &CronJob) -> CronRunOutcome {
-    execute_job_now_with_runtime(config, job, None, false).await
 }
 
 async fn execute_job_now_with_runtime(
@@ -2314,7 +2411,7 @@ mod tests {
             false,
         ))
         .await;
-        let (success, output) = (outcome.is_success(), outcome.output().to_string());
+        let (success, output) = (outcome.is_success(), outcome.into_output());
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -2339,7 +2436,7 @@ mod tests {
             false,
         ))
         .await;
-        let (success, output) = (outcome.is_success(), outcome.output().to_string());
+        let (success, output) = (outcome.is_success(), outcome.into_output());
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -3752,11 +3849,11 @@ mod tests {
         job.id = "shared-id".into();
         job.source = "imperative".into();
 
-        let outcome = execute_job_now(&config, &job).await;
+        let outcome = execute_job_now_with_runtime(&config, &job, None, false).await;
 
         assert!(outcome.ran_body(), "imperative job should not be gated");
         assert!(outcome.is_success());
-        assert!(outcome.output().contains("imperative-body-ran"));
+        assert!(outcome.into_output().contains("imperative-body-ran"));
     }
 
     #[tokio::test]
@@ -3833,6 +3930,186 @@ mod tests {
         // The delivery error is appended, but the cause of death stays the gate.
         assert_eq!(outcome.status, STATUS_PRECONDITION_FAILED);
         assert!(outcome.output.contains("delivery failed"));
+    }
+
+    // ── Manual-run ownership: the claim must cover the gate too ──────
+
+    #[tokio::test]
+    async fn manual_run_is_refused_while_the_scheduler_holds_the_claim() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "claimed-job", "exit 0", 30);
+
+        // Stand in for a due scheduled run that already claimed the row.
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        assert!(!result.success);
+        assert_eq!(result.status, STATUS_ALREADY_IN_FLIGHT);
+        assert!(
+            !body_ran(&result),
+            "a refused trigger must not run the body"
+        );
+
+        // A refusal is not a run: it writes no history and leaves the other
+        // owner's claim intact.
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert!(
+            runs.is_empty(),
+            "a refused manual trigger must not record a run"
+        );
+        assert!(
+            !cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the refused trigger must not have released the scheduler's claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_run_releases_its_claim_so_the_next_run_can_take_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "release-job", "exit 0", 30);
+
+        let first = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        assert_eq!(first.status, "ok");
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the claim must be released once the manual run finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_run_releases_its_claim_even_when_the_gate_refuses_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        // The gate skips, so the run returns early — the guard still releases.
+        let job = declarative_gated_job(&mut config, "skip-release", "exit 10", 30);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        assert_eq!(result.status, STATUS_SKIPPED_PRECONDITION);
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "an early gate return must not strand the claim"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn two_concurrent_manual_runs_cannot_both_execute() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["exit".into(), "sleep".into()];
+
+        use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl, CronScheduleDecl};
+        config.cron.insert(
+            "race-job".to_string(),
+            CronJobDecl {
+                job_type: "shell".into(),
+                schedule: CronScheduleDecl::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                // A body slow enough that the second trigger is still inside
+                // the first one's claim window.
+                command: Some("sleep 2".into()),
+                pre_hook: Some(CronPreHookDecl {
+                    command: "exit 0".into(),
+                    timeout_secs: 30,
+                }),
+                ..CronJobDecl::default()
+            },
+        );
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("test agent exists")
+            .cron_jobs
+            .push("race-job".to_string());
+        let decls = config.cron.clone();
+        cron::sync_declarative_jobs(&config, &decls).expect("declarative sync should succeed");
+        let job = cron::get_job(&config, "race-job").expect("synced job should be readable");
+
+        let (first, second) = tokio::join!(
+            run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None),
+            async {
+                // Let the first trigger take the claim before the second asks.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &None).await
+            }
+        );
+
+        assert_eq!(
+            first.status, "ok",
+            "the first trigger should own the window"
+        );
+        assert_eq!(
+            second.status, STATUS_ALREADY_IN_FLIGHT,
+            "the second trigger must be refused, not run in parallel"
+        );
+
+        // Exactly one execution reached history.
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(
+            runs.len(),
+            1,
+            "only one of the two triggers may record a run"
+        );
+    }
+
+    // ── Manual broadcast carries the outcome status ──────────────────
+
+    #[tokio::test]
+    async fn manual_broadcast_carries_the_precondition_skip_status() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "skip-broadcast", "exit 10", 30);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+
+        let result =
+            run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &Some(tx)).await;
+        assert_eq!(result.status, STATUS_SKIPPED_PRECONDITION);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("manual trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["manual"], true);
+        // A skip is deliberately `success: true`, so without `status` an SSE
+        // consumer could not tell it from an ordinary successful run.
+        assert_eq!(event["success"], true);
+        assert_eq!(event["status"], STATUS_SKIPPED_PRECONDITION);
+    }
+
+    #[tokio::test]
+    async fn manual_broadcast_carries_the_precondition_failure_status() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "fail-broadcast", "exit 3", 30);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+
+        let result =
+            run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &Some(tx)).await;
+        assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("manual trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["success"], false);
+        assert_eq!(event["status"], STATUS_PRECONDITION_FAILED);
     }
 
     #[test]
