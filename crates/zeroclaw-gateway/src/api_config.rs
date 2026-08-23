@@ -261,6 +261,56 @@ fn scoped_validate(
     Ok(Vec::new())
 }
 
+/// Put the pre-write disk state back after `save_dirty` failed.
+///
+/// `save_dirty` takes the cross-process config write lock and releases it
+/// before it returns, so by the time the caller sees the error the lock is
+/// free. Re-acquire it here rather than writing unlocked: an unlocked
+/// rollback can land inside another writer's compare-then-rename section and
+/// revert a revision it never looked at — the same lost-update window this
+/// lock exists to close.
+///
+/// Lock ordering: the caller holds the in-process `state.config_write_lock`
+/// witness across this call, so the order is mutex first, then flock. That
+/// matches every other gateway config write, and nothing in the tree takes
+/// the mutex while holding the flock, so the ordering cannot invert.
+///
+/// The restore itself stays a plain write rather than going through the
+/// atomic replacement helper: that helper refreshes `config.toml.bak` from
+/// the current file, which on a rollback would overwrite the operator's
+/// backup with post-failure state. Best-effort as before — a rollback failure
+/// must not mask the save error the caller is about to return.
+async fn restore_config_snapshot(config_path: &std::path::Path, snapshot: Option<Vec<u8>>) {
+    let write_lock = match zeroclaw_config::schema::acquire_config_write_lock(config_path).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": config_path.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "could not take the config write lock to roll back a failed save; \
+                 leaving the file as the failed save left it"
+            );
+            return;
+        }
+    };
+    match snapshot {
+        Some(prev) => {
+            let _ = tokio::fs::write(config_path, prev).await;
+        }
+        None => {
+            if config_path.exists() {
+                let _ = tokio::fs::remove_file(config_path).await;
+            }
+        }
+    }
+    drop(write_lock);
+}
+
 /// Save `new_config` to disk, then install it as the live config.
 ///
 /// `_guard` is never read — it is a witness reminding the caller to
@@ -292,11 +342,7 @@ async fn persist_and_swap(
     };
 
     if let Err(e) = new_config.save_dirty().await {
-        if let Some(prev) = snapshot {
-            let _ = tokio::fs::write(&config_path, prev).await;
-        } else if config_path.exists() {
-            let _ = tokio::fs::remove_file(&config_path).await;
-        }
+        restore_config_snapshot(&config_path, snapshot).await;
         return Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
@@ -1984,6 +2030,28 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
     // can't interleave their read-migrate-swap sections.
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let config_path = state.config.read().config_path.clone();
+
+    // The in-process witness above only excludes other tasks in this daemon.
+    // Take the cross-process config write lock too, so a CLI `zeroclaw config
+    // set` or `config migrate` in another process cannot commit between the
+    // read below and the rename further down and have its revision discarded
+    // by the migrated bytes. Held for the rest of this handler.
+    //
+    // Lock ordering is mutex first, then flock — the same order every other
+    // gateway config write uses (`persist_and_swap` callers take the witness
+    // at handler entry and reach the flock inside `save_dirty`). Nothing in
+    // the tree acquires the witness while holding the flock, so the ordering
+    // cannot invert.
+    let _config_flock = match zeroclaw_config::schema::acquire_config_write_lock(&config_path).await
+    {
+        Ok(lock) => lock,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to acquire the config write lock: {e}"),
+            ));
+        }
+    };
 
     let raw = match tokio::fs::read_to_string(&config_path).await {
         Ok(s) => s,
@@ -4056,6 +4124,152 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "Bearer test-api-key-123"
+        );
+    }
+
+    /// Require that nothing has arrived on `rx` within a bounded window, i.e.
+    /// the operation running on the other thread is still parked on the
+    /// cross-process config lock.
+    ///
+    /// The no-op-waker polling used by
+    /// `config_write_lock_serializes_prop_put_against_concurrent_writer` is
+    /// valid for the in-process `tokio::sync::Mutex` witness but cannot detect
+    /// this lock: it is acquired via `spawn_blocking`, and a no-op waker never
+    /// reschedules that blocking task, so the future reports Pending whether
+    /// or not the lock was ever taken. Driving the handler on a real runtime
+    /// and waiting a bounded window does discriminate — an unlocked writer
+    /// completes a sub-kilobyte read and rename orders of magnitude inside
+    /// this window, and a loaded machine can only lengthen the wait, never
+    /// turn a real failure into a pass.
+    fn assert_still_blocked<T>(rx: &std::sync::mpsc::Receiver<T>, message: &str) {
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(500)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{message}"
+        );
+    }
+
+    /// `handle_migrate` reimplements the migration write inline and used to
+    /// hold only the in-process `config_write_lock` witness, which excludes
+    /// other tasks in this daemon but not a CLI writer in another process
+    /// (issue #41). It must now also take the cross-process advisory lock,
+    /// before its read, and hold it through the rename.
+    #[tokio::test]
+    async fn migrate_waits_for_the_cross_process_config_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        let config_path = config.config_path.clone();
+        // Minimal V1 input (no schema_version) so a migration would run.
+        std::fs::write(
+            &config_path,
+            "default_model_provider = \"openai\"\nfoo = 1\n",
+        )
+        .unwrap();
+        let state = test_state(config);
+
+        // Stand in for another process's critical section.
+        let held = zeroclaw_config::schema::acquire_config_write_lock(&config_path)
+            .await
+            .expect("the test may hold the config write lock");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = runtime.block_on(handle_migrate(State(state), HeaderMap::new()));
+            let status = response.status();
+            let body = runtime
+                .block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .unwrap();
+            let _ = done_tx.send((status, body));
+        });
+
+        assert_still_blocked(
+            &done_rx,
+            "handle_migrate must park on the cross-process config write lock \
+             for as long as another writer holds it, not race ahead and read \
+             a revision that writer is still replacing",
+        );
+
+        // Commit an already-current revision from inside the held section.
+        let committed = format!(
+            "schema_version = {}\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &committed).unwrap();
+        drop(held);
+
+        let (status, body) = done_rx
+            .recv()
+            .expect("the migrate thread reports its response");
+        worker.join().expect("migrate thread joins");
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["migrated"], false,
+            "the handler must read the revision committed under the lock, not \
+             the pre-lock snapshot it would otherwise have migrated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            committed,
+            "the revision committed under the lock must survive — no lost update"
+        );
+    }
+
+    /// `persist_and_swap`'s rollback restores a pre-write snapshot after
+    /// `save_dirty` has already released the cross-process lock. Writing it
+    /// unlocked could revert a revision another writer committed in the
+    /// meantime, so the restore re-acquires the lock for itself.
+    #[tokio::test]
+    async fn rollback_restore_waits_for_the_cross_process_config_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "schema_version = 3\n").unwrap();
+
+        let held = zeroclaw_config::schema::acquire_config_write_lock(&config_path)
+            .await
+            .expect("the test may hold the config write lock");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let restore_path = config_path.clone();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(restore_config_snapshot(
+                &restore_path,
+                Some(b"schema_version = 3\nrestored = true\n".to_vec()),
+            ));
+            let _ = done_tx.send(());
+        });
+
+        assert_still_blocked(
+            &done_rx,
+            "the rollback restore must park on the config write lock for as \
+             long as another writer holds it, not overwrite that writer's \
+             revision with a stale snapshot",
+        );
+
+        // Commit a revision from inside the held section. A restore that had
+        // raced ahead would already have replaced these bytes.
+        std::fs::write(&config_path, "schema_version = 3\ncommitted = true\n").unwrap();
+        drop(held);
+        done_rx
+            .recv()
+            .expect("the restore thread reports completion");
+        worker.join().expect("restore thread joins");
+
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "schema_version = 3\nrestored = true\n",
+            "the snapshot must be restored once the lock is free"
         );
     }
 }
