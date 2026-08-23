@@ -57,6 +57,8 @@
 //! reachability does not lower the required quorum, because otherwise a
 //! requester could reduce the quorum by becoming able to reach an operator.
 
+use serde::{Deserialize, Serialize};
+
 use crate::principal::PROPOSAL_DOMAIN_AGENT;
 
 /// How strong a confirmation an operation demands.
@@ -65,7 +67,8 @@ use crate::principal::PROPOSAL_DOMAIN_AGENT;
 /// protocol version that proceeds without an operator decision, so a tier
 /// meaning "no confirmation" would be unreachable at best and a declassification
 /// route at worst.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConfirmationTier {
     /// The ordinary operator confirmation.
     Standard,
@@ -98,7 +101,8 @@ impl std::fmt::Display for ConfirmationTier {
 ///
 /// Two variants, both of which require an approval receipt. See the module
 /// documentation for why there is no third.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthorityTier {
     /// A normal managed change, within a requester's granted proposal domains.
     Ordinary,
@@ -152,7 +156,8 @@ impl std::fmt::Display for AuthorityTier {
 ///
 /// Closed on purpose: an operation that is not named here has no authority tier
 /// and therefore cannot be brokered at all, which is the fail-closed direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ControlOperation {
     // -- ordinary ----------------------------------------------------------
     /// Create a managed agent profile: the phase-2 proposal this crate already
@@ -362,7 +367,8 @@ impl std::fmt::Display for ControlOperation {
 /// A newtype rather than a bare `u32` so a count of operators cannot be passed
 /// where a quorum is expected, and so the invariant "never zero" lives in one
 /// place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RequiredQuorum(u32);
 
 impl RequiredQuorum {
@@ -579,6 +585,37 @@ mod tests {
         assert!(!quorum.is_satisfied_by(1));
         assert!(quorum.is_satisfied_by(2));
         assert!(quorum.is_satisfied_by(3));
+    }
+
+    #[test]
+    fn the_serde_spelling_matches_the_authenticated_spelling() {
+        // The receipt's canonical encoding absorbs `wire()`, while its JSON
+        // body carries the serde spelling. If the two ever diverged, a receipt
+        // could be re-serialized into a different operation whose tag still
+        // verified. Pin them together.
+        for operation in ControlOperation::ALL {
+            assert_eq!(
+                serde_json::to_string(operation).expect("encode"),
+                format!("\"{}\"", operation.wire()),
+                "{operation} serde and wire spellings diverge"
+            );
+        }
+        for tier in AuthorityTier::ALL {
+            assert_eq!(
+                serde_json::to_string(tier).expect("encode"),
+                format!("\"{}\"", tier.wire())
+            );
+        }
+        for tier in ConfirmationTier::ALL {
+            assert_eq!(
+                serde_json::to_string(tier).expect("encode"),
+                format!("\"{}\"", tier.wire())
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&RequiredQuorum::MINIMUM).expect("encode"),
+            "1"
+        );
     }
 
     #[test]

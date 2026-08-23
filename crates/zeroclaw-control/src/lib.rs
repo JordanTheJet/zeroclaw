@@ -16,6 +16,7 @@
 //!
 //! This crate deliberately sits above `zeroclaw-runtime`.
 
+pub mod approval;
 pub mod ceremony;
 pub mod client_registry;
 pub mod genesis;
@@ -34,7 +35,15 @@ pub mod registry_store;
 mod service;
 mod session;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 
+pub use approval::{
+    ApprovalBroker, ApprovalError, ApprovalErrorCode, ApprovalReceipt, ApprovalRequest,
+    AuthenticatedReceipt, ConsumptionMarker, Decision, Expectations, InMemoryReceiptLedger,
+    OperatorDecision, ProposalDigest, ReceiptId, ReceiptLedger, SourceRevisionDigest,
+    verify_for_consumption,
+};
 pub use ceremony::{
     CeremonyError, CeremonyErrorCode, GenesisOutcome, GenesisRequest, PresenceError,
     TerminalConfirmation, UserPresence, run_genesis, run_register_client,
