@@ -44,6 +44,8 @@ mod quickstart_pane;
 mod relay_proto;
 mod sop_pane;
 mod terminal_backend;
+#[cfg(test)]
+mod test_support;
 mod text_navigation;
 mod theme;
 mod todo_tracker;

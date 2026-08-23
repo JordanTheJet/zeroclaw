@@ -10,8 +10,10 @@
 mod client_crypto;
 mod color_depth;
 mod relay_proto;
+
+#[cfg(test)]
+mod test_support;
 mod theme;
-mod todo_tracker;
 mod widgets;
 
 pub mod client;

@@ -140,10 +140,9 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
-MUSL legs install `cross` through `scripts/ci/install_release_tool.sh`, which
-downloads the exact pinned upstream release asset and verifies its SHA-256
-before installing it. The required Repository Structure job tests the supported
-runner-to-asset mapping without making network calls.
+Every dispatch also runs a small release-tool smoke matrix independently of the builds. Set `release_tools_only` when only this evidence is needed; the web and release-build jobs are then skipped. On trusted GitHub-hosted Linux x86_64, the smoke installs the pinned `cross` archive, confirms both `cross` and `cross-util`, and records `cross --version`. On trusted GitHub-hosted Windows x86_64, it uses the same Rust version and Bash-to-Cargo path shape as the stable release workflow, then records both `cargo-tauri.exe --version` and `cargo tauri --version`. Each leg records the exact tested commit and runner architecture in the public job summary. The smoke uses read-only repository permissions and has no publishing job, environment, secret, or artifact upload.
+
+MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
 
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
