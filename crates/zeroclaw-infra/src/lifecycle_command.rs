@@ -22,7 +22,21 @@ use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric
 
 const TERMINAL_QUEUE_CAPACITY: usize = 8;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_COMMAND_NAME_CHARS: usize = 64;
+
+/// Maximum Unicode scalar values in a configured command name.
+pub const LIFECYCLE_COMMAND_NAME_CHARS_MAX: usize = 64;
+/// Maximum queued non-terminal events per configured command.
+pub const LIFECYCLE_COMMAND_QUEUE_MAX: usize = 1024;
+/// Maximum child processes running concurrently per configured command.
+pub const LIFECYCLE_COMMAND_CONCURRENCY_MAX: usize = 16;
+/// Maximum per-child wall-clock timeout in milliseconds.
+pub const LIFECYCLE_COMMAND_TIMEOUT_MS_MAX: u64 = 60_000;
+/// Maximum bytes retained independently from stdout and stderr.
+pub const LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX: usize = 1_048_576;
+/// Maximum executable-plus-argument entries in literal argv.
+pub const LIFECYCLE_COMMAND_ARGV_MAX: usize = 64;
+/// Maximum bytes in one literal argv entry.
+pub const LIFECYCLE_COMMAND_ARG_BYTES_MAX: usize = 4096;
 
 /// Fully validated command-runner configuration independent of config storage.
 #[derive(Debug, Clone)]
@@ -54,11 +68,11 @@ impl LifecycleCommandSpec {
         if self.name.trim().is_empty() {
             anyhow::bail!("lifecycle command name must not be blank");
         }
-        if self.name.chars().count() > MAX_COMMAND_NAME_CHARS
+        if self.name.chars().count() > LIFECYCLE_COMMAND_NAME_CHARS_MAX
             || self.name.chars().any(char::is_control)
         {
             anyhow::bail!(
-                "lifecycle command name must contain at most {MAX_COMMAND_NAME_CHARS} non-control characters"
+                "lifecycle command name must contain at most {LIFECYCLE_COMMAND_NAME_CHARS_MAX} non-control characters"
             );
         }
         let Some(executable) = self.argv.first() else {
@@ -67,11 +81,40 @@ impl LifecycleCommandSpec {
         if !std::path::Path::new(executable).is_absolute() {
             anyhow::bail!("lifecycle command executable must be absolute");
         }
+        if self.argv.len() > LIFECYCLE_COMMAND_ARGV_MAX
+            || self
+                .argv
+                .iter()
+                .any(|arg| arg.len() > LIFECYCLE_COMMAND_ARG_BYTES_MAX)
+        {
+            anyhow::bail!(
+                "lifecycle command argv exceeds the {LIFECYCLE_COMMAND_ARGV_MAX}-entry or {LIFECYCLE_COMMAND_ARG_BYTES_MAX}-byte-per-entry bound"
+            );
+        }
         if self.events.is_empty() {
             anyhow::bail!("lifecycle command event allowlist must not be empty");
         }
-        if self.queue_capacity == 0 || self.max_concurrency == 0 || self.timeout.is_zero() {
-            anyhow::bail!("lifecycle command queue, concurrency, and timeout must be non-zero");
+        if !(1..=LIFECYCLE_COMMAND_QUEUE_MAX).contains(&self.queue_capacity) {
+            anyhow::bail!(
+                "lifecycle command queue capacity must be 1..={LIFECYCLE_COMMAND_QUEUE_MAX}"
+            );
+        }
+        if !(1..=LIFECYCLE_COMMAND_CONCURRENCY_MAX).contains(&self.max_concurrency) {
+            anyhow::bail!(
+                "lifecycle command concurrency must be 1..={LIFECYCLE_COMMAND_CONCURRENCY_MAX}"
+            );
+        }
+        if self.timeout.is_zero()
+            || self.timeout > Duration::from_millis(LIFECYCLE_COMMAND_TIMEOUT_MS_MAX)
+        {
+            anyhow::bail!(
+                "lifecycle command timeout must be 1..={LIFECYCLE_COMMAND_TIMEOUT_MS_MAX} milliseconds"
+            );
+        }
+        if self.max_output_bytes > LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX {
+            anyhow::bail!(
+                "lifecycle command output bound must be 0..={LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX} bytes per stream"
+            );
         }
         Ok(())
     }
@@ -775,6 +818,47 @@ mod tests {
             max_output_bytes: 0,
         };
         assert!(invalid_name.validate().is_err());
+
+        let valid = LifecycleCommandSpec {
+            name: "valid".into(),
+            argv: vec!["/bin/echo".into()],
+            events: [LifecycleEventKind::TurnStarted].into_iter().collect(),
+            queue_capacity: 1,
+            max_concurrency: 1,
+            timeout: Duration::from_millis(1),
+            max_output_bytes: 0,
+        };
+        for invalid in [
+            LifecycleCommandSpec {
+                queue_capacity: LIFECYCLE_COMMAND_QUEUE_MAX + 1,
+                ..valid.clone()
+            },
+            LifecycleCommandSpec {
+                max_concurrency: LIFECYCLE_COMMAND_CONCURRENCY_MAX + 1,
+                ..valid.clone()
+            },
+            LifecycleCommandSpec {
+                timeout: Duration::from_millis(LIFECYCLE_COMMAND_TIMEOUT_MS_MAX + 1),
+                ..valid.clone()
+            },
+            LifecycleCommandSpec {
+                max_output_bytes: LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX + 1,
+                ..valid.clone()
+            },
+            LifecycleCommandSpec {
+                argv: vec!["/bin/echo".into(); LIFECYCLE_COMMAND_ARGV_MAX + 1],
+                ..valid.clone()
+            },
+            LifecycleCommandSpec {
+                argv: vec![
+                    "/bin/echo".into(),
+                    "x".repeat(LIFECYCLE_COMMAND_ARG_BYTES_MAX + 1),
+                ],
+                ..valid
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[tokio::test]
