@@ -103,12 +103,26 @@ Run all of these. The data informs every step that follows.
    Read the full diff. Cross-check author commitments from step 3 against what actually shipped. Cross-check against the local repository where the change lands.
 
 7. **Current merge and required-check state**
-
+   <!-- >>> generated:review-ci-state-fetch by `cargo generate review-docs` - do not edit <<< -->
    <div class="os-tabs-src">
 
    #### sh
 
    ```sh
+   GH_MIN_VERSION=2.50.0
+   GH_VERSION=$(gh --version | awk 'NR == 1 { print $3 }')
+   GH_MAJOR=${GH_VERSION%%.*}
+   GH_REST=${GH_VERSION#*.}
+   GH_MINOR=${GH_REST%%.*}
+   if ! printf '%s\n' "$GH_MAJOR" "$GH_MINOR" | awk 'NF != 1 || $0 !~ /^[0-9]+$/ { exit 1 }'; then
+     echo "could not parse gh version: $GH_VERSION" >&2
+     exit 1
+   fi
+   if [ "$GH_MAJOR" -lt 2 ] || { [ "$GH_MAJOR" -eq 2 ] && [ "$GH_MINOR" -lt 50 ]; }; then
+     echo "gh $GH_MIN_VERSION or newer is required for machine-readable required checks" >&2
+     exit 1
+   fi
+
    PR_STATE=$(gh pr view <number> --repo zeroclaw-labs/zeroclaw \
      --json headRefOid,mergeable,mergeStateStatus)
    printf '%s\n' "$PR_STATE"
@@ -121,10 +135,12 @@ Run all of these. The data informs every step that follows.
 
    </div>
 
-   Record `headRefOid` as the revision being reviewed. Treat the check output
-   and `behind_by` comparison as current only for that head. `gh pr checks`
-   exits non-zero by design when required checks are pending (exit 8), failing,
-   or absent. Treat that exit code as state to classify, not as a failed fetch,
+   This classification requires `gh >= 2.50.0`. Stop and upgrade
+   an older client rather than silently dropping required-check data. Record
+   `headRefOid` as the revision being reviewed. Treat the check output and
+   `behind_by` comparison as current only for that head. `gh pr checks` exits
+   non-zero by design when required checks are pending (exit 8), failing, or
+   absent. Treat that exit code as state to classify, not as a failed fetch,
    and inspect any JSON output it returned. Use this state for the CI freshness
    and base drift rules below, never an author's description of the state.
 
@@ -134,6 +150,7 @@ Run all of these. The data informs every step that follows.
    has confirmed that the new revision contains the requested refresh. On a
    first review or without a prior reviewed head, do not infer a rerun from
    author prose; use the normal pending-CI rules.
+   <!-- >>> end generated:review-ci-state-fetch <<< -->
 
 ## Take stock before writing
 
@@ -205,6 +222,7 @@ verdict:
 
 Do not ignore another reviewer's visible `CHANGES_REQUESTED`. Before approving, check whether the underlying concern is resolved in the current diff, stale, dismissed, or still valid. A review state left on an older head is not automatically an unresolved concern. If you approve while that state is still visible, explain why the concern has been resolved; your approval does not clear the other review state for merge.
 
+<!-- >>> generated:review-ci-freshness-policy by `cargo generate review-docs` - do not edit <<< -->
 ## CI freshness and base drift
 
 Classify CI freshness from the current GitHub state fetched above, not from an
@@ -249,10 +267,13 @@ required-check and freshness-basis steps still apply before merge. Because
 this path is dismissed when the author performs the requested refresh;
 re-approve the refreshed head after reviewing it and once the required gate
 reports.
+<!-- >>> end generated:review-ci-freshness-policy <<< -->
 
 ## Validation evidence gaps
 
+<!-- >>> generated:review-validation-evidence-gaps by `cargo generate review-docs` - do not edit <<< -->
 When validation is the concern, identify the exact evidence gap instead of asking for "full Cargo" by reflex. Check the current required CI jobs and the changed surface, then ask for extra validation only where required CI does not prove the thing under review: tests for a platform that only received compile checks, Clippy for a platform or path outside the required lint job, desktop coverage when the desktop workflow did not trigger, release targets outside the PR matrix, stale CI beyond the base-drift-only case classified above, or unavailable CI.
+<!-- >>> end generated:review-validation-evidence-gaps <<< -->
 
 ## Shape and generated artifacts
 
