@@ -1265,3 +1265,33 @@ cli-control-operator-registered =
       presence:    {$presence}
       operators:   {$operators}
 cli-control-operator-no-credential = Operators hold no credential. This one approves by being present at a controlling terminal and naming this identity; there is no token to store, lose, or capture.
+cli-control-enable-mutations-confirm = Enable management mutations on this instance? Type yes to confirm:{" "}
+cli-control-enable-mutations-operator = Enabling operator identity (a registered operator):{" "}
+cli-control-mutations-enabled =
+    Management mutations enabled. Enablement grants no tool to any agent.
+      instance:    {$instance}
+      trust epoch: {$epoch}
+      operator:    {$operator}
+      assurance:   {$assurance}
+cli-control-grant-proposal-confirm = Grant this control client a proposal domain? Type yes to confirm:{" "}
+cli-control-grant-proposal-operator = Granting operator identity (a registered operator):{" "}
+cli-control-proposal-granted =
+    Proposal domain granted. The client can now request apply.
+      registration: {$registration}
+      client:       {$label}
+      operator:     {$operator}
+      assurance:    {$assurance}
+      domains:      {$domains}
+cli-control-approve-confirm = Approve and apply this parked operation? Type yes to confirm:{" "}
+cli-control-approve-operator = Operator identity (the label you registered as):{" "}
+cli-control-approved =
+    Approved and applied through the control-plane transaction.
+      operation: {$operation}
+      agent:     {$agent}
+      state:     {$state}
+cli-control-reject-confirm = Reject this parked operation? Type yes to confirm:{" "}
+cli-control-reject-operator = Operator identity (the label you registered as):{" "}
+cli-control-rejected =
+    Rejection recorded. No config changed.
+      operation: {$operation}
+      state:     {$state}

@@ -1537,4 +1537,74 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn control_ceremony_cli_strings_resolve_to_real_text() {
+        // Regression for issue #52: the enable-mutations ceremony (and the
+        // approve/reject and grant-proposal ceremonies alongside it) referenced
+        // `cli-control-*` keys that were never added to the embedded English
+        // catalogue, so the release binary rendered the raw `{key}` sentinel.
+        // Each key below must resolve to real text; removing any one of them
+        // from `en/cli.ftl` makes this fail (the mutation check for the fix).
+        let simple = [
+            "cli-control-enable-mutations-confirm",
+            "cli-control-enable-mutations-operator",
+            "cli-control-grant-proposal-confirm",
+            "cli-control-grant-proposal-operator",
+            "cli-control-approve-confirm",
+            "cli-control-approve-operator",
+            "cli-control-reject-confirm",
+            "cli-control-reject-operator",
+        ];
+        for key in simple {
+            let value = get_english_cli_string_with_args(key, &[]);
+            assert_ne!(
+                value,
+                format!("{{{key}}}"),
+                "{key} must resolve, not render the raw sentinel"
+            );
+            assert!(!value.trim().is_empty(), "{key} must not be empty");
+        }
+
+        // The argumented success messages must resolve AND substitute their
+        // arguments rather than leaving `{$name}` placeholders visible.
+        let enabled = get_english_cli_string_with_args(
+            "cli-control-mutations-enabled",
+            &[
+                ("instance", "inst-1"),
+                ("epoch", "1"),
+                ("operator", "jordan"),
+                ("assurance", "terminal"),
+            ],
+        );
+        assert!(
+            enabled.contains("inst-1") && enabled.contains("jordan"),
+            "cli-control-mutations-enabled must inline its args; got {enabled:?}"
+        );
+        assert!(
+            !enabled.contains("{$"),
+            "cli-control-mutations-enabled left an unresolved placeholder: {enabled:?}"
+        );
+
+        let granted = get_english_cli_string_with_args(
+            "cli-control-proposal-granted",
+            &[
+                ("registration", "reg-abc123"),
+                ("label", "claude-code"),
+                ("operator", "jordan"),
+                ("assurance", "terminal"),
+                ("domains", "agent"),
+            ],
+        );
+        for expected in ["reg-abc123", "claude-code", "jordan", "agent"] {
+            assert!(
+                granted.contains(expected),
+                "cli-control-proposal-granted must inline {expected}; got {granted:?}"
+            );
+        }
+        assert!(
+            !granted.contains("{$"),
+            "cli-control-proposal-granted left an unresolved placeholder: {granted:?}"
+        );
+    }
 }
