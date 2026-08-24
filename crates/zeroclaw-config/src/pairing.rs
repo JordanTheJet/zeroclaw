@@ -19,7 +19,7 @@ const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
 
 /// Smallest pairing-code length any configuration may select.
 ///
-/// Six is the pre-#6613 shipped length, so no configuration can produce a
+/// Six is the previously shipped length, so no configuration can produce a
 /// code weaker (in length) than what the gateway used to generate.
 pub const PAIRING_CODE_MIN_LENGTH: usize = 6;
 
@@ -46,7 +46,7 @@ const UNAMBIGUOUS_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 #[serde(rename_all = "snake_case")]
 pub enum PairingCodeCharset {
     /// `0-9`. Compatibility mode for demos and retyping-heavy flows.
-    /// Paired with `length = 6` this reproduces the pre-#6613 code exactly.
+    /// Paired with `length = 6` this reproduces the previously shipped code exactly.
     Numeric,
     /// `0-9A-Za-z`, case-sensitive (62 symbols). The default: densest
     /// entropy per character for a code that is copied and pasted.
@@ -120,7 +120,7 @@ pub enum PairingCodePolicyError {
 /// # Default
 ///
 /// 32 case-sensitive alphanumeric characters ≈ **190.6 bits** of entropy,
-/// against ≈19.9 bits for the six-digit numeric code shipped before #6613.
+/// against ≈19.9 bits for the six-digit numeric code shipped before the shared policy.
 /// Pairing codes are pasted far more often than they are retyped, and a
 /// pairing code is the gateway's front door: getting it wrong is an
 /// authentication bypass, while getting it long is a paste.
@@ -134,7 +134,7 @@ pub enum PairingCodePolicyError {
 /// length = 24
 /// charset = "unambiguous"
 ///
-/// # Exact pre-#6613 behaviour. Only for local, short-lived pairing.
+/// # Exact legacy behaviour. Only for local, short-lived pairing.
 /// [gateway.pairing_code]
 /// length = 6
 /// charset = "numeric"
@@ -176,7 +176,7 @@ impl PairingCodePolicy {
         Ok(policy)
     }
 
-    /// The exact pre-#6613 policy: six numeric digits.
+    /// The exact legacy policy: six numeric digits.
     ///
     /// Kept as a named constructor so the compatibility shape is testable
     /// and greppable rather than a magic pair of literals.
@@ -818,7 +818,7 @@ mod tests {
 
     // ── Pairing-code policy: default shape ───────────────────
 
-    /// #6613 acceptance criterion: the default is chosen deliberately and is
+    /// Acceptance criterion: the default is chosen deliberately and is
     /// materially stronger than the six-digit numeric code master shipped.
     #[test]
     async fn default_policy_is_32_char_case_sensitive_alphanumeric() {
@@ -842,7 +842,7 @@ mod tests {
     }
 
     /// The old-vs-new discriminator: a default code is no longer something
-    /// the pre-#6613 generator could ever have produced.
+    /// the legacy generator could ever have produced.
     #[test]
     async fn default_generated_code_is_not_a_six_digit_numeric_code() {
         let policy = PairingCodePolicy::default();
@@ -881,7 +881,7 @@ mod tests {
 
     // ── Pairing-code policy: configured shapes ───────────────
 
-    /// Numeric compatibility mode reproduces the pre-#6613 code exactly.
+    /// Numeric compatibility mode reproduces the previously shipped code exactly.
     #[test]
     async fn numeric_compat_policy_reproduces_six_digit_numeric_code() {
         let policy = PairingCodePolicy::numeric_compat();
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     async fn entropy_bits_tracks_length_and_charset() {
         let numeric = PairingCodePolicy::numeric_compat();
-        // The pre-#6613 code: log2(10^6) ≈ 19.93 bits.
+        // The legacy code: log2(10^6) ≈ 19.93 bits.
         assert!(
             (numeric.entropy_bits() - 19.93).abs() < 0.01,
             "six numeric digits ≈ 19.93 bits, got {}",
@@ -1498,7 +1498,7 @@ mod tests {
         );
     }
 
-    /// #6613: startup pairing, on-demand regeneration, and the atomic
+    /// Startup pairing, on-demand regeneration, and the atomic
     /// dashboard/API issue path must all draw from the same policy. A
     /// non-default shape is used so a hardcoded generator cannot pass.
     #[test]
@@ -1526,7 +1526,7 @@ mod tests {
         assert_matches_policy(&vacant, policy);
     }
 
-    /// #6613 / review MAJOR-1: the guard must not snapshot the policy.
+    /// Review follow-up: the guard must not snapshot the policy.
     /// A guard built under the weak compatibility policy, then asked to mint
     /// under a strengthened one, issues the strengthened shape — no
     /// reconstruction, no restart. This is the unit-level half of the
@@ -1565,7 +1565,7 @@ mod tests {
     }
 
     /// A guard configured for numeric compatibility keeps issuing exactly
-    /// the pre-#6613 shape, so the old flow is preserved, not merely
+    /// the legacy shape, so the old flow is preserved, not merely
     /// tolerated.
     #[test]
     async fn numeric_compat_guard_still_issues_six_digit_codes() {
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 
-    /// #6613 acceptance criterion: a successful pair using the configured
+    /// Acceptance criterion: a successful pair using the configured
     /// code shape. Exercised for every charset family so none of them
     /// breaks the constant-time comparison or the trim on submit.
     #[test]

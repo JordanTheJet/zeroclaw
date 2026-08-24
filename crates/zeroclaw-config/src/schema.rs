@@ -7147,7 +7147,7 @@ impl Default for GatewayConfig {
 /// [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing and
 /// `zeroclaw gateway get-paircode`, so it consumes
 /// [`gateway.pairing_code`](crate::pairing::PairingCodePolicy) rather than
-/// carrying a second, dashboard-only setting (#6613).
+/// carrying a second, dashboard-only setting.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
@@ -20853,7 +20853,7 @@ impl Config {
             );
         }
 
-        // Pairing-code policy (#6613). Rejected at load rather than clamped
+        // Pairing-code policy. Rejected at load rather than clamped
         // at generation, so an operator who asks for a weak pairing code is
         // told, not silently given a different one.
         let pairing_code_length = self.gateway.pairing_code.length;
@@ -26110,7 +26110,7 @@ enabled = true
             .expect("WebSocket ping interval upper bound must validate");
     }
 
-    // ── Pairing-code policy (#6613) ──────────────────────────
+    // ── Pairing-code policy ──────────────────────────
 
     /// The shipped default is the strong policy, not the six-digit code.
     #[test]
@@ -26178,7 +26178,7 @@ enabled = true
         }
     }
 
-    /// #6613: the dashboard consumes the shared policy instead of carrying
+    /// The dashboard consumes the shared policy instead of carrying
     /// its own length knob. A config that still names the retired
     /// `gateway.pairing_dashboard.code_length` must load, must not resurrect
     /// a parallel setting, and must leave `[gateway.pairing_code]` in charge.

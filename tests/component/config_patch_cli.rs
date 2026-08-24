@@ -346,7 +346,7 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
     );
 }
 
-/// #6613 / review MAJOR-2: an out-of-range pairing-code length must be
+/// Review follow-up: an out-of-range pairing-code length must be
 /// refused at the write, not clamped later at mint time. `config patch`
 /// runs `Config::validate()` post-apply and before `save_dirty()`, so the
 /// weak value never reaches disk.

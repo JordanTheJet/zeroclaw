@@ -405,7 +405,7 @@ impl V2Config {
 }
 
 /// V3 moved pairing-code shape out of `[gateway.pairing_dashboard]` and into
-/// the shared `[gateway.pairing_code]` policy (#6613).
+/// the shared `[gateway.pairing_code]` policy.
 ///
 /// `[gateway]` rides through the V2→V3 step inside `passthrough`, so without
 /// this the migrated document keeps the retired `pairing_dashboard.code_length`

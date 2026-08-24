@@ -2092,7 +2092,7 @@ fn generate_current_emits_at_current_schema_version() {
     );
 }
 
-// ── Pairing-code policy (#6613) ──────────────────────────────
+// ── Pairing-code policy ──────────────────────────────
 
 /// Review MAJOR-3: `zeroclaw config generate 3` must not hand the operator
 /// a config that names the retired `pairing_dashboard.code_length`, and must

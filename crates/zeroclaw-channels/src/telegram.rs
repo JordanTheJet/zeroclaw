@@ -800,7 +800,7 @@ impl TelegramChannel {
         } else {
             // Chat-channel bind codes are retyped by hand into a Telegram/
             // LINE/WeChat message, so they deliberately keep the six-digit
-            // numeric shape. #6613 re-scoped the *gateway* pairing code, not
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
             // this one; changing it here would be an unreviewed UX change.
             let guard = PairingGuard::new(
                 true,

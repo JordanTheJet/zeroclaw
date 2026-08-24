@@ -1230,7 +1230,7 @@ pub async fn run_gateway(
     // ── Pairing guard ──────────────────────────────────────
     // The pairing-code policy is resolved from config here and nowhere
     // else: startup pairing, `gateway get-paircode --new`, the dashboard
-    // pairing flow, and rotate-device all issue through this guard (#6613).
+    // pairing flow, and rotate-device all issue through this guard.
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
@@ -1379,7 +1379,7 @@ pub async fn run_gateway(
         );
     }
     if let Some(code) = pairing.pairing_code() {
-        // The box is sized from the code, not from a literal: since #6613
+        // The box is sized from the code, not from a literal: since the policy became config-driven,
         // the code length is operator-configurable (6..=128 chars).
         let rule = "─".repeat(code.chars().count() + 4);
         println!();
@@ -4101,7 +4101,7 @@ async fn handle_admin_paircode(
 /// `api_config.rs` replaces the whole `Config`), so the guard deliberately
 /// stores no policy. Resolving it here, per mint, is what makes a
 /// strengthened `[gateway.pairing_code]` take effect on the next code
-/// instead of at the next restart (#6613).
+/// instead of at the next restart.
 pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
     state.config.read().gateway.pairing_code
 }
@@ -4863,7 +4863,7 @@ path = "{trigger_path}"
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, true, true);
 
-        // Boot weak: six numeric digits, the pre-#6613 shape.
+        // Boot weak: six numeric digits, the legacy shape.
         let weak = PairingCodePolicy::numeric_compat();
         state.config.write().gateway.pairing_code = weak;
         let guard_before = Arc::as_ptr(&state.pairing);
