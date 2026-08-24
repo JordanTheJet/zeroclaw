@@ -10,15 +10,35 @@
 //! who finds out is the user whose first launch fails. Nothing below the
 //! system level catches that, because every layer in isolation is correct.
 //!
-//! These tests drive the **real** Quickstart submission path
-//! (`zeroclaw_runtime::quickstart::apply_with_surface`, the same entry point
-//! the CLI, TUI, and gateway all funnel into) against a hermetic temp config
-//! dir, then re-read the persisted `config.toml` through the same
-//! deserialization the daemon loader uses and assert the on-disk result agrees
-//! with what was submitted.
+//! # What is and is not covered
+//!
+//! **Covered.** The shared Quickstart apply core
+//! (`zeroclaw_runtime::quickstart::apply_with_surface`) driven with a
+//! hand-built [`BuilderSubmission`] into a hermetic temp install root; the
+//! persisted `config.toml`; and — in
+//! [`first_run_config_loads_through_the_real_binary`] — the real
+//! `Config::load_or_init()` loader, reached by spawning the actual `zeroclaw`
+//! binary as a child process against that install root.
+//!
+//! **Not covered.** The adapters that *build* a submission are each their own
+//! surface and none of them run here: the zerocode TUI form
+//! (`apps/zerocode/src/quickstart_pane.rs::to_submission`), the interactive CLI
+//! quickstart (`src/main.rs`), and the gateway HTTP handler
+//! (`crates/zeroclaw-gateway/src/api_quickstart.rs`). A bug that lives purely
+//! in one of those adapters — a field the form never collects, a key the HTTP
+//! layer renames — is invisible to this file. Those are follow-up matrix rows,
+//! not something to fake here with a hand-built submission that would only
+//! restate what the core already guarantees.
+//!
+//! In-process reloads use `migration::migrate_to_current`, which is the exact
+//! parse `load_or_init` performs on the file body but *not* the whole loader:
+//! it skips salvage bookkeeping (`degraded_sections`), runtime path stamping,
+//! and env-var overrides. The child-process test is what covers those.
 //!
 //! No network, no real credentials, no operator config: every value is a
-//! neutral placeholder and every byte written lands under a `TempDir`.
+//! neutral placeholder and every byte written lands under a `TempDir`. The
+//! child process gets a scrubbed, child-scoped environment; the test process
+//! never mutates its own env.
 //!
 //! # How to add another first-run scenario
 //!
@@ -34,6 +54,10 @@
 //!    [`FirstRun::assert_agent_channel_aliases_resolve_to_populated_blocks`],
 //!    and [`FirstRun::assert_submitted_channel_fields_persisted`]. Add
 //!    scenario-specific typed assertions on `run.reloaded()` afterwards.
+//! 4. To assert against the real loader instead of the in-process parse, call
+//!    [`run_zeroclaw`] with a read-only subcommand and check its output.
+//! 5. Any new harness check needs a matching guard test proving it fails on the
+//!    shape it claims to catch — see the guard section at the bottom.
 //!
 //! Live, credential-backed channel connectivity stays out of this file — that
 //! belongs in `tests/live/`, ignored by default.
@@ -123,7 +147,7 @@ impl FirstRun {
         }
     }
 
-    /// Rewrite the persisted config, then re-read it exactly as
+    /// Rewrite the persisted config on disk, then re-read it exactly as
     /// [`FirstRun::quickstart`] does.
     ///
     /// Used only by the guard tests at the bottom of this file, which corrupt
@@ -131,6 +155,10 @@ impl FirstRun {
     /// actually fire. A check that stays green against its own failure mode is
     /// decoration, not coverage — and a decorative check is exactly what let
     /// the broken first-run config ship in the first place.
+    ///
+    /// The corrupted document is written back to `config.toml` so guards that
+    /// spawn the real binary see it too; comment formatting from the config
+    /// writer is lost in the round-trip, which does not matter for a fixture.
     fn with_corrupted_disk_view(mut self, mutate: impl FnOnce(&mut toml::Table)) -> Self {
         let mut doc = self
             .raw
@@ -139,6 +167,8 @@ impl FirstRun {
             .clone();
         mutate(&mut doc);
         let raw_text = toml::to_string(&doc).expect("corrupted config must re-serialize");
+        std::fs::write(self.dir.path().join("config.toml"), &raw_text)
+            .expect("corrupted config must be writable");
         self.reloaded = zeroclaw_config::migration::migrate_to_current(&raw_text)
             .expect("corrupted config must still parse");
         self.raw = toml::Value::Table(doc);
@@ -317,6 +347,40 @@ fn submission(agent: &str, channels: Vec<SelectorChoice<ChannelQuickStart>>) -> 
             personality_files: vec![],
         },
     }
+}
+
+/// Run the real `zeroclaw` binary against a first-run install root.
+///
+/// Every `ZEROCLAW_*` variable inherited from the developer's shell is stripped
+/// from the child before `ZEROCLAW_CONFIG_DIR` is set, so an operator env var
+/// (the `ZEROCLAW_*` config-override grammar included) cannot leak into the
+/// result. The parent's environment is only read, never mutated, so this stays
+/// safe under parallel test execution — which is exactly why the loader is
+/// exercised in a child process rather than in-process.
+fn run_zeroclaw(install_root: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_zeroclaw"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("ZEROCLAW_") {
+            command.env_remove(&key);
+        }
+    }
+    command
+        .args(args)
+        .env("ZEROCLAW_CONFIG_DIR", install_root)
+        .output()
+        .expect("failed to spawn the zeroclaw binary")
+}
+
+/// Assert the child exited cleanly and return its stdout.
+fn stdout_of(output: &std::process::Output, what: &str) -> String {
+    assert!(
+        output.status.success(),
+        "`zeroclaw {what}` exited with {:?} against a first-run config\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// One freshly built channel. `fields` keys must be schema-canonical and
@@ -509,13 +573,87 @@ async fn first_run_without_channels_validates_and_binds_nothing() {
     );
 }
 
+/// **The real loader.** Everything above reloads in-process through
+/// `migrate_to_current`, which is the parse but not the whole of
+/// `Config::load_or_init()`. Here the actual `zeroclaw` binary is spawned
+/// against the first-run install root, so the production loader runs in full —
+/// directory resolution, filesystem migration checks, salvage bookkeeping,
+/// runtime path stamping, secret-store wiring — and the surfaces a user reads
+/// on their second launch must agree with what the first run wrote.
+///
+/// A config that only *parses* is not the bar: the binary has to exit clean and
+/// report the channel and the binding.
+#[tokio::test]
+async fn first_run_config_loads_through_the_real_binary() {
+    let run = FirstRun::quickstart(submission(
+        "bot",
+        vec![fresh_channel(
+            "telegram",
+            "ops",
+            &[("bot_token", "111111:placeholder-bot-token")],
+        )],
+    ))
+    .await;
+    let root = run.install_root();
+
+    // `channel list` is the surface that disagreed in the motivating failure:
+    // it must mark Telegram configured, not just count something.
+    let listing = stdout_of(&run_zeroclaw(root, &["channel", "list"]), "channel list");
+    assert!(
+        listing.contains("✅ Telegram"),
+        "the real loader must see the channel the first run configured; got:\n{listing}"
+    );
+
+    // The agent alias survived the loader.
+    let agents = stdout_of(&run_zeroclaw(root, &["agents", "list"]), "agents list");
+    assert!(
+        agents.contains("bot"),
+        "the real loader must see the agent the first run created; got:\n{agents}"
+    );
+
+    // The binding itself, read back through the loader rather than off disk.
+    let bound = stdout_of(
+        &run_zeroclaw(root, &["config", "get", "agents.bot.channels", "--json"]),
+        "config get agents.bot.channels",
+    );
+    let bound: serde_json::Value =
+        serde_json::from_str(&bound).expect("`config get --json` must emit a JSON envelope");
+    assert_eq!(bound["path"], "agents.bot.channels");
+    assert!(
+        bound["value"].to_string().contains("telegram.ops"),
+        "the loader must report the agent bound to `telegram.ops`; got {bound}"
+    );
+
+    // The secret reached the loader's secret store as a populated value — the
+    // in-process reload cannot prove this, because it never builds one.
+    let token = stdout_of(
+        &run_zeroclaw(
+            root,
+            &["config", "get", "channels.telegram.ops.bot_token", "--json"],
+        ),
+        "config get channels.telegram.ops.bot_token",
+    );
+    let token: serde_json::Value =
+        serde_json::from_str(&token).expect("`config get --json` must emit a JSON envelope");
+    assert_eq!(
+        token["populated"],
+        serde_json::Value::Bool(true),
+        "the credential the user typed must read back as populated through the real loader; got {token}"
+    );
+}
+
 /// The surfaces a user actually reads must agree with the config that was
 /// written: `zeroclaw doctor` must see the channel as configured and must not
 /// report it as credential-less. The motivating failure had these disagree —
 /// doctor counted a channel while the channel runtime had nothing usable.
 ///
-/// Only the `config` category is asserted: `diagnose` also probes the host
-/// environment and PATH, which is not something a system test can pin.
+/// Ignored by default. `diagnose()` is the only public sync entry point and it
+/// bundles host probing with the config view: it shells out to git/curl and
+/// runs `<tool> --version` for every CLI tool on PATH through a
+/// `Command::output()` call with no timeout, so a single wedged binary on the
+/// host hangs the suite. The assertions below are the ones worth keeping the
+/// moment a config-only doctor entry point exists; until then they are opt-in.
+#[ignore = "needs a config-only doctor entry point; diagnose() probes host PATH unbounded"]
 #[tokio::test]
 async fn first_run_doctor_agrees_the_channel_is_configured() {
     let run = FirstRun::quickstart(submission(
@@ -553,10 +691,9 @@ async fn first_run_doctor_agrees_the_channel_is_configured() {
 // ═════════════════════════════════════════════════════════════════════════════
 // Guard checks — prove each harness assertion fires on its own failure mode
 //
-// The broken first-run config shipped because every surface agreed while
-// being wrong. A green harness is only evidence if it goes red on the shape it
-// claims to
-// catch, so each check above is re-run here against a config corrupted into
+// The broken first-run config shipped because every surface agreed while being
+// wrong. A green harness is only evidence if it goes red on the shape it claims
+// to catch, so each check above is re-run here against a config corrupted into
 // that shape and is required to fail.
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -616,10 +753,21 @@ async fn guard_config_validation_rejects_a_dangling_channel_binding() {
         );
     });
 
+    // Pinned to the specific dangling-reference rejection: a guard that accepts
+    // any validation failure would stay green if validate() started failing for
+    // an unrelated reason, and would stop proving anything about bindings.
     let message = panic_message_from(|| run.assert_config_validates());
     assert!(
         message.contains("Config::validate()"),
         "unexpected failure message: {message}"
+    );
+    assert!(
+        message.contains("agents.bot.channels[0]") && message.contains("telegram.ghost"),
+        "the failure must name the dangling binding, not some other validation error: {message}"
+    );
+    assert!(
+        message.contains("is not configured"),
+        "the failure must be the dangling-reference rejection: {message}"
     );
 }
 
@@ -683,6 +831,44 @@ async fn guard_alias_resolution_rejects_a_missing_channel_block() {
     );
 }
 
+/// Guard for [`first_run_config_loads_through_the_real_binary`]: the strings it
+/// matches on must actually discriminate. Remove the channel from the persisted
+/// config and the real binary has to say so — otherwise `✅ Telegram` is just a
+/// substring that happens to be present whatever the config holds.
+#[tokio::test]
+async fn guard_real_binary_reports_a_channel_that_is_no_longer_configured() {
+    let run = FirstRun::quickstart(submission(
+        "bot",
+        vec![fresh_channel(
+            "telegram",
+            "ops",
+            &[("bot_token", "111111:placeholder-bot-token")],
+        )],
+    ))
+    .await
+    .with_corrupted_disk_view(|doc| {
+        doc.get_mut("channels")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|channels| channels.get_mut("telegram"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("telegram family")
+            .remove("ops");
+    });
+
+    let listing = stdout_of(
+        &run_zeroclaw(run.install_root(), &["channel", "list"]),
+        "channel list",
+    );
+    assert!(
+        listing.contains("❌ Telegram"),
+        "the real binary must report Telegram unconfigured once the block is gone; got:\n{listing}"
+    );
+    assert!(
+        !listing.contains("✅ Telegram"),
+        "the marker the positive test matches on must not survive the block's removal; got:\n{listing}"
+    );
+}
+
 /// Guard for `assert_submitted_channel_fields_persisted`: a submitted plain
 /// field that never reached disk must be caught. This is the dropped-field
 /// shape — the block is populated and validates, it just lost what the user
@@ -742,7 +928,8 @@ async fn guard_field_persistence_rejects_a_corrupted_secret_field() {
 
 /// Guard for the doctor assertion: doctor must actually notice a channel that
 /// is enabled with no credential, otherwise the "doctor agrees" test proves
-/// nothing.
+/// nothing. Ignored for the same reason as the test it guards.
+#[ignore = "needs a config-only doctor entry point; diagnose() probes host PATH unbounded"]
 #[tokio::test]
 async fn guard_doctor_reports_an_enabled_channel_with_no_credential() {
     let run = FirstRun::quickstart(submission(
