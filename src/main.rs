@@ -1286,6 +1286,33 @@ instance and in recovery-only mode."
     )]
     EnableMutations,
 
+    /// Grant a registered client a proposal domain, unlocking request-apply.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(
+        name = "grant-proposal",
+        long_about = "\
+Widen a registered control client's grant to include the v1 proposal domain.
+
+A client is registered with read domains only, so control.request_apply refuses
+it and it can change nothing. This ceremony adds the proposal domain to the named
+registration, after which that client can PARK a proposal for an operator to
+approve. It grants no approval authority and no tool to any agent, adds no read
+domain, and changes no client credential — the client keeps the secret it holds.
+
+Widening an external client grant is a meta-authority operation. It is host-side
+only, like enable-mutations: no agent, tool, or MCP session can reach it. It runs
+the user-presence ceremony on this terminal and records the granting operator,
+who must already be a registered operator. Refuses on an uninitialized or
+recovery-only instance, and on an unknown or revoked client registration.
+Granting a domain the client already holds succeeds and changes nothing."
+    )]
+    GrantProposal {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        /// Registration id of the client to widen (from register-client).
+        #[arg(long, value_name = "ID")]
+        client: String,
+    },
+
     /// Approve a parked proposal, applying it through the control-plane CAS.
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -1571,6 +1598,49 @@ fn run_control_ceremony(config: &Config, command: ControlCommands) -> Result<()>
                     ],
                     // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
                     "Management mutations enabled. Enablement grants no tool to any agent.",
+                )
+            );
+            Ok(())
+        }
+
+        ControlCommands::GrantProposal { client } => {
+            let registration_id = zeroclaw_control::RegistrationId::new(client)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let outcome = zeroclaw_control::grant::grant_proposal_domains(
+                &install_root,
+                &presence,
+                &registration_id,
+                t(
+                    "cli-control-grant-proposal-confirm",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Grant this control client a proposal domain? Type yes to confirm: ",
+                ),
+                t(
+                    "cli-control-grant-proposal-operator",
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Granting operator identity (a registered operator): ",
+                ),
+            )
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let domains = outcome
+                .proposal_domains
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{}",
+                ta(
+                    "cli-control-proposal-granted",
+                    &[
+                        ("registration", outcome.registration_id.as_str()),
+                        ("label", outcome.client_label.as_str()),
+                        ("operator", &outcome.granting_operator),
+                        ("assurance", &outcome.assurance_class),
+                        ("domains", &domains),
+                    ],
+                    // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+                    "Proposal domain granted. The client can now request apply.",
                 )
             );
             Ok(())

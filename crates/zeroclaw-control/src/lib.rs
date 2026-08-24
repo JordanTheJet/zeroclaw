@@ -21,6 +21,7 @@ pub mod approval;
 pub mod ceremony;
 pub mod client_registry;
 pub mod genesis;
+pub mod grant;
 mod guard;
 mod inventory;
 pub mod journal;
@@ -56,11 +57,12 @@ pub use ceremony::{
 pub use client_registry::{
     ClientCredential, ClientGrant, ClientLabel, ClientRegistration, ClientRegistry,
     ClientRegistryError, ClientRegistryErrorCode, CredentialDelivery, CredentialVerifier,
-    RegistrationId, RegistrationStatus,
+    ProposalGrantAudit, ProposalGrantOutcome, RegistrationId, RegistrationStatus,
 };
 pub use genesis::{
     GenesisRecord, InstanceTrustState, KeyCommitment, PresenceClass, RecoveryReason,
 };
+pub use grant::{GrantError, GrantErrorCode, ProposalGrantIssued, grant_proposal_domains};
 pub use guard::{
     EffectivePosture, GuardCode, GuardError, assess_effective_posture, validate_operator_input,
 };

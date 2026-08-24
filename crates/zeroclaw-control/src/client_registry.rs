@@ -161,6 +161,10 @@ pub enum ClientRegistryErrorCode {
     CredentialNotIssued,
     /// The requested credential path is inside an agent workspace root.
     CredentialPathInsideWorkspace,
+    /// No registration with the requested id is present in the registry.
+    UnknownRegistration,
+    /// The registration is revoked and cannot be widened.
+    RegistrationRevoked,
 }
 
 /// A client registration failure.
@@ -197,6 +201,8 @@ impl std::fmt::Display for ClientRegistryError {
             ClientRegistryErrorCode::CredentialPathInsideWorkspace => {
                 "credential path is inside an agent workspace root"
             }
+            ClientRegistryErrorCode::UnknownRegistration => "unknown client registration",
+            ClientRegistryErrorCode::RegistrationRevoked => "client registration is revoked",
         };
         write!(f, "{what}: {}", self.detail)
     }
@@ -583,6 +589,25 @@ impl RegistrationStatus {
     }
 }
 
+/// Provenance of one post-issuance proposal-grant widening.
+///
+/// A registration's `proposal_domains` set is the authoritative grant; this
+/// records *who* widened it, under *what* presence assurance, and *when*, so an
+/// operator can later audit how a client came to hold a proposal domain. It is
+/// attribution only and confers nothing: nothing reads it to make an
+/// authorization decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalGrantAudit {
+    /// The registered operator identity that authorized this widening.
+    pub granting_operator: String,
+    /// The presence assurance class that operator authenticated under.
+    pub assurance_class: String,
+    /// Wall-clock time of the widening, seconds since the Unix epoch.
+    pub granted_at_unix_secs: u64,
+    /// The proposal domains this widening newly added.
+    pub granted_domains: BTreeSet<String>,
+}
+
 /// One registered client.
 ///
 /// There is no `approval_authority` field, and no field whose value could grant
@@ -614,6 +639,12 @@ pub struct ClientRegistration {
     pub ceremony_presence_class: PresenceClass,
     /// Current status.
     pub status: RegistrationStatus,
+    /// Provenance of each post-issuance proposal-grant widening, in the order
+    /// they were applied. Empty for a registration that was only ever issued;
+    /// the grant-proposal ceremony appends one entry per widening. Attribution
+    /// only — the authoritative grant is [`Self::proposal_domains`].
+    #[serde(default)]
+    pub proposal_grant_audit: Vec<ProposalGrantAudit>,
 }
 
 /// The grant a registration is being issued with.
@@ -739,6 +770,9 @@ impl ClientRegistration {
                 created_by_genesis_digest,
                 ceremony_presence_class,
                 status: RegistrationStatus::Active,
+                // A freshly issued registration has been widened by no ceremony
+                // yet. Any proposal domains it holds came from the issuing grant.
+                proposal_grant_audit: Vec::new(),
             },
             credential,
         })
@@ -790,6 +824,20 @@ pub struct ClientRegistry {
     registrations: BTreeMap<RegistrationId, ClientRegistration>,
 }
 
+/// What widening one registration's proposal grant established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalGrantOutcome {
+    /// The registration that was widened.
+    pub registration_id: RegistrationId,
+    /// Its display label, for the operator-facing summary.
+    pub client_label: ClientLabel,
+    /// Every proposal domain the registration now holds after the widening.
+    pub proposal_domains: BTreeSet<String>,
+    /// The domains this call newly added. Empty when every requested domain was
+    /// already held, which is the idempotent no-op case.
+    pub newly_granted: BTreeSet<String>,
+}
+
 impl ClientRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -837,6 +885,81 @@ impl ClientRegistry {
     pub fn is_empty(&self) -> bool {
         self.registrations.is_empty()
     }
+
+    /// Widen one registration's grant to include `domains`, recording the
+    /// widening's provenance.
+    ///
+    /// This is the in-memory half of the grant-proposal ceremony: the caller
+    /// (`crate::grant`) has already authenticated a registered operator through
+    /// user presence, and persists the result with [`save`] afterwards. Nothing
+    /// here authenticates anyone — a registry method cannot, and must not be
+    /// mistaken for the authority that does.
+    ///
+    /// Idempotent: a domain already held is not re-added, and when nothing is
+    /// added no audit entry is appended, so re-running against an
+    /// already-granted registration is a clean no-op that still reports success
+    /// with an empty [`ProposalGrantOutcome::newly_granted`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientRegistryErrorCode::UnknownProposalDomain`] when `domains` names
+    ///   anything outside [`PROPOSAL_DOMAINS_V1`]. An allowlist, so a widening
+    ///   cannot introduce a domain no operation defines.
+    /// - [`ClientRegistryErrorCode::UnknownRegistration`] when no registration
+    ///   has `registration_id`.
+    /// - [`ClientRegistryErrorCode::RegistrationRevoked`] when the registration
+    ///   is revoked. A revoked registration authenticates nothing, so widening
+    ///   its grant would be widening a grant no one can present.
+    pub fn widen_proposal_domains(
+        &mut self,
+        registration_id: &RegistrationId,
+        domains: &[&str],
+        granting_operator: &str,
+        assurance_class: &str,
+        granted_at_unix_secs: u64,
+    ) -> Result<ProposalGrantOutcome, ClientRegistryError> {
+        for domain in domains {
+            if !PROPOSAL_DOMAINS_V1.contains(domain) {
+                return Err(ClientRegistryError::new(
+                    ClientRegistryErrorCode::UnknownProposalDomain,
+                    (*domain).to_owned(),
+                ));
+            }
+        }
+        let registration = self.registrations.get_mut(registration_id).ok_or_else(|| {
+            ClientRegistryError::new(
+                ClientRegistryErrorCode::UnknownRegistration,
+                registration_id.as_str().to_owned(),
+            )
+        })?;
+        if registration.status != RegistrationStatus::Active {
+            return Err(ClientRegistryError::new(
+                ClientRegistryErrorCode::RegistrationRevoked,
+                registration_id.as_str().to_owned(),
+            ));
+        }
+
+        let mut newly_granted = BTreeSet::new();
+        for domain in domains {
+            if registration.proposal_domains.insert((*domain).to_string()) {
+                newly_granted.insert((*domain).to_string());
+            }
+        }
+        if !newly_granted.is_empty() {
+            registration.proposal_grant_audit.push(ProposalGrantAudit {
+                granting_operator: granting_operator.to_owned(),
+                assurance_class: assurance_class.to_owned(),
+                granted_at_unix_secs,
+                granted_domains: newly_granted.clone(),
+            });
+        }
+        Ok(ProposalGrantOutcome {
+            registration_id: registration_id.clone(),
+            client_label: registration.client_label.clone(),
+            proposal_domains: registration.proposal_domains.clone(),
+            newly_granted,
+        })
+    }
 }
 
 /// Absorb one registration.
@@ -857,6 +980,7 @@ fn absorb_registration(out: &mut Vec<u8>, registration: &ClientRegistration) {
         created_by_genesis_digest,
         ceremony_presence_class,
         status,
+        proposal_grant_audit,
     } = registration;
     absorb_str(out, registration_id.as_str());
     absorb_str(out, client_label.as_str());
@@ -879,6 +1003,22 @@ fn absorb_registration(out: &mut Vec<u8>, registration: &ClientRegistration) {
     absorb_field(out, created_by_genesis_digest.as_bytes());
     absorb_str(out, ceremony_presence_class.wire());
     absorb_str(out, status.wire());
+    absorb_u64(out, proposal_grant_audit.len() as u64);
+    for entry in proposal_grant_audit {
+        let ProposalGrantAudit {
+            granting_operator,
+            assurance_class,
+            granted_at_unix_secs,
+            granted_domains,
+        } = entry;
+        absorb_str(out, granting_operator);
+        absorb_str(out, assurance_class);
+        absorb_u64(out, *granted_at_unix_secs);
+        absorb_u64(out, granted_domains.len() as u64);
+        for domain in granted_domains {
+            absorb_str(out, domain);
+        }
+    }
 }
 
 impl CanonicalBytes for ClientRegistry {
@@ -1599,6 +1739,15 @@ mod tests {
         other_status.status = RegistrationStatus::Revoked;
         let mut other_id = base.clone();
         other_id.registration_id = RegistrationId::new("reg-other").expect("id");
+        let mut other_audit = base.clone();
+        other_audit.proposal_grant_audit.push(ProposalGrantAudit {
+            granting_operator: "jordan".to_string(),
+            assurance_class: "terminal".to_string(),
+            granted_at_unix_secs: 1_755_000_001,
+            granted_domains: [crate::principal::PROPOSAL_DOMAIN_AGENT.to_string()]
+                .into_iter()
+                .collect(),
+        });
 
         for (name, variant) in [
             ("registration id", other_id),
@@ -1612,6 +1761,7 @@ mod tests {
             ("created at", other_time),
             ("ceremony anchor", other_anchor),
             ("status", other_status),
+            ("proposal grant audit", other_audit),
         ] {
             let mut encoded = Vec::new();
             absorb_registration(&mut encoded, &variant);
@@ -1723,6 +1873,159 @@ mod tests {
             generated,
             RegistrationId::generate().expect("generate"),
             "registration ids must not repeat"
+        );
+    }
+
+    // -- proposal-grant widening --------------------------------------------
+
+    /// A registration issued read-only: every read domain, no proposal domain.
+    fn read_only_registration(key: &ApprovalAuditKey) -> ClientRegistration {
+        let grant = ClientGrant {
+            client_label: ClientLabel::new("read-only").expect("label"),
+            delivery_assurance: CredentialDelivery::IsolatedDescriptor,
+            granted_instances: [InstanceId::new("inst-default").expect("instance")]
+                .into_iter()
+                .collect(),
+            granted_read_domains: READ_DOMAINS_V1.iter().map(|d| (*d).to_string()).collect(),
+            proposal_domains: BTreeSet::new(),
+        };
+        ClientRegistration::issue(
+            &grant,
+            TrustEpoch::GENESIS,
+            1_755_000_000,
+            GenesisDigest::from_bytes([0xAA; 32]),
+            PresenceClass::Terminal,
+            key,
+        )
+        .expect("issue")
+        .registration
+    }
+
+    #[test]
+    fn widening_a_read_only_registration_grants_the_v1_proposal_domain_and_records_it() {
+        let k = key(0x11);
+        let mut registry = ClientRegistry::new();
+        let reg = read_only_registration(&k);
+        let id = reg.registration_id.clone();
+        assert!(!reg.covers_proposal_domain(crate::principal::PROPOSAL_DOMAIN_AGENT));
+        registry.insert(reg).expect("insert");
+
+        let outcome = registry
+            .widen_proposal_domains(
+                &id,
+                PROPOSAL_DOMAINS_V1,
+                "jordan",
+                "terminal",
+                1_755_000_100,
+            )
+            .expect("widen");
+        assert!(
+            outcome
+                .newly_granted
+                .contains(crate::principal::PROPOSAL_DOMAIN_AGENT)
+        );
+        assert!(
+            outcome
+                .proposal_domains
+                .contains(crate::principal::PROPOSAL_DOMAIN_AGENT)
+        );
+
+        let widened = registry.get(&id).expect("present");
+        assert!(widened.covers_proposal_domain(crate::principal::PROPOSAL_DOMAIN_AGENT));
+        assert_eq!(widened.proposal_grant_audit.len(), 1);
+        let entry = &widened.proposal_grant_audit[0];
+        assert_eq!(entry.granting_operator, "jordan");
+        assert_eq!(entry.assurance_class, "terminal");
+        assert_eq!(entry.granted_at_unix_secs, 1_755_000_100);
+        assert!(
+            entry
+                .granted_domains
+                .contains(crate::principal::PROPOSAL_DOMAIN_AGENT)
+        );
+    }
+
+    #[test]
+    fn widening_is_idempotent_and_appends_no_duplicate_audit() {
+        let k = key(0x11);
+        let mut registry = ClientRegistry::new();
+        let reg = read_only_registration(&k);
+        let id = reg.registration_id.clone();
+        registry.insert(reg).expect("insert");
+
+        registry
+            .widen_proposal_domains(&id, PROPOSAL_DOMAINS_V1, "jordan", "terminal", 1)
+            .expect("first widen");
+        let second = registry
+            .widen_proposal_domains(&id, PROPOSAL_DOMAINS_V1, "jordan", "terminal", 2)
+            .expect("second widen");
+        assert!(second.newly_granted.is_empty(), "nothing new on re-grant");
+        assert!(
+            second
+                .proposal_domains
+                .contains(crate::principal::PROPOSAL_DOMAIN_AGENT)
+        );
+        assert_eq!(
+            registry
+                .get(&id)
+                .expect("present")
+                .proposal_grant_audit
+                .len(),
+            1,
+            "an already-granted domain appends no second audit entry"
+        );
+    }
+
+    #[test]
+    fn widening_an_unknown_registration_is_refused() {
+        let mut registry = ClientRegistry::new();
+        let missing = RegistrationId::new("reg-missing").expect("id");
+        assert_eq!(
+            registry
+                .widen_proposal_domains(&missing, PROPOSAL_DOMAINS_V1, "jordan", "terminal", 1)
+                .expect_err("unknown")
+                .code,
+            ClientRegistryErrorCode::UnknownRegistration
+        );
+    }
+
+    #[test]
+    fn widening_a_revoked_registration_is_refused() {
+        let k = key(0x11);
+        let mut registry = ClientRegistry::new();
+        let mut reg = read_only_registration(&k);
+        reg.status = RegistrationStatus::Revoked;
+        let id = reg.registration_id.clone();
+        registry.insert(reg).expect("insert");
+        assert_eq!(
+            registry
+                .widen_proposal_domains(&id, PROPOSAL_DOMAINS_V1, "jordan", "terminal", 1)
+                .expect_err("revoked")
+                .code,
+            ClientRegistryErrorCode::RegistrationRevoked
+        );
+    }
+
+    #[test]
+    fn widening_an_undefined_proposal_domain_is_refused_and_changes_nothing() {
+        let k = key(0x11);
+        let mut registry = ClientRegistry::new();
+        let reg = read_only_registration(&k);
+        let id = reg.registration_id.clone();
+        registry.insert(reg).expect("insert");
+        assert_eq!(
+            registry
+                .widen_proposal_domains(&id, &["host.shell"], "jordan", "terminal", 1)
+                .expect_err("undefined")
+                .code,
+            ClientRegistryErrorCode::UnknownProposalDomain
+        );
+        assert!(
+            registry
+                .get(&id)
+                .expect("present")
+                .proposal_domains
+                .is_empty(),
+            "a refused widening leaves the grant untouched"
         );
     }
 }

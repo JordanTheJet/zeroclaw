@@ -2654,6 +2654,108 @@ async fn request_apply_refuses_a_read_grant_without_the_proposal_domain() {
 }
 
 #[tokio::test]
+async fn grant_proposal_unlocks_request_apply_for_a_read_only_client() {
+    // The #52 end-to-end unlock: a client registered read-only (the shape
+    // `register-client` issues today) is refused by request_apply until the
+    // host-side grant-proposal ceremony widens its grant, after which the SAME
+    // client can park a proposal. This is the seam the mutation check for the
+    // request_apply authorization targets: reverting the grant to ignore the
+    // newly-granted domain leaves the widened client refused and fails here.
+    let _lock = ENV_LOCK.lock().await;
+    let install = ManagedInstall::new();
+    let _guard = ConfigDirGuard::pin(install.root());
+    enable_mutations(&install);
+
+    // A read-only client: every read domain, no proposal domain.
+    let read_only = ClientGrant {
+        client_label: ClientLabel::new("read-only").expect("label"),
+        delivery_assurance: CredentialDelivery::IsolatedDescriptor,
+        granted_instances: [install.instance_id.clone()].into_iter().collect(),
+        granted_read_domains: client_registry::READ_DOMAINS_V1
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect(),
+        proposal_domains: std::collections::BTreeSet::new(),
+    };
+    let (id, credential_path) = install.register(&read_only, "read-only.cred");
+
+    // Before the grant: request_apply is hidden and refuses on the proposal gate.
+    {
+        let host = start_with_descriptor(&install, &id, &credential_path)
+            .await
+            .expect("the credential authenticates");
+        let server = host.server();
+        let _ = initialize(server).await;
+        let listed =
+            listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+        assert!(
+            !listed.contains(&"control.request_apply".to_string()),
+            "a read-only grant must not see request_apply before the grant"
+        );
+        let refused = exchange(
+            server,
+            &call(2, "control.request_apply", request_apply_args()),
+        )
+        .await;
+        assert_eq!(error_code(&refused), "grant_required");
+        assert!(
+            !journal_path(&install).exists(),
+            "a read-only client parks nothing before the grant"
+        );
+    }
+
+    // The host-side grant-proposal ceremony widens the registration, naming the
+    // genesis first operator ("operator") through the fixture presence adapter.
+    // This is exactly what `zeroclaw control grant-proposal` performs; nothing an
+    // MCP session can reach.
+    let granted = zeroclaw_control::grant::grant_proposal_domains(
+        install.root(),
+        &FixturePresence::new("operator"),
+        &id,
+        "confirm".to_string(),
+        "operator".to_string(),
+    )
+    .expect("the grant-proposal ceremony widens the client's grant");
+    assert!(
+        granted.newly_granted,
+        "the first grant newly adds the domain"
+    );
+    assert!(granted.proposal_domains.contains(PROPOSAL_DOMAIN_AGENT));
+
+    // After the grant: a fresh session (capabilities are not retroactive) now
+    // sees request_apply and parks a durable proposal, changing no config.
+    let host = start_with_descriptor(&install, &id, &credential_path)
+        .await
+        .expect("the credential still authenticates");
+    let server = host.server();
+    let _ = initialize(server).await;
+    let listed = listed_tool_names(&exchange(server, &request(1, "tools/list", json!({}))).await);
+    assert!(
+        listed.contains(&"control.request_apply".to_string()),
+        "the widened client sees request_apply"
+    );
+    let config_before = std::fs::read(&install.config_path).expect("config before");
+    let parked = tool_ok(
+        &exchange(
+            server,
+            &call(2, "control.request_apply", request_apply_args()),
+        )
+        .await,
+    );
+    assert_eq!(parked["state"], json!("awaiting_approval"));
+    assert_eq!(parked["durable"], json!(true));
+    assert!(
+        journal_path(&install).exists(),
+        "the widened client parked a durable proposal"
+    );
+    let config_after = std::fs::read(&install.config_path).expect("config after");
+    assert_eq!(
+        config_before, config_after,
+        "parking changes no config — operator approval is still a separate step"
+    );
+}
+
+#[tokio::test]
 async fn status_and_verify_are_scoped_to_the_owning_requester() {
     let _lock = ENV_LOCK.lock().await;
     let install = ManagedInstall::new();
