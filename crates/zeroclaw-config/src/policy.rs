@@ -3526,14 +3526,38 @@ impl SecurityPolicy {
             // narrower surface than this flag.
             //
             // Scope: the file tools honor this grant because they consult
-            // these allowlists. The shell tool's OS sandbox
-            // (Landlock/Seatbelt) is built from `security.workspace_dir`
-            // alone and does not yet receive the allowed-root tiers, so
-            // shell commands touching `shared/` are denied under an active
-            // sandbox even with this flag on. That mismatch is
-            // fail-closed — an availability inconsistency, not a widening.
-            // Propagating allowlist tiers into the sandbox backends is a
-            // separate runtime change.
+            // these allowlists. Two limits on the SHELL path are worth
+            // stating plainly, because choosing the read-only tier fixes
+            // neither:
+            //
+            // (a) Under an ACTIVE OS sandbox (Landlock/Seatbelt), the
+            //     sandbox is built from `security.workspace_dir` alone and
+            //     does not yet receive the allowed-root tiers, so shell
+            //     commands touching `shared/` are denied even with this
+            //     flag on. Fail-closed — an availability gap, not a
+            //     widening. Tier propagation into the sandbox backends is
+            //     a separate runtime change, tracked by the open sandbox tier-propagation PR.
+            //
+            // (b) Under a DISABLED or pass-through sandbox, the shell's
+            //     static argument scan accepts a resolved path that is
+            //     allowed for reading OR for writing (`is_resolved_path_allowed`
+            //     || `is_resolved_path_readable`, earlier in this file), so
+            //     this read-only tier does not by itself stop a shell
+            //     redirect writing into `shared/`. That is a pre-existing,
+            //     deliberate property of EVERY read-only root — it already
+            //     applies to the `shared/skills/` wire pushed above on
+            //     master — and the scan's own comment says as much: a full
+            //     boundary needs the execution-time sandbox. The OS
+            //     sandbox, not this tier, is the real write boundary for
+            //     shell. The tier remains the boundary for the file tools,
+            //     which is what this flag governs.
+            //
+            // Discoverability: `is_under_allowed_root` (glob-style path
+            // search) deliberately reads only the read-write and
+            // write-only tiers, so paths under `shared/` are readable via
+            // the file tools but are not enumerated by that search. Pinned
+            // on master by
+            // `is_under_allowed_root_does_not_see_read_only_entries`.
             if agent_cfg.can_use_shared_workspace {
                 policy
                     .allowed_roots_read_only

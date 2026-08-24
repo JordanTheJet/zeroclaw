@@ -3771,9 +3771,10 @@ pub struct AliasedAgentConfig {
     /// Deny by default. `false` — the default, and the value every config
     /// written before this flag existed carries — leaves the agent's reach
     /// exactly as it was: nothing under `<install>/shared/` except the
-    /// code-enforced `shared/skills/<bundle-alias>/` read-only wire that
+    /// code-enforced `shared/skills/` read-only wire that
     /// `SecurityPolicy::for_agent` installs for every agent regardless of
-    /// this flag.
+    /// this flag. (That wire covers the whole `shared/skills/` directory,
+    /// not a per-bundle subdirectory.)
     ///
     /// `true` puts `<install>/shared/` on the READ-ONLY allowlist tier
     /// (`SecurityPolicy::allowed_roots_read_only`): the agent may read
@@ -3794,11 +3795,23 @@ pub struct AliasedAgentConfig {
     /// install that points `data_dir` elsewhere still shares the directory
     /// beside `config.toml`.
     ///
-    /// Scope: the file tools honor this grant. The shell tool's OS sandbox
-    /// (Landlock/Seatbelt) is currently built from the workspace dir alone
-    /// and does not yet receive allowlist tiers, so shell commands
-    /// touching `shared/` are denied under an active sandbox even with the
-    /// flag on. Fail-closed, but worth knowing before filing a bug.
+    /// Scope — the file tools honor this tier in every case; the shell
+    /// path has two limits the tier does not fix. With an OS sandbox
+    /// active (Landlock/Seatbelt), shell commands touching `shared/` are
+    /// denied outright, because the sandbox is built from the workspace
+    /// dir alone and does not yet receive allowlist tiers — fail-closed,
+    /// an availability gap, tracked by the open sandbox tier-propagation PR. With the sandbox
+    /// disabled or pass-through, the shell's static argument scan accepts
+    /// a resolved path allowed for reading OR for writing, so this
+    /// read-only tier does not by itself stop a shell redirect writing
+    /// into `shared/`; that is a pre-existing property of every read-only
+    /// root (the `shared/skills/` wire included), and the OS sandbox, not
+    /// the tier, is the real write boundary for shell.
+    ///
+    /// Discoverability: glob-style path search goes through
+    /// `SecurityPolicy::is_under_allowed_root`, which deliberately ignores
+    /// the read-only tier, so files under `shared/` are readable by the
+    /// file tools but are not enumerated by that search.
     ///
     /// Env opt-in follows the usual convention:
     /// `ZEROCLAW_agents__<alias>__can_use_shared_workspace=true`.
