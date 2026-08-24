@@ -781,6 +781,12 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
+/// Advance or disable an overdue job at startup without executing it.
+///
+/// Both updates skip rows with a live claim. Startup can race a manual trigger
+/// that the gateway accepted before the scheduler finished initializing, and
+/// rewriting `next_run` or disabling a row underneath that run would clobber
+/// the state its own completion is about to write.
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
     if matches!(job.schedule, Schedule::At { .. }) {
         // One-shot job whose scheduled moment has already passed —
@@ -790,7 +796,7 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
             conn.execute(
                 "UPDATE cron_jobs
                  SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
-                 WHERE id = ?3",
+                 WHERE id = ?3 AND locked_at IS NULL",
                 params![now.to_rfc3339(), bounded_output, job.id],
             )
             .context("Failed to disable overdue one-shot cron job on startup skip")?;
@@ -801,7 +807,7 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
         let next_run = next_run_for_schedule(&job.schedule, now)?;
         with_initialized_connection(config, |conn| {
             conn.execute(
-                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2 AND locked_at IS NULL",
                 params![next_run.to_rfc3339(), job.id],
             )
             .context("Failed to advance next_run on startup skip")?;
