@@ -686,6 +686,7 @@ pub async fn handle_sop_rename(
             let code = match e {
                 zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
                 zeroclaw_runtime::sop::SopAuthorError::AlreadyExists(_) => StatusCode::CONFLICT,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 zeroclaw_runtime::sop::SopAuthorError::Other(_) => StatusCode::BAD_REQUEST,
             };
             (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()

@@ -102,8 +102,10 @@ A rename:
   other name-taking SOP operation applies;
 - re-runs strict save validation, so it cannot put a definition back on disk
   that the authoring surface would have refused to write;
-- changes only `[sop] name` in `SOP.toml`. Steps, triggers, comments, and
-  `SOP.md` are left exactly as they were.
+- changes only the `[sop] name` value in `SOP.toml`, keeping that line's own
+  comment and spacing. Steps, triggers, other comments, and `SOP.md` are left
+  exactly as they were; the one cosmetic change is that a single-quoted name
+  comes back double-quoted.
 
 The directory move is a single filesystem rename and it happens last, so the SOP
 exists in exactly one place at every instant: an interrupted rename can leave
@@ -116,5 +118,10 @@ Renaming rewrites the definition on disk, exactly like saving or deleting one. A
 daemon that already loaded the old definition keeps running it until it reloads
 its SOPs, and run history, audit records, and anything else that captured the old
 name keeps the old name.
+
+Rename assumes one writer at a time, as saving and deleting do. Running the CLI
+against a SOP root a daemon is authoring into, or firing two renames at the same
+SOP at once, can interleave the manifest rewrite with another write; there is no
+cross-process lock on the SOP root.
 
 For trigger routing and auth details, see [SOP Fan-In](./fan-in/overview.md).

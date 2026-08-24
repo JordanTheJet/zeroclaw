@@ -284,6 +284,9 @@ pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
 pub enum SopAuthorError {
     AlreadyExists(String),
     NotFound(String),
+    /// The request was fine; the filesystem was not. Transports map this to a
+    /// server error, never to a client input error.
+    Io(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -292,7 +295,7 @@ impl std::fmt::Display for SopAuthorError {
         match self {
             SopAuthorError::AlreadyExists(name) => write!(f, "SOP '{name}' already exists"),
             SopAuthorError::NotFound(name) => write!(f, "SOP '{name}' not found"),
-            SopAuthorError::Other(e) => write!(f, "{e}"),
+            SopAuthorError::Io(e) | SopAuthorError::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -319,12 +322,18 @@ pub fn delete_sop_typed(sops_dir: &Path, name: &str) -> std::result::Result<(), 
 /// and update the manifest's `[sop] name` so the directory and the name the
 /// runtime loads stay in agreement.
 ///
-/// Rename is a pure identity change. Only `[sop] name` in `SOP.toml` is
-/// rewritten; steps, triggers, comments, key order, and every other manifest
-/// key are left byte-for-byte alone, and `SOP.md` is never touched. That
-/// keeps a rename from quietly materializing defaults (an execution mode the
-/// manifest deliberately left unset, say) the way a load/save round trip
-/// would.
+/// Rename is a pure identity change. Only the `[sop] name` value in
+/// `SOP.toml` is rewritten, keeping that line's own comment and spacing;
+/// steps, triggers, key order, and every other manifest key are left alone,
+/// and `SOP.md` is never touched. That keeps a rename from quietly
+/// materializing defaults (an execution mode the manifest deliberately left
+/// unset, say) the way a load/save round trip would. The one cosmetic change
+/// is quote style: a single-quoted name comes back double-quoted.
+///
+/// One writer at a time. A concurrent `save_sop`, `create_sop_typed`, or
+/// second rename against the same SOP can interleave with the steps below;
+/// the authoring surfaces are a single daemon, and nothing here adds
+/// cross-process locking.
 ///
 /// Ordering is what makes this safe against an interrupted rename. The
 /// directory move is a single `rename(2)`, and it goes last:
@@ -370,7 +379,7 @@ pub fn rename_sop_typed(
 
     // Strict-save validation still applies: a rename cannot put a SOP back on
     // disk that `save_sop` would have refused to write in the first place.
-    let mut renamed = load_sop(&from_dir, default_execution_mode).map_err(SopAuthorError::Other)?;
+    let mut renamed = load_sop(&from_dir, default_execution_mode).map_err(classify_author_error)?;
     renamed.name = to.to_string();
     let validation = validate_sop_strict(&renamed);
     if !validation.is_ok() {
@@ -382,20 +391,37 @@ pub fn rename_sop_typed(
 
     let manifest_path = from_dir.join("SOP.toml");
     let original =
-        std::fs::read_to_string(&manifest_path).map_err(|e| SopAuthorError::Other(e.into()))?;
+        std::fs::read_to_string(&manifest_path).map_err(|e| SopAuthorError::Io(e.into()))?;
     let updated = manifest_with_name(&original, to).map_err(SopAuthorError::Other)?;
 
-    write_file_atomic(&manifest_path, &updated).map_err(SopAuthorError::Other)?;
+    write_file_atomic(&manifest_path, &updated).map_err(SopAuthorError::Io)?;
     if let Err(e) = std::fs::rename(&from_dir, &to_dir) {
         // The move is the commit point; it did not happen, so put the old
         // name back rather than leaving a directory that disagrees with its
-        // manifest.
-        let _ = write_file_atomic(&manifest_path, &original);
-        return Err(SopAuthorError::Other(
-            anyhow::Error::new(e).context(format!("failed to move SOP '{from}' to '{to}'")),
-        ));
+        // manifest. If even that fails the SOP is left in the mismatched
+        // state, so the caller has to hear about it.
+        let mut msg = format!("failed to move SOP '{from}' to '{to}': {e}");
+        if let Err(rollback) = write_file_atomic(&manifest_path, &original) {
+            msg.push_str(&format!(
+                "; the manifest could not be rolled back and still names '{to}' \
+                 (re-run the rename to finish it): {rollback}"
+            ));
+        }
+        return Err(SopAuthorError::Io(anyhow::Error::msg(msg)));
     }
     Ok(())
+}
+
+/// Split a failure into "the filesystem broke" and "the SOP is wrong", so a
+/// transport can answer a caller with a server error rather than telling them
+/// to fix input that was never the problem. A malformed manifest is the
+/// caller's; an unreadable one is ours.
+fn classify_author_error(e: anyhow::Error) -> SopAuthorError {
+    if e.chain().any(|cause| cause.is::<std::io::Error>()) {
+        SopAuthorError::Io(e)
+    } else {
+        SopAuthorError::Other(e)
+    }
 }
 
 /// Whether anything already occupies `path`, a broken symlink included -
@@ -426,8 +452,18 @@ fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
         .get_mut("sop")
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| anyhow::Error::msg("SOP.toml has no [sop] table"))?;
-    match table.get_mut("name") {
-        Some(existing) => *existing = toml_edit::value(new_name),
+    match table
+        .get_mut("name")
+        .and_then(toml_edit::Item::as_value_mut)
+    {
+        // Swap the string in place and put the original decor back, so a
+        // trailing comment on the name line (`name = "x" # note`) and the
+        // surrounding whitespace survive the edit.
+        Some(existing) => {
+            let decor = existing.decor().clone();
+            *existing = toml_edit::Value::from(new_name);
+            *existing.decor_mut() = decor;
+        }
         None => {
             table.insert("name", toml_edit::value(new_name));
         }
@@ -435,34 +471,30 @@ fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
-/// Replace a file's contents atomically: write a sibling temp file, flush it
+/// Replace a file's contents atomically: stage a sibling temp file, flush it
 /// to disk, then rename it over the target. Readers see either the old
 /// contents or the new ones, never a half-written file.
+///
+/// The staging file is created fresh and exclusively under a name nothing can
+/// predict. A fixed name like `.SOP.toml.tmp` would be wrong twice over: two
+/// concurrent writers would share one staging path and could commit each
+/// other's bytes, and a symlink planted at that name would be followed and its
+/// target truncated. The target's permissions carry over, so replacing the
+/// inode cannot widen a deliberately tight manifest mode.
 fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write as _;
 
-    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
+    let Some(dir) = path.parent() else {
         anyhow::bail!("cannot write '{}': no parent directory", path.display());
     };
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(file_name);
-    tmp_name.push(".tmp");
-    let tmp = dir.join(tmp_name);
 
-    let mut file = std::fs::File::create(&tmp)?;
-    if let Err(e) = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-    {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        tmp.as_file().set_permissions(existing.permissions())?;
     }
-    drop(file);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    tmp.persist(path).map_err(|e| anyhow::Error::new(e.error))?;
     Ok(())
 }
 
@@ -1843,6 +1875,99 @@ mod tests {
         assert!(dir.path().join("authoring").exists());
     }
 
+    #[test]
+    fn rename_sop_keeps_a_trailing_comment_on_the_name_line() {
+        // The name line is the one line a rename edits, so it is the line most
+        // at risk of losing its decoration. Swapping the whole TOML item would
+        // drop the comment; only the string may change.
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let manifest_path = dir.path().join("authoring").join("SOP.toml");
+        let annotated = std::fs::read_to_string(&manifest_path).unwrap().replace(
+            "name = \"authoring\"",
+            "name = \"authoring\" # operator note, keep me",
+        );
+        std::fs::write(&manifest_path, &annotated).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("renamed").join("SOP.toml")).unwrap();
+        assert!(
+            after.contains("name = \"renamed\" # operator note, keep me"),
+            "the comment on the renamed line must survive: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_preserves_the_manifest_file_mode() {
+        // The manifest is replaced by renaming a fresh file over it, which
+        // would otherwise hand it whatever mode the umask dictates and widen a
+        // deliberately tight one.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let manifest_path = dir.path().join("authoring").join("SOP.toml");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("renamed").join("SOP.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a rename must not widen the manifest's mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_does_not_write_through_a_planted_staging_symlink() {
+        // A predictable staging name (`.SOP.toml.tmp`) would be followed and
+        // its target truncated. Staging under an unpredictable, exclusively
+        // created name means a planted link is simply never opened.
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let outside = dir.path().join("outside-victim");
+        std::fs::write(&outside, "do not truncate me").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("authoring/.SOP.toml.tmp")).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "do not truncate me",
+            "the staging write must not follow a planted symlink"
+        );
+        let after = std::fs::read_to_string(dir.path().join("renamed").join("SOP.toml")).unwrap();
+        assert!(after.contains("name = \"renamed\""), "{after}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rename_sop_rolls_back_the_manifest_when_the_move_fails() {
@@ -1876,6 +2001,10 @@ mod tests {
         .expect_err("a move that cannot happen must not report success");
         std::fs::set_permissions(dir.path(), root_perms).unwrap();
 
+        assert!(
+            matches!(err, SopAuthorError::Io(_)),
+            "a failed move is a filesystem failure, not a bad request: {err:?}"
+        );
         assert!(err.to_string().contains("failed to move"), "{err}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("authoring").join("SOP.toml")).unwrap(),
