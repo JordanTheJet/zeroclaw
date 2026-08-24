@@ -79,14 +79,13 @@ Newline-delimited JSON, one request per line, one response per line. Request cap
 | `screenshot` | `max_width` (default 540) | returns a bounded base64 PNG; the Rust client writes the temporary image file |
 | `read` | `max_depth` (default 15) | flattened node list: text, desc, class, clickable, bounds, center |
 | `foreground` | — | current package and optional activity |
-| `foreground` | — | current package + activity |
 | `tap` | `expect_package` + `{x,y}` **or** `{text}` | target revalidated at execution time |
 | `swipe` | `expect_package`, `x1,y1,x2,y2`, `duration_ms` (300) | |
 | `scroll` | `expect_package`, `direction`, optional `x,y` | |
 | `text` | `expect_package`, `text` | types into the focused editable |
 | `key` | `expect_package`, `key` | `back`, `home`, `recents`, … |
 | `device` | `what` | read-only sensors, location, or telephony facts |
-| `dialog` | `expect_package`, `button=allow|deny` | privileged path, separate from ordinary actions |
+| `dialog` | `expect_package`, `button=allow\|deny` | privileged path, separate from ordinary actions |
 
 Error codes: `service_unavailable`, `bad_args`, `timeout`, `no_focus`, `not_found`,
 `screenshot_failed`, `unsupported_op`, and `internal`. The canonical wire spec lives at
