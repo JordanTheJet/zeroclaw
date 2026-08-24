@@ -123,7 +123,8 @@ Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
 
 The protocol specifies:
 - **What to fetch** (PR metadata, comments, inline threads, formal reviews,
-  diff, RFCs) — run all fetches in a single parallel batch
+  diff, RFCs, current merge state, base drift, and required checks) — run all
+  fetches in a single parallel batch
 - **Which foundations documents to read** based on what the PR touches — the
   relevance table is in the protocol; always read at minimum
   `docs/book/src/foundations/fnd-005-contribution-culture.md`
@@ -135,6 +136,9 @@ The protocol specifies:
 - **Template and public-artifact checks** — run the checks defined in the
   protocol before approving
 - **The verdict decision tree** — which flag to use based on review state
+- **CI freshness and base-drift classification** — current GitHub state and
+  the protocol's precedence rules keep refresh-and-rerun-only findings as
+  warnings without hiding current failures, evidence gaps, or conflicts
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the
   taxonomy emoji
