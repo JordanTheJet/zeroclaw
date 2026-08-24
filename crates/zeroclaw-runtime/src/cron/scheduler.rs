@@ -600,6 +600,18 @@ pub async fn run(
 }
 
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
+    // A declarative job's owner is whichever agent lists it in `cron_jobs`
+    // today, not whichever alias happened to be stored when the row was first
+    // synced. The stored alias is not refreshed when config membership moves,
+    // so preferring it would run the job -- and its config-declared pre_hook --
+    // under the previous owner's allowed commands, workspace roots, autonomy,
+    // and action budget. Live config is the source of truth here.
+    if job.source == "declarative"
+        && let Some(alias) = config.agent_for_cron_job(&job.id)
+    {
+        return Some(alias);
+    }
+
     if !job.agent_alias.is_empty()
         && let Some((alias, _)) = config
             .agents
@@ -3930,6 +3942,118 @@ mod tests {
         // The delivery error is appended, but the cause of death stays the gate.
         assert_eq!(outcome.status, STATUS_PRECONDITION_FAILED);
         assert!(outcome.output.contains("delivery failed"));
+    }
+
+    // ── Ownership resolution for declarative jobs ────────────────────
+
+    #[tokio::test]
+    async fn declarative_gate_runs_under_the_current_owner_not_the_stored_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+
+        // Old owner: allowed to run the hook. New owner: not allowed.
+        const NEW_AGENT: &str = "new-owner";
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["exit".into(), "echo".into()];
+        config.risk_profiles.insert(
+            NEW_AGENT.to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                allowed_commands: vec!["echo".into()],
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            NEW_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.providers.models.openrouter.insert(
+            NEW_AGENT.to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+        );
+        config.agents.insert(
+            NEW_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{NEW_AGENT}").into(),
+                risk_profile: NEW_AGENT.into(),
+                runtime_profile: NEW_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        let job = declarative_gated_job(&mut config, "moved-job", "exit 0", 30);
+        // Sync stamped the owner onto the row. That stored alias is exactly
+        // what goes stale when config membership later moves.
+        assert_eq!(job.agent_alias, TEST_AGENT);
+
+        // Move ownership in live config, exactly as an operator edit would.
+        // The stored row is not rewritten, which is the point of the test.
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("old owner exists")
+            .cron_jobs
+            .retain(|c| c != "moved-job");
+        config
+            .agents
+            .get_mut(NEW_AGENT)
+            .expect("new owner exists")
+            .cron_jobs
+            .push("moved-job".to_string());
+
+        // The row still carries the old owner; only live config moved.
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        // Under the old owner `exit` is allowed and the gate would pass. Under
+        // the new owner it is not, so a correct resolver refuses the hook.
+        assert_eq!(
+            result.status, STATUS_PRECONDITION_FAILED,
+            "the gate must be authorized against the current owner: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("blocked by security policy"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn imperative_jobs_still_resolve_through_their_stored_alias() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo owned");
+
+        // Imperative rows carry their owner on the row; live `cron_jobs`
+        // membership does not name them, so the stored alias must still win.
+        assert_eq!(resolve_owning_agent(&config, &job), Some(TEST_AGENT));
+    }
+
+    // ── Startup recovery must not mutate a claimed row ───────────────
+
+    #[tokio::test]
+    async fn startup_skip_leaves_a_claimed_row_alone() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "startup-race", "exit 0", 30);
+
+        // A manual trigger accepted before the scheduler finished starting.
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let before = cron::get_job(&config, &job.id).unwrap();
+
+        // Startup recovery then reaches this overdue row.
+        cron::skip_missed_run(&config, &before, Utc::now() + ChronoDuration::hours(1))
+            .expect("skip should not error on a claimed row");
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            after.next_run, before.next_run,
+            "startup skip must not advance a row that another owner is running"
+        );
+        assert!(after.enabled, "startup skip must not disable a claimed row");
     }
 
     // ── Manual-run ownership: the claim must cover the gate too ──────
