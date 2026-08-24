@@ -21,7 +21,9 @@
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
-mod ws_accept;
+mod frontdoor;
+mod frontdoor_assets;
+mod frontdoor_tls_assets;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -158,6 +160,13 @@ pub struct RelayConfig {
     /// shared-token modes one permitted party can mint unlimited signing keys
     /// and node-ids, so the registry needs its own aggregate bound.
     pub max_registered_nodes: usize,
+    /// Serve the browser enrollment frontdoor (HTML/JS/worker) from this relay.
+    /// OFF by default: a relay that serves enrollment code is a TRUSTED code
+    /// origin for those browsers - it could substitute JS that leaks the
+    /// pairing code or key material - so enabling it is an explicit, documented
+    /// narrowing of the blind-forwarder guarantee.
+    /// zerocode/native enrollment is relay-blind regardless of this knob.
+    pub frontdoor_enabled: bool,
 }
 
 impl RelayConfig {
@@ -190,6 +199,7 @@ impl Default for RelayConfig {
             max_pending_handshakes: 256,
             handshake_timeout: Duration::from_secs(10),
             max_registered_nodes: 1024,
+            frontdoor_enabled: false,
         }
     }
 }
@@ -338,6 +348,9 @@ struct Inner {
     handshake_permits: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
     max_registered_nodes: usize,
+    /// Serve the browser frontdoor over plain HTTP hits (opt-in; see
+    /// [`RelayConfig::frontdoor_enabled`]).
+    frontdoor_enabled: bool,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
@@ -422,6 +435,7 @@ impl RelayServer {
                 )),
                 handshake_timeout: cfg.handshake_timeout,
                 max_registered_nodes: cfg.max_registered_nodes.max(1),
+                frontdoor_enabled: cfg.frontdoor_enabled,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
@@ -480,8 +494,8 @@ impl RelayServer {
             };
             tokio::spawn(async move {
                 // ONE absolute deadline for the whole pre-admission sequence:
-                // TLS accept, the HTTP/WebSocket upgrade, the first control
-                // frame, and - on the daemon path -
+                // TLS accept, the HTTP/WS upgrade (including a frontdoor HTTP
+                // response), the first control frame, and - on the daemon path -
                 // the signed registration exchange in `handle_daemon`. A fresh
                 // relative timeout per phase would let a peer spend the full
                 // `handshake_timeout` in EACH phase, so the effective budget was
@@ -505,9 +519,9 @@ impl RelayServer {
                     } else {
                         None
                     };
-                    match ws_accept::accept_websocket(accepted).await {
-                        Ok(ws_accept::Accepted::WebSocket(w)) => Some((w, cert_node_id)),
-                        Ok(ws_accept::Accepted::Rejected) | Err(_) => None,
+                    match frontdoor::accept_or_serve(accepted, hs_inner.frontdoor_enabled).await {
+                        Ok(frontdoor::Frontdoor::WebSocket(w)) => Some((w, cert_node_id)),
+                        Ok(frontdoor::Frontdoor::ServedHttp) | Err(_) => None,
                     }
                 };
                 let Ok(Some((ws, cert_node_id))) =
