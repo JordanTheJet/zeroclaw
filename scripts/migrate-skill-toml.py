@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 # Top-level keys the retired SkillForge integrator emitted inside `[skill]`
-# that must be moved to `[forge]`. The generator was removed in #8309; this
+# that must be moved to `[forge]`. The generator itself has been removed; this
 # list is a frozen compatibility contract for manifests it emitted while it
 # existed, and must not change.
 PROVENANCE_KEYS: Tuple[str, ...] = (
