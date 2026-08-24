@@ -19,10 +19,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use zeroclaw_plugins::component::PluginLimits;
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::egress::{EgressHostService, EgressPolicy, EgressPolicyResolver};
 use zeroclaw_plugins::instance::PluginInstanceScope;
+use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 // ── fixture provisioning ──────────────────────────────────────────
@@ -68,6 +71,7 @@ fn limits() -> PluginLimits {
         max_memory_bytes: 64 * 1024 * 1024,
         max_table_elements: 10_000,
         max_instances: 32,
+        call_timeout: Duration::from_secs(30),
     }
 }
 
@@ -114,18 +118,28 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
     )
     .expect("admit fixture scope");
 
-    let mut plugin =
-        zeroclaw_plugins::runtime::create_plugin_with_egress(&fixture(), &scope, limits(), egress)
-            .await
-            .expect("instantiate fixture tool");
+    // The fixture requests no `config_read` and declares no schema, so the
+    // injected config service resolves to the empty validated view production
+    // would hand the guest.
+    let services = {
+        let manifest = manifest.clone();
+        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, None)
+        }))
+    };
 
-    // The fixture requests no `config_read` and declares no schema, so this
-    // resolves to the empty validated view production would hand the guest.
-    let resolved = zeroclaw_plugins::config::resolve_plugin_config(&manifest, &scope, None)
-        .expect("resolve empty fixture config");
+    let mut plugin = zeroclaw_plugins::runtime::create_plugin_with_egress(
+        &fixture(),
+        &scope,
+        &services,
+        limits(),
+        egress,
+    )
+    .await
+    .expect("instantiate fixture tool");
 
     let args = format!(r#"{{"url":"{url}","follow":{follow}}}"#);
-    let result = zeroclaw_plugins::runtime::call_execute(&mut plugin, args.as_bytes(), &resolved)
+    let result = zeroclaw_plugins::runtime::call_execute(&mut plugin, args.as_bytes())
         .await
         .expect("fixture execute must return, denied or not");
     assert!(result.success, "fixture reported failure: {result:?}");
