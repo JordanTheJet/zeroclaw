@@ -354,7 +354,10 @@ pub async fn initiate_pairing(
         return e.into_response();
     }
 
-    match state.pairing.generate_new_pairing_code() {
+    match state
+        .pairing
+        .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
+    {
         Some(code) => Json(serde_json::json!({
             "pairing_code": code,
             "message": "New pairing code generated"
@@ -707,7 +710,7 @@ pub async fn rotate_token(
     // flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state.pairing.generate_pairing_code_if_vacant() {
+    match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
@@ -775,7 +778,7 @@ mod tests {
         // Issue a pairing code so the next `try_pair` succeeds.
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let (status, body) = response_json(
@@ -827,7 +830,7 @@ mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let (status, body) = response_json(

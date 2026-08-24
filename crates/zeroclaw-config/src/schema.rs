@@ -26232,7 +26232,7 @@ enabled = true
     }
 
     /// The dashboard/API pairing flow and startup pairing must agree,
-    /// because they are the same guard built from the same config value.
+    /// because both resolve the same `[gateway.pairing_code]` value.
     #[test]
     async fn dashboard_and_startup_pairing_share_one_policy() {
         let config: Config =
@@ -26242,14 +26242,43 @@ enabled = true
 
         // Startup code (what the banner prints).
         let startup = guard.pairing_code().expect("startup code");
-        // Dashboard code (`POST /api/pairing/initiate`).
-        let dashboard = guard.generate_new_pairing_code().expect("dashboard code");
+        // Dashboard code (`POST /api/pairing/initiate`) — the gateway
+        // re-reads live config for this argument on every mint.
+        let dashboard = guard
+            .generate_new_pairing_code(config.gateway.pairing_code)
+            .expect("dashboard code");
 
         for code in [&startup, &dashboard] {
             assert_eq!(code.len(), 12, "code {code} must follow the config");
             assert!(code.chars().all(|c| c.is_ascii_digit()));
         }
-        assert_eq!(guard.code_policy(), config.gateway.pairing_code);
+    }
+
+    /// Review MAJOR-1, config half: strengthening `[gateway.pairing_code]`
+    /// changes what the *same* guard mints, with no reconstruction. Mirrors
+    /// how the gateway swaps the whole `Config` on a config write.
+    #[test]
+    async fn a_strengthened_policy_applies_without_rebuilding_the_guard() {
+        let weak: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 6\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], weak.gateway.pairing_code);
+        assert_eq!(guard.pairing_code().expect("startup code").len(), 6);
+
+        // Operator edits config; the gateway replaces the whole Config.
+        let strong: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 28\ncharset = \"unambiguous\"\n")
+                .expect("parses");
+        let minted = guard
+            .generate_new_pairing_code(strong.gateway.pairing_code)
+            .expect("mint under the new policy");
+
+        assert_eq!(minted.len(), 28, "next code must follow the new policy");
+        let alphabet = strong.gateway.pairing_code.charset.alphabet();
+        assert!(
+            minted.bytes().all(|b| alphabet.contains(&b)),
+            "code {minted} must use the new charset"
+        );
     }
 
     fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {

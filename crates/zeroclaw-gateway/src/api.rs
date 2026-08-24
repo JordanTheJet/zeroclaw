@@ -5164,7 +5164,7 @@ pub(crate) mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = submit_pairing_enhanced(
@@ -5248,7 +5248,7 @@ pub(crate) mod tests {
 
         let pending_code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = rotate_device_token(
@@ -5298,7 +5298,7 @@ pub(crate) mod tests {
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing
-                .generate_new_pairing_code()
+                .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
             registry

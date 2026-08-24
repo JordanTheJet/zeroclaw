@@ -326,6 +326,10 @@ function PairingDialog({
         )}
 
         <form onSubmit={handleSubmit}>
+          {/* Pairing codes are case-sensitive alphanumeric by default
+              (#6613). Mobile keyboards auto-capitalise and autocorrect free
+              text, which silently corrupts a typed or pasted code, so both
+              are turned off here. */}
           <input
             type="text"
             value={code}
@@ -333,6 +337,9 @@ function PairingDialog({
             placeholder="pairing code"
             className="input-electric w-full px-4 py-4 text-center text-xl tracking-widest font-medium mb-4"
             maxLength={128}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
             autoFocus
           />
           {error && (

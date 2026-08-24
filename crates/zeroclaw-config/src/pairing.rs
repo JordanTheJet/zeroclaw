@@ -71,6 +71,23 @@ impl PairingCodeCharset {
     pub fn bits_per_char(self) -> f64 {
         (self.alphabet().len() as f64).log2()
     }
+
+    /// The name this family is written as in `config.toml`.
+    ///
+    /// Must stay in step with the `serde(rename_all = "snake_case")` above;
+    /// `charset_config_names_match_serde` pins that.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Numeric => "numeric",
+            Self::Alphanumeric => "alphanumeric",
+            Self::Unambiguous => "unambiguous",
+        }
+    }
+
+    /// Every supported family, for exhaustive tests and docs.
+    pub fn all() -> [Self; 3] {
+        [Self::Numeric, Self::Alphanumeric, Self::Unambiguous]
+    }
 }
 
 /// Why a [`PairingCodePolicy`] is not usable.
@@ -185,14 +202,28 @@ impl PairingCodePolicy {
         Ok(())
     }
 
+    /// The length generation will actually use, paired with the configured
+    /// length it replaced when the two differ.
+    ///
+    /// Split out from [`Self::generate`] so the clamp decision is a plain
+    /// value a test can assert on directly, independent of the WARN that
+    /// [`Self::generate`] emits when it fires.
+    pub fn resolve_length(&self) -> (usize, Option<usize>) {
+        let effective = self
+            .length
+            .clamp(PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH);
+        let clamped_from = (effective != self.length).then_some(self.length);
+        (effective, clamped_from)
+    }
+
     /// The length actually used for generation.
     ///
-    /// `Config::validate` rejects an out-of-range length at load, so this
-    /// clamp is defence in depth for a policy built by other means — a
-    /// generator must never panic or emit a zero-length code.
+    /// `Config::validate` rejects an out-of-range length, and the gateway
+    /// `PATCH /api/config` path refuses such a write outright, so reaching
+    /// the clamp means the policy was built by some other route. Generation
+    /// must still never panic or emit a zero-length code.
     pub fn effective_length(&self) -> usize {
-        self.length
-            .clamp(PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH)
+        self.resolve_length().0
     }
 
     /// Shannon entropy of a code generated under this policy, in bits.
@@ -215,7 +246,24 @@ impl PairingCodePolicy {
         // rejected to keep the modulo unbiased.
         let reject_threshold = (u32::MAX / n) * n;
 
-        let length = self.effective_length();
+        let (length, clamped_from) = self.resolve_length();
+        if let Some(configured) = clamped_from {
+            // Never silently downgrade or inflate a pairing code: the
+            // operator asked for one strength and is getting another.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_length": configured,
+                        "effective_length": length,
+                        "min": PAIRING_CODE_MIN_LENGTH,
+                        "max": PAIRING_CODE_MAX_LENGTH,
+                    })),
+                "[gateway.pairing_code] length is out of range; generating at the clamped \
+                 length instead — fix `gateway.pairing_code.length` in config.toml"
+            );
+        }
         let mut code = String::with_capacity(length);
         for _ in 0..length {
             loop {
@@ -258,16 +306,17 @@ pub struct PairingGuard {
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
-    /// The shared policy every code this guard issues is drawn from.
-    code_policy: PairingCodePolicy,
 }
 
 impl PairingGuard {
-    /// Build a guard that issues codes under `code_policy`.
+    /// Build a guard, minting the startup code under `code_policy`.
     ///
-    /// The policy is a required argument rather than a defaulted one so that
-    /// every construction site — production wiring and tests alike — states
-    /// which pairing-code strength it means.
+    /// The policy is **not** retained. `PairingGuard` outlives any number of
+    /// config writes, and root `AGENTS.md` forbids snapshotting live policy
+    /// into a long-lived handle — a code minted after an operator strengthens
+    /// `[gateway.pairing_code]` must use the new policy without a restart.
+    /// Every later mint therefore takes the policy the caller resolved from
+    /// live config at that moment.
     pub fn new(
         require_pairing: bool,
         existing_tokens: &[String],
@@ -293,13 +342,7 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
-            code_policy,
         }
-    }
-
-    /// The pairing-code policy in force for this guard.
-    pub fn code_policy(&self) -> PairingCodePolicy {
-        self.code_policy
     }
 
     /// The one-time pairing code (generated only on first startup when no tokens exist).
@@ -457,16 +500,28 @@ impl PairingGuard {
     /// Generate a new pairing code that pairs an additional client.
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.
-    pub fn generate_new_pairing_code(&self) -> Option<String> {
+    ///
+    /// `code_policy` is passed per call, resolved by the caller from live
+    /// config at this moment — the guard holds no policy of its own, so an
+    /// operator who strengthens `[gateway.pairing_code]` sees the next code
+    /// follow the new policy without a restart.
+    pub fn generate_new_pairing_code(&self, code_policy: PairingCodePolicy) -> Option<String> {
         if !self.require_pairing {
             return None;
         }
-        let new_code = self.code_policy.generate();
+        let new_code = code_policy.generate();
         *self.pairing_code.lock() = Some(new_code.clone());
         Some(new_code)
     }
 
-    pub fn generate_pairing_code_if_vacant(&self) -> Result<String, GeneratePairingCodeError> {
+    /// Issue a code only if no code is currently pending.
+    ///
+    /// `code_policy` is resolved per call for the same reason as
+    /// [`Self::generate_new_pairing_code`].
+    pub fn generate_pairing_code_if_vacant(
+        &self,
+        code_policy: PairingCodePolicy,
+    ) -> Result<String, GeneratePairingCodeError> {
         if !self.require_pairing {
             return Err(GeneratePairingCodeError::PairingDisabled);
         }
@@ -474,7 +529,7 @@ impl PairingGuard {
         if slot.is_some() {
             return Err(GeneratePairingCodeError::Pending);
         }
-        let new_code = self.code_policy.generate();
+        let new_code = code_policy.generate();
         *slot = Some(new_code.clone());
         Ok(new_code)
     }
@@ -562,6 +617,34 @@ pub fn is_public_bind(host: &str) -> bool {
 mod tests {
     use super::*;
     use tokio::test;
+
+    /// Serializes the tests that either emit or assert-the-absence-of the
+    /// clamp WARN. The log broadcast is process-global, so two overlapping
+    /// capture windows would let one test see the other's warning.
+    static CLAMP_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+    fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+        ::zeroclaw_log::try_install_capture_subscriber();
+        ::zeroclaw_log::subscribe_or_install()
+    }
+
+    fn drain_captured_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            events.push(value);
+        }
+        events
+    }
+
+    fn drain_captured(rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>) -> String {
+        drain_captured_events(rx)
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// A guard under the shipped default policy. Behaviour tests that are
     /// not about code shape use this so the default stays exercised.
@@ -893,6 +976,7 @@ mod tests {
     /// usable code rather than panicking or returning an empty string.
     #[test]
     async fn generate_clamps_an_out_of_range_length() {
+        let _serial = CLAMP_LOG_LOCK.lock();
         let degenerate = PairingCodePolicy {
             length: 0,
             charset: PairingCodeCharset::Numeric,
@@ -961,6 +1045,129 @@ mod tests {
                 (0.06..0.14).contains(&share),
                 "symbol {} took {share:.3} of a uniform-0.1 sample — biased draw",
                 *symbol as char
+            );
+        }
+    }
+
+    // ── Out-of-range lengths are clamped loudly, never silently ──
+
+    /// Review MAJOR-2: the clamp decision itself, as a plain value.
+    #[test]
+    async fn resolve_length_reports_what_it_clamped() {
+        let in_range = PairingCodePolicy::default();
+        assert_eq!(
+            in_range.resolve_length(),
+            (32, None),
+            "an in-range length reports no clamp"
+        );
+
+        let too_short = PairingCodePolicy {
+            length: 2,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(
+            too_short.resolve_length(),
+            (PAIRING_CODE_MIN_LENGTH, Some(2)),
+            "a short length is clamped up and reports the configured value"
+        );
+
+        let too_long = PairingCodePolicy {
+            length: 5_000,
+            charset: PairingCodeCharset::Numeric,
+        };
+        assert_eq!(
+            too_long.resolve_length(),
+            (PAIRING_CODE_MAX_LENGTH, Some(5_000)),
+            "a long length is clamped down and reports the configured value"
+        );
+    }
+
+    /// Review MAJOR-2: clamping must be loud. Pins the actual emitted WARN,
+    /// including both the configured and effective lengths, so an operator
+    /// reading logs can see they are not getting the code they asked for.
+    #[test]
+    async fn generating_at_a_clamped_length_warns_with_both_values() {
+        let _serial = CLAMP_LOG_LOCK.lock();
+        let mut rx = capture_log_events();
+        let degenerate = PairingCodePolicy {
+            length: 2,
+            charset: PairingCodeCharset::Numeric,
+        };
+        let code = degenerate.generate();
+        assert_eq!(code.len(), PAIRING_CODE_MIN_LENGTH);
+
+        // Pick out *our* event structurally: a substring match over the whole
+        // capture window would also match another test's WARN, and would not
+        // pin the severity to this event.
+        let events = drain_captured_events(&mut rx);
+        let warning = events
+            .iter()
+            .find(|e| {
+                e.get("body")
+                    .or_else(|| e.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|m| m.contains("gateway.pairing_code"))
+            })
+            .unwrap_or_else(|| {
+                panic!("no clamp warning naming gateway.pairing_code in {events:#?}")
+            });
+
+        assert_eq!(
+            warning.get("severity_text").and_then(|v| v.as_str()),
+            Some("WARN"),
+            "the clamp notice must be a WARN, not a quieter level: {warning:#?}"
+        );
+        let body = warning
+            .get("body")
+            .or_else(|| warning.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("out of range"),
+            "warning must say the length is out of range; got: {body}"
+        );
+
+        let rendered = serde_json::to_string(warning).unwrap_or_default();
+        assert!(
+            rendered.contains("\"configured_length\":2"),
+            "warning must report the configured length; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"effective_length\":6"),
+            "warning must report the effective length; got: {rendered}"
+        );
+    }
+
+    /// The happy path must stay quiet — a warning on every mint would train
+    /// operators to ignore it.
+    #[test]
+    async fn generating_at_a_valid_length_emits_no_clamp_warning() {
+        let _serial = CLAMP_LOG_LOCK.lock();
+        let mut rx = capture_log_events();
+        let _ = PairingCodePolicy::default().generate();
+        let logs = drain_captured(&mut rx);
+        assert!(
+            !logs.contains("configured_length"),
+            "an in-range policy must not emit a clamp warning; got: {logs}"
+        );
+    }
+
+    /// `config_name` feeds the migration writer, so it must agree with what
+    /// serde accepts, in both directions.
+    #[test]
+    async fn charset_config_names_match_serde() {
+        for charset in PairingCodeCharset::all() {
+            let name = charset.config_name();
+            let parsed: PairingCodePolicy =
+                toml::from_str(&format!("length = 8\ncharset = \"{name}\"\n"))
+                    .unwrap_or_else(|e| panic!("serde must accept config_name {name:?}: {e}"));
+            assert_eq!(parsed.charset, charset, "round-trip for {name}");
+
+            let serialized = toml::to_string(&PairingCodePolicy { length: 8, charset })
+                .expect("policy serializes");
+            assert!(
+                serialized.contains(&format!("charset = \"{name}\"")),
+                "serde must emit config_name {name:?}; got: {serialized}"
             );
         }
     }
@@ -1246,7 +1453,9 @@ mod tests {
         let guard = new_guard(true, &["zc_existing".into()]);
         // `new()` does not issue a code once paired; slot is empty here.
         assert!(guard.pairing_code().is_none());
-        let code = guard.generate_pairing_code_if_vacant().unwrap();
+        let code = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap();
         assert_eq!(guard.pairing_code().as_deref(), Some(code.as_str()));
     }
 
@@ -1254,7 +1463,9 @@ mod tests {
     async fn generate_pairing_code_if_vacant_refuses_when_slot_occupied() {
         let guard = new_guard(true, &[]);
         let pre_existing = guard.pairing_code().expect("startup code");
-        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        let err = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::Pending);
         assert_eq!(
             guard.pairing_code().as_deref(),
@@ -1266,7 +1477,9 @@ mod tests {
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_pairing_disabled() {
         let guard = new_guard(false, &[]);
-        let err = guard.generate_pairing_code_if_vacant().unwrap_err();
+        let err = guard
+            .generate_pairing_code_if_vacant(PairingCodePolicy::default())
+            .unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
     }
 
@@ -1294,14 +1507,13 @@ mod tests {
 
         // 1. Startup code (`PairingGuard::new` with no existing tokens).
         let guard = PairingGuard::new(true, &[], policy);
-        assert_eq!(guard.code_policy(), policy);
         let startup = guard.pairing_code().expect("startup code is issued");
         assert_matches_policy(&startup, policy);
 
         // 2. On-demand regeneration (`gateway get-paircode --new`,
         //    `POST /api/pairing/initiate`).
         let regenerated = guard
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(policy)
             .expect("regeneration is allowed when pairing is required");
         assert_matches_policy(&regenerated, policy);
         assert_ne!(startup, regenerated, "regeneration must issue a fresh code");
@@ -1309,9 +1521,47 @@ mod tests {
         // 3. Atomic issue-if-vacant (rotate-device flow).
         let paired = PairingGuard::new(true, &["zc_existing".into()], policy);
         let vacant = paired
-            .generate_pairing_code_if_vacant()
+            .generate_pairing_code_if_vacant(policy)
             .expect("slot is empty once paired");
         assert_matches_policy(&vacant, policy);
+    }
+
+    /// #6613 / review MAJOR-1: the guard must not snapshot the policy.
+    /// A guard built under the weak compatibility policy, then asked to mint
+    /// under a strengthened one, issues the strengthened shape — no
+    /// reconstruction, no restart. This is the unit-level half of the
+    /// regression; the gateway half swaps live config.
+    #[test]
+    async fn a_long_lived_guard_mints_under_the_policy_passed_at_issuance() {
+        let weak = PairingCodePolicy::numeric_compat();
+        let strong = PairingCodePolicy::new(24, PairingCodeCharset::Unambiguous).unwrap();
+
+        // Born weak.
+        let guard = PairingGuard::new(true, &[], weak);
+        assert_matches_policy(&guard.pairing_code().expect("startup code"), weak);
+
+        // Operator strengthens the policy. Same guard instance throughout.
+        let regenerated = guard
+            .generate_new_pairing_code(strong)
+            .expect("regeneration allowed");
+        assert_matches_policy(&regenerated, strong);
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(regenerated.as_str()),
+            "the strengthened code is the one now pending"
+        );
+
+        // And the vacant path agrees once the slot clears.
+        let token = guard
+            .try_pair(&regenerated, "client")
+            .await
+            .expect("not locked out")
+            .expect("strengthened code pairs");
+        assert!(guard.is_authenticated(&token));
+        let vacant = guard
+            .generate_pairing_code_if_vacant(strong)
+            .expect("slot cleared by the successful pair");
+        assert_matches_policy(&vacant, strong);
     }
 
     /// A guard configured for numeric compatibility keeps issuing exactly
