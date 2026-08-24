@@ -477,7 +477,7 @@ async fn long_running_router_uses_the_configured_long_running_timeout() {
 // on `long_running_router_uses_the_configured_long_running_timeout`, which
 // covers the same sub-router through its `/a2a/{alias}` sibling.
 
-/// Half one of the straddle, and the load-bearing assertion for issue #7692:
+/// Half one of the straddle, and the load-bearing cron-exemption assertion:
 /// `POST /api/cron/{id}/run` runs a 5s job to completion under a 10s
 /// long-running budget, while the same gateway cuts an ordinary route off at
 /// 1s. The route takes no body extractor, so a stalled body proves nothing
