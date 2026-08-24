@@ -1,4 +1,5 @@
-//! System-level user-behavior coverage for **first-run setup**.
+//! First-run setup coverage of the shared quickstart apply core and the real
+//! config loader.
 //!
 //! # What this pins
 //!
@@ -296,6 +297,67 @@ impl FirstRun {
                 "`{prefix}.enabled` must be persisted as true for a freshly built channel",
             );
         }
+    }
+
+    /// (4a) `zeroclaw agents list` through the real loader reports exactly
+    /// these aliases, in order.
+    ///
+    /// Compared as a whole list rather than by substring: `contains("bot")` is
+    /// also true of `bot_shadow`, so a near-miss alias would slip through and
+    /// the assertion would stop distinguishing the config it claims to check.
+    fn assert_loader_lists_agents(&self, expected: &[&str]) {
+        let stdout = stdout_of(
+            &run_zeroclaw(self.install_root(), &["agents", "list"]),
+            "agents list",
+        );
+        let listed: Vec<&str> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "the real loader must report exactly these agent aliases; got:\n{stdout}"
+        );
+    }
+
+    /// (4b) `zeroclaw config get <agent>.channels` through the real loader
+    /// reports exactly these channel refs, in order.
+    ///
+    /// The CLI renders a `StringArray` prop as a TOML array literal inside the
+    /// JSON envelope's `value` string. That literal is re-parsed and compared
+    /// element by element, so the check is exact without being hostage to the
+    /// renderer's spacing.
+    fn assert_loader_reports_agent_channels(&self, agent: &str, expected: &[&str]) {
+        let path = format!("agents.{agent}.channels");
+        let stdout = stdout_of(
+            &run_zeroclaw(self.install_root(), &["config", "get", &path, "--json"]),
+            &format!("config get {path}"),
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout).expect("`config get --json` must emit a JSON envelope");
+        assert_eq!(envelope["path"], serde_json::Value::String(path.clone()));
+
+        let rendered = envelope["value"].as_str().unwrap_or_else(|| {
+            panic!("`{path}` envelope must carry a string `value`; got {envelope}")
+        });
+        let parsed: toml::Value =
+            toml::from_str(&format!("value = {rendered}")).unwrap_or_else(|err| {
+                panic!("`{path}` rendered as {rendered:?}, not a TOML array: {err}")
+            });
+        let listed: Vec<&str> = parsed["value"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{path}` rendered as {rendered:?}, not an array"))
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .unwrap_or_else(|| panic!("`{path}` holds a non-string element: {item}"))
+            })
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "the real loader must report exactly these channel refs for `{agent}`; got {rendered}"
+        );
     }
 }
 
@@ -604,25 +666,11 @@ async fn first_run_config_loads_through_the_real_binary() {
         "the real loader must see the channel the first run configured; got:\n{listing}"
     );
 
-    // The agent alias survived the loader.
-    let agents = stdout_of(&run_zeroclaw(root, &["agents", "list"]), "agents list");
-    assert!(
-        agents.contains("bot"),
-        "the real loader must see the agent the first run created; got:\n{agents}"
-    );
+    // The agent alias survived the loader, and it is the only one.
+    run.assert_loader_lists_agents(&["bot"]);
 
     // The binding itself, read back through the loader rather than off disk.
-    let bound = stdout_of(
-        &run_zeroclaw(root, &["config", "get", "agents.bot.channels", "--json"]),
-        "config get agents.bot.channels",
-    );
-    let bound: serde_json::Value =
-        serde_json::from_str(&bound).expect("`config get --json` must emit a JSON envelope");
-    assert_eq!(bound["path"], "agents.bot.channels");
-    assert!(
-        bound["value"].to_string().contains("telegram.ops"),
-        "the loader must report the agent bound to `telegram.ops`; got {bound}"
-    );
+    run.assert_loader_reports_agent_channels("bot", &["telegram.ops"]);
 
     // The secret reached the loader's secret store as a populated value — the
     // in-process reload cannot prove this, because it never builds one.
@@ -866,6 +914,57 @@ async fn guard_real_binary_reports_a_channel_that_is_no_longer_configured() {
     assert!(
         !listing.contains("✅ Telegram"),
         "the marker the positive test matches on must not survive the block's removal; got:\n{listing}"
+    );
+}
+
+/// Guard for the two exact-match loader assertions: a *near* match must fail
+/// them.
+///
+/// Both corruptions here are names that contain the expected name as a prefix,
+/// so a substring check would stay green on a config that binds the agent to a
+/// different channel than the one the first run built. That is the whole point
+/// of comparing lists rather than searching text.
+#[tokio::test]
+async fn guard_loader_assertions_reject_a_near_match_alias() {
+    let run = FirstRun::quickstart(submission(
+        "bot",
+        vec![fresh_channel(
+            "telegram",
+            "ops",
+            &[("bot_token", "111111:placeholder-bot-token")],
+        )],
+    ))
+    .await
+    .with_corrupted_disk_view(|doc| {
+        let agents = doc
+            .get_mut("agents")
+            .and_then(toml::Value::as_table_mut)
+            .expect("agents table");
+        let mut agent = agents.remove("bot").expect("agent block");
+        agent
+            .as_table_mut()
+            .expect("agent block is a table")
+            .insert(
+                "channels".into(),
+                toml::Value::Array(vec![toml::Value::String("telegram.ops-shadow".into())]),
+            );
+        // `bot_shadow` contains `bot`; `telegram.ops-shadow` contains
+        // `telegram.ops`. Neither is the config the first run wrote.
+        agents.insert("bot_shadow".into(), agent);
+    });
+
+    let message = panic_message_from(|| run.assert_loader_lists_agents(&["bot"]));
+    assert!(
+        message.contains("bot_shadow"),
+        "the agent-list assertion must reject a near-match alias: {message}"
+    );
+
+    let message = panic_message_from(|| {
+        run.assert_loader_reports_agent_channels("bot_shadow", &["telegram.ops"])
+    });
+    assert!(
+        message.contains("telegram.ops-shadow"),
+        "the binding assertion must reject a near-match channel ref: {message}"
     );
 }
 
