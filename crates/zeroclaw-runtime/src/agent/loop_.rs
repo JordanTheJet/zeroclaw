@@ -12359,7 +12359,7 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("file_write"));
     }
 
-    /// #8529: the tool-call guidance lives in `agent::tool_call_format` and
+    /// The tool-call guidance lives in `agent::tool_call_format` and
     /// must be embedded verbatim here, not re-typed. The sibling assertion
     /// for the XML dispatcher lives in `agent::tests`; both are re-checked
     /// together in `agent::tool_call_format`.

@@ -1545,7 +1545,7 @@ fn xml_dispatcher_generates_tool_instructions() {
     );
 }
 
-/// #8529: this builder used to carry an abridged copy of the tool-call
+/// This builder used to carry an abridged copy of the tool-call
 /// guidance (no `CRITICAL:` line, no worked example) while `loop_`'s builder
 /// carried the full text, so tool-use behavior depended on which builder
 /// produced the prompt. It must now emit the shared block verbatim.
