@@ -46,7 +46,7 @@ const OK: u16 = 200;
 /// Aborts the gateway task when the test scope ends, including on a panicking
 /// assertion, so a failing test cannot leave a listener bound.
 struct GatewayGuard {
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
     addr: SocketAddr,
     _tmp: tempfile::TempDir,
 }
@@ -130,10 +130,11 @@ async fn boot(tmp: tempfile::TempDir, cfg: Config) -> GatewayGuard {
         let _ = ready_tx.send(Some(addr));
     });
 
-    let task = zeroclaw_spawn::spawn!(async move {
-        // The gateway never returns under normal operation; the guard aborts
-        // it. A boot failure surfaces as the readiness wait below timing out.
-        let _ = zeroclaw_gateway::run_gateway(
+    // The gateway never returns under normal operation; the guard aborts it.
+    // The error is stringified inside the task so the handle's type stays
+    // nameable here without importing `anyhow`.
+    let mut task = zeroclaw_spawn::spawn!(async move {
+        zeroclaw_gateway::run_gateway(
             "127.0.0.1",
             0,
             cfg,
@@ -145,17 +146,29 @@ async fn boot(tmp: tempfile::TempDir, cfg: Config) -> GatewayGuard {
             None,
             Some(readiness),
         )
-        .await;
+        .await
+        .map_err(|error| format!("{error:#}"))
     });
 
-    tokio::time::timeout(Duration::from_secs(30), async {
-        ready_rx
-            .wait_for(Option::is_some)
-            .await
-            .expect("readiness channel should stay open");
+    // `map(|_| ())` so no watch `Ref` outlives the borrow of `ready_rx`.
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        ready_rx.wait_for(Option::is_some).await.map(|_| ())
     })
-    .await
-    .expect("gateway should report the address it bound");
+    .await;
+
+    // Two ways to fail, and the gateway task holds the reason for both. The
+    // reporter owns the watch sender, so a `run_gateway` that returns early —
+    // a bad config, a failed bind — drops it and closes the channel; reporting
+    // "channel closed" there would bury the actual error one join away.
+    if !matches!(ready, Ok(Ok(()))) {
+        let reason = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+            Ok(Ok(Err(error))) => format!("run_gateway returned an error: {error}"),
+            Ok(Ok(Ok(()))) => "run_gateway returned before reporting a bound address".to_string(),
+            Ok(Err(error)) => format!("the gateway task panicked or was cancelled: {error}"),
+            Err(_) => "it never reported a bound address and is still running".to_string(),
+        };
+        panic!("gateway did not boot: {reason}");
+    }
 
     let addr = ready_rx.borrow().expect("readiness reported an address");
 
@@ -225,14 +238,29 @@ async fn post(addr: SocketAddr, path: &str, body: &[u8], budget: Duration) -> (u
         .unwrap_or_else(|| panic!("no response for POST {path} within {budget:?}"))
 }
 
-/// Stall an ordinary main-router route and assert it is cut off at the
-/// configured `request_timeout_secs`. Used as an in-process control alongside
-/// the long-running assertions: without it, "the cron run survived N seconds"
-/// could just mean no timeout is configured anywhere in this gateway.
+/// Stall an ordinary main-router route and assert it is cut off at exactly
+/// `configured_secs` — the gateway's `request_timeout_secs`.
 ///
-/// Gated with its only callers, the two unix-only cron tests below.
-#[cfg(unix)]
-async fn assert_default_budget_is_live(addr: SocketAddr) {
+/// `handle_api_cron_add` takes a `Json<CronAddBody>` extractor, so a request
+/// whose body never finishes keeps the response future pending until the layer
+/// fires; the 408's arrival time is therefore the budget itself.
+///
+/// Two-sided on purpose. Requiring only "a 408 eventually" would pass under
+/// any hard-coded main-router budget, so the arrival is bounded on both sides
+/// of the configured value: the floor rules out a shorter budget, the ceiling
+/// rules out a longer constant. The upside margin is deliberately generous —
+/// three whole seconds over the budget, against observed timer jitter in the
+/// low milliseconds — while still excluding every constant of five seconds or
+/// more, including the 30s shipping default.
+///
+/// Doubles as the in-process control for the long-running assertions: without
+/// it, "the cron run survived N seconds" could just mean no timeout is
+/// configured anywhere in this gateway.
+async fn assert_main_router_times_out_at(addr: SocketAddr, configured_secs: u64) {
+    let budget = Duration::from_secs(configured_secs);
+    let started = std::time::Instant::now();
+
+    // Declare 512 bytes, send 13, never finish.
     let mut control = open_request(addr, "POST", "/api/cron", 512).await;
     control
         .write_all(br#"{"agent":"a","#)
@@ -240,11 +268,21 @@ async fn assert_default_budget_is_live(addr: SocketAddr) {
         .expect("write partial body");
     let (status, raw) = read_response(&mut control, Duration::from_secs(30))
         .await
-        .expect("control probe: the default TimeoutLayer must answer");
+        .expect("the main-router TimeoutLayer must answer a stalled request");
+    let elapsed = started.elapsed();
+
     assert_eq!(
         status, REQUEST_TIMEOUT,
-        "control probe: request_timeout_secs must be live on the main router \
-         in this gateway; response was:\n{raw}"
+        "an ordinary API route must be bounded by request_timeout_secs; \
+         response was:\n{raw}"
+    );
+    let floor = budget.mul_f64(0.8);
+    let ceiling = budget + Duration::from_secs(3);
+    assert!(
+        (floor..=ceiling).contains(&elapsed),
+        "the 408 must arrive at the configured {configured_secs}s budget \
+         (window {floor:?}..={ceiling:?}), not at some other hard-coded value; \
+         it arrived after {elapsed:?}"
     );
 }
 
@@ -387,9 +425,13 @@ async fn oversized_body_is_rejected_with_413_on_the_cron_run_route() {
 // ── Timeout wiring ─────────────────────────────────────────────────────────
 
 /// Control for the timeout differential: an ordinary API route really is
-/// bounded by `gateway.request_timeout_secs`. `handle_api_cron_add` takes a
-/// `Json<CronAddBody>` extractor, so a request whose body never finishes keeps
-/// the response future pending until the layer fires.
+/// bounded by `gateway.request_timeout_secs`, and by *that* value rather than
+/// some other constant — see `assert_main_router_times_out_at` for how the
+/// arrival window is bounded on both sides.
+///
+/// `long_running_request_timeout_secs` is set far away from the default here,
+/// so a wiring swap that handed the main router the long budget would leave
+/// the stalled request unanswered instead of landing in the window.
 #[tokio::test]
 async fn ordinary_api_routes_time_out_at_the_configured_request_timeout() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -398,22 +440,7 @@ async fn ordinary_api_routes_time_out_at_the_configured_request_timeout() {
     cfg.gateway.long_running_request_timeout_secs = 600;
     let gw = boot(tmp, cfg).await;
 
-    // Declare 512 bytes, send 13, never finish.
-    let mut stream = open_request(gw.addr, "POST", "/api/cron", 512).await;
-    stream
-        .write_all(br#"{"agent":"a","#)
-        .await
-        .expect("write partial body");
-
-    let (status, raw) = read_response(&mut stream, Duration::from_secs(30))
-        .await
-        .expect("the 1s TimeoutLayer must answer a stalled request");
-
-    assert_eq!(
-        status, REQUEST_TIMEOUT,
-        "an ordinary API route must be bounded by request_timeout_secs; \
-         response was:\n{raw}"
-    );
+    assert_main_router_times_out_at(gw.addr, 1).await;
 }
 
 /// The long-running sub-router carries `long_running_request_timeout_secs`
@@ -498,7 +525,7 @@ async fn cron_run_route_completes_when_the_budget_exceeds_the_job() {
     let cfg = with_shell_cron_agent(cfg);
     let gw = boot(tmp, cfg).await;
 
-    assert_default_budget_is_live(gw.addr).await;
+    assert_main_router_times_out_at(gw.addr, 1).await;
 
     let job_id = create_sleep_job(gw.addr, 5).await;
 
@@ -550,7 +577,7 @@ async fn cron_run_route_is_cut_off_when_the_budget_is_below_the_job() {
     let cfg = with_shell_cron_agent(cfg);
     let gw = boot(tmp, cfg).await;
 
-    assert_default_budget_is_live(gw.addr).await;
+    assert_main_router_times_out_at(gw.addr, 1).await;
 
     let job_id = create_sleep_job(gw.addr, 5).await;
 
