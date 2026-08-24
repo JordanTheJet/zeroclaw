@@ -3768,9 +3768,9 @@ pub struct AliasedAgentConfig {
     /// Grant this agent read access to `<install>/shared/`, the host-wide
     /// shared directory ([`Config::shared_workspace_dir`]).
     ///
-    /// Deny by default. `false` — the default, and the value every config
-    /// written before this flag existed carries — leaves the agent's reach
-    /// exactly as it was: nothing under `<install>/shared/` except the
+    /// Deny by default. `false`, which is the default and the value every
+    /// config written before this flag existed carries, leaves the agent's
+    /// reach exactly as it was: nothing under `<install>/shared/` except the
     /// code-enforced `shared/skills/` read-only wire that
     /// `SecurityPolicy::for_agent` installs for every agent regardless of
     /// this flag. (That wire covers the whole `shared/skills/` directory,
@@ -3795,12 +3795,13 @@ pub struct AliasedAgentConfig {
     /// install that points `data_dir` elsewhere still shares the directory
     /// beside `config.toml`.
     ///
-    /// Scope — the file tools honor this tier in every case; the shell
+    /// Scope: the file tools honor this tier in every case; the shell
     /// path has two limits the tier does not fix. With an OS sandbox
     /// active (Landlock/Seatbelt), shell commands touching `shared/` are
     /// denied outright, because the sandbox is built from the workspace
-    /// dir alone and does not yet receive allowlist tiers — fail-closed,
-    /// an availability gap, tracked by the open sandbox tier-propagation PR. With the sandbox
+    /// dir alone and does not yet receive allowlist tiers. That denial is
+    /// fail-closed, an availability gap, tracked by the open sandbox
+    /// tier-propagation PR. With the sandbox
     /// disabled or pass-through, the shell's static argument scan accepts
     /// a resolved path allowed for reading OR for writing, so this
     /// read-only tier does not by itself stop a shell redirect writing
