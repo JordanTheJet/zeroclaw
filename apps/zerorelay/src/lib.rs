@@ -105,6 +105,82 @@ impl AdmissionPolicy {
     }
 }
 
+/// True when this configuration would run an unguarded open relay on a public
+/// address: non-loopback bind + open registration + no shared-secret token.
+/// (An allowlist guards regardless of token; a token guards open mode.)
+fn public_open_unguarded(bind: &str, mode: &Admission, relay_token: Option<&str>) -> bool {
+    if !matches!(mode, Admission::Open) || relay_token.is_some_and(|t| !t.trim().is_empty()) {
+        return false;
+    }
+    let host = bind
+        .rsplit_once(':')
+        .map_or(bind, |(h, _)| h)
+        .trim_matches(['[', ']']);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        // Unparseable host (a name): "localhost" is loopback; anything else is
+        // conservatively treated as public.
+        Err(_) => !host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The fail-closed public-open rule, carried so it applies to EVERY admission
+/// policy the relay adopts - not only the one it started with.
+///
+/// AGENTS.md: new external surfaces default closed. An OPEN, tokenless relay on
+/// a public bind admits any daemon on the internet and lets unclaimed node-ids
+/// be squatted, so it takes an explicit operator opt-in. Startup enforced that,
+/// but a SIGHUP reload swapped a freshly read policy in without it, so editing a
+/// token-gated or allowlisted config into an open one and sending a signal
+/// reached exactly the state startup refuses. The guard travels with the reload
+/// because neither input hot-reloads: `bind` is where the listener already is,
+/// and `allow_public_open` is the operator's deliberate opt-in.
+#[derive(Debug, Clone)]
+pub struct PublicOpenGuard {
+    bind: String,
+    allow_public_open: bool,
+}
+
+impl PublicOpenGuard {
+    /// `bind` is the address the relay listens on; `allow_public_open` is the
+    /// explicit opt-in (`--allow-public-open` / `[admission] allow_public_open`).
+    pub fn new(bind: impl Into<String>, allow_public_open: bool) -> Self {
+        Self {
+            bind: bind.into(),
+            allow_public_open,
+        }
+    }
+
+    /// `Err` when adopting `policy` would leave an open, tokenless relay on a
+    /// public bind without the opt-in. `action` names what is being refused;
+    /// the rest of the message is identical wherever the guard fires, so an
+    /// operator reads the same instruction at startup and at reload.
+    fn check(&self, policy: &AdmissionPolicy, action: &str) -> Result<()> {
+        if self.allow_public_open
+            || !public_open_unguarded(
+                &self.bind,
+                &policy.registration_mode,
+                policy.relay_token.as_deref(),
+            )
+        {
+            return Ok(());
+        }
+        let bind = &self.bind;
+        anyhow::bail!(
+            "{action}: bind {bind} is public, admission mode is open, and no \
+             relay_token is set — any daemon on the internet could register and squat \
+             unclaimed node-ids. Set [admission] relay_token, use mode = \"allowlist\", \
+             or pass --allow-public-open (config: [admission] allow_public_open = true) \
+             if an open public relay is genuinely intended."
+        )
+    }
+
+    /// Startup form of the guard: refuse to come up at all.
+    pub fn check_startup(&self, policy: &AdmissionPolicy) -> Result<()> {
+        self.check(policy, "refusing to start")
+    }
+}
+
 /// Relay admission + abuse policy. Deny always wins.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -431,8 +507,16 @@ impl RelayServer {
 
     /// Swap the admission policy live (SIGHUP reload). Existing connections are
     /// untouched; the new policy applies to subsequent registrations.
-    pub fn reload_admission(&self, policy: AdmissionPolicy) {
+    ///
+    /// The reload is subject to the same fail-closed rule as startup: `guard`
+    /// carries the bind and the operator's explicit opt-in, and a policy that
+    /// would expose an open, tokenless public relay is REFUSED. On `Err` nothing
+    /// is swapped and the relay keeps running the policy it already had, so a
+    /// bad edit plus a signal cannot widen admission behind the guard's back.
+    pub fn reload_admission(&self, policy: AdmissionPolicy, guard: &PublicOpenGuard) -> Result<()> {
+        guard.check(&policy, "refusing to reload admission")?;
         *self.inner.admission.write().expect("admission lock") = Arc::new(policy);
+        Ok(())
     }
 
     /// A read-only snapshot of the live routing table + per-node counters. Counts
@@ -607,6 +691,149 @@ where
     }
 }
 
+/// Send one SETUP frame under the shared absolute setup deadline.
+///
+/// Both outbound setup writes (`Challenge`, `Registered`) go to a
+/// peer-controlled sink. Awaited bare, a peer that completes the upgrade and
+/// then stops reading can park the relay inside `send` indefinitely - holding a
+/// task, a TLS session and the pre-classification permit past the whole
+/// documented `handshake_timeout` budget. Returns false when the frame could not
+/// be delivered inside that budget (link error or deadline); the caller then
+/// tears the setup down through its normal cleanup path.
+async fn send_setup_control<S>(
+    ws: &mut WebSocketStream<S>,
+    frame: &Control,
+    deadline: tokio::time::Instant,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    matches!(
+        tokio::time::timeout_at(deadline, send_control(ws, frame)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Drop a registration and tear down its client conns - but ONLY if the registry
+/// entry is still the one `epoch` inserted.
+///
+/// A same-key re-registration replaces the map entry under a new epoch, so an
+/// older link (or a rolled-back one) must never evict its replacement. Shared by
+/// normal teardown and by [`RegistrationGuard`]'s rollback so both obey the same
+/// identity rule.
+async fn deregister(
+    inner: &Inner,
+    node_id: &str,
+    epoch: u64,
+    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    reason: &str,
+) {
+    {
+        let mut daemons = inner.daemons.lock().await;
+        if daemons.get(node_id).map(|h| h.epoch) == Some(epoch) {
+            daemons.remove(node_id);
+        }
+    }
+    let drained: Vec<_> = conns.lock().await.drain().collect();
+    for (_, tx) in drained {
+        // Non-blocking: a stalled conn must not delay tearing down the rest;
+        // dropping the sender closes its channel regardless.
+        let _ = tx.try_send(ConnEvent::Close(reason.to_string()));
+    }
+}
+
+/// The registry slot a registration owns between the map insert and the moment
+/// its `Registered` confirmation is actually on the wire.
+struct RegistrationSlot {
+    inner: Arc<Inner>,
+    node_id: String,
+    epoch: u64,
+    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+}
+
+/// Makes registration failure-atomic across the window where the relay is
+/// routable but the daemon does not yet know it is registered.
+///
+/// The entry has to go in before the confirmation is written (a client that
+/// arrives in between must find a live route rather than `no_such_node`), so
+/// every way out of that window has to put the slot back. Otherwise a
+/// confirmation that cannot be delivered leaves a [`DaemonHandle`] whose channel
+/// points at a dead link: clients route into it until the relay restarts, and
+/// enough failed registrations consume `max_registered_nodes`.
+///
+/// Armed at insert, disarmed only by [`RegistrationGuard::confirmed`]. Rollback
+/// is epoch-identified (see [`deregister`]), so it removes only the entry THIS
+/// registration inserted and can never evict a concurrent same-key
+/// re-registration that already replaced it.
+struct RegistrationGuard {
+    slot: Option<RegistrationSlot>,
+}
+
+impl RegistrationGuard {
+    /// Arm the guard for the entry just inserted under `epoch`.
+    fn armed(
+        inner: Arc<Inner>,
+        node_id: String,
+        epoch: u64,
+        conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+    ) -> Self {
+        Self {
+            slot: Some(RegistrationSlot {
+                inner,
+                node_id,
+                epoch,
+                conns,
+            }),
+        }
+    }
+
+    /// The daemon has the confirmation: the registration now owns its slot for
+    /// real, and the reader loop's teardown is what releases it.
+    fn confirmed(mut self) {
+        self.slot = None;
+    }
+
+    /// Undo the registration: remove the entry, drain any conns a client opened
+    /// in the meantime, and leave the node-id immediately reclaimable.
+    async fn rollback(mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        deregister(
+            &slot.inner,
+            &slot.node_id,
+            slot.epoch,
+            &slot.conns,
+            "registration_failed",
+        )
+        .await;
+    }
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        // Only reached if the window exited without confirming or rolling back -
+        // a panic, or a cancelled task. Rollback needs an async lock, so finish
+        // it on the runtime rather than leaving a routable entry behind. No
+        // runtime means the process is going away with the registry.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                deregister(
+                    &slot.inner,
+                    &slot.node_id,
+                    slot.epoch,
+                    &slot.conns,
+                    "registration_failed",
+                )
+                .await;
+            });
+        }
+    }
+}
+
 /// Daemon control connection: signed admission, then multiplex client conns.
 ///
 /// `permit` (the pre-classification handshake permit) is held for the WHOLE
@@ -676,13 +903,20 @@ where
         let _ = send_control(&mut ws, &Control::error("internal", "rng")).await;
         return Ok(());
     }
-    send_control(
+    // The write itself shares the setup deadline: nothing has been allocated for
+    // this peer yet, so a challenge that cannot be delivered inside the budget
+    // just ends the connection (and releases the permit with it).
+    if !send_setup_control(
         &mut ws,
         &Control::Challenge {
             nonce: B64.encode(nonce),
         },
+        deadline,
     )
-    .await?;
+    .await
+    {
+        return Ok(());
+    }
     // Bounded by the shared setup deadline: a peer that sends Hello and then
     // withholds Register must not be able to hold this state open forever.
     let (reg_node, sig_b64) = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
@@ -725,7 +959,10 @@ where
     // superseded link's own `supersede` so it tears down; this link parks on its
     // fresh one in the reader loop below.
     let supersede = Arc::new(tokio::sync::Notify::new());
-    {
+    // Armed inside the same critical section as the insert below: from that
+    // point the slot belongs to this registration until the daemon has its
+    // confirmation, and every way out of the window puts it back.
+    let registration = {
         let mut daemons = inner.daemons.lock().await;
         if let Some(existing) = daemons.get(&node_id)
             && existing.fpr != fpr
@@ -779,15 +1016,30 @@ where
                 supersede: supersede.clone(),
             },
         );
-    }
-    send_control(
+        RegistrationGuard::armed(inner.clone(), node_id.clone(), epoch, conns.clone())
+    };
+    // Confirmation, under the same absolute setup deadline as every other step.
+    // Until it lands the daemon does not know it is registered, so a send that
+    // fails or misses the budget must undo the registration rather than leave a
+    // routable entry pointing at a link nobody is serving.
+    if !send_setup_control(
         &mut ws,
         &Control::Registered {
             node_id: node_id.clone(),
             lease_ttl_secs: inner.lease_ttl.as_secs(),
         },
+        deadline,
     )
-    .await?;
+    .await
+    {
+        registration.rollback().await;
+        // The node-id is free again and so is the pre-classification permit;
+        // dropping `from_clients` with this frame makes any client that raced in
+        // see a dead daemon channel and answer `no_such_node`.
+        drop(permit);
+        return Ok(());
+    }
+    registration.confirmed();
     // Registered: the signed exchange is complete and this connection is now a
     // long-lived admitted daemon link, not pending setup. Release the permit so
     // it is available to the next connection being classified.
@@ -866,18 +1118,7 @@ where
     }
 
     // Teardown: deregister only if still current (epoch guard), close all conns.
-    {
-        let mut daemons = inner.daemons.lock().await;
-        if daemons.get(&node_id).map(|h| h.epoch) == Some(epoch) {
-            daemons.remove(&node_id);
-        }
-    }
-    let drained: Vec<_> = conns.lock().await.drain().collect();
-    for (_, tx) in drained {
-        // Non-blocking: a stalled conn must not delay tearing down the rest;
-        // dropping the sender closes its channel regardless.
-        let _ = tx.try_send(ConnEvent::Close("daemon_gone".into()));
-    }
+    deregister(&inner, &node_id, epoch, &conns, "daemon_gone").await;
     writer.abort();
     Ok(())
 }
@@ -1326,5 +1567,379 @@ mod tests {
 
         assert!(oversized.len() > MAX_CONTROL_FRAME);
         assert!(parse_control_text(&oversized).is_none());
+    }
+}
+
+/// The fail-closed public-open rule. Moved here from the binary with the helper
+/// itself, because the rule now has to apply to every policy the relay adopts
+/// (startup AND SIGHUP reload), not only to the one it parsed at startup.
+#[cfg(test)]
+mod admission_guard_tests {
+    use super::*;
+
+    fn policy(mode: Admission, relay_token: Option<&str>) -> AdmissionPolicy {
+        AdmissionPolicy {
+            registration_mode: mode,
+            relay_token: relay_token.map(str::to_string),
+            ..AdmissionPolicy::default()
+        }
+    }
+
+    #[test]
+    fn public_open_tokenless_is_unguarded() {
+        assert!(public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(public_open_unguarded(
+            "34.209.38.50:443",
+            &Admission::Open,
+            Some("  ")
+        ));
+        // A hostname that is not localhost is conservatively public.
+        assert!(public_open_unguarded(
+            "relay.example.com:443",
+            &Admission::Open,
+            None
+        ));
+    }
+
+    #[test]
+    fn loopback_token_or_allowlist_are_guarded() {
+        assert!(!public_open_unguarded(
+            "127.0.0.1:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(!public_open_unguarded("[::1]:8443", &Admission::Open, None));
+        assert!(!public_open_unguarded(
+            "localhost:8443",
+            &Admission::Open,
+            None
+        ));
+        assert!(!public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Open,
+            Some("secret")
+        ));
+        assert!(!public_open_unguarded(
+            "0.0.0.0:8443",
+            &Admission::Allowlist,
+            None
+        ));
+    }
+
+    /// The guard is the same object at startup and at reload: only the wording
+    /// of the refusal differs, so an operator cannot get a policy past one entry
+    /// point that the other would reject.
+    #[test]
+    fn startup_and_reload_refuse_the_same_policy() {
+        let unguarded = policy(Admission::Open, None);
+        let guard = PublicOpenGuard::new("0.0.0.0:8443", false);
+        let startup = guard
+            .check_startup(&unguarded)
+            .expect_err("startup must refuse an unguarded public open policy");
+        assert!(startup.to_string().starts_with("refusing to start:"));
+        let reload = guard
+            .check(&unguarded, "refusing to reload admission")
+            .expect_err("reload must refuse the same policy");
+        assert!(
+            reload
+                .to_string()
+                .starts_with("refusing to reload admission:")
+        );
+        // Same condition, same remedy text.
+        let tail = |m: &str| m.split_once(": ").expect("prefixed message").1.to_string();
+        assert_eq!(tail(&startup.to_string()), tail(&reload.to_string()));
+
+        // The explicit opt-in, an allowlist, and a token each clear the guard.
+        assert!(
+            PublicOpenGuard::new("0.0.0.0:8443", true)
+                .check_startup(&unguarded)
+                .is_ok()
+        );
+        assert!(
+            guard
+                .check_startup(&policy(Admission::Allowlist, None))
+                .is_ok()
+        );
+        assert!(
+            guard
+                .check_startup(&policy(Admission::Open, Some("s3cret")))
+                .is_ok()
+        );
+    }
+}
+
+/// Registration atomicity + setup-write deadline regressions (August review).
+///
+/// The registry entry is inserted BEFORE the `Registered` confirmation can be
+/// written, and both outbound setup writes go to a peer-controlled sink. These
+/// tests drive `handle_daemon` over an in-memory link so the peer's reads and
+/// the link's failure mode are exact, rather than racing a real socket's close
+/// against the relay's next write.
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::{DuplexStream, ReadBuf};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// The relay's end of a link whose WRITE direction can be killed on demand.
+    /// A peer that resets its connection leaves the relay exactly here: bytes the
+    /// peer already sent are still readable, every write fails. Forcing that
+    /// state directly is what makes the regression deterministic - a real peer's
+    /// close races the relay's next write, so the failing send is not guaranteed.
+    struct KillableWrite {
+        inner: DuplexStream,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl KillableWrite {
+        fn gone(&self) -> bool {
+            self.dead.load(Ordering::Relaxed)
+        }
+    }
+
+    impl AsyncRead for KillableWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for KillableWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.gone() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer gone")));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            if self.gone() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer gone")));
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The daemon side of a registration under test.
+    struct PeerLink {
+        ws: WebSocketStream<DuplexStream>,
+        kp: Ed25519KeyPair,
+        node_id: String,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl PeerLink {
+        /// Read the relay's `Challenge` and return its nonce. Returning proves
+        /// the relay finished its FIRST setup write and is now parked reading,
+        /// which is what makes the rest deterministic: the relay cannot write
+        /// again until it has read the frame the test sends next.
+        async fn challenge(&mut self) -> Vec<u8> {
+            match next_control(&mut self.ws).await {
+                Some(Control::Challenge { nonce }) => B64.decode(nonce.as_bytes()).expect("nonce"),
+                other => panic!("expected a challenge, got {other:?}"),
+            }
+        }
+
+        /// Answer a challenge with a valid `Register`, then stop. The peer does
+        /// NOT read the confirmation that follows.
+        async fn register(&mut self, nonce: &[u8]) {
+            let sig = self.kp.sign(nonce);
+            self.ws
+                .send(Message::text(
+                    Control::Register {
+                        node_id: self.node_id.clone(),
+                        sig: B64.encode(sig.as_ref()),
+                    }
+                    .to_json(),
+                ))
+                .await
+                .expect("register frame");
+        }
+
+        /// Make every later relay write to this link fail, as a reset peer would.
+        fn abandon(&self) {
+            self.dead.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Start one `handle_daemon` registration over an in-memory link of
+    /// `link_buffer` bytes per direction (small buffers let a peer that stops
+    /// reading stall the relay's outbound setup writes).
+    async fn start_registration(
+        server: &RelayServer,
+        node_id: &str,
+        link_buffer: usize,
+    ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
+        let (peer_io, relay_io) = tokio::io::duplex(link_buffer);
+        let dead = Arc::new(AtomicBool::new(false));
+        let relay_ws = WebSocketStream::from_raw_socket(
+            KillableWrite {
+                inner: relay_io,
+                dead: dead.clone(),
+            },
+            Role::Server,
+            None,
+        )
+        .await;
+        let peer_ws = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keypair");
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("keypair");
+        let pubkey = B64.encode(kp.public_key().as_ref());
+
+        let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
+        let deadline = tokio::time::Instant::now() + inner.handshake_timeout;
+        let node = node_id.to_string();
+        let task = tokio::spawn(async move {
+            handle_daemon(inner, relay_ws, pubkey, node, None, permit, deadline).await
+        });
+        (
+            PeerLink {
+                ws: peer_ws,
+                kp,
+                node_id: node_id.to_string(),
+                dead,
+            },
+            task,
+        )
+    }
+
+    /// A registration whose `Registered` confirmation cannot be delivered must be
+    /// undone: the registry entry the relay just inserted is removed, the permit
+    /// is released, and the node-id is immediately reclaimable. Otherwise the
+    /// registry keeps a `DaemonHandle` whose channel points at a dead link -
+    /// clients route to it until the relay restarts, and enough failed
+    /// registrations consume `max_registered_nodes`.
+    #[tokio::test]
+    async fn failed_confirmation_frees_the_node_id_and_the_permit() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 1,
+            max_registered_nodes: 1,
+            handshake_timeout: Duration::from_secs(5),
+            ..RelayConfig::default()
+        });
+        let (mut peer, task) = start_registration(&server, "node-lost", 64 * 1024).await;
+        // The daemon is already gone when the relay answers: the link stops
+        // accepting writes while the relay is parked awaiting `Register`, so the
+        // confirmation send that follows is guaranteed to be the failing one.
+        let nonce = peer.challenge().await;
+        peer.abandon();
+        peer.register(&nonce).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the relay must not park on a dead link")
+            .expect("the registration task must not panic");
+
+        assert!(
+            !server.inner.daemons.lock().await.contains_key("node-lost"),
+            "a registration whose confirmation never reached the daemon must not stay in the registry"
+        );
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "the pre-classification permit must be released with the failed registration"
+        );
+
+        // Reclaimable at once: a fresh key registering the SAME node-id is
+        // admitted. A leaked entry would answer `node_taken` (it is bound to the
+        // abandoned link's fingerprint) and, at a ceiling of one, would also have
+        // consumed the registry.
+        let (mut peer, task) = start_registration(&server, "node-lost", 64 * 1024).await;
+        let nonce = peer.challenge().await;
+        peer.register(&nonce).await;
+        match next_control(&mut peer.ws).await {
+            Some(Control::Registered { node_id, .. }) => assert_eq!(node_id, "node-lost"),
+            other => {
+                panic!("the node-id must be reclaimable after a failed confirmation, got {other:?}")
+            }
+        }
+        task.abort();
+    }
+
+    /// The `Registered` write goes to a peer-controlled sink, so it must share the
+    /// ONE absolute setup deadline rather than awaiting forever. A daemon that
+    /// stops reading must be reaped, and its half-finished registration undone.
+    #[tokio::test]
+    async fn confirmation_that_misses_the_setup_deadline_frees_the_node_id() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 1,
+            handshake_timeout: Duration::from_millis(400),
+            ..RelayConfig::default()
+        });
+        // A link too small to absorb the confirmation, and a peer that never
+        // reads it: the outbound setup write is what is under test.
+        let (mut peer, task) = start_registration(&server, "node-stuck", 32).await;
+        let nonce = peer.challenge().await;
+        peer.register(&nonce).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            finished.is_ok(),
+            "the confirmation write must be bounded by the shared setup deadline"
+        );
+        assert!(
+            !server.inner.daemons.lock().await.contains_key("node-stuck"),
+            "a confirmation that missed the deadline must not leave a live registry entry"
+        );
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "the permit must not be pinned by a peer that stops reading"
+        );
+        drop(peer);
+    }
+
+    /// The other outbound setup write. A peer that completes the WebSocket
+    /// upgrade and then stops reading must not be able to park the relay - and
+    /// its permit - inside the `Challenge` send, outside the setup budget.
+    #[tokio::test]
+    async fn challenge_write_shares_the_setup_deadline() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 1,
+            handshake_timeout: Duration::from_millis(400),
+            ..RelayConfig::default()
+        });
+        let (peer, task) = start_registration(&server, "node-mute", 8).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            finished.is_ok(),
+            "the challenge write must share the one setup deadline"
+        );
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "a permit must not be pinned by a peer that stops reading mid-setup"
+        );
+        drop(peer);
     }
 }

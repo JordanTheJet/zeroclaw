@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Message};
 use zeroclaw_relay_proto::{Control, PEER_HINT_ENROLL, SUBPROTOCOL, decode_data, encode_data};
-use zerorelay::{Admission, RelayConfig, RelayServer};
+use zerorelay::{Admission, AdmissionPolicy, PublicOpenGuard, RelayConfig, RelayServer};
 
 type RelayWs =
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
@@ -205,6 +205,56 @@ async fn hello_only(relay_addr: std::net::SocketAddr, node_id: &str, pkcs8: &[u8
     .await
     .unwrap();
     ws
+}
+
+/// Run the signed exchange up to and including `Register`, then DROP the link
+/// without ever reading the confirmation. This is the daemon that goes away in
+/// the window between the relay's registry insert and its `Registered` send.
+async fn register_then_vanish(relay_addr: std::net::SocketAddr, node_id: &str, pkcs8: &[u8]) {
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
+    let mut ws = connect_ws(relay_addr).await;
+    ws.send(Message::text(
+        Control::Hello {
+            daemon_pubkey: B64.encode(kp.public_key().as_ref()),
+            node_id: node_id.to_string(),
+            relay_token: None,
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    let nonce = match next_control(&mut ws).await {
+        Some(Control::Challenge { nonce }) => B64.decode(nonce.as_bytes()).unwrap(),
+        other => panic!("expected a challenge, got {other:?}"),
+    };
+    ws.send(Message::text(
+        Control::Register {
+            node_id: node_id.to_string(),
+            sig: B64.encode(kp.sign(&nonce).as_ref()),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+    drop(ws);
+}
+
+/// Wait (bounded) for `node_id` to be absent from the relay's live routing
+/// table. Returns false if it is still there when the budget runs out.
+async fn wait_until_unregistered(server: &RelayServer, node_id: &str) -> bool {
+    for _ in 0..60 {
+        if !server
+            .status()
+            .await
+            .nodes
+            .iter()
+            .any(|n| n.node_id == node_id)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// Open an outer TLS + WS connection to the relay WITHOUT registering (the client
@@ -947,5 +997,135 @@ async fn same_key_reregistration_reclaims_the_old_link() {
     assert!(
         matches!(closed, Ok(None)),
         "the superseded link must be closed after same-key re-registration, got {closed:?}"
+    );
+}
+
+/// Registration atomicity, end to end (August review). The registry entry goes
+/// in BEFORE the `Registered` confirmation can be written, so a daemon that
+/// completes `Register` and then vanishes - never reading the confirmation -
+/// must leave nothing behind: no routable entry pointing at a dead link, no
+/// consumed registry slot. Clients must be told `no_such_node`, and the node-id
+/// must be claimable again immediately, by a DIFFERENT key (a leaked entry is
+/// bound to the vanished daemon's fingerprint and would answer `node_taken`).
+///
+/// The deterministic mechanism tests - a confirmation that fails to send, and
+/// one that misses the setup deadline - are the unit regressions in `lib.rs`;
+/// over a real socket the relay may legitimately clean up through either path.
+/// This pins the contract a client actually depends on.
+#[tokio::test]
+async fn a_daemon_that_vanishes_after_register_leaves_no_route() {
+    // A ceiling of one: a leaked slot would also make the relay full.
+    let (addr, server) = start_relay_handle(RelayConfig {
+        max_registered_nodes: 1,
+        ..RelayConfig::default()
+    })
+    .await;
+
+    let vanished = gen_key();
+    register_then_vanish(addr, "node-vanish", &vanished).await;
+    assert!(
+        wait_until_unregistered(&server, "node-vanish").await,
+        "a daemon that never took its confirmation must not stay in the routing table"
+    );
+
+    // A client asking for that node-id is told it does not exist, rather than
+    // being routed onto a channel nobody is serving.
+    let mut client = connect_ws(addr).await;
+    client
+        .send(Message::text(
+            Control::Connect {
+                node_id: "node-vanish".into(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+    match next_control(&mut client).await {
+        Some(Control::Error { code, .. }) => assert_eq!(code, "no_such_node"),
+        other => panic!("expected no_such_node for a vanished daemon, got {other:?}"),
+    }
+
+    // The node-id (and the registry slot) are free: a different key claims it.
+    let successor = gen_key();
+    let (_ws, term) = handshake(addr, "node-vanish", &successor, None, true).await;
+    assert!(
+        matches!(term, Control::Registered { .. }),
+        "the node-id must be reclaimable after an abandoned registration, got {term:?}"
+    );
+}
+
+/// SIGHUP admission reload must not bypass the fail-closed public-open guard
+/// (August review). Startup refuses open + tokenless admission on a public bind
+/// without an explicit opt-in; the reload path re-read the file and swapped the
+/// policy live without repeating that check, so the same configuration an
+/// operator cannot BOOT could be activated with a signal.
+///
+/// The guard's inputs are the configured bind and the opt-in, carried from
+/// startup - so the guard here spells a public bind while the test listener
+/// stays on loopback (which is what makes a relay testable at all), the same way
+/// the library's own guard tests pass the bind in as data.
+#[tokio::test]
+async fn reload_cannot_open_a_public_relay_without_the_opt_in() {
+    let listed = gen_key();
+    let unlisted = gen_key();
+    let mut allow = HashSet::new();
+    allow.insert(fingerprint(&listed));
+    let (addr, server) = start_relay_handle(RelayConfig {
+        registration_mode: Admission::Allowlist,
+        allow: allow.clone(),
+        ..RelayConfig::default()
+    })
+    .await;
+    let guard = PublicOpenGuard::new("0.0.0.0:8443", false);
+
+    // The operator's edited file: open registration, no token, no opt-in.
+    let err = server
+        .reload_admission(
+            AdmissionPolicy {
+                registration_mode: Admission::Open,
+                allow: HashSet::new(),
+                deny: HashSet::new(),
+                relay_token: None,
+            },
+            &guard,
+        )
+        .expect_err("an unguarded public open policy must not be swapped in");
+    assert!(
+        format!("{err:#}").contains("refusing to reload admission"),
+        "the refusal must name the guard, got: {err:#}"
+    );
+
+    // The OLD policy is still the live one: an unlisted key is still refused,
+    // and a listed key still registers.
+    let (_ws, denied) = handshake(addr, "node-unlisted", &unlisted, None, true).await;
+    assert!(
+        matches!(denied, Control::Error { ref code, .. } if code == "forbidden"),
+        "the refused reload must leave the allowlist in force, got {denied:?}"
+    );
+    let (_ws, ok) = handshake(addr, "node-listed", &listed, None, true).await;
+    assert!(
+        matches!(ok, Control::Registered { .. }),
+        "the old allowlist must still admit its own key, got {ok:?}"
+    );
+
+    // A reload the guard permits still applies, so the refusal above is the
+    // guard and not a broken reload path.
+    let mut widened = allow;
+    widened.insert(fingerprint(&unlisted));
+    server
+        .reload_admission(
+            AdmissionPolicy {
+                registration_mode: Admission::Allowlist,
+                allow: widened,
+                deny: HashSet::new(),
+                relay_token: None,
+            },
+            &guard,
+        )
+        .expect("a guarded reload must still take effect");
+    let (_ws, now_ok) = handshake(addr, "node-widened", &unlisted, None, true).await;
+    assert!(
+        matches!(now_ok, Control::Registered { .. }),
+        "the widened allowlist must be live after a permitted reload, got {now_ok:?}"
     );
 }

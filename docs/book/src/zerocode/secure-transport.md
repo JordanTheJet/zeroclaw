@@ -194,7 +194,8 @@ forwards ciphertext.
 
 Configure with `relay.toml` (see `apps/zerorelay/relay.example.toml`); every CLI
 flag overrides the matching file value. The `[admission]` section hot-reloads on
-`SIGHUP`.
+`SIGHUP`; a reload that would turn a public relay into open, tokenless admission
+without the explicit opt-in is refused, and the previous policy stays live.
 
 ```toml
 # relay.toml

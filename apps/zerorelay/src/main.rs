@@ -22,7 +22,9 @@ use clap::{Parser, Subcommand};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
-use zerorelay::{Admission, AdmissionPolicy, RelayConfig, RelayServer, RelayStatus};
+use zerorelay::{
+    Admission, AdmissionPolicy, PublicOpenGuard, RelayConfig, RelayServer, RelayStatus,
+};
 
 /// Build-time version: `git describe` (tag + commits-since + short hash, `-dirty`
 /// when modified), or the crate version when git is unavailable. Set by build.rs.
@@ -222,25 +224,6 @@ fn normalize_admission_fingerprints(entries: &[String]) -> Result<HashSet<String
         .collect()
 }
 
-/// True when this configuration would run an unguarded open relay on a public
-/// address: non-loopback bind + open registration + no shared-secret token.
-/// (An allowlist guards regardless of token; a token guards open mode.)
-fn public_open_unguarded(bind: &str, mode: &Admission, relay_token: Option<&str>) -> bool {
-    if !matches!(mode, Admission::Open) || relay_token.is_some_and(|t| !t.trim().is_empty()) {
-        return false;
-    }
-    let host = bind
-        .rsplit_once(':')
-        .map_or(bind, |(h, _)| h)
-        .trim_matches(['[', ']']);
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => !ip.is_loopback(),
-        // Unparseable host (a name): "localhost" is loopback; anything else is
-        // conservatively treated as public.
-        Err(_) => !host.eq_ignore_ascii_case("localhost"),
-    }
-}
-
 fn resolve_admission(file: &AdmissionFile, overlay: &AdmissionOverlay) -> Result<AdmissionPolicy> {
     let mode_str = overlay.mode.clone().or_else(|| file.mode.clone());
     let registration_mode = match mode_str.as_deref() {
@@ -416,20 +399,14 @@ async fn main() -> Result<()> {
     // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,
     // tokenless relay on a public bind admits any daemon on the internet and
     // lets unclaimed node-ids be squatted. Refuse to start unless the operator
-    // explicitly opts in — loopback binds (dev/tests) are unaffected.
-    let public_open_override =
-        cli.allow_public_open || file.admission.allow_public_open.unwrap_or(false);
-    if public_open_unguarded(&bind, &cfg.registration_mode, cfg.relay_token.as_deref())
-        && !public_open_override
-    {
-        anyhow::bail!(
-            "refusing to start: bind {bind} is public, admission mode is open, and no \
-             relay_token is set — any daemon on the internet could register and squat \
-             unclaimed node-ids. Set [admission] relay_token, use mode = \"allowlist\", \
-             or pass --allow-public-open (config: [admission] allow_public_open = true) \
-             if an open public relay is genuinely intended."
-        );
-    }
+    // explicitly opts in — loopback binds (dev/tests) are unaffected. The same
+    // guard is re-applied to every SIGHUP reload below, which is why the CLI
+    // opt-in is kept rather than consumed here.
+    PublicOpenGuard::new(
+        &bind,
+        cli.allow_public_open || file.admission.allow_public_open.unwrap_or(false),
+    )
+    .check_startup(&admission)?;
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -441,7 +418,13 @@ async fn main() -> Result<()> {
     );
 
     let server = RelayServer::new(cfg);
-    spawn_sighup_reloader(server.clone(), cli.config.clone(), overlay);
+    spawn_sighup_reloader(
+        server.clone(),
+        cli.config.clone(),
+        overlay,
+        bind.clone(),
+        cli.allow_public_open,
+    );
     spawn_status_dumper(server.clone(), cli.status_file.clone());
     server.serve(listener, acceptor).await
 }
@@ -496,6 +479,36 @@ fn spawn_status_dumper(server: RelayServer, status_file: Option<String>) {
     });
 }
 
+/// One admission reload: re-read the file, re-apply the startup CLI overlay, and
+/// swap the live policy - unless the fail-closed public-open guard refuses it.
+///
+/// `bind` and `cli_allow_public_open` are carried from startup because neither
+/// hot-reloads: the listener is already bound, and the opt-in is a deliberate
+/// operator choice. Without them a reload could turn a token-gated or
+/// allowlisted public relay into an open, tokenless one - the exact
+/// configuration startup refuses. The opt-in is the CLI flag OR the freshly
+/// re-read file's own `allow_public_open`, matching startup's rule so an
+/// operator who genuinely wants an open public relay can still say so in the
+/// same edit.
+///
+/// Unix-only, like the SIGHUP handler that drives it.
+#[cfg(unix)]
+fn reload_admission_once(
+    server: &RelayServer,
+    path: &str,
+    overlay: &AdmissionOverlay,
+    bind: &str,
+    cli_allow_public_open: bool,
+) -> Result<()> {
+    let file = load_file_config(path)?;
+    let policy = resolve_admission(&file.admission, overlay)?;
+    let guard = PublicOpenGuard::new(
+        bind,
+        cli_allow_public_open || file.admission.allow_public_open.unwrap_or(false),
+    );
+    server.reload_admission(policy, &guard)
+}
+
 /// On SIGHUP, re-read the config file's `[admission]` section and swap the live
 /// admission policy (allow/deny/mode/token), re-applying the startup CLI overlay.
 /// Live connections are untouched. No-op when there is no `--config` file.
@@ -504,6 +517,8 @@ fn spawn_sighup_reloader(
     server: RelayServer,
     config_path: Option<String>,
     overlay: AdmissionOverlay,
+    bind: String,
+    cli_allow_public_open: bool,
 ) {
     tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -519,11 +534,8 @@ fn spawn_sighup_reloader(
                 eprintln!("zerorelay: SIGHUP ignored (no --config to reload)");
                 continue;
             };
-            match load_file_config(path).and_then(|f| resolve_admission(&f.admission, &overlay)) {
-                Ok(policy) => {
-                    server.reload_admission(policy);
-                    eprintln!("zerorelay: reloaded admission from {path} (SIGHUP)");
-                }
+            match reload_admission_once(&server, path, &overlay, &bind, cli_allow_public_open) {
+                Ok(()) => eprintln!("zerorelay: reloaded admission from {path} (SIGHUP)"),
                 Err(e) => {
                     eprintln!("zerorelay: SIGHUP reload failed, keeping current policy ({e:#})");
                 }
@@ -537,6 +549,8 @@ fn spawn_sighup_reloader(
     _server: RelayServer,
     _config_path: Option<String>,
     _overlay: AdmissionOverlay,
+    _bind: String,
+    _cli_allow_public_open: bool,
 ) {
 }
 
@@ -771,52 +785,83 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod admission_guard_tests {
+/// SIGHUP reload plumbing. Startup enforces the fail-closed public-open rule,
+/// but the reload path re-reads the file and swaps the policy live: without the
+/// bind and the CLI opt-in carried into it, an operator could edit a token-gated
+/// or allowlisted config into an open, tokenless one and activate it with a
+/// signal - reaching the exact configuration startup refuses. (The rule itself
+/// is unit-tested in the library; these cover the wiring.)
+#[cfg(all(test, unix))]
+mod reload_guard_tests {
     use super::*;
 
-    #[test]
-    fn public_open_tokenless_is_unguarded() {
-        assert!(public_open_unguarded(
-            "0.0.0.0:8443",
-            &Admission::Open,
-            None
-        ));
-        assert!(public_open_unguarded(
-            "34.209.38.50:443",
-            &Admission::Open,
-            Some("  ")
-        ));
-        // A hostname that is not localhost is conservatively public.
-        assert!(public_open_unguarded(
-            "relay.example.com:443",
-            &Admission::Open,
-            None
-        ));
+    fn write_config(dir: &tempfile::TempDir, body: &str) -> String {
+        let path = dir.path().join("relay.toml");
+        std::fs::write(&path, body).expect("write relay.toml");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn no_overlay() -> AdmissionOverlay {
+        AdmissionOverlay {
+            mode: None,
+            allow: vec![],
+            deny: vec![],
+            relay_token: None,
+        }
     }
 
     #[test]
-    fn loopback_token_or_allowlist_are_guarded() {
-        assert!(!public_open_unguarded(
-            "127.0.0.1:8443",
-            &Admission::Open,
-            None
-        ));
-        assert!(!public_open_unguarded("[::1]:8443", &Admission::Open, None));
-        assert!(!public_open_unguarded(
-            "localhost:8443",
-            &Admission::Open,
-            None
-        ));
-        assert!(!public_open_unguarded(
-            "0.0.0.0:8443",
-            &Admission::Open,
-            Some("secret")
-        ));
-        assert!(!public_open_unguarded(
-            "0.0.0.0:8443",
-            &Admission::Allowlist,
-            None
-        ));
+    fn reload_refuses_to_open_a_public_relay_without_the_opt_in() {
+        let server = RelayServer::new(RelayConfig {
+            registration_mode: Admission::Allowlist,
+            ..RelayConfig::default()
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The operator rewrites a guarded config into open + tokenless.
+        let path = write_config(&dir, "[admission]\nmode = \"open\"\n");
+
+        let err = reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect_err("an unguarded public open policy must not be swapped in");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to reload admission") && msg.contains("--allow-public-open"),
+            "the refusal must name the guard and the way out, got: {msg}"
+        );
+
+        // The same edit WITH the explicit opt-in is accepted: the guard gates the
+        // deliberateness of the change, it does not forbid open public relays.
+        let path = write_config(
+            &dir,
+            "[admission]\nmode = \"open\"\nallow_public_open = true\n",
+        );
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect("an explicit opt-in must reload");
+    }
+
+    #[test]
+    fn reload_carries_the_bind_and_cli_opt_in_from_startup() {
+        let server = RelayServer::new(RelayConfig::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(&dir, "[admission]\nmode = \"open\"\n");
+
+        // A loopback bind is not a public surface: the same file reloads.
+        reload_admission_once(&server, &path, &no_overlay(), "127.0.0.1:8443", false)
+            .expect("a loopback relay is unaffected by the guard");
+        // A public bind with the startup CLI opt-in still reloads: the flag is
+        // carried rather than consumed at startup.
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", true)
+            .expect("--allow-public-open from startup must survive into reloads");
+        // Same file, same public bind, no opt-in: refused.
+        assert!(
+            reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false).is_err(),
+            "a public bind without the opt-in must be refused"
+        );
+        // A token gates open mode, so this reload is admissible again.
+        let path = write_config(
+            &dir,
+            "[admission]\nmode = \"open\"\nrelay_token = \"a-long-secret\"\n",
+        );
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect("a token-gated open relay is guarded");
     }
 }
