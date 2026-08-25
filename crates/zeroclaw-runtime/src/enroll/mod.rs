@@ -806,6 +806,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_delivers_no_certificate_when_the_ledger_write_fails() {
+        // The audit event is written BEFORE the ledger row, so a forced SQLite
+        // failure lands after it. The append-only record must then read as an
+        // attempt - not a completed issuance - and the client must get an error
+        // instead of a certificate it could authenticate with.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::security::audit::AuditLogger::new(
+            zeroclaw_config::schema::AuditConfig {
+                enabled: true,
+                log_path: "audit.log".to_string(),
+                max_size_mb: 100,
+                sign_events: false,
+            },
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let ledger = Arc::new(CertLedger::open_in_memory(Some(Arc::new(audit))).unwrap());
+        ledger.detach_issued_certs_for_test().unwrap();
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let server = test_server_with_ledger(pairing, None, ledger);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let req = EnrollRequest {
+            pairing_code: code,
+            csr_pem: csr,
+        };
+
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .expect_err("a ledger write failure must not return a certificate");
+        assert_eq!(err.0, 500);
+        assert!(err.1.contains("insert issued cert"), "got: {}", err.1);
+        assert!(
+            server.pairing.pairing_code().is_some(),
+            "a ledger failure must not consume the one-time pairing code"
+        );
+
+        let events: Vec<String> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["event_type"]
+                    .as_str()
+                    .expect("event_type is a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["cert_issuance_attempted"],
+            "the trail must record the attempt, never a completed issuance"
+        );
+
+        // The retry is the one that completes, and it issues exactly one cert.
+        server.ledger.reattach_issued_certs_for_test().unwrap();
+        let code = server.pairing.pairing_code().unwrap();
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let resp = server
+            .process(
+                &EnrollRequest {
+                    pairing_code: code,
+                    csr_pem: csr,
+                },
+                "1.2.3.4",
+                PeerClass::Direct,
+            )
+            .await
+            .unwrap();
+        assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(server.ledger.list_active().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn process_rejects_in_band_enrollment_when_static_pins_are_configured() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let pairing = PairingGuard::new(true, &[]);

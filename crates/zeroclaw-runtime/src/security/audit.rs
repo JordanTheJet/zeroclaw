@@ -27,10 +27,18 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    /// A client certificate issuance (or renewal) was attempted: the CSR is
+    /// signed but the issued-cert ledger has not committed and no certificate
+    /// has been delivered. Recorded before the ledger write, so it never claims
+    /// a completed issuance; the matching `CertIssued`/`CertRenewed` follows
+    /// once the row commits. An attempt with no completion is an interrupted,
+    /// retryable issuance.
+    CertIssuanceAttempted,
     /// A client mTLS certificate was issued from the daemon CA (enrollment or
-    /// operator `issue-client-cert`). Recorded by the issued-cert ledger.
+    /// operator `issue-client-cert`) AND committed to the issued-cert ledger.
     CertIssued,
-    /// A client certificate was renewed over an authenticated mTLS session.
+    /// A client certificate was renewed over an authenticated mTLS session and
+    /// committed to the issued-cert ledger.
     CertRenewed,
     /// A client certificate was revoked (status flipped in the ledger).
     CertRevoked,

@@ -7,6 +7,11 @@
 //! owns this ledger; when the gateway is present it READS the ledger (one store,
 //! two readers - no third device store, per AGENTS.md no-duplicate-state).
 //!
+//! Issuance is audited as an attempt before the ledger row and a completion
+//! after it commits, so a completion event means the certificate is recorded and
+//! an unmatched attempt means an interrupted, retryable issuance
+//! ([`CertLedger::record_issued`]).
+//!
 //! Revocation is sourced here. The renew RPC (`cert/renew`) refuses a
 //! revoked-but-unexpired cert immediately by consulting [`CertLedger::status_of`]
 //! (threat A5). The WSS handshake-time refusal is wired separately against this
@@ -235,30 +240,36 @@ impl CertLedger {
         Ok(())
     }
 
-    /// Record a freshly issued (or renewed) certificate and write the matching
-    /// append-only audit event. `renewal` selects `CertRenewed` vs `CertIssued`.
-    /// Record an issuance across both durable surfaces.
+    /// Record an issuance across both durable surfaces as an attempt followed
+    /// by a completion. `renewal` selects `CertRenewed` vs `CertIssued` for the
+    /// completion event.
     ///
     /// SQLite and the append-only audit file cannot share one transaction, so
-    /// the ORDER is the correctness argument. The audit event is written first:
-    /// if it fails, no active row exists, the caller returns an error and
-    /// restores the one-time pairing code, and the retry issues exactly one
-    /// certificate. Committing the row first left an orphaned ACTIVE row behind
-    /// on an audit failure, and because the retry carries a fresh CSR - and so
-    /// a different fingerprint - it created a SECOND active credential rather
-    /// than replacing the first.
+    /// the ORDER is the correctness argument, and each event claims only what
+    /// has already happened:
     ///
-    /// The residue of the safe order is a recorded attempt with no issued
-    /// certificate, which is what an append-only attempt log is for. The row
-    /// write itself is keyed on the fingerprint via INSERT OR REPLACE, so
-    /// re-recording the same certificate is idempotent.
+    /// 1. `CertIssuanceAttempted` - written BEFORE the row. If it fails, no
+    ///    active row exists, the caller returns an error and restores the
+    ///    one-time pairing code, and the retry issues exactly one certificate.
+    ///    Committing the row first left an orphaned ACTIVE row behind on an
+    ///    audit failure, and because the retry carries a fresh CSR - and so a
+    ///    different fingerprint - it created a SECOND active credential rather
+    ///    than replacing the first.
+    /// 2. the ledger row.
+    /// 3. `CertIssued`/`CertRenewed` - written AFTER the row commits, so a
+    ///    completion event in the trail means the ledger holds that
+    ///    certificate, never merely that issuance was tried.
+    ///
+    /// An attempt with no matching completion for the same fingerprint is
+    /// therefore an interrupted issuance: retryable, and never evidence that a
+    /// certificate was delivered. Every failure mode returns `Err`, and callers
+    /// must not hand the certificate to the client unless this returns `Ok`, so
+    /// the residue of a failure is at most a recorded attempt plus a row for a
+    /// certificate nobody holds - which is what reconciling attempts against
+    /// completions is for. The row write is keyed on the fingerprint via INSERT
+    /// OR REPLACE, so re-recording the same certificate is idempotent.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
-        let kind = if renewal {
-            AuditEventType::CertRenewed
-        } else {
-            AuditEventType::CertIssued
-        };
-        self.audit_cert(kind, entry)?;
+        self.audit_cert(entry, CertAuditStage::Attempted { renewal })?;
         {
             let conn = self.conn.lock();
             conn.execute(
@@ -278,7 +289,28 @@ impl CertLedger {
             )
             .context("insert issued cert")?;
         }
-        Ok(())
+        self.audit_cert(entry, CertAuditStage::Completed { renewal })
+    }
+
+    /// Fault injection for the issuance ordering contract: detach the table so
+    /// the next [`CertLedger::record_issued`] fails at the ledger write, AFTER
+    /// its audit event. Lets the callers' interrupted-issuance behaviour be
+    /// tested without a production error hook.
+    #[cfg(test)]
+    pub(crate) fn detach_issued_certs_for_test(&self) -> Result<()> {
+        self.conn
+            .lock()
+            .execute_batch("ALTER TABLE issued_certs RENAME TO issued_certs_detached")
+            .context("detach issued_certs")
+    }
+
+    /// Undo [`CertLedger::detach_issued_certs_for_test`].
+    #[cfg(test)]
+    pub(crate) fn reattach_issued_certs_for_test(&self) -> Result<()> {
+        self.conn
+            .lock()
+            .execute_batch("ALTER TABLE issued_certs_detached RENAME TO issued_certs")
+            .context("reattach issued_certs")
     }
 
     /// The status of a cert by fingerprint, or `None` if unknown to the ledger.
@@ -375,7 +407,7 @@ impl CertLedger {
             })
         };
         if let Some(entry) = audit_entry {
-            self.audit_cert(AuditEventType::CertRevoked, &entry)?;
+            self.audit_cert(&entry, CertAuditStage::Revoked)?;
         }
         Ok(true)
     }
@@ -443,11 +475,15 @@ impl CertLedger {
     /// security audit log is already separate from operational logs; cert facts
     /// (device id, fingerprint, validity, actor) are recorded in the existing
     /// actor/action fields so the entry is covered by the Merkle chain.
-    fn audit_cert(&self, kind: AuditEventType, entry: &LedgerEntry) -> Result<()> {
+    ///
+    /// Only a committed stage carries an `ExecutionResult`: a pre-commit
+    /// attempt has no outcome to report, and recording one would make the
+    /// append-only trail claim an issuance the ledger may still reject.
+    fn audit_cert(&self, entry: &LedgerEntry, stage: CertAuditStage) -> Result<()> {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
-        let event = AuditEvent::new(kind)
+        let mut event = AuditEvent::new(stage.event_type())
             .with_actor(
                 "cert".to_string(),
                 Some(entry.device_id.clone()),
@@ -455,17 +491,64 @@ impl CertLedger {
             )
             .with_action(
                 format!(
-                    "fingerprint={} not_before={} not_after={}",
-                    entry.fingerprint, entry.not_before, entry.not_after
+                    "{}fingerprint={} not_before={} not_after={}",
+                    stage.action_prefix(),
+                    entry.fingerprint,
+                    entry.not_before,
+                    entry.not_after
                 ),
                 "cert".to_string(),
                 true,
                 true,
-            )
-            .with_result(true, None, 0, None);
+            );
+        if stage.committed() {
+            event = event.with_result(true, None, 0, None);
+        }
         audit
             .log(&event)
             .with_context(|| format!("write certificate audit event for {}", entry.fingerprint))
+    }
+}
+
+/// Which certificate lifecycle fact an audit event records.
+///
+/// Issuance spans two events because SQLite and the append-only audit file
+/// cannot share one transaction; see [`CertLedger::record_issued`] for the
+/// ordering argument and what an unmatched attempt means.
+#[derive(Debug, Clone, Copy)]
+enum CertAuditStage {
+    /// Issuance attempted: the CSR is signed, the ledger has not committed and
+    /// the caller has not delivered the certificate.
+    Attempted { renewal: bool },
+    /// Issuance completed: the ledger row is committed.
+    Completed { renewal: bool },
+    /// Revocation committed together with its enforcement file.
+    Revoked,
+}
+
+impl CertAuditStage {
+    fn event_type(self) -> AuditEventType {
+        match self {
+            CertAuditStage::Attempted { .. } => AuditEventType::CertIssuanceAttempted,
+            CertAuditStage::Completed { renewal: true } => AuditEventType::CertRenewed,
+            CertAuditStage::Completed { renewal: false } => AuditEventType::CertIssued,
+            CertAuditStage::Revoked => AuditEventType::CertRevoked,
+        }
+    }
+
+    /// True for stages the durable stores already hold.
+    fn committed(self) -> bool {
+        !matches!(self, CertAuditStage::Attempted { .. })
+    }
+
+    /// Names the completion an attempt is waiting on, so an unmatched attempt
+    /// reads as an interrupted renewal or an interrupted first issuance.
+    fn action_prefix(self) -> &'static str {
+        match self {
+            CertAuditStage::Attempted { renewal: true } => "attempt=renew ",
+            CertAuditStage::Attempted { renewal: false } => "attempt=issue ",
+            _ => "",
+        }
     }
 }
 
@@ -502,6 +585,47 @@ mod tests {
             .label(),
             issued_at: 1_000,
         }
+    }
+
+    /// An audit logger writing to `<dir>/audit.log`, with that path.
+    fn audit_logger(dir: &Path) -> (Arc<AuditLogger>, std::path::PathBuf) {
+        let logger = AuditLogger::new(
+            AuditConfig {
+                enabled: true,
+                log_path: "audit.log".to_string(),
+                max_size_mb: 100,
+                sign_events: false,
+            },
+            dir.to_path_buf(),
+        )
+        .unwrap();
+        (Arc::new(logger), dir.join("audit.log"))
+    }
+
+    fn audit_events(log_path: &Path) -> Vec<AuditEvent> {
+        std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<AuditEvent>(l).expect("audit line is a valid event"))
+            .collect()
+    }
+
+    /// The serialized `event_type`: the readable surface an audit reader sees.
+    fn type_name(event: &AuditEvent) -> String {
+        serde_json::to_value(&event.event_type)
+            .unwrap()
+            .as_str()
+            .expect("event_type serializes as a string")
+            .to_string()
+    }
+
+    fn command_of(event: &AuditEvent) -> String {
+        event
+            .action
+            .as_ref()
+            .and_then(|a| a.command.clone())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -688,6 +812,88 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("certificate audit event"), "got: {err}");
+    }
+
+    #[test]
+    fn record_issued_audits_an_attempt_then_a_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open_in_memory(Some(audit)).unwrap();
+
+        led.record_issued(&entry("fp1", "dev1"), false).unwrap();
+        led.record_issued(&entry("fp2", "dev1"), true).unwrap();
+
+        let events = audit_events(&log);
+        let names: Vec<String> = events.iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issued",
+                "cert_issuance_attempted",
+                "cert_renewed",
+            ],
+            "each issuance is an attempt followed by its completion"
+        );
+        // The attempt claims no outcome and names the completion it is waiting
+        // on; only the post-commit event records success.
+        assert!(events[0].result.is_none(), "an attempt records no outcome");
+        assert!(events[2].result.is_none(), "an attempt records no outcome");
+        assert!(command_of(&events[0]).starts_with("attempt=issue fingerprint=fp1 "));
+        assert!(command_of(&events[2]).starts_with("attempt=renew fingerprint=fp2 "));
+        assert!(events[1].result.as_ref().unwrap().success);
+        assert!(events[3].result.as_ref().unwrap().success);
+        assert!(command_of(&events[1]).starts_with("fingerprint=fp1 "));
+        assert!(command_of(&events[3]).starts_with("fingerprint=fp2 "));
+        // The chain sequence is the append order: no completion precedes its attempt.
+        assert!(events[0].sequence < events[1].sequence);
+        assert!(events[2].sequence < events[3].sequence);
+    }
+
+    #[test]
+    fn record_issued_ledger_failure_leaves_an_attempt_with_no_completion() {
+        // Forced SQLite failure AFTER the audit write. Renaming the INSERT
+        // target away is the least invasive stand-in for any commit-time
+        // failure (full disk, corruption, lock timeout) and needs no production
+        // injection hook. The pre-commit event must not have claimed issuance.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open_in_memory(Some(audit)).unwrap();
+        led.detach_issued_certs_for_test().unwrap();
+
+        let err = led
+            .record_issued(&entry("fp1", "dev1"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("insert issued cert"), "got: {err}");
+
+        let events = audit_events(&log);
+        let names: Vec<String> = events.iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            ["cert_issuance_attempted"],
+            "a failed ledger write must leave an attempt, never a completion"
+        );
+        assert!(events[0].result.is_none(), "an attempt records no outcome");
+
+        // Nothing usable was delivered: the caller got the retryable error, so
+        // it never hands the certificate over, and no row backs that fingerprint.
+        led.reattach_issued_certs_for_test().unwrap();
+        assert_eq!(led.status_of("fp1").unwrap(), None);
+        assert!(led.list_active().unwrap().is_empty());
+
+        // The retry completes, and the completion event is what marks it so.
+        led.record_issued(&entry("fp1", "dev1"), false).unwrap();
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issuance_attempted",
+                "cert_issued",
+            ]
+        );
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
     }
 
     #[test]
