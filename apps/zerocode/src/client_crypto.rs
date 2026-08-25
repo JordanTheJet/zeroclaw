@@ -11,10 +11,15 @@ use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-pub fn cert_sha256_fingerprint(cert_der: &[u8]) -> String {
+/// SHA-256 of `bytes` as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(cert_der);
+    hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+pub fn cert_sha256_fingerprint(cert_der: &[u8]) -> String {
+    sha256_hex(cert_der)
 }
 
 pub fn enrollment_sas(pairing_code: &str, ca_fingerprint_hex: &str) -> String {

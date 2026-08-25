@@ -473,58 +473,242 @@ fn single_ca_cert_der(ca_chain_pem: &str) -> Result<rustls::pki_types::Certifica
 
 /// Marker written immediately before the first publication rename and removed
 /// after the last. Its presence means a publication was interrupted part-way.
+/// It carries the manifest of the generation being published, so recovery can
+/// tell that generation apart from whatever else is on disk.
 const PUBLISH_MARKER: &str = ".publish.pending";
 
+/// First line of the marker. A marker that does not start with this tag was not
+/// written by this publication contract, so recovery refuses it rather than
+/// guessing which files belong together.
+const PUBLISH_MANIFEST_TAG: &str = "zerocode-publish-v1";
+
+/// Length of a SHA-256 digest in lowercase hex.
+const DIGEST_HEX_LEN: usize = 64;
+
+/// One file of a credential generation.
+struct Material {
+    /// Staged name under `<config_dir>/tls`, written before the marker exists.
+    staged: &'static str,
+    /// Published name under `<config_dir>/tls`.
+    published: &'static str,
+    /// The private key is written `0600`; cert, CA, and profile are public.
+    private: bool,
+}
+
+/// How many files make up one credential generation.
+const MATERIAL_COUNT: usize = 4;
+
 /// The staged files and their published names, in publication order.
-const STAGED_MATERIALS: [(&str, &str); 4] = [
-    (".client.crt.tmp", "client.crt"),
-    (".ca.crt.tmp", "ca.crt"),
-    (".client.key.tmp", "client.key"),
-    (".profile.json.tmp", "profile.json"),
+const STAGED_MATERIALS: [Material; MATERIAL_COUNT] = [
+    Material {
+        staged: ".client.crt.tmp",
+        published: "client.crt",
+        private: false,
+    },
+    Material {
+        staged: ".ca.crt.tmp",
+        published: "ca.crt",
+        private: false,
+    },
+    Material {
+        staged: ".client.key.tmp",
+        published: "client.key",
+        private: true,
+    },
+    Material {
+        staged: ".profile.json.tmp",
+        published: "profile.json",
+        private: false,
+    },
 ];
 
-/// Complete a publication interrupted between the first and last rename.
+/// A credential generation staged under `<config_dir>/tls`, ready to publish.
+struct StagedGeneration {
+    tls_dir: std::path::PathBuf,
+    /// Marker contents: the tag plus the digest of every staged material.
+    manifest: String,
+}
+
+/// Stage every material and make the bytes AND their directory entries durable.
+/// No marker exists yet, so a crash at any point here leaves the previous
+/// generation published and untouched, and the stale `.tmp` files are ignored
+/// and overwritten by the next attempt.
+fn stage_generation(tls_dir: &Path, payloads: [&[u8]; MATERIAL_COUNT]) -> Result<StagedGeneration> {
+    let mut manifest = String::from(PUBLISH_MANIFEST_TAG);
+    manifest.push('\n');
+    for (material, bytes) in STAGED_MATERIALS.iter().zip(payloads) {
+        write_durable(&tls_dir.join(material.staged), bytes, material.private)?;
+        manifest.push_str(&crate::client_crypto::sha256_hex(bytes));
+        manifest.push(' ');
+        manifest.push_str(material.published);
+        manifest.push('\n');
+    }
+    sync_dir_where_supported(tls_dir)?;
+    Ok(StagedGeneration {
+        tls_dir: tls_dir.to_path_buf(),
+        manifest,
+    })
+}
+
+/// Make the marker durable, which opens the recovery window. From here the
+/// staged set is complete and self-describing, so every state a crash can leave
+/// carries the manifest that decides whether the set can still be assembled.
+///
+/// The manifest is written `0600` because it digests the private key alongside
+/// the public materials.
+fn mark_generation(staged: &StagedGeneration) -> Result<()> {
+    write_durable(
+        &staged.tls_dir.join(PUBLISH_MARKER),
+        staged.manifest.as_bytes(),
+        true,
+    )?;
+    sync_dir_where_supported(&staged.tls_dir)
+}
+
+/// Rename one staged material over its published name.
+fn install_material(tls_dir: &Path, material: &Material) -> Result<()> {
+    let published = tls_dir.join(material.published);
+    std::fs::rename(tls_dir.join(material.staged), &published)
+        .with_context(|| format!("installing {}", published.display()))
+}
+
+/// Complete a publication interrupted between the first and last rename, or
+/// refuse when the recorded generation can no longer be assembled from disk.
 ///
 /// The credential set is four files published with four renames, which is not
 /// one atomic step. A crash in between leaves a mixed set - most damagingly a
 /// NEW `client.crt` beside the OLD `client.key`, which authenticates as
 /// neither. Making the swap genuinely atomic needs a directory-swap or symlink
 /// layout that changes the published `<config_dir>/tls/` contract and does not
-/// port cleanly to Windows, so this is the recovery contract instead:
+/// port cleanly to Windows, so the transition is made durable and verifiable
+/// instead:
 ///
-/// - Staged `.tmp` files are written and fsynced BEFORE the marker exists, so a
-///   crash during staging leaves no marker and the stale `.tmp` files are
-///   ignored and overwritten by the next attempt.
-/// - The marker is written only once every staged file is complete. From that
-///   point the staged set is known-good, so finishing the renames is always the
-///   correct recovery - each rename is idempotent and a rename already applied
-///   simply has no `.tmp` left to move.
-/// - The marker is removed only after the last rename, so the window is closed
-///   exactly when the set is consistent.
+/// - Every staged `.tmp` file is fsynced, and its directory entry fsynced,
+///   BEFORE the marker exists. A crash during staging therefore leaves no
+///   marker, and the stale `.tmp` files are ignored.
+/// - The marker is a manifest: it records the digest of every staged material
+///   and is itself fsynced, directory entry included, before the first rename.
+///   Any state reachable after that carries the manifest.
+/// - Recovery matches every material against the manifest BEFORE it moves
+///   anything. A material must be either staged with the recorded digest or
+///   already published with it. Anything else - a lost staged file, a stale
+///   published file, an unreadable manifest - is a hard error that leaves the
+///   marker in place, because the generation cannot be reconstructed and the
+///   partial set must not be trusted.
+/// - The marker is removed only once every rename is durable, so the window
+///   closes exactly when the set is consistent.
+///
+/// This is also the commit path for a fresh publication (see `cache_materials`),
+/// so the published set is only ever assembled by the code a crashed run uses.
 ///
 /// Callers run this before READING the materials and before staging new ones,
 /// so an interrupted publication is repaired rather than observed.
 pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
     let tls_dir = config_dir.join("tls");
     let marker = tls_dir.join(PUBLISH_MARKER);
-    if !marker.exists() {
-        return Ok(());
-    }
-    for (tmp_name, final_name) in STAGED_MATERIALS {
-        let staged = tls_dir.join(tmp_name);
-        if staged.exists() {
-            let published = tls_dir.join(final_name);
-            std::fs::rename(&staged, &published).with_context(|| {
-                format!("completing interrupted publish of {}", published.display())
-            })?;
+    let raw = match std::fs::read_to_string(&marker) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading {}", marker.display()));
+        }
+    };
+    let digests = parse_publish_manifest(&raw)
+        .with_context(|| format!("reading the credential manifest in {}", marker.display()))?;
+
+    // Classify the whole set BEFORE moving anything: a rename applied on the way
+    // to a refusal would publish exactly the mixed generation this recovery
+    // exists to prevent.
+    let mut pending = Vec::new();
+    let mut unrecoverable = Vec::new();
+    for (material, digest) in STAGED_MATERIALS.iter().zip(&digests) {
+        let staged = tls_dir.join(material.staged);
+        let published = tls_dir.join(material.published);
+        if file_digest(&staged)?.as_deref() == Some(digest.as_str()) {
+            pending.push(material);
+        } else if file_digest(&published)?.as_deref() != Some(digest.as_str()) {
+            unrecoverable.push(format!(
+                "{} (staged as {})",
+                published.display(),
+                staged.display()
+            ));
         }
     }
+    if !unrecoverable.is_empty() {
+        anyhow::bail!(
+            "an interrupted credential publication cannot be completed: {} \
+             no longer match the generation recorded in {}. The marker is kept \
+             so the partial set is never trusted; remove the credentials in {} \
+             and enroll again.",
+            unrecoverable.join(", "),
+            marker.display(),
+            tls_dir.display()
+        );
+    }
+
+    for material in pending {
+        install_material(&tls_dir, material).with_context(|| {
+            format!(
+                "completing interrupted publish of {}",
+                tls_dir.join(material.published).display()
+            )
+        })?;
+    }
+    // Every rename must be durable before the marker stops guarding the set.
+    sync_dir_where_supported(&tls_dir)?;
     std::fs::remove_file(&marker).with_context(|| format!("clearing {}", marker.display()))?;
-    Ok(())
+    sync_dir_where_supported(&tls_dir)
+}
+
+/// Parse the marker into the recorded digest of each material, in
+/// `STAGED_MATERIALS` order. The published names are checked so a manifest
+/// describing a different set is refused rather than matched positionally.
+fn parse_publish_manifest(raw: &str) -> Result<Vec<String>> {
+    let mut lines = raw.lines();
+    let tag = lines.next().unwrap_or_default().trim();
+    if tag != PUBLISH_MANIFEST_TAG {
+        anyhow::bail!("unrecognised publication marker format {tag:?}");
+    }
+    let mut digests = Vec::with_capacity(MATERIAL_COUNT);
+    for material in &STAGED_MATERIALS {
+        let line = lines.next().context("truncated publication marker")?;
+        let (digest, name) = line
+            .trim()
+            .split_once(' ')
+            .with_context(|| format!("malformed publication marker entry {line:?}"))?;
+        if name != material.published {
+            anyhow::bail!(
+                "publication marker lists {name:?} where {} is expected",
+                material.published
+            );
+        }
+        if digest.len() != DIGEST_HEX_LEN || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "publication marker holds a malformed digest for {}",
+                material.published
+            );
+        }
+        digests.push(digest.to_ascii_lowercase());
+    }
+    Ok(digests)
+}
+
+/// SHA-256 of a file's bytes, or `None` when the file is absent.
+fn file_digest(path: &Path) -> Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(crate::client_crypto::sha256_hex(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e)).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Write the cert, key, CA, and cached profile under `<config_dir>/tls`. The key
 /// is written `0600` on Unix; the cert/CA/profile are public.
+///
+/// The four files are ONE generation: they are staged and made durable, then the
+/// manifest marker is made durable, and only then are they renamed into place -
+/// by the same recovery path a crashed run takes. See `finish_pending_publish`.
 fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> Result<()> {
     // Validate before writing anything. The SAS is bound to this single trust
     // anchor, so refuse to persist a broader
@@ -533,6 +717,8 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
 
     let tls_dir = config_dir.join("tls");
     std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
+    // The directory entry must be durable before it holds credentials.
+    sync_dir_where_supported(config_dir)?;
     // Repair an interrupted earlier publication before staging over it.
     finish_pending_publish(config_dir)?;
     #[cfg(unix)]
@@ -548,67 +734,83 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     };
     let json = serde_json::to_string_pretty(&profile).context("serializing profile")?;
 
-    let client_crt = tls_dir.join("client.crt");
-    let ca_crt = tls_dir.join("ca.crt");
-    let client_key = tls_dir.join("client.key");
-    let profile_json = tls_dir.join("profile.json");
-    let client_crt_tmp = tls_dir.join(".client.crt.tmp");
-    let ca_crt_tmp = tls_dir.join(".ca.crt.tmp");
-    let client_key_tmp = tls_dir.join(".client.key.tmp");
-    let profile_json_tmp = tls_dir.join(".profile.json.tmp");
-
-    std::fs::write(&client_crt_tmp, resp.cert_pem.as_bytes())
-        .with_context(|| format!("writing {}", client_crt_tmp.display()))?;
-    std::fs::write(&ca_crt_tmp, resp.ca_chain_pem.as_bytes())
-        .with_context(|| format!("writing {}", ca_crt_tmp.display()))?;
-    write_private(&client_key_tmp, key_pem)?;
-    std::fs::write(&profile_json_tmp, json)
-        .with_context(|| format!("writing {}", profile_json_tmp.display()))?;
-
-    // Only publish after every replacement has been durably written. A failed
-    // staging write leaves the previous cert/key/CA/profile set untouched, and
-    // leaves no marker, so the stale staged files are ignored.
-    //
-    // The marker opens the recovery window: from here the staged set is known
-    // complete, so if the process dies mid-rename the next run finishes the
-    // publication rather than leaving a new cert beside an old key. See
-    // `finish_pending_publish`.
-    let marker = tls_dir.join(PUBLISH_MARKER);
-    std::fs::write(&marker, b"publishing\n")
-        .with_context(|| format!("writing {}", marker.display()))?;
-
-    std::fs::rename(&client_crt_tmp, &client_crt)
-        .with_context(|| format!("installing {}", client_crt.display()))?;
-    std::fs::rename(&ca_crt_tmp, &ca_crt)
-        .with_context(|| format!("installing {}", ca_crt.display()))?;
-    std::fs::rename(&client_key_tmp, &client_key)
-        .with_context(|| format!("installing {}", client_key.display()))?;
-    std::fs::rename(&profile_json_tmp, &profile_json)
-        .with_context(|| format!("installing {}", profile_json.display()))?;
-
-    std::fs::remove_file(&marker).with_context(|| format!("clearing {}", marker.display()))?;
-    Ok(())
+    let staged = stage_generation(
+        &tls_dir,
+        [
+            resp.cert_pem.as_bytes(),
+            resp.ca_chain_pem.as_bytes(),
+            key_pem.as_bytes(),
+            json.as_bytes(),
+        ],
+    )?;
+    mark_generation(&staged)?;
+    finish_pending_publish(config_dir)
 }
 
-/// Write a private key at `0600` (Unix), no world-readable window.
-fn write_private(path: &Path, pem: &str) -> Result<()> {
+/// Write `bytes` to `path` and fsync them, so the content survives power loss
+/// before anything claims it. `private` writes `0600` on Unix, with no
+/// world-readable window.
+fn write_durable(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        f.write_all(pem.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
+        if private {
+            options.mode(0o600);
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))?;
+        // No mode bits here; the tls directory ACL is the guard.
+        let _ = private;
+    }
+    let mut f = options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    Ok(())
+}
+
+/// fsync a directory so the entries created, renamed, or removed inside it are
+/// durable, not just the file contents. Unix opens the directory and syncs the
+/// handle. No other platform offers a portable equivalent, so this is a
+/// documented no-op there and the publication relies on the marker alone.
+fn sync_dir_where_supported(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let handle = std::fs::File::open(dir)
+            .with_context(|| format!("opening {} to sync it", dir.display()))?;
+        handle
+            .sync_all()
+            .with_context(|| format!("syncing {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Leave `<config_dir>/tls` in the state a crash leaves after `renames` of the
+/// four publication renames: the new generation staged and marked, the first
+/// `renames` materials published, the marker still present. Test-only seam so a
+/// regression can build a real interrupted state rather than an approximation.
+#[cfg(test)]
+pub(crate) fn interrupt_publication_for_test(
+    config_dir: &Path,
+    payloads: [&[u8]; MATERIAL_COUNT],
+    renames: usize,
+) -> Result<()> {
+    let tls_dir = config_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
+    let staged = stage_generation(&tls_dir, payloads)?;
+    mark_generation(&staged)?;
+    for material in STAGED_MATERIALS.iter().take(renames) {
+        install_material(&tls_dir, material)?;
     }
     Ok(())
 }
@@ -684,44 +886,157 @@ impl rustls::client::danger::ServerCertVerifier for AcceptProvisional {
 
 #[cfg(test)]
 mod tests {
-    /// Recovery contract for the four-rename credential publication (August
-    /// human review). A crash between renames must not leave a NEW cert beside
-    /// an OLD key: the marker makes the interrupted state recoverable, and the
-    /// next run finishes the publication.
+    // Fault-phase coverage for the four-rename credential publication (August
+    // human review). A test cannot cut the power, so each phase runs the REAL
+    // publication steps and stops at the boundary where the process would have
+    // died; the on-disk state is therefore the state a crash at that point
+    // actually leaves, not a hand-built approximation of it.
+    //
+    // The contract every phase asserts: recovery either completes the whole
+    // generation or refuses and keeps its marker. It never publishes a mixed
+    // set (a NEW cert beside an OLD key), and it never clears the marker while
+    // the recorded generation is incomplete.
+
+    /// The generation already published before the publication under test.
+    const OLD: [&[u8]; MATERIAL_COUNT] = [b"OLD-CERT", b"OLD-CA", b"OLD-KEY", b"OLD-PROFILE"];
+    /// The generation being published.
+    const NEW: [&[u8]; MATERIAL_COUNT] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", b"NEW-PROFILE"];
+
+    fn publish_old_generation(tls: &std::path::Path) {
+        std::fs::create_dir_all(tls).unwrap();
+        for (material, bytes) in STAGED_MATERIALS.iter().zip(OLD) {
+            std::fs::write(tls.join(material.published), bytes).unwrap();
+        }
+    }
+
+    /// Every published material belongs to the same generation.
+    fn assert_published_generation(tls: &std::path::Path, expected: [&[u8]; MATERIAL_COUNT]) {
+        for (material, bytes) in STAGED_MATERIALS.iter().zip(expected) {
+            let path = tls.join(material.published);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{} is not the expected generation",
+                path.display()
+            );
+        }
+    }
+
+    /// Phase: staged and durable, marker not yet written. The set is not
+    /// known-good, so recovery leaves the published generation alone.
     #[test]
-    fn interrupted_publish_is_completed_from_the_marker() {
+    fn interruption_after_staging_leaves_the_published_set_alone() {
         let dir = tempfile::tempdir().unwrap();
         let tls = dir.path().join("tls");
-        std::fs::create_dir_all(&tls).unwrap();
+        publish_old_generation(&tls);
+        stage_generation(&tls, NEW).unwrap();
 
-        // Previous generation, already published.
-        std::fs::write(tls.join("client.crt"), b"OLD-CERT").unwrap();
-        std::fs::write(tls.join("ca.crt"), b"OLD-CA").unwrap();
-        std::fs::write(tls.join("client.key"), b"OLD-KEY").unwrap();
-        std::fs::write(tls.join("profile.json"), b"OLD-PROFILE").unwrap();
+        finish_pending_publish(dir.path())
+            .expect("an unmarked staged set is not a pending publish");
 
-        // Simulate a crash after the FIRST rename: client.crt is the new one,
-        // the remaining three are still staged, and the marker is present.
-        std::fs::write(tls.join("client.crt"), b"NEW-CERT").unwrap();
-        std::fs::write(tls.join(".ca.crt.tmp"), b"NEW-CA").unwrap();
-        std::fs::write(tls.join(".client.key.tmp"), b"NEW-KEY").unwrap();
-        std::fs::write(tls.join(".profile.json.tmp"), b"NEW-PROFILE").unwrap();
-        std::fs::write(tls.join(PUBLISH_MARKER), b"publishing\n").unwrap();
+        assert_published_generation(&tls, OLD);
+        assert!(!tls.join(PUBLISH_MARKER).exists());
+    }
+
+    /// Phases: marker durable with zero renames applied, through every rename
+    /// count up to all four with the marker still present. Each is recoverable
+    /// into the complete new generation.
+    #[test]
+    fn every_rename_interruption_completes_the_generation() {
+        for renames in 0..=MATERIAL_COUNT {
+            let dir = tempfile::tempdir().unwrap();
+            let tls = dir.path().join("tls");
+            publish_old_generation(&tls);
+            interrupt_publication_for_test(dir.path(), NEW, renames).unwrap();
+            assert!(
+                tls.join(PUBLISH_MARKER).exists(),
+                "the marker guards the window after {renames} rename(s)"
+            );
+
+            finish_pending_publish(dir.path())
+                .unwrap_or_else(|e| panic!("recovery after {renames} rename(s) failed: {e:#}"));
+
+            assert_published_generation(&tls, NEW);
+            assert!(
+                !tls.join(PUBLISH_MARKER).exists(),
+                "the marker must be cleared once the set is consistent"
+            );
+        }
+    }
+
+    /// A first enrollment has no previous generation to fall back to, so an
+    /// interruption before any rename must still recover the complete set.
+    #[test]
+    fn a_first_publication_interrupted_before_any_rename_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        interrupt_publication_for_test(dir.path(), NEW, 0).unwrap();
 
         finish_pending_publish(dir.path()).expect("recovery must succeed");
 
-        // The whole set is now the new generation: no cert/key mismatch.
-        assert_eq!(std::fs::read(tls.join("client.crt")).unwrap(), b"NEW-CERT");
-        assert_eq!(std::fs::read(tls.join("ca.crt")).unwrap(), b"NEW-CA");
-        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"NEW-KEY");
-        assert_eq!(
-            std::fs::read(tls.join("profile.json")).unwrap(),
-            b"NEW-PROFILE"
-        );
+        assert_published_generation(&tls, NEW);
+        assert!(!tls.join(PUBLISH_MARKER).exists());
+    }
+
+    /// A staged material that is not on disk any more means the recorded
+    /// generation cannot be assembled. Finishing the other renames is exactly
+    /// what leaves a NEW cert beside an OLD key, so recovery refuses, moves
+    /// nothing, and keeps the marker.
+    #[test]
+    fn a_lost_staged_material_is_refused_and_keeps_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        interrupt_publication_for_test(dir.path(), NEW, 1).unwrap();
+        std::fs::remove_file(tls.join(".client.key.tmp")).unwrap();
+
+        let err = format!("{:#}", finish_pending_publish(dir.path()).unwrap_err());
+        assert!(err.contains("client.key"), "got: {err}");
         assert!(
-            !tls.join(PUBLISH_MARKER).exists(),
-            "the marker must be cleared once the set is consistent"
+            tls.join(PUBLISH_MARKER).exists(),
+            "an incomplete generation must never clear its marker"
         );
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"OLD-KEY");
+        assert_eq!(
+            std::fs::read(tls.join("ca.crt")).unwrap(),
+            b"OLD-CA",
+            "no rename may be applied on the way to a refusal"
+        );
+        assert!(tls.join(".ca.crt.tmp").exists());
+        // The refusal is stable: a later run must not decide differently.
+        assert!(finish_pending_publish(dir.path()).is_err());
+    }
+
+    /// A staged material whose bytes do not match the manifest is not part of
+    /// the recorded generation, so the set is refused rather than published.
+    #[test]
+    fn a_staged_material_that_does_not_match_the_manifest_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        interrupt_publication_for_test(dir.path(), NEW, 0).unwrap();
+        std::fs::write(tls.join(".profile.json.tmp"), b"TORN").unwrap();
+
+        let err = format!("{:#}", finish_pending_publish(dir.path()).unwrap_err());
+        assert!(err.contains("profile.json"), "got: {err}");
+        assert!(tls.join(PUBLISH_MARKER).exists());
+        assert_published_generation(&tls, OLD);
+    }
+
+    /// A marker without a parseable manifest describes no generation at all, so
+    /// recovery refuses instead of renaming whatever happens to be staged.
+    #[test]
+    fn a_marker_without_a_manifest_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        stage_generation(&tls, NEW).unwrap();
+        std::fs::write(tls.join(PUBLISH_MARKER), b"publishing\n").unwrap();
+
+        let err = format!("{:#}", finish_pending_publish(dir.path()).unwrap_err());
+        assert!(err.contains("publication marker"), "got: {err}");
+        assert!(tls.join(PUBLISH_MARKER).exists());
+        assert_published_generation(&tls, OLD);
     }
 
     /// Staged files WITHOUT a marker are the residue of a crash during staging:
@@ -762,7 +1077,14 @@ mod tests {
             !dir.path().join("tls").join(PUBLISH_MARKER).exists(),
             "a completed publish must clear its marker"
         );
-        assert!(dir.path().join("tls").join("client.key").exists());
+        let key = dir.path().join("tls").join("client.key");
+        assert!(key.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the published key must stay 0600");
+        }
     }
 
     use super::*;

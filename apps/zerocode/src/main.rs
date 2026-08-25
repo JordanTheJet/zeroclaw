@@ -451,6 +451,35 @@ async fn resolve_relay_dial(
     }
 }
 
+/// The credential facts every startup decision reads: the cached enrollment
+/// profile (device id, renewal deadline, relay coordinates) and whether a client
+/// certificate exists at all.
+#[derive(Debug)]
+struct CredentialStartup {
+    profile: Option<enroll::CachedProfile>,
+    certless: bool,
+}
+
+/// Recover an interrupted credential publication, THEN read the credential
+/// facts. The order is the contract: a publication interrupted mid-rename has a
+/// new certificate beside an old profile, so a read taken first reports stale
+/// relay coordinates or an absent certificate that re-runs enrollment. A
+/// recovery that cannot reassemble the generation is fatal here, because every
+/// route that follows would otherwise dial with a mixed certificate/key set.
+fn recover_then_read_credentials(
+    config_dir: &std::path::Path,
+    cli_client_cert: Option<&str>,
+    cfg_client_cert: &str,
+) -> anyhow::Result<CredentialStartup> {
+    use anyhow::Context as _;
+    enroll::finish_pending_publish(config_dir)
+        .context("completing an interrupted credential publication")?;
+    Ok(CredentialStartup {
+        profile: enroll::cached_profile(config_dir),
+        certless: enroll::is_certless(config_dir, cli_client_cert, cfg_client_cert),
+    })
+}
+
 /// A default client-TLS file under `<config_dir>/tls/<name>`, if it exists, so a
 /// client provisioned the conventional way needs no explicit `--tls-*` flags.
 fn default_tls_path(config_dir: &std::path::Path, name: &str) -> Option<String> {
@@ -749,20 +778,23 @@ async fn run() -> anyhow::Result<()> {
         use std::io::IsTerminal as _;
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         let cfg_wss = &loaded_config.connection.wss;
-        let cached = enroll::cached_profile(&config_dir);
-        let cached_relay = cached.as_ref().map(|p| &p.relay);
+        // Recovery runs before the first credential read of the process, so no
+        // decision below observes a half-published generation.
+        let credentials = recover_then_read_credentials(
+            &config_dir,
+            cli.tls_client_cert.as_deref(),
+            &cfg_wss.tls.client_cert_path,
+        )?;
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
         let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
         let wss_intended = cli.connect.is_some()
             || cfg_wss.uri.is_some()
             || cli.relay.is_some()
             || cfg_wss.relay_url.is_some();
-        let certless = enroll::is_certless(
-            &config_dir,
-            cli.tls_client_cert.as_deref(),
-            &cfg_wss.tls.client_cert_path,
-        );
-        let auto =
-            wss_intended && certless && cli.connect.is_some() && std::io::stderr().is_terminal();
+        let auto = wss_intended
+            && credentials.certless
+            && cli.connect.is_some()
+            && std::io::stderr().is_terminal();
         if cli.enroll || auto {
             if should_enroll_via_relay(&cli, cfg_wss, relay.is_some()) {
                 enroll::enroll_via_relay(
@@ -792,8 +824,16 @@ async fn run() -> anyhow::Result<()> {
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         // The cached enrollment profile supplies the relay coordinates so a bare
         // `zerocode` after enrollment still reaches the daemon through its relay.
-        let cached = enroll::cached_profile(&config_dir);
-        let cached_relay = cached.as_ref().map(|p| &p.relay);
+        // Enrollment above may have published a new generation, so recover and
+        // re-read here too rather than reusing the pre-enrollment facts. A
+        // recovery that cannot reassemble the generation aborts the run instead
+        // of resolving relay coordinates or TLS paths from a mixed set.
+        let credentials = recover_then_read_credentials(
+            &config_dir,
+            cli.tls_client_cert.as_deref(),
+            &cfg_wss.tls.client_cert_path,
+        )?;
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
 
         // Direct daemon address (CLI overrides config). `None` => relay-only.
         let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
@@ -804,12 +844,6 @@ async fn run() -> anyhow::Result<()> {
         // A WSS route is chosen when a direct address OR a relay is available;
         // otherwise the local IPC socket.
         if direct_url.is_some() || relay.is_some() {
-            // Repair a publication interrupted mid-rename before resolving any
-            // path, so we never load a new cert beside an old key.
-            if let Err(e) = enroll::finish_pending_publish(&config_dir) {
-                eprintln!("warning: could not complete a pending credential publish: {e:#}");
-            }
-
             // Mutual-TLS material: CLI flag -> config -> conventional default path
             // under <config_dir>/tls, so a provisioned client needs no --tls-* flags.
             let tls = client::ClientTls {
@@ -2055,6 +2089,124 @@ mod apply_insecure_tls_choice_tests {
         assert!(
             cfg.connection.wss.tls.route_acked(URL),
             "Always must persist the confirmed route alongside unrelated sections"
+        );
+    }
+}
+
+#[cfg(test)]
+mod credential_recovery_order_tests {
+    //! Startup-ORDER regressions for [`crate::recover_then_read_credentials`].
+    //!
+    //! An interrupted credential publication cannot be produced by cutting the
+    //! power in a test, so these build the real post-crash state with the
+    //! publication's own steps (`enroll::interrupt_publication_for_test`) and
+    //! then assert what startup reads. Each test first shows what a read taken
+    //! BEFORE recovery would have reported, so the assertions prove the order
+    //! matters rather than restating the recovered state.
+
+    use super::*;
+
+    fn profile_json(relay_url: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "device_id": "dev_1",
+            "not_after": 0,
+            "relay": {
+                "relay_url": relay_url,
+                "node_id": "node-1",
+                "relay_cert_pin": "",
+            },
+        }))
+        .unwrap()
+    }
+
+    fn publish_old_generation(tls: &std::path::Path, relay_url: &str) {
+        std::fs::create_dir_all(tls).unwrap();
+        std::fs::write(tls.join("client.crt"), b"OLD-CERT").unwrap();
+        std::fs::write(tls.join("ca.crt"), b"OLD-CA").unwrap();
+        std::fs::write(tls.join("client.key"), b"OLD-KEY").unwrap();
+        std::fs::write(tls.join("profile.json"), profile_json(relay_url)).unwrap();
+    }
+
+    /// A publication interrupted after its FIRST rename leaves the new
+    /// certificate beside the old profile. Reading before recovery hands the
+    /// connect path the OLD relay coordinates, and pairs a new certificate with
+    /// the old key.
+    #[test]
+    fn a_first_rename_interruption_does_not_yield_stale_relay_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+
+        // What an unordered startup would have read.
+        assert_eq!(
+            enroll::cached_profile(dir.path()).unwrap().relay.relay_url,
+            "old-relay.invalid:443",
+            "the interrupted state must still carry the stale coordinates"
+        );
+
+        let credentials = recover_then_read_credentials(dir.path(), None, "").unwrap();
+
+        assert_eq!(
+            credentials.profile.unwrap().relay.relay_url,
+            "new-relay.invalid:443",
+            "startup must read the recovered generation, not the interrupted one"
+        );
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"NEW-KEY");
+        assert!(!credentials.certless);
+    }
+
+    /// A first enrollment interrupted before any rename has no published
+    /// certificate yet. Read before recovery it looks certless, which re-runs
+    /// enrollment and discards the certificate the daemon already issued.
+    #[test]
+    fn an_interrupted_first_enrollment_is_not_reported_as_certless() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 0).unwrap();
+
+        // What an unordered startup would have read.
+        assert!(enroll::is_certless(dir.path(), None, ""));
+        assert!(enroll::cached_profile(dir.path()).is_none());
+
+        let credentials = recover_then_read_credentials(dir.path(), None, "").unwrap();
+
+        assert!(
+            !credentials.certless,
+            "recovery must publish the issued certificate before enrollment is considered"
+        );
+        assert_eq!(
+            credentials.profile.unwrap().relay.relay_url,
+            "new-relay.invalid:443"
+        );
+    }
+
+    /// Recovery that cannot reassemble the generation must stop the run, not
+    /// warn and continue into relay resolution and TLS path derivation with a
+    /// mixed set.
+    #[test]
+    fn an_unrecoverable_publication_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+        std::fs::remove_file(tls.join(".client.key.tmp")).unwrap();
+
+        let err = recover_then_read_credentials(dir.path(), None, "").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("interrupted credential publication"),
+            "got: {err}"
+        );
+        assert!(err.contains("client.key"), "got: {err}");
+        assert!(
+            tls.join(".publish.pending").exists(),
+            "an incomplete generation must keep its marker for the next run"
         );
     }
 }
