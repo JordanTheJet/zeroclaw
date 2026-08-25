@@ -522,6 +522,16 @@ relay/relay_pin                    relay outer-leaf pin (--relay-tofu)
 
 **Relay `<tls-dir>/`:** `ca.crt`, `server.crt`, `server.key` (self-provisioned).
 
+### Upgrading an existing issued-cert ledger
+
+`tls/ledger.db` carries a schema version. A ledger written by an earlier
+revision is rebuilt in place the first time the new daemon opens it, preserving
+every issued and revoked certificate along with its device id, validity and
+audit actor. The rebuild runs in a single transaction: if it cannot complete,
+the daemon refuses to start and leaves the original ledger untouched rather than
+half-migrated, and the error names the file. No operator action is required, and
+enrolled devices do not need to re-enroll.
+
 ## Verifying and troubleshooting
 
 - **Daemon up:** look for the WSS listener log on `0.0.0.0:9781` and, with a relay,

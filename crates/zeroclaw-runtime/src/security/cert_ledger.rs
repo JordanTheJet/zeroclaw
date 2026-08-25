@@ -20,7 +20,7 @@
 //! (threat A5). The WSS handshake-time refusal is wired separately against this
 //! ledger via [`CertLedger::revoked_fingerprints`] / [`CertLedger::is_revoked`].
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -36,6 +36,50 @@ use super::audit::{AuditEvent, AuditEventType, AuditLogger};
 /// status. Every read either filters it out or reports the fingerprint as
 /// unknown; see [`CertLedger::record_issued`] for the state machine.
 const PENDING: &str = "pending";
+
+/// The `issued_certs` schema revision this build expects, stamped into
+/// `PRAGMA user_version`.
+///
+/// * 0 - pre-versioned: `CHECK(status IN ('active','revoked'))`, no `pending`.
+/// * 1 - `pending` admitted by the CHECK, so the issuance two-phase commit in
+///   [`CertLedger::record_issued`] can stage a row.
+const SCHEMA_VERSION: i64 = 1;
+
+/// The `issued_certs` column definitions at [`SCHEMA_VERSION`].
+///
+/// Shared by the fresh-create path and the migration rebuild so a migrated
+/// table can never drift from a freshly created one - the classic migration
+/// bug, and the one that would silently reintroduce the old CHECK.
+const ISSUED_CERTS_COLUMNS: &str = "
+     fingerprint TEXT PRIMARY KEY,
+     device_id   TEXT NOT NULL,
+     token_hash  TEXT NOT NULL DEFAULT '',
+     not_before  INTEGER NOT NULL,
+     not_after   INTEGER NOT NULL,
+     -- 'pending' is the pre-completion state of the issuance two-phase
+     -- commit, never a credential; see record_issued.
+     status      TEXT NOT NULL DEFAULT 'active'
+                     CHECK(status IN ('active','revoked','pending')),
+     issued_at   INTEGER NOT NULL,
+     actor       TEXT NOT NULL DEFAULT ''
+";
+
+/// Every index the ledger relies on. Recreated verbatim after a rebuild,
+/// because `DROP TABLE` takes the old table's indexes with it.
+const ISSUED_CERTS_INDEXES: &str = "
+     CREATE INDEX IF NOT EXISTS idx_issued_certs_device ON issued_certs(device_id);
+     CREATE INDEX IF NOT EXISTS idx_issued_certs_status ON issued_certs(status);
+     CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);
+";
+
+/// Columns named explicitly for the migration copy, so the rebuild is
+/// insensitive to column ORDER and fails loudly rather than silently shifting
+/// values if the shape ever changes.
+const ISSUED_CERTS_COLUMN_LIST: &str =
+    "fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor";
+
+/// Scratch table the rebuild stages into before swapping it in.
+const MIGRATION_TABLE: &str = "issued_certs_migrated";
 
 /// Status of an issued certificate the ledger vouches for.
 ///
@@ -178,7 +222,10 @@ impl CertLedger {
         let db_path = tls_dir.join("ledger.db");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open cert ledger DB: {}", db_path.display()))?;
+        // Name the file: a migration or reconciliation error is only actionable
+        // if the operator knows which ledger to look at.
         Self::init(conn, audit, Some(revoked_path))
+            .with_context(|| format!("initialize cert ledger DB: {}", db_path.display()))
     }
 
     /// In-memory ledger for unit tests.
@@ -191,7 +238,7 @@ impl CertLedger {
     }
 
     fn init(
-        conn: Connection,
+        mut conn: Connection,
         audit: Option<Arc<AuditLogger>>,
         revoked_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
@@ -202,25 +249,9 @@ impl CertLedger {
              PRAGMA temp_store = MEMORY;",
         )
         .context("set cert-ledger PRAGMAs")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS issued_certs (
-                 fingerprint TEXT PRIMARY KEY,
-                 device_id   TEXT NOT NULL,
-                 token_hash  TEXT NOT NULL DEFAULT '',
-                 not_before  INTEGER NOT NULL,
-                 not_after   INTEGER NOT NULL,
-                 -- 'pending' is the pre-completion state of the issuance
-                 -- two-phase commit, never a credential; see record_issued.
-                 status      TEXT NOT NULL DEFAULT 'active'
-                                 CHECK(status IN ('active','revoked','pending')),
-                 issued_at   INTEGER NOT NULL,
-                 actor       TEXT NOT NULL DEFAULT ''
-             );
-             CREATE INDEX IF NOT EXISTS idx_issued_certs_device ON issued_certs(device_id);
-             CREATE INDEX IF NOT EXISTS idx_issued_certs_status ON issued_certs(status);
-             CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);",
-        )
-        .context("create cert-ledger schema")?;
+        // Bring the schema up to date BEFORE anything reads or writes the
+        // table, so a migrated ledger is then reconciled like any other.
+        Self::migrate_schema(&mut conn)?;
         let ledger = Self {
             conn: Mutex::new(conn),
             audit,
@@ -233,6 +264,89 @@ impl CertLedger {
         // startup (covers a missing/stale file).
         ledger.materialize_revocations()?;
         Ok(ledger)
+    }
+
+    /// Bring `conn` to [`SCHEMA_VERSION`], creating or rebuilding
+    /// `issued_certs` as needed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does NOT touch a table that already exists,
+    /// so widening the status CHECK in the schema literal alone left every
+    /// ledger written by an earlier revision of this branch stuck on the
+    /// two-value constraint. Such a daemon opened its ledger successfully and
+    /// then failed EVERY enrollment and renewal at `CHECK constraint failed:
+    /// status IN ('active','revoked')` the moment the issuance path staged a
+    /// `pending` row. An existing table has to be REBUILT, not merely
+    /// re-declared.
+    ///
+    /// The rebuild is the standard SQLite table rewrite inside ONE transaction:
+    /// stage a table at the current schema, copy every column by name, drop the
+    /// old table, rename, recreate the indexes `DROP TABLE` removed, and stamp
+    /// `user_version`. SQLite gives both DDL and `user_version` full
+    /// transactional semantics, so ANY failure rolls the whole thing back and
+    /// leaves the original table and its rows exactly as they were - there is
+    /// no half-migrated state to recover from.
+    ///
+    /// Only one shape has ever shipped on this branch (identical columns and
+    /// indexes, narrower CHECK), so a single rebuild covers every ledger an
+    /// early adopter can be holding.
+    fn migrate_schema(conn: &mut Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("read cert-ledger schema version")?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version > SCHEMA_VERSION {
+            // Fail closed: a ledger written by a newer build may use states
+            // this binary would mis-read, and silently operating on it risks
+            // publishing or discarding credentials on bad assumptions.
+            bail!(
+                "cert ledger is at schema v{version}, newer than the v{SCHEMA_VERSION} this build \
+                 understands; upgrade ZeroClaw, or move the ledger aside to start fresh (issued \
+                 certificates would then need re-enrollment)"
+            );
+        }
+
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'issued_certs'",
+                [],
+                |r| r.get(0),
+            )
+            .context("probe for an existing issued_certs table")?;
+
+        if existing == 0 {
+            // Fresh ledger: create at the current schema and stamp it, so this
+            // path never looks like a pre-versioned table on the next open.
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS issued_certs ({ISSUED_CERTS_COLUMNS});
+                 {ISSUED_CERTS_INDEXES}
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
+            .context("create cert-ledger schema")?;
+            return Ok(());
+        }
+
+        let tx = conn
+            .transaction()
+            .context("begin cert-ledger schema migration")?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE {MIGRATION_TABLE} ({ISSUED_CERTS_COLUMNS});
+             INSERT INTO {MIGRATION_TABLE} ({ISSUED_CERTS_COLUMN_LIST})
+                 SELECT {ISSUED_CERTS_COLUMN_LIST} FROM issued_certs;
+             DROP TABLE issued_certs;
+             ALTER TABLE {MIGRATION_TABLE} RENAME TO issued_certs;
+             {ISSUED_CERTS_INDEXES}
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .with_context(|| {
+            format!(
+                "rebuild the cert-ledger issued_certs table from schema v{version} to \
+                 v{SCHEMA_VERSION}; the existing ledger was rolled back and left unchanged, so \
+                 no certificate records were lost"
+            )
+        })?;
+        tx.commit().context("commit cert-ledger schema migration")
     }
 
     /// Resolve rows a previous process left in the `pending` state.
@@ -921,6 +1035,357 @@ mod tests {
             params![fingerprint, device_id],
         )
         .unwrap();
+    }
+
+    /// The `issued_certs` schema EXACTLY as every pre-versioned revision of
+    /// this branch created it: same columns, same indexes, the old two-value
+    /// CHECK, and `user_version` left at 0.
+    ///
+    /// Verified against the branch history - commits a762ced3c through
+    /// 0ec59c70e all created this identical shape - so one fixture covers every
+    /// ledger an early adopter can be holding.
+    const V0_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS issued_certs (
+             fingerprint TEXT PRIMARY KEY,
+             device_id   TEXT NOT NULL,
+             token_hash  TEXT NOT NULL DEFAULT '',
+             not_before  INTEGER NOT NULL,
+             not_after   INTEGER NOT NULL,
+             status      TEXT NOT NULL DEFAULT 'active'
+                             CHECK(status IN ('active','revoked')),
+             issued_at   INTEGER NOT NULL,
+             actor       TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_device ON issued_certs(device_id);
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_status ON issued_certs(status);
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);";
+
+    /// Lay down a pre-versioned ledger holding one active and one revoked cert.
+    fn create_v0_ledger(dir: &Path) {
+        std::fs::create_dir_all(dir.join("tls")).unwrap();
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.execute_batch(V0_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO issued_certs
+                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+             VALUES
+                ('fpOldActive','devOld','tokOld',100,200,'active',150,'operator'),
+                ('fpOldRevoked','devOld2','tokOld2',300,400,'revoked',350,'enroll:deadbeef');",
+        )
+        .unwrap();
+    }
+
+    fn user_version(dir: &Path) -> i64 {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn index_names(dir: &Path) -> Vec<String> {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'issued_certs' AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// The stored CREATE TABLE text, so a test can assert WHICH constraint the
+    /// table actually carries rather than inferring it from behaviour.
+    fn table_sql(dir: &Path) -> String {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issued_certs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_migrates_a_pre_versioned_ledger_and_preserves_every_row() {
+        // Blocking regression: CREATE TABLE IF NOT EXISTS does NOT widen the
+        // CHECK on a table that already exists, so a daemon that ran an earlier
+        // revision of this branch opened its ledger fine and then failed EVERY
+        // enrollment and renewal at `CHECK constraint failed: status IN
+        // ('active','revoked')` the moment the issuance path inserted 'pending'.
+        let dir = tempfile::tempdir().unwrap();
+        create_v0_ledger(dir.path());
+        assert_eq!(user_version(dir.path()), 0, "fixture must be pre-versioned");
+        assert!(
+            table_sql(dir.path()).contains("'active','revoked')"),
+            "fixture must carry the OLD two-value CHECK"
+        );
+
+        let led = CertLedger::open(dir.path(), None).unwrap();
+
+        // Every column of every pre-existing row survives the rebuild intact.
+        let active = led
+            .lookup_by_fingerprint("fpOldActive")
+            .unwrap()
+            .expect("the pre-existing active cert must survive migration");
+        assert_eq!(active.device_id, "devOld");
+        assert_eq!(active.token_hash, "tokOld");
+        assert_eq!(active.not_before, 100);
+        assert_eq!(active.not_after, 200);
+        assert_eq!(active.issued_at, 150);
+        assert_eq!(active.actor, "operator");
+        assert_eq!(active.status, CertStatus::Active);
+        let revoked = led
+            .lookup_by_fingerprint("fpOldRevoked")
+            .unwrap()
+            .expect("the pre-existing revoked cert must survive migration");
+        assert_eq!(revoked.device_id, "devOld2");
+        assert_eq!(revoked.token_hash, "tokOld2");
+        assert_eq!(revoked.not_before, 300);
+        assert_eq!(revoked.not_after, 400);
+        assert_eq!(revoked.issued_at, 350);
+        assert_eq!(revoked.actor, "enroll:deadbeef");
+        assert_eq!(revoked.status, CertStatus::Revoked);
+        // Revocation state survives too - it drives the WSS refusal.
+        assert!(led.is_revoked("fpOldRevoked").unwrap());
+        assert_eq!(
+            led.revoked_fingerprints().unwrap(),
+            vec!["fpOldRevoked".to_string()]
+        );
+
+        // THE POINT: the pending -> active issuance path now runs on this DB.
+        // This is the line that reproduced the reviewer's IntegrityError.
+        led.record_issued(&entry("fpNew", "devNew"), false)
+            .expect("issuance must succeed against a migrated ledger");
+        assert_eq!(led.status_of("fpNew").unwrap(), Some(CertStatus::Active));
+
+        // ... and the new credential coexists with the preserved ones.
+        let mut active_fps: Vec<String> = led
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.fingerprint)
+            .collect();
+        active_fps.sort();
+        assert_eq!(active_fps, ["fpNew", "fpOldActive"]);
+        assert!(led.is_revoked("fpOldRevoked").unwrap());
+
+        // The schema is stamped, widened, and still carries its indexes.
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        assert!(
+            table_sql(dir.path()).contains("'active','revoked','pending')"),
+            "migrated table must carry the widened CHECK, got: {}",
+            table_sql(dir.path())
+        );
+        assert_eq!(
+            index_names(dir.path()),
+            [
+                "idx_issued_certs_device",
+                "idx_issued_certs_status",
+                "idx_issued_certs_token"
+            ],
+            "the rebuild must recreate every index the old table had"
+        );
+    }
+
+    /// Occupy the scratch table name the rebuild stages into, so the migration
+    /// fails at its very first statement.
+    fn obstruct_migration(dir: &Path) {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.execute_batch("CREATE TABLE issued_certs_migrated (occupied INTEGER);")
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_handles_an_unversioned_ledger_that_already_has_the_wide_check() {
+        // The other early-adopter shape: a ledger written by the revision that
+        // widened the CHECK but predated versioning. It is v1-shaped yet still
+        // stamped 0, so the rebuild runs over it. That must be lossless - and
+        // it must carry `pending` rows through the copy, where reconciliation
+        // then resolves them exactly as it would on any other open.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tls")).unwrap();
+        {
+            let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS issued_certs ({ISSUED_CERTS_COLUMNS});
+                 {ISSUED_CERTS_INDEXES}"
+            ))
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO issued_certs
+                    (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+                 VALUES
+                    ('fpKeep','devK','tokK',100,200,'active',150,'operator'),
+                    ('fpGone','devG','tokG',300,400,'pending',350,'enroll:cafe');",
+            )
+            .unwrap();
+        }
+        assert_eq!(user_version(dir.path()), 0);
+
+        let led = CertLedger::open(dir.path(), None).unwrap();
+
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        let kept = led.lookup_by_fingerprint("fpKeep").unwrap().unwrap();
+        assert_eq!(kept.actor, "operator");
+        assert_eq!(kept.not_after, 200);
+        // The pending row survived the rebuild and was then reconciled away.
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![("fpKeep".to_string(), "active".to_string())],
+            "a pending row must migrate, then be reconciled - never block the rebuild"
+        );
+        led.record_issued(&entry("fpNew", "devNew"), false).unwrap();
+        assert_eq!(led.list_active().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_migration_rolls_back_and_leaves_the_old_ledger_intact() {
+        // Failure-safety: a migration that dies part-way must leave the ledger
+        // exactly as it found it. A half-migrated certificate ledger is worse
+        // than an un-migrated one - it can lose or duplicate credentials.
+        let dir = tempfile::tempdir().unwrap();
+        create_v0_ledger(dir.path());
+        obstruct_migration(dir.path());
+
+        let err = CertLedger::open(dir.path(), None)
+            .map(|_| ())
+            .expect_err("an obstructed migration must fail the open");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("rebuild the cert-ledger issued_certs table"),
+            "got: {chain}"
+        );
+        assert!(
+            chain.contains("left unchanged"),
+            "the error must tell the operator nothing was lost: {chain}"
+        );
+        assert!(
+            chain.contains("ledger.db"),
+            "the error must name the ledger file: {chain}"
+        );
+
+        // Everything about the original table survives the rollback.
+        assert_eq!(
+            user_version(dir.path()),
+            0,
+            "a failed migration must not stamp the version"
+        );
+        assert!(
+            table_sql(dir.path()).contains("'active','revoked')"),
+            "the original CHECK must be intact"
+        );
+        assert_eq!(
+            index_names(dir.path()),
+            [
+                "idx_issued_certs_device",
+                "idx_issued_certs_status",
+                "idx_issued_certs_token"
+            ]
+        );
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![
+                ("fpOldActive".to_string(), "active".to_string()),
+                ("fpOldRevoked".to_string(), "revoked".to_string()),
+            ],
+            "every pre-existing row must survive a failed migration"
+        );
+
+        // Clearing the obstruction lets the very same ledger migrate cleanly.
+        {
+            let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute_batch("DROP TABLE issued_certs_migrated;")
+                .unwrap();
+        }
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        led.record_issued(&entry("fpNew", "devNew"), false).unwrap();
+        assert_eq!(led.list_active().unwrap().len(), 2);
+        assert!(led.is_revoked("fpOldRevoked").unwrap());
+    }
+
+    #[test]
+    fn reopening_an_already_migrated_ledger_does_not_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        create_v0_ledger(dir.path());
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            led.record_issued(&entry("fpNew", "devNew"), false).unwrap();
+        }
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+
+        // Occupy the scratch table name. If the version check did NOT
+        // short-circuit, the rebuild would run and fail on it - so a CLEAN open
+        // here is positive proof the migration path was skipped entirely.
+        obstruct_migration(dir.path());
+
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        let mut fps: Vec<String> = led
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.fingerprint)
+            .collect();
+        fps.sort();
+        assert_eq!(fps, ["fpNew", "fpOldActive"]);
+        assert!(led.is_revoked("fpOldRevoked").unwrap());
+    }
+
+    #[test]
+    fn a_ledger_from_a_newer_build_is_refused_rather_than_guessed_at() {
+        // Fail closed on a forward version: a newer build may use states this
+        // one would mis-read, and a certificate ledger is the wrong place to
+        // guess.
+        let dir = tempfile::tempdir().unwrap();
+        create_v0_ledger(dir.path());
+        {
+            let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+                .unwrap();
+        }
+
+        let err = format!(
+            "{:#}",
+            CertLedger::open(dir.path(), None)
+                .map(|_| ())
+                .expect_err("a forward schema version must be refused")
+        );
+        assert!(err.contains("newer than"), "got: {err}");
+        assert!(
+            err.contains("re-enrollment"),
+            "the refusal must tell the operator what their options are: {err}"
+        );
+        // Refusing touched nothing.
+        assert_eq!(stored_rows(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_fresh_ledger_is_created_already_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            user_version(dir.path()),
+            SCHEMA_VERSION,
+            "a fresh ledger must not look pre-versioned on the next open"
+        );
+        assert!(table_sql(dir.path()).contains("'active','revoked','pending')"));
+        assert_eq!(
+            index_names(dir.path()),
+            [
+                "idx_issued_certs_device",
+                "idx_issued_certs_status",
+                "idx_issued_certs_token"
+            ]
+        );
+        // And a fresh ledger reopens without rebuilding.
+        drop(led);
+        obstruct_migration(dir.path());
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fp1", "dev1"), false).unwrap();
+        assert_eq!(led.list_active().unwrap().len(), 1);
     }
 
     #[test]
