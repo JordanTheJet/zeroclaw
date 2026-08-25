@@ -109,6 +109,15 @@ struct EnrollResponse {
     not_after: i64,
     /// Where to reach this daemon through a relay (empty fields when no relay).
     relay_profile: RelayProfile,
+    /// SHA-256 fingerprint of the issued certificate, carried out of
+    /// [`EnrollServer::process`] so the connection handler can mark the ledger
+    /// row delivered once the response write actually succeeds.
+    ///
+    /// `serde(skip)`: this is plumbing between two daemon-side steps, not part
+    /// of the wire contract - the client already holds the certificate these
+    /// bytes fingerprint.
+    #[serde(skip)]
+    fingerprint: String,
 }
 
 /// The preflight response body (`GET /enroll/ca`). It intentionally contains only
@@ -299,12 +308,18 @@ impl EnrollServer {
             .map_err(|e| (500, format!("ledger error: {e}")))?;
         pairing.commit();
 
+        // The row is active from here, but the client does not hold the
+        // certificate yet - `deliver_enroll_response` marks it delivered only
+        // once the response write succeeds. Until then the ledger treats it as
+        // an undelivered credential and will revoke it (see
+        // `CertLedger::record_issued`).
         Ok(EnrollResponse {
             cert_pem: issued.cert_pem,
             ca_chain_pem: self.ca_cert_pem.clone(),
             device_id,
             not_after: issued.not_after,
             relay_profile: self.relay_profile.clone(),
+            fingerprint: issued.fingerprint,
         })
     }
 }
@@ -441,15 +456,97 @@ async fn handle_conn(
             return;
         }
     };
-    match server.process(&req, peer, class).await {
+    let outcome = server.process(&req, peer, class).await;
+    deliver_enroll_response(server, &mut tls, outcome).await;
+}
+
+/// Write the enrollment outcome to `stream` and, for a success, mark the ledger
+/// row delivered - but ONLY if the response write actually succeeded.
+///
+/// This is the enrollment side of the delivery boundary. `process` has already
+/// published an active ledger row for a certificate the client does not hold
+/// yet; a write failure or a client that disconnected mid-response leaves that
+/// row unmarked, and the ledger's undelivered sweep revokes it. Marking here
+/// rather than in `process` is the whole point - `process` cannot know whether
+/// the bytes went out.
+///
+/// Generic over the stream so the failure branch is reachable in a test with a
+/// writer that errors; production passes the live TLS stream.
+///
+/// What "delivered" can honestly mean at this layer: `write_json` returned Ok,
+/// so the response was written and flushed into the TLS session. That is not
+/// proof the client parsed it - no HTTP response can be - but it is the last
+/// point the daemon has any evidence about, and it is exactly the boundary the
+/// undelivered sweep needs to distinguish "the client got its certificate" from
+/// "the connection died holding it".
+async fn deliver_enroll_response<S: AsyncWrite + Unpin>(
+    server: &EnrollServer,
+    stream: &mut S,
+    outcome: Result<EnrollResponse, (u16, String)>,
+) {
+    match outcome {
         Ok(resp) => {
+            let fingerprint = resp.fingerprint.clone();
             let json = serde_json::to_vec(&resp).unwrap_or_default();
-            let _ = write_json(&mut tls, 200, "OK", &json).await;
+            match write_json(stream, 200, "OK", &json).await {
+                Ok(()) => mark_enrollment_delivered(server, &fingerprint),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "fingerprint": fingerprint,
+                            })),
+                        "enrollment response never reached the client; the issued certificate \
+                         stays undelivered and will be reconciled"
+                    );
+                }
+            }
         }
         Err((status, msg)) => {
             let reason = http_reason(status);
             let body = serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default();
-            let _ = write_json(&mut tls, status, reason, &body).await;
+            let _ = write_json(stream, status, reason, &body).await;
+        }
+    }
+}
+
+/// Record a delivered enrollment, logging rather than failing.
+///
+/// The response has already gone out by the time this runs, so there is nothing
+/// left to fail: the client holds the certificate either way. A ledger that
+/// cannot record the delivery therefore leaves the row undelivered and the
+/// sweep revokes a certificate that DID arrive - the fail-closed direction, and
+/// recoverable by re-enrolling. The alternative (assume delivery) would leave a
+/// credential the ledger cannot account for, which is the failure this whole
+/// protocol exists to prevent.
+fn mark_enrollment_delivered(server: &EnrollServer, fingerprint: &str) {
+    match server.ledger.mark_delivered(fingerprint) {
+        Ok(true) => {}
+        Ok(false) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "fingerprint": fingerprint })),
+                "enrollment delivered but no active undelivered ledger row matched; it will be \
+                 reconciled unless it was already marked"
+            );
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "fingerprint": fingerprint,
+                    })),
+                "enrollment delivered but the ledger could not record delivery; the certificate \
+                 will be reconciled and the client must re-enroll"
+            );
         }
     }
 }
@@ -980,6 +1077,169 @@ mod tests {
             ],
             "the interrupted issuance stays an unmatched attempt; only the retry completes"
         );
+    }
+
+    /// A stream whose every write fails: a client that vanished between the
+    /// daemon signing its certificate and the response reaching it. This is the
+    /// real seam - `deliver_enroll_response` takes the stream, so the failure is
+    /// injected at exactly the boundary production uses, with no test hook in
+    /// the production path.
+    struct DisconnectedClient;
+
+    impl AsyncWrite for DisconnectedClient {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client disconnected",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `delivered_at` for a fingerprint, straight from the table. The ledger
+    /// deliberately exposes no reader for it, so a test asserting on delivery
+    /// goes to SQLite.
+    fn delivered_at(data_dir: &std::path::Path, fingerprint: &str) -> Option<i64> {
+        let conn = rusqlite::Connection::open(data_dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row(
+            "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Age a row so the ledger's undelivered sweep treats it as stale, exactly
+    /// as an hour of wall clock would.
+    fn backdate_issuance(data_dir: &std::path::Path, fingerprint: &str) {
+        let conn = rusqlite::Connection::open(data_dir.join("tls").join("ledger.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE issued_certs SET issued_at = issued_at - 7200 WHERE fingerprint = ?1",
+                rusqlite::params![fingerprint],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "backdate fixture must hit exactly one row");
+    }
+
+    /// Enroll once against a file-backed ledger and return `(data_dir, server,
+    /// response)` with the issuance recorded but NOT yet delivered.
+    async fn enrolled_but_undelivered() -> (tempfile::TempDir, EnrollServer, EnrollResponse) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let server = test_server_with_ledger(pairing, None, ledger);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let resp = server
+            .process(
+                &EnrollRequest {
+                    pairing_code: code,
+                    csr_pem: csr,
+                },
+                "1.2.3.4",
+                PeerClass::Direct,
+            )
+            .await
+            .expect("enrollment must issue a certificate");
+        (dir, server, resp)
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_response_that_never_reaches_the_client_is_reconciled_away() {
+        // The reviewer's blocking case, at the boundary that actually decides
+        // it. `process` has already promoted the row to ACTIVE - deliberately,
+        // because the inverse ordering can hand out a certificate the ledger
+        // never records - so the client disconnecting here leaves an active row
+        // for a certificate nobody holds. Delivery tracking is what bounds that.
+        let (dir, server, resp) = enrolled_but_undelivered().await;
+        let fingerprint = resp.fingerprint.clone();
+        assert_eq!(
+            server.ledger.status_of(&fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "the row is published before the response is written - by design"
+        );
+
+        deliver_enroll_response(&server, &mut DisconnectedClient, Ok(resp)).await;
+
+        // The write failed, so nothing claimed delivery.
+        assert_eq!(
+            delivered_at(dir.path(), &fingerprint),
+            None,
+            "a failed response write must not mark the certificate delivered"
+        );
+        assert_eq!(
+            server.ledger.status_of(&fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "the ghost row is still active until the TTL passes"
+        );
+
+        // Once the delivery deadline passes, the next ledger open revokes it -
+        // and the revocation reaches the file the WSS verifier reads, so the
+        // certificate is refused at the handshake even if its bytes leaked.
+        drop(server);
+        backdate_issuance(dir.path(), &fingerprint);
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of(&fingerprint).unwrap(),
+            Some(CertStatus::Revoked),
+            "an undelivered enrollment must be reconciled to revoked"
+        );
+        let crl = crate::security::cert_ledger::revoked_list_path(dir.path());
+        let set = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
+        assert!(
+            set.contains(&fingerprint.to_ascii_lowercase()),
+            "the reconciled revocation must reach the verifier's CRL file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_enrollment_survives_the_undelivered_sweep() {
+        // The happy path through the same seam: the response write succeeds, so
+        // the row is marked delivered and the sweep leaves it alone forever.
+        // Without this the previous test would pass just as well against a
+        // ledger that revoked every certificate it ever issued.
+        let (dir, server, resp) = enrolled_but_undelivered().await;
+        let fingerprint = resp.fingerprint.clone();
+
+        let mut written: Vec<u8> = Vec::new();
+        deliver_enroll_response(&server, &mut written, Ok(resp)).await;
+
+        let text = String::from_utf8_lossy(&written);
+        assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+        assert!(text.contains("BEGIN CERTIFICATE"), "got: {text}");
+        assert!(
+            delivered_at(dir.path(), &fingerprint).is_some(),
+            "a successful response write must record delivery"
+        );
+
+        drop(server);
+        backdate_issuance(dir.path(), &fingerprint);
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of(&fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "a certificate the client received must never be swept"
+        );
+        assert!(reopened.revoked_fingerprints().unwrap().is_empty());
     }
 
     #[tokio::test]

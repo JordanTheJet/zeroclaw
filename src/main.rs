@@ -3244,10 +3244,16 @@ fn issue_wss_client_cert(
 
     // Record the issuance in the daemon-owned ledger so this cert is revocable and
     // appears in the canonical "who holds which cert" record (actor = operator).
-    let ledger_result = (|| -> Result<()> {
-        use zeroclaw_runtime::security::cert_ledger::{
-            CertLedger, CertStatus, IssuanceActor, LedgerEntry,
-        };
+    //
+    // Deliberately BEFORE the staged files are published: a ledger this command
+    // could not write must not leave certificate material on disk, and an
+    // over-recorded credential is recoverable where an unrecorded one is not
+    // (see CertLedger::record_issued). The row is therefore active-but-
+    // undelivered until the renames below succeed.
+    use zeroclaw_runtime::security::cert_ledger::{
+        CertLedger, CertStatus, IssuanceActor, LedgerEntry,
+    };
+    let ledger_result = (|| -> Result<(CertLedger, String)> {
         let fingerprint = zeroclaw_tls::single_cert_pem_sha256_fingerprint(&issued.cert_pem)
             .context("parse staged issued certificate")?;
         let now = std::time::SystemTime::now()
@@ -3258,7 +3264,7 @@ fn issue_wss_client_cert(
         ledger.record_issued(
             &LedgerEntry {
                 device_id: name.to_string(),
-                fingerprint,
+                fingerprint: fingerprint.clone(),
                 not_before: now - 300,
                 not_after: now + 30 * 86_400,
                 status: CertStatus::Active,
@@ -3268,22 +3274,59 @@ fn issue_wss_client_cert(
             },
             false,
         )?;
-        Ok(())
+        Ok((ledger, fingerprint))
     })();
-    if let Err(e) = ledger_result {
+    let (ledger, fingerprint) = match ledger_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&cert_tmp_path);
+            let _ = std::fs::remove_file(&key_tmp_path);
+            return Err(e);
+        }
+    };
+
+    // Publication. A rename that fails leaves the ledger row undelivered, which
+    // is exactly what the undelivered sweep needs to see: the operator never
+    // got a usable pair, so the certificate is revoked at the next ledger open
+    // rather than sitting active forever for a credential nobody holds.
+    //
+    // Both failure paths name the STAGED path as well as the destination - the
+    // destination alone does not tell an operator which half of the operation
+    // got where - and clear the staged material, so a private key never
+    // survives a failed publish as a stray dotfile.
+    if let Err(e) = std::fs::rename(&key_tmp_path, &key_path).with_context(|| {
+        format!(
+            "publish private key {} from staged {}",
+            key_path.display(),
+            key_tmp_path.display()
+        )
+    }) {
         let _ = std::fs::remove_file(&cert_tmp_path);
         let _ = std::fs::remove_file(&key_tmp_path);
         return Err(e);
     }
-
-    std::fs::rename(&key_tmp_path, &key_path)
-        .with_context(|| format!("publish private key {}", key_path.display()))?;
-    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path)
-        .with_context(|| format!("publish certificate {}", cert_path.display()))
-    {
+    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path).with_context(|| {
+        format!(
+            "publish certificate {} from staged {}",
+            cert_path.display(),
+            cert_tmp_path.display()
+        )
+    }) {
         let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&cert_tmp_path);
         return Err(e);
     }
+
+    // Published: the operator now holds both halves, so the credential is
+    // delivered. Marking BEFORE this point would have recorded a delivery the
+    // filesystem never made.
+    ledger.mark_delivered(&fingerprint).with_context(|| {
+        format!(
+            "record delivery of certificate {fingerprint}; the files were published but the \
+             ledger could not record it, so this certificate will be revoked as undelivered - \
+             re-issue it with --force"
+        )
+    })?;
 
     // When issuing into a separate out-dir, also lay it out as a drop-in client
     // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
@@ -5465,16 +5508,21 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         // ledger-materialized list under <data_dir>/tls/revoked
                         // (the daemon rewrites it on every revoke), overridable by
                         // [wss.client_auth].crl_path.
-                        let default_crl_path =
-                            zeroclaw_runtime::security::cert_ledger::revoked_list_path(&data_dir);
-                        let configured_crl_path = wss_cfg
-                            .client_auth
-                            .as_ref()
-                            .map(|c| c.crl_path.clone())
-                            .filter(|p| !p.is_empty());
-                        let crl_path = configured_crl_path.clone().unwrap_or_else(|| {
-                            default_crl_path.to_string_lossy().into_owned()
-                        });
+                        // Resolve the effective CRL path exactly once, with the
+                        // SAME normalization the ledger and operator CLI use
+                        // (trim; blank means unset), and hand that one value to
+                        // both the ledger and the TLS acceptor below. Selecting
+                        // the raw string here let a whitespace spelling install
+                        // no revocation verifier while the ledger materialized
+                        // the default file - revocation must never be split or
+                        // disabled by an accepted configuration spelling.
+                        let crl_path =
+                            zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                &data_dir,
+                                wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                            )
+                            .to_string_lossy()
+                            .into_owned();
                         // Materialize to the path the verifier will read,
                         // including a configured override. Skipping this when an
                         // override is set left `revoke-client-cert` writing to
@@ -5643,13 +5691,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, audit_cfg, data_dir) = {
+                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
-                                cfg.security.audit.clone(),
                                 cfg.data_dir.clone(),
                             )
                         };
@@ -5791,13 +5838,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             None
                         };
 
-                        let audit = std::sync::Arc::new(
-                            zeroclaw_runtime::security::audit::AuditLogger::new(
-                                audit_cfg,
-                                data_dir.clone(),
-                            )
-                            .context("initialize certificate audit logger for enrollment endpoint")?,
-                        );
+                        // The daemon's shared certificate audit logger, built
+                        // once in `daemon::run` and handed to every certificate
+                        // path through the RPC context. Enrollment must not
+                        // build its own: a second logger over the same file
+                        // recovers the same Merkle-chain tip as the renewal
+                        // path and races it into duplicate sequence numbers,
+                        // which makes `verify_chain` reject the trail.
+                        let audit = ctx
+                            .cert_audit
+                            .clone()
+                            .context(
+                                "the enrollment endpoint requires the daemon's certificate \
+                                 audit logger; it failed to initialize at startup (see the \
+                                 startup error) and enrollment will not issue certificates \
+                                 without an audit trail",
+                            )?;
                         let ledger = std::sync::Arc::new(
                             zeroclaw_runtime::security::cert_ledger::CertLedger::open(
                                 &data_dir,
@@ -10868,6 +10924,145 @@ mod tests {
         assert!(!out.path().join("client-dev_under_test.key").exists());
         assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
         assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+    }
+
+    /// `delivered_at` for a fingerprint, straight from the ledger table. The
+    /// ledger exposes no reader for it (nothing in production asks), so the
+    /// operator-CLI test reads SQLite directly.
+    #[cfg(feature = "agent-runtime")]
+    fn cert_delivered_at(data_dir: &std::path::Path, fingerprint: &str) -> Option<i64> {
+        let conn = rusqlite::Connection::open(data_dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row(
+            "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The operator CLI's publication boundary, which is the most direct of the
+    /// three: `issue-client-cert` records the issuance and only then renames
+    /// the staged key and certificate into place. A rename that fails leaves an
+    /// ACTIVE ledger row for a credential that was never published, and a retry
+    /// used to add a SECOND active row for the same device rather than
+    /// replacing the first.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_rename_failure_leaves_an_undelivered_row_that_reconciles_away() {
+        use zeroclaw_runtime::security::cert_ledger::{CertLedger, CertStatus, revoked_list_path};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Make the publication rename fail the way a real filesystem does:
+        // the destination is a non-empty directory, so renaming a file onto it
+        // cannot succeed. `--force` gets past the "already exists" guard, which
+        // is exactly how an operator re-issuing over a broken layout arrives
+        // here.
+        let key_dest = out.path().join("client-dev_under_test.key");
+        std::fs::create_dir(&key_dest).expect("obstruct the key destination");
+        std::fs::write(key_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an unpublishable certificate must fail the command")
+        .to_string();
+        assert!(
+            err.contains("publish private key"),
+            "the error must say publication failed: {err}"
+        );
+        assert!(
+            err.contains(".client-dev_under_test.key.tmp"),
+            "the error must name the STAGED file, not only the destination: {err}"
+        );
+        // Staged material is not left lying around as a stray private key.
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+
+        // The row is active - promotion happens before publication by design -
+        // but undelivered, because the rename never succeeded.
+        let ghost = {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            let active = ledger.list_active().expect("list active");
+            assert_eq!(
+                active.len(),
+                1,
+                "the issuance was recorded before publishing"
+            );
+            active[0].fingerprint.clone()
+        };
+        assert_eq!(
+            cert_delivered_at(&config.data_dir, &ghost),
+            None,
+            "a failed rename must not mark the certificate delivered"
+        );
+
+        // Once the delivery deadline passes, the next ledger open revokes it.
+        {
+            let conn =
+                rusqlite::Connection::open(config.data_dir.join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET issued_at = issued_at - 7200 WHERE fingerprint = ?1",
+                rusqlite::params![ghost],
+            )
+            .unwrap();
+        }
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+            assert_eq!(
+                ledger.status_of(&ghost).expect("status"),
+                Some(CertStatus::Revoked),
+                "an unpublished certificate must be reconciled to revoked"
+            );
+        }
+        let crl = std::fs::read_to_string(revoked_list_path(&config.data_dir)).expect("read crl");
+        assert!(
+            crl.lines().any(|l| l == ghost),
+            "the reconciled revocation must reach the verifier's file, got: {crl:?}"
+        );
+
+        // The retry - the operator clears the obstruction and re-issues - must
+        // end with exactly ONE usable credential, not two.
+        std::fs::remove_dir_all(&key_dest).expect("clear the obstruction");
+        issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect("the retry must publish");
+
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        let active = ledger.list_active().expect("list active");
+        assert_eq!(
+            active.len(),
+            1,
+            "the retry must not leave a second active row for the same device, got: {:?}",
+            active.iter().map(|e| &e.fingerprint).collect::<Vec<_>>()
+        );
+        let published = active[0].fingerprint.clone();
+        assert_ne!(published, ghost, "the retry mints a fresh certificate");
+        assert!(
+            cert_delivered_at(&config.data_dir, &published).is_some(),
+            "a published certificate must be recorded as delivered"
+        );
+        assert_eq!(
+            ledger.status_of(&ghost).expect("status"),
+            Some(CertStatus::Revoked),
+            "the first attempt stays revoked - not duplicated into a second active row"
+        );
+        // And the files the operator asked for are actually there.
+        assert!(out.path().join("client-dev_under_test.crt").is_file());
+        assert!(out.path().join("client-dev_under_test.key").is_file());
     }
 
     /// Operator revocation through the `revoke-client-cert` handler writes the

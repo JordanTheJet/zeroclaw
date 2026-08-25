@@ -15,6 +15,13 @@
 //! most a `pending` row, which the next open reconciles away
 //! ([`CertLedger::record_issued`]).
 //!
+//! Promotion happens BEFORE the certificate reaches its keyholder, so *delivery*
+//! is tracked as a second, explicitly reconciled dimension: `delivered_at`, set
+//! by [`CertLedger::mark_delivered`] at the real delivery/publication boundary
+//! and swept by `reconcile_undelivered_issuances` at open. See
+//! [`CertLedger::record_issued`] for why promotion-before-delivery is the
+//! deliberately chosen failure direction.
+//!
 //! Revocation is sourced here. The renew RPC (`cert/renew`) refuses a
 //! revoked-but-unexpired cert immediately by consulting [`CertLedger::status_of`]
 //! (threat A5). The WSS handshake-time refusal is wired separately against this
@@ -43,7 +50,10 @@ const PENDING: &str = "pending";
 /// * 0 - pre-versioned: `CHECK(status IN ('active','revoked'))`, no `pending`.
 /// * 1 - `pending` admitted by the CHECK, so the issuance two-phase commit in
 ///   [`CertLedger::record_issued`] can stage a row.
-const SCHEMA_VERSION: i64 = 1;
+/// * 2 - nullable `delivered_at`, so an active row records whether its
+///   certificate actually reached its keyholder
+///   ([`CertLedger::mark_delivered`]).
+const SCHEMA_VERSION: i64 = 2;
 
 /// The `issued_certs` column definitions at [`SCHEMA_VERSION`].
 ///
@@ -61,8 +71,38 @@ const ISSUED_CERTS_COLUMNS: &str = "
      status      TEXT NOT NULL DEFAULT 'active'
                      CHECK(status IN ('active','revoked','pending')),
      issued_at   INTEGER NOT NULL,
-     actor       TEXT NOT NULL DEFAULT ''
+     actor       TEXT NOT NULL DEFAULT '',
+     -- NULL until the certificate is confirmed handed to its keyholder; see
+     -- mark_delivered and reconcile_undelivered_issuances. Deliberately
+     -- separate from `status`: an active-but-undelivered row is a credential
+     -- that MIGHT exist in the wild, so it must stay recorded (and revocable)
+     -- rather than be hidden.
+     delivered_at INTEGER
 ";
+
+/// How long an ACTIVE row may sit with no recorded delivery before
+/// `reconcile_undelivered_issuances` revokes it.
+///
+/// One hour. The upper bound on a real delivery is tiny by comparison - the
+/// enrollment endpoint caps a whole connection at
+/// `crate::enroll::CONN_TIMEOUT_SECS` (15s), renewal answers inside one RPC
+/// call, and the operator CLI publishes its files in the same process - so an
+/// hour cannot fire on a slow-but-live delivery even across a wildly loaded
+/// host or a clock nudge. It is also ~700x shorter than the 30-day certificate
+/// lifetime, so the window in which an undelivered credential could be used by
+/// whoever *did* end up with it is bounded to something an operator can reason
+/// about rather than a month.
+const UNDELIVERED_CERT_TTL_SECS: i64 = 3_600;
+
+/// The revocation `actor` recorded for a certificate swept by
+/// `reconcile_undelivered_issuances`, so the audit trail
+/// distinguishes it from an operator's deliberate revoke.
+const UNDELIVERED_RECONCILE_ACTOR: &str = "reconcile:undelivered";
+
+/// Disambiguates the scratch file each revocation-list materialization writes
+/// before renaming it into place, so concurrent materializations cannot clobber
+/// one another's temp file. See `CertLedger::materialize_on`.
+static MATERIALIZE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Every index the ledger relies on. Recreated verbatim after a rebuild,
 /// because `DROP TABLE` takes the old table's indexes with it.
@@ -72,9 +112,13 @@ const ISSUED_CERTS_INDEXES: &str = "
      CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);
 ";
 
-/// Columns named explicitly for the migration copy, so the rebuild is
-/// insensitive to column ORDER and fails loudly rather than silently shifting
-/// values if the shape ever changes.
+/// The columns EVERY pre-v2 shape carries, named explicitly for the migration
+/// copy so the rebuild is insensitive to column ORDER and fails loudly rather
+/// than silently shifting values if the shape ever changes.
+///
+/// `delivered_at` is deliberately absent: it does not exist in a v0 or v1
+/// table, so it cannot be selected from one. The rebuild supplies it, which is
+/// where the backfill rule lives (see `migrate_schema`).
 const ISSUED_CERTS_COLUMN_LIST: &str =
     "fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor";
 
@@ -258,8 +302,11 @@ impl CertLedger {
             revoked_path,
         };
         // Resolve anything a previous process left mid-issuance BEFORE this
-        // ledger answers a single query.
+        // ledger answers a single query. Pending first: a pending row is not a
+        // credential at all, so it is discarded outright, and the undelivered
+        // sweep that follows then sees only rows this ledger vouches for.
         ledger.reconcile_pending_issuances()?;
+        ledger.reconcile_undelivered_issuances()?;
         // Refresh the materialized revocation list so it reflects the ledger at
         // startup (covers a missing/stale file).
         ledger.materialize_revocations()?;
@@ -286,9 +333,21 @@ impl CertLedger {
     /// leaves the original table and its rows exactly as they were - there is
     /// no half-migrated state to recover from.
     ///
-    /// Only one shape has ever shipped on this branch (identical columns and
-    /// indexes, narrower CHECK), so a single rebuild covers every ledger an
-    /// early adopter can be holding.
+    /// Two shapes have shipped on this branch (v0 and v1: identical columns and
+    /// indexes, differing only in the status CHECK), and neither has
+    /// `delivered_at`. Both therefore migrate to v2 in the SAME single pass -
+    /// the copy selects only the columns they share, and the rebuild supplies
+    /// `delivered_at` itself.
+    ///
+    /// **Backfill rule: a row that exists at migration time gets
+    /// `delivered_at = issued_at`.** Those rows predate delivery tracking, so
+    /// the ledger has no evidence either way - and the two possible defaults are
+    /// not symmetric. Leaving them NULL would mark every certificate on the
+    /// host as never-delivered, and the undelivered sweep would then revoke the
+    /// operator's entire live fleet on the first upgraded start. Treating them
+    /// as delivered preserves exactly the status quo the operator had before the
+    /// upgrade: they remain active, revocable, and visible. Pinned by
+    /// `migrating_a_v1_ledger_backfills_delivery_and_never_mass_revokes`.
     fn migrate_schema(conn: &mut Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -332,8 +391,8 @@ impl CertLedger {
             .context("begin cert-ledger schema migration")?;
         tx.execute_batch(&format!(
             "CREATE TABLE {MIGRATION_TABLE} ({ISSUED_CERTS_COLUMNS});
-             INSERT INTO {MIGRATION_TABLE} ({ISSUED_CERTS_COLUMN_LIST})
-                 SELECT {ISSUED_CERTS_COLUMN_LIST} FROM issued_certs;
+             INSERT INTO {MIGRATION_TABLE} ({ISSUED_CERTS_COLUMN_LIST}, delivered_at)
+                 SELECT {ISSUED_CERTS_COLUMN_LIST}, issued_at FROM issued_certs;
              DROP TABLE issued_certs;
              ALTER TABLE {MIGRATION_TABLE} RENAME TO issued_certs;
              {ISSUED_CERTS_INDEXES}
@@ -408,6 +467,87 @@ impl CertLedger {
         Ok(())
     }
 
+    /// Revoke every ACTIVE row whose certificate was never confirmed delivered
+    /// and is older than `UNDELIVERED_CERT_TTL_SECS`.
+    ///
+    /// The other half of the issuance protocol. `record_issued` publishes the
+    /// row BEFORE the caller can hand the certificate over (see there for why
+    /// that direction is deliberate), so an active row is a claim that the
+    /// certificate *may* exist in the wild, not that it does. Delivery closes
+    /// that gap from the other side: the call site that owns the real
+    /// delivery/publication boundary calls [`CertLedger::mark_delivered`] on
+    /// success, and anything still unmarked once the TTL has passed is swept
+    /// here.
+    ///
+    /// Revoking - rather than deleting - is what makes the sweep safe. The
+    /// keyholder that never completed its enrollment cannot legitimately be
+    /// depending on this certificate, but *something* may hold the bytes, so
+    /// the fingerprint goes into the materialized revocation list the WSS
+    /// verifier reads and stays a permanent, audited record. Deleting it would
+    /// un-record a credential that might exist, which is the one thing this
+    /// ledger must never do.
+    ///
+    /// This runs at open, in [`CertLedger::open`] - which for the renew RPC is
+    /// once per call, and for the daemon is once per start. A long-lived daemon
+    /// holding one ledger handle therefore sweeps at its next restart (or at
+    /// the next `cert/renew`, which opens its own handle), not on a timer.
+    fn reconcile_undelivered_issuances(&self) -> Result<()> {
+        let cutoff = now_unix() - UNDELIVERED_CERT_TTL_SECS;
+        let stale: Vec<String> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fingerprint FROM issued_certs
+                         WHERE status = 'active' AND delivered_at IS NULL AND issued_at < ?1",
+                )
+                .context("prepare undelivered-issuance reconciliation")?;
+            let rows = stmt
+                .query_map(params![cutoff], |r| r.get::<_, String>(0))
+                .context("query undelivered issuances")?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()
+                .context("collect undelivered issuances")?
+        };
+        for fingerprint in stale {
+            // mark_revoked is the whole revocation contract: it flips the row,
+            // materializes the enforcement file from the in-transaction view,
+            // and audits a CertRevoked naming this sweep as the actor. An
+            // undelivered certificate is revoked by exactly the same path an
+            // operator's revoke takes - no second, weaker mechanism.
+            self.mark_revoked(&fingerprint, UNDELIVERED_RECONCILE_ACTOR)
+                .with_context(|| format!("revoke undelivered certificate {fingerprint}"))?;
+        }
+        Ok(())
+    }
+
+    /// Record that the certificate behind `fingerprint` actually reached its
+    /// keyholder. Returns true if this call is the one that marked it.
+    ///
+    /// Called by the site that owns the real delivery/publication boundary -
+    /// the enrollment response write, the renewal response construction, the
+    /// operator CLI's staged-file rename - and only on that boundary's success.
+    /// Until then the row is active but undelivered, and
+    /// `reconcile_undelivered_issuances` will revoke it.
+    ///
+    /// Idempotent: the `delivered_at IS NULL` guard means a repeat call reports
+    /// false and leaves the FIRST delivery time standing, so the recorded
+    /// instant is when the credential actually went out rather than whenever
+    /// something last touched the row.
+    ///
+    /// Only an ACTIVE row is markable. Marking a `pending` row would claim
+    /// delivery of a certificate the ledger has not vouched for; marking a
+    /// revoked one would contradict the revocation.
+    pub fn mark_delivered(&self, fingerprint: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE issued_certs SET delivered_at = ?2
+                     WHERE fingerprint = ?1 AND status = 'active' AND delivered_at IS NULL",
+                params![fingerprint, now_unix()],
+            )
+            .context("mark issued cert delivered")?;
+        Ok(changed == 1)
+    }
+
     /// Rewrite the revoked-fingerprint file from the SQLite truth (atomic temp +
     /// rename). This is what makes a revoke take effect at the next handshake -
     /// the WSS verifier re-reads the file when its mtime changes. No-op for an
@@ -435,9 +575,27 @@ impl CertLedger {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
-        let tmp = path.with_extension("tmp");
+        // A temp name unique to this call, not the fixed `revoked.tmp` this
+        // replaced. Every ledger open materializes, so N ledgers opened
+        // concurrently against one data_dir - eight clients renewing at once,
+        // each of which opens its own handle - all wrote the SAME temp path and
+        // then renamed it. The first rename won and the rest failed with
+        // ENOENT, so an ordinary burst of concurrent renewals turned into
+        // "atomically replace the revocation list: No such file or directory"
+        // and refused the renewals. Uniqueness by pid + counter covers both
+        // threads in this process and a second process sharing the data dir.
+        let unique = format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            MATERIALIZE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let tmp = path.with_extension(unique);
         std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).context("atomically replace the revocation list")?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // Do not leave the scratch file behind for an operator to wonder at.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("atomically replace the revocation list");
+        }
         Ok(())
     }
 
@@ -489,6 +647,34 @@ impl CertLedger {
     /// established row exactly as it was, with its old validity - correct,
     /// since the caller is returning an error rather than delivering the
     /// renewed certificate.
+    ///
+    /// # Why promotion happens before delivery
+    ///
+    /// Step 4 publishes the row while the caller still holds the certificate:
+    /// the enrollment response has not been written, the renewal reply has not
+    /// been serialized, the operator CLI has not renamed its staged files. That
+    /// ordering is chosen, not incidental.
+    ///
+    /// The inverse - deliver first, promote after - fails in the strictly worse
+    /// direction. A crash in *that* window hands a client a live, CA-signed
+    /// certificate whose row is later reconciled away, so the ledger has no
+    /// record of a credential that exists in the wild: nothing to list, nothing
+    /// to revoke, and a certificate that keeps authenticating until it expires
+    /// because the WSS verifier authorizes by CA chain, not by ledger
+    /// membership. A ghost row is the opposite failure and a recoverable one -
+    /// the ledger over-records a credential that may not exist, and an
+    /// over-recorded credential can be revoked. **This ledger must never
+    /// under-record a credential that might exist in the wild.**
+    ///
+    /// Delivery is therefore tracked as its own dimension rather than folded
+    /// into `status`: `delivered_at` stays NULL until
+    /// [`CertLedger::mark_delivered`] is called at the real
+    /// delivery/publication boundary, and
+    /// `reconcile_undelivered_issuances` revokes - never deletes -
+    /// whatever is still unmarked once
+    /// `UNDELIVERED_CERT_TTL_SECS` has passed. The ghost row is bounded to an
+    /// hour and ends up in the materialized revocation list, while a delivered
+    /// certificate is never at risk of vanishing from the record.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
         self.audit_cert(entry, CertAuditStage::Attempted { renewal })?;
         let staged = self.stage_pending(entry)?;
@@ -537,24 +723,48 @@ impl CertLedger {
 
     /// Publish the issuance: rewrite the row with `entry.status`. This is the
     /// single statement that makes the certificate visible to every reader.
+    ///
+    /// An UPDATE rather than the `INSERT OR REPLACE` this replaced, for one
+    /// reason: `INSERT OR REPLACE` is a delete plus an insert, so it would
+    /// silently reset `delivered_at` to NULL. Re-recording a fingerprint the
+    /// ledger already holds (a renewal that produced the same certificate)
+    /// cannot UN-deliver the credential its keyholder is already using, and
+    /// resetting the mark would hand that established certificate to the
+    /// undelivered sweep an hour later. Delivery is only ever set by
+    /// [`CertLedger::mark_delivered`], never by an issuance write.
+    ///
+    /// `stage_pending` guarantees a row exists by the time this runs, so zero
+    /// affected rows means one vanished underneath us (a concurrent
+    /// compensation or an external deletion). That fails closed: the caller
+    /// gets `Err` and delivers nothing, rather than publishing a certificate
+    /// with no row behind it.
     fn promote_staged(&self, entry: &LedgerEntry) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO issued_certs
-                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                entry.fingerprint,
-                entry.device_id,
-                entry.token_hash,
-                entry.not_before,
-                entry.not_after,
-                entry.status.as_str(),
-                entry.issued_at,
-                entry.actor,
-            ],
-        )
-        .context("activate issued cert")?;
+        let changed = conn
+            .execute(
+                "UPDATE issued_certs
+                    SET device_id = ?2, token_hash = ?3, not_before = ?4, not_after = ?5,
+                        status = ?6, issued_at = ?7, actor = ?8
+                  WHERE fingerprint = ?1",
+                params![
+                    entry.fingerprint,
+                    entry.device_id,
+                    entry.token_hash,
+                    entry.not_before,
+                    entry.not_after,
+                    entry.status.as_str(),
+                    entry.issued_at,
+                    entry.actor,
+                ],
+            )
+            .context("activate issued cert")?;
+        if changed == 0 {
+            bail!(
+                "activate issued cert: the staged row for {} disappeared before it could be \
+                 published; nothing was delivered",
+                entry.fingerprint
+            );
+        }
         Ok(())
     }
 
@@ -842,6 +1052,18 @@ impl CertLedger {
     }
 }
 
+/// Wall-clock unix seconds, the unit every ledger timestamp column uses.
+///
+/// A clock that cannot resolve reads as 0, which makes a row look ancient and
+/// so undelivered-sweepable rather than permanently unsweepable - the
+/// fail-closed direction for a credential this ledger cannot vouch for.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// The certificate facts every cert audit event carries.
 struct CertFacts<'a> {
     device_id: &'a str,
@@ -1021,6 +1243,40 @@ mod tests {
             .unwrap()
     }
 
+    /// Every (fingerprint, delivered_at) pair actually stored, read through a
+    /// SEPARATE connection. `delivered_at` has no reader on [`CertLedger`] by
+    /// design - nothing in production needs to ask - so a test that asserts on
+    /// it has to go to the table.
+    fn delivery_marks(dir: &Path) -> Vec<(String, Option<i64>)> {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT fingerprint, delivered_at FROM issued_certs ORDER BY fingerprint")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, Option<i64>)>>>()
+            .unwrap()
+    }
+
+    /// Age a row by `secs` so the undelivered sweep sees it as stale - exactly
+    /// what `secs` of wall clock would do, without the test sleeping for an
+    /// hour. Backdating the data rather than shrinking the TTL keeps the
+    /// production constant under test instead of substituting a test-only one.
+    fn backdate_issuance(dir: &Path, fingerprint: &str, secs: i64) {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE issued_certs SET issued_at = ?2 WHERE fingerprint = ?1",
+                params![fingerprint, now_unix() - secs],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "backdate fixture must hit exactly one row");
+    }
+
+    /// Comfortably past [`UNDELIVERED_CERT_TTL_SECS`], for tests that want a row
+    /// the sweep must act on.
+    const PAST_TTL_SECS: i64 = UNDELIVERED_CERT_TTL_SECS + 600;
+
     /// Commit a row in the `pending` state through a separate connection:
     /// exactly what a process that died between the ledger commit and the
     /// completion audit event leaves behind. Building the fixture outside the
@@ -1058,6 +1314,50 @@ mod tests {
          CREATE INDEX IF NOT EXISTS idx_issued_certs_device ON issued_certs(device_id);
          CREATE INDEX IF NOT EXISTS idx_issued_certs_status ON issued_certs(status);
          CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);";
+
+    /// The `issued_certs` schema as the revision that widened the status CHECK
+    /// created it: v0's columns, the three-value CHECK, and still NO
+    /// `delivered_at`.
+    ///
+    /// Spelled out rather than derived from [`ISSUED_CERTS_COLUMNS`], because
+    /// that const now describes v2 - reusing it would quietly turn every
+    /// "migrate from the old shape" test into a no-op the day the shape
+    /// changed, which is the exact class of bug the migration tests exist to
+    /// catch.
+    const V1_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS issued_certs (
+             fingerprint TEXT PRIMARY KEY,
+             device_id   TEXT NOT NULL,
+             token_hash  TEXT NOT NULL DEFAULT '',
+             not_before  INTEGER NOT NULL,
+             not_after   INTEGER NOT NULL,
+             status      TEXT NOT NULL DEFAULT 'active'
+                             CHECK(status IN ('active','revoked','pending')),
+             issued_at   INTEGER NOT NULL,
+             actor       TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_device ON issued_certs(device_id);
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_status ON issued_certs(status);
+         CREATE INDEX IF NOT EXISTS idx_issued_certs_token  ON issued_certs(token_hash);";
+
+    /// Lay down a v1-shaped ledger stamped `version`, holding certificates
+    /// issued long ago - the state a host that has been running this branch is
+    /// actually in when it upgrades.
+    fn create_v1_ledger(dir: &Path, version: i64) {
+        std::fs::create_dir_all(dir.join("tls")).unwrap();
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO issued_certs
+                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+             VALUES
+                ('fpLiveA','devA','tokA',100,200,'active',150,'operator'),
+                ('fpLiveB','devB','tokB',300,400,'active',350,'enroll:deadbeef'),
+                ('fpDead','devC','tokC',500,600,'revoked',550,'operator');",
+        )
+        .unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .unwrap();
+    }
 
     /// Lay down a pre-versioned ledger holding one active and one revoked cert.
     fn create_v0_ledger(dir: &Path) {
@@ -1208,11 +1508,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("tls")).unwrap();
         {
             let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
-            conn.execute_batch(&format!(
-                "CREATE TABLE IF NOT EXISTS issued_certs ({ISSUED_CERTS_COLUMNS});
-                 {ISSUED_CERTS_INDEXES}"
-            ))
-            .unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
             conn.execute_batch(
                 "INSERT INTO issued_certs
                     (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
@@ -1313,6 +1609,10 @@ mod tests {
         {
             let led = CertLedger::open(dir.path(), None).unwrap();
             led.record_issued(&entry("fpNew", "devNew"), false).unwrap();
+            // A real issuance is delivered to its client; without the mark the
+            // reopen below would (correctly) sweep it as undelivered, which is
+            // a different test.
+            assert!(led.mark_delivered("fpNew").unwrap());
         }
         assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
 
@@ -1526,6 +1826,21 @@ mod tests {
             effective_revoked_list_path(dir.path(), Some("   ")),
             default_path,
             "a whitespace-only crl_path is not a real override"
+        );
+    }
+
+    /// A padded spelling resolves to the same trimmed path everywhere. The WSS
+    /// startup resolver, operator CLI, and ledger all call THIS function, so
+    /// the verifier and the revocation writer cannot be split onto different
+    /// files by a configuration spelling.
+    #[test]
+    fn effective_revoked_list_path_trims_padded_overrides_to_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let padded = effective_revoked_list_path(dir.path(), Some("  /tmp/crl.pem  "));
+        let exact = effective_revoked_list_path(dir.path(), Some("/tmp/crl.pem"));
+        assert_eq!(
+            padded, exact,
+            "padded and exact spellings must resolve to one CRL path"
         );
     }
 
@@ -1774,6 +2089,9 @@ mod tests {
         {
             let led = CertLedger::open(dir.path(), Some(audit.clone())).unwrap();
             led.record_issued(&entry("fpDone", "dev1"), false).unwrap();
+            // fpDone stands for a completed, delivered issuance; the undelivered
+            // sweep is exercised on its own below.
+            assert!(led.mark_delivered("fpDone").unwrap());
         }
         stage_pending_row(dir.path(), "fpCrash", "dev2");
         assert!(
@@ -1887,6 +2205,354 @@ mod tests {
         assert_eq!(got.not_after, 9_999_999);
         // Only one row exists for that fingerprint.
         assert_eq!(led.list_active().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_ledger_opens_do_not_clobber_each_others_materialization() {
+        // Regression: every open materializes the revocation list, and the
+        // scratch file used to be a fixed `revoked.tmp`. Several ledgers opened
+        // at once against one data_dir therefore wrote the same temp path and
+        // raced the rename - the first won, the rest failed ENOENT and took the
+        // whole open down with them. Eight clients renewing simultaneously is
+        // ordinary traffic, and each renewal opens its own ledger handle, so
+        // this failed a routine burst with an error about the revocation list.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            led.record_issued(&entry("fpA", "dev1"), false).unwrap();
+            assert!(led.mark_delivered("fpA").unwrap());
+            led.record_issued(&entry("fpB", "dev2"), false).unwrap();
+            assert!(led.mark_delivered("fpB").unwrap());
+            assert!(led.mark_revoked("fpB", "operator").unwrap());
+        }
+
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| CertLedger::open(dir.path(), None).map(|_| ())))
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap().err())
+                .map(|e| format!("{e:#}"))
+                .collect()
+        });
+        assert!(
+            failures.is_empty(),
+            "concurrent opens must all succeed, got: {failures:?}"
+        );
+
+        // The list is intact - not truncated or half-written by the race - and
+        // no scratch files were left lying around the tls dir.
+        let crl = revoked_list_path(dir.path());
+        assert_eq!(std::fs::read_to_string(&crl).unwrap().trim(), "fpB");
+        let strays: Vec<String> = std::fs::read_dir(dir.path().join("tls"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("revoked.tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left scratch files behind: {strays:?}");
+    }
+
+    #[test]
+    fn an_undelivered_active_row_is_revoked_once_the_ttl_has_passed() {
+        // The window the pending -> active protocol alone could not close: the
+        // row is promoted BEFORE the caller can hand the certificate over, so a
+        // crash or a dead connection in between leaves an ACTIVE row for a
+        // certificate nobody received. The sweep bounds that to the TTL.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        {
+            let led = CertLedger::open(dir.path(), Some(audit.clone())).unwrap();
+            led.record_issued(&entry("fpGhost", "devGhost"), false)
+                .unwrap();
+            // No mark_delivered: the delivery boundary never succeeded.
+            assert_eq!(led.status_of("fpGhost").unwrap(), Some(CertStatus::Active));
+        }
+        backdate_issuance(dir.path(), "fpGhost", PAST_TTL_SECS);
+
+        let reopened = CertLedger::open(dir.path(), Some(audit)).unwrap();
+
+        // Revoked - not deleted. The bytes may exist in the wild, so the ledger
+        // keeps vouching for the fingerprint as a REVOKED credential.
+        assert_eq!(
+            reopened.status_of("fpGhost").unwrap(),
+            Some(CertStatus::Revoked),
+            "an undelivered certificate past the TTL must be revoked"
+        );
+        assert!(reopened.is_revoked("fpGhost").unwrap());
+        assert!(reopened.list_active().unwrap().is_empty());
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![("fpGhost".to_string(), "revoked".to_string())],
+            "the row must survive as a revocation, never be erased"
+        );
+
+        // It reached the file the WSS verifier actually reads.
+        let crl = std::fs::read_to_string(revoked_list_path(dir.path())).unwrap();
+        assert_eq!(crl.trim(), "fpGhost");
+        let set = zeroclaw_tls::load_revoked_fingerprints(&revoked_list_path(dir.path())).unwrap();
+        assert!(
+            set.contains("fpghost"),
+            "the verifier must see the revocation"
+        );
+
+        // And the trail says WHO revoked it, so an operator reading the log can
+        // tell a reconciliation from a deliberate revoke.
+        let events = audit_events(&log);
+        let names: Vec<String> = events.iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            ["cert_issuance_attempted", "cert_issued", "cert_revoked"],
+        );
+        let revoked_event = events.last().unwrap();
+        assert_eq!(
+            revoked_event
+                .actor
+                .as_ref()
+                .and_then(|a| a.username.clone())
+                .unwrap_or_default(),
+            UNDELIVERED_RECONCILE_ACTOR,
+            "the revocation must name the undelivered sweep as its actor"
+        );
+        assert_eq!(
+            revoked_event
+                .actor
+                .as_ref()
+                .and_then(|a| a.user_id.clone())
+                .unwrap_or_default(),
+            "devGhost",
+            "and the device whose credential it was"
+        );
+
+        // Idempotent: a second open finds nothing left to sweep.
+        drop(reopened);
+        let again = CertLedger::open(dir.path(), None).unwrap();
+        assert!(again.is_revoked("fpGhost").unwrap());
+        assert_eq!(audit_events(&log).len(), 3, "the sweep must not re-revoke");
+    }
+
+    #[test]
+    fn a_delivered_row_survives_the_undelivered_sweep() {
+        // The other half of the contract, and the one that keeps the sweep from
+        // being a slow-motion outage: a certificate whose delivery boundary
+        // succeeded is never touched, however old it gets.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            led.record_issued(&entry("fpReal", "devReal"), false)
+                .unwrap();
+            assert!(
+                led.mark_delivered("fpReal").unwrap(),
+                "the delivery boundary marks the row"
+            );
+        }
+        assert!(
+            delivery_marks(dir.path())[0].1.is_some(),
+            "delivery must be recorded durably, not in memory"
+        );
+        backdate_issuance(dir.path(), "fpReal", PAST_TTL_SECS * 24);
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+
+        assert_eq!(
+            reopened.status_of("fpReal").unwrap(),
+            Some(CertStatus::Active),
+            "a delivered certificate must never be swept"
+        );
+        assert!(reopened.revoked_fingerprints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_undelivered_row_inside_the_ttl_is_left_alone() {
+        // The sweep is a deadline, not a mode. A just-issued row is undelivered
+        // for the width of the response write; revoking THAT would break every
+        // enrollment instead of only the failed ones.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            let mut fresh = entry("fpFresh", "devFresh");
+            fresh.issued_at = now_unix();
+            led.record_issued(&fresh, false).unwrap();
+        }
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+
+        assert_eq!(
+            reopened.status_of("fpFresh").unwrap(),
+            Some(CertStatus::Active),
+            "an in-flight issuance must survive a ledger open"
+        );
+        assert!(reopened.revoked_fingerprints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_delivered_is_idempotent_and_only_marks_a_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fp1", "dev1"), false).unwrap();
+
+        assert!(led.mark_delivered("fp1").unwrap(), "first mark takes");
+        let first = delivery_marks(dir.path())[0].1.expect("marked");
+        assert!(
+            !led.mark_delivered("fp1").unwrap(),
+            "a repeat mark reports no change rather than failing"
+        );
+        assert_eq!(
+            delivery_marks(dir.path())[0].1,
+            Some(first),
+            "a repeat mark must keep the FIRST delivery instant"
+        );
+
+        // A fingerprint the ledger has never seen is not markable.
+        assert!(!led.mark_delivered("nope").unwrap());
+
+        // Neither is a pending row: the ledger does not vouch for it, so it has
+        // no delivery to claim.
+        stage_pending_row(dir.path(), "fpPending", "devP");
+        assert!(!led.mark_delivered("fpPending").unwrap());
+        assert_eq!(
+            delivery_marks(dir.path())
+                .into_iter()
+                .find(|(fp, _)| fp == "fpPending")
+                .unwrap()
+                .1,
+            None,
+        );
+
+        // Nor a revoked one - marking it would contradict the revocation.
+        led.record_issued(&entry("fp2", "dev2"), false).unwrap();
+        assert!(led.mark_revoked("fp2", "operator").unwrap());
+        assert!(!led.mark_delivered("fp2").unwrap());
+    }
+
+    #[test]
+    fn re_recording_a_delivered_fingerprint_keeps_its_delivery_mark() {
+        // Guards the promote_staged UPDATE. The INSERT OR REPLACE it replaced
+        // was a delete plus an insert, so re-recording an established
+        // fingerprint reset delivered_at to NULL - and the sweep would then
+        // revoke a certificate its keyholder is actively using, an hour after a
+        // renewal that produced the same certificate.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            let mut e = entry("fp1", "dev1");
+            led.record_issued(&e, false).unwrap();
+            assert!(led.mark_delivered("fp1").unwrap());
+            let delivered = delivery_marks(dir.path())[0].1.expect("marked");
+
+            // A renewal that lands on the same fingerprint updates validity.
+            e.not_after = 9_999_999;
+            led.record_issued(&e, true).unwrap();
+            assert_eq!(
+                led.lookup_by_fingerprint("fp1").unwrap().unwrap().not_after,
+                9_999_999,
+                "the re-record must still update the row"
+            );
+            assert_eq!(
+                delivery_marks(dir.path())[0].1,
+                Some(delivered),
+                "an issuance write must never clear a delivery mark"
+            );
+        }
+
+        backdate_issuance(dir.path(), "fp1", PAST_TTL_SECS);
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of("fp1").unwrap(),
+            Some(CertStatus::Active),
+            "the established credential must survive the sweep after a re-record"
+        );
+    }
+
+    #[test]
+    fn migrating_a_v1_ledger_backfills_delivery_and_never_mass_revokes() {
+        // THE mass-revocation guard. Rows written before delivery tracking
+        // existed carry no evidence of delivery, and the undelivered sweep
+        // revokes anything active it finds unmarked. Migrate them as NULL and
+        // the first upgraded start would revoke every live certificate on the
+        // host - every device locked out at once, by an upgrade. The backfill
+        // (delivered_at = issued_at) is what makes an upgrade a no-op for the
+        // fleet, and it is load-bearing enough to pin explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        create_v1_ledger(dir.path(), 1);
+        assert_eq!(user_version(dir.path()), 1, "fixture must be a v1 ledger");
+        assert!(
+            !table_sql(dir.path()).contains("delivered_at"),
+            "fixture must predate the delivery column"
+        );
+
+        let led = CertLedger::open(dir.path(), None).unwrap();
+
+        // Migrated to v2, and every row's delivery stamped from its issuance.
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        assert_eq!(
+            delivery_marks(dir.path()),
+            vec![
+                ("fpDead".to_string(), Some(550)),
+                ("fpLiveA".to_string(), Some(150)),
+                ("fpLiveB".to_string(), Some(350)),
+            ],
+            "every pre-existing row must be backfilled with delivered_at = issued_at"
+        );
+
+        // The point: these certificates are ANCIENT (issued_at 150/350, i.e.
+        // 1970), so they are far past the undelivered TTL. The sweep ran during
+        // that open and left them alone.
+        let mut active: Vec<String> = led
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.fingerprint)
+            .collect();
+        active.sort();
+        assert_eq!(
+            active,
+            ["fpLiveA", "fpLiveB"],
+            "an upgrade must not revoke the operator's live certificates"
+        );
+        assert!(led.revoked_fingerprints().unwrap() == vec!["fpDead".to_string()]);
+
+        // And it stays a no-op across further opens - the backfill is durable,
+        // not a per-open suppression.
+        drop(led);
+        let again = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(again.list_active().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migrating_a_v0_ledger_reaches_v2_in_one_pass() {
+        // The other early-adopter shape. v0 (narrow CHECK) and v1 (wide CHECK)
+        // differ only in a constraint and neither has delivered_at, so ONE
+        // rebuild has to carry either of them all the way to v2 - there is no
+        // v0 -> v1 -> v2 staircase to fall back on.
+        let dir = tempfile::tempdir().unwrap();
+        create_v0_ledger(dir.path());
+        assert_eq!(user_version(dir.path()), 0);
+
+        let led = CertLedger::open(dir.path(), None).unwrap();
+
+        assert_eq!(
+            user_version(dir.path()),
+            SCHEMA_VERSION,
+            "a v0 ledger must land on v2 in one pass, not on an intermediate"
+        );
+        assert!(
+            table_sql(dir.path()).contains("'active','revoked','pending')"),
+            "the v1 widening must still be applied on the way through"
+        );
+        assert!(table_sql(dir.path()).contains("delivered_at"));
+        assert_eq!(
+            delivery_marks(dir.path()),
+            vec![
+                ("fpOldActive".to_string(), Some(150)),
+                ("fpOldRevoked".to_string(), Some(350)),
+            ],
+        );
+        // Same guard as v1: the ancient active row survives the sweep.
+        assert_eq!(
+            led.status_of("fpOldActive").unwrap(),
+            Some(CertStatus::Active)
+        );
     }
 
     #[test]

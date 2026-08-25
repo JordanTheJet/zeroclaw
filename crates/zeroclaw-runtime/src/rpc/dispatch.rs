@@ -1053,11 +1053,10 @@ impl RpcDispatcher {
             .and_then(Value::as_str)
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
 
-        let (data_dir, audit_cfg, relay_cfg, static_client_pins_configured) = {
+        let (data_dir, relay_cfg, static_client_pins_configured) = {
             let cfg = self.ctx.config.read();
             (
                 cfg.data_dir.clone(),
-                cfg.security.audit.clone(),
                 cfg.relay.clone(),
                 cfg.wss
                     .client_auth
@@ -1074,10 +1073,18 @@ impl RpcDispatcher {
             ));
         }
 
-        let audit = Arc::new(
-            crate::security::audit::AuditLogger::new(audit_cfg, data_dir.clone())
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("certificate audit logger: {e}")))?,
-        );
+        // The daemon-wide audit logger, NOT a fresh one per renewal. Each
+        // logger holds the Merkle chain's sequence and prev_hash in its own
+        // mutex, so per-request loggers recover the same tip and append
+        // conflicting entries; concurrent renewals then leave an audit file
+        // that `verify_chain` rejects. Cloning the shared `Arc` puts every
+        // renewal behind the one lock that enrollment and the ledger use.
+        let audit = Arc::clone(self.ctx.cert_audit.as_ref().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "certificate audit logger unavailable; refusing to renew without an audit trail",
+            )
+        })?);
         let ledger = CertLedger::open(&data_dir, Some(audit))
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("cert ledger: {e}")))?;
 
@@ -1147,13 +1154,34 @@ impl RpcDispatcher {
         // reaches the client without a second bootstrap (rotation push consumer).
         let relay_profile = crate::enroll::relay_profile(&data_dir, &relay_cfg);
 
-        Ok(serde_json::json!({
+        let response = serde_json::json!({
             "cert_pem": issued.cert_pem,
             "ca_chain_pem": ca_cert_pem,
             "device_id": device_id,
             "not_after": issued.not_after,
             "relay_profile": relay_profile,
-        }))
+        });
+
+        // Delivery boundary for renewal - and an honest one about its limits.
+        // This layer returns a value to the JSON-RPC framing; it never sees the
+        // transport write, so "delivered" here means the response payload was
+        // built successfully, not that the client received it. That residual
+        // window is benign in a way the enrollment one is not: the client's
+        // PREVIOUS certificate is still active and unrevoked, so a renewal that
+        // is recorded but never arrives costs the client nothing - it keeps
+        // using the old cert and renews again - while the unmarked new row is
+        // swept and revoked. Marking after the ledger write (rather than
+        // inside it) is what keeps the sweep able to see the failure at all.
+        //
+        // A ledger that cannot record the delivery fails the renewal outright:
+        // nothing has been sent yet, so refusing is free, and it spares the
+        // client a certificate that would be revoked out from under it an hour
+        // later.
+        ledger
+            .mark_delivered(&issued.fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger delivery record: {e}")))?;
+
+        Ok(response)
     }
 
     async fn handle_status(&self) -> RpcResult {
@@ -6482,6 +6510,11 @@ mod tests {
                         false,
                     )
                     .unwrap();
+                // These stand for certificates their clients actually hold. An
+                // unmarked row is an UNDELIVERED one, and the ledger's sweep
+                // revokes those at open - so without this the renewal below
+                // would be refused for the wrong reason entirely.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
             }
             ledger.mark_revoked(&revoked.fingerprint, "test").unwrap();
         }
@@ -6490,7 +6523,7 @@ mod tests {
             4, 10, 60,
         ));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, sessions);
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
         let params = serde_json::json!({ "csr_pem": renew_csr });
@@ -6548,6 +6581,9 @@ mod tests {
                     false,
                 )
                 .unwrap();
+            // A certificate its client holds; an unmarked row would be swept as
+            // undelivered and the assertion below would read Revoked.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
         }
 
         let mut config = zeroclaw_config::schema::Config {
@@ -6563,7 +6599,7 @@ mod tests {
             4, 10, 60,
         ));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, sessions);
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
         let params = serde_json::json!({ "csr_pem": renew_csr });
@@ -6585,6 +6621,121 @@ mod tests {
         assert_eq!(
             ledger.status_of(&active.fingerprint).unwrap(),
             Some(CertStatus::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_marks_delivery_and_reconciles_one_that_never_landed() {
+        // Renewal's half of the delivery contract, both directions.
+        //
+        // A renewal records a SECOND active row (new fingerprint, same device)
+        // while the old certificate stays valid - that is what makes renewal
+        // safe. So an undelivered renewal has to be reconciled without
+        // disturbing the certificate the client is still using, or the sweep
+        // would lock out the very client it is protecting.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-renew");
+        let prior = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-renew", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-renew".to_string(),
+                        fingerprint: prior.fingerprint.clone(),
+                        not_before: prior.not_before,
+                        not_after: prior.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // The client holds this one - it is what it presents to renew.
+            ledger.mark_delivered(&prior.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(prior.fingerprint.clone()));
+
+        let renewed = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("an active, delivered cert must renew");
+        let renewed_fp = zeroclaw_tls::single_cert_pem_sha256_fingerprint(
+            renewed["cert_pem"].as_str().expect("cert_pem is a string"),
+        )
+        .unwrap();
+        assert_ne!(
+            renewed_fp, prior.fingerprint,
+            "a renewal produces a new fingerprint, so it is a second row"
+        );
+
+        // Direction 1: the handler marked the renewal delivered, so it survives
+        // the sweep. Without the call site this assertion is what fails.
+        let marks = |fp: &str| -> Option<i64> {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.query_row(
+                "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+                rusqlite::params![fp],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            marks(&renewed_fp).is_some(),
+            "the renewal handler must record delivery of the certificate it returns"
+        );
+
+        // Direction 2: the crash window the handler cannot close itself - the
+        // process dies between the ledger write and the delivery mark. Clearing
+        // the mark reproduces exactly the durable state that leaves behind,
+        // the same way `stage_pending_row` reproduces a mid-issuance crash.
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET delivered_at = NULL, issued_at = issued_at - 7200
+                     WHERE fingerprint = ?1",
+                rusqlite::params![renewed_fp],
+            )
+            .unwrap();
+        }
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of(&renewed_fp).unwrap(),
+            Some(CertStatus::Revoked),
+            "an undelivered renewal must be reconciled to revoked"
+        );
+        assert_eq!(
+            reopened.status_of(&prior.fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "the certificate the client still holds must be untouched by the sweep"
+        );
+        assert_eq!(
+            reopened.revoked_fingerprints().unwrap(),
+            vec![renewed_fp],
+            "only the undelivered renewal is revoked"
         );
     }
 
@@ -6621,13 +6772,17 @@ mod tests {
                     false,
                 )
                 .unwrap();
+            // Delivered, so the failing audit logger below is exercised by the
+            // RENEWAL write - not by the undelivered sweep trying to revoke
+            // this row at open, which fails the open for a different reason.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
         }
 
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
         ));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, sessions);
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
         let params = serde_json::json!({ "csr_pem": renew_csr });
@@ -6643,6 +6798,237 @@ mod tests {
             err.message.contains("certificate audit event"),
             "got: {}",
             err.message
+        );
+    }
+
+    /// Renewal must append through the daemon's SHARED audit logger, not one
+    /// it builds itself. Proven by injecting a write failure into
+    /// `ctx.cert_audit` and requiring the renewal to see it: a handler that
+    /// constructed its own `AuditLogger` would be writing to a different
+    /// instance, the injected fault would not reach it, and the renewal would
+    /// succeed. Deterministic — no concurrency needed to tell the two wirings
+    /// apart.
+    #[tokio::test]
+    async fn cert_renew_writes_through_the_shared_audit_logger() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-shared");
+        let active = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-shared", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-shared".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let shared = ctx
+            .cert_audit
+            .clone()
+            .expect("the daemon context must carry a certificate audit logger");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Fault the SHARED instance. Only a renewal that writes through it
+        // can observe this.
+        shared.fail_writes_after_for_test(0);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp.handle_renew_cert(&params).await.expect_err(
+            "renewal must write through the shared audit logger, so a fault injected \
+             into it must fail the renewal",
+        );
+        assert_eq!(err.code, INTERNAL_ERROR);
+
+        // Clearing the fault on the same instance lets renewal proceed, which
+        // confirms the failure came from the injection and not from setup.
+        shared.clear_write_failure_for_test();
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        disp.handle_renew_cert(&params)
+            .await
+            .expect("renewal must succeed once the injected fault is cleared");
+
+        let log_path = dir.path().join("audit.log");
+        crate::security::audit::verify_chain(&log_path)
+            .expect("a failed then retried renewal must leave a verifiable audit chain");
+    }
+
+    /// Renewal is a normal operational path with audit logging on by default,
+    /// so several clients renewing at once is ordinary traffic - not an edge
+    /// case. Every one of them appends to the Merkle-chained audit file, and
+    /// the chain has exactly one writer per file: the shared
+    /// `RpcContext::cert_audit`.
+    ///
+    /// When each renewal built its own `AuditLogger`, each instance recovered
+    /// the same chain tip and then advanced its own private copy of the
+    /// sequence and `prev_hash`. Concurrent renewals appended entries that
+    /// duplicated sequence numbers and linked to hashes their neighbours had
+    /// overwritten, and `verify_chain` rejected the whole file even though
+    /// every request had used its own correctly locked logger.
+    ///
+    /// NOTE: some renewals in this test are expected to fail, for a reason
+    /// that has nothing to do with the audit chain. `CertLedger::open` runs
+    /// `materialize_revocations`, which stages the revocation list through a
+    /// FIXED temp filename (`cert_ledger.rs`, `materialize_on`: `let tmp =
+    /// path.with_extension("tmp")`) and renames it into place. Concurrent
+    /// opens — and renewal opens the ledger per request — collide on that one
+    /// temp path, and the loser's rename fails with ENOENT. This test
+    /// therefore accepts that specific failure and rejects every other error,
+    /// so it still fails loudly if renewal breaks for any new reason. The
+    /// ledger race is tracked separately; fixing it should let this test
+    /// require all renewals to succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_renewals_keep_the_audit_chain_verifiable() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        const RENEWALS: usize = 8;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+
+        // One active certificate per concurrent client.
+        let mut fingerprints = Vec::with_capacity(RENEWALS);
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            for i in 0..RENEWALS {
+                let device = format!("dev-concurrent-{i}");
+                let (csr, _) = zeroclaw_tls::testing::gen_client_csr(&device);
+                let issued = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, &device, &csr).unwrap();
+                ledger
+                    .record_issued(
+                        &LedgerEntry {
+                            device_id: device,
+                            fingerprint: issued.fingerprint.clone(),
+                            not_before: issued.not_before,
+                            not_after: issued.not_after,
+                            status: CertStatus::Active,
+                            token_hash: String::new(),
+                            actor: "enroll:test".to_string(),
+                            issued_at: 0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+                // A real client cert reached its owner, so the row is
+                // delivered; without this the undelivered sweep at ledger open
+                // revokes it and renewal is refused for the wrong reason.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
+                fingerprints.push(issued.fingerprint);
+            }
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        // ONE context, so one shared audit logger - exactly the daemon's shape.
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Every renewal is in flight before any of them finishes.
+        let gate = Arc::new(tokio::sync::Barrier::new(RENEWALS));
+        let mut tasks = Vec::with_capacity(RENEWALS);
+        for fingerprint in fingerprints {
+            let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+                .with_peer_cert_fingerprint(Some(fingerprint));
+            let gate = Arc::clone(&gate);
+            let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+            tasks.push(::zeroclaw_spawn::spawn!(async move {
+                let params = serde_json::json!({ "csr_pem": renew_csr });
+                gate.wait().await;
+                disp.handle_renew_cert(&params).await
+            }));
+        }
+        // EVERY concurrent renewal must succeed. This assertion used to tolerate
+        // failures whose message contained "initialize cert ledger DB", because
+        // each ledger open materializes the revocation list through a FIXED
+        // temp path and concurrent opens raced the rename - three of eight
+        // failed. That race is fixed in `CertLedger::materialize_on` (unique
+        // per-call temp name), so tolerating it here would only hide its
+        // return.
+        let mut succeeded = 0usize;
+        for task in tasks {
+            match task.await.expect("renewal task panicked") {
+                Ok(_) => succeeded += 1,
+                Err(e) => panic!("a concurrent renewal must not fail: {e:?}"),
+            }
+        }
+        assert_eq!(
+            succeeded, RENEWALS,
+            "all {RENEWALS} concurrent renewals must complete"
+        );
+
+        // The trail must still verify end to end.
+        let log_path = dir.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path).expect("audit log must exist");
+        let entries: Vec<crate::security::audit::AuditEvent> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must be complete JSON"))
+            .collect();
+
+        let verified = crate::security::audit::verify_chain(&log_path)
+            .expect("concurrent renewals must leave a verifiable audit chain");
+        assert_eq!(
+            verified as usize,
+            entries.len(),
+            "verify_chain must cover every appended entry"
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            (0..entries.len() as u64).collect::<Vec<_>>(),
+            "sequences must be strictly consecutive: no duplicates, no gaps"
+        );
+
+        let renewed = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    crate::security::audit::AuditEventType::CertRenewed
+                )
+            })
+            .count();
+        assert_eq!(
+            renewed, succeeded,
+            "every renewal that completed must be recorded exactly once"
         );
     }
 
@@ -10690,6 +11076,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -10733,6 +11120,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -10833,6 +11221,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());

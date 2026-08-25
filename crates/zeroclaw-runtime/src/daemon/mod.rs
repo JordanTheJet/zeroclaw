@@ -736,6 +736,36 @@ pub async fn run(
             }
         };
 
+        // THE certificate audit logger for this daemon iteration. Built once
+        // here and shared through RpcContext so enrollment, in-band renewal
+        // and the issued-cert ledger all append through a single Merkle-chain
+        // writer. A per-request logger recovers the same chain tip as its
+        // siblings and races them into duplicate sequence numbers, which makes
+        // `verify_chain` reject a file no single writer got wrong.
+        //
+        // Best-effort, like the ACP store above: a logger that cannot be
+        // constructed (e.g. `sign_events` with no usable signing key) leaves
+        // `cert_audit` unset, and the certificate paths then refuse to issue
+        // rather than issue untraceably.
+        let cert_audit: Option<std::sync::Arc<crate::security::audit::AuditLogger>> =
+            match crate::security::audit::AuditLogger::open_shared(
+                config.security.audit.clone(),
+                config.data_dir.clone(),
+            ) {
+                Ok(logger) => Some(logger),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "certificate audit logger unavailable: enrollment and certificate \
+                         renewal will refuse to issue"
+                    );
+                    None
+                }
+            };
+
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
             Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
                 &config.hooks,
@@ -768,6 +798,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             hooks,
+            cert_audit,
         }))
     } else {
         None
