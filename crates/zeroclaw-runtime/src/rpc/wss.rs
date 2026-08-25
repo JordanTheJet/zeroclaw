@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -28,9 +28,9 @@ use tokio_util::sync::CancellationToken;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
-/// What the WebSocket parser actually reads from: the TLS stream with a
-/// byte counter in front of it. See [`CountingStream`].
-type CountedTlsStream = CountingStream<TlsStream>;
+/// What the WebSocket parser actually reads from: the TLS stream with a frame
+/// scanner reading over it. See [`ScanningStream`].
+type ScannedTlsStream = ScanningStream<TlsStream>;
 
 /// How long the read side waits for any frame before sending a liveness Ping.
 const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
@@ -63,17 +63,10 @@ pub const DEFAULT_MAX_SESSIONS_PER_CLIENT: usize = 8;
 /// See [`WssLimits::incomplete_message_timeout`].
 pub const DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS: u64 = 60;
 
-/// Bytes read with no message completed before the incomplete-message deadline
-/// applies at all. Below this nothing worth reclaiming is parked in the parser,
-/// and the threshold is what keeps a QUIET connection (which accumulates no
-/// bytes) out of the rule entirely.
-const INCOMPLETE_MESSAGE_BYTES: u64 = 64 * 1024;
-
-/// Wire size of a client-to-server control frame's header: two bytes of framing
-/// plus the four-byte mask every client frame carries (RFC 6455 5.1). Control
-/// frames cannot be fragmented and cap their payload at 125 bytes, so this is
-/// exact rather than an estimate.
-const CONTROL_FRAME_HEADER_BYTES: u64 = 6;
+/// Longest possible WebSocket frame header: two base bytes, up to eight bytes
+/// of extended payload length, and the four-byte mask every client-to-server
+/// frame carries (RFC 6455 5.2).
+const FRAME_HEADER_MAX: usize = 14;
 
 /// Bound on the courtesy Close frame sent to a refused peer, so a peer that
 /// stops reading cannot make the refusal itself hold the permits it was denied.
@@ -120,10 +113,18 @@ pub struct WssLimits {
     /// The heartbeat proves liveness, not progress: tungstenite yields
     /// interleaved control frames while a fragmented message is still
     /// incomplete, so a peer can Ping forever while the parser retains the
-    /// partial buffer. This bounds that hold time. It applies only while bytes
-    /// are actually accumulating with no message completed (see
-    /// `INCOMPLETE_MESSAGE_BYTES`); an idle connection is the heartbeat's
-    /// business.
+    /// partial buffer. This bounds that hold time.
+    ///
+    /// The deadline is armed by the peer's own DECLARATION, not by bytes
+    /// received. tungstenite reserves a frame's declared length the moment it
+    /// parses that frame's header, before any payload arrives, so bytes read is
+    /// not a proxy for bytes reserved: a 14-byte header can reserve the whole
+    /// parser envelope. A frame scanner under the parser (`FrameScanner`) reads
+    /// the same plaintext byte stream and starts this clock at the FIRST byte
+    /// of a data frame's header, so every partial-message reservation is
+    /// bounded from the moment it exists. Control frames are inert to it by
+    /// construction, and with no data message in progress there is no deadline
+    /// at all - an idle connection is the heartbeat's business.
     ///
     /// It is a lifetime bound, not a stall detector - a peer that trickles
     /// bytes is exactly the case a stall detector would miss - so it also
@@ -209,26 +210,316 @@ impl Drop for ClientSessionGuard {
     }
 }
 
-/// Counts plaintext bytes read out of the inner stream.
+/// Where the scanner is in the client-to-server byte stream.
 ///
-/// tungstenite does not expose the buffer holding a partially-received message,
-/// so bytes read with no message completed is the observable stand-in for how
-/// much a peer has parked in the parser. See
-/// [`WssLimits::incomplete_message_timeout`].
-struct CountingStream<S> {
-    inner: S,
-    bytes_in: Arc<AtomicU64>,
+/// Every variant is a fixed-size counter set, so scanner state is O(1) no
+/// matter what a peer declares.
+#[derive(Debug, Clone, Copy)]
+enum ScanState {
+    /// Still inside the HTTP upgrade REQUEST, whose bytes are not frames.
+    ///
+    /// The scanner cannot simply be armed once the upgrade "completes": the
+    /// handshake reads AHEAD, and whatever followed the request in the same
+    /// read is handed to the frame parser as its initial buffer - so a peer
+    /// that pipelines a frame header into its upgrade read would slip that
+    /// header past a post-handshake scanner. Skipping the request itself and
+    /// resuming at the byte after the blank line that ends it has no such gap.
+    ///
+    /// `blank_line` counts the line terminators seen back to back; two means
+    /// the empty line that ends the headers.
+    Prelude { blank_line: u8 },
+    /// Accumulating a frame header. Its total length is only known once the
+    /// first two bytes are in (they carry the length format and the mask bit).
+    Header {
+        buf: [u8; FRAME_HEADER_MAX],
+        len: usize,
+    },
+    /// Counting off a frame's DECLARED payload. `remaining` is exactly the
+    /// reservation tungstenite has already made that the peer has not yet
+    /// backed with data. `ends_message` marks a FIN data/continuation frame,
+    /// whose last payload byte completes the message.
+    Payload { remaining: u64, ends_message: bool },
 }
 
-impl<S> CountingStream<S> {
-    fn new(inner: S) -> (Self, Arc<AtomicU64>) {
-        let bytes_in = Arc::new(AtomicU64::new(0));
+impl ScanState {
+    fn awaiting_header() -> Self {
+        Self::Header {
+            buf: [0u8; FRAME_HEADER_MAX],
+            len: 0,
+        }
+    }
+}
+
+/// A passive reader of the WebSocket framing the parser above it is about to
+/// act on, used to bound how long a partial message may be held.
+///
+/// Bytes read is NOT a proxy for parser-reserved memory: tungstenite's
+/// `FrameCodec::read_frame` reserves a frame's peer-declared length as soon as
+/// it parses the header and before any payload arrives, so a 14-byte header can
+/// reserve the whole envelope while the connection stays almost silent. This
+/// sits on the same plaintext byte stream the parser reads and tracks exactly
+/// one thing: whether a data message is in flight, and when its first header
+/// byte arrived. The deadline therefore arms at the instant the reservation
+/// exists, with no byte threshold to hide under.
+///
+/// Because it is byte-exact and runs at READ time, a read that carries the end
+/// of one message and the opening of the next is handled with no special case:
+/// the first message's completion and the second's start are both observed
+/// within that one read.
+///
+/// It never allocates in proportion to a declared length - it only moves
+/// counters - and it deliberately enforces no protocol rules. An impossible
+/// length, a reserved opcode, an unmasked client frame or a data frame opened
+/// mid-fragmentation are all tungstenite's to reject; duplicating that here
+/// would only add a second, divergent parser.
+#[derive(Debug)]
+struct FrameScanner {
+    state: ScanState,
+    /// When the data message currently in flight began - the instant its first
+    /// header byte was read - or `None` when no data message is in flight.
+    message_started_at: Option<tokio::time::Instant>,
+}
+
+impl FrameScanner {
+    fn new() -> Self {
+        Self {
+            state: ScanState::Prelude { blank_line: 0 },
+            message_started_at: None,
+        }
+    }
+
+    /// When the data message currently in flight began, or `None` when there is
+    /// none. This is what [`WssLimits::incomplete_message_timeout`] runs from.
+    fn data_message_started_at(&self) -> Option<tokio::time::Instant> {
+        self.message_started_at
+    }
+
+    /// Payload bytes the frame in flight declared but the peer has not sent:
+    /// the parser reservation not backed by data. Reported when a session is
+    /// closed so the log states what was actually being held.
+    fn outstanding_declared_bytes(&self) -> u64 {
+        match self.state {
+            ScanState::Payload { remaining, .. } => remaining,
+            _ => 0,
+        }
+    }
+
+    /// Advance over plaintext bytes just read from the peer.
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match self.state {
+                ScanState::Prelude { mut blank_line } => {
+                    let mut consumed = 0usize;
+                    for b in bytes {
+                        consumed += 1;
+                        match *b {
+                            // A bare LF terminator is tolerated because the
+                            // upgrade's own header parser tolerates it; a
+                            // stricter match here would leave the scanner stuck
+                            // in the prelude on a request the upgrade accepted.
+                            b'\n' => {
+                                blank_line = blank_line.saturating_add(1);
+                                if blank_line >= 2 {
+                                    break;
+                                }
+                            }
+                            b'\r' => {}
+                            _ => blank_line = 0,
+                        }
+                    }
+                    bytes = &bytes[consumed..];
+                    self.state = if blank_line >= 2 {
+                        ScanState::awaiting_header()
+                    } else {
+                        ScanState::Prelude { blank_line }
+                    };
+                }
+                ScanState::Header { mut buf, mut len } => {
+                    // Byte 0 carries FIN and the opcode, so a DATA frame is
+                    // recognised - and its message's clock started - at the
+                    // very first byte of its header, which is already enough
+                    // for the peer to be holding parser state.
+                    if len == 0 && !is_control_opcode(bytes[0]) && self.message_started_at.is_none()
+                    {
+                        self.message_started_at = Some(tokio::time::Instant::now());
+                    }
+                    while len < FRAME_HEADER_MAX && !bytes.is_empty() {
+                        buf[len] = bytes[0];
+                        len += 1;
+                        bytes = &bytes[1..];
+                        if header_len(&buf, len) == Some(len) {
+                            break;
+                        }
+                    }
+                    self.state = if header_len(&buf, len) == Some(len) {
+                        let (payload_len, ends_message) = decode_header(&buf);
+                        if payload_len == 0 {
+                            // A zero-length frame completes within its header.
+                            if ends_message {
+                                self.message_started_at = None;
+                            }
+                            ScanState::awaiting_header()
+                        } else {
+                            ScanState::Payload {
+                                remaining: payload_len,
+                                ends_message,
+                            }
+                        }
+                    } else {
+                        ScanState::Header { buf, len }
+                    };
+                }
+                ScanState::Payload {
+                    remaining,
+                    ends_message,
+                } => {
+                    let taken = remaining.min(bytes.len() as u64);
+                    // `taken` is bounded by `bytes.len()`, so the cast back is
+                    // exact on every target.
+                    bytes = &bytes[taken as usize..];
+                    let left = remaining - taken;
+                    self.state = if left == 0 {
+                        if ends_message {
+                            self.message_started_at = None;
+                        }
+                        ScanState::awaiting_header()
+                    } else {
+                        ScanState::Payload {
+                            remaining: left,
+                            ends_message,
+                        }
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Opcodes 0x8-0xF are control frames (RFC 6455 5.5). They are never part of a
+/// data message and may interleave with a fragmented one.
+fn is_control_opcode(first: u8) -> bool {
+    first & 0x08 != 0
+}
+
+/// Total header length implied by the bytes gathered so far, or `None` while
+/// the two bytes that determine it are not both in yet.
+fn header_len(buf: &[u8; FRAME_HEADER_MAX], len: usize) -> Option<usize> {
+    if len < 2 {
+        return None;
+    }
+    let extended = match buf[1] & 0x7F {
+        126 => 2,
+        127 => 8,
+        _ => 0,
+    };
+    let masked = if buf[1] & 0x80 != 0 { 4 } else { 0 };
+    Some(2 + extended + masked)
+}
+
+/// Declared payload length, and whether this frame's last payload byte
+/// completes a data message. Only called on a header known to be complete;
+/// every index is a constant into a fixed-size array, so it cannot panic.
+fn decode_header(buf: &[u8; FRAME_HEADER_MAX]) -> (u64, bool) {
+    let payload_len = match buf[1] & 0x7F {
+        126 => (u64::from(buf[2]) << 8) | u64::from(buf[3]),
+        127 => {
+            let mut n = 0u64;
+            for b in &buf[2..10] {
+                n = (n << 8) | u64::from(*b);
+            }
+            n
+        }
+        n => u64::from(n),
+    };
+    let fin = buf[0] & 0x80 != 0;
+    (payload_len, fin && !is_control_opcode(buf[0]))
+}
+
+/// The scanner as the IO layer and the session loop share it, plus the wakeup
+/// that keeps the two in step.
+///
+/// A deadline is armed from INSIDE a read poll: the session loop asks for a
+/// deadline, is told there is none, and parks on the very read that then
+/// observes the peer's declaration. Nothing else would wake it - while a frame
+/// is pending, tungstenite feeds every later byte (Pings included) into that
+/// frame's payload and yields nothing - so without this signal the loop would
+/// stay parked until the heartbeat, tens of seconds past the deadline it should
+/// have been running.
+struct SharedScanner {
+    state: Mutex<FrameScanner>,
+    /// Signalled when a data message becomes in-flight and none was before.
+    /// A LATER message replacing an earlier one needs no signal: its deadline
+    /// can only be further out, and the loop re-checks when the earlier one
+    /// expires.
+    armed: tokio::sync::Notify,
+}
+
+impl SharedScanner {
+    /// A poisoned lock means a task panicked mid-scan. The scanner is a counter
+    /// set with no invariant a panic can leave broken, and refusing to read it
+    /// would disarm the bound it exists to enforce, so recover the guard.
+    fn lock(&self) -> std::sync::MutexGuard<'_, FrameScanner> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Advance the scan over bytes just read, waking the session loop when this
+    /// is where a partial message's clock starts.
+    fn feed(&self, bytes: &[u8]) {
+        let mut state = self.lock();
+        let was_in_flight = state.data_message_started_at().is_some();
+        state.feed(bytes);
+        let in_flight = state.data_message_started_at().is_some();
+        drop(state);
+        if in_flight && !was_in_flight {
+            self.armed.notify_waiters();
+        }
+    }
+
+    /// When the in-flight data message must be given up on, or `None` when the
+    /// peer has no data message in flight.
+    ///
+    /// Armed by the peer's DECLARATION rather than by traffic volume: the
+    /// parser reserves a frame's declared length from its header alone, so the
+    /// clock starts at the first header byte of a data message and runs for
+    /// that message's whole lifetime. A connection with no data message in
+    /// flight - quiet, or exchanging only control frames - parks nothing and
+    /// gets no deadline here; idle liveness is the heartbeat's policy, and this
+    /// rule must not duplicate it with a different one.
+    fn incomplete_message_deadline(&self, window: Duration) -> Option<tokio::time::Instant> {
+        self.lock().data_message_started_at().map(|at| at + window)
+    }
+
+    /// How long the in-flight data message has been held, and how much of its
+    /// declared payload the peer never sent. For the closing log line only.
+    fn incomplete_message_hold(&self) -> (Duration, u64) {
+        let state = self.lock();
+        let held = state
+            .data_message_started_at()
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        (held, state.outstanding_declared_bytes())
+    }
+}
+
+/// The plaintext byte stream between rustls and the WebSocket parser, with a
+/// [`FrameScanner`] reading over everything the parser reads.
+struct ScanningStream<S> {
+    inner: S,
+    scanner: Arc<SharedScanner>,
+}
+
+impl<S> ScanningStream<S> {
+    fn new(inner: S) -> (Self, Arc<SharedScanner>) {
+        let scanner = Arc::new(SharedScanner {
+            state: Mutex::new(FrameScanner::new()),
+            armed: tokio::sync::Notify::new(),
+        });
         (
             Self {
                 inner,
-                bytes_in: bytes_in.clone(),
+                scanner: scanner.clone(),
             },
-            bytes_in,
+            scanner,
         )
     }
 
@@ -237,7 +528,7 @@ impl<S> CountingStream<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for ScanningStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -247,14 +538,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if matches!(polled, Poll::Ready(Ok(()))) {
-            let read = buf.filled().len().saturating_sub(before);
-            this.bytes_in.fetch_add(read as u64, Ordering::Relaxed);
+            let fresh = &buf.filled()[before..];
+            if !fresh.is_empty() {
+                this.scanner.feed(fresh);
+            }
         }
         polled
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for ScanningStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -319,37 +612,31 @@ enum Control {
 }
 
 pub struct WssTransport {
-    reader: futures_util::stream::SplitStream<WebSocketStream<CountedTlsStream>>,
+    reader: futures_util::stream::SplitStream<WebSocketStream<ScannedTlsStream>>,
     writer_tx: mpsc::Sender<String>,
     control_tx: mpsc::Sender<Control>,
     peer_label: String,
     /// Set once a Ping has been sent and we are awaiting any reply. Detects a
     /// peer that went silent on a half-open TCP connection (no FIN/RST).
     awaiting_pong: bool,
-    /// Plaintext bytes read off this connection, shared with the IO layer.
-    bytes_in: Arc<AtomicU64>,
-    /// `bytes_in` as of the last COMPLETED message (or of the upgrade).
-    bytes_at_last_message: u64,
-    /// When the last message completed, or when the session began.
-    last_message_at: tokio::time::Instant,
+    /// Reads the peer's framing under the parser, shared with the IO layer.
+    /// The only source of the incomplete-message deadline.
+    scanner: Arc<SharedScanner>,
     /// See [`WssLimits::incomplete_message_timeout`].
     incomplete_message_timeout: Duration,
 }
 
 impl WssTransport {
     /// Module-private: a transport is only well-formed when its parser sits
-    /// behind the byte counter the listener installs, so only the listener can
+    /// behind the frame scanner the listener installs, so only the listener can
     /// build one.
     fn new(
-        ws: WebSocketStream<CountedTlsStream>,
+        ws: WebSocketStream<ScannedTlsStream>,
         remote_addr: SocketAddr,
-        bytes_in: Arc<AtomicU64>,
+        scanner: Arc<SharedScanner>,
         incomplete_message_timeout: Duration,
     ) -> Self {
         let peer_label = format!("wss:{remote_addr}");
-        // Baseline past the handshake bytes: only what the parser reads for
-        // MESSAGES counts toward the incomplete-message bound.
-        let bytes_at_last_message = bytes_in.load(Ordering::Relaxed);
         let (sink, stream) = ws.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
@@ -379,53 +666,9 @@ impl WssTransport {
             control_tx,
             peer_label,
             awaiting_pong: false,
-            bytes_in,
-            bytes_at_last_message,
-            last_message_at: tokio::time::Instant::now(),
+            scanner,
             incomplete_message_timeout,
         }
-    }
-
-    /// Bytes read with no message completed since. tungstenite hides its
-    /// partial-message buffer, so this is what stands in for it.
-    fn pending_bytes(&self) -> u64 {
-        self.bytes_in
-            .load(Ordering::Relaxed)
-            .saturating_sub(self.bytes_at_last_message)
-    }
-
-    /// When a partially-received message must be given up on, or `None` when
-    /// nothing meaningful is parked in the parser.
-    ///
-    /// Gated on bytes having actually accumulated: a QUIET connection parks
-    /// nothing and must NOT be torn down here - idle liveness is the
-    /// heartbeat's policy, and this rule would otherwise duplicate it with a
-    /// different deadline.
-    fn incomplete_message_deadline(&self) -> Option<tokio::time::Instant> {
-        (self.pending_bytes() > INCOMPLETE_MESSAGE_BYTES)
-            .then(|| self.last_message_at + self.incomplete_message_timeout)
-    }
-
-    /// A message completed: the parser released its buffer, so the
-    /// incomplete-message window restarts from here.
-    fn note_message_completed(&mut self) {
-        self.bytes_at_last_message = self.bytes_in.load(Ordering::Relaxed);
-        self.last_message_at = tokio::time::Instant::now();
-    }
-
-    /// Discount a control frame from the accounting above.
-    ///
-    /// A control frame is delivered whole and parks NOTHING in the parser, so
-    /// its bytes are not held memory. Leaving them in the count would make a
-    /// healthy session that only exchanges keepalives eventually cross the
-    /// threshold and be closed by a rule that is meant to reclaim buffered
-    /// message bytes. It does NOT extend the window: the deadline still runs
-    /// from the last COMPLETED message, which is what stops a peer from
-    /// holding a partial message alive by pinging.
-    fn credit_control_frame(&mut self, payload_len: usize) {
-        self.bytes_at_last_message = self
-            .bytes_at_last_message
-            .saturating_add(CONTROL_FRAME_HEADER_BYTES + payload_len as u64);
     }
 }
 
@@ -436,6 +679,10 @@ impl RpcTransport for WssTransport {
     }
 
     async fn next_frame(&mut self) -> Option<String> {
+        // A handle of its own, so the deadline can be consulted while the read
+        // below holds `self.reader`.
+        let scanner = self.scanner.clone();
+        let window = self.incomplete_message_timeout;
         loop {
             let idle = if self.awaiting_pong {
                 HEARTBEAT_TIMEOUT
@@ -448,28 +695,52 @@ impl RpcTransport for WssTransport {
             // message), and folding them together would let either fire for the
             // other's reason. It also lands on a peer that never sends another
             // frame to wake this loop.
-            let message_deadline = self.incomplete_message_deadline();
+            let message_deadline = scanner.incomplete_message_deadline(window);
             let read = tokio::time::timeout(idle, self.reader.next());
             let polled = match message_deadline {
                 Some(at) => tokio::select! {
                     biased;
-                    _ = tokio::time::sleep_until(at) => None,
+                    _ = tokio::time::sleep_until(at) => {
+                        match scanner.incomplete_message_deadline(window) {
+                            // Still the message that armed this deadline (or an
+                            // earlier one): its budget is spent.
+                            Some(now_at) if now_at <= at => None,
+                            // That message completed and a LATER one took its
+                            // place inside a single read - or none did. Re-arm
+                            // on what is actually in flight now rather than
+                            // closing a session that made progress.
+                            _ => continue,
+                        }
+                    }
                     frame = read => Some(frame),
                 },
-                None => Some(read.await),
+                // Nothing in flight yet. The peer's declaration is observed
+                // from inside the read below and yields no frame to wake this
+                // loop, so wait on the scanner's signal alongside it. The
+                // signal is registered BEFORE the read is first polled, which
+                // is the only place a deadline can be armed, so it cannot be
+                // missed.
+                None => tokio::select! {
+                    biased;
+                    _ = scanner.armed.notified() => continue,
+                    frame = read => Some(frame),
+                },
             };
 
             let Some(frame) = polled else {
+                let (held, undelivered) = scanner.incomplete_message_hold();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     &format!(
-                        "WSS closing {}: {} bytes held in an incomplete message for over {}s; \
-                         control frames do not extend that budget",
+                        "WSS closing {}: a data message has been incomplete for {}s, past the {}s \
+                         budget, with {} declared payload bytes still unsent; control frames do \
+                         not extend that budget",
                         self.peer_label,
-                        self.pending_bytes(),
-                        self.incomplete_message_timeout.as_secs()
+                        held.as_secs(),
+                        self.incomplete_message_timeout.as_secs(),
+                        undelivered
                     )
                 );
                 return None;
@@ -487,27 +758,20 @@ impl RpcTransport for WssTransport {
                 }
                 Ok(frame) => {
                     self.awaiting_pong = false;
+                    // Nothing here touches the incomplete-message deadline: the
+                    // scanner already observed every one of these frames at the
+                    // byte level as they were read, including any part of the
+                    // NEXT message that arrived in the same read. Clearing state
+                    // here instead would discard exactly that read-ahead.
                     match frame {
-                        Some(Ok(Message::Text(text))) => {
-                            self.note_message_completed();
-                            return Some(text.to_string());
-                        }
+                        Some(Ok(Message::Text(text))) => return Some(text.to_string()),
                         Some(Ok(Message::Close(_))) | None => return None,
                         // Control frames prove liveness but complete no
-                        // message, so they deliberately do NOT restart the
-                        // incomplete-message window - only discount their own
-                        // bytes, which the parser is not holding.
-                        Some(Ok(Message::Ping(payload) | Message::Pong(payload))) => {
-                            self.credit_control_frame(payload.len());
-                            continue;
-                        }
-                        // Never yielded by a read, so there is nothing to
-                        // discount.
+                        // message; they are inert to the deadline.
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                        // Never yielded by a read.
                         Some(Ok(Message::Frame(_))) => continue,
-                        Some(Ok(Message::Binary(_))) => {
-                            self.note_message_completed();
-                            continue;
-                        }
+                        Some(Ok(Message::Binary(_))) => continue,
                         Some(Err(_)) => return None,
                     }
                 }
@@ -575,7 +839,7 @@ fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
 /// network failure. Bounded by [`REFUSAL_CLOSE_TIMEOUT`]: a peer that stops
 /// reading must not be able to make the refusal itself hold the permits the
 /// caller is about to release.
-async fn close_with_reason(ws: &mut WebSocketStream<CountedTlsStream>, reason: &'static str) {
+async fn close_with_reason(ws: &mut WebSocketStream<ScannedTlsStream>, reason: &'static str) {
     let frame = CloseFrame {
         code: CloseCode::Policy,
         reason: reason.into(),
@@ -721,18 +985,21 @@ pub async fn run_wss_listener(
                         }
                     };
 
-                    // Count plaintext bytes from here on. What buffers a
-                    // partially-received message is the WebSocket parser, and it
-                    // does not expose that buffer, so the session loop reads
-                    // progress off this counter instead.
-                    let (counted_stream, bytes_in) = CountingStream::new(tls_stream);
+                    // Scan the plaintext framing from here on, starting with the
+                    // upgrade REQUEST: the handshake reads ahead, so a scanner
+                    // installed after it could miss a frame header the peer
+                    // pipelined into that read. What buffers a partially-received
+                    // message is the WebSocket parser, which does not expose that
+                    // buffer - the session loop reads the peer's own frame
+                    // declarations off this scanner instead.
+                    let (scanned_stream, scanner) = ScanningStream::new(tls_stream);
 
                     // WebSocket upgrade. An explicit parser config replaces
                     // tungstenite's 64 MiB message / 16 MiB frame defaults with a
                     // ceiling sized to the RPC contract, so the parser cannot buffer
                     // far more than a legitimate request before `next_frame` sees it.
                     let ws_stream = match tokio_tungstenite::accept_async_with_config(
-                        counted_stream,
+                        scanned_stream,
                         Some(rpc_ws_config()),
                     )
                     .await
@@ -748,10 +1015,10 @@ pub async fn run_wss_listener(
                             return None;
                         }
                     };
-                        Some((ws_stream, bytes_in))
+                        Some((ws_stream, scanner))
                     };
 
-                    let (mut ws_stream, bytes_in) = match tokio::time::timeout_at(deadline, setup).await {
+                    let (mut ws_stream, scanner) = match tokio::time::timeout_at(deadline, setup).await {
                         Ok(Some(ws)) => ws,
                         Ok(None) => return, // logged above
                         Err(_) => {
@@ -850,7 +1117,7 @@ pub async fn run_wss_listener(
                     let mut transport = WssTransport::new(
                         ws_stream,
                         remote_addr,
-                        bytes_in,
+                        scanner,
                         incomplete_message_timeout,
                     );
                     let peer = transport.peer_label();
@@ -885,6 +1152,254 @@ pub async fn run_wss_listener(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_scanner_tests {
+    use super::{FRAME_HEADER_MAX, FrameScanner, ScanState};
+
+    /// A minimal WebSocket upgrade REQUEST. The scanner starts inside one, so
+    /// every case here has to get through it first.
+    const UPGRADE_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n";
+
+    /// A client-to-server frame as it appears on the wire: masked, carrying a
+    /// DECLARED payload length that `payload` may be shorter than. That gap -
+    /// declared but not sent - is exactly the reservation under test.
+    fn wire_frame(fin: bool, opcode: u8, declared: u64, payload: &[u8]) -> Vec<u8> {
+        let mask = [0xA3u8, 0x5C, 0x11, 0x7E];
+        let mut out = vec![if fin { 0x80 | opcode } else { opcode }];
+        if declared < 126 {
+            out.push(0x80 | declared as u8);
+        } else if declared < 65536 {
+            out.push(0x80 | 126);
+            out.extend_from_slice(&(declared as u16).to_be_bytes());
+        } else {
+            out.push(0x80 | 127);
+            out.extend_from_slice(&declared.to_be_bytes());
+        }
+        out.extend_from_slice(&mask);
+        out.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % mask.len()]),
+        );
+        out
+    }
+
+    fn past_upgrade() -> FrameScanner {
+        let mut scanner = FrameScanner::new();
+        scanner.feed(UPGRADE_REQUEST);
+        assert!(
+            matches!(scanner.state, ScanState::Header { len: 0, .. }),
+            "the scanner must resume framing at the byte after the request"
+        );
+        scanner
+    }
+
+    // The longest header the wire format allows must fit the fixed buffer, or
+    // the scanner would silently truncate one and lose sync.
+    #[tokio::test]
+    async fn header_buffer_covers_the_longest_legal_header() {
+        let longest = wire_frame(false, 0x1, u64::from(u32::MAX), &[]);
+        assert_eq!(longest.len(), FRAME_HEADER_MAX);
+    }
+
+    // The core of the reviewer's finding: a 14-byte header declaring a huge
+    // payload is a huge reservation. The clock must start on the header, not on
+    // any volume of payload.
+    #[tokio::test]
+    async fn a_declared_payload_arms_the_clock_before_any_payload_arrives() {
+        let mut scanner = past_upgrade();
+        assert!(scanner.data_message_started_at().is_none());
+
+        let header = &wire_frame(false, 0x1, 31 * 1024 * 1024, &[])[..FRAME_HEADER_MAX];
+        scanner.feed(header);
+
+        assert!(
+            scanner.data_message_started_at().is_some(),
+            "a data frame header declaring 31 MiB must arm the deadline on its own"
+        );
+        assert_eq!(
+            scanner.outstanding_declared_bytes(),
+            31 * 1024 * 1024,
+            "the whole declared payload is reserved and unsent"
+        );
+    }
+
+    // Even the first byte is enough to classify the frame, and a peer that
+    // stops there is still holding parser state.
+    #[tokio::test]
+    async fn one_header_byte_is_enough_to_arm_and_a_split_header_stays_in_sync() {
+        let mut scanner = past_upgrade();
+        let frame = wire_frame(false, 0x2, 1000, &[7u8; 4]);
+        scanner.feed(&frame[..1]);
+        assert!(scanner.data_message_started_at().is_some());
+
+        // The rest of the header dribbles in a byte at a time, then 4 payload
+        // bytes: the scanner must still know 996 remain.
+        for b in &frame[1..] {
+            scanner.feed(std::slice::from_ref(b));
+        }
+        assert_eq!(scanner.outstanding_declared_bytes(), 996);
+    }
+
+    // Control frames park nothing, so no volume of them may arm the deadline.
+    #[tokio::test]
+    async fn control_frames_never_arm_the_clock() {
+        let mut scanner = past_upgrade();
+        for _ in 0..500 {
+            scanner.feed(&wire_frame(true, 0x9, 125, &[0u8; 125])); // Ping
+            scanner.feed(&wire_frame(true, 0xA, 125, &[0u8; 125])); // Pong
+        }
+        assert!(
+            scanner.data_message_started_at().is_none(),
+            "control frames are not part of any data message"
+        );
+    }
+
+    // A control frame interleaved into a fragmented message must neither end it
+    // nor restart its clock.
+    #[tokio::test]
+    async fn an_interleaved_ping_neither_ends_nor_restarts_a_partial_message() {
+        let mut scanner = past_upgrade();
+        scanner.feed(&wire_frame(false, 0x1, 8, &[1u8; 8]));
+        let started = scanner
+            .data_message_started_at()
+            .expect("the fragmented message is in flight");
+
+        scanner.feed(&wire_frame(true, 0x9, 0, &[]));
+        assert_eq!(
+            scanner.data_message_started_at(),
+            Some(started),
+            "a Ping must not restart the partial message's clock"
+        );
+
+        // The FIN continuation frame is what ends it.
+        scanner.feed(&wire_frame(true, 0x0, 8, &[1u8; 8]));
+        assert!(scanner.data_message_started_at().is_none());
+    }
+
+    // The read-ahead case: one read carrying the end of one message and the
+    // opening of the next leaves the SECOND message in flight.
+    #[tokio::test]
+    async fn read_ahead_past_a_completed_message_keeps_the_next_one_armed() {
+        let mut scanner = past_upgrade();
+        let mut one_read = wire_frame(true, 0x1, 16, &[b'a'; 16]);
+        one_read.extend_from_slice(&wire_frame(false, 0x1, 4 * 1024 * 1024, &[b'b'; 32]));
+        scanner.feed(&one_read);
+
+        assert!(
+            scanner.data_message_started_at().is_some(),
+            "the partial message opened in the same read must still be in flight"
+        );
+        assert_eq!(
+            scanner.outstanding_declared_bytes(),
+            4 * 1024 * 1024 - 32,
+            "the 32 payload bytes already read must be accounted against the declaration"
+        );
+    }
+
+    // Two complete messages in one read leave nothing in flight - the deadline
+    // must not linger on a session that is making progress.
+    #[tokio::test]
+    async fn two_complete_messages_in_one_read_leave_nothing_in_flight() {
+        let mut scanner = past_upgrade();
+        let mut one_read = wire_frame(true, 0x1, 16, &[b'a'; 16]);
+        one_read.extend_from_slice(&wire_frame(true, 0x1, 24, &[b'b'; 24]));
+        scanner.feed(&one_read);
+        assert!(scanner.data_message_started_at().is_none());
+    }
+
+    // Zero-length frames complete inside their own header; a FIN one must not
+    // leave a phantom message in flight.
+    #[tokio::test]
+    async fn zero_length_frames_are_resolved_within_the_header() {
+        let mut scanner = past_upgrade();
+        scanner.feed(&wire_frame(true, 0x1, 0, &[]));
+        assert!(scanner.data_message_started_at().is_none());
+
+        scanner.feed(&wire_frame(false, 0x1, 0, &[]));
+        assert!(
+            scanner.data_message_started_at().is_some(),
+            "a zero-length NON-final frame still opens a message"
+        );
+    }
+
+    // 16-bit and 64-bit length encodings must be decoded exactly, or the
+    // scanner would resynchronise in the middle of a payload.
+    #[tokio::test]
+    async fn extended_length_encodings_are_decoded_exactly() {
+        for declared in [125u64, 126, 65535, 65536, 1 << 32] {
+            let mut scanner = past_upgrade();
+            let frame = wire_frame(false, 0x2, declared, &[]);
+            scanner.feed(&frame);
+            assert_eq!(
+                scanner.outstanding_declared_bytes(),
+                declared,
+                "declared length {declared} was decoded wrong"
+            );
+        }
+    }
+
+    // An unmasked frame has a 4-byte-shorter header. Getting that wrong would
+    // desynchronise the scanner even though tungstenite is the one that rejects
+    // the frame.
+    #[tokio::test]
+    async fn an_unmasked_client_frame_does_not_desynchronise_the_scanner() {
+        let mut scanner = past_upgrade();
+        // FIN text, unmasked, 4-byte payload, then a masked Ping behind it.
+        let mut bytes = vec![0x81, 0x04, b'p', b'i', b'n', b'g'];
+        bytes.extend_from_slice(&wire_frame(true, 0x9, 0, &[]));
+        scanner.feed(&bytes);
+        assert!(
+            scanner.data_message_started_at().is_none(),
+            "the unmasked frame completed and the Ping behind it must not have armed anything"
+        );
+    }
+
+    // A length no host could ever hold must move a counter and nothing else.
+    #[tokio::test]
+    async fn an_absurd_declared_length_only_moves_a_counter() {
+        let mut scanner = past_upgrade();
+        scanner.feed(&wire_frame(false, 0x1, u64::MAX, &[9u8; 3]));
+        assert_eq!(scanner.outstanding_declared_bytes(), u64::MAX - 3);
+        assert!(scanner.data_message_started_at().is_some());
+        // The state a declaration can create is a fixed set of counters. If
+        // this ever grew with the declared length, the scanner would have
+        // become the very allocation it exists to bound.
+        assert!(
+            std::mem::size_of::<ScanState>() <= 40,
+            "scanner state must stay O(1), got {} bytes",
+            std::mem::size_of::<ScanState>()
+        );
+    }
+
+    // Header bytes pipelined into the upgrade read are inside the prelude's
+    // tail: the scanner must resume framing at exactly the right byte.
+    #[tokio::test]
+    async fn a_frame_pipelined_into_the_upgrade_read_is_still_seen() {
+        let mut scanner = FrameScanner::new();
+        let mut one_read = UPGRADE_REQUEST.to_vec();
+        one_read.extend_from_slice(&wire_frame(false, 0x1, 9 * 1024 * 1024, &[b'z'; 8]));
+        scanner.feed(&one_read);
+        assert!(
+            scanner.data_message_started_at().is_some(),
+            "a header pipelined into the handshake read must not slip past the scanner"
+        );
+        assert_eq!(scanner.outstanding_declared_bytes(), 9 * 1024 * 1024 - 8);
+    }
+
+    // The upgrade's own parser tolerates bare-LF line endings, so the scanner
+    // must too - otherwise it would sit in the prelude forever on a session the
+    // daemon accepted, and arm nothing at all.
+    #[tokio::test]
+    async fn a_bare_lf_request_terminator_still_ends_the_prelude() {
+        let mut scanner = FrameScanner::new();
+        scanner.feed(b"GET / HTTP/1.1\nHost: h\n\n");
+        scanner.feed(&wire_frame(false, 0x1, 4096, &[]));
+        assert!(scanner.data_message_started_at().is_some());
+    }
 }
 
 #[cfg(test)]

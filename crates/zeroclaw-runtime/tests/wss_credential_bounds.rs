@@ -7,12 +7,19 @@
 //! liveness, not progress, so interleaved control frames could keep a
 //! connection alive indefinitely while the parser retained a partial message.
 //!
+//! Nor is bytes received a proxy for parser memory: tungstenite reserves a
+//! frame's peer-declared length the moment it parses that frame's header, so a
+//! 14-byte header can reserve the whole 32 MiB envelope while the connection
+//! stays almost silent.
+//!
 //! These drive the real `run_wss_listener` and the real tungstenite parser over
 //! real mTLS handshakes, across MULTIPLE sessions, and cover: the
 //! per-credential session ceiling, that it is per-credential rather than
 //! global, that a released slot is reusable, that a partial message is closed
-//! at its deadline while a quiet session is not, and that capacity returns
-//! after a rejection.
+//! at its deadline while a quiet session is not, that a large DECLARATION with
+//! a tiny body is closed on the declaration alone, that a partial message read
+//! ahead of a completed one is not forgotten, and that capacity returns after a
+//! rejection.
 //!
 //! Test code, not daemon-path: bare `tokio::spawn` is fine here (the
 //! `zeroclaw_spawn::spawn!` rule is for production daemon tasks).
@@ -260,6 +267,52 @@ async fn admit_within(addr: SocketAddr, cred: &ClientCred, budget: Duration) -> 
     }
 }
 
+/// WebSocket opcodes this suite writes by hand (RFC 6455 5.2).
+const OPCODE_TEXT: u8 = 0x1;
+
+/// A client-to-server frame exactly as it goes on the wire: masked, and
+/// carrying a DECLARED payload length that the bytes actually sent may fall
+/// short of.
+///
+/// tungstenite's `Message` API cannot express that gap - it always sends the
+/// payload it declares - and the gap is the whole subject here: the declared
+/// length is what the server's parser reserves before any payload arrives.
+fn wire_frame(fin: bool, opcode: u8, declared: u64, payload: &[u8]) -> Vec<u8> {
+    let mask = [0x6Du8, 0x2B, 0xF0, 0x91];
+    let mut out = vec![if fin { 0x80 | opcode } else { opcode }];
+    if declared < 126 {
+        out.push(0x80 | declared as u8);
+    } else if declared < 65536 {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(declared as u16).to_be_bytes());
+    } else {
+        out.push(0x80 | 127);
+        out.extend_from_slice(&declared.to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    out.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i % mask.len()]),
+    );
+    out
+}
+
+/// Write raw frame bytes underneath the client's own WebSocket parser, so the
+/// daemon sees exactly what this test wrote rather than something tungstenite
+/// re-encoded. Anything tungstenite had queued is flushed first, so the raw
+/// bytes can never land in the middle of one of its frames.
+async fn write_raw(ws: &mut WsClient, bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    SinkExt::flush(ws).await.expect("flush the client's queue");
+    ws.get_mut()
+        .write_all(bytes)
+        .await
+        .expect("raw frame write");
+    ws.get_mut().flush().await.expect("raw frame flush");
+}
+
 /// One keepalive per interval - the rate a real client would use, not a flood.
 const PING_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -404,6 +457,175 @@ async fn incomplete_message_deadline_closes_and_returns_capacity() {
     cancel.cancel();
 }
 
+/// A near-envelope DECLARATION backed by almost no payload is closed at its
+/// deadline, on the declaration alone.
+///
+/// This is the case a byte-counting bound cannot see. tungstenite reserves the
+/// peer-declared frame length in `FrameCodec::read_frame` before it reads any
+/// payload, so 14 bytes of header buy a 31 MiB reservation. A rule that waits
+/// for 64 KiB of traffic before it arms anything never fires here: the peer
+/// sends half that and then only keepalives, which cost 6 bytes each and would
+/// need over half an hour to reach the threshold - by which time the deadline
+/// it was standing in for has passed fifteen times over at the default window.
+#[tokio::test]
+async fn a_large_declared_payload_with_a_tiny_body_is_closed_at_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cancel, cred_a, _cred_b) = start_listener(
+        dir.path(),
+        WssLimits {
+            max_pending_handshakes: 8,
+            handshake_timeout: Duration::from_secs(5),
+            // One global slot and one per-credential slot, so the reconnect at
+            // the end can only succeed if BOTH were released.
+            max_sessions: 1,
+            max_sessions_per_client: 1,
+            incomplete_message_timeout: Duration::from_secs(2),
+        },
+    )
+    .await;
+
+    let mut ws = admit(addr, &cred_a).await.expect_open("the first session");
+
+    // 31 MiB is just inside the daemon's 32 MiB parser envelope, so the header
+    // is accepted and the reservation made. The 32 KiB body is deliberately
+    // HALF the 64 KiB the superseded byte-count proxy required.
+    const DECLARED: u64 = 31 * 1024 * 1024;
+    let body = vec![b'x'; 32 * 1024];
+    assert!(
+        (body.len() as u64) < DECLARED / 900,
+        "the body must be negligible against the declaration for this to mean anything"
+    );
+    write_raw(&mut ws, &wire_frame(false, OPCODE_TEXT, DECLARED, &body)).await;
+
+    let closed_after = ping_until_closed(&mut ws, Duration::from_secs(12))
+        .await
+        .expect("a 31 MiB reservation held past its deadline must be closed");
+    assert!(
+        closed_after >= Duration::from_secs(1),
+        "closed after {closed_after:?}, too early to be the 2s incomplete-message deadline"
+    );
+    assert!(
+        closed_after < Duration::from_secs(10),
+        "closed after {closed_after:?}: that is the 20s heartbeat expiring, not the 2s \
+         incomplete-message deadline"
+    );
+
+    drop(ws);
+    assert!(
+        admit_within(addr, &cred_a, Duration::from_secs(5))
+            .await
+            .is_open(),
+        "the session permit and the credential slot must return after a declared-but-unsent \
+         reservation is closed"
+    );
+
+    cancel.cancel();
+}
+
+/// A partial message that arrives in the SAME read as the end of a completed
+/// one still gets its own deadline.
+///
+/// The superseded accounting rebased its byte baseline to everything read so
+/// far whenever a message completed, so the second message's already-buffered
+/// bytes were struck from the record - a peer could complete one small message
+/// per read and have the partial message trailing it forgotten each time.
+/// Nothing here depends on the daemon noticing the boundary: the scan is done
+/// on the bytes as they are read, before the parser yields anything.
+#[tokio::test]
+async fn a_partial_message_read_ahead_of_a_completed_one_is_not_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cancel, cred_a, _cred_b) = start_listener(
+        dir.path(),
+        WssLimits {
+            max_pending_handshakes: 8,
+            handshake_timeout: Duration::from_secs(5),
+            max_sessions: 1,
+            max_sessions_per_client: 1,
+            incomplete_message_timeout: Duration::from_secs(2),
+        },
+    )
+    .await;
+
+    let mut ws = admit(addr, &cred_a).await.expect_open("the first session");
+
+    // ONE write, so both land in one read: a complete JSON-RPC request (the
+    // daemon answers it with an error, which is beside the point) immediately
+    // followed by the opening fragment of a second, much larger message.
+    let complete = br#"{"jsonrpc":"2.0","id":1,"method":"no.such.method"}"#;
+    let mut one_write = wire_frame(true, OPCODE_TEXT, complete.len() as u64, complete);
+    one_write.extend_from_slice(&wire_frame(
+        false,
+        OPCODE_TEXT,
+        8 * 1024 * 1024,
+        &[b'y'; 512],
+    ));
+    write_raw(&mut ws, &one_write).await;
+
+    let closed_after = ping_until_closed(&mut ws, Duration::from_secs(12))
+        .await
+        .expect("the partial message trailing a completed one must still be closed");
+    assert!(
+        closed_after >= Duration::from_secs(1),
+        "closed after {closed_after:?}, too early to be the 2s incomplete-message deadline"
+    );
+    assert!(
+        closed_after < Duration::from_secs(10),
+        "closed after {closed_after:?}: that is the 20s heartbeat expiring, not the 2s \
+         incomplete-message deadline"
+    );
+
+    drop(ws);
+    assert!(
+        admit_within(addr, &cred_a, Duration::from_secs(5))
+            .await
+            .is_open(),
+        "the session permit and the credential slot must return after the deadline closes a \
+         read-ahead partial message"
+    );
+
+    cancel.cancel();
+}
+
+/// The same read-ahead shape, but with BOTH messages complete, must leave the
+/// session alone. The read-ahead fix has to distinguish "a partial message
+/// trails a completed one" from "two messages completed back to back";
+/// tracking the boundary anywhere but on the byte stream itself blurs the two.
+#[tokio::test]
+async fn two_completed_messages_in_one_read_leave_the_session_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cancel, cred_a, _cred_b) = start_listener(
+        dir.path(),
+        WssLimits {
+            max_pending_handshakes: 8,
+            handshake_timeout: Duration::from_secs(5),
+            max_sessions: 4,
+            max_sessions_per_client: 4,
+            incomplete_message_timeout: Duration::from_secs(1),
+        },
+    )
+    .await;
+
+    let mut ws = admit(addr, &cred_a)
+        .await
+        .expect_open("a session making progress");
+
+    let first = br#"{"jsonrpc":"2.0","id":1,"method":"no.such.method"}"#;
+    let second = br#"{"jsonrpc":"2.0","id":2,"method":"no.such.method"}"#;
+    let mut one_write = wire_frame(true, OPCODE_TEXT, first.len() as u64, first);
+    one_write.extend_from_slice(&wire_frame(true, OPCODE_TEXT, second.len() as u64, second));
+    write_raw(&mut ws, &one_write).await;
+
+    // Five times the deadline with nothing outstanding.
+    let closed = ping_until_closed(&mut ws, Duration::from_secs(5)).await;
+    assert!(
+        closed.is_none(),
+        "a session whose messages both completed was closed after {closed:?}, but it left \
+         nothing in the parser"
+    );
+
+    cancel.cancel();
+}
+
 /// The incomplete-message bound is about bytes parked in the parser. A QUIET
 /// connection accumulates none, so it must be left to the idle heartbeat -
 /// otherwise this bound silently becomes a second, much shorter idle policy.
@@ -434,11 +656,11 @@ async fn a_quiet_session_outlives_the_incomplete_message_deadline() {
     cancel.cancel();
 }
 
-/// No VOLUME of control frames is counted as parser-held memory. Control frames
-/// are delivered whole and park nothing, so a peer that sends far past the
-/// accounting threshold in Pings alone - and keeps doing so past the deadline -
-/// must survive. Without this carve-out the bound would eventually close
-/// healthy long-lived sessions that only exchange keepalives.
+/// No VOLUME of control frames counts as parser-held memory. Control frames are
+/// delivered whole and park nothing, so a peer that sends 100 KiB of Pings -
+/// and keeps doing so past the deadline - must survive. Any accounting that
+/// treated their bytes as held memory would eventually close healthy long-lived
+/// sessions that only exchange keepalives.
 #[tokio::test]
 async fn control_frame_volume_is_not_counted_as_parser_memory() {
     let dir = tempfile::tempdir().unwrap();
@@ -458,8 +680,8 @@ async fn control_frame_volume_is_not_counted_as_parser_memory() {
         .await
         .expect_open("a keepalive-only session");
 
-    // 800 frames at the 125-byte control-frame maximum is ~104 KiB, comfortably
-    // past the 64 KiB threshold, spread over twice the deadline.
+    // 800 frames at the 125-byte control-frame maximum is ~104 KiB of traffic
+    // that holds nothing, spread over twice the deadline.
     let payload = Bytes::from(vec![0u8; 125]);
     let started = Instant::now();
     for _ in 0..20 {
