@@ -110,7 +110,7 @@ pub struct WssLimits {
     ///
     /// `max_sessions` alone is an arithmetic ceiling, not a host-memory budget:
     /// every session may declare a message up to the parser envelope
-    /// ([`rpc_ws_config`]), so 512 sessions is a 16 GiB ceiling, and one
+    /// (`rpc_ws_config`), so 512 sessions is a 16 GiB ceiling, and one
     /// admitted-but-hostile credential (or a stolen one, before it is detected
     /// and revoked) can occupy all of it. This bounds the parser bytes ONE
     /// credential can reserve at `max_sessions_per_client x envelope`.
@@ -122,7 +122,7 @@ pub struct WssLimits {
     /// incomplete, so a peer can Ping forever while the parser retains the
     /// partial buffer. This bounds that hold time. It applies only while bytes
     /// are actually accumulating with no message completed (see
-    /// [`INCOMPLETE_MESSAGE_BYTES`]); an idle connection is the heartbeat's
+    /// `INCOMPLETE_MESSAGE_BYTES`); an idle connection is the heartbeat's
     /// business.
     ///
     /// It is a lifetime bound, not a stall detector - a peer that trickles
