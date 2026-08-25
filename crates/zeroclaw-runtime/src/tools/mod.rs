@@ -210,6 +210,10 @@ impl Tool for ArcToolRef {
         self.0.spec()
     }
 
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.0.invocation_triggers()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -272,6 +276,10 @@ impl Tool for ArcDelegatingTool {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2737,6 +2745,66 @@ permissions = ["http_client"]
     }
 
     #[test]
+    fn send_via_triggers_survive_production_registry_boxing() {
+        // Regression: every arc in the registry is re-boxed as an
+        // `ArcDelegatingTool`, which must forward `invocation_triggers()` —
+        // otherwise the trait default erases send_via's vocabulary and the
+        // pre-turn prefilter can never match it. Build the real registry and
+        // assert the boxed send_via still carries its live triggers.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let send_via = tools
+            .iter()
+            .find(|t| t.name() == "send_via")
+            .expect("send_via is always registered");
+        let triggers = send_via.invocation_triggers();
+        assert!(
+            triggers.iter().any(|t| t == "send this to"),
+            "boxed send_via must keep its static triggers; got {triggers:?}"
+        );
+    }
+
+    #[test]
     fn sop_tools_present_when_engine_provided() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -2833,10 +2901,20 @@ permissions = ["http_client"]
             workspace_dir: &std::path::Path,
         ) -> anyhow::Result<tokio::process::Command> {
             *self.seen_command.lock().unwrap() = Some(command.to_string());
+            #[cfg(windows)]
+            let mut process = {
+                let mut process = tokio::process::Command::new("cmd.exe");
+                process.args(["/D", "/S", "/C", "echo zc-runtime"]);
+                process
+            };
+            #[cfg(not(windows))]
             let mut process = tokio::process::Command::new("/bin/sh");
+            #[cfg(not(windows))]
             process
                 .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
                 .current_dir(workspace_dir);
+            #[cfg(windows)]
+            process.current_dir(workspace_dir);
             Ok(process)
         }
     }
