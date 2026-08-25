@@ -7336,6 +7336,18 @@ pub struct WssConfig {
     /// the steady state that survives authentication.
     #[serde(default = "default_wss_max_sessions")]
     pub max_sessions: usize,
+    /// Ceiling on concurrent sessions presenting ONE client certificate
+    /// (default: 8). `max_sessions` alone lets a single admitted (or stolen,
+    /// pre-revocation) credential occupy every session and its parser
+    /// envelope; this bounds what one credential can reserve.
+    #[serde(default = "default_wss_max_sessions_per_client")]
+    pub max_sessions_per_client: usize,
+    /// How long, in seconds, a partially-received message may be held by the
+    /// parser while control frames keep the connection alive (default: 60).
+    /// Also the deadline for the slowest legitimate full-size request; raise
+    /// it on slow links rather than disabling the bound.
+    #[serde(default = "default_wss_incomplete_message_timeout_secs")]
+    pub incomplete_message_timeout_secs: u64,
 }
 
 impl Default for WssConfig {
@@ -7351,6 +7363,8 @@ impl Default for WssConfig {
             max_pending_handshakes: default_wss_max_pending_handshakes(),
             handshake_timeout_secs: default_wss_handshake_timeout_secs(),
             max_sessions: default_wss_max_sessions(),
+            max_sessions_per_client: default_wss_max_sessions_per_client(),
+            incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
     }
 }
@@ -7438,6 +7452,14 @@ fn default_wss_handshake_timeout_secs() -> u64 {
 
 fn default_wss_max_sessions() -> usize {
     512
+}
+
+fn default_wss_max_sessions_per_client() -> usize {
+    8
+}
+
+fn default_wss_incomplete_message_timeout_secs() -> u64 {
+    60
 }
 
 fn default_enroll_bind() -> String {

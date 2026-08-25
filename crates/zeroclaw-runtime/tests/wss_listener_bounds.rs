@@ -196,6 +196,7 @@ async fn tls_stall_is_reaped_at_the_setup_deadline() {
             max_pending_handshakes: 8,
             handshake_timeout: Duration::from_secs(2),
             max_sessions: 8,
+            ..Default::default()
         },
     )
     .await;
@@ -223,6 +224,7 @@ async fn websocket_upgrade_stall_is_reaped_at_the_setup_deadline() {
             max_pending_handshakes: 8,
             handshake_timeout: Duration::from_secs(2),
             max_sessions: 8,
+            ..Default::default()
         },
     )
     .await;
@@ -263,6 +265,7 @@ async fn pending_handshake_budget_sheds_then_admits_a_valid_peer() {
             max_pending_handshakes: 2,
             handshake_timeout: Duration::from_secs(3),
             max_sessions: 8,
+            ..Default::default()
         },
     )
     .await;
@@ -317,6 +320,7 @@ async fn session_budget_sheds_beyond_its_bound() {
             max_pending_handshakes: 8,
             handshake_timeout: Duration::from_secs(5),
             max_sessions: 1,
+            ..Default::default()
         },
     )
     .await;
@@ -371,6 +375,7 @@ async fn pending_stalls_do_not_consume_session_capacity() {
             max_pending_handshakes: 4,
             handshake_timeout: Duration::from_secs(10),
             max_sessions: 1,
+            ..Default::default()
         },
     )
     .await;

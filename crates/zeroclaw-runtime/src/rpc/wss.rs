@@ -8,19 +8,29 @@ use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
+
+/// What the WebSocket parser actually reads from: the TLS stream with a
+/// byte counter in front of it. See [`CountingStream`].
+type CountedTlsStream = CountingStream<TlsStream>;
 
 /// How long the read side waits for any frame before sending a liveness Ping.
 const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
@@ -44,6 +54,30 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 /// Default ceiling on concurrently established WSS sessions.
 /// See [`WssLimits::max_sessions`].
 pub const DEFAULT_MAX_SESSIONS: usize = 512;
+
+/// Default ceiling on concurrent sessions holding ONE client certificate.
+/// See [`WssLimits::max_sessions_per_client`].
+pub const DEFAULT_MAX_SESSIONS_PER_CLIENT: usize = 8;
+
+/// Default lifetime bound on a partially-received data message.
+/// See [`WssLimits::incomplete_message_timeout`].
+pub const DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS: u64 = 60;
+
+/// Bytes read with no message completed before the incomplete-message deadline
+/// applies at all. Below this nothing worth reclaiming is parked in the parser,
+/// and the threshold is what keeps a QUIET connection (which accumulates no
+/// bytes) out of the rule entirely.
+const INCOMPLETE_MESSAGE_BYTES: u64 = 64 * 1024;
+
+/// Wire size of a client-to-server control frame's header: two bytes of framing
+/// plus the four-byte mask every client frame carries (RFC 6455 5.1). Control
+/// frames cannot be fragmented and cap their payload at 125 bytes, so this is
+/// exact rather than an estimate.
+const CONTROL_FRAME_HEADER_BYTES: u64 = 6;
+
+/// Bound on the courtesy Close frame sent to a refused peer, so a peer that
+/// stops reading cannot make the refusal itself hold the permits it was denied.
+const REFUSAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bounds on the WSS listener's pre-authentication and session state.
 ///
@@ -71,6 +105,33 @@ pub struct WssLimits {
     /// state that survives authentication, so an authorized-but-abusive peer
     /// cannot grow dispatcher and transport state without limit.
     pub max_sessions: usize,
+    /// Ceiling on concurrent sessions presenting ONE client certificate, keyed
+    /// by that certificate's SHA-256 fingerprint.
+    ///
+    /// `max_sessions` alone is an arithmetic ceiling, not a host-memory budget:
+    /// every session may declare a message up to the parser envelope
+    /// ([`rpc_ws_config`]), so 512 sessions is a 16 GiB ceiling, and one
+    /// admitted-but-hostile credential (or a stolen one, before it is detected
+    /// and revoked) can occupy all of it. This bounds the parser bytes ONE
+    /// credential can reserve at `max_sessions_per_client x envelope`.
+    pub max_sessions_per_client: usize,
+    /// How long a partially-received data message may be held by the parser.
+    ///
+    /// The heartbeat proves liveness, not progress: tungstenite yields
+    /// interleaved control frames while a fragmented message is still
+    /// incomplete, so a peer can Ping forever while the parser retains the
+    /// partial buffer. This bounds that hold time. It applies only while bytes
+    /// are actually accumulating with no message completed (see
+    /// [`INCOMPLETE_MESSAGE_BYTES`]); an idle connection is the heartbeat's
+    /// business.
+    ///
+    /// It is a lifetime bound, not a stall detector - a peer that trickles
+    /// bytes is exactly the case a stall detector would miss - so it also
+    /// bounds the slowest legitimate upload: a full-size request
+    /// ([`crate::rpc::attachments::MAX_REQUEST_BYTES`], 20 MiB) must arrive
+    /// within this window (at the 60s default that is a ~341 KiB/s floor;
+    /// operators on slower links should raise the window, not disable it).
+    pub incomplete_message_timeout: Duration,
 }
 
 impl Default for WssLimits {
@@ -79,7 +140,141 @@ impl Default for WssLimits {
             max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
             handshake_timeout: Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
             max_sessions: DEFAULT_MAX_SESSIONS,
+            max_sessions_per_client: DEFAULT_MAX_SESSIONS_PER_CLIENT,
+            incomplete_message_timeout: Duration::from_secs(
+                DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS,
+            ),
         }
+    }
+}
+
+/// Concurrent sessions per client credential, keyed by the SHA-256 fingerprint
+/// of the presented client certificate.
+///
+/// The fingerprint is the only stable per-credential identity the mTLS accept
+/// path exposes; source address is not one (a single credential can arrive from
+/// many addresses, and many credentials can share one). Entries exist only
+/// while a credential holds at least one session, so a churn of certificates
+/// cannot grow this map.
+#[derive(Default)]
+struct ClientSessionQuota {
+    counts: Mutex<HashMap<String, usize>>,
+}
+
+impl ClientSessionQuota {
+    /// Reserve one session slot for `fingerprint`, or `None` when that
+    /// credential is already at `max`. A refused peer is never recorded, so a
+    /// rejection leaves no residue in the map.
+    fn try_admit(self: &Arc<Self>, fingerprint: &str, max: usize) -> Option<ClientSessionGuard> {
+        let cap = max.max(1);
+        let mut counts = self.lock_counts();
+        let current = counts.get(fingerprint).copied().unwrap_or(0);
+        if current >= cap {
+            return None;
+        }
+        counts.insert(fingerprint.to_string(), current + 1);
+        drop(counts);
+        Some(ClientSessionGuard {
+            quota: self.clone(),
+            fingerprint: fingerprint.to_string(),
+        })
+    }
+
+    /// A poisoned lock means some other task panicked mid-update; the map is a
+    /// plain counter table with no invariant that a panic can leave broken, so
+    /// recover the guard rather than propagating the panic into the accept loop.
+    fn lock_counts(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Releases the per-credential session slot on every exit path of a session
+/// task - dispatcher return, read error, EOF, heartbeat timeout, panic. Manual
+/// decrements would be missed by at least one of those, and a missed decrement
+/// permanently shrinks that credential's quota.
+struct ClientSessionGuard {
+    quota: Arc<ClientSessionQuota>,
+    fingerprint: String,
+}
+
+impl Drop for ClientSessionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.quota.lock_counts();
+        if let Some(slot) = counts.get_mut(&self.fingerprint) {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                counts.remove(&self.fingerprint);
+            }
+        }
+    }
+}
+
+/// Counts plaintext bytes read out of the inner stream.
+///
+/// tungstenite does not expose the buffer holding a partially-received message,
+/// so bytes read with no message completed is the observable stand-in for how
+/// much a peer has parked in the parser. See
+/// [`WssLimits::incomplete_message_timeout`].
+struct CountingStream<S> {
+    inner: S,
+    bytes_in: Arc<AtomicU64>,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S) -> (Self, Arc<AtomicU64>) {
+        let bytes_in = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                inner,
+                bytes_in: bytes_in.clone(),
+            },
+            bytes_in,
+        )
+    }
+
+    fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            let read = buf.filled().len().saturating_sub(before);
+            this.bytes_in.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -124,18 +319,37 @@ enum Control {
 }
 
 pub struct WssTransport {
-    reader: futures_util::stream::SplitStream<WebSocketStream<TlsStream>>,
+    reader: futures_util::stream::SplitStream<WebSocketStream<CountedTlsStream>>,
     writer_tx: mpsc::Sender<String>,
     control_tx: mpsc::Sender<Control>,
     peer_label: String,
     /// Set once a Ping has been sent and we are awaiting any reply. Detects a
     /// peer that went silent on a half-open TCP connection (no FIN/RST).
     awaiting_pong: bool,
+    /// Plaintext bytes read off this connection, shared with the IO layer.
+    bytes_in: Arc<AtomicU64>,
+    /// `bytes_in` as of the last COMPLETED message (or of the upgrade).
+    bytes_at_last_message: u64,
+    /// When the last message completed, or when the session began.
+    last_message_at: tokio::time::Instant,
+    /// See [`WssLimits::incomplete_message_timeout`].
+    incomplete_message_timeout: Duration,
 }
 
 impl WssTransport {
-    pub fn new(ws: WebSocketStream<TlsStream>, remote_addr: SocketAddr) -> Self {
+    /// Module-private: a transport is only well-formed when its parser sits
+    /// behind the byte counter the listener installs, so only the listener can
+    /// build one.
+    fn new(
+        ws: WebSocketStream<CountedTlsStream>,
+        remote_addr: SocketAddr,
+        bytes_in: Arc<AtomicU64>,
+        incomplete_message_timeout: Duration,
+    ) -> Self {
         let peer_label = format!("wss:{remote_addr}");
+        // Baseline past the handshake bytes: only what the parser reads for
+        // MESSAGES counts toward the incomplete-message bound.
+        let bytes_at_last_message = bytes_in.load(Ordering::Relaxed);
         let (sink, stream) = ws.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
@@ -165,7 +379,53 @@ impl WssTransport {
             control_tx,
             peer_label,
             awaiting_pong: false,
+            bytes_in,
+            bytes_at_last_message,
+            last_message_at: tokio::time::Instant::now(),
+            incomplete_message_timeout,
         }
+    }
+
+    /// Bytes read with no message completed since. tungstenite hides its
+    /// partial-message buffer, so this is what stands in for it.
+    fn pending_bytes(&self) -> u64 {
+        self.bytes_in
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_at_last_message)
+    }
+
+    /// When a partially-received message must be given up on, or `None` when
+    /// nothing meaningful is parked in the parser.
+    ///
+    /// Gated on bytes having actually accumulated: a QUIET connection parks
+    /// nothing and must NOT be torn down here - idle liveness is the
+    /// heartbeat's policy, and this rule would otherwise duplicate it with a
+    /// different deadline.
+    fn incomplete_message_deadline(&self) -> Option<tokio::time::Instant> {
+        (self.pending_bytes() > INCOMPLETE_MESSAGE_BYTES)
+            .then(|| self.last_message_at + self.incomplete_message_timeout)
+    }
+
+    /// A message completed: the parser released its buffer, so the
+    /// incomplete-message window restarts from here.
+    fn note_message_completed(&mut self) {
+        self.bytes_at_last_message = self.bytes_in.load(Ordering::Relaxed);
+        self.last_message_at = tokio::time::Instant::now();
+    }
+
+    /// Discount a control frame from the accounting above.
+    ///
+    /// A control frame is delivered whole and parks NOTHING in the parser, so
+    /// its bytes are not held memory. Leaving them in the count would make a
+    /// healthy session that only exchanges keepalives eventually cross the
+    /// threshold and be closed by a rule that is meant to reclaim buffered
+    /// message bytes. It does NOT extend the window: the deadline still runs
+    /// from the last COMPLETED message, which is what stops a peer from
+    /// holding a partial message alive by pinging.
+    fn credit_control_frame(&mut self, payload_len: usize) {
+        self.bytes_at_last_message = self
+            .bytes_at_last_message
+            .saturating_add(CONTROL_FRAME_HEADER_BYTES + payload_len as u64);
     }
 }
 
@@ -182,10 +442,44 @@ impl RpcTransport for WssTransport {
             } else {
                 HEARTBEAT_IDLE
             };
+            // The incomplete-message bound runs on its OWN timer rather than by
+            // shortening the heartbeat window: the two answer different
+            // questions (is the peer alive vs. is it still holding a partial
+            // message), and folding them together would let either fire for the
+            // other's reason. It also lands on a peer that never sends another
+            // frame to wake this loop.
+            let message_deadline = self.incomplete_message_deadline();
+            let read = tokio::time::timeout(idle, self.reader.next());
+            let polled = match message_deadline {
+                Some(at) => tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(at) => None,
+                    frame = read => Some(frame),
+                },
+                None => Some(read.await),
+            };
 
-            match tokio::time::timeout(idle, self.reader.next()).await {
-                Err(_) if self.awaiting_pong => return None,
+            let Some(frame) = polled else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "WSS closing {}: {} bytes held in an incomplete message for over {}s; \
+                         control frames do not extend that budget",
+                        self.peer_label,
+                        self.pending_bytes(),
+                        self.incomplete_message_timeout.as_secs()
+                    )
+                );
+                return None;
+            };
+
+            match frame {
                 Err(_) => {
+                    if self.awaiting_pong {
+                        return None;
+                    }
                     if self.control_tx.send(Control::Ping).await.is_err() {
                         return None;
                     }
@@ -194,12 +488,26 @@ impl RpcTransport for WssTransport {
                 Ok(frame) => {
                     self.awaiting_pong = false;
                     match frame {
-                        Some(Ok(Message::Text(text))) => return Some(text.to_string()),
+                        Some(Ok(Message::Text(text))) => {
+                            self.note_message_completed();
+                            return Some(text.to_string());
+                        }
                         Some(Ok(Message::Close(_))) | None => return None,
-                        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+                        // Control frames prove liveness but complete no
+                        // message, so they deliberately do NOT restart the
+                        // incomplete-message window - only discount their own
+                        // bytes, which the parser is not holding.
+                        Some(Ok(Message::Ping(payload) | Message::Pong(payload))) => {
+                            self.credit_control_frame(payload.len());
                             continue;
                         }
-                        Some(Ok(Message::Binary(_))) => continue,
+                        // Never yielded by a read, so there is nothing to
+                        // discount.
+                        Some(Ok(Message::Frame(_))) => continue,
+                        Some(Ok(Message::Binary(_))) => {
+                            self.note_message_completed();
+                            continue;
+                        }
                         Some(Err(_)) => return None,
                     }
                 }
@@ -235,19 +543,44 @@ pub fn build_tls_acceptor(
 
 /// Parser limits for the WSS RPC plane. tungstenite defaults to a 64 MiB message
 /// / 16 MiB frame, which would let the parser buffer far more than the RPC
-/// contract permits before [`WssTransport`]/`RpcDispatcher` can reject it. The
-/// RPC attachment contract caps a request at
-/// [`crate::rpc::attachments::MAX_REQUEST_BYTES`] (20 MiB); this ceiling leaves
-/// encoding headroom above that while still replacing the unbounded-by-default
-/// parser allocation. It mirrors the client's RPC-plane config (zerocode
-/// `rpc_ws_config`) so the two ends cannot drift.
+/// contract permits before [`WssTransport`]/`RpcDispatcher` can reject it.
 fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-    // 20 MiB request (MAX_REQUEST_BYTES) + encoding headroom, matching the client.
+    /// Why 32 MiB, and what it does and does not bound:
+    ///
+    /// - ONE WSS message carries a WHOLE RPC request, and the attachment
+    ///   contract caps a request at [`crate::rpc::attachments::MAX_REQUEST_BYTES`]
+    ///   (20 MiB). This envelope is that ceiling plus encoding headroom
+    ///   (base64 plus JSON framing), so a legitimate max-size request is
+    ///   admitted as a single frame - which tungstenite's 16 MiB DEFAULT frame
+    ///   cap would wrongly reject. It must not be shrunk below the request
+    ///   contract.
+    /// - It mirrors the client's RPC-plane config (zerocode `rpc_ws_config`),
+    ///   so the two ends cannot drift into one side rejecting what the other
+    ///   will send.
+    /// - It is a PER-MESSAGE bound, not a host budget. Aggregate parser
+    ///   exposure is bounded elsewhere and multiplicatively:
+    ///   [`WssLimits::max_sessions_per_client`] x this envelope per credential,
+    ///   and [`WssLimits::max_sessions`] x this envelope globally. How long a
+    ///   session may hold a partial message toward that envelope is bounded by
+    ///   [`WssLimits::incomplete_message_timeout`].
     const RPC_WS_MAX: usize = 32 * 1024 * 1024;
     let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
     cfg.max_message_size = Some(RPC_WS_MAX);
     cfg.max_frame_size = Some(RPC_WS_MAX);
     cfg
+}
+
+/// Refuse an authenticated peer with a stated WebSocket close reason rather
+/// than a bare drop, so the client can distinguish a policy refusal from a
+/// network failure. Bounded by [`REFUSAL_CLOSE_TIMEOUT`]: a peer that stops
+/// reading must not be able to make the refusal itself hold the permits the
+/// caller is about to release.
+async fn close_with_reason(ws: &mut WebSocketStream<CountedTlsStream>, reason: &'static str) {
+    let frame = CloseFrame {
+        code: CloseCode::Policy,
+        reason: reason.into(),
+    };
+    let _ = tokio::time::timeout(REFUSAL_CLOSE_TIMEOUT, ws.close(Some(frame))).await;
 }
 
 /// Run the WSS RPC listener as a daemon subsystem.
@@ -272,6 +605,9 @@ pub async fn run_wss_listener(
         limits.max_pending_handshakes.max(1),
     ));
     let session_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_sessions.max(1)));
+    // Per-credential slice of that ceiling, so one enrolled (or stolen)
+    // certificate cannot occupy the global limit by itself.
+    let client_quota = Arc::new(ClientSessionQuota::default());
 
     ::zeroclaw_log::record!(
         INFO,
@@ -346,6 +682,9 @@ pub async fn run_wss_listener(
                 // stall can never occupy an established-session slot.
                 let session_permits = session_permits.clone();
                 let max_sessions = limits.max_sessions;
+                let client_quota = client_quota.clone();
+                let max_sessions_per_client = limits.max_sessions_per_client;
+                let incomplete_message_timeout = limits.incomplete_message_timeout;
 
                 count.fetch_add(1, Ordering::Relaxed);
 
@@ -382,12 +721,18 @@ pub async fn run_wss_listener(
                         }
                     };
 
+                    // Count plaintext bytes from here on. What buffers a
+                    // partially-received message is the WebSocket parser, and it
+                    // does not expose that buffer, so the session loop reads
+                    // progress off this counter instead.
+                    let (counted_stream, bytes_in) = CountingStream::new(tls_stream);
+
                     // WebSocket upgrade. An explicit parser config replaces
                     // tungstenite's 64 MiB message / 16 MiB frame defaults with a
                     // ceiling sized to the RPC contract, so the parser cannot buffer
                     // far more than a legitimate request before `next_frame` sees it.
                     let ws_stream = match tokio_tungstenite::accept_async_with_config(
-                        tls_stream,
+                        counted_stream,
                         Some(rpc_ws_config()),
                     )
                     .await
@@ -403,10 +748,10 @@ pub async fn run_wss_listener(
                             return None;
                         }
                     };
-                        Some(ws_stream)
+                        Some((ws_stream, bytes_in))
                     };
 
-                    let ws_stream = match tokio::time::timeout_at(deadline, setup).await {
+                    let (mut ws_stream, bytes_in) = match tokio::time::timeout_at(deadline, setup).await {
                         Ok(Some(ws)) => ws,
                         Ok(None) => return, // logged above
                         Err(_) => {
@@ -443,14 +788,12 @@ pub async fn run_wss_listener(
                         );
                         return;
                     };
-                    // Released for the next connection being set up now that this
-                    // one holds an established-session slot.
-                    drop(handshake_permit);
-
                     // The client cert was verified against the CA during the
                     // mTLS handshake; capture its SHA-256 fingerprint (the ledger
-                    // key) before the stream is consumed by the transport.
+                    // key, and the per-credential quota key) before the stream is
+                    // consumed by the transport.
                     let peer_cert_fp = ws_stream
+                        .get_ref()
                         .get_ref()
                         .get_ref()
                         .1
@@ -458,11 +801,62 @@ pub async fn run_wss_listener(
                         .and_then(|certs| certs.first())
                         .map(|der| zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()));
 
-                    let mut transport = WssTransport::new(ws_stream, remote_addr);
+                    // The plane is mandatory mTLS, so this is always present. A
+                    // session with no credential could not be attributed to one
+                    // and so could not be quota-bounded: refuse rather than admit
+                    // an unaccountable session.
+                    let Some(peer_cert_fp) = peer_cert_fp else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "WSS refusing {remote_addr}: the mutually-authenticated handshake \
+                                 exposed no client certificate, so no per-credential quota applies"
+                            )
+                        );
+                        close_with_reason(&mut ws_stream, "no client certificate").await;
+                        return;
+                    };
+
+                    // Per-credential slice of the session ceiling. Held for the
+                    // life of the session by a guard, so it is returned on every
+                    // exit path below (dispatcher return, read error, EOF,
+                    // heartbeat, incomplete-message deadline).
+                    let Some(_client_slot) =
+                        client_quota.try_admit(&peer_cert_fp, max_sessions_per_client)
+                    else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "WSS refusing {remote_addr}: client certificate {peer_cert_fp} \
+                                 already holds {max_sessions_per_client} sessions, its \
+                                 per-credential ceiling"
+                            )
+                        );
+                        // Distinct, clean refusal; the session permit and the
+                        // handshake permit are released by returning, and the
+                        // refused credential is never recorded in the quota map.
+                        close_with_reason(&mut ws_stream, "per-certificate session quota").await;
+                        return;
+                    };
+
+                    // Released for the next connection being set up now that this
+                    // one holds an established-session slot and a credential slot.
+                    drop(handshake_permit);
+
+                    let mut transport = WssTransport::new(
+                        ws_stream,
+                        remote_addr,
+                        bytes_in,
+                        incomplete_message_timeout,
+                    );
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
-                        .with_peer_cert_fingerprint(peer_cert_fp);
+                        .with_peer_cert_fingerprint(Some(peer_cert_fp));
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {

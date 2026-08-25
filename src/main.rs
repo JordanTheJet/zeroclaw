@@ -5507,6 +5507,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 wss_cfg.handshake_timeout_secs,
                             ),
                             max_sessions: wss_cfg.max_sessions,
+                            max_sessions_per_client: wss_cfg.max_sessions_per_client,
+                            incomplete_message_timeout: std::time::Duration::from_secs(
+                                wss_cfg.incomplete_message_timeout_secs,
+                            ),
                         };
                         zeroclaw_runtime::rpc::wss::run_wss_listener(
                             ctx,
