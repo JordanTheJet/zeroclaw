@@ -882,6 +882,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_delivers_no_certificate_when_the_completion_audit_fails() {
+        // The blocking case at the boundary the client actually sees. The
+        // attempt event lands, the ledger row commits, and the COMPLETION event
+        // fails. Before the pending -> active protocol this returned HTTP 500
+        // with an ACTIVE ledger row already committed for a certificate the
+        // client never received - and since the failure restores the one-time
+        // pairing code, the retry (a fresh CSR, so a fresh fingerprint) turned
+        // that stranded row into a SECOND active credential.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(
+            crate::security::audit::AuditLogger::new(
+                zeroclaw_config::schema::AuditConfig {
+                    enabled: true,
+                    log_path: "audit.log".to_string(),
+                    max_size_mb: 100,
+                    sign_events: false,
+                },
+                dir.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let ledger = Arc::new(CertLedger::open(dir.path(), Some(audit.clone())).unwrap());
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let server = test_server_with_ledger(pairing, None, ledger);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+
+        // Let the attempt write land, then fail the completion write.
+        audit.fail_writes_after_for_test(1);
+        let err = server
+            .process(
+                &EnrollRequest {
+                    pairing_code: code,
+                    csr_pem: csr,
+                },
+                "1.2.3.4",
+                PeerClass::Direct,
+            )
+            .await
+            .expect_err("a completion-audit failure must not return a certificate");
+        assert_eq!(err.0, 500);
+        assert!(err.1.contains("certificate audit event"), "got: {}", err.1);
+        assert!(
+            server.pairing.pairing_code().is_some(),
+            "a completion-audit failure must not consume the one-time pairing code"
+        );
+        assert_eq!(
+            server.ledger.list_active().unwrap().len(),
+            0,
+            "a certificate the client never received must hold no active ledger row"
+        );
+
+        // The retry carries a fresh CSR - a different fingerprint - exactly as
+        // a real client would, and must end with ONE active credential.
+        audit.clear_write_failure_for_test();
+        let code = server.pairing.pairing_code().unwrap();
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let resp = server
+            .process(
+                &EnrollRequest {
+                    pairing_code: code,
+                    csr_pem: csr,
+                },
+                "1.2.3.4",
+                PeerClass::Direct,
+            )
+            .await
+            .unwrap();
+        assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
+        let active = server.ledger.list_active().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "the retry must not add a second active credential"
+        );
+        assert_eq!(active[0].device_id, resp.device_id);
+
+        let events: Vec<String> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["event_type"]
+                    .as_str()
+                    .expect("event_type is a string")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "cert_issuance_attempted",
+                "cert_issuance_attempted",
+                "cert_issued",
+            ],
+            "the interrupted issuance stays an unmatched attempt; only the retry completes"
+        );
+    }
+
+    #[tokio::test]
     async fn process_rejects_in_band_enrollment_when_static_pins_are_configured() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let pairing = PairingGuard::new(true, &[]);

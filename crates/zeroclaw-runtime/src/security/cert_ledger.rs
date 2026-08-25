@@ -7,9 +7,12 @@
 //! owns this ledger; when the gateway is present it READS the ledger (one store,
 //! two readers - no third device store, per AGENTS.md no-duplicate-state).
 //!
-//! Issuance is audited as an attempt before the ledger row and a completion
-//! after it commits, so a completion event means the certificate is recorded and
-//! an unmatched attempt means an interrupted, retryable issuance
+//! Issuance is a two-phase commit across those two stores: the row lands in a
+//! `pending` state that NO reader treats as a credential, and is promoted to
+//! its final status only once the completion audit event is durable. A row this
+//! ledger vouches for therefore always has a matching completion event, and
+//! every failure mode - including a process that dies mid-issuance - leaves at
+//! most a `pending` row, which the next open reconciles away
 //! ([`CertLedger::record_issued`]).
 //!
 //! Revocation is sourced here. The renew RPC (`cert/renew`) refuses a
@@ -25,7 +28,20 @@ use std::sync::Arc;
 
 use super::audit::{AuditEvent, AuditEventType, AuditLogger};
 
-/// Status of an issued certificate.
+/// The `issued_certs.status` value for a row that is committed but whose
+/// issuance has not been recorded as complete in the audit trail.
+///
+/// Deliberately outside [`CertStatus`]: a pending row is a certificate the
+/// ledger does NOT vouch for, and no consumer may resolve it to a usable
+/// status. Every read either filters it out or reports the fingerprint as
+/// unknown; see [`CertLedger::record_issued`] for the state machine.
+const PENDING: &str = "pending";
+
+/// Status of an issued certificate the ledger vouches for.
+///
+/// There is no variant for the transient `pending` state on purpose: readers
+/// see a fingerprint this ledger vouches for, or they see nothing at all. See
+/// [`CertLedger::record_issued`] for the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertStatus {
     Active,
@@ -40,10 +56,17 @@ impl CertStatus {
         }
     }
 
-    fn from_db(s: &str) -> CertStatus {
+    /// Parse a stored status, or `None` for one this ledger does not vouch for
+    /// ([`PENDING`], or any value a future schema adds).
+    ///
+    /// The permissive `_ => Active` this replaced was the dangerous default: it
+    /// would resolve a pending - that is, undelivered - certificate into an
+    /// active credential for any reader that forgot to filter it out.
+    fn from_db(s: &str) -> Option<CertStatus> {
         match s {
-            "revoked" => CertStatus::Revoked,
-            _ => CertStatus::Active,
+            "active" => Some(CertStatus::Active),
+            "revoked" => Some(CertStatus::Revoked),
+            _ => None,
         }
     }
 }
@@ -186,8 +209,10 @@ impl CertLedger {
                  token_hash  TEXT NOT NULL DEFAULT '',
                  not_before  INTEGER NOT NULL,
                  not_after   INTEGER NOT NULL,
+                 -- 'pending' is the pre-completion state of the issuance
+                 -- two-phase commit, never a credential; see record_issued.
                  status      TEXT NOT NULL DEFAULT 'active'
-                                 CHECK(status IN ('active','revoked')),
+                                 CHECK(status IN ('active','revoked','pending')),
                  issued_at   INTEGER NOT NULL,
                  actor       TEXT NOT NULL DEFAULT ''
              );
@@ -201,10 +226,72 @@ impl CertLedger {
             audit,
             revoked_path,
         };
+        // Resolve anything a previous process left mid-issuance BEFORE this
+        // ledger answers a single query.
+        ledger.reconcile_pending_issuances()?;
         // Refresh the materialized revocation list so it reflects the ledger at
         // startup (covers a missing/stale file).
         ledger.materialize_revocations()?;
         Ok(ledger)
+    }
+
+    /// Resolve rows a previous process left in the `pending` state.
+    ///
+    /// The pending -> final flip happens inside the same
+    /// [`CertLedger::record_issued`] call that committed the row, so ANY
+    /// pending row still present when the ledger is opened belongs to a process
+    /// that died - or a compensation that could not run - before the issuance
+    /// completed. Such a row is an undelivered certificate by construction:
+    /// discard it, and record WHY, so the unmatched `CertIssuanceAttempted` in
+    /// the trail is closed out rather than left to inference.
+    ///
+    /// The audit event is written BEFORE the delete, matching the rest of this
+    /// module: a failing audit logger leaves the row pending - invisible to
+    /// every reader, and retried at the next open - instead of erasing it with
+    /// no record.
+    fn reconcile_pending_issuances(&self) -> Result<()> {
+        let stale = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fingerprint, device_id, not_before, not_after, actor
+                         FROM issued_certs WHERE status = ?1",
+                )
+                .context("prepare pending-issuance reconciliation")?;
+            let rows = stmt
+                .query_map(params![PENDING], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .context("query pending issuances")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("collect pending issuances")?
+        };
+        for (fingerprint, device_id, not_before, not_after, actor) in stale {
+            self.audit_cert_fields(
+                CertFacts {
+                    device_id: &device_id,
+                    actor: &actor,
+                    fingerprint: &fingerprint,
+                    not_before,
+                    not_after,
+                },
+                CertAuditStage::Abandoned,
+            )?;
+            self.conn
+                .lock()
+                .execute(
+                    "DELETE FROM issued_certs WHERE fingerprint = ?1 AND status = ?2",
+                    params![fingerprint, PENDING],
+                )
+                .context("discard a pending issuance")?;
+        }
+        Ok(())
     }
 
     /// Rewrite the revoked-fingerprint file from the SQLite truth (atomic temp +
@@ -240,56 +327,151 @@ impl CertLedger {
         Ok(())
     }
 
-    /// Record an issuance across both durable surfaces as an attempt followed
-    /// by a completion. `renewal` selects `CertRenewed` vs `CertIssued` for the
-    /// completion event.
+    /// Record an issuance across both durable surfaces as a two-phase commit.
+    /// `renewal` selects `CertRenewed` vs `CertIssued` for the completion
+    /// event.
     ///
     /// SQLite and the append-only audit file cannot share one transaction, so
-    /// the ORDER is the correctness argument, and each event claims only what
-    /// has already happened:
+    /// the row carries the protocol instead: it is committed in the `pending`
+    /// state - which no reader resolves to a credential - and promoted to
+    /// `entry.status` only once the completion event is durable.
     ///
-    /// 1. `CertIssuanceAttempted` - written BEFORE the row. If it fails, no
-    ///    active row exists, the caller returns an error and restores the
-    ///    one-time pairing code, and the retry issues exactly one certificate.
-    ///    Committing the row first left an orphaned ACTIVE row behind on an
-    ///    audit failure, and because the retry carries a fresh CSR - and so a
-    ///    different fingerprint - it created a SECOND active credential rather
-    ///    than replacing the first.
-    /// 2. the ledger row.
-    /// 3. `CertIssued`/`CertRenewed` - written AFTER the row commits, so a
-    ///    completion event in the trail means the ledger holds that
-    ///    certificate, never merely that issuance was tried.
+    /// 1. `CertIssuanceAttempted`, BEFORE any row exists. A failure here leaves
+    ///    the ledger untouched.
+    /// 2. the row, as `pending`. A failure here leaves an attempt with no
+    ///    completion and nothing the ledger vouches for.
+    /// 3. `CertIssued`/`CertRenewed`, AFTER the row commits, so a completion
+    ///    event means the row exists.
+    /// 4. the promotion to `entry.status`, which is what publishes the
+    ///    certificate to every reader.
     ///
-    /// An attempt with no matching completion for the same fingerprint is
-    /// therefore an interrupted issuance: retryable, and never evidence that a
-    /// certificate was delivered. Every failure mode returns `Err`, and callers
-    /// must not hand the certificate to the client unless this returns `Ok`, so
-    /// the residue of a failure is at most a recorded attempt plus a row for a
-    /// certificate nobody holds - which is what reconciling attempts against
-    /// completions is for. The row write is keyed on the fingerprint via INSERT
-    /// OR REPLACE, so re-recording the same certificate is idempotent.
+    /// The two invariants this buys, in the order they matter:
+    ///
+    /// - **A row this ledger vouches for was always audited as complete.**
+    ///   Step 4 cannot run before step 3 succeeds, so no failure - of the
+    ///   completion write's rotation, open, serialization, write or sync - can
+    ///   publish a certificate the caller never delivered. That is the failure
+    ///   that used to strand an ACTIVE row for an undelivered credential, and
+    ///   because the client's retry carries a fresh CSR (a different
+    ///   fingerprint) it left a SECOND active row rather than replacing the
+    ///   first.
+    /// - **No failure publishes anything.** Every step returns `Err` and
+    ///   callers must not hand the certificate to the client unless this
+    ///   returns `Ok`. When a failure follows step 2, the pending row this call
+    ///   staged is removed on the same connection; if that compensation cannot
+    ///   run (or the process dies first) the row stays `pending`, which is
+    ///   still invisible to every reader, and `reconcile_pending_issuances`
+    ///   discards it at the next open.
+    ///
+    /// The converse is deliberately NOT claimed: a completion event without a
+    /// row is possible, when step 4 fails. The caller still gets `Err` and
+    /// still delivers nothing, so the residue is a fingerprint that is audited
+    /// but absent - which fails closed - rather than a live credential with no
+    /// audit.
+    ///
+    /// Re-recording a fingerprint the ledger already holds is idempotent and
+    /// never downgrades it: step 2 does not disturb an existing row, and step 4
+    /// rewrites it. A failed completion for such a call therefore leaves the
+    /// established row exactly as it was, with its old validity - correct,
+    /// since the caller is returning an error rather than delivering the
+    /// renewed certificate.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
         self.audit_cert(entry, CertAuditStage::Attempted { renewal })?;
-        {
-            let conn = self.conn.lock();
-            conn.execute(
-                "INSERT OR REPLACE INTO issued_certs
+        let staged = self.stage_pending(entry)?;
+        if let Err(err) = self.audit_cert(entry, CertAuditStage::Completed { renewal }) {
+            self.discard_staged(entry, staged);
+            return Err(err);
+        }
+        if let Err(err) = self.promote_staged(entry) {
+            self.discard_staged(entry, staged);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Commit the row in the `pending` state, reporting whether THIS call is
+    /// the one that staged it.
+    ///
+    /// `DO NOTHING` on conflict rather than `INSERT OR REPLACE`: an existing
+    /// row is an already-completed issuance for that fingerprint, and briefly
+    /// demoting it to `pending` would make a live credential vanish from every
+    /// reader - including [`CertLedger::is_revoked`] - for the width of the
+    /// completion write. Only the caller that created the row may compensate
+    /// for it, which is what the returned flag carries.
+    fn stage_pending(&self, entry: &LedgerEntry) -> Result<bool> {
+        let conn = self.conn.lock();
+        let inserted = conn
+            .execute(
+                "INSERT INTO issued_certs
                     (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(fingerprint) DO NOTHING",
                 params![
                     entry.fingerprint,
                     entry.device_id,
                     entry.token_hash,
                     entry.not_before,
                     entry.not_after,
-                    entry.status.as_str(),
+                    PENDING,
                     entry.issued_at,
                     entry.actor,
                 ],
             )
             .context("insert issued cert")?;
+        Ok(inserted == 1)
+    }
+
+    /// Publish the issuance: rewrite the row with `entry.status`. This is the
+    /// single statement that makes the certificate visible to every reader.
+    fn promote_staged(&self, entry: &LedgerEntry) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO issued_certs
+                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.fingerprint,
+                entry.device_id,
+                entry.token_hash,
+                entry.not_before,
+                entry.not_after,
+                entry.status.as_str(),
+                entry.issued_at,
+                entry.actor,
+            ],
+        )
+        .context("activate issued cert")?;
+        Ok(())
+    }
+
+    /// Compensate a failed issuance by removing the row this call staged.
+    ///
+    /// Best-effort by design, and it never masks the failure that triggered it:
+    /// the caller returns that error either way. The `status = pending` guard
+    /// makes the delete safe against a concurrent issuance of the same
+    /// fingerprint that already promoted the row, and a delete that cannot run
+    /// is not a leak - the row is still pending, so still not a credential, and
+    /// the next open reconciles it away.
+    fn discard_staged(&self, entry: &LedgerEntry, staged: bool) {
+        if !staged {
+            return;
         }
-        self.audit_cert(entry, CertAuditStage::Completed { renewal })
+        let result = self.conn.lock().execute(
+            "DELETE FROM issued_certs WHERE fingerprint = ?1 AND status = ?2",
+            params![entry.fingerprint, PENDING],
+        );
+        if let Err(error) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{error}"),
+                        "fingerprint": entry.fingerprint,
+                    })),
+                "cert ledger: could not discard a pending issuance; it will be reconciled at the next open"
+            );
+        }
     }
 
     /// Fault injection for the issuance ordering contract: detach the table so
@@ -314,17 +496,28 @@ impl CertLedger {
     }
 
     /// The status of a cert by fingerprint, or `None` if unknown to the ledger.
+    ///
+    /// A `pending` row reads as `None`: its issuance has not been recorded as
+    /// complete, so the ledger does not vouch for that certificate and callers
+    /// must treat it exactly as they treat one they have never seen. For the
+    /// renew RPC that means "re-enroll", which is the correct answer for a
+    /// certificate that was never delivered.
     pub fn status_of(&self, fingerprint: &str) -> Result<Option<CertStatus>> {
         let conn = self.conn.lock();
         let s: Option<String> = conn
             .query_row(
-                "SELECT status FROM issued_certs WHERE fingerprint = ?1",
-                params![fingerprint],
+                "SELECT status FROM issued_certs WHERE fingerprint = ?1 AND status != ?2",
+                params![fingerprint, PENDING],
                 |r| r.get(0),
             )
             .optional()
             .context("query cert status")?;
-        Ok(s.map(|s| CertStatus::from_db(&s)))
+        match s {
+            None => Ok(None),
+            Some(s) => CertStatus::from_db(&s).map(Some).with_context(|| {
+                format!("issued_certs.status {s:?} is not a status this ledger vouches for")
+            }),
+        }
     }
 
     /// True iff the cert is known to this ledger AND marked revoked.
@@ -344,13 +537,14 @@ impl CertLedger {
         ))
     }
 
-    /// Look up the full ledger row for a fingerprint.
+    /// Look up the full ledger row for a fingerprint. A `pending` row reads as
+    /// `None`, for the reason given on [`CertLedger::status_of`].
     pub fn lookup_by_fingerprint(&self, fingerprint: &str) -> Result<Option<LedgerEntry>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT fingerprint, device_id, token_hash, not_before, not_after, status, actor, issued_at
-                 FROM issued_certs WHERE fingerprint = ?1",
-            params![fingerprint],
+                 FROM issued_certs WHERE fingerprint = ?1 AND status != ?2",
+            params![fingerprint, PENDING],
             row_to_entry,
         )
         .optional()
@@ -378,10 +572,15 @@ impl CertLedger {
         let audit_entry = {
             let mut conn = self.conn.lock();
             let tx = conn.transaction().context("begin revocation transaction")?;
+            // Only an ACTIVE row is revocable. Revoking a `pending` row would
+            // publish - as revoked - a certificate the ledger has not vouched
+            // for and whose issuance may still be compensated away; such a
+            // fingerprint reads as unknown everywhere else, and reporting a
+            // revocation for it here would contradict that.
             let changed = tx
                 .execute(
                     "UPDATE issued_certs SET status = 'revoked'
-                         WHERE fingerprint = ?1 AND status != 'revoked'",
+                         WHERE fingerprint = ?1 AND status = 'active'",
                     params![fingerprint],
                 )
                 .context("revoke cert")?;
@@ -471,43 +670,77 @@ impl CertLedger {
             .context("collect revoked_fingerprints")
     }
 
-    /// Emit a hash-chained audit event for a certificate lifecycle action. The
-    /// security audit log is already separate from operational logs; cert facts
-    /// (device id, fingerprint, validity, actor) are recorded in the existing
-    /// actor/action fields so the entry is covered by the Merkle chain.
-    ///
-    /// Only a committed stage carries an `ExecutionResult`: a pre-commit
-    /// attempt has no outcome to report, and recording one would make the
-    /// append-only trail claim an issuance the ledger may still reject.
+    /// Emit a hash-chained audit event for a certificate lifecycle action.
     fn audit_cert(&self, entry: &LedgerEntry, stage: CertAuditStage) -> Result<()> {
+        self.audit_cert_fields(
+            CertFacts {
+                device_id: &entry.device_id,
+                actor: &entry.actor,
+                fingerprint: &entry.fingerprint,
+                not_before: entry.not_before,
+                not_after: entry.not_after,
+            },
+            stage,
+        )
+    }
+
+    /// Emit a hash-chained audit event from loose facts, for the reconciliation
+    /// path - which describes a row that is by definition not a [`LedgerEntry`]
+    /// this ledger vouches for, so it has no [`CertStatus`] to carry.
+    ///
+    /// The security audit log is already separate from operational logs; cert
+    /// facts (device id, fingerprint, validity, actor) are recorded in the
+    /// existing actor/action fields so the entry is covered by the Merkle
+    /// chain.
+    ///
+    /// Only a stage the durable stores have settled carries an
+    /// `ExecutionResult`: a pre-commit attempt has no outcome to report, and
+    /// recording one would make the append-only trail claim an issuance the
+    /// ledger may still reject.
+    fn audit_cert_fields(&self, facts: CertFacts<'_>, stage: CertAuditStage) -> Result<()> {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
         let mut event = AuditEvent::new(stage.event_type())
             .with_actor(
                 "cert".to_string(),
-                Some(entry.device_id.clone()),
-                Some(entry.actor.clone()),
+                Some(facts.device_id.to_string()),
+                Some(facts.actor.to_string()),
             )
             .with_action(
                 format!(
                     "{}fingerprint={} not_before={} not_after={}",
                     stage.action_prefix(),
-                    entry.fingerprint,
-                    entry.not_before,
-                    entry.not_after
+                    facts.fingerprint,
+                    facts.not_before,
+                    facts.not_after
                 ),
                 "cert".to_string(),
                 true,
                 true,
             );
-        if stage.committed() {
-            event = event.with_result(true, None, 0, None);
+        if let Some(outcome) = stage.outcome() {
+            event = event.with_result(outcome.success, None, 0, outcome.error);
         }
         audit
             .log(&event)
-            .with_context(|| format!("write certificate audit event for {}", entry.fingerprint))
+            .with_context(|| format!("write certificate audit event for {}", facts.fingerprint))
     }
+}
+
+/// The certificate facts every cert audit event carries.
+struct CertFacts<'a> {
+    device_id: &'a str,
+    actor: &'a str,
+    fingerprint: &'a str,
+    not_before: i64,
+    not_after: i64,
+}
+
+/// The `ExecutionResult` a settled [`CertAuditStage`] claims.
+struct StageOutcome {
+    success: bool,
+    error: Option<String>,
 }
 
 /// Which certificate lifecycle fact an audit event records.
@@ -520,8 +753,12 @@ enum CertAuditStage {
     /// Issuance attempted: the CSR is signed, the ledger has not committed and
     /// the caller has not delivered the certificate.
     Attempted { renewal: bool },
-    /// Issuance completed: the ledger row is committed.
+    /// Issuance completed: the ledger row is committed and about to be
+    /// promoted out of `pending`.
     Completed { renewal: bool },
+    /// An issuance that committed a row but never completed was reconciled
+    /// away at open; the row is about to be discarded.
+    Abandoned,
     /// Revocation committed together with its enforcement file.
     Revoked,
 }
@@ -532,35 +769,62 @@ impl CertAuditStage {
             CertAuditStage::Attempted { .. } => AuditEventType::CertIssuanceAttempted,
             CertAuditStage::Completed { renewal: true } => AuditEventType::CertRenewed,
             CertAuditStage::Completed { renewal: false } => AuditEventType::CertIssued,
+            CertAuditStage::Abandoned => AuditEventType::CertIssuanceAbandoned,
             CertAuditStage::Revoked => AuditEventType::CertRevoked,
         }
     }
 
-    /// True for stages the durable stores already hold.
-    fn committed(self) -> bool {
-        !matches!(self, CertAuditStage::Attempted { .. })
+    /// What the event claims, or `None` for a stage whose outcome is not
+    /// settled yet.
+    fn outcome(self) -> Option<StageOutcome> {
+        match self {
+            CertAuditStage::Attempted { .. } => None,
+            CertAuditStage::Abandoned => Some(StageOutcome {
+                success: false,
+                error: Some("issuance never completed; the ledger row was discarded".to_string()),
+            }),
+            CertAuditStage::Completed { .. } | CertAuditStage::Revoked => Some(StageOutcome {
+                success: true,
+                error: None,
+            }),
+        }
     }
 
     /// Names the completion an attempt is waiting on, so an unmatched attempt
-    /// reads as an interrupted renewal or an interrupted first issuance.
+    /// reads as an interrupted renewal or an interrupted first issuance, and
+    /// marks the reconciliation that closes such an attempt out.
     fn action_prefix(self) -> &'static str {
         match self {
             CertAuditStage::Attempted { renewal: true } => "attempt=renew ",
             CertAuditStage::Attempted { renewal: false } => "attempt=issue ",
-            _ => "",
+            CertAuditStage::Abandoned => "abandoned=reconcile ",
+            CertAuditStage::Completed { .. } | CertAuditStage::Revoked => "",
         }
     }
 }
 
+/// Map a row this ledger vouches for. A `pending` (or otherwise unrecognized)
+/// status is an ERROR here rather than a silent widening to `Active`: every
+/// query feeding this mapper filters pending out, and a reader that ever forgot
+/// to must fail loudly instead of reporting an undelivered certificate as a
+/// usable one.
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEntry> {
     let status: String = row.get(5)?;
+    let status = CertStatus::from_db(&status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            format!("issued_certs.status {status:?} is not a status this ledger vouches for")
+                .into(),
+        )
+    })?;
     Ok(LedgerEntry {
         fingerprint: row.get(0)?,
         device_id: row.get(1)?,
         token_hash: row.get(2)?,
         not_before: row.get(3)?,
         not_after: row.get(4)?,
-        status: CertStatus::from_db(&status),
+        status,
         actor: row.get(6)?,
         issued_at: row.get(7)?,
     })
@@ -626,6 +890,37 @@ mod tests {
             .as_ref()
             .and_then(|a| a.command.clone())
             .unwrap_or_default()
+    }
+
+    /// Every (fingerprint, status) pair actually stored, read through a
+    /// SEPARATE connection. The ledger's own readers deliberately hide
+    /// `pending`, so asserting a row is *gone* rather than merely invisible has
+    /// to go around them.
+    fn stored_rows(dir: &Path) -> Vec<(String, String)> {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT fingerprint, status FROM issued_certs ORDER BY fingerprint")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .unwrap()
+    }
+
+    /// Commit a row in the `pending` state through a separate connection:
+    /// exactly what a process that died between the ledger commit and the
+    /// completion audit event leaves behind. Building the fixture outside the
+    /// ledger API keeps the crash-window test independent of the code under
+    /// test, and proves the schema CHECK actually admits the state.
+    fn stage_pending_row(dir: &Path, fingerprint: &str, device_id: &str) {
+        let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+        conn.execute(
+            "INSERT INTO issued_certs
+                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+             VALUES (?1, ?2, 'abcdef0123456789', 1000, 2592000, 'pending', 1000, 'enroll:abcdef01')",
+            params![fingerprint, device_id],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -894,6 +1189,213 @@ mod tests {
             ]
         );
         assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
+    }
+
+    #[test]
+    fn completion_audit_failure_publishes_no_certificate_and_no_duplicate_on_retry() {
+        // The blocking case. The ATTEMPT event lands, the row commits, and the
+        // COMPLETION event fails. Before the pending -> active protocol this
+        // returned Err with an ACTIVE row already committed for a certificate
+        // the caller never delivered; because the client's retry carries a
+        // fresh CSR - and so a different fingerprint - the retry then added a
+        // SECOND active credential instead of replacing the first.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open(dir.path(), Some(audit.clone())).unwrap();
+
+        // Let the attempt write land; fail every write after it. This is the
+        // one fault an external manipulation of the log file cannot produce:
+        // both writes happen inside a single record_issued call.
+        audit.fail_writes_after_for_test(1);
+        let err = led
+            .record_issued(&entry("fp1", "dev1"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("certificate audit event"), "got: {err}");
+
+        // The trail holds the attempt and no completion.
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            ["cert_issuance_attempted"],
+            "a failed completion write must not leave a completion event"
+        );
+
+        // Nothing was published: no status, no row to look up, no active list
+        // entry, and no revocation state for a fingerprint nobody holds.
+        assert_eq!(
+            led.status_of("fp1").unwrap(),
+            None,
+            "an undelivered certificate must not be Active - or known at all"
+        );
+        assert!(led.lookup_by_fingerprint("fp1").unwrap().is_none());
+        assert!(!led.is_revoked("fp1").unwrap());
+        assert!(led.list_active().unwrap().is_empty());
+        // The compensating delete removed the row; it did not merely hide it.
+        assert!(
+            stored_rows(dir.path()).is_empty(),
+            "the staged row must be compensated away, got: {:?}",
+            stored_rows(dir.path())
+        );
+
+        // The retry - a fresh CSR, so a fresh fingerprint, as the real client
+        // does - completes, and leaves exactly ONE active credential.
+        audit.clear_write_failure_for_test();
+        led.record_issued(&entry("fp2", "dev1"), false).unwrap();
+        let active = led.list_active().unwrap();
+        assert_eq!(active.len(), 1, "the retry must not multiply active rows");
+        assert_eq!(active[0].fingerprint, "fp2");
+        assert_eq!(led.status_of("fp1").unwrap(), None);
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issuance_attempted",
+                "cert_issued",
+            ],
+            "the interrupted attempt stays unmatched; only the retry completes"
+        );
+    }
+
+    #[test]
+    fn completion_audit_failure_leaves_an_established_certificate_untouched() {
+        // Re-recording a fingerprint the ledger already holds must not use the
+        // established row as the compensation target: the certificate behind it
+        // WAS delivered. A failed completion leaves it active with its original
+        // validity, which is right - the caller is returning an error rather
+        // than handing over the renewed certificate.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open(dir.path(), Some(audit.clone())).unwrap();
+        led.record_issued(&entry("fp1", "dev1"), false).unwrap();
+
+        let mut renewed = entry("fp1", "dev1");
+        renewed.not_after = 9_999_999;
+        audit.fail_writes_after_for_test(1);
+        assert!(led.record_issued(&renewed, true).is_err());
+
+        let held = led
+            .lookup_by_fingerprint("fp1")
+            .unwrap()
+            .expect("the established certificate must survive");
+        assert_eq!(held.status, CertStatus::Active);
+        assert_eq!(
+            held.not_after,
+            1_000 + 30 * 86_400,
+            "an undelivered renewal must not extend the established validity"
+        );
+        assert_eq!(led.list_active().unwrap().len(), 1);
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issued",
+                "cert_issuance_attempted",
+            ]
+        );
+    }
+
+    #[test]
+    fn open_reconciles_a_pending_row_left_by_a_crash() {
+        // The crash window the compensating delete cannot cover: the process
+        // dies between the ledger commit and the completion event. The flip out
+        // of `pending` happens inside the same record_issued call, so any
+        // pending row seen at open is stale by construction - an undelivered
+        // certificate that must be resolved durably, not left to linger.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        {
+            let led = CertLedger::open(dir.path(), Some(audit.clone())).unwrap();
+            led.record_issued(&entry("fpDone", "dev1"), false).unwrap();
+        }
+        stage_pending_row(dir.path(), "fpCrash", "dev2");
+        assert!(
+            stored_rows(dir.path()).contains(&("fpCrash".to_string(), "pending".to_string())),
+            "fixture must actually commit a pending row"
+        );
+
+        let reopened = CertLedger::open(dir.path(), Some(audit)).unwrap();
+
+        // Resolved durably, and it never surfaces as a credential on the way.
+        assert_eq!(reopened.status_of("fpCrash").unwrap(), None);
+        assert!(reopened.lookup_by_fingerprint("fpCrash").unwrap().is_none());
+        assert!(!reopened.is_revoked("fpCrash").unwrap());
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![("fpDone".to_string(), "active".to_string())],
+            "the stranded row is gone; the completed issuance is untouched"
+        );
+        let active: Vec<String> = reopened
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.fingerprint)
+            .collect();
+        assert_eq!(active, ["fpDone"]);
+
+        // And the trail explains the stranded attempt rather than leaving the
+        // reader to infer it from a missing completion.
+        let events = audit_events(&log);
+        let names: Vec<String> = events.iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issued",
+                "cert_issuance_abandoned",
+            ]
+        );
+        let abandoned = events.last().unwrap();
+        assert!(
+            command_of(abandoned).starts_with("abandoned=reconcile fingerprint=fpCrash "),
+            "got: {}",
+            command_of(abandoned)
+        );
+        let result = abandoned
+            .result
+            .as_ref()
+            .expect("a reconciliation has a settled outcome");
+        assert!(
+            !result.success,
+            "the reconciliation must record a FAILED issuance, not a completed one"
+        );
+
+        // Reconciliation is not a one-shot: a second open finds nothing left.
+        let again = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(again.list_active().unwrap().len(), 1);
+        assert_eq!(audit_events(&log).len(), 3);
+    }
+
+    #[test]
+    fn a_pending_row_is_never_a_credential_for_any_reader() {
+        // The consumer audit, executable: every reader that means "usable
+        // credential" must refuse a pending row. Inserted after open, so it is
+        // a live pending row rather than one reconciliation already removed.
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        stage_pending_row(dir.path(), "fpPending", "devP");
+
+        assert_eq!(led.status_of("fpPending").unwrap(), None);
+        assert!(led.lookup_by_fingerprint("fpPending").unwrap().is_none());
+        assert!(led.device_of("fpPending").unwrap().is_none());
+        assert!(!led.is_revoked("fpPending").unwrap());
+        assert!(led.list_active().unwrap().is_empty());
+        assert!(led.revoked_fingerprints().unwrap().is_empty());
+        assert!(
+            !led.mark_revoked("fpPending", "operator").unwrap(),
+            "a pending row is not revocable: it is not a credential to revoke"
+        );
+        assert_eq!(led.revoke_device("devP", "operator").unwrap(), 0);
+        // Refusing to revoke it did not quietly flip it either.
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![("fpPending".to_string(), "pending".to_string())]
+        );
+        // And the enforcement file the WSS verifier reads stays empty.
+        let crl = std::fs::read_to_string(revoked_list_path(dir.path())).unwrap_or_default();
+        assert!(crl.trim().is_empty());
     }
 
     #[test]

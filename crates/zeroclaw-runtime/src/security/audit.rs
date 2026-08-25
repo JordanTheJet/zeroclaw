@@ -42,6 +42,13 @@ pub enum AuditEventType {
     CertRenewed,
     /// A client certificate was revoked (status flipped in the ledger).
     CertRevoked,
+    /// A certificate issuance that committed a ledger row but never completed
+    /// was reconciled away: the row is discarded and the certificate - if it
+    /// ever reached a client at all - is not, and never was, in the ledger.
+    /// This is what closes out an unmatched `CertIssuanceAttempted` left by a
+    /// process that died mid-issuance, so the trail explains the gap instead of
+    /// leaving it to inference.
+    CertIssuanceAbandoned,
 }
 
 /// Actor information (who performed the action)
@@ -228,6 +235,10 @@ pub struct AuditLogger {
     chain: Mutex<ChainState>,
     /// Signing key (loaded once at construction time if sign_events enabled)
     signing_key: Option<Vec<u8>>,
+    /// Remaining [`AuditLogger::log`] calls to honour before every further one
+    /// fails. Test-only; see [`AuditLogger::fail_writes_after_for_test`].
+    #[cfg(test)]
+    write_budget: Mutex<Option<usize>>,
 }
 
 /// Structured command execution details for audit logging.
@@ -303,7 +314,33 @@ impl AuditLogger {
             config,
             chain: Mutex::new(chain_state),
             signing_key,
+            #[cfg(test)]
+            write_budget: Mutex::new(None),
         })
+    }
+
+    /// Fault injection: honour the next `successes` [`AuditLogger::log`] calls,
+    /// then fail every one after them.
+    ///
+    /// Callers that write MORE THAN ONE event to describe a single durable
+    /// action need a partial audit failure - the first event landing and a
+    /// later one failing - which no external manipulation of the log file can
+    /// produce, because the whole sequence happens inside one call. The
+    /// certificate issuance attempt/completion pair
+    /// (`security::cert_ledger::CertLedger::record_issued`) is that shape.
+    ///
+    /// The injected failure lands at the rotation step, before this call
+    /// touches the chain state, so it models a rotate/open failure and leaves
+    /// the hash chain consistent with the file for the caller's retry.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after_for_test(&self, successes: usize) {
+        *self.write_budget.lock() = Some(successes);
+    }
+
+    /// Undo [`AuditLogger::fail_writes_after_for_test`].
+    #[cfg(test)]
+    pub(crate) fn clear_write_failure_for_test(&self) {
+        *self.write_budget.lock() = None;
     }
 
     /// Compute HMAC-SHA256 signature over entry_hash when sign_events enabled.
@@ -338,6 +375,17 @@ impl AuditLogger {
 
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
+
+        #[cfg(test)]
+        {
+            let mut budget = self.write_budget.lock();
+            if let Some(remaining) = budget.as_mut() {
+                match remaining.checked_sub(1) {
+                    Some(left) => *remaining = left,
+                    None => bail!("injected audit write failure"),
+                }
+            }
+        }
 
         // Populate chain fields under the lock
         let mut chained = event.clone();
