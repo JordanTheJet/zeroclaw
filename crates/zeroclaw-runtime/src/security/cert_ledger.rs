@@ -44,6 +44,15 @@ use super::audit::{AuditEvent, AuditEventType, AuditLogger};
 /// unknown; see [`CertLedger::record_issued`] for the state machine.
 const PENDING: &str = "pending";
 
+/// How old a `pending` row must be before open-time reconciliation treats it
+/// as crash residue. The stage->promote flip happens inside one
+/// `record_issued` call and completes in well under a second, but the ledger
+/// is opened per request (renewal) and per process (CLI), so a concurrent
+/// open CAN observe another connection's in-flight staging - reconciling that
+/// row out from under it makes the promotion fail spuriously. Anything older
+/// than this window cannot be in flight and is safe to resolve.
+const PENDING_RECONCILE_GRACE_SECS: i64 = 60;
+
 /// The `issued_certs` schema revision this build expects, stamped into
 /// `PRAGMA user_version`.
 ///
@@ -428,19 +437,22 @@ impl CertLedger {
             let mut stmt = conn
                 .prepare(
                     "SELECT fingerprint, device_id, not_before, not_after, actor
-                         FROM issued_certs WHERE status = ?1",
+                         FROM issued_certs WHERE status = ?1 AND issued_at < ?2",
                 )
                 .context("prepare pending-issuance reconciliation")?;
             let rows = stmt
-                .query_map(params![PENDING], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                    ))
-                })
+                .query_map(
+                    params![PENDING, now_unix() - PENDING_RECONCILE_GRACE_SECS],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )
                 .context("query pending issuances")?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("collect pending issuances")?
@@ -1293,6 +1305,34 @@ mod tests {
         .unwrap();
     }
 
+    /// An in-flight staging must survive a concurrent open. The ledger is
+    /// opened per request, so open-time reconciliation runs while another
+    /// connection may be between stage and promote; only rows older than the
+    /// grace window may be swept. Without the window this deleted the fresh
+    /// row and the concurrent promotion failed with "staged row disappeared".
+    #[test]
+    fn a_concurrent_open_leaves_a_fresh_pending_row_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _log) = audit_logger(dir.path());
+        drop(CertLedger::open(dir.path(), Some(audit.clone())).unwrap());
+        // A pending row staged moments ago, exactly as another connection's
+        // in-flight record_issued would leave it mid-call.
+        let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+        conn.execute(
+            "INSERT INTO issued_certs
+                (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at, actor)
+             VALUES ('fpLive', 'devL', 'abcdef0123456789', 1000, 2592000, 'pending', ?1, 'enroll:abcdef01')",
+            params![now_unix()],
+        )
+        .unwrap();
+        drop(conn);
+        drop(CertLedger::open(dir.path(), Some(audit)).unwrap());
+        assert!(
+            stored_rows(dir.path()).contains(&("fpLive".to_string(), "pending".to_string())),
+            "a fresh in-flight pending row must survive a concurrent open"
+        );
+    }
+
     /// The `issued_certs` schema EXACTLY as every pre-versioned revision of
     /// this branch created it: same columns, same indexes, the old two-value
     /// CHECK, and `user_version` left at 0.
@@ -2081,9 +2121,10 @@ mod tests {
     fn open_reconciles_a_pending_row_left_by_a_crash() {
         // The crash window the compensating delete cannot cover: the process
         // dies between the ledger commit and the completion event. The flip out
-        // of `pending` happens inside the same record_issued call, so any
-        // pending row seen at open is stale by construction - an undelivered
-        // certificate that must be resolved durably, not left to linger.
+        // of `pending` happens inside the same record_issued call, so a pending
+        // row older than the reconciliation grace window is crash residue - an
+        // undelivered certificate that must be resolved durably, not left to
+        // linger. (The fixture's 1970 issued_at is far past the window.)
         let dir = tempfile::tempdir().unwrap();
         let (audit, log) = audit_logger(dir.path());
         {

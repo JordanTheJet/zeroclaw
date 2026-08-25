@@ -443,7 +443,7 @@ impl AuditLogger {
     ///   exactly as it was and the caller's retry reuses the same sequence
     ///   and `prev_hash`. Advancing first left the in-memory chain ahead of
     ///   the file, and every later entry then linked to a hash that was never
-    ///   written (#10359).
+    ///   written.
     ///
     /// Both properties hold only WITHIN one instance: one `AuditLogger` per
     /// file is a hard requirement, see [`AuditLogger::new`].
