@@ -35,7 +35,7 @@ const TERMINAL: Theme = Theme {
     background: Color::Reset,
 };
 
-include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
+include!("generated_themes.rs");
 
 pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
 
