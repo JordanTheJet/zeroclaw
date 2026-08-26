@@ -230,12 +230,16 @@ pub struct RelayConfig {
     /// Off by default (a client cert whose CN is not a node-id would misroute). The
     /// outer client-cert REQUIREMENT itself is configured on the TLS acceptor.
     pub route_by_client_cert: bool,
-    /// Global cap on sockets that are past accept but not yet classified
-    /// (TLS handshake, HTTP/WebSocket upgrade, first control frame). The
-    /// per-IP token bucket bounds one source; this bounds the SUM, so a
-    /// slowloris spread across many source addresses cannot accumulate
-    /// unbounded TLS/parser/task state. When the pool is exhausted new
-    /// sockets are shed at accept.
+    /// Global cap on sockets that are past accept but not yet ADMITTED: the TLS
+    /// handshake, the HTTP/WebSocket upgrade, the first control frame, and
+    /// whatever follows it until the peer is either serving a registration or
+    /// routed to a daemon - including the reply to a peer that is being refused.
+    /// The per-IP token bucket bounds one source; this bounds the SUM, so a
+    /// flood spread across many source addresses cannot accumulate unbounded
+    /// TLS/parser/task state, whether it stalls in setup or gets itself refused
+    /// on purpose. When the pool is exhausted new sockets are shed at accept.
+    /// Admitted connections never hold one, so an exhausted pool never stalls
+    /// established traffic.
     pub max_pending_handshakes: usize,
     /// ONE absolute deadline for the whole pre-admission sequence: TLS accept,
     /// the HTTP/WebSocket upgrade, the first control frame, and - on the daemon
@@ -426,7 +430,7 @@ struct Inner {
     connect_rate_per_node: f64,
     /// Outer-mTLS variant: read the target node-id from the client cert CN.
     route_by_client_cert: bool,
-    /// Pre-classification handshake permits (see `RelayConfig::max_pending_handshakes`).
+    /// Pre-admission handshake permits (see `RelayConfig::max_pending_handshakes`).
     handshake_permits: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
     max_registered_nodes: usize,
@@ -641,11 +645,18 @@ fn resolve_target_node(cert_node_id: Option<String>, frame_node_id: String) -> S
 /// Read the first control frame and dispatch by role. `cert_node_id` is the
 /// outer-mTLS-derived target (outer client cert CN), used only on the client path.
 ///
-/// `permit` is the pre-classification handshake permit. A `Connect`/`Enroll`
-/// client is fully admitted by its first frame, so the permit is released here.
-/// A daemon is NOT: its `Hello` is unauthenticated and the signed registration
-/// exchange still follows, so `handle_daemon` keeps the permit until that
-/// exchange completes. `deadline` is the absolute end of the setup budget.
+/// `permit` is the pre-admission handshake permit, and NO branch releases it
+/// here. A first frame classifies a peer's role; it does not admit it. A
+/// `Connect`/`Enroll` may still be refused (unknown node, rate cap, node at
+/// capacity), a `Hello` still has a signed exchange to complete, and a junk
+/// frame still gets a reply - and every one of those refusals is a
+/// peer-controlled write. Releasing the permit at classification bounded each
+/// refusal's DURATION (the write deadlines) but not the NUMBER of refusal tasks:
+/// a client could complete the upgrade, name a nonexistent node, stop reading,
+/// and hold a task and its TLS session for the whole refusal budget while the
+/// permit was already back in the pool for the next flooder. So each callee
+/// carries the permit to the point it is genuinely admitted.
+/// `deadline` is the absolute end of the setup budget.
 async fn handle_conn<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
@@ -675,36 +686,37 @@ where
             .await
         }
         Some(Control::Connect { node_id }) => {
-            drop(permit);
             handle_client(
                 inner,
                 ws,
                 resolve_target_node(cert_node_id, node_id),
                 ClientRoute::Wss,
+                permit,
             )
             .await
         }
         Some(Control::Enroll { node_id }) => {
-            drop(permit);
             handle_client(
                 inner,
                 ws,
                 resolve_target_node(cert_node_id, node_id),
                 ClientRoute::Enrollment,
+                permit,
             )
             .await
         }
         Some(other) => {
-            drop(permit);
-            // Still a setup-phase write even though the permit is already back:
-            // a peer that sends a junk first frame and stops reading would
-            // otherwise park this task and its TLS session with no deadline.
+            // The permit is held across this refusal write and released with the
+            // frame: a peer that sends a junk first frame and stops reading
+            // occupies a slot until the write lands or its deadline expires,
+            // rather than freeing one instantly for the next such peer.
             let _ = send_setup_control(
                 &mut ws,
                 &Control::error("bad_first_frame", format!("unexpected {other:?}")),
                 deadline,
             )
             .await;
+            drop(permit);
             Ok(())
         }
         None => Ok(()),
@@ -1260,11 +1272,31 @@ async fn deliver_conn_event(
 }
 
 /// Client connection: route it to the daemon serving `node_id` and pipe `DATA`.
+///
+/// `permit` is the pre-admission handshake permit, held until this client is
+/// ADMITTED - the point where the relay has allocated conn state and the daemon
+/// has taken the `Open`. Every refusal before that (unknown node, per-node rate
+/// cap, node at capacity, daemon link gone) needs no daemon and no prior state,
+/// so it is floodable from nothing; holding the permit across those replies caps
+/// how MANY such tasks can exist at once, which their per-write deadlines do
+/// not. Refusal paths simply return, dropping the permit with the frame.
+///
+/// The permit is released at `Open`, NOT at pairing. A conn that has been handed
+/// to the daemon already occupies one of `max_conns_per_node` slots and needs a
+/// live registered daemon to exist at all, so the later pair-timeout refusal is
+/// bounded by that cap rather than by this pool. Holding through the pairing
+/// wait would put honest clients on a slow daemon (up to `PAIR_TIMEOUT`, longer
+/// than the refusal budget) in contention for the handshake pool.
+///
+/// The pump never needs a permit, so an exhausted pool cannot stall established
+/// traffic, and permits are taken only at accept - never re-acquired - so there
+/// is no path on which holding one waits for another.
 async fn handle_client<S>(
     inner: Arc<Inner>,
     mut ws: WebSocketStream<S>,
     node_id: String,
     route: ClientRoute,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1331,6 +1363,11 @@ where
         send_refusal(&mut ws, &Control::error("no_such_node", "daemon gone")).await;
         return Ok(());
     }
+    // ADMITTED: conn state is allocated and the daemon has the `Open`. From here
+    // the conn is bounded by `max_conns_per_node` and a live registration, not
+    // by the pre-admission pool, so the permit goes back for the next peer
+    // still trying to get in.
+    drop(permit);
 
     let (mut sink, mut stream) = ws.split();
 
@@ -2221,9 +2258,21 @@ mod client_refusal_tests {
         let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
 
         let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
         let started = tokio::time::Instant::now();
         let task = tokio::spawn(async move {
-            handle_client(inner, relay_ws, "no-such-node".into(), ClientRoute::Wss).await
+            handle_client(
+                inner,
+                relay_ws,
+                "no-such-node".into(),
+                ClientRoute::Wss,
+                permit,
+            )
+            .await
         });
 
         let finished = tokio::time::timeout(REFUSAL_WRITE_BUDGET * 4, task).await;
@@ -2288,6 +2337,9 @@ mod paired_client_tests {
         let idle = Duration::from_secs(2);
         let server = RelayServer::new(RelayConfig {
             idle_timeout: idle,
+            // A pool of one, so "the admitted client gave its permit back" is a
+            // crisp assertion below rather than arithmetic on the default.
+            max_pending_handshakes: 1,
             ..RelayConfig::default()
         });
         let (mut daemon_rx, conns) = register_stub_daemon(&server, "node-paired").await;
@@ -2299,9 +2351,21 @@ mod paired_client_tests {
         let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
 
         let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
         let started = tokio::time::Instant::now();
         let task = tokio::spawn(async move {
-            handle_client(inner, relay_ws, "node-paired".into(), ClientRoute::Wss).await
+            handle_client(
+                inner,
+                relay_ws,
+                "node-paired".into(),
+                ClientRoute::Wss,
+                permit,
+            )
+            .await
         });
 
         // Play the daemon: take the Open and accept it, so the conn is PAIRED
@@ -2311,6 +2375,17 @@ mod paired_client_tests {
             Ok(Control::Open { conn_id, .. }) => conn_id,
             other => panic!("expected an Open, got {other:?}"),
         };
+        // The other half of the admission contract: a client the relay has
+        // routed to a daemon is ADMITTED, so it must have handed its
+        // pre-admission permit back - a paired conn is bounded by
+        // `max_conns_per_node`, not by the setup pool, and an exhausted pool
+        // must never be able to stall established traffic.
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "an admitted client must not keep holding a pre-admission permit"
+        );
+
         let conn_tx = conns
             .lock()
             .await
@@ -2349,5 +2424,106 @@ mod paired_client_tests {
             "the relay-side route must be forgotten with the client"
         );
         drop(peer);
+    }
+}
+
+/// The COUNT of refusal tasks, not their duration. Each refusal write is
+/// deadline-bounded, but releasing the admission permit at classification meant
+/// a peer could name a nonexistent node, stop reading, and hold a task and a TLS
+/// session for the whole refusal budget while its permit was already back in the
+/// pool for the next one. Nothing in that path needs a daemon or any prior
+/// state, so it is floodable from nothing across many source addresses. The
+/// permit now spans the refusal, which is what bounds how many can exist at once.
+#[cfg(test)]
+mod refusal_bound_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// One client that completes the upgrade, names a node that does not exist,
+    /// and never reads the refusal. Returns its end of the link (held open so
+    /// the link stays up, never polled) and the relay task.
+    #[allow(clippy::type_complexity)]
+    async fn park_a_refusal(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        // A link far too small for the refusal frame, so the write stalls.
+        let (peer_io, relay_io) = tokio::io::duplex(8);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+
+        let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
+        let node = node_id.to_string();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, node, ClientRoute::Wss, permit).await
+        });
+        (peer, task)
+    }
+
+    /// Paused clock (see `client_refusal_tests`): the refusal budget elapses in
+    /// no wall time.
+    #[tokio::test(start_paused = true)]
+    async fn refusal_tasks_are_capped_by_the_pre_admission_pool() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 2,
+            ..RelayConfig::default()
+        });
+
+        // Two distinct clients take the whole pool asking for nodes that do not
+        // exist, then stop reading.
+        let (peer_a, task_a) = park_a_refusal(&server, "ghost-a").await;
+        let (peer_b, task_b) = park_a_refusal(&server, "ghost-b").await;
+        // Let both reach the stalled refusal write. Yielding never lets the
+        // paused clock advance: this task is re-queued ready each time, so the
+        // runtime is never idle.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // A third connection finds the pool empty - and an empty pool is exactly
+        // what makes the accept loop shed a socket before spending a TLS
+        // handshake on it. Before the fix both permits were already back and
+        // this third peer (and any number after it) would be accepted.
+        assert!(
+            server
+                .inner
+                .handshake_permits
+                .clone()
+                .try_acquire_owned()
+                .is_err(),
+            "a refusal must hold its slot while it holds a task and a TLS session"
+        );
+
+        // Capacity returns when the refusal budget expires.
+        for task in [task_a, task_b] {
+            let finished = tokio::time::timeout(REFUSAL_WRITE_BUDGET * 4, task).await;
+            assert!(
+                finished.is_ok(),
+                "a parked refusal must still be reaped at its budget"
+            );
+        }
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            2,
+            "the whole pool must come back once the refusals are reaped"
+        );
+        assert!(
+            server
+                .inner
+                .handshake_permits
+                .clone()
+                .try_acquire_owned()
+                .is_ok(),
+            "a later peer must be able to enter setup again"
+        );
+        drop((peer_a, peer_b));
     }
 }

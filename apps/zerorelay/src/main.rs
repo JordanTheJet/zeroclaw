@@ -101,8 +101,9 @@ struct Cli {
     #[arg(long)]
     lease_ttl_secs: Option<u64>,
 
-    /// Global cap on sockets past accept but not yet classified (TLS handshake,
-    /// WS upgrade, first control frame); excess sockets are shed. [default: 256]
+    /// Global cap on sockets past accept but not yet admitted (TLS handshake, WS
+    /// upgrade, first control frame, and any refusal reply); excess sockets are
+    /// shed. Admitted connections do not count. [default: 256]
     #[arg(long)]
     max_pending_handshakes: Option<usize>,
 
