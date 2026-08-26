@@ -5854,10 +5854,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                  startup error) and enrollment will not issue certificates \
                                  without an audit trail",
                             )?;
+                        // Materialize revocations to the file the WSS verifier
+                        // ACTUALLY reads - the same `[wss.client_auth].crl_path`
+                        // resolution the acceptor above performs. Opening on the
+                        // ledger default instead meant an enrollment-path
+                        // revocation (including the undelivered sweep, which
+                        // runs on this long-lived handle) rewrote
+                        // `<data_dir>/tls/revoked` while the verifier kept
+                        // reading an unchanged operator-managed file: revoked in
+                        // SQLite, still accepted at the handshake.
                         let ledger = std::sync::Arc::new(
-                            zeroclaw_runtime::security::cert_ledger::CertLedger::open(
+                            zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
                                 &data_dir,
                                 Some(audit),
+                                zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                    &data_dir,
+                                    wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                                ),
                             )?,
                         );
 

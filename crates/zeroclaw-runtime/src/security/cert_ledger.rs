@@ -223,6 +223,68 @@ pub struct LedgerEntry {
     pub issued_at: i64,
 }
 
+/// Marker carried in the error chain when an issuance is refused because its
+/// precondition no longer holds - a renewal whose certificate was revoked while
+/// the renewal was in flight.
+///
+/// A stable substring rather than a typed error because it has to survive the
+/// `anyhow` chain and the JSON-RPC string that carries it to the client, which
+/// is the only place the distinction is actionable: the client must re-enroll
+/// rather than retry.
+pub const ISSUANCE_PRECONDITION_FAILED: &str = "issuance precondition failed";
+
+/// An extra condition a revocation's compare-and-set requires of the row.
+#[derive(Debug, Clone, Copy)]
+enum RevokePrecondition {
+    /// Revoke any active row - an operator's deliberate revoke, which is
+    /// correct whatever else is true of the certificate.
+    Any,
+    /// Revoke only while the row is STILL undelivered.
+    ///
+    /// The undelivered sweep scans for stale rows, releases the connection, and
+    /// then revokes them one at a time. A delivery can commit in that gap: the
+    /// client's response write succeeds and `mark_delivered` marks the row
+    /// microseconds after the sweep decided it was abandoned. Without this
+    /// condition the sweep would go on to revoke a certificate that had just
+    /// been delivered, taking a working client offline for no reason - and
+    /// unrecoverably, since revocation is permanent.
+    ///
+    /// Re-testing `delivered_at IS NULL` inside the UPDATE makes delivery win
+    /// that race, which is the right winner: a delivered certificate is by
+    /// definition not an undelivered one.
+    StillUndelivered,
+}
+
+impl RevokePrecondition {
+    fn sql_suffix(self) -> &'static str {
+        match self {
+            RevokePrecondition::Any => "",
+            RevokePrecondition::StillUndelivered => " AND delivered_at IS NULL",
+        }
+    }
+}
+
+/// Interleavings a test needs to force at a point production code cannot be
+/// paused from the outside.
+///
+/// Every race this ledger defends against lives between two statements that a
+/// second connection can slip between. Reproducing one by racing real threads
+/// is inherently flaky, so each defended window gets a hook the test fills with
+/// "run the competing operation now" - making the interleaving deterministic
+/// and the regression meaningful rather than probabilistic.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LedgerTestHooks {
+    /// After `stage_pending` commits, before the completion audit and promote.
+    pub after_stage: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// After the undelivered sweep has collected its stale set, before it
+    /// revokes any of them.
+    pub after_stale_scan: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// After the revocation snapshot has been read and staged, before it is
+    /// renamed over the file the verifier reads.
+    pub before_crl_rename: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
 /// The daemon's issued-certificate ledger over SQLite (`<data_dir>/tls/ledger.db`).
 pub struct CertLedger {
     conn: Mutex<Connection>,
@@ -230,6 +292,8 @@ pub struct CertLedger {
     /// Where revocations are materialized for the WSS verifier to read
     /// (`<data_dir>/tls/revoked`). `None` for an in-memory ledger.
     revoked_path: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    pub(crate) hooks: LedgerTestHooks,
 }
 
 /// The revoked-fingerprint list the daemon's WSS mTLS verifier reads for
@@ -311,6 +375,8 @@ impl CertLedger {
             conn: Mutex::new(conn),
             audit,
             revoked_path,
+            #[cfg(test)]
+            hooks: LedgerTestHooks::default(),
         };
         // Resolve anything a previous process left mid-issuance BEFORE this
         // ledger answers a single query. Pending first: a pending row is not a
@@ -543,14 +609,31 @@ impl CertLedger {
             rows.collect::<rusqlite::Result<Vec<String>>>()
                 .context("collect undelivered issuances")?
         };
+        // The scan above released the connection lock, so between it and the
+        // revocations below a delivery can commit. The revocation therefore
+        // re-tests `delivered_at IS NULL` inside its own UPDATE rather than
+        // trusting this list.
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.after_stale_scan.lock().as_ref() {
+            hook();
+        }
         for fingerprint in stale {
-            // mark_revoked is the whole revocation contract: it flips the row,
-            // materializes the enforcement file from the in-transaction view,
-            // and audits a CertRevoked naming this sweep as the actor. An
+            // revoke_matching is the whole revocation contract: it flips the
+            // row, materializes the enforcement file from the in-transaction
+            // view, and audits a CertRevoked naming this sweep as the actor. An
             // undelivered certificate is revoked by exactly the same path an
             // operator's revoke takes - no second, weaker mechanism.
-            self.mark_revoked(&fingerprint, UNDELIVERED_RECONCILE_ACTOR)
-                .with_context(|| format!("revoke undelivered certificate {fingerprint}"))?;
+            //
+            // StillUndelivered is what makes a delivery that lands mid-sweep
+            // win: the row it names is no longer undelivered, the UPDATE
+            // matches nothing, and the sweep moves on without revoking a
+            // certificate its client is at that moment starting to use.
+            self.revoke_matching(
+                &fingerprint,
+                UNDELIVERED_RECONCILE_ACTOR,
+                RevokePrecondition::StillUndelivered,
+            )
+            .with_context(|| format!("revoke undelivered certificate {fingerprint}"))?;
         }
         Ok(())
     }
@@ -601,9 +684,39 @@ impl CertLedger {
     /// rename). This is what makes a revoke take effect at the next handshake -
     /// the WSS verifier re-reads the file when its mtime changes. No-op for an
     /// in-memory ledger.
+    /// Rewrite the revocation file from the ledger's committed truth, under the
+    /// SAME exclusive write lock a revocation takes.
+    ///
+    /// The lock is the point. Reading the revoked set, writing the scratch file
+    /// and renaming it are three steps, and a revocation committing between the
+    /// read and the rename would be published to the file and then immediately
+    /// overwritten by this call's older snapshot - a committed revocation
+    /// silently vanishing from the file the WSS verifier reads, which is the
+    /// one direction revocation may never fail.
+    ///
+    /// `BEGIN IMMEDIATE` takes SQLite's write lock up front, and
+    /// [`CertLedger::mark_revoked`] holds that same lock across its own flip,
+    /// materialization and commit. So the two cannot interleave: one runs to
+    /// completion before the other reads anything. That lock is held by SQLite
+    /// itself, so it serializes across independent connections AND across
+    /// processes sharing the data dir - which a `parking_lot` mutex on this
+    /// handle would not, and this ledger is opened per request and per CLI
+    /// invocation.
+    ///
+    /// A read-only `DEFERRED` transaction would NOT do: it takes only a read
+    /// lock, which a concurrent writer is free to pass straight through.
     pub fn materialize_revocations(&self) -> Result<()> {
-        let conn = self.conn.lock();
-        Self::materialize_on(&conn, self.revoked_path.as_deref())
+        let Some(path) = self.revoked_path.clone() else {
+            return Ok(());
+        };
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin revocation materialization")?;
+        self.materialize_on(&tx, Some(path.as_path()))?;
+        // Commits no rows - it releases the write lock, and only once the file
+        // on disk matches what this transaction read.
+        tx.commit().context("commit revocation materialization")
     }
 
     /// Materialize the revocation file from `conn`'s current view. Taking the
@@ -611,7 +724,12 @@ impl CertLedger {
     /// transaction, enforcing a pending revocation BEFORE committing it - a
     /// failed file write then rolls the status flip back instead of leaving a
     /// committed revoked row the verifier never sees.
-    fn materialize_on(conn: &Connection, revoked_path: Option<&Path>) -> Result<()> {
+    ///
+    /// Callers MUST hold SQLite's write lock (an `IMMEDIATE` transaction, or a
+    /// transaction that has already written). Every caller does; see
+    /// [`CertLedger::materialize_revocations`] for why a read-lock caller would
+    /// be able to publish a stale snapshot over a newer one.
+    fn materialize_on(&self, conn: &Connection, revoked_path: Option<&Path>) -> Result<()> {
         let Some(path) = revoked_path else {
             return Ok(());
         };
@@ -640,6 +758,14 @@ impl CertLedger {
         );
         let tmp = path.with_extension(unique);
         std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+        // The window a competing revocation would have to slip through. It
+        // cannot: every caller holds SQLite's write lock across this whole
+        // function. The seam exists so a test can PROVE that rather than assert
+        // it in a comment.
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.before_crl_rename.lock().as_ref() {
+            hook();
+        }
         if let Err(e) = std::fs::rename(&tmp, path) {
             // Do not leave the scratch file behind for an operator to wonder at.
             let _ = std::fs::remove_file(&tmp);
@@ -731,6 +857,40 @@ impl CertLedger {
     /// sweep is age-gated at the TTL, so it can never touch the row this call
     /// is about to create, nor any other issuance still in flight.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
+        self.record_issued_requiring(entry, renewal, None)
+    }
+
+    /// [`CertLedger::record_issued`] for a renewal, which may only publish
+    /// while the certificate it renews is STILL active.
+    ///
+    /// Renewal reads the presenting certificate's status, resolves its device,
+    /// signs a new certificate, and records it - four steps, on a connection
+    /// the operator's `revoke-client-cert` does not share. An operator revoking
+    /// that device in the middle of them would see their revocation succeed and
+    /// then watch the renewal hand the same device a brand-new active
+    /// certificate: revocation reported, device still connected. That is the
+    /// worst outcome this ledger has, because the operator believes the device
+    /// is off the network.
+    ///
+    /// `still_active` closes it by making the presenting fingerprint a
+    /// precondition of the issuance commit itself, re-tested inside the
+    /// transaction that publishes the new row. Revocation therefore always
+    /// wins: either it lands before the check and the renewal is refused, or it
+    /// lands after the new row is published and `revoke_device` - which
+    /// revokes every active certificate the device holds - takes the new one
+    /// too. There is no ordering in which the device keeps a usable
+    /// certificate.
+    ///
+    /// A refused renewal returns [`ISSUANCE_PRECONDITION_FAILED`] in its error
+    /// chain. It is retryable only in the sense that re-enrolling is the
+    /// client's correct next move; retrying the renewal will keep failing,
+    /// because the certificate it presents is revoked.
+    pub fn record_issued_requiring(
+        &self,
+        entry: &LedgerEntry,
+        renewal: bool,
+        still_active: Option<&str>,
+    ) -> Result<()> {
         // Best-effort, deliberately NOT `?`. This sweep is maintenance for
         // OTHER issuances; failing it would turn an unwritable CRL - or a
         // failing audit sink on some unrelated stale row - into a refusal to
@@ -748,15 +908,60 @@ impl CertLedger {
                  they stay eligible for the next issuance, ledger open, or explicit sweep"
             );
         }
+        // Fail fast, before the attempt event: a renewal whose certificate is
+        // already revoked has nothing to record. This is an optimization and a
+        // cleaner audit trail, NOT the guarantee - the authoritative re-test is
+        // inside `promote_staged`'s transaction, because only a check in the
+        // same transaction as the publish can exclude a revocation landing
+        // between them.
+        self.require_still_active(still_active)?;
         self.audit_cert(entry, CertAuditStage::Attempted { renewal })?;
         let staged = self.stage_pending(entry)?;
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.after_stage.lock().as_ref() {
+            hook();
+        }
         if let Err(err) = self.audit_cert(entry, CertAuditStage::Completed { renewal }) {
             self.discard_staged(entry, staged);
             return Err(err);
         }
-        if let Err(err) = self.promote_staged(entry) {
+        if let Err(err) = self.promote_staged(entry, still_active) {
             self.discard_staged(entry, staged);
             return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Refuse unless `fingerprint` (when given) is an active row right now.
+    ///
+    /// Advisory on its own - the row can be revoked the instant after this
+    /// returns - so it is used only to fail early. The binding check is the
+    /// same predicate evaluated inside the publishing transaction.
+    fn require_still_active(&self, fingerprint: Option<&str>) -> Result<()> {
+        let Some(fingerprint) = fingerprint else {
+            return Ok(());
+        };
+        let conn = self.conn.lock();
+        Self::assert_still_active(&conn, fingerprint)
+    }
+
+    /// The precondition itself, evaluated on whatever connection - or open
+    /// transaction - the caller supplies.
+    fn assert_still_active(conn: &Connection, fingerprint: &str) -> Result<()> {
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM issued_certs WHERE fingerprint = ?1 AND status = 'active'",
+                params![fingerprint],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("check the presenting certificate is still active")?;
+        if active.is_none() {
+            bail!(
+                "{ISSUANCE_PRECONDITION_FAILED}: the certificate being renewed ({fingerprint}) is \
+                 no longer active in the ledger; it was revoked while this renewal was in \
+                 flight, so no replacement was issued - re-enroll for a new certificate"
+            );
         }
         Ok(())
     }
@@ -810,9 +1015,23 @@ impl CertLedger {
     /// compensation or an external deletion). That fails closed: the caller
     /// gets `Err` and delivers nothing, rather than publishing a certificate
     /// with no row behind it.
-    fn promote_staged(&self, entry: &LedgerEntry) -> Result<()> {
-        let conn = self.conn.lock();
-        let changed = conn
+    ///
+    /// `still_active` is the renewal precondition, and this is where it becomes
+    /// a guarantee rather than a hope. The check and the publish run in ONE
+    /// `IMMEDIATE` transaction, so a revocation committing on another
+    /// connection lands entirely before it (and the publish is refused) or
+    /// entirely after it (where `revoke_device` sweeps the new row too). A
+    /// check outside this transaction could be overtaken between the two
+    /// statements, which is exactly the race being closed.
+    fn promote_staged(&self, entry: &LedgerEntry, still_active: Option<&str>) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin issuance publication")?;
+        if let Some(fingerprint) = still_active {
+            Self::assert_still_active(&tx, fingerprint)?;
+        }
+        let changed = tx
             .execute(
                 "UPDATE issued_certs
                     SET device_id = ?2, token_hash = ?3, not_before = ?4, not_after = ?5,
@@ -837,7 +1056,7 @@ impl CertLedger {
                 entry.fingerprint
             );
         }
-        Ok(())
+        tx.commit().context("commit issuance publication")
     }
 
     /// Compensate a failed issuance by removing the row this call staged.
@@ -965,9 +1184,32 @@ impl CertLedger {
     /// - a commit failure after the file write leaves the file over-enforcing
     ///   until the next materialization (fail-closed, never fail-open).
     pub fn mark_revoked(&self, fingerprint: &str, actor: &str) -> Result<bool> {
+        self.revoke_matching(fingerprint, actor, RevokePrecondition::Any)
+    }
+
+    /// [`CertLedger::mark_revoked`] with an extra condition the row must still
+    /// satisfy at the moment of the flip.
+    ///
+    /// The flip is a compare-and-set: the condition lives in the UPDATE's WHERE
+    /// clause, so it is evaluated against the row inside the same statement
+    /// that changes it. Checking it beforehand and flipping afterwards is
+    /// exactly the bug this exists to prevent - see
+    /// [`RevokePrecondition::StillUndelivered`].
+    ///
+    /// A condition that no longer holds means zero rows changed, and then
+    /// NOTHING happens: no audit event, no materialization, no report of a
+    /// revocation. That is the honest outcome, because nothing was revoked.
+    fn revoke_matching(
+        &self,
+        fingerprint: &str,
+        actor: &str,
+        precondition: RevokePrecondition,
+    ) -> Result<bool> {
         let audit_entry = {
             let mut conn = self.conn.lock();
-            let tx = conn.transaction().context("begin revocation transaction")?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("begin revocation transaction")?;
             // Only an ACTIVE row is revocable. Revoking a `pending` row would
             // publish - as revoked - a certificate the ledger has not vouched
             // for and whose issuance may still be compensated away; such a
@@ -975,8 +1217,11 @@ impl CertLedger {
             // revocation for it here would contradict that.
             let changed = tx
                 .execute(
-                    "UPDATE issued_certs SET status = 'revoked'
-                         WHERE fingerprint = ?1 AND status = 'active'",
+                    &format!(
+                        "UPDATE issued_certs SET status = 'revoked'
+                             WHERE fingerprint = ?1 AND status = 'active'{}",
+                        precondition.sql_suffix()
+                    ),
                     params![fingerprint],
                 )
                 .context("revoke cert")?;
@@ -994,7 +1239,7 @@ impl CertLedger {
                 .context("lookup revoked cert")?;
             // Enforce BEFORE the ledger reports it (drives the A5 refusal from
             // the real revoke action); failure here rolls the flip back.
-            Self::materialize_on(&tx, self.revoked_path.as_deref())?;
+            self.materialize_on(&tx, self.revoked_path.as_deref())?;
             tx.commit().context("commit revocation")?;
             entry.map(|mut e| {
                 e.actor = actor.to_string();
@@ -2496,6 +2741,282 @@ mod tests {
                 "cert_issued",
             ],
         );
+    }
+
+    /// Install a one-shot hook: it runs the closure the first time the seam is
+    /// reached and never again, so a hook that itself performs ledger work
+    /// cannot recurse into its own seam.
+    fn once_hook(
+        slot: &Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        action: impl Fn() + Send + Sync + 'static,
+    ) {
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        *slot.lock() = Some(Box::new(move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                action();
+            }
+        }));
+    }
+
+    #[test]
+    fn a_committed_revocation_cannot_be_overwritten_by_an_older_snapshot() {
+        // Materialization is read-set, write-scratch, rename. A revocation
+        // committing between the read and the rename would publish itself to
+        // the file and then be silently overwritten by this older snapshot -
+        // SQLite says revoked, the file the WSS verifier reads does not, and
+        // the certificate keeps authenticating. Revocation may never fail in
+        // that direction.
+        //
+        // The fix is that materialization holds SQLite's WRITE lock across all
+        // three steps, so a revocation on another connection cannot interleave
+        // - it waits. This forces exactly that interleaving through the seam
+        // and proves the revocation survives.
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        publisher
+            .record_issued(&entry("fpDoomed", "devD"), false)
+            .unwrap();
+        assert!(publisher.mark_delivered("fpDoomed").unwrap());
+
+        // A SECOND handle - its own SQLite connection, exactly like a second
+        // process running `security revoke-client-cert`.
+        let revoker = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        let revoked_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let revoker_thread = Arc::clone(&revoker);
+        let flag = Arc::clone(&revoked_ok);
+        once_hook(&publisher.hooks.before_crl_rename, move || {
+            // Start the competing revocation and give it every chance to get
+            // in. Under the fix it blocks on the write lock this thread holds;
+            // the bounded wait is what keeps the test from hanging on that.
+            let inner = Arc::clone(&revoker_thread);
+            let inner_flag = Arc::clone(&flag);
+            let handle = std::thread::spawn(move || {
+                if inner.mark_revoked("fpDoomed", "operator").unwrap_or(false) {
+                    inner_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Deliberately NOT joined here: joining would deadlock against the
+            // very lock this test is proving we hold.
+            std::mem::drop(handle);
+        });
+
+        // Publishes an EMPTY snapshot - taken before the revocation exists.
+        publisher.materialize_revocations().unwrap();
+
+        // Let the revocation finish now that the lock is free.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !revoked_ok.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            revoked_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "the competing revocation must eventually commit, not fail"
+        );
+
+        // THE POINT: the committed revocation is still in the file the verifier
+        // reads. It was not overwritten by the older, empty snapshot.
+        let crl = revoked_list_path(dir.path());
+        let body = std::fs::read_to_string(&crl).unwrap();
+        assert_eq!(
+            body.trim(),
+            "fpDoomed",
+            "a committed revocation must never be overwritten by an older snapshot"
+        );
+        let set = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
+        assert!(set.contains("fpdoomed"), "the verifier must enforce it");
+        assert!(revoker.is_revoked("fpDoomed").unwrap());
+        // SQLite and the file agree, which is the invariant that was at risk.
+        assert_eq!(
+            publisher.revoked_fingerprints().unwrap(),
+            vec!["fpDoomed".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_delivery_that_lands_mid_sweep_beats_the_revocation() {
+        // The sweep scans for stale undelivered rows, releases the connection,
+        // and then revokes them one by one. A delivery can commit in that gap -
+        // the client's response write finally succeeds and marks the row
+        // delivered microseconds after the sweep listed it as abandoned.
+        //
+        // The flip must therefore re-test `delivered_at IS NULL` inside its own
+        // UPDATE. Without that, the sweep revokes a certificate that was just
+        // delivered, and permanently: the client is cut off with no recourse
+        // but re-enrolment, for a delivery that actually succeeded.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = Arc::new(CertLedger::open(dir.path(), Some(audit)).unwrap());
+        led.record_issued(&entry("fpRaced", "devRaced"), false)
+            .unwrap();
+        backdate_issuance(dir.path(), "fpRaced", PAST_TTL_SECS);
+
+        // The delivery lands after the scan has already selected the row.
+        let deliverer = Arc::clone(&led);
+        once_hook(&led.hooks.after_stale_scan, move || {
+            assert!(
+                deliverer.mark_delivered("fpRaced").unwrap(),
+                "the delivery must win the row while the sweep is mid-flight"
+            );
+        });
+
+        led.sweep_undelivered_certificates().unwrap();
+
+        // Delivery wins: the certificate its client is now using stays usable.
+        assert_eq!(
+            led.status_of("fpRaced").unwrap(),
+            Some(CertStatus::Active),
+            "a certificate delivered mid-sweep must not be revoked"
+        );
+        assert!(
+            led.revoked_fingerprints().unwrap().is_empty(),
+            "and it must not reach the verifier's revocation list"
+        );
+        assert!(
+            std::fs::read_to_string(revoked_list_path(dir.path()))
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+
+        // A compare-and-set miss is a no-op, not a silent half-revocation: no
+        // CertRevoked event claims something that did not happen.
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            ["cert_issuance_attempted", "cert_issued"],
+            "a skipped revocation must not be audited as one"
+        );
+
+        // And the row is genuinely settled - a later sweep leaves it alone too.
+        *led.hooks.after_stale_scan.lock() = None;
+        led.sweep_undelivered_certificates().unwrap();
+        assert_eq!(led.status_of("fpRaced").unwrap(), Some(CertStatus::Active));
+    }
+
+    #[test]
+    fn a_revocation_that_lands_mid_renewal_stops_the_new_certificate() {
+        // Renewal reads the presenting certificate's status, resolves its
+        // device, signs, and only then records - on a connection the operator's
+        // revoke does not share. An operator revoking that device in between
+        // would see their revocation succeed and the renewal still hand the
+        // device a fresh ACTIVE certificate: the operator believes the device
+        // is off the network while it holds a brand-new credential.
+        //
+        // The presenting fingerprint is therefore a precondition of the
+        // publishing transaction. Here the revocation lands at the worst
+        // possible moment - after the new row is already staged.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = Arc::new(CertLedger::open(dir.path(), Some(audit)).unwrap());
+        led.record_issued(&entry("fpOld", "devRenew"), false)
+            .unwrap();
+        assert!(led.mark_delivered("fpOld").unwrap());
+
+        let revoker = Arc::clone(&led);
+        once_hook(&led.hooks.after_stage, move || {
+            assert!(
+                revoker.mark_revoked("fpOld", "operator").unwrap(),
+                "the operator's revocation must land while the renewal is staged"
+            );
+        });
+
+        let err = format!(
+            "{:#}",
+            led.record_issued_requiring(&entry("fpNew", "devRenew"), true, Some("fpOld"))
+                .expect_err("a renewal must not publish after its certificate is revoked")
+        );
+        assert!(
+            err.contains(ISSUANCE_PRECONDITION_FAILED),
+            "the refusal must be distinguishable from an internal fault: {err}"
+        );
+        assert!(
+            err.contains("re-enroll"),
+            "and must tell the client what to do instead: {err}"
+        );
+
+        // Revocation wins, completely: no new active certificate exists for the
+        // device, and the staged row was compensated away rather than left.
+        assert_eq!(led.status_of("fpNew").unwrap(), None);
+        assert_eq!(led.status_of("fpOld").unwrap(), Some(CertStatus::Revoked));
+        assert!(
+            led.list_active().unwrap().is_empty(),
+            "the revoked device must hold no active certificate, got: {:?}",
+            led.list_active().unwrap()
+        );
+        assert_eq!(
+            stored_rows(dir.path()),
+            vec![("fpOld".to_string(), "revoked".to_string())],
+            "the refused renewal must leave no row behind"
+        );
+
+        // The trail records the renewal as attempted and even completed - the
+        // completion event is written before the publishing transaction, and
+        // the revocation landed after it. That is the residue `record_issued`
+        // already documents and deliberately accepts: an audited fingerprint
+        // with no row fails CLOSED (nothing to authenticate with), whereas the
+        // opposite - a live credential with no audit - does not. What must
+        // never appear is a published row, and there is none.
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issued",
+                "cert_issuance_attempted",
+                "cert_revoked",
+                "cert_renewed",
+            ],
+            "the renewal may be audited, but must publish nothing"
+        );
+        assert_eq!(
+            led.status_of("fpNew").unwrap(),
+            None,
+            "an audited-but-unpublished renewal is unusable, which is the point"
+        );
+    }
+
+    #[test]
+    fn a_renewal_of_an_already_revoked_certificate_is_refused_up_front() {
+        // The same guarantee without any interleaving: revocation already won,
+        // so the renewal is refused before it writes anything at all.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open(dir.path(), Some(audit)).unwrap();
+        led.record_issued(&entry("fpOld", "devRenew"), false)
+            .unwrap();
+        assert!(led.mark_delivered("fpOld").unwrap());
+        assert!(led.mark_revoked("fpOld", "operator").unwrap());
+
+        let err = format!(
+            "{:#}",
+            led.record_issued_requiring(&entry("fpNew", "devRenew"), true, Some("fpOld"))
+                .expect_err("a revoked certificate must not renew")
+        );
+        assert!(err.contains(ISSUANCE_PRECONDITION_FAILED), "got: {err}");
+        assert_eq!(led.status_of("fpNew").unwrap(), None);
+        assert!(led.list_active().unwrap().is_empty());
+
+        // Refused before the attempt event: nothing was tried, so nothing is
+        // recorded as tried.
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            ["cert_issuance_attempted", "cert_issued", "cert_revoked"]
+        );
+    }
+
+    #[test]
+    fn a_first_enrollment_carries_no_renewal_precondition() {
+        // The precondition is renewal-only. A first enrollment has no
+        // presenting certificate, and must not be gated on one.
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_requiring(&entry("fp1", "dev1"), false, None)
+            .expect("a first issuance has nothing to precondition on");
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
     }
 
     #[test]

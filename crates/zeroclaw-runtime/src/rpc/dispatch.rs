@@ -1053,7 +1053,7 @@ impl RpcDispatcher {
             .and_then(Value::as_str)
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
 
-        let (data_dir, relay_cfg, static_client_pins_configured) = {
+        let (data_dir, relay_cfg, static_client_pins_configured, crl_path) = {
             let cfg = self.ctx.config.read();
             (
                 cfg.data_dir.clone(),
@@ -1063,6 +1063,22 @@ impl RpcDispatcher {
                     .as_ref()
                     .map(|auth| !auth.pinned_certs.is_empty())
                     .unwrap_or(false),
+                // The file the WSS verifier ACTUALLY reads, resolved from the
+                // same `[wss.client_auth].crl_path` the startup acceptor
+                // resolves. A ledger opened on the default path instead would
+                // revoke in SQLite and rewrite `<data_dir>/tls/revoked` while
+                // the verifier kept reading an unchanged operator-managed file
+                // - a revocation reported and never enforced.
+                //
+                // Resolved HERE, from the config this handler already reads,
+                // rather than snapshotted into `RpcContext` at startup: an
+                // operator who changes `crl_path` and reloads must not have
+                // renewals keep materializing to the old file. Deriving live
+                // policy at use time is the rule this repo works by.
+                crate::security::cert_ledger::effective_revoked_list_path(
+                    &cfg.data_dir,
+                    cfg.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                ),
             )
         };
 
@@ -1085,7 +1101,7 @@ impl RpcDispatcher {
                 "certificate audit logger unavailable; refusing to renew without an audit trail",
             )
         })?);
-        let ledger = CertLedger::open(&data_dir, Some(audit))
+        let ledger = CertLedger::open_at(&data_dir, Some(audit), crl_path)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("cert ledger: {e}")))?;
 
         // Gate on ledger status (A5): revoked cannot self-renew; an unknown cert
@@ -1130,12 +1146,20 @@ impl RpcDispatcher {
         // Record the renewal (new fingerprint, same device id) -> CertRenewed
         // audit. The old cert stays active until it expires; revocation is a
         // separate, explicit action.
+        //
+        // The presenting fingerprint rides along as a PRECONDITION of the
+        // publish. The status gate above ran several steps ago - a CA signature
+        // ago - on a connection the operator's `revoke-client-cert` does not
+        // share, so an operator revoking this device in the meantime would
+        // otherwise see their revocation succeed and this renewal hand the same
+        // device a fresh active certificate. Re-testing it inside the
+        // publishing transaction makes revocation the guaranteed winner.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         ledger
-            .record_issued(
+            .record_issued_requiring(
                 &LedgerEntry {
                     device_id: device_id.clone(),
                     fingerprint: issued.fingerprint.clone(),
@@ -1147,8 +1171,19 @@ impl RpcDispatcher {
                     issued_at: now,
                 },
                 true,
+                Some(fingerprint),
             )
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger record: {e}")))?;
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                // A revocation that beat this renewal is the client's business,
+                // not an internal fault: it must re-enroll, and retrying the
+                // renewal will only fail again.
+                if message.contains(crate::security::cert_ledger::ISSUANCE_PRECONDITION_FAILED) {
+                    rpc_err(INVALID_PARAMS, message)
+                } else {
+                    rpc_err(INTERNAL_ERROR, format!("ledger record: {e}"))
+                }
+            })?;
 
         // Hand back the current relay profile so an in-band node-id rotation
         // reaches the client without a second bootstrap (rotation push consumer).
@@ -6621,6 +6656,179 @@ mod tests {
         assert_eq!(
             ledger.status_of(&active.fingerprint).unwrap(),
             Some(CertStatus::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_once_the_operator_has_revoked_the_device() {
+        // End-to-end at the RPC boundary: an operator revocation that wins the
+        // race must leave the device with no usable certificate, and the client
+        // must be told to re-enroll rather than retry. INVALID_PARAMS, not
+        // INTERNAL_ERROR - this is the client's situation, not a server fault.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-revoked-mid");
+        let presenting =
+            zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-revoked-mid", &csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-revoked-mid".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // The operator revokes the whole device, exactly as
+            // `security revoke-client-cert --device` does, on its own handle.
+            assert_eq!(
+                ledger.revoke_device("dev-revoked-mid", "operator").unwrap(),
+                1
+            );
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        let err = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect_err("a revoked device must not renew");
+        assert_eq!(err.code, INVALID_PARAMS, "got: {err:?}");
+
+        // No new active certificate exists for the revoked device.
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert!(
+            ledger.list_active().unwrap().is_empty(),
+            "a revoked device must hold no active certificate, got: {:?}",
+            ledger.list_active().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_revokes_into_the_configured_crl_not_the_default() {
+        // The renewal RPC opens its own ledger per call. Opening it on the
+        // ledger DEFAULT path while `[wss.client_auth].crl_path` is configured
+        // meant every revocation it performs - including the undelivered sweep
+        // that runs at every open - rewrote `<data_dir>/tls/revoked`, a file
+        // the verifier never reads, and left the operator's real CRL untouched.
+        // Revoked in SQLite, still accepted at the handshake.
+        use crate::security::cert_ledger::{
+            CertLedger, CertStatus, LedgerEntry, effective_revoked_list_path, revoked_list_path,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let custom_crl = dir.path().join("operator-managed.crl");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            crl_path: custom_crl.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-crl");
+        let presenting = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-crl", &csr).unwrap();
+
+        // Seed through a ledger opened on the SAME configured path, so the
+        // fixture cannot be what puts the revocation in the right file.
+        let effective = effective_revoked_list_path(
+            dir.path(),
+            config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+        );
+        assert_eq!(effective, custom_crl);
+        {
+            let ledger = CertLedger::open_at(dir.path(), None, effective.clone()).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-crl".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // A stranded undelivered certificate, already past the TTL. The
+            // renewal's ledger open must sweep it.
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-ghost".to_string(),
+                        fingerprint: "ab".repeat(32),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        disp.handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("renewal must succeed");
+
+        // The sweep's revocation landed in the file the verifier reads...
+        let set = zeroclaw_tls::load_revoked_fingerprints(&custom_crl)
+            .expect("the configured CRL must exist");
+        assert!(
+            set.contains(&"ab".repeat(32)),
+            "the renewal path must revoke into the CONFIGURED CRL, got: {set:?}"
+        );
+        // ...and not only into the default path the verifier ignores.
+        let default_body =
+            std::fs::read_to_string(revoked_list_path(dir.path())).unwrap_or_default();
+        assert!(
+            !default_body.contains(&"ab".repeat(32)),
+            "revocation must not be written to the unused default path: {default_body:?}"
         );
     }
 

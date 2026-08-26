@@ -1171,9 +1171,21 @@ mod tests {
     /// Enroll once against a file-backed ledger and return `(data_dir, server,
     /// response)` with the issuance recorded but NOT yet delivered.
     async fn enrolled_but_undelivered() -> (tempfile::TempDir, EnrollServer, EnrollResponse) {
+        enrolled_but_undelivered_with_crl(|dir| {
+            crate::security::cert_ledger::revoked_list_path(dir)
+        })
+        .await
+    }
+
+    /// [`enrolled_but_undelivered`] with the revocation file the ledger
+    /// materializes to chosen by the caller, so a test can prove the
+    /// enrollment path honours a configured `[wss.client_auth].crl_path`.
+    async fn enrolled_but_undelivered_with_crl(
+        crl_for: impl Fn(&std::path::Path) -> std::path::PathBuf,
+    ) -> (tempfile::TempDir, EnrollServer, EnrollResponse) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
-        let ledger = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        let ledger = Arc::new(CertLedger::open_at(dir.path(), None, crl_for(dir.path())).unwrap());
         let pairing = PairingGuard::new(true, &[]);
         let code = pairing.pairing_code().unwrap();
         let server = test_server_with_ledger(pairing, None, ledger);
@@ -1237,6 +1249,48 @@ mod tests {
         assert!(
             set.contains(&fingerprint.to_ascii_lowercase()),
             "the reconciled revocation must reach the verifier's CRL file"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_enrollment_sweep_revokes_into_the_configured_crl_not_the_default() {
+        // The enrollment server holds ONE ledger, built once at daemon startup.
+        // Building it on the ledger DEFAULT path while
+        // `[wss.client_auth].crl_path` is configured meant every revocation it
+        // performs - and the undelivered sweep runs entirely on this handle -
+        // rewrote `<data_dir>/tls/revoked`, which the verifier never reads,
+        // leaving the operator's real CRL untouched. Revoked in SQLite, still
+        // accepted at the handshake: revocation failing open, which is the one
+        // direction it may never fail.
+        let custom_name = "operator-managed.crl";
+        let (dir, server, first) = enrolled_but_undelivered_with_crl(|d| d.join(custom_name)).await;
+        let ghost = first.fingerprint.clone();
+
+        // The response never reaches the client, so the row stays undelivered.
+        deliver_enroll_response(&server, &mut DisconnectedClient, Ok(first)).await;
+        backdate_issuance(dir.path(), &ghost);
+
+        sweep_undelivered(&server);
+
+        // The revocation is in the file the verifier actually reads...
+        let custom = dir.path().join(custom_name);
+        let set = zeroclaw_tls::load_revoked_fingerprints(&custom)
+            .expect("the configured CRL must exist");
+        assert!(
+            set.contains(&ghost.to_ascii_lowercase()),
+            "the enrollment sweep must revoke into the CONFIGURED CRL"
+        );
+        // ...and not only in the default path nothing consults.
+        let default_body =
+            std::fs::read_to_string(crate::security::cert_ledger::revoked_list_path(dir.path()))
+                .unwrap_or_default();
+        assert!(
+            !default_body.contains(&ghost),
+            "revocation must not be written to the unused default path: {default_body:?}"
+        );
+        assert_eq!(
+            server.ledger.status_of(&ghost).unwrap(),
+            Some(CertStatus::Revoked)
         );
     }
 
