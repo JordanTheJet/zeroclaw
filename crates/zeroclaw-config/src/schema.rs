@@ -3237,6 +3237,45 @@ impl FamilyEndpoint for KiloModelProviderConfig {
     }
 }
 
+// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ──
+
+/// ZeroRouter endpoint. ZeroRouter is a family of independently operated
+/// routers, so there is no canonical hosted default: the single variant
+/// points at the router container's own bind
+/// (`ZEROROUTER_BIND=0.0.0.0:8080`). A hosted deployment does run at
+/// `https://zerorouter.ai`, but it is one deployment among many rather than
+/// the family default, so operators reaching it — or any other remote
+/// router — set `base.uri`. [`ZEROROUTER_DEFAULT_URL`] is the canonical
+/// family default consumed by both schema and provider construction.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZerorouterEndpoint {
+    #[default]
+    Default,
+}
+
+/// Default API base for a locally running ZeroRouter.
+pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
+impl ModelEndpoint for ZerorouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => ZEROROUTER_DEFAULT_URL,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zerorouter"]
+pub struct ZerorouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -3356,6 +3395,7 @@ impl_default_family_endpoint! {
     VeniceModelProviderConfig,
     NearaiModelProviderConfig,
     NovitaModelProviderConfig,
+    ZerorouterModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
@@ -5157,6 +5197,12 @@ impl Default for McpConfig {
 /// a credential chain verifier. Until one exists the `vi_verify` tool is
 /// withheld from the model-visible registry, so neither key below enables
 /// verification of a credential. The library paths are unaffected.
+///
+/// Enabling the section reports that gap two ways. The runtime traces it at
+/// each config application, which needs log persistence to be on to reach a
+/// sink. `zeroclaw doctor` and the config API also report it as the
+/// `verifiable_intent_tool_withheld` validation warning, which stays available
+/// when persistence is off.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
@@ -20210,6 +20256,40 @@ impl Config {
         }
     }
 
+    /// Report that opting into `[verifiable_intent]` does not currently enable
+    /// credential verification, because `vi_verify` is withheld from the
+    /// model-visible registry until a chain verifier exists.
+    ///
+    /// The runtime already traces this at config load. That trace reaches a
+    /// sink only when log persistence is on, so under
+    /// `observability.log_persistence = "none"` it is delivered nowhere. This
+    /// warning is the channel that survives: `zeroclaw doctor` prints the
+    /// structured list to stdout and the config API returns it in its
+    /// response, neither of which depends on the log writer.
+    ///
+    /// Same class as `memory_config_knob_inert` — a knob that is set, accepted,
+    /// and currently has no runtime consumer.
+    ///
+    /// The change that re-registers `vi_verify` must delete this check and the
+    /// runtime trace together, or an operator is told the capability is
+    /// unavailable while the model is calling it.
+    fn collect_verifiable_intent_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.verifiable_intent.enabled {
+            return;
+        }
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+            "verifiable_intent.enabled is set, but the vi_verify tool is withheld from the \
+             model-visible registry until a credential chain verifier exists. Enabling the \
+             section does not enable credential verification on commerce tool calls. The \
+             issuance and verification library paths are unaffected.",
+            "verifiable_intent.enabled",
+        ));
+    }
+
     /// Collect non-fatal validation warnings — config that loads and
     /// validates successfully (`validate()` returns `Ok(())`) but will fail
     /// at runtime because of a logical inconsistency the schema cannot
@@ -20236,6 +20316,7 @@ impl Config {
         // warning when the more specific cross-provider diagnostic already
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
+        self.collect_verifiable_intent_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -21675,9 +21756,25 @@ impl Config {
         // Non-fatal validation warnings: surfaced both via tracing (CLI sees
         // on stderr) and via Config::collect_warnings (gateway HTTP returns
         // structured to dashboard callers). Single source of truth lives in
-        // collect_warnings; emit each one to tracing here so the existing
-        // log behavior is preserved.
+        // collect_warnings; emit them to tracing here so the existing log
+        // behavior is preserved, with the single documented exception below.
         for w in self.collect_warnings() {
+            // One code is held back from this loop on purpose. The runtime
+            // already records the withheld-capability notice itself, with an
+            // explicit `System` category and the same code and path, once at
+            // every config application. Records emitted here carry no category
+            // and are stored as `internal`, which the dashboard Logs view hides
+            // by default, so tracing it here as well leaves a hidden second copy
+            // of a notice an operator is supposed to read. Every command that
+            // loads config a second time inside a live process writes that pair.
+            //
+            // `collect_warnings` still returns it, so `zeroclaw doctor` and the
+            // config API report it exactly as before; only this tracing copy is
+            // dropped. The change that re-registers the tool retires this skip
+            // together with the runtime record it defers to.
+            if w.code == crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD {
+                continue;
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -22618,31 +22715,40 @@ impl Config {
             );
         }
 
-        // The granted egress allowlist is a security control, so a
-        // malformed entry is a hard config error rather than a silently
-        // dropped line. Both lists validate against the one shared strict
-        // grammar in `zeroclaw_infra::net_guard`.
+        // The granted egress allowlist is a security control, so a malformed
+        // entry is a hard config error rather than a silently dropped line.
+        // Both lists validate against the one shared strict grammar in
+        // `zeroclaw_infra::net_guard`, including containment of the private
+        // address carveout by the host grant.
         for entry in &self.plugins.entries {
-            for (field, patterns) in [
-                ("egress_hosts", &entry.egress_hosts),
-                ("egress_allow_private", &entry.egress_allow_private),
-            ] {
-                let path = format!("plugins.entries.{}.{field}", entry.name);
-                if let Err(e) =
-                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
-                {
-                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+            let hosts = {
+                let path = format!("plugins.entries.{}.egress_hosts", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_hosts,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
-            }
+            };
+            let private = {
+                let path = format!("plugins.entries.{}.egress_allow_private", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_allow_private,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                }
+            };
 
             // A carveout for a host that was never granted is almost always a
             // typo, and silently ignoring it leaves an operator believing they
             // opened a path they did not.
-            for private in &entry.egress_allow_private {
-                if !zeroclaw_infra::net_guard::egress_host_matches(
-                    private.trim_start_matches("*."),
-                    &entry.egress_hosts,
-                ) && !entry.egress_hosts.iter().any(|h| h == private)
+            for private in &private {
+                if !hosts
+                    .iter()
+                    .any(|grant| zeroclaw_infra::net_guard::egress_pattern_contains(grant, private))
                 {
                     validation_bail!(
                         InvalidFormat,
@@ -26210,6 +26316,19 @@ enabled = true
     }
 
     #[test]
+    async fn validate_accepts_canonical_equivalent_ipv6_and_wildcard_carveouts() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["[::1]", "*.example.com"],
+            &["[::1]", "*.sub.example.com"],
+        ));
+
+        config
+            .validate()
+            .expect("equivalent IPv6 and narrower wildcard grants must validate");
+    }
+
+    #[test]
     async fn validate_rejects_an_allow_all_egress_entry() {
         let mut config = Config::default();
         config
@@ -26262,6 +26381,21 @@ enabled = true
             text.contains("egress_allow_private"),
             "error must name the offending path; got: {text}"
         );
+        assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    #[test]
+    async fn validate_rejects_a_wildcard_carveout_for_an_exact_apex_grant() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["example.com"],
+            &["*.example.com"],
+        ));
+        let err = config
+            .validate()
+            .expect_err("a wildcard carveout must not widen an exact grant");
+        let text = err.to_string();
+        assert!(text.contains("egress_allow_private"), "got: {text}");
         assert!(text.contains("not granted by egress_hosts"), "got: {text}");
     }
 
@@ -34090,6 +34224,97 @@ group_policy = "disabled"
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
         );
+    }
+
+    /// The section is opt-in, so an operator who has not touched it is told
+    /// nothing.
+    #[test]
+    async fn verifiable_intent_disabled_does_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(!config.verifiable_intent.enabled);
+
+        assert!(
+            !config
+                .collect_warnings()
+                .iter()
+                .any(|w| w.code == "verifiable_intent_tool_withheld"),
+        );
+    }
+
+    /// Opting in produces the structured warning. This is the delivery path
+    /// that survives `observability.log_persistence = "none"`, since
+    /// `zeroclaw doctor` prints this list to stdout and the config API returns
+    /// it, neither of which goes through the log writer.
+    #[test]
+    async fn verifiable_intent_enabled_warns_that_the_tool_is_withheld() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.verifiable_intent.enabled = true;
+
+        let warnings = config.collect_warnings();
+        let withheld: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.code == "verifiable_intent_tool_withheld")
+            .collect();
+
+        assert_eq!(withheld.len(), 1, "exactly one notice, got {warnings:?}");
+        assert_eq!(withheld[0].path, "verifiable_intent.enabled");
+        assert!(
+            withheld[0].message.contains("vi_verify"),
+            "the message must name the withheld tool: {}",
+            withheld[0].message
+        );
+    }
+
+    /// Every `LogPersistence` variant, walked through a `match` rather than
+    /// listed.
+    ///
+    /// Adding a variant makes the `match` non-exhaustive, so a new policy forces
+    /// a decision here instead of being covered silently. An array literal keeps
+    /// compiling unchanged and covers one policy less.
+    ///
+    /// The compile error is the whole of the guarantee. An arm returning `None`
+    /// satisfies it while leaving the variant out of the returned list, so this
+    /// forces the update to be considered rather than making it correct.
+    fn every_log_persistence() -> Vec<LogPersistence> {
+        let mut all = Vec::new();
+        let mut next = Some(LogPersistence::None);
+        while let Some(policy) = next {
+            all.push(policy);
+            next = match policy {
+                LogPersistence::None => Some(LogPersistence::Rolling),
+                LogPersistence::Rolling => Some(LogPersistence::Full),
+                LogPersistence::Full => Some(LogPersistence::Rotating),
+                LogPersistence::Rotating => None,
+            };
+        }
+        all
+    }
+
+    /// The config surface does not consult the observability policy, which is
+    /// the property that makes it a second channel rather than a second copy
+    /// of the same one. Asserting it here pins the independence at the unit
+    /// level; the process-level proof lives in the component test.
+    ///
+    /// Every current variant is covered rather than the three that motivated the
+    /// change. See [`every_log_persistence`] for the extent of that.
+    #[test]
+    async fn verifiable_intent_warning_is_independent_of_log_persistence() {
+        for policy in every_log_persistence() {
+            let mut config = Config::default();
+            suppress_semantic_memory_warning(&mut config);
+            config.verifiable_intent.enabled = true;
+            config.observability.log_persistence = policy;
+
+            assert!(
+                config
+                    .collect_warnings()
+                    .iter()
+                    .any(|w| w.code == "verifiable_intent_tool_withheld"),
+                "the notice must survive log_persistence = {policy:?}",
+            );
+        }
     }
 
     #[cfg(unix)]
