@@ -56,6 +56,22 @@ const RELAY_OVERRUN_TOLERANCE: u64 = INITIAL_WINDOW as u64;
 /// the relay gives up and drops it.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long the relay will hold a task and its TLS session open purely to
+/// deliver a refusal on a connection it is closing anyway.
+///
+/// The refusal is a courtesy: the connection is going away whether or not the
+/// peer ever reads it, so the only question is how long we are willing to wait
+/// to say goodbye politely. Five seconds is generous for one small frame to a
+/// live peer, and short enough that a peer which never reads cannot
+/// meaningfully accumulate relay tasks by tripping refusals on purpose.
+///
+/// Deliberately NOT the setup deadline: that one is absolute and measured from
+/// accept, so on a long-lived admitted connection hitting `daemon_gone` it
+/// expired hours ago, and the refusal window would depend on connection age.
+/// Deliberately NOT `idle_timeout` either: that is a liveness policy for an
+/// established pump, not a bound on a single write.
+const REFUSAL_WRITE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Which daemons may register a rendezvous on this relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
@@ -680,9 +696,13 @@ where
         }
         Some(other) => {
             drop(permit);
-            let _ = send_control(
+            // Still a setup-phase write even though the permit is already back:
+            // a peer that sends a junk first frame and stops reading would
+            // otherwise park this task and its TLS session with no deadline.
+            let _ = send_setup_control(
                 &mut ws,
                 &Control::error("bad_first_frame", format!("unexpected {other:?}")),
+                deadline,
             )
             .await;
             Ok(())
@@ -691,15 +711,23 @@ where
     }
 }
 
-/// Send one SETUP frame under the shared absolute setup deadline.
+/// Send one SETUP frame under the shared absolute setup deadline. The bounded
+/// best-effort write primitive; [`send_refusal`] is the same mechanism on the
+/// post-classification budget.
 ///
-/// Both outbound setup writes (`Challenge`, `Registered`) go to a
-/// peer-controlled sink. Awaited bare, a peer that completes the upgrade and
-/// then stops reading can park the relay inside `send` indefinitely - holding a
-/// task, a TLS session and the pre-classification permit past the whole
-/// documented `handshake_timeout` budget. Returns false when the frame could not
-/// be delivered inside that budget (link error or deadline); the caller then
-/// tears the setup down through its normal cleanup path.
+/// EVERY write the relay makes before a connection is fully admitted goes
+/// through here: the `Challenge` and `Registered` confirmations and, just as
+/// importantly, every refusal (`forbidden`, `bad_sig`, `node_taken`,
+/// `registry_full`, ...). All of them target a peer-controlled sink. Awaited
+/// bare, a peer that triggers a refusal and then stops reading parks the relay
+/// inside `send` once the socket buffer fills - holding a task, a TLS session
+/// and the pre-classification permit past the whole documented
+/// `handshake_timeout` budget. The reply is a courtesy; the budget is not.
+///
+/// Returns false when the frame could not be delivered inside that budget (link
+/// error or deadline). Refusal paths ignore the result - they were ending the
+/// connection either way - and the caller tears down through its normal cleanup
+/// path, releasing the permit with it.
 async fn send_setup_control<S>(
     ws: &mut WebSocketStream<S>,
     frame: &Control,
@@ -712,6 +740,40 @@ where
         tokio::time::timeout_at(deadline, send_control(ws, frame)).await,
         Ok(Ok(()))
     )
+}
+
+/// Best-effort refusal on a connection that is already being torn down, bounded
+/// by [`REFUSAL_WRITE_BUDGET`].
+///
+/// The post-classification counterpart to the setup-phase writes: the same
+/// peer-controlled-sink problem (a client that trips a refusal and then stops
+/// reading parks a task and its TLS session once the socket buffer fills), on
+/// its own budget because the setup deadline no longer means anything here.
+/// The result is discarded on purpose - the caller is returning either way.
+async fn send_refusal<S>(ws: &mut WebSocketStream<S>, frame: &Control)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + REFUSAL_WRITE_BUDGET;
+    let _ = send_setup_control(ws, frame, deadline).await;
+}
+
+/// [`send_refusal`] for a connection whose socket has already been split: once
+/// the pump owns the halves, the goodbye frame goes out through the write half.
+///
+/// Only for frames the caller follows with a `break`/`return`. The pump's
+/// ordinary data and flow-control writes are NOT refusals: blocking on a slow
+/// reader there is legitimate backpressure, and the credit window is what
+/// bounds it.
+async fn send_refusal_to_sink<K>(sink: &mut K, frame: &Control)
+where
+    K: futures_util::Sink<Message> + Unpin,
+{
+    let _ = tokio::time::timeout(
+        REFUSAL_WRITE_BUDGET,
+        sink.send(Message::text(frame.to_json())),
+    )
+    .await;
 }
 
 /// Drop a registration and tear down its client conns - but ONLY if the registry
@@ -859,7 +921,7 @@ where
     // verification on it: it is the registry key, so it must be bounded and
     // printable regardless of who is asking.
     if !valid_node_id(&node_id) {
-        let _ = send_control(
+        let _ = send_setup_control(
             &mut ws,
             &Control::error(
                 "bad_node_id",
@@ -867,6 +929,7 @@ where
                     "node-id must be 1..={MAX_NODE_ID_LEN} bytes of printable ASCII without spaces"
                 ),
             ),
+            deadline,
         )
         .await;
         return Ok(());
@@ -880,27 +943,42 @@ where
     if let Some(required) = &policy.relay_token
         && relay_token.as_deref() != Some(required.as_str())
     {
-        let _ = send_control(&mut ws, &Control::error("forbidden", "bad relay token")).await;
+        let _ = send_setup_control(
+            &mut ws,
+            &Control::error("forbidden", "bad relay token"),
+            deadline,
+        )
+        .await;
         return Ok(());
     }
 
     let pubkey = match B64.decode(daemon_pubkey.as_bytes()) {
         Ok(k) => k,
         Err(_) => {
-            let _ = send_control(&mut ws, &Control::error("bad_pubkey", "not base64")).await;
+            let _ = send_setup_control(
+                &mut ws,
+                &Control::error("bad_pubkey", "not base64"),
+                deadline,
+            )
+            .await;
             return Ok(());
         }
     };
     let fpr = hex::encode(Sha256::digest(&pubkey));
     if !policy.admit(&fpr) {
-        let _ = send_control(&mut ws, &Control::error("forbidden", "registration denied")).await;
+        let _ = send_setup_control(
+            &mut ws,
+            &Control::error("forbidden", "registration denied"),
+            deadline,
+        )
+        .await;
         return Ok(());
     }
 
     // Challenge / verify: prove possession of the private key over a fresh nonce.
     let mut nonce = [0u8; 32];
     if SystemRandom::new().fill(&mut nonce).is_err() {
-        let _ = send_control(&mut ws, &Control::error("internal", "rng")).await;
+        let _ = send_setup_control(&mut ws, &Control::error("internal", "rng"), deadline).await;
         return Ok(());
     }
     // The write itself shares the setup deadline: nothing has been allocated for
@@ -923,22 +1001,29 @@ where
         Ok(Some(Control::Register { node_id, sig })) => (node_id, sig),
         Err(_) => return Ok(()), // stalled after Hello; reap without a reply
         Ok(_) => {
-            let _ = send_control(
+            let _ = send_setup_control(
                 &mut ws,
                 &Control::error("bad_register", "expected register"),
+                deadline,
             )
             .await;
             return Ok(());
         }
     };
     if reg_node != node_id {
-        let _ = send_control(&mut ws, &Control::error("bad_register", "node_id mismatch")).await;
+        let _ = send_setup_control(
+            &mut ws,
+            &Control::error("bad_register", "node_id mismatch"),
+            deadline,
+        )
+        .await;
         return Ok(());
     }
     let sig = match B64.decode(sig_b64.as_bytes()) {
         Ok(s) => s,
         Err(_) => {
-            let _ = send_control(&mut ws, &Control::error("bad_sig", "not base64")).await;
+            let _ = send_setup_control(&mut ws, &Control::error("bad_sig", "not base64"), deadline)
+                .await;
             return Ok(());
         }
     };
@@ -946,7 +1031,12 @@ where
         .verify(&nonce, &sig)
         .is_err()
     {
-        let _ = send_control(&mut ws, &Control::error("bad_sig", "signature invalid")).await;
+        let _ = send_setup_control(
+            &mut ws,
+            &Control::error("bad_sig", "signature invalid"),
+            deadline,
+        )
+        .await;
         return Ok(());
     }
 
@@ -968,9 +1058,10 @@ where
             && existing.fpr != fpr
         {
             drop(daemons);
-            let _ = send_control(
+            let _ = send_setup_control(
                 &mut ws,
                 &Control::error("node_taken", "node-id bound to another key"),
+                deadline,
             )
             .await;
             return Ok(());
@@ -980,7 +1071,7 @@ where
         // a genuinely new node-id has to fit under the ceiling.
         if !daemons.contains_key(&node_id) && daemons.len() >= inner.max_registered_nodes {
             drop(daemons);
-            let _ = send_control(
+            let _ = send_setup_control(
                 &mut ws,
                 &Control::error(
                     "registry_full",
@@ -989,6 +1080,7 @@ where
                         inner.max_registered_nodes
                     ),
                 ),
+                deadline,
             )
             .await;
             return Ok(());
@@ -1191,8 +1283,9 @@ where
     let Some((to_daemon, conns, metrics, connect_bucket)) = handle else {
         // Reply AFTER the registry guard is released: this send awaits a
         // peer-controlled sink, and a client that stops reading must stall
-        // only itself, never the relay-wide daemon registry.
-        let _ = send_control(&mut ws, &Control::error("no_such_node", node_id)).await;
+        // only itself, never the relay-wide daemon registry. Bounded, so it
+        // cannot stall even itself indefinitely.
+        send_refusal(&mut ws, &Control::error("no_such_node", node_id)).await;
         return Ok(());
     };
 
@@ -1200,7 +1293,7 @@ where
     // is rejected before any conn state is allocated.
     if !connect_bucket.lock().await.try_take() {
         metrics.connects_rejected.fetch_add(1, Ordering::Relaxed);
-        let _ = send_control(
+        send_refusal(
             &mut ws,
             &Control::error("rate_limited", "too many connects to this node"),
         )
@@ -1214,7 +1307,7 @@ where
         let mut cs = conns.lock().await;
         if cs.len() >= inner.max_conns_per_node {
             drop(cs);
-            let _ = send_control(&mut ws, &Control::error("busy", "node at capacity")).await;
+            send_refusal(&mut ws, &Control::error("busy", "node at capacity")).await;
             return Ok(());
         }
         cs.insert(conn_id, conn_tx);
@@ -1235,7 +1328,7 @@ where
         .is_err()
     {
         conns.lock().await.remove(&conn_id);
-        let _ = send_control(&mut ws, &Control::error("no_such_node", "daemon gone")).await;
+        send_refusal(&mut ws, &Control::error("no_such_node", "daemon gone")).await;
         return Ok(());
     }
 
@@ -1267,15 +1360,35 @@ where
                 .to_json(),
             ))
             .await;
-        let _ = sink
-            .send(Message::text(
-                Control::error("timeout", "daemon did not accept").to_json(),
-            ))
-            .await;
+        // Same courtesy, same budget: a client that asked for a route, never got
+        // one, and is not reading must not park this task either.
+        send_refusal_to_sink(
+            &mut sink,
+            &Control::error("timeout", "daemon did not accept"),
+        )
+        .await;
         return Ok(());
     }
-    sink.send(Message::text(Control::Opened { conn_id }.to_json()))
-        .await?;
+    // The first write of an ESTABLISHED conn, not a courtesy: the route is
+    // paired and this frame is load-bearing protocol, so it gets the
+    // established-connection liveness policy (`idle_timeout`) rather than
+    // REFUSAL_WRITE_BUDGET. A client that asked for a route, was paired, and
+    // then stops reading is exactly what `idle_timeout` describes, and timing
+    // out here behaves as the pump's idle path does: break to teardown.
+    //
+    // Routed through `release_conn` rather than `?` so the daemon is told to
+    // drop its half; returning early here left the pairing half-open.
+    let idle = inner.idle_timeout;
+    if !matches!(
+        tokio::time::timeout(
+            idle,
+            sink.send(Message::text(Control::Opened { conn_id }.to_json())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return release_conn(&to_daemon, &conns, conn_id).await;
+    }
 
     // Pump bytes both ways until either side closes or the conn goes idle. The
     // idle deadline is reset at the top of every iteration, so ANY frame -
@@ -1287,7 +1400,6 @@ where
     // DATA frame debits it. A client that drives it far past zero is ignoring
     // flow control and flooding the shared link, so the relay tears the conn
     // down (A6). The relay never originates credit; it only forwards + watches.
-    let idle = inner.idle_timeout;
     let mut c2d_window = ConnWindow::new(INITIAL_WINDOW);
     loop {
         let deadline = tokio::time::Instant::now() + idle;
@@ -1321,9 +1433,9 @@ where
                     }
                 }
                 Some(ConnEvent::Close(reason)) => {
-                    let _ = sink
-                        .send(Message::text(Control::Close { conn_id, reason }.to_json()))
-                        .await;
+                    // Teardown courtesy: this conn is over either way, so the
+                    // goodbye gets the refusal budget, not an open-ended await.
+                    send_refusal_to_sink(&mut sink, &Control::Close { conn_id, reason }).await;
                     break;
                 }
                 Some(ConnEvent::Opened) => {}
@@ -1339,12 +1451,15 @@ where
                     }
                     c2d_window.debit(payload.len());
                     if c2d_window.overrun() > RELAY_OVERRUN_TOLERANCE {
-                        let _ = sink
-                            .send(Message::text(
-                                Control::error("rate_limited", "flow-control window exceeded")
-                                    .to_json(),
-                            ))
-                            .await;
+                        // A client is only here because it is flooding past its
+                        // window. Bounded on purpose: unbounded, the very frame
+                        // that sheds an abusive client would let that client
+                        // pin this task by simply not reading it.
+                        send_refusal_to_sink(
+                            &mut sink,
+                            &Control::error("rate_limited", "flow-control window exceeded"),
+                        )
+                        .await;
                         break;
                     }
                     if to_daemon
@@ -1382,7 +1497,18 @@ where
                     _ => {}
                 },
                 Some(Ok(Message::Ping(p))) => {
-                    let _ = sink.send(Message::Pong(p)).await;
+                    // Peer-triggered and NOT credit-controlled: a client can
+                    // ping and then stop reading, so unlike the DATA writes
+                    // below this one is not bounded by the send window. Same
+                    // rule as the `Opened` write - established-connection
+                    // traffic gets the established-connection budget, and
+                    // missing it means the peer is gone, so break to teardown.
+                    if tokio::time::timeout(idle, sink.send(Message::Pong(p)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
@@ -1391,7 +1517,24 @@ where
         }
     }
 
-    // Tell the daemon to release the conn and unregister it.
+    release_conn(&to_daemon, &conns, conn_id).await
+}
+
+/// Release one client conn: tell the daemon to drop its half of the pairing and
+/// forget the relay-side route.
+///
+/// EVERY exit from a paired conn goes through here. It used to be inline at the
+/// end of the pump only, so the `?` on the `Opened` write returned past it: a
+/// client that never took its `Opened` left the daemon believing the logical
+/// connection was live and left the relay-side `conns` entry behind, to be
+/// reaped lazily only if the daemon happened to send something for that
+/// conn_id. Sharing one teardown is what keeps a half-finished pairing from
+/// lingering on the daemon side.
+async fn release_conn(
+    to_daemon: &mpsc::Sender<Message>,
+    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    conn_id: u64,
+) -> Result<()> {
     let _ = to_daemon
         .send(Message::text(
             Control::Close {
@@ -1766,12 +1909,24 @@ mod registration_tests {
         /// Answer a challenge with a valid `Register`, then stop. The peer does
         /// NOT read the confirmation that follows.
         async fn register(&mut self, nonce: &[u8]) {
-            let sig = self.kp.sign(nonce);
+            let sig = self.kp.sign(nonce).as_ref().to_vec();
+            self.send_register(&sig).await;
+        }
+
+        /// Answer a challenge with a signature that does NOT verify, then stop.
+        /// Drives the relay onto its `bad_sig` refusal.
+        async fn register_with_invalid_signature(&mut self, nonce: &[u8]) {
+            let mut sig = self.kp.sign(nonce).as_ref().to_vec();
+            sig[0] ^= 0xff;
+            self.send_register(&sig).await;
+        }
+
+        async fn send_register(&mut self, sig: &[u8]) {
             self.ws
                 .send(Message::text(
                     Control::Register {
                         node_id: self.node_id.clone(),
-                        sig: B64.encode(sig.as_ref()),
+                        sig: B64.encode(sig),
                     }
                     .to_json(),
                 ))
@@ -1792,6 +1947,18 @@ mod registration_tests {
         server: &RelayServer,
         node_id: &str,
         link_buffer: usize,
+    ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
+        start_registration_with(server, node_id, link_buffer, None).await
+    }
+
+    /// As [`start_registration`], with the `relay_token` the peer presented in
+    /// its `Hello` (the shared-secret gate the relay checks before anything
+    /// else it might reply with).
+    async fn start_registration_with(
+        server: &RelayServer,
+        node_id: &str,
+        link_buffer: usize,
+        relay_token: Option<String>,
     ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
         let (peer_io, relay_io) = tokio::io::duplex(link_buffer);
         let dead = Arc::new(AtomicBool::new(false));
@@ -1819,7 +1986,7 @@ mod registration_tests {
         let deadline = tokio::time::Instant::now() + inner.handshake_timeout;
         let node = node_id.to_string();
         let task = tokio::spawn(async move {
-            handle_daemon(inner, relay_ws, pubkey, node, None, permit, deadline).await
+            handle_daemon(inner, relay_ws, pubkey, node, relay_token, permit, deadline).await
         });
         (
             PeerLink {
@@ -1918,6 +2085,87 @@ mod registration_tests {
         drop(peer);
     }
 
+    /// A REFUSED registration is the same resource story as an accepted one.
+    /// The relay's error replies are peer-controlled sink writes too, so a peer
+    /// that deliberately trips one and then stops reading would otherwise pin a
+    /// `max_pending_handshakes` permit (and its TLS/WebSocket state) for as long
+    /// as it likes - the documented setup budget having long since elapsed.
+    /// Repeated across enough source addresses that exhausts the global
+    /// pre-classification bound using nothing but invalid handshakes.
+    ///
+    /// Early path: the shared-secret gate, which the relay checks before it has
+    /// written anything at all, so the refusal is the FIRST write on the link.
+    #[tokio::test]
+    async fn refused_hello_does_not_pin_a_permit_past_the_deadline() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 1,
+            handshake_timeout: Duration::from_millis(400),
+            relay_token: Some("expected-secret".into()),
+            ..RelayConfig::default()
+        });
+        let started = tokio::time::Instant::now();
+        // Wrong token, and a link too small to absorb the refusal from a peer
+        // that never reads it.
+        let (peer, task) =
+            start_registration_with(&server, "node-badtoken", 8, Some("wrong".into())).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            finished.is_ok(),
+            "a refusal write must share the one setup deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the refusal was reaped after {:?}, far past the 400ms setup budget",
+            started.elapsed()
+        );
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "a refused Hello must return its pre-classification permit"
+        );
+        drop(peer);
+    }
+
+    /// Post-Hello path: an invalid signature. The peer takes the challenge
+    /// (which is what proves the relay is parked reading and cannot write again
+    /// until it consumes the next frame), answers it with a signature that does
+    /// not verify, and stops reading - so the `bad_sig` refusal is
+    /// deterministically the write that stalls.
+    #[tokio::test]
+    async fn refused_register_does_not_pin_a_permit_past_the_deadline() {
+        let server = RelayServer::new(RelayConfig {
+            max_pending_handshakes: 1,
+            handshake_timeout: Duration::from_millis(400),
+            ..RelayConfig::default()
+        });
+        let started = tokio::time::Instant::now();
+        let (mut peer, task) = start_registration(&server, "node-badsig", 32).await;
+        let nonce = peer.challenge().await;
+        peer.register_with_invalid_signature(&nonce).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            finished.is_ok(),
+            "the bad_sig refusal must share the one setup deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the refusal was reaped after {:?}, far past the 400ms setup budget",
+            started.elapsed()
+        );
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            1,
+            "a refused Register must return its pre-classification permit"
+        );
+        assert!(
+            server.inner.daemons.lock().await.is_empty(),
+            "a refused registration must not have touched the registry"
+        );
+        drop(peer);
+    }
+
     /// The other outbound setup write. A peer that completes the WebSocket
     /// upgrade and then stops reading must not be able to park the relay - and
     /// its permit - inside the `Challenge` send, outside the setup budget.
@@ -1939,6 +2187,166 @@ mod registration_tests {
             server.inner.handshake_permits.available_permits(),
             1,
             "a permit must not be pinned by a peer that stops reading mid-setup"
+        );
+        drop(peer);
+    }
+}
+
+/// Post-classification refusal writes (August review, follow-up). A client that
+/// is refused a route holds no handshake permit, so it cannot exhaust
+/// `max_pending_handshakes` - but nothing else bounded the goodbye frame either.
+/// A peer that asks for a route it cannot have and then stops reading parked the
+/// relay task and its TLS session with no deadline at all: the setup budget is
+/// spent by then, and `idle_timeout` only starts inside the pump loop this
+/// connection never reaches. Repeated across source addresses that accumulates
+/// relay tasks using nothing but well-formed, promptly-refused requests.
+#[cfg(test)]
+mod client_refusal_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// The test runs on a PAUSED clock: tokio auto-advances it whenever every
+    /// task is parked, so the real 5s budget elapses in microseconds of wall
+    /// time and `elapsed()` reports the exact virtual budget that fired. If the
+    /// refusal write is unbounded, no relay timer exists at all and the only
+    /// timer left is this test's own guard - which is what makes the failure
+    /// visible instead of hanging the suite.
+    #[tokio::test(start_paused = true)]
+    async fn refused_client_connect_does_not_park_the_relay() {
+        let server = RelayServer::new(RelayConfig::default());
+        // A link far too small for the refusal frame, and a peer that never
+        // reads it: `peer` is held to keep the link open, never polled.
+        let (peer_io, relay_io) = tokio::io::duplex(8);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+
+        let inner = server.inner.clone();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, "no-such-node".into(), ClientRoute::Wss).await
+        });
+
+        let finished = tokio::time::timeout(REFUSAL_WRITE_BUDGET * 4, task).await;
+        assert!(
+            finished.is_ok(),
+            "a refused client must not park the relay task on an unread goodbye frame"
+        );
+        assert!(
+            started.elapsed() < REFUSAL_WRITE_BUDGET * 2,
+            "the refusal took {:?}, past the {REFUSAL_WRITE_BUDGET:?} courtesy budget",
+            started.elapsed()
+        );
+        drop(peer);
+    }
+}
+
+/// The success path's one pre-pump write. A client that asks for a route, gets
+/// PAIRED, and then stops reading is not a refusal case - the frame is
+/// load-bearing protocol - so it is bounded by the established-connection
+/// liveness policy (`idle_timeout`) and tears down exactly as the pump's idle
+/// path does. Unbounded, it parked the relay task; worse, the `?` that used to
+/// end it returned past the teardown, so the daemon was never told to drop its
+/// half of the pairing.
+#[cfg(test)]
+mod paired_client_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// Register a routable node directly, so the test can play the daemon
+    /// without standing up a second handshake.
+    async fn register_stub_daemon(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (
+        mpsc::Receiver<Message>,
+        Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+    ) {
+        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(8);
+        let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        server.inner.daemons.lock().await.insert(
+            node_id.to_string(),
+            DaemonHandle {
+                fpr: "stub-fingerprint".into(),
+                epoch: 1,
+                to_daemon,
+                conns: conns.clone(),
+                metrics: Arc::new(NodeMetrics::default()),
+                connect_bucket: Arc::new(Mutex::new(TokenBucket::new(60, 20.0))),
+                supersede: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        (daemon_rx, conns)
+    }
+
+    /// Paused clock (see `client_refusal_tests`): the virtual `idle_timeout`
+    /// elapses in no wall time, and `elapsed()` reports which budget fired.
+    /// A 2s idle timeout against a 4s assertion also pins the CHOICE of budget:
+    /// the 5s courtesy budget would overshoot it.
+    #[tokio::test(start_paused = true)]
+    async fn paired_client_that_never_reads_is_reaped_and_releases_the_daemon() {
+        let idle = Duration::from_secs(2);
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: idle,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node-paired").await;
+
+        // A link far too small for the `Opened` frame, and a client that never
+        // reads it: `peer` is held to keep the link open, never polled.
+        let (peer_io, relay_io) = tokio::io::duplex(8);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+
+        let inner = server.inner.clone();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, "node-paired".into(), ClientRoute::Wss).await
+        });
+
+        // Play the daemon: take the Open and accept it, so the conn is PAIRED
+        // before the relay tries to tell the client about it.
+        let open = daemon_rx.recv().await.expect("the relay asks for an Open");
+        let conn_id = match Control::from_json(&open.into_text().expect("text frame")) {
+            Ok(Control::Open { conn_id, .. }) => conn_id,
+            other => panic!("expected an Open, got {other:?}"),
+        };
+        let conn_tx = conns
+            .lock()
+            .await
+            .get(&conn_id)
+            .cloned()
+            .expect("the relay registered the conn");
+        conn_tx
+            .send(ConnEvent::Opened)
+            .await
+            .expect("accept the pairing");
+
+        let finished = tokio::time::timeout(idle * 8, task).await;
+        assert!(
+            finished.is_ok(),
+            "a paired client that never reads its Opened must not park the relay task"
+        );
+        assert!(
+            started.elapsed() < idle * 2,
+            "the conn was reaped after {:?}, past the {idle:?} idle budget",
+            started.elapsed()
+        );
+
+        // The daemon side must not half-linger: it is told to release its half,
+        // and the relay-side route is forgotten.
+        let close = daemon_rx
+            .recv()
+            .await
+            .expect("the daemon is told to release its half");
+        let text = close.into_text().expect("text frame");
+        assert!(
+            text.contains("client_gone") && text.contains(&format!("\"conn_id\":{conn_id}")),
+            "expected a Close for this conn, got: {text}"
+        );
+        assert!(
+            !conns.lock().await.contains_key(&conn_id),
+            "the relay-side route must be forgotten with the client"
         );
         drop(peer);
     }
