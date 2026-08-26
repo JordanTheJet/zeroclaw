@@ -20,10 +20,13 @@ use futures_util::{SinkExt, StreamExt};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
+// Every deadline in this module is a runtime deadline, so the runtime clock is
+// the one that must measure it (and the one a paused-clock test drives).
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 // The runtime depends on tokio-rustls (not rustls directly); use its re-export.
 use tokio_rustls::rustls;
@@ -53,6 +56,21 @@ const ESTABLISHED: Duration = Duration::from_secs(5);
 const KEEPALIVE: Duration = Duration::from_secs(20);
 /// Declare the link dead if nothing has been heard for this long.
 const DEAD_AFTER: Duration = Duration::from_secs(60);
+/// ONE absolute budget for the entire outbound setup: TCP connect, outer TLS,
+/// the WebSocket upgrade, and the signed Hello/Challenge/Register/Registered
+/// exchange. A fresh timeout per phase would let an unresponsive relay spend the
+/// whole budget in EACH phase, making the effective wait a multiple of it.
+/// Sized above the relay's own 10s default handshake budget, so a healthy relay
+/// always ends the exchange first, and never above [`ROTATION_READY_TIMEOUT`],
+/// so a candidate rotation link cannot still be setting up after the window in
+/// which it may still replace the published route.
+const SETUP_DEADLINE: Duration = Duration::from_secs(30);
+/// Bound on one outbound frame write once the link is established. The
+/// tungstenite sink reports no partial progress, so from here a relay that has
+/// stopped reading is indistinguishable from one that is merely slow; the bound
+/// is therefore the same silence budget the keepalive watchdog applies, which no
+/// healthy link reaches for a single frame of at most `MAX_WS_MESSAGE`.
+const WRITE_STALL: Duration = DEAD_AFTER;
 /// During a node-id rotation, keep the OLD id's link alive this long after the
 /// NEW id registers, so clients mid-session on the old id are not cut off.
 const ROTATION_GRACE: Duration = Duration::from_secs(600);
@@ -484,6 +502,36 @@ async fn serve_once(
 ) -> Result<()> {
     let keypair = Ed25519KeyPair::from_pkcs8(&cfg.signing_key_pkcs8)
         .map_err(|e| anyhow::Error::msg(format!("loading relay signing key: {e}")))?;
+
+    // Bounded, cancellable setup. One absolute deadline spans every await from
+    // the TCP connect through the `Registered` reply, with the daemon
+    // cancellation token biased ahead of it. A relay that accepts a socket and
+    // then stops responding can therefore hold neither shutdown nor the
+    // reconnect progression: cancellation returns immediately and the deadline
+    // fails the attempt so the caller's backoff retries. Dropping the setup
+    // future on either path tears down whatever half-built socket, TLS session,
+    // or WebSocket it was holding.
+    let deadline = Instant::now() + SETUP_DEADLINE;
+    let setup = connect_and_register(cfg, &keypair, registered);
+    let ws = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(()),
+        outcome = tokio::time::timeout_at(deadline, setup) => outcome
+            .map_err(|_| anyhow::Error::msg("relay setup exceeded its bounded budget"))??,
+    };
+
+    serve_established(cfg, cancel, ws).await
+}
+
+/// The entire outbound setup for one link: TCP connect, outer TLS, the relay
+/// WebSocket upgrade, and the signed `Hello` -> `Challenge` -> `Register` ->
+/// `Registered` exchange. Kept as ONE future so the caller can impose a single
+/// absolute budget and cancellation over all of it rather than per phase.
+async fn connect_and_register(
+    cfg: &RelayBridgeConfig,
+    keypair: &Ed25519KeyPair,
+    registered: &mut Option<oneshot::Sender<()>>,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>> {
     let pubkey = keypair.public_key().as_ref().to_vec();
 
     // Outer TLS + WS to the relay. An operator-configured CA wins over remembered
@@ -572,52 +620,34 @@ async fn serve_once(
         }
         other => anyhow::bail!("unexpected relay reply to register: {other:?}"),
     }
+    Ok(ws)
+}
 
+/// Serve one registered link until it is cancelled or declared dead.
+async fn serve_established(
+    cfg: &RelayBridgeConfig,
+    cancel: &CancellationToken,
+    ws: tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Result<()> {
     // Connection bookkeeping + the single outbound write path to the relay.
-    let (to_relay, mut from_tasks) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
+    let (to_relay, from_tasks) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
     let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let link_dead = CancellationToken::new();
 
-    let (mut sink, mut stream) = ws.split();
-    let writer = zeroclaw_spawn::spawn!(async move {
-        while let Some(msg) = from_tasks.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let (sink, mut stream) = ws.split();
+    let writer = {
+        let link_dead = link_dead.clone();
+        zeroclaw_spawn::spawn!(relay_writer(from_tasks, sink, link_dead))
+    };
 
     // Keepalive watchdog: ping below NAT timeout, declare dead on silence.
     {
         let to_relay = to_relay.clone();
         let last_seen = last_seen.clone();
         let link_dead = link_dead.clone();
-        zeroclaw_spawn::spawn!(async move {
-            let mut tick = tokio::time::interval(KEEPALIVE);
-            tick.tick().await; // immediate first tick; skip
-            loop {
-                tokio::select! {
-                    _ = link_dead.cancelled() => break,
-                    _ = tick.tick() => {
-                        if to_relay
-                            .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
-                            .await
-                            .is_err()
-                        {
-                            link_dead.cancel();
-                            break;
-                        }
-                        if last_seen.lock().await.elapsed() > DEAD_AFTER {
-                            link_dead.cancel();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        zeroclaw_spawn::spawn!(keepalive_watchdog(to_relay, last_seen, link_dead));
     }
 
     // Per-node OPEN handshake-rate cap (A6). Single-threaded reader loop, so a
@@ -738,6 +768,86 @@ async fn serve_once(
     link_dead.cancel();
     writer.abort();
     result
+}
+
+/// The single outbound write path to the relay, with the liveness bound that
+/// stops a wedged link from becoming a permanent one.
+///
+/// `SinkExt::send` awaits the peer: a relay that accepts frames and then stops
+/// reading parks this task once the socket buffer fills, the bounded `to_relay`
+/// queue fills behind it, and every producer blocks with it - the reader loop's
+/// pong and close writes and the keepalive watchdog alike - leaving nothing able
+/// to declare the link dead. Each write is therefore bounded by [`WRITE_STALL`].
+///
+/// Exiting for any reason means the link is unusable, so this closes the
+/// receiver before it returns: producers already parked on the queue fail
+/// immediately instead of waiting on a sink nobody is draining, which is what
+/// lets the reader loop reach its cancellation arm and tear the link down.
+async fn relay_writer<S>(
+    mut from_tasks: mpsc::Receiver<tokio_tungstenite::tungstenite::Message>,
+    mut sink: S,
+    link_dead: CancellationToken,
+) where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = link_dead.cancelled() => break,
+            msg = from_tasks.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
+        // A timeout here is a stalled peer, not a slow one: no healthy relay
+        // takes the whole silence budget to accept a single bounded frame.
+        if !matches!(
+            tokio::time::timeout(WRITE_STALL, sink.send(msg)).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+    }
+    from_tasks.close();
+    link_dead.cancel();
+    let _ = tokio::time::timeout(WRITE_STALL, sink.close()).await;
+}
+
+/// Keepalive watchdog: ping below the NAT idle window, and declare the link dead
+/// once nothing has been heard for [`DEAD_AFTER`].
+///
+/// The ping is enqueued with `try_send` deliberately. Awaiting a bounded queue
+/// that a stalled writer has stopped draining parks the watchdog on its own
+/// ping, so the deadline check below - the one check that has to keep running
+/// while the outbound path is stuck - would never run again. A momentarily full
+/// queue is not by itself fatal, since a healthy but busy link drains it;
+/// silence past `DEAD_AFTER` is fatal whether or not the ping went out.
+async fn keepalive_watchdog(
+    to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    last_seen: Arc<Mutex<Instant>>,
+    link_dead: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(KEEPALIVE);
+    tick.tick().await; // immediate first tick; skip
+    loop {
+        tokio::select! {
+            _ = link_dead.cancelled() => break,
+            _ = tick.tick() => {
+                let ping = tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into());
+                if matches!(
+                    to_relay.try_send(ping),
+                    Err(mpsc::error::TrySendError::Closed(_))
+                ) {
+                    link_dead.cancel();
+                    break;
+                }
+                if last_seen.lock().await.elapsed() > DEAD_AFTER {
+                    link_dead.cancel();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn open_route_target<'a>(
@@ -1265,6 +1375,206 @@ mod control_frame_tests {
 
         assert!(oversized.len() > MAX_CONTROL_FRAME);
         assert!(parse_control_text(&oversized).is_none());
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here (the
+// `zeroclaw_spawn::spawn!` attribution rule is for production daemon tasks).
+#[allow(clippy::disallowed_methods)]
+mod link_liveness_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn ping() -> Message {
+        Message::Ping(Vec::new().into())
+    }
+
+    /// Accepts a frame and then never completes the flush: the shape a relay
+    /// takes once it stops reading and the socket buffer is full.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    /// Completes every flush, but only after `delay`: a relay that is slow and
+    /// still reading. The liveness bound must not touch this one.
+    struct SlowSink {
+        delay: Duration,
+        sleeping: Option<Pin<Box<tokio::time::Sleep>>>,
+        delivered: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Sink<Message> for SlowSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            let this = self.as_mut().get_mut();
+            let delay = this.delay;
+            let sleeping = this
+                .sleeping
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match sleeping.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    this.sleeping = None;
+                    this.delivered.fetch_add(1, Ordering::Relaxed);
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // A relay that accepts the socket and stops reading parks the writer inside
+    // `sink.send`. Unbounded, that write never returns, the queue behind it
+    // fills, and every producer parks with it, so nothing is left to declare the
+    // link dead.
+    #[tokio::test(start_paused = true)]
+    async fn writer_declares_the_link_dead_when_the_sink_stalls() {
+        let (to_relay, from_tasks) = mpsc::channel::<Message>(4);
+        let link_dead = CancellationToken::new();
+        let writer = tokio::spawn(relay_writer(from_tasks, StalledSink, link_dead.clone()));
+
+        to_relay.send(ping()).await.expect("queued");
+
+        tokio::time::timeout(WRITE_STALL * 2, link_dead.cancelled())
+            .await
+            .expect("a stalled sink must declare the link dead within WRITE_STALL");
+        assert!(
+            to_relay.send(ping()).await.is_err(),
+            "the writer must close the queue so parked producers fail instead of waiting on it"
+        );
+
+        writer.abort();
+    }
+
+    // The bound is on no progress, not on slow progress: a relay that keeps
+    // reading, however slowly, stays up and every frame is still delivered.
+    #[tokio::test(start_paused = true)]
+    async fn writer_keeps_a_slow_but_reading_relay_alive() {
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let sink = SlowSink {
+            delay: WRITE_STALL / 2,
+            sleeping: None,
+            delivered: delivered.clone(),
+        };
+        let (to_relay, from_tasks) = mpsc::channel::<Message>(4);
+        let link_dead = CancellationToken::new();
+        let writer = tokio::spawn(relay_writer(from_tasks, sink, link_dead.clone()));
+
+        for _ in 0..4 {
+            to_relay.send(ping()).await.expect("queued");
+        }
+        while delivered.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(WRITE_STALL).await;
+        }
+        assert!(
+            !link_dead.is_cancelled(),
+            "backpressure from a reading relay must not be treated as a dead link"
+        );
+
+        writer.abort();
+    }
+
+    // The watchdog's silence check is the last thing still running when the
+    // outbound path is stuck, so its own ping must never be able to park it.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_declares_the_link_dead_while_the_queue_is_full() {
+        let (to_relay, _from_tasks) = mpsc::channel::<Message>(1);
+        to_relay.try_send(ping()).expect("prefill");
+        let last_seen = Arc::new(Mutex::new(Instant::now()));
+        let link_dead = CancellationToken::new();
+        tokio::spawn(keepalive_watchdog(to_relay, last_seen, link_dead.clone()));
+
+        tokio::time::timeout(DEAD_AFTER + 2 * KEEPALIVE, link_dead.cancelled())
+            .await
+            .expect("silence past DEAD_AFTER must kill the link even with the queue full");
+    }
+
+    // A full queue on its own is not death: a busy link that is still being
+    // heard from survives well past DEAD_AFTER.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_leaves_a_link_it_still_hears_from_alive() {
+        let (to_relay, mut from_tasks) = mpsc::channel::<Message>(4);
+        let last_seen = Arc::new(Mutex::new(Instant::now()));
+        let link_dead = CancellationToken::new();
+        tokio::spawn(keepalive_watchdog(
+            to_relay,
+            last_seen.clone(),
+            link_dead.clone(),
+        ));
+        // Stand in for the reader loop, which stamps `last_seen` on every
+        // inbound frame while the writer drains the queue.
+        let reader = tokio::spawn(async move {
+            while from_tasks.recv().await.is_some() {
+                *last_seen.lock().await = Instant::now();
+            }
+        });
+
+        tokio::time::sleep(DEAD_AFTER * 3).await;
+        assert!(
+            !link_dead.is_cancelled(),
+            "a link that is still being heard from must stay up"
+        );
+
+        reader.abort();
     }
 }
 

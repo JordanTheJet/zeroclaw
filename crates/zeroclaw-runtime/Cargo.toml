@@ -129,7 +129,10 @@ zeroclaw-tls = { workspace = true, features = ["testing"] }
 zerorelay = { workspace = true }
 futures-util = "0.3"
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+# `test-util` enables tokio's paused-clock test runtime, which is what the relay
+# bridge's setup-deadline and keepalive-liveness regressions need to reach a
+# minute-scale budget without waiting a minute.
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
 scopeguard = "1.2"
 filetime = "0.2"
 wiremock = "0.6"
