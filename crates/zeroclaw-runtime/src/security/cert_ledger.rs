@@ -283,6 +283,9 @@ pub(crate) struct LedgerTestHooks {
     /// After the revocation snapshot has been read and staged, before it is
     /// renamed over the file the verifier reads.
     pub before_crl_rename: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// After a device-wide revocation has read the device's active set, before
+    /// it flips those rows.
+    pub after_device_snapshot: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// The daemon's issued-certificate ledger over SQLite (`<data_dir>/tls/ledger.db`).
@@ -1252,27 +1255,130 @@ impl CertLedger {
         Ok(true)
     }
 
-    /// Revoke every active cert held by a device (e.g. a compromised device).
-    /// Returns the number of certs revoked.
+    /// Revoke every active cert held by a device (e.g. a compromised device),
+    /// as ONE atomic transaction. Returns the number of certs revoked.
+    ///
+    /// # Why this is one transaction
+    ///
+    /// This is the operator's "get that device off the network" command, so its
+    /// promise is total: when it returns, the device holds no usable
+    /// certificate. A snapshot followed by per-fingerprint revocations - which
+    /// is what this replaced - cannot keep that promise, because a renewal can
+    /// publish a NEW active row for the same device in the gap between the
+    /// snapshot and the updates. The command then revokes only the stale set,
+    /// reports success, and leaves the device holding a certificate it was
+    /// handed moments earlier.
+    ///
+    /// Reading and flipping inside one `IMMEDIATE` transaction closes it, and
+    /// [`CertLedger::record_issued_requiring`]'s promote step is likewise an
+    /// `IMMEDIATE` transaction, so SQLite's write lock serializes the two.
+    /// Only two orderings exist, and neither leaves the device usable:
+    ///
+    /// 1. **Revocation commits first.** The renewal's promote step then
+    ///    re-tests its presenting fingerprint, finds it revoked, and refuses -
+    ///    no new row is ever published. (The presenting certificate always
+    ///    belongs to this device: renewal resolves the device id FROM it.)
+    /// 2. **The renewal commits first.** This transaction's `UPDATE` then runs
+    ///    against committed state that already includes the new row, and
+    ///    `WHERE device_id = ? AND status = 'active'` sweeps it along with the
+    ///    rest.
+    ///
+    /// There is no third ordering in which the two overlap, which is precisely
+    /// what the write lock buys and what a stale snapshot gave away. No
+    /// revocation epoch or device generation is needed for the same reason.
     pub fn revoke_device(&self, device_id: &str, actor: &str) -> Result<usize> {
-        let fingerprints: Vec<String> = {
-            let conn = self.conn.lock();
-            let mut stmt = conn
-                .prepare("SELECT fingerprint FROM issued_certs WHERE device_id = ?1 AND status = 'active'")
-                .context("prepare device revoke")?;
-            let rows = stmt
-                .query_map(params![device_id], |r| r.get::<_, String>(0))
-                .context("query device certs")?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()
-                .context("collect device certs")?
+        let revoked = {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("begin device revocation transaction")?;
+
+            // Read the set INSIDE the write-locked transaction. The snapshot
+            // and the flip below are therefore one indivisible step; the
+            // version this replaced read the set with no transaction at all,
+            // released it, and then revoked each fingerprint in a transaction
+            // of its own.
+            let entries: Vec<LedgerEntry> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT fingerprint, device_id, token_hash, not_before, not_after, status, actor, issued_at
+                             FROM issued_certs WHERE device_id = ?1 AND status = 'active'",
+                    )
+                    .context("prepare device revoke")?;
+                let rows = stmt
+                    .query_map(params![device_id], row_to_entry)
+                    .context("query device certs")?;
+                rows.collect::<rusqlite::Result<Vec<LedgerEntry>>>()
+                    .context("collect device certs")?
+            };
+
+            #[cfg(test)]
+            if let Some(hook) = self.hooks.after_device_snapshot.lock().as_ref() {
+                hook();
+            }
+
+            let changed = tx
+                .execute(
+                    "UPDATE issued_certs SET status = 'revoked'
+                         WHERE device_id = ?1 AND status = 'active'",
+                    params![device_id],
+                )
+                .context("revoke device certs")?;
+            // Holding the write lock means no row can have been added to or
+            // removed from the set between the SELECT and the UPDATE. If that
+            // ever stops being true, fail rather than under-report a
+            // revocation the operator was told had happened.
+            if changed != entries.len() {
+                bail!(
+                    "device revocation for {device_id} matched {changed} rows but audited \
+                     {}; refusing to report a revocation whose scope is uncertain",
+                    entries.len()
+                );
+            }
+            if changed == 0 {
+                return Ok(0);
+            }
+            // Enforce before the ledger reports it, from the in-transaction
+            // view, exactly as a single-fingerprint revoke does: a failed file
+            // write rolls the whole batch back rather than leaving the ledger
+            // claiming revocations the verifier does not enforce.
+            self.materialize_on(&tx, self.revoked_path.as_deref())?;
+            tx.commit().context("commit device revocation")?;
+            entries
         };
-        let mut n = 0;
-        for fp in fingerprints {
-            if self.mark_revoked(&fp, actor)? {
-                n += 1;
+
+        // Audited after the commit, per fingerprint, mirroring `mark_revoked`.
+        //
+        // The module's audit-before-mutate rule exists for ISSUANCE, where an
+        // unaudited publish would put a credential in the world with no record.
+        // Revocation is the inverted risk: it fails closed, so the danger is an
+        // event claiming a revocation that never committed. Committing first
+        // means every event describes something that actually happened.
+        //
+        // A failing audit sink does not silently swallow the revocation: every
+        // remaining fingerprint is still attempted, and the first error is
+        // returned, so the operator learns the trail is incomplete for a
+        // revocation that IS in force.
+        let mut first_error = None;
+        for entry in &revoked {
+            let mut entry = entry.clone();
+            entry.actor = actor.to_string();
+            if let Err(error) = self.audit_cert(&entry, CertAuditStage::Revoked)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
         }
-        Ok(n)
+        match first_error {
+            Some(error) => Err(error).with_context(|| {
+                format!(
+                    "device {device_id}: {} certificate(s) were revoked and are enforced, but the \
+                     audit trail could not be written",
+                    revoked.len()
+                )
+            }),
+            None => Ok(revoked.len()),
+        }
     }
 
     /// All currently-active ledger rows.
@@ -2977,6 +3083,190 @@ mod tests {
             None,
             "an audited-but-unpublished renewal is unusable, which is the point"
         );
+    }
+
+    /// Every still-active fingerprint held by a device.
+    fn active_for_device(led: &CertLedger, device_id: &str) -> Vec<String> {
+        led.list_active()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.device_id == device_id)
+            .map(|e| e.fingerprint)
+            .collect()
+    }
+
+    #[test]
+    fn device_revocation_catches_a_renewal_racing_its_snapshot() {
+        // The operator's "get that device off the network" command must be
+        // total. It used to take a snapshot of the device's active
+        // fingerprints with no transaction, release it, and then revoke each
+        // one separately - so a renewal publishing a NEW active row for the
+        // same device in that gap survived. The command reported success and
+        // the device kept a certificate it had been handed moments earlier.
+        //
+        // The seam fires at exactly the snapshot moment and publishes a renewal
+        // from a SECOND connection, which is the interleaving that defeated the
+        // old implementation.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _log) = audit_logger(dir.path());
+        let revoker = Arc::new(CertLedger::open(dir.path(), Some(audit)).unwrap());
+        revoker
+            .record_issued(&entry("fpOld", "devRaced"), false)
+            .unwrap();
+        assert!(revoker.mark_delivered("fpOld").unwrap());
+
+        // A second handle: its own SQLite connection, as a renewal RPC has.
+        let renewer = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        let renewal_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let renewer_thread = Arc::clone(&renewer);
+        let done = Arc::clone(&renewal_done);
+        once_hook(&revoker.hooks.after_device_snapshot, move || {
+            let inner = Arc::clone(&renewer_thread);
+            let inner_done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                // Publishes a second active certificate for the SAME device.
+                let _ =
+                    inner.record_issued_requiring(&entry("fpNew", "devRaced"), true, Some("fpOld"));
+                inner_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            // Give the renewal every chance to get in. Under the fix it blocks
+            // on the write lock this transaction holds; joining here would
+            // deadlock against that lock, so the wait is bounded instead.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        let n = revoker.revoke_device("devRaced", "operator").unwrap();
+        assert!(n >= 1, "the device's certificate must be revoked");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !renewal_done.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            renewal_done.load(std::sync::atomic::Ordering::SeqCst),
+            "the racing renewal must finish one way or the other"
+        );
+
+        // THE INVARIANT: whatever order the two landed in, the device is off
+        // the network. Either the renewal was refused (its presenting
+        // certificate was revoked first) or it published and was swept - never
+        // "published and survived".
+        let reader = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            active_for_device(&reader, "devRaced"),
+            Vec::<String>::new(),
+            "a revoked device must hold NO active certificate"
+        );
+        assert_eq!(
+            reader.status_of("fpOld").unwrap(),
+            Some(CertStatus::Revoked)
+        );
+
+        // If the renewal did publish, it must be revoked in SQLite AND in the
+        // file the verifier reads - not merely absent from list_active.
+        let crl = revoked_list_path(dir.path());
+        let enforced = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
+        assert!(enforced.contains("fpold"), "the old cert must be enforced");
+        if let Some(status) = reader.status_of("fpNew").unwrap() {
+            assert_eq!(
+                status,
+                CertStatus::Revoked,
+                "a renewal that published during a device revoke must be revoked"
+            );
+            assert!(
+                enforced.contains("fpnew"),
+                "and it must reach the verifier's CRL, got: {enforced:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_revocation_sweeps_a_certificate_published_before_it_runs() {
+        // Ordering 2 from the doc comment, deterministically: the renewal
+        // commits first, so the device holds TWO active certificates when the
+        // revoke runs. Both must go, and both must reach the CRL - the command
+        // operates on committed state, not on any earlier view.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open(dir.path(), Some(audit)).unwrap();
+        led.record_issued(&entry("fpOld", "devTwo"), false).unwrap();
+        assert!(led.mark_delivered("fpOld").unwrap());
+        led.record_issued_requiring(&entry("fpNew", "devTwo"), true, Some("fpOld"))
+            .expect("the renewal publishes while the old certificate is active");
+        assert!(led.mark_delivered("fpNew").unwrap());
+        let mut before = active_for_device(&led, "devTwo");
+        before.sort();
+        assert_eq!(before, ["fpNew", "fpOld"], "both must be live to start");
+
+        assert_eq!(led.revoke_device("devTwo", "operator").unwrap(), 2);
+
+        assert_eq!(active_for_device(&led, "devTwo"), Vec::<String>::new());
+        assert_eq!(led.status_of("fpOld").unwrap(), Some(CertStatus::Revoked));
+        assert_eq!(led.status_of("fpNew").unwrap(), Some(CertStatus::Revoked));
+        let enforced =
+            zeroclaw_tls::load_revoked_fingerprints(&revoked_list_path(dir.path())).unwrap();
+        assert!(enforced.contains("fpold") && enforced.contains("fpnew"));
+
+        // Every revoked certificate is audited individually, with the operator
+        // as the actor - a batched flip must not collapse into one event.
+        let revocations: Vec<AuditEvent> = audit_events(&log)
+            .into_iter()
+            .filter(|e| type_name(e) == "cert_revoked")
+            .collect();
+        assert_eq!(revocations.len(), 2, "one audit event per revoked cert");
+        for event in &revocations {
+            assert_eq!(
+                event.actor.as_ref().and_then(|a| a.username.clone()),
+                Some("operator".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_revocation_that_wins_refuses_the_later_renewal() {
+        // Ordering 1 from the doc comment: the revoke commits first, so the
+        // renewal's presenting certificate is already revoked and its publish
+        // is refused. Pinned device-scoped, since `revoke_device` is the
+        // operator command that has to make this promise.
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fpOld", "devLate"), false)
+            .unwrap();
+        assert!(led.mark_delivered("fpOld").unwrap());
+        assert_eq!(led.revoke_device("devLate", "operator").unwrap(), 1);
+
+        let err = format!(
+            "{:#}",
+            led.record_issued_requiring(&entry("fpNew", "devLate"), true, Some("fpOld"))
+                .expect_err("a revoked device must not renew")
+        );
+        assert!(err.contains(ISSUANCE_PRECONDITION_FAILED), "got: {err}");
+        assert_eq!(active_for_device(&led, "devLate"), Vec::<String>::new());
+        assert_eq!(led.status_of("fpNew").unwrap(), None);
+    }
+
+    #[test]
+    fn revoking_a_device_leaves_other_devices_alone() {
+        // The batched UPDATE is scoped by device_id; a wider WHERE clause would
+        // take the whole fleet off the network in one command.
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fpA", "devA"), false).unwrap();
+        led.record_issued(&entry("fpB", "devB"), false).unwrap();
+        assert!(led.mark_delivered("fpA").unwrap());
+        assert!(led.mark_delivered("fpB").unwrap());
+
+        assert_eq!(led.revoke_device("devA", "operator").unwrap(), 1);
+
+        assert_eq!(led.status_of("fpA").unwrap(), Some(CertStatus::Revoked));
+        assert_eq!(led.status_of("fpB").unwrap(), Some(CertStatus::Active));
+        assert_eq!(active_for_device(&led, "devB"), ["fpB"]);
+        // Revoking a device with nothing active is a no-op that reports zero.
+        assert_eq!(led.revoke_device("devA", "operator").unwrap(), 0);
+        assert_eq!(led.revoke_device("nobody", "operator").unwrap(), 0);
     }
 
     #[test]
