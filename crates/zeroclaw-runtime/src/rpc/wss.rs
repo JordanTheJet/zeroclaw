@@ -53,7 +53,13 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
 /// Default ceiling on concurrently established WSS sessions.
 /// See [`WssLimits::max_sessions`].
-pub const DEFAULT_MAX_SESSIONS: usize = 512;
+/// Sized as an explicit host-memory policy, not a connection-count guess: the
+/// parser envelope (`rpc_ws_config`) is 32 MiB per session, so this default
+/// caps the aggregate parser reservation at 2 GiB - defensible on a small
+/// daemon host - while 64 concurrent remote sessions is far beyond a personal
+/// daemon's working set. Operators with bigger hosts and fleets raise it
+/// consciously, envelope arithmetic in hand.
+pub const DEFAULT_MAX_SESSIONS: usize = 64;
 
 /// Default ceiling on concurrent sessions holding ONE client certificate.
 /// See [`WssLimits::max_sessions_per_client`].
@@ -103,7 +109,7 @@ pub struct WssLimits {
     ///
     /// `max_sessions` alone is an arithmetic ceiling, not a host-memory budget:
     /// every session may declare a message up to the parser envelope
-    /// (`rpc_ws_config`), so 512 sessions is a 16 GiB ceiling, and one
+    /// (`rpc_ws_config`), so the session ceiling is a memory ceiling, and one
     /// admitted-but-hostile credential (or a stolen one, before it is detected
     /// and revoked) can occupy all of it. This bounds the parser bytes ONE
     /// credential can reserve at `max_sessions_per_client x envelope`.

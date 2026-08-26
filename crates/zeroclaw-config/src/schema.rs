@@ -7343,8 +7343,10 @@ pub struct WssConfig {
     /// a session is established.
     #[serde(default = "default_wss_handshake_timeout_secs")]
     pub handshake_timeout_secs: u64,
-    /// Ceiling on concurrently established WSS sessions (default: 512). Bounds
-    /// the steady state that survives authentication.
+    /// Ceiling on concurrently established WSS sessions (default: 64). Bounds
+    /// the steady state that survives authentication; with the 32 MiB parser
+    /// envelope this is also the aggregate parser-memory ceiling (64 x 32 MiB
+    /// = 2 GiB by default), so raise it as a deliberate host-memory decision.
     #[serde(default = "default_wss_max_sessions")]
     pub max_sessions: usize,
     /// Ceiling on concurrent sessions presenting ONE client certificate
@@ -7462,7 +7464,7 @@ fn default_wss_handshake_timeout_secs() -> u64 {
 }
 
 fn default_wss_max_sessions() -> usize {
-    512
+    64
 }
 
 fn default_wss_max_sessions_per_client() -> usize {
