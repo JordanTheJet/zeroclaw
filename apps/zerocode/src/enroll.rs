@@ -482,6 +482,28 @@ const PUBLISH_MARKER: &str = ".publish.pending";
 /// guessing which files belong together.
 const PUBLISH_MANIFEST_TAG: &str = "zerocode-publish-v1";
 
+/// Durable record of the generation that is CURRENTLY published. It is written
+/// after the last rename and before the marker is cleared, so it outlives the
+/// marker: a run that finds no marker can still tell a coherent generation from
+/// a mixed one. This is the fail-closed net for a marker that never became
+/// durable, which is reachable on any platform where the directory entry cannot
+/// be fsynced (see `sync_dir_where_supported`).
+const PUBLISHED_MANIFEST: &str = "published.manifest";
+
+/// Staged name for the record, so it is installed by the same replace primitive
+/// as the credentials and is never observed half-written.
+const STAGED_PUBLISHED_MANIFEST: &str = ".published.manifest.tmp";
+
+/// First line of the published-generation record. Distinct from the marker tag,
+/// so neither file can ever be parsed as the other.
+const PUBLISHED_MANIFEST_TAG: &str = "zerocode-published-v1";
+
+/// Error label for the in-progress marker, used in parse diagnostics.
+const MARKER_LABEL: &str = "publication marker";
+
+/// Error label for the published-generation record.
+const PUBLISHED_LABEL: &str = "published-credential manifest";
+
 /// Length of a SHA-256 digest in lowercase hex.
 const DIGEST_HEX_LEN: usize = 64;
 
@@ -534,20 +556,31 @@ struct StagedGeneration {
 /// generation published and untouched, and the stale `.tmp` files are ignored
 /// and overwritten by the next attempt.
 fn stage_generation(tls_dir: &Path, payloads: [&[u8]; MATERIAL_COUNT]) -> Result<StagedGeneration> {
-    let mut manifest = String::from(PUBLISH_MANIFEST_TAG);
-    manifest.push('\n');
+    let mut digests = Vec::with_capacity(MATERIAL_COUNT);
     for (material, bytes) in STAGED_MATERIALS.iter().zip(payloads) {
         write_durable(&tls_dir.join(material.staged), bytes, material.private)?;
-        manifest.push_str(&crate::client_crypto::sha256_hex(bytes));
-        manifest.push(' ');
-        manifest.push_str(material.published);
-        manifest.push('\n');
+        digests.push(crate::client_crypto::sha256_hex(bytes));
     }
     sync_dir_where_supported(tls_dir)?;
     Ok(StagedGeneration {
         tls_dir: tls_dir.to_path_buf(),
-        manifest,
+        manifest: render_manifest(PUBLISH_MANIFEST_TAG, &digests),
     })
+}
+
+/// Render a manifest: the tag line, then one `<digest> <published-name>` line
+/// per material in `STAGED_MATERIALS` order. The same body serves the in-flight
+/// marker and the published-generation record; only the tag differs.
+fn render_manifest(tag: &str, digests: &[String]) -> String {
+    let mut out = String::from(tag);
+    out.push('\n');
+    for (material, digest) in STAGED_MATERIALS.iter().zip(digests) {
+        out.push_str(digest);
+        out.push(' ');
+        out.push_str(material.published);
+        out.push('\n');
+    }
+    out
 }
 
 /// Make the marker durable, which opens the recovery window. From here the
@@ -565,11 +598,38 @@ fn mark_generation(staged: &StagedGeneration) -> Result<()> {
     sync_dir_where_supported(&staged.tls_dir)
 }
 
+/// Replace `published` with `staged` in one step, on every platform.
+///
+/// `std::fs::rename` IS the atomic-replace primitive here; its documented
+/// cross-platform contract is "renames a file or directory to a new name,
+/// replacing the original file if `to` already exists". On Unix that is POSIX
+/// `rename(2)`. On Windows the standard library issues `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`, falling back to `SetFileInformationByHandle`
+/// with `FileRenameInfoEx` / `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` when the
+/// destination's read-only attribute denies the first call. A renewal over an
+/// existing generation therefore replaces the destination rather than failing,
+/// which is what makes `cache_materials` re-runnable.
+///
+/// Deliberately NOT remove-then-rename: unlinking the destination first would
+/// open a window where the credential is absent entirely, which is the mixed or
+/// missing generation the marker and the published manifest exist to prevent.
+///
+/// Residual Windows risk: another process holding the destination open without
+/// delete-sharing (a scanner, a second zerocode) can still make the call fail.
+/// That failure is fail-safe, not fail-open - the error propagates with the
+/// marker still on disk and the previous generation intact, so the next run
+/// recovers.
+fn replace_file(staged: &Path, published: &Path) -> Result<()> {
+    std::fs::rename(staged, published)
+        .with_context(|| format!("installing {}", published.display()))
+}
+
 /// Rename one staged material over its published name.
 fn install_material(tls_dir: &Path, material: &Material) -> Result<()> {
-    let published = tls_dir.join(material.published);
-    std::fs::rename(tls_dir.join(material.staged), &published)
-        .with_context(|| format!("installing {}", published.display()))
+    replace_file(
+        &tls_dir.join(material.staged),
+        &tls_dir.join(material.published),
+    )
 }
 
 /// Complete a publication interrupted between the first and last rename, or
@@ -595,8 +655,14 @@ fn install_material(tls_dir: &Path, material: &Material) -> Result<()> {
 ///   published file, an unreadable manifest - is a hard error that leaves the
 ///   marker in place, because the generation cannot be reconstructed and the
 ///   partial set must not be trusted.
-/// - The marker is removed only once every rename is durable, so the window
-///   closes exactly when the set is consistent.
+/// - The published-generation record is written AFTER the last rename and
+///   BEFORE the marker is cleared, so every state a crash can leave is covered
+///   by one of the two: a surviving marker means "recover me", and a marker that
+///   never became durable leaves a record that no longer matches the files on
+///   disk. `validate_published_generation` turns that second case into a
+///   refusal instead of a silently trusted mixed set.
+/// - The marker is removed only once every rename AND the record are durable,
+///   so the window closes exactly when the set is consistent and self-describing.
 ///
 /// This is also the commit path for a fresh publication (see `cache_materials`),
 /// so the published set is only ever assembled by the code a crashed run uses.
@@ -614,7 +680,7 @@ pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
                 .with_context(|| format!("reading {}", marker.display()));
         }
     };
-    let digests = parse_publish_manifest(&raw)
+    let digests = parse_manifest(&raw, PUBLISH_MANIFEST_TAG, MARKER_LABEL)
         .with_context(|| format!("reading the credential manifest in {}", marker.display()))?;
 
     // Classify the whole set BEFORE moving anything: a rename applied on the way
@@ -657,35 +723,142 @@ pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
     }
     // Every rename must be durable before the marker stops guarding the set.
     sync_dir_where_supported(&tls_dir)?;
+    // The record of what is published NOW must exist before the marker stops
+    // guarding it: from the moment the marker is gone, this record is the only
+    // evidence that the four files belong to one generation.
+    record_published_generation(&tls_dir, &digests)?;
     std::fs::remove_file(&marker).with_context(|| format!("clearing {}", marker.display()))?;
     sync_dir_where_supported(&tls_dir)
 }
 
-/// Parse the marker into the recorded digest of each material, in
+/// Verify the published credential set against the record written by the last
+/// completed publication, and refuse to run on a set that does not match it.
+///
+/// `finish_pending_publish` handles the states a marker survives. This handles
+/// the state it does NOT: a crash whose marker removal became durable while a
+/// rename did not, which leaves a mixed generation and no marker to point at it.
+/// A directory entry cannot be fsynced portably, so that reordering is reachable
+/// on Windows in particular, and this check is what keeps it fail-closed instead
+/// of silently trusting a NEW certificate beside an OLD key.
+///
+/// Order matters: callers run this AFTER `finish_pending_publish`, never before.
+/// During the marker window the record still describes the PREVIOUS generation
+/// by design, and recovery refreshes it; validating first would refuse a state
+/// that is perfectly recoverable.
+///
+/// A missing record is the pre-record (legacy) cache or a machine that has never
+/// enrolled. A complete set is adopted and recorded so later runs are covered;
+/// an incomplete one is left alone, because without a record there is no
+/// evidence of a mixed generation and refusing would break caches that were
+/// always partial.
+///
+/// The residual window this leaves: a crash that loses BOTH the marker removal
+/// and the record write while a rename is missing looks exactly like a legacy
+/// cache, and is adopted. Closing it would mean refusing every cache written
+/// before this record existed, which breaks working installs to guard a
+/// double-fault - the record write is ordered before the marker removal, so a
+/// filesystem that journals metadata in order never reaches it.
+pub fn validate_published_generation(config_dir: &Path) -> Result<()> {
+    let tls_dir = config_dir.join("tls");
+    let record = tls_dir.join(PUBLISHED_MANIFEST);
+    let raw = match std::fs::read_to_string(&record) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return adopt_published_generation(&tls_dir);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading {}", record.display()));
+        }
+    };
+    let digests = parse_manifest(&raw, PUBLISHED_MANIFEST_TAG, PUBLISHED_LABEL)
+        .with_context(|| format!("reading the credential manifest in {}", record.display()))?;
+
+    let mut mismatched = Vec::new();
+    for (material, digest) in STAGED_MATERIALS.iter().zip(&digests) {
+        let published = tls_dir.join(material.published);
+        if file_digest(&published)?.as_deref() != Some(digest.as_str()) {
+            mismatched.push(published.display().to_string());
+        }
+    }
+    if !mismatched.is_empty() {
+        anyhow::bail!(
+            "the published credential set is inconsistent: {} no longer match the \
+             generation recorded in {}. A publication was interrupted without \
+             leaving its marker, so the set may pair a new certificate with an \
+             old key and would authenticate as neither; remove the credentials \
+             in {} and enroll again.",
+            mismatched.join(", "),
+            record.display(),
+            tls_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Record the set already on disk when no record exists yet, so an upgrade from
+/// a pre-record cache is protected from the next crash without re-enrolling.
+///
+/// Best-effort: a set that cannot be recorded (a read-only credential directory)
+/// still runs, because a missing record is not evidence that anything is wrong.
+/// The run is told, so the missing protection is not silent.
+fn adopt_published_generation(tls_dir: &Path) -> Result<()> {
+    let mut digests = Vec::with_capacity(MATERIAL_COUNT);
+    for material in &STAGED_MATERIALS {
+        match file_digest(&tls_dir.join(material.published))? {
+            Some(digest) => digests.push(digest),
+            // Not a complete generation: nothing to adopt, nothing to refuse.
+            None => return Ok(()),
+        }
+    }
+    if let Err(e) = record_published_generation(tls_dir, &digests) {
+        eprintln!(
+            "zerocode: could not record the published credential generation ({e:#}); \
+             an interrupted publication may go undetected until the next enrollment."
+        );
+    }
+    Ok(())
+}
+
+/// Write the record of the generation that is published now. Staged and renamed
+/// through the same replace primitive as the credentials, so a crash leaves the
+/// previous record rather than a truncated one. Written `0600` like the marker:
+/// it digests the private key alongside the public materials.
+fn record_published_generation(tls_dir: &Path, digests: &[String]) -> Result<()> {
+    let body = render_manifest(PUBLISHED_MANIFEST_TAG, digests);
+    let staged = tls_dir.join(STAGED_PUBLISHED_MANIFEST);
+    write_durable(&staged, body.as_bytes(), true)?;
+    replace_file(&staged, &tls_dir.join(PUBLISHED_MANIFEST))?;
+    sync_dir_where_supported(tls_dir)
+}
+
+/// Parse a manifest into the recorded digest of each material, in
 /// `STAGED_MATERIALS` order. The published names are checked so a manifest
 /// describing a different set is refused rather than matched positionally.
-fn parse_publish_manifest(raw: &str) -> Result<Vec<String>> {
+/// `label` names the file in diagnostics, since the marker and the
+/// published-generation record share this body format.
+fn parse_manifest(raw: &str, expected_tag: &str, label: &str) -> Result<Vec<String>> {
     let mut lines = raw.lines();
     let tag = lines.next().unwrap_or_default().trim();
-    if tag != PUBLISH_MANIFEST_TAG {
-        anyhow::bail!("unrecognised publication marker format {tag:?}");
+    if tag != expected_tag {
+        anyhow::bail!("unrecognised {label} format {tag:?}");
     }
     let mut digests = Vec::with_capacity(MATERIAL_COUNT);
     for material in &STAGED_MATERIALS {
-        let line = lines.next().context("truncated publication marker")?;
+        let line = lines.next().with_context(|| format!("truncated {label}"))?;
         let (digest, name) = line
             .trim()
             .split_once(' ')
-            .with_context(|| format!("malformed publication marker entry {line:?}"))?;
+            .with_context(|| format!("malformed {label} entry {line:?}"))?;
         if name != material.published {
             anyhow::bail!(
-                "publication marker lists {name:?} where {} is expected",
+                "{label} lists {name:?} where {} is expected",
                 material.published
             );
         }
         if digest.len() != DIGEST_HEX_LEN || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             anyhow::bail!(
-                "publication marker holds a malformed digest for {}",
+                "{label} holds a malformed digest for {}",
                 material.published
             );
         }
@@ -708,7 +881,13 @@ fn file_digest(path: &Path) -> Result<Option<String>> {
 ///
 /// The four files are ONE generation: they are staged and made durable, then the
 /// manifest marker is made durable, and only then are they renamed into place -
-/// by the same recovery path a crashed run takes. See `finish_pending_publish`.
+/// by the same recovery path a crashed run takes, which also records the
+/// published generation before it clears the marker. See `finish_pending_publish`.
+///
+/// This path REPAIRS rather than refuses: it does not run
+/// `validate_published_generation`, so a set that startup refused can still be
+/// replaced by enrolling again, which is what that refusal tells the operator
+/// to do.
 fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> Result<()> {
     // Validate before writing anything. The SAS is bound to this single trust
     // anchor, so refuse to persist a broader
@@ -1085,6 +1264,223 @@ mod tests {
             let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the published key must stay 0600");
         }
+    }
+
+    /// The digests the published-generation record currently claims.
+    fn recorded_digests(tls: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(tls.join(PUBLISHED_MANIFEST))
+            .expect("a completed publication must leave a record");
+        parse_manifest(&raw, PUBLISHED_MANIFEST_TAG, PUBLISHED_LABEL)
+            .expect("the record this code wrote must parse")
+    }
+
+    /// The record must describe the bytes that are actually published.
+    fn assert_record_matches_disk(tls: &std::path::Path) {
+        for (material, digest) in STAGED_MATERIALS.iter().zip(recorded_digests(tls)) {
+            let path = tls.join(material.published);
+            assert_eq!(
+                file_digest(&path).unwrap().as_deref(),
+                Some(digest.as_str()),
+                "{} does not match the recorded generation",
+                path.display()
+            );
+        }
+    }
+
+    fn enroll_response(cert: &str, ca: String, device: &str) -> EnrollResponse {
+        EnrollResponse {
+            cert_pem: cert.into(),
+            ca_chain_pem: ca,
+            device_id: device.into(),
+            not_after: 0,
+            relay_profile: RelayProfile::default(),
+        }
+    }
+
+    /// The publication primitive must REPLACE an existing destination rather
+    /// than fail on it: every rename after the first enrollment has a
+    /// destination that already exists. On Unix this is POSIX rename; on Windows
+    /// the standard library maps it to `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING`. The assertion is the same on both, so this
+    /// is the regression a Windows run would catch.
+    #[test]
+    fn replacing_an_existing_destination_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(STAGED_MATERIALS[0].staged);
+        let published = dir.path().join(STAGED_MATERIALS[0].published);
+        std::fs::write(&published, b"OLD-CERT").unwrap();
+        std::fs::write(&staged, b"NEW-CERT").unwrap();
+
+        replace_file(&staged, &published).expect("replacing a published credential must succeed");
+
+        assert_eq!(std::fs::read(&published).unwrap(), b"NEW-CERT");
+        assert!(
+            !staged.exists(),
+            "the staged file must not survive its own publication"
+        );
+    }
+
+    /// A renewal republishes over four destinations that all already exist. The
+    /// whole set must turn over and the record must follow it, or the next run
+    /// refuses a set that is in fact fine.
+    #[test]
+    fn a_renewal_replaces_every_published_file_and_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-1", daemon_ca.clone(), "dev_1"),
+            "key-gen-1",
+        )
+        .expect("the first enrollment must publish");
+        validate_published_generation(dir.path()).expect("a fresh publication must validate");
+        let first = recorded_digests(&tls);
+
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-2", daemon_ca, "dev_2"),
+            "key-gen-2",
+        )
+        .expect("a renewal over an existing generation must publish");
+
+        assert_eq!(
+            std::fs::read(tls.join("client.crt")).unwrap(),
+            b"cert-gen-2"
+        );
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"key-gen-2");
+        assert_eq!(
+            cached_profile(dir.path()).unwrap().device_id,
+            "dev_2",
+            "the renewed profile must replace the previous one"
+        );
+        assert!(!tls.join(PUBLISH_MARKER).exists());
+        assert_ne!(
+            recorded_digests(&tls),
+            first,
+            "the record must follow the generation it describes"
+        );
+        assert_record_matches_disk(&tls);
+        validate_published_generation(dir.path()).expect("the renewed generation must validate");
+    }
+
+    /// The state the marker cannot cover: one rename applied, and the marker
+    /// gone before the rest were. Nothing on disk says a publication was in
+    /// flight, so only the record can tell that the set is mixed.
+    #[test]
+    fn a_mixed_set_whose_marker_did_not_survive_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        validate_published_generation(dir.path()).expect("the published set is recorded");
+
+        interrupt_publication_for_test(dir.path(), NEW, 1).unwrap();
+        std::fs::remove_file(tls.join(PUBLISH_MARKER)).unwrap();
+
+        finish_pending_publish(dir.path()).expect("without a marker there is nothing to recover");
+        let err = format!(
+            "{:#}",
+            validate_published_generation(dir.path())
+                .expect_err("a mixed set must never be accepted")
+        );
+        assert!(err.contains("client.crt"), "got: {err}");
+        assert!(
+            err.contains("enroll again"),
+            "the refusal must say how to recover, got: {err}"
+        );
+        assert!(
+            !err.contains("client.key"),
+            "only the file that moved is inconsistent, got: {err}"
+        );
+    }
+
+    /// A cache published before this record existed must keep working: the set
+    /// is adopted and recorded, not refused. The adopted record then guards it.
+    #[test]
+    fn a_credential_set_without_a_record_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        assert!(!tls.join(PUBLISHED_MANIFEST).exists());
+
+        validate_published_generation(dir.path()).expect("an upgrade must not break a valid cache");
+
+        assert_published_generation(&tls, OLD);
+        assert_record_matches_disk(&tls);
+        assert_eq!(
+            recorded_digests(&tls)[0],
+            crate::client_crypto::sha256_hex(OLD[0])
+        );
+        validate_published_generation(dir.path()).expect("the adopted record must validate");
+
+        std::fs::write(tls.join("client.key"), b"MIXED-KEY").unwrap();
+        assert!(
+            validate_published_generation(dir.path()).is_err(),
+            "the adopted record must guard the set from then on"
+        );
+    }
+
+    /// Nothing to validate is not a failure: a machine that never enrolled, or
+    /// one whose cache was always partial, must still start.
+    #[test]
+    fn an_absent_or_partial_credential_set_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        validate_published_generation(dir.path()).expect("a machine with no credentials must run");
+        assert!(!tls.join(PUBLISHED_MANIFEST).exists());
+
+        std::fs::create_dir_all(&tls).unwrap();
+        std::fs::write(tls.join("client.crt"), OLD[0]).unwrap();
+        validate_published_generation(dir.path()).expect("a partial cache must not be refused");
+        assert!(
+            !tls.join(PUBLISHED_MANIFEST).exists(),
+            "an incomplete set must not be recorded as a generation"
+        );
+    }
+
+    /// The window between the last rename and the record: the marker is still
+    /// there, so the record still describes the PREVIOUS generation. Validation
+    /// alone must not accept that, and the startup order must repair it.
+    #[test]
+    fn a_crash_before_the_record_is_repaired_not_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        validate_published_generation(dir.path()).expect("the old set is recorded");
+
+        interrupt_publication_for_test(dir.path(), NEW, MATERIAL_COUNT).unwrap();
+        assert_published_generation(&tls, NEW);
+
+        assert!(
+            validate_published_generation(dir.path()).is_err(),
+            "a record that describes other bytes must never be accepted"
+        );
+
+        finish_pending_publish(dir.path()).expect("the marker still guards this state");
+
+        assert!(!tls.join(PUBLISH_MARKER).exists());
+        assert_published_generation(&tls, NEW);
+        assert_record_matches_disk(&tls);
+        validate_published_generation(dir.path()).expect("the refreshed record must validate");
+    }
+
+    /// The marker and the record share a body format and a directory. Their tags
+    /// keep them apart, so neither can be read as the other.
+    #[test]
+    fn a_publication_marker_is_not_accepted_as_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls);
+        let staged = stage_generation(&tls, NEW).unwrap();
+        std::fs::write(tls.join(PUBLISHED_MANIFEST), staged.manifest.as_bytes()).unwrap();
+
+        let err = format!(
+            "{:#}",
+            validate_published_generation(dir.path())
+                .expect_err("a marker must not pass as the published record")
+        );
+        assert!(err.contains(PUBLISHED_LABEL), "got: {err}");
     }
 
     use super::*;

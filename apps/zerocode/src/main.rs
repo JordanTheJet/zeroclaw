@@ -460,12 +460,18 @@ struct CredentialStartup {
     certless: bool,
 }
 
-/// Recover an interrupted credential publication, THEN read the credential
-/// facts. The order is the contract: a publication interrupted mid-rename has a
-/// new certificate beside an old profile, so a read taken first reports stale
-/// relay coordinates or an absent certificate that re-runs enrollment. A
-/// recovery that cannot reassemble the generation is fatal here, because every
-/// route that follows would otherwise dial with a mixed certificate/key set.
+/// Recover an interrupted credential publication, VALIDATE the published
+/// generation, THEN read the credential facts. The order is the contract: a
+/// publication interrupted mid-rename has a new certificate beside an old
+/// profile, so a read taken first reports stale relay coordinates or an absent
+/// certificate that re-runs enrollment. A recovery that cannot reassemble the
+/// generation is fatal here, because every route that follows would otherwise
+/// dial with a mixed certificate/key set.
+///
+/// Validation runs second and covers the case recovery cannot see: a crash whose
+/// marker did not survive, which leaves a mixed set with nothing pointing at it.
+/// It must not run first, because during the marker window the recorded
+/// generation is deliberately the previous one and recovery refreshes it.
 fn recover_then_read_credentials(
     config_dir: &std::path::Path,
     cli_client_cert: Option<&str>,
@@ -474,6 +480,8 @@ fn recover_then_read_credentials(
     use anyhow::Context as _;
     enroll::finish_pending_publish(config_dir)
         .context("completing an interrupted credential publication")?;
+    enroll::validate_published_generation(config_dir)
+        .context("validating the published credential set")?;
     Ok(CredentialStartup {
         profile: enroll::cached_profile(config_dir),
         certless: enroll::is_certless(config_dir, cli_client_cert, cfg_client_cert),
@@ -2212,5 +2220,35 @@ mod credential_recovery_order_tests {
             tls.join(".publish.pending").exists(),
             "an incomplete generation must keep its marker for the next run"
         );
+    }
+
+    /// A publication whose marker did not become durable leaves a mixed set with
+    /// nothing on disk pointing at it. Recovery sees no marker and has nothing to
+    /// do, so startup must refuse on the recorded generation instead of dialling
+    /// with a new certificate and the old key.
+    #[test]
+    fn a_mixed_set_without_a_marker_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        // The first run adopts and records the generation it finds.
+        recover_then_read_credentials(dir.path(), None, "")
+            .expect("a pre-record credential set must still start");
+
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+        std::fs::remove_file(tls.join(".publish.pending")).unwrap();
+
+        let err = format!(
+            "{:#}",
+            recover_then_read_credentials(dir.path(), None, "")
+                .expect_err("startup must refuse a mixed credential set")
+        );
+        assert!(
+            err.contains("published credential set is inconsistent"),
+            "got: {err}"
+        );
+        assert!(err.contains("client.crt"), "got: {err}");
     }
 }
