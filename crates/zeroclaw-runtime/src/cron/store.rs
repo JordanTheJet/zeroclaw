@@ -816,12 +816,25 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
     }
 }
 
+/// Identity of this process for cron claim ownership. Regenerated per process,
+/// so any lock still carrying a different token belongs to a run that died with
+/// its owner and is safe to clear at startup.
+static CLAIM_OWNER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+/// The current process's claim-owner token.
+#[must_use]
+pub fn claim_owner_token() -> &'static str {
+    CLAIM_OWNER.as_str()
+}
+
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
     with_initialized_connection(config, |conn| {
         let claimed = conn
             .execute(
-                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
-                params![now.to_rfc3339(), job_id],
+                "UPDATE cron_jobs SET locked_at = ?1, locked_by = ?3
+                 WHERE id = ?2 AND locked_at IS NULL",
+                params![now.to_rfc3339(), job_id, claim_owner_token()],
             )
             .context("Failed to claim cron job for execution")?;
         Ok(claimed == 1)
@@ -831,7 +844,7 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL, locked_by = NULL WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -839,11 +852,45 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
+/// Clear locks left behind by a previous process.
+///
+/// Only rows whose `locked_by` differs from this process's token are cleared.
+/// The gateway can accept a manual trigger before the scheduler finishes
+/// starting, so an unqualified clear would erase a claim this same process is
+/// actively executing under and let a second run overlap it. Rows written
+/// before `locked_by` existed have a NULL owner and are treated as stale, which
+/// is the correct reading: they cannot belong to this process.
+/// Test-only helpers for constructing claim states this process cannot
+/// otherwise produce.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Connection, Context, DateTime, Result, Utc, params};
+    use zeroclaw_config::schema::Config;
+
+    /// Seed a claim owned by `owner` (`None` reproduces a row written before
+    /// the `locked_by` column existed).
+    pub fn force_claim(config: &Config, job_id: &str, owner: Option<&str>) -> Result<()> {
+        super::with_initialized_connection(config, |conn: &Connection| {
+            conn.execute(
+                "UPDATE cron_jobs SET locked_at = ?1, locked_by = ?2 WHERE id = ?3",
+                params![Utc::now().to_rfc3339(), owner, job_id],
+            )
+            .context("Failed to seed cron claim for test")?;
+            Ok(())
+        })
+    }
+
+    #[allow(unused_imports)]
+    use DateTime as _EnsureImport;
+}
+
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
-            [],
+            "UPDATE cron_jobs SET locked_at = NULL, locked_by = NULL
+             WHERE locked_at IS NOT NULL
+               AND (locked_by IS NULL OR locked_by != ?1)",
+            params![claim_owner_token()],
         )
         .context("Failed to clear stale cron job locks")
     })?;
@@ -1800,6 +1847,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    // Identity of the process holding `locked_at`. Startup recovery clears
+    // only locks that belong to some *other* process, so a claim taken by the
+    // running daemon (for example a manual trigger the gateway accepted before
+    // the scheduler finished starting) is never cleared out from under itself.
+    add_column_if_missing(conn, "locked_by", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",
@@ -2158,6 +2210,29 @@ mod tests {
     }
 
     #[test]
+    fn clear_stale_locks_preserves_a_claim_owned_by_this_process() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let now = Utc::now();
+
+        // A claim this process is actively running under, for example a manual
+        // trigger the gateway accepted before the scheduler finished starting.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        assert_eq!(
+            clear_stale_locks(&config).unwrap(),
+            0,
+            "startup recovery must not clear a claim owned by this process"
+        );
+        assert!(
+            !claim_job(&config, &job.id, now).unwrap(),
+            "the live claim must survive so no second run can overlap it"
+        );
+    }
+
+    #[test]
     fn clear_stale_locks_releases_in_flight_locks() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -2165,7 +2240,7 @@ mod tests {
         force_due(&config, &job.id);
         let now = Utc::now();
 
-        assert!(claim_job(&config, &job.id, now).unwrap());
+        test_support::force_claim(&config, &job.id, Some("previous-process")).unwrap();
         assert!(due_jobs(&config, now).unwrap().is_empty());
 
         assert_eq!(
