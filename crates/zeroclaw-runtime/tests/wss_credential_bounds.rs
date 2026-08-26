@@ -29,7 +29,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
@@ -762,4 +762,140 @@ async fn parser_rejection_returns_session_and_credential_capacity() {
 /// Read until the daemon ends the session.
 async fn drain(ws: &mut WsClient) {
     while let Some(Ok(_)) = ws.next().await {}
+}
+
+/// Mirrors the listener's own `PEER_WRITE_TIMEOUT`, which is module-private:
+/// the read side's idle window plus its post-ping window, the same budget a
+/// silent peer gets.
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(20 + 10);
+
+/// Requests the client pushes before giving up on wedging the write path. It
+/// stalls far short of this; the count only has to outlast the daemon's
+/// outbound queue and the socket buffers on both sides.
+const FLOOD_REQUESTS: usize = 4096;
+
+/// A request whose error response echoes a large `id` back to the sender, so a
+/// modest number of them fills the daemon's write path against a peer that has
+/// stopped reading. An unknown method is answered with an error carrying the
+/// request's own id, which is what makes the response amplify.
+fn amplifying_request(seq: usize) -> String {
+    let id = "x".repeat(8 * 1024);
+    format!(r#"{{"jsonrpc":"2.0","id":"{id}{seq}","method":"no.such.method"}}"#)
+}
+
+/// Wait, on the real clock, until the client's own writes stop making progress.
+/// That stall IS the wedge under test: the client's sends can only block once
+/// the daemon has stopped reading, and the daemon only stops reading once its
+/// dispatcher is parked on a full outbound queue behind a stalled writer.
+async fn wait_for_wedge(sent: &AtomicUsize) {
+    let mut previous = 0;
+    let mut stalled = 0;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = sent.load(Ordering::Relaxed);
+        if now == previous && now > 0 {
+            stalled += 1;
+            if stalled >= 4 {
+                return;
+            }
+        } else {
+            stalled = 0;
+        }
+        previous = now;
+    }
+    panic!("the client's writes never stalled, so the daemon's write path never wedged");
+}
+
+/// Spend `budget` of the daemon's timers without waiting for it, with no test
+/// I/O in flight. The clock is paused only for the jump and handed straight
+/// back, so nothing that needs real socket readiness ever runs against it.
+async fn advance_while_idle(budget: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    tokio::time::resume();
+}
+
+/// An authenticated peer that stops reading must not be able to hold its
+/// session, and with it the global session permit and its credential's quota
+/// slot, indefinitely.
+///
+/// The daemon answers into a bounded outbound queue. With no bound on the write
+/// itself, a peer that stops reading parks the writer, fills that queue, and
+/// parks the dispatcher on its own response - so the dispatcher never returns to
+/// `next_frame`, the heartbeat that would have retired the session never runs
+/// again, and neither guard in the session task's frame is ever dropped.
+#[tokio::test]
+async fn a_peer_that_stops_reading_loses_its_session_and_returns_its_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, cancel, cred_a, cred_b) = start_listener(
+        dir.path(),
+        WssLimits {
+            max_pending_handshakes: 16,
+            handshake_timeout: Duration::from_secs(5),
+            // One of each, so a single wedged session provably holds both the
+            // global session permit and its credential's only quota slot.
+            max_sessions: 1,
+            max_sessions_per_client: 1,
+            incomplete_message_timeout: Duration::from_secs(300),
+        },
+    )
+    .await;
+
+    let ws = admit(addr, &cred_a)
+        .await
+        .expect_open("the wedging session");
+
+    // Push requests and never read the answers. Each answer is far larger than
+    // the request that provoked it, so the daemon's write path fills first.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let feeder = {
+        let sent = sent.clone();
+        tokio::spawn(async move {
+            let mut ws = ws;
+            for seq in 0..FLOOD_REQUESTS {
+                if ws
+                    .send(Message::Text(amplifying_request(seq).into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+            // Stay connected, and stay not reading.
+            std::future::pending::<()>().await
+        })
+    };
+    wait_for_wedge(&sent).await;
+
+    // The wedged session is still holding both bounds.
+    assert!(
+        !admit(addr, &cred_b).await.is_open(),
+        "the wedged session must still hold the global session permit"
+    );
+
+    // The wedge holds nothing but timers now, so the write budget is spent by
+    // advancing the clock rather than by waiting on it. Each probe below is a
+    // real mTLS connection, so the clock is handed back for every one of them: a
+    // running virtual clock cannot tell a task waiting on real socket readiness
+    // from an idle runtime, and would race the budget against that handshake.
+    advance_while_idle(PEER_WRITE_TIMEOUT / 2).await;
+    assert!(
+        !admit(addr, &cred_b).await.is_open(),
+        "a wedged session must be given its full write budget, not closed on sight"
+    );
+
+    advance_while_idle(PEER_WRITE_TIMEOUT).await;
+
+    // Both guards live in the session task's frame, so the credential getting
+    // back in proves the frame unwound through the session permit as well.
+    assert!(
+        admit_within(addr, &cred_a, Duration::from_secs(10))
+            .await
+            .is_open(),
+        "a peer that stopped reading must lose its session and return its capacity"
+    );
+
+    feeder.abort();
+    cancel.cancel();
 }

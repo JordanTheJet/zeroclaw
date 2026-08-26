@@ -65,6 +65,16 @@ const DEAD_AFTER: Duration = Duration::from_secs(60);
 /// so a candidate rotation link cannot still be setting up after the window in
 /// which it may still replace the published route.
 const SETUP_DEADLINE: Duration = Duration::from_secs(30);
+/// Absolute budget for ONE per-`Open` dial of a local loopback listener.
+///
+/// The target is a listener on this same host, so the only thing this connect
+/// waits on is that listener's accept backlog; a healthy dial completes in
+/// microseconds. A saturated or wedged local listener otherwise leaves the
+/// connect pending in the kernel with nothing able to cancel it, holding the
+/// bridge task and its registered source port. Kept well inside the relay's own
+/// 15s per-`Open` pair timeout, so the bridge always abandons the dial before
+/// the relay abandons the route it is holding open for it.
+const LOCAL_DIAL_DEADLINE: Duration = Duration::from_secs(10);
 /// Bound on one outbound frame write once the link is established. The
 /// tungstenite sink reports no partial progress, so from here a relay that has
 /// stopped reading is indistinguishable from one that is merely slow; the bound
@@ -937,8 +947,22 @@ async fn bridge_conn(
     // after `connect()` returned (the previous ordering) left a window in which
     // the accept task could classify a relay-routed client as `Direct` (B2).
     // `_port_guard` deregisters the port on every exit path.
+    // The dial itself is bounded and cancellable. A local listener whose accept
+    // backlog is full leaves this connect pending in the kernel, and the relay's
+    // per-`Open` pair timeout can only drop its own route entry - it cannot
+    // reach a bridge task parked in `connect`. Without this, that task and the
+    // source port it registered are held until the kernel gives up. On every
+    // exit here `guard` falls out of scope, so the port deregisters whether the
+    // dial succeeded, timed out, or was cancelled.
     let local_and_guard = match bind_and_register(local_addr, bridge_ports) {
-        Ok((socket, remote, guard)) => socket.connect(remote).await.ok().map(|s| (s, guard)),
+        Ok((socket, remote, guard)) => {
+            let dial = tokio::time::timeout(LOCAL_DIAL_DEADLINE, socket.connect(remote));
+            tokio::select! {
+                biased;
+                _ = link_dead.cancelled() => None,
+                outcome = dial => outcome.ok().and_then(|s| s.ok()).map(|s| (s, guard)),
+            }
+        }
         Err(_) => None,
     };
     let (local, _port_guard) = match local_and_guard {
@@ -1575,6 +1599,146 @@ mod link_liveness_tests {
         );
 
         reader.abort();
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here (the
+// `zeroclaw_spawn::spawn!` attribution rule is for production daemon tasks).
+#[allow(clippy::disallowed_methods)]
+mod local_dial_tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn empty_port_set() -> crate::enroll::BridgePortSet {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// A loopback listener whose accept backlog is full and which never accepts,
+    /// so a further connect to it stays pending in the kernel instead of
+    /// completing or being refused. That is the stalled local listener a bridge
+    /// dial has to be able to survive. Kernels round `listen(1)` up by different
+    /// amounts, so the backlog is filled by probing rather than by assuming a
+    /// count. The listener and the connections that fill it are returned because
+    /// dropping either would free the backlog.
+    async fn stalled_listener() -> (String, TcpListener, Vec<TcpStream>) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+        let listener = socket.listen(1).expect("listen");
+        let addr = listener.local_addr().expect("local addr");
+        let mut held = Vec::new();
+        for _ in 0..512 {
+            match tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => held.push(stream),
+                Err(_) => return (addr.to_string(), listener, held),
+                Ok(Err(_)) => break,
+            }
+        }
+        panic!("could not stall a loopback connect: the listener backlog never filled");
+    }
+
+    /// Drive one `bridge_conn` against `addr`, returning its task and the port
+    /// set it registers into.
+    fn spawn_bridge_dial(
+        addr: String,
+        link_dead: CancellationToken,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        crate::enroll::BridgePortSet,
+        mpsc::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) {
+        let ports = empty_port_set();
+        let (to_relay, to_relay_rx) = mpsc::channel(8);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(8);
+        let conns = Arc::new(Mutex::new(HashMap::new()));
+        let task = {
+            let ports = ports.clone();
+            tokio::spawn(async move {
+                bridge_conn(
+                    1,
+                    &addr,
+                    to_relay,
+                    inbound_rx,
+                    link_dead,
+                    conns,
+                    Some(ports),
+                )
+                .await;
+            })
+        };
+        (task, ports, to_relay_rx)
+    }
+
+    /// Wait until the dial has registered its source port. From that point the
+    /// task is inside `connect` with the deregistering guard held, which is the
+    /// state the bound has to be able to end.
+    async fn wait_for_registered_port(ports: &crate::enroll::BridgePortSet) -> u16 {
+        for _ in 0..400 {
+            if let Some(port) = ports
+                .lock()
+                .expect("bridge port set lock")
+                .iter()
+                .copied()
+                .next()
+            {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the bridge dial never registered its source port");
+    }
+
+    // The relay's per-`Open` pair timeout drops its own route entry but cannot
+    // reach a bridge task parked in `connect`, so the route closing has to be
+    // able to end the dial itself. Real clock: LOCAL_DIAL_DEADLINE cannot expire
+    // inside the window asserted here, so a prompt return is cancellation's.
+    #[tokio::test]
+    async fn a_closed_route_releases_a_dial_parked_on_a_stalled_listener() {
+        let (addr, _listener, _backlog) = stalled_listener().await;
+        let link_dead = CancellationToken::new();
+        let (task, ports, _to_relay_rx) = spawn_bridge_dial(addr, link_dead.clone());
+        let port = wait_for_registered_port(&ports).await;
+
+        link_dead.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a closed route must not wait on the local listener's accept")
+            .expect("bridge task");
+        assert!(
+            !ports.lock().expect("bridge port set lock").contains(&port),
+            "the source port must deregister when the dial is abandoned"
+        );
+    }
+
+    // Nothing closes the route here: the dial has to end on its own budget, and
+    // release the source port when it does.
+    #[tokio::test]
+    async fn a_dial_that_never_connects_ends_on_its_own_budget() {
+        let (addr, _listener, _backlog) = stalled_listener().await;
+        let (task, ports, _to_relay_rx) = spawn_bridge_dial(addr, CancellationToken::new());
+        let port = wait_for_registered_port(&ports).await;
+
+        // The dial holds nothing but its own deadline now, so the budget is
+        // spent by advancing the clock rather than by waiting on it.
+        tokio::time::pause();
+        tokio::time::advance(LOCAL_DIAL_DEADLINE / 2).await;
+        assert!(
+            !task.is_finished(),
+            "a dial must be given its full budget, not abandoned early"
+        );
+
+        tokio::time::advance(LOCAL_DIAL_DEADLINE).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a dial that never connects must end at its deadline")
+            .expect("bridge task");
+        assert!(
+            !ports.lock().expect("bridge port set lock").contains(&port),
+            "the source port must deregister when the dial times out"
+        );
     }
 }
 

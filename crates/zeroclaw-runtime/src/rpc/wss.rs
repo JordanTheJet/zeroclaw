@@ -39,6 +39,18 @@ const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 /// before declaring the peer dead and tearing the connection down.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on ONE outbound frame write to an established peer.
+///
+/// The read side already declares a peer dead after [`HEARTBEAT_IDLE`] plus
+/// [`HEARTBEAT_TIMEOUT`] of silence, so a peer that will not accept a write gets
+/// exactly the same budget: one session can never be alive by one half of the
+/// liveness policy and dead by the other. The tungstenite sink reports no
+/// partial progress, so a peer that has stopped reading and one that is merely
+/// slow are indistinguishable from the writer; that budget is generous enough
+/// that no healthy peer reaches it for a single frame.
+const PEER_WRITE_TIMEOUT: Duration =
+    Duration::from_secs(HEARTBEAT_IDLE.as_secs() + HEARTBEAT_TIMEOUT.as_secs());
+
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
@@ -660,10 +672,26 @@ impl WssTransport {
                         None => break,
                     },
                 };
-                if sink.send(msg).await.is_err() {
+                // An authenticated peer that stops reading parks this write once
+                // the socket buffer fills. Unbounded, the outbound queue fills
+                // behind it and the dispatcher parks on its own response, so it
+                // never returns to `next_frame` and the heartbeat that would
+                // have retired the session never runs again. A timeout here is
+                // a peer that has stopped reading, not one that is merely slow.
+                if !matches!(
+                    tokio::time::timeout(PEER_WRITE_TIMEOUT, sink.send(msg)).await,
+                    Ok(Ok(()))
+                ) {
                     break;
                 }
             }
+            // Returning here drops both receivers, and that is what unwedges
+            // the rest of the session: a dispatcher parked on a full outbound
+            // queue fails at once instead of waiting on a sink nobody is
+            // draining, and `next_frame` sees the writer depart and returns, so
+            // the session task unwinds through the session permit and the
+            // per-certificate quota guard. Nothing may be awaited after this
+            // loop without closing the receivers first.
         });
 
         Self {
@@ -689,6 +717,12 @@ impl RpcTransport for WssTransport {
         // below holds `self.reader`.
         let scanner = self.scanner.clone();
         let window = self.incomplete_message_timeout;
+        // Likewise a handle of its own: the writer task owns both receivers and
+        // closes them as it exits, so this resolves exactly when the session's
+        // output is gone. Reading on past that would keep the session permit and
+        // the credential's quota slot held for a peer that can no longer be
+        // answered.
+        let writer_gone = self.control_tx.clone();
         loop {
             let idle = if self.awaiting_pong {
                 HEARTBEAT_TIMEOUT
@@ -706,6 +740,7 @@ impl RpcTransport for WssTransport {
             let polled = match message_deadline {
                 Some(at) => tokio::select! {
                     biased;
+                    _ = writer_gone.closed() => return None,
                     _ = tokio::time::sleep_until(at) => {
                         match scanner.incomplete_message_deadline(window) {
                             // Still the message that armed this deadline (or an
@@ -728,6 +763,7 @@ impl RpcTransport for WssTransport {
                 // missed.
                 None => tokio::select! {
                     biased;
+                    _ = writer_gone.closed() => return None,
                     _ = scanner.armed.notified() => continue,
                     frame = read => Some(frame),
                 },
