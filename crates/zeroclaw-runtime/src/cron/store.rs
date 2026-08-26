@@ -70,6 +70,24 @@ pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     }
 }
 
+/// Seed a claim carrying `lock_token`, as another process or an older build
+/// would have left it. `None` reproduces a row claimed before tokens existed.
+#[cfg(test)]
+pub(crate) fn force_claim_for_tests(
+    config: &Config,
+    job_id: &str,
+    lock_token: Option<&str>,
+) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = ?1, lock_token = ?2 WHERE id = ?3",
+            params![Utc::now().to_rfc3339(), lock_token, job_id],
+        )
+        .context("Failed to seed cron claim for test")?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 fn should_force_release_failure(config: &Config) -> bool {
     FORCED_RELEASE_FAILURES
@@ -939,6 +957,31 @@ pub fn claim_job_for_agent_with_token(
     agent_alias: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
+    claim_with_live_token(config, job_id, Some(agent_alias), now)
+}
+
+/// Claim a job for a manual run and return the opaque claim token.
+///
+/// Gateway and RPC triggers can be accepted before the scheduler finishes
+/// starting, and startup recovery clears every lock whose token is not
+/// registered live. An untokened claim taken there would be cleared mid-run
+/// and let a second run overlap it, so manual runs claim through the same
+/// live-token registry as agent triggers. There is no owner predicate: the
+/// caller has already resolved the job.
+pub fn claim_job_with_token(
+    config: &Config,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    claim_with_live_token(config, job_id, None, now)
+}
+
+fn claim_with_live_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
     let lock_token = new_agent_lock_token();
     register_live_agent_claim(config, job_id, &lock_token);
     let result = with_initialized_connection(config, |conn| {
@@ -946,10 +989,10 @@ pub fn claim_job_for_agent_with_token(
             .execute(
                 "UPDATE cron_jobs
                  SET locked_at = ?1, lock_token = ?2
-                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                 WHERE id = ?3 AND (?4 IS NULL OR agent_alias = ?4) AND locked_at IS NULL",
                 params![now.to_rfc3339(), lock_token, job_id, agent_alias],
             )
-            .context("Failed to claim agent-owned cron job for execution")?;
+            .context("Failed to claim cron job for execution")?;
         Ok(if claimed == 1 {
             Some(lock_token.clone())
         } else {
