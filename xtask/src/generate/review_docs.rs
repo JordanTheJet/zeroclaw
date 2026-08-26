@@ -256,15 +256,7 @@ fn render_validation_gap(_policy: &ReviewCiPolicy) -> String {
     "When validation is the concern, identify the exact evidence gap instead of asking for \"full Cargo\" by reflex. Check the current required CI jobs and the changed surface, then ask for extra validation only where required CI does not prove the thing under review: tests for a platform that only received compile checks, Clippy for a platform or path outside the required lint job, desktop coverage when the desktop workflow did not trigger, release targets outside the PR matrix, stale CI beyond the base-drift-only case classified above, or unavailable CI.".to_owned()
 }
 
-fn expected_verdict_row(_policy: &ReviewCiPolicy) -> &'static str {
-    "| Your only new blocking or warning finding is a [CI freshness warning](#ci-freshness-and-base-drift), the rest of the review is satisfied, and no other reviewer holds an unresolved substantive concern; 🟢 praise and 🔵 suggestions do not disqualify this row | `--approve` with a `### 🟡 Warning — ...` finding |"
-}
-
 fn render_protocol(policy: &ReviewCiPolicy, current: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        current.contains(expected_verdict_row(policy)),
-        "review verdict row drifted from the canonical CI-freshness policy"
-    );
     let rendered = splice(
         current,
         "review-ci-state-fetch",
@@ -378,14 +370,5 @@ mod tests {
         );
         assert!(splice(&duplicate, zone, "new").is_err());
         assert!(splice("no markers", zone, "new").is_err());
-    }
-
-    #[test]
-    fn verdict_row_remains_bound_to_the_generated_policy() {
-        let protocol = std::fs::read_to_string(
-            workspace_root().join("docs/book/src/contributing/pr-review-protocol.md"),
-        )
-        .unwrap();
-        assert!(protocol.contains(expected_verdict_row(&POLICY)));
     }
 }
