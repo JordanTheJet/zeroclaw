@@ -2628,10 +2628,11 @@ mod tests {
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
-        let (success, output) = Box::pin(execute_job_with_retry(
+        let outcome = Box::pin(execute_job_with_retry(
             &config, &security, TEST_AGENT, &job, None, false,
         ))
         .await;
+        let (success, output) = (outcome.is_success(), outcome.into_output());
         assert!(success, "retrying cron agent run failed: {output}");
         assert_eq!(output, "done");
 
