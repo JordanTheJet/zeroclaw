@@ -385,6 +385,15 @@ pub async fn serve_on(
                 };
                 zeroclaw_spawn::spawn!(async move {
                     let _permit = permit;
+                    // This server holds ONE ledger for the daemon's lifetime,
+                    // so it never gets an open-time sweep after startup. Any
+                    // enrollment activity - including a connection that goes on
+                    // to fail authentication - is a fine moment to reconcile
+                    // certificates an earlier failed response left undelivered.
+                    // One indexed query against a table with a row per issued
+                    // certificate; the sweep is age-gated, so it cannot touch
+                    // an issuance in flight.
+                    sweep_undelivered(&server);
                     let peer_ip = peer.ip().to_string();
                     let fut = handle_conn(&server, tcp, &peer_ip, class);
                     let _ = tokio::time::timeout(
@@ -395,6 +404,26 @@ pub async fn serve_on(
                 });
             }
         }
+    }
+}
+
+/// Reconcile certificates an earlier enrollment left undelivered, logging
+/// rather than failing.
+///
+/// Never propagates: this is maintenance for PAST issuances, and refusing to
+/// serve the connection in front of us because an unrelated stale row could not
+/// be revoked would trade a bounded residue for an outage. The rows stay
+/// eligible for the next connection, the next issuance, or the next restart.
+fn sweep_undelivered(server: &EnrollServer) {
+    if let Err(error) = server.ledger.sweep_undelivered_certificates() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+            "enrollment: could not sweep undelivered certificates; they stay eligible for the \
+             next enrollment, issuance, or ledger open"
+        );
     }
 }
 
@@ -1208,6 +1237,67 @@ mod tests {
         assert!(
             set.contains(&fingerprint.to_ascii_lowercase()),
             "the reconciled revocation must reach the verifier's CRL file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_enrollment_reconciles_an_earlier_undelivered_one_on_the_live_server() {
+        // The liveness gap, at the layer that had it. The enrollment server
+        // holds ONE Arc<CertLedger> for the daemon's lifetime, so when the
+        // sweep only ran at ledger open, a failed enrollment response left an
+        // active row and an unchanged CRL until the process restarted - the
+        // stated one-hour bound did not hold on this path at all.
+        //
+        // Nothing here reopens or drops the ledger: the SAME server and the
+        // SAME handle serve both enrollments.
+        let (dir, server, first) = enrolled_but_undelivered().await;
+        let ghost = first.fingerprint.clone();
+        deliver_enroll_response(&server, &mut DisconnectedClient, Ok(first)).await;
+        assert_eq!(
+            delivered_at(dir.path(), &ghost),
+            None,
+            "the first client never received its certificate"
+        );
+        assert_eq!(
+            server.ledger.status_of(&ghost).unwrap(),
+            Some(CertStatus::Active),
+            "and its row is live until something sweeps"
+        );
+
+        // Time passes past the delivery deadline. Nothing sweeps on its own -
+        // this is the honest bound: the row waits for the next activity.
+        backdate_issuance(dir.path(), &ghost);
+        assert_eq!(
+            server.ledger.status_of(&ghost).unwrap(),
+            Some(CertStatus::Active),
+            "the bound is per-activity, not a timer - state that honestly"
+        );
+
+        // The next client to reach the endpoint is enough. This is exactly what
+        // the accept loop runs for every accepted connection, before it knows
+        // whether the peer will even authenticate.
+        sweep_undelivered(&server);
+
+        // Revoked and enforced, with no restart, no reopen, and no unrelated
+        // cert/renew - on the very Arc<CertLedger> the running server holds.
+        assert_eq!(
+            server.ledger.status_of(&ghost).unwrap(),
+            Some(CertStatus::Revoked),
+            "enrollment activity must reconcile an earlier undelivered issuance"
+        );
+        let crl = crate::security::cert_ledger::revoked_list_path(dir.path());
+        let set = zeroclaw_tls::load_revoked_fingerprints(&crl).unwrap();
+        assert!(
+            set.contains(&ghost.to_ascii_lowercase()),
+            "the verifier's CRL must carry it while the daemon keeps running"
+        );
+
+        // Repeat activity is a no-op, not a second revocation.
+        sweep_undelivered(&server);
+        assert_eq!(
+            server.ledger.revoked_fingerprints().unwrap(),
+            vec![ghost],
+            "the sweep must be idempotent across connections"
         );
     }
 

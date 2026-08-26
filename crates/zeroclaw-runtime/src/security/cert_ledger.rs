@@ -18,7 +18,9 @@
 //! Promotion happens BEFORE the certificate reaches its keyholder, so *delivery*
 //! is tracked as a second, explicitly reconciled dimension: `delivered_at`, set
 //! by [`CertLedger::mark_delivered`] at the real delivery/publication boundary
-//! and swept by `reconcile_undelivered_issuances` at open. See
+//! and swept by `reconcile_undelivered_issuances` at the first issuance, ledger
+//! open, or explicit [`CertLedger::sweep_undelivered_certificates`] after the
+//! TTL elapses (not on a timer - see that function for the residual). See
 //! [`CertLedger::record_issued`] for why promotion-before-delivery is the
 //! deliberately chosen failure direction.
 //!
@@ -499,10 +501,32 @@ impl CertLedger {
     /// un-record a credential that might exist, which is the one thing this
     /// ledger must never do.
     ///
-    /// This runs at open, in [`CertLedger::open`] - which for the renew RPC is
-    /// once per call, and for the daemon is once per start. A long-lived daemon
-    /// holding one ledger handle therefore sweeps at its next restart (or at
-    /// the next `cert/renew`, which opens its own handle), not on a timer.
+    /// # When this runs, precisely
+    ///
+    /// A stale row is revoked at **the first issuance, ledger open, or explicit
+    /// sweep after the TTL elapses** - not on a timer. Three triggers:
+    ///
+    /// - every [`CertLedger::open`], which for the renew RPC is once per call
+    ///   and for the daemon is once per start;
+    /// - the start of every [`CertLedger::record_issued`], so any new issuance
+    ///   or renewal cleans up what earlier ones stranded - this is what gives
+    ///   the long-lived enrollment handle a bound at all, since it is opened
+    ///   once for the daemon's whole lifetime;
+    /// - [`CertLedger::sweep_undelivered_certificates`], for a caller that
+    ///   knows it is at a good moment to reconcile.
+    ///
+    /// **Residual:** a daemon that goes completely idle on the certificate
+    /// paths - no enrollment, no renewal, no restart - sweeps at its next such
+    /// activity rather than exactly one hour in. The TTL bounds the age of a
+    /// row that any of these triggers will tolerate, not wall-clock time since
+    /// the failure. Concretely: on a daemon that does no certificate work, a
+    /// ghost certificate stays out of the CRL, so it can still complete the WSS
+    /// handshake - that plane authorizes by CA chain and revocation list and
+    /// never consults this ledger. It cannot RENEW (the renew RPC opens a
+    /// ledger, which sweeps before it reads status), and the next enrollment or
+    /// renewal by anyone revokes it. A timer would close only the
+    /// no-certificate-activity case; that is a deliberate tradeoff, not an
+    /// oversight, and the operator-facing docs state the same bound.
     fn reconcile_undelivered_issuances(&self) -> Result<()> {
         let cutoff = now_unix() - UNDELIVERED_CERT_TTL_SECS;
         let stale: Vec<String> = {
@@ -529,6 +553,19 @@ impl CertLedger {
                 .with_context(|| format!("revoke undelivered certificate {fingerprint}"))?;
         }
         Ok(())
+    }
+
+    /// Run the undelivered sweep on this handle, for a caller holding a
+    /// long-lived ledger that wants to reconcile without reopening.
+    ///
+    /// The enrollment endpoint is the case this exists for: it builds ONE
+    /// ledger for the daemon's lifetime, so without a trigger like this its
+    /// only sweep would be the one at startup. Best-effort by design - it
+    /// reports whether the sweep ran, and a caller on an unrelated path should
+    /// log rather than fail, since a sweep failure does not make the caller's
+    /// own work unsafe and the rows stay eligible for the next attempt.
+    pub fn sweep_undelivered_certificates(&self) -> Result<()> {
+        self.reconcile_undelivered_issuances()
     }
 
     /// Record that the certificate behind `fingerprint` actually reached its
@@ -684,10 +721,33 @@ impl CertLedger {
     /// delivery/publication boundary, and
     /// `reconcile_undelivered_issuances` revokes - never deletes -
     /// whatever is still unmarked once
-    /// `UNDELIVERED_CERT_TTL_SECS` has passed. The ghost row is bounded to an
-    /// hour and ends up in the materialized revocation list, while a delivered
-    /// certificate is never at risk of vanishing from the record.
+    /// `UNDELIVERED_CERT_TTL_SECS` has passed. The ghost row ends up in the
+    /// materialized revocation list, while a delivered certificate is never at
+    /// risk of vanishing from the record.
+    ///
+    /// Every call sweeps stale undelivered rows before staging anything, which
+    /// is what bounds a ghost row on a handle that is never reopened - the
+    /// enrollment endpoint holds exactly one for the daemon's lifetime. The
+    /// sweep is age-gated at the TTL, so it can never touch the row this call
+    /// is about to create, nor any other issuance still in flight.
     pub fn record_issued(&self, entry: &LedgerEntry, renewal: bool) -> Result<()> {
+        // Best-effort, deliberately NOT `?`. This sweep is maintenance for
+        // OTHER issuances; failing it would turn an unwritable CRL - or a
+        // failing audit sink on some unrelated stale row - into a refusal to
+        // issue for a client that has done nothing wrong. The stale rows stay
+        // eligible for the next trigger, so nothing is lost by deferring. At
+        // open the same failure IS fatal, because there is no in-flight
+        // operation to protect and a broken ledger should surface loudly.
+        if let Err(error) = self.reconcile_undelivered_issuances() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "cert ledger: could not sweep undelivered certificates before this issuance; \
+                 they stay eligible for the next issuance, ledger open, or explicit sweep"
+            );
+        }
         self.audit_cert(entry, CertAuditStage::Attempted { renewal })?;
         let staged = self.stage_pending(entry)?;
         if let Err(err) = self.audit_cert(entry, CertAuditStage::Completed { renewal }) {
@@ -1195,7 +1255,12 @@ mod tests {
                 token_hash: "abcdef0123456789".to_string(),
             }
             .label(),
-            issued_at: 1_000,
+            // Issued NOW, as every production caller records it. A 1970
+            // timestamp would make every fixture row instantly eligible for the
+            // undelivered sweep, so tests would be asserting against a state no
+            // real issuance passes through. Staleness is opt-in, via
+            // `backdate_issuance`.
+            issued_at: now_unix(),
         }
     }
 
@@ -2370,6 +2435,93 @@ mod tests {
         let again = CertLedger::open(dir.path(), None).unwrap();
         assert!(again.is_revoked("fpGhost").unwrap());
         assert_eq!(audit_events(&log).len(), 3, "the sweep must not re-revoke");
+    }
+
+    #[test]
+    fn a_new_issuance_sweeps_stale_undelivered_rows_on_the_same_handle() {
+        // Liveness. The enrollment endpoint builds ONE ledger for the daemon's
+        // whole lifetime, so an open-time-only sweep meant a failed enrollment
+        // could leave an active row and an unchanged CRL until the daemon
+        // restarted - the "one hour" bound was not a bound at all on that path.
+        // Every issuance now sweeps first, so ordinary enrollment traffic is
+        // what enforces it. Deliberately NO reopen anywhere in this test.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, log) = audit_logger(dir.path());
+        let led = CertLedger::open(dir.path(), Some(audit)).unwrap();
+
+        // A: issued, never delivered - the response write failed.
+        led.record_issued(&entry("fpGhost", "devGhost"), false)
+            .unwrap();
+        backdate_issuance(dir.path(), "fpGhost", PAST_TTL_SECS);
+        assert_eq!(
+            led.status_of("fpGhost").unwrap(),
+            Some(CertStatus::Active),
+            "still active until something sweeps"
+        );
+
+        // B: an unrelated later enrollment, through the SAME handle.
+        led.record_issued(&entry("fpNew", "devNew"), false).unwrap();
+
+        // A is gone from service, without anyone reopening the ledger.
+        assert_eq!(
+            led.status_of("fpGhost").unwrap(),
+            Some(CertStatus::Revoked),
+            "a new issuance must sweep stale undelivered rows on a live handle"
+        );
+        let crl = std::fs::read_to_string(revoked_list_path(dir.path())).unwrap();
+        assert_eq!(
+            crl.trim(),
+            "fpGhost",
+            "the sweep must reach the CRL the verifier reads, with no reopen"
+        );
+
+        // B is untouched: young, and undelivered only because it has not been
+        // marked yet. Sweeping it would break every enrollment in flight.
+        assert_eq!(
+            led.status_of("fpNew").unwrap(),
+            Some(CertStatus::Active),
+            "the issuance that triggered the sweep must not sweep itself"
+        );
+        assert!(led.mark_delivered("fpNew").unwrap());
+
+        // The trail shows the revocation landing between the two issuances.
+        let names: Vec<String> = audit_events(&log).iter().map(type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "cert_issuance_attempted",
+                "cert_issued",
+                "cert_revoked",
+                "cert_issuance_attempted",
+                "cert_issued",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_explicit_sweep_reconciles_without_reopening() {
+        // The public trigger the long-lived enrollment handle uses when it is
+        // not issuing anything - a client connects, fails to authenticate, and
+        // that activity is still enough to reconcile earlier residue.
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued(&entry("fpGhost", "devGhost"), false)
+            .unwrap();
+        backdate_issuance(dir.path(), "fpGhost", PAST_TTL_SECS);
+
+        led.sweep_undelivered_certificates().unwrap();
+
+        assert_eq!(
+            led.status_of("fpGhost").unwrap(),
+            Some(CertStatus::Revoked),
+            "an explicit sweep must reconcile without a reopen"
+        );
+        // Idempotent: sweeping again is a no-op, not a second revocation.
+        led.sweep_undelivered_certificates().unwrap();
+        assert_eq!(
+            led.revoked_fingerprints().unwrap(),
+            vec!["fpGhost".to_string()]
+        );
     }
 
     #[test]

@@ -533,6 +533,36 @@ the daemon refuses to start and leaves the original ledger untouched rather than
 half-migrated, and the error names the file. No operator action is required, and
 enrolled devices do not need to re-enroll.
 
+### Undelivered certificates
+
+The daemon records an issuance in the ledger *before* it hands the certificate
+over - to the enrolling client, to a renewing client, or to the operator's
+`issue-client-cert` files. That order is deliberate: the alternative can leave a
+live CA-signed certificate in someone's hands with no ledger row, and a
+certificate the ledger has never heard of cannot be listed or revoked.
+
+The cost is that a failure in between - a client that disconnects mid-response,
+a failed rename - leaves an `active` row for a certificate nobody received. Such
+a row is tracked separately as *undelivered* and is **revoked once it is older
+than one hour**, at the first of:
+
+- any new certificate issuance or renewal,
+- any enrollment connection,
+- any daemon restart or other ledger open.
+
+It is not a background timer. A daemon doing no certificate work at all defers
+the sweep until its next such activity; until then the certificate stays out of
+`tls/revoked` and would still pass a WSS handshake, though it cannot renew. Any
+enrollment or renewal traffic - including a connection that fails to
+authenticate - is enough to reconcile it.
+
+Reconciled certificates are revoked, never deleted: they appear in
+`security list-client-certs` history and in `tls/revoked` exactly like an
+operator revocation, with the audit actor `reconcile:undelivered` so the trail
+distinguishes them. If a device reports that a certificate it *did* receive
+stopped working, look for that actor - it means the delivery record was lost,
+and the fix is to re-enroll or re-issue.
+
 ## Verifying and troubleshooting
 
 - **Daemon up:** look for the WSS listener log on `0.0.0.0:9781` and, with a relay,
