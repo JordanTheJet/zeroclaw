@@ -155,30 +155,7 @@ Parser behavior:
 
 - Numbered items (`1.`, `2.`, ...) define step order.
 - Leading bold text (`**Title**`) becomes step title.
-- `- tools:` maps to `suggested_tools`.
-- `- requires_confirmation: true` enforces approval for that step.
-- `- kind:` accepts `execute` (default) or `checkpoint`. A checkpoint step
-  pauses deterministic execution at that step. Use `requires_confirmation: true`
-  when a step must require approval in any execution mode.
-- `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
-- `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
-- `- when:` guards an explicit `- next:` jump and is evaluated against
-  accumulated completed-step outputs after the current step finishes. A
-  matching guard takes the explicit jump. A false guard advances to the next
-  linear step (`current_step + 1`), or completes when the current step is
-  terminal.
-- `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
-  are marked `skipped` and leave the run `pending` instead of dispatching.
-- `- terminal: true` completes the run instead of advancing to another step.
-  The final step also completes when it has no linear successor.
-- `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
-  enforced for reported step failures and output schema failures.
-- `- mode:` overrides the SOP execution mode for that step.
-- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
-  that gates this step's approval with required-group membership and quorum. Omit
-  it for an unpoliced gate. A step that names a policy absent from
-  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
-  clearing on a single approval.
+{{#include ../_snippets/sop-step-bullets.md}}
 
 ### Copyable conditional-routing example
 
@@ -461,8 +438,9 @@ useful for scalar event payloads.
 
 ### Operators
 
-A comparison uses one operator, matched longest-first: `>=`, `<=`, `!=`, `==`,
-`>`, `<`. JSON-path comparisons try numeric comparison first. If both sides
+{{#include ../_snippets/sop-condition-operators.md}}
+
+JSON-path comparisons try numeric comparison first. If both sides
 parse as numbers, they compare numerically; otherwise values compare as strings.
 Surrounding double quotes on the comparand are stripped, so quote string
 literals: `$.status == "critical"`. Direct numeric conditions are numeric-only:

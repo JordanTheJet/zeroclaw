@@ -14,6 +14,7 @@ pub mod route;
 pub mod rundata;
 pub mod schema;
 pub mod scope;
+pub mod step_bullets;
 pub mod step_contract;
 pub mod store;
 pub mod trigger_registry;
@@ -570,6 +571,9 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
         // Sub-bullet parsing (only when inside a step)
         if current.number.is_some() && trimmed.starts_with("- ") {
             let bullet = trimmed.trim_start_matches("- ").trim();
+            // step-bullet handlers: begin (bounds the drift test in
+            // step_bullets.rs; every handler in this chain must have a
+            // catalog entry there, which the docs generator renders)
             if let Some(tools_str) = bullet.strip_prefix("tools:") {
                 current.tools = parse_csv_list(tools_str);
             } else if let Some(tools_str) = bullet
@@ -650,6 +654,7 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                     Some(val.to_string())
                 };
             } else {
+                // step-bullet handlers: end
                 // Continuation body line
                 if !current.body.is_empty() {
                     current.body.push('\n');

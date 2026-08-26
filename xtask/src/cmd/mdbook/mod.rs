@@ -10,6 +10,7 @@ pub mod plugins;
 pub mod protected;
 pub mod refs;
 pub mod serve;
+pub mod sop_syntax;
 pub mod stats;
 pub mod sync;
 pub mod themes;

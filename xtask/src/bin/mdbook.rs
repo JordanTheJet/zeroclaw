@@ -108,6 +108,7 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::keymap::run(&root)?;
             cmd::mdbook::hardware::run(&root)?;
             cmd::mdbook::feature_matrix::run(&root)?;
+            cmd::mdbook::sop_syntax::run(&root)?;
             cmd::mdbook::peer_groups::run()
         }
         Cmd::Placeholders { arg, .. } => {

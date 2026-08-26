@@ -72,6 +72,7 @@ pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> an
     crate::cmd::mdbook::hardware::run(root)?;
     crate::cmd::mdbook::feature_matrix::run(root)?;
     crate::cmd::mdbook::plugins::run(root)?;
+    crate::cmd::mdbook::sop_syntax::run(root)?;
     Ok(())
 }
 
