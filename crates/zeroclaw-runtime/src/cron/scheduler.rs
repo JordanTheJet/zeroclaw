@@ -23,6 +23,36 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
 
+/// Action-budget trackers shared across cron runs, keyed by install data
+/// directory and agent alias.
+///
+/// `SecurityPolicy::for_agent` builds a fresh `PerSenderTracker` on every call
+/// and cron builds a policy per run, so without a shared tracker the hourly
+/// action budget resets each tick and never actually bounds cron work. The
+/// data-dir half of the key keeps separate installs (and separate tests) from
+/// sharing a budget.
+static CRON_ACTION_TRACKERS: std::sync::LazyLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<
+            (std::path::PathBuf, String),
+            zeroclaw_config::policy::PerSenderTracker,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Build the security policy a cron run executes under.
+///
+/// Identical to `SecurityPolicy::for_agent` except that the action-budget
+/// tracker persists for the life of the process, so `max_actions_per_hour`
+/// bounds cron work across runs rather than resetting on each one.
+fn cron_security_policy(config: &Config, agent_alias: &str) -> anyhow::Result<SecurityPolicy> {
+    let mut policy = SecurityPolicy::for_agent(config, agent_alias)?;
+    let key = (config.data_dir.clone(), agent_alias.to_string());
+    let tracker = CRON_ACTION_TRACKERS.lock().entry(key).or_default().clone();
+    policy.tracker = tracker;
+    Ok(policy)
+}
+
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
@@ -511,6 +541,7 @@ pub async fn run(
         jobs_with_builtin.insert("__builtin_backup".to_string(), backup_job);
     }
 
+    let mut declarative_sync_failed = false;
     match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
             if !jobs_with_builtin.is_empty() {
@@ -522,13 +553,22 @@ pub async fn run(
                 );
             }
         }
-        Err(e) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to sync declarative cron jobs"
-        ),
+        Err(e) => {
+            // Fail closed. A partial reconciliation can leave a row's stored
+            // `command`/`prompt` at the previous revision while the gate still
+            // resolves from live config, which would authorize an old body with
+            // a new precondition. Refusing to run declarative jobs is the only
+            // outcome that keeps the gate and the work it authorizes describing
+            // the same declaration.
+            declarative_sync_failed = true;
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to sync declarative cron jobs; declarative jobs are held until reconciliation succeeds"
+            );
+        }
     }
 
     // ── Stale-lock recovery: any in-flight lock present at boot was left by a
@@ -583,6 +623,10 @@ pub async fn run(
                     }
                 };
 
+                // Held back while reconciliation is unresolved: a declarative
+                // row may still carry a body from before the config change the
+                // gate is being resolved from.
+                let jobs = withhold_declarative_when_unreconciled(jobs, declarative_sync_failed);
                 let jobs = claim_due_jobs(&config, jobs);
                 process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
@@ -765,7 +809,7 @@ async fn execute_job_now_with_runtime(
         );
     };
     let agent_alias = agent_alias.to_string();
-    let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+    let security = match cron_security_policy(config, &agent_alias) {
         Ok(s) => s,
         Err(e) => {
             return CronRunOutcome::executed(
@@ -920,6 +964,32 @@ async fn execute_job_with_retry(
     CronRunOutcome::executed(false, last_output)
 }
 
+/// Drop declarative jobs from a due batch when declarative reconciliation has
+/// not succeeded this process.
+///
+/// Imperative jobs are unaffected: their body lives on the row and has no
+/// config declaration to disagree with.
+fn withhold_declarative_when_unreconciled(jobs: Vec<CronJob>, sync_failed: bool) -> Vec<CronJob> {
+    if !sync_failed {
+        return jobs;
+    }
+    jobs.into_iter()
+        .filter(|job| {
+            if job.source == "declarative" {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"job_id": job.id})),
+                    "Skipping declarative cron job: config reconciliation has not succeeded"
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
     jobs.into_iter()
         .filter(|job| match claim_job(config, &job.id, Utc::now()) {
@@ -966,7 +1036,7 @@ async fn process_due_jobs(
             return None;
         };
         let agent_alias = agent_alias.to_owned();
-        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+        let security = match cron_security_policy(config, &agent_alias) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
@@ -3942,6 +4012,95 @@ mod tests {
         // The delivery error is appended, but the cause of death stays the gate.
         assert_eq!(outcome.status, STATUS_PRECONDITION_FAILED);
         assert!(outcome.output.contains("delivery failed"));
+    }
+
+    // ── Startup recovery, reconciliation, and budget lifetime ────────
+
+    #[tokio::test]
+    async fn startup_recovery_keeps_a_claim_made_by_this_process() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "own-claim", "exit 0", 30);
+
+        // The gateway accepted a manual trigger before the scheduler started.
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+
+        // Scheduler startup recovery now runs in the same process.
+        let cleared = cron::clear_stale_locks(&config).expect("recovery should succeed");
+
+        assert_eq!(cleared, 0, "this process's own claim must not be cleared");
+        assert!(
+            !cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the live claim must still be held after startup recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_clears_a_claim_left_by_another_process() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "dead-claim", "exit 0", 30);
+
+        // A lock whose owner is some other (dead) process, and the pre-column
+        // shape where the owner is unknown. Both are stale by definition.
+        for owner in [Some("some-other-process"), None] {
+            cron::test_support::force_claim(&config, &job.id, owner).expect("seed a foreign claim");
+            let cleared = cron::clear_stale_locks(&config).expect("recovery should succeed");
+            assert_eq!(
+                cleared, 1,
+                "a foreign claim must be cleared (owner={owner:?})"
+            );
+            assert!(
+                cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "the row must be claimable again"
+            );
+            cron::release_job(&config, &job.id).unwrap();
+        }
+    }
+
+    #[test]
+    fn declarative_jobs_are_withheld_while_reconciliation_is_unresolved() {
+        let mut declarative = test_job("echo decl");
+        declarative.source = "declarative".into();
+        let imperative = test_job("echo imp");
+
+        let jobs = vec![declarative.clone(), imperative.clone()];
+
+        // Reconciliation succeeded: everything runs.
+        let kept = withhold_declarative_when_unreconciled(jobs.clone(), false);
+        assert_eq!(kept.len(), 2);
+
+        // Reconciliation failed: the declarative row's stored body may predate
+        // the config the gate resolves from, so it is held back. Imperative
+        // rows have no config declaration to disagree with.
+        let kept = withhold_declarative_when_unreconciled(jobs, true);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].source, "imperative");
+    }
+
+    #[tokio::test]
+    async fn cron_action_budget_persists_across_runs() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        // One action per hour: the first run consumes it, the second must be
+        // refused rather than handed a fresh budget.
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .max_actions_per_hour = 1;
+
+        let first = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        assert!(first.record_action(), "the first action fits the budget");
+
+        let second = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        assert!(
+            !second.record_action(),
+            "a later cron run must share the budget, not reset it"
+        );
     }
 
     // ── Ownership resolution for declarative jobs ────────────────────

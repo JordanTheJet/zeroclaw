@@ -10,6 +10,10 @@
 //! | `10` | preconditions not met — record a clean skip, never start the body |
 //! | anything else, a signal, or a timeout | the gate itself failed — record a precondition failure |
 //!
+//! A hook only runs under a runtime whose work the daemon can actually
+//! terminate. Container and remote runtimes are refused up front rather than
+//! given a deadline that cannot be enforced.
+//!
 //! The hook is a config-declared command executed on a timer, so it is gated
 //! exactly like the job's own shell command: allowlist, risk level, path guard,
 //! autonomy, rate limit, and action budget are all re-checked on every run, and
@@ -89,6 +93,23 @@ pub(crate) async fn evaluate(
     if hook.timeout_secs == 0 {
         return PreconditionOutcome::Failed {
             output: "pre_hook timeout_secs must be at least 1".to_string(),
+        };
+    }
+
+    // Fail closed where a timeout cannot actually stop the work. Under a
+    // container runtime the hook is `docker run ... sh -c <command>`, and
+    // killing the client leaves the container running past the timeout, after
+    // the gate has already reported failure and released the claim. A gate
+    // whose deadline is unenforceable is not a gate, so refuse rather than
+    // advertise a guarantee that does not hold.
+    if !cancellation_is_enforceable(config.runtime.kind) {
+        return PreconditionOutcome::Failed {
+            output: format!(
+                "pre_hook is not supported under the {} runtime: a timeout cannot \
+                 terminate work started inside it, so the gate's deadline could \
+                 not be enforced",
+                config.runtime.kind.as_wire()
+            ),
         };
     }
 
@@ -226,6 +247,19 @@ pub(crate) async fn evaluate(
     }
 }
 
+/// Whether a timed-out hook can actually be stopped under this runtime.
+///
+/// Native execution is cancellable: the hook is spawned into its own process
+/// group (unix) or killed as a tree (windows). Container and remote runtimes
+/// start work whose lifetime the daemon does not control.
+fn cancellation_is_enforceable(kind: zeroclaw_config::schema::RuntimeKind) -> bool {
+    use zeroclaw_config::schema::RuntimeKind;
+    match kind {
+        RuntimeKind::Native => true,
+        RuntimeKind::Docker | RuntimeKind::Cloudflare => false,
+    }
+}
+
 /// Drain `reader` while keeping at most `cap` bytes.
 ///
 /// Returns the retained bytes and whether anything was discarded. Reading
@@ -281,7 +315,20 @@ async fn terminate_process_tree(child: &mut tokio::process::Child, pid: Option<u
             libc::killpg(pgid, libc::SIGKILL);
         }
     }
-    #[cfg(not(unix))]
+    // Windows has no process groups here; `taskkill /T` walks the child tree,
+    // which is what `<shell> -c <command>` needs since the real work is a
+    // grandchild of the process we hold a handle to.
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = pid;
 
     let _ = child.start_kill();
@@ -389,6 +436,16 @@ mod tests {
             truncated,
             String::from_utf8(truncated.clone().into_bytes()).unwrap()
         );
+    }
+
+    #[test]
+    fn cancellation_is_only_enforceable_on_the_native_runtime() {
+        use zeroclaw_config::schema::RuntimeKind;
+        assert!(cancellation_is_enforceable(RuntimeKind::Native));
+        // A timeout cannot stop work inside a container or a remote runtime,
+        // so the gate must refuse rather than promise a deadline it cannot keep.
+        assert!(!cancellation_is_enforceable(RuntimeKind::Docker));
+        assert!(!cancellation_is_enforceable(RuntimeKind::Cloudflare));
     }
 
     #[tokio::test]
