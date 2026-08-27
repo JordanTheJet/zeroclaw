@@ -272,7 +272,13 @@ async fn fetch_enroll_trust_via_relay(
     relay: &crate::client::RelayDial,
 ) -> Result<EnrollTrustResponse> {
     within_exchange_budget("the enrollment trust fetch through the relay", async {
-        let stream = crate::client::dial_enrollment_through_relay(relay).await?;
+        // `_pump` is held for exactly as long as the stream is in use. Dropping
+        // it retires the tunnel, and it is dropped by every way out of this
+        // block - including the budget above expiring, which drops the whole
+        // future without running anything written here.
+        let (stream, _pump) = crate::client::dial_enrollment_through_relay(relay)
+            .await?
+            .split();
         fetch_enroll_trust_on_stream(stream, RELAY_ENROLL_SERVER_NAME, RELAY_ENROLL_SERVER_NAME)
             .await
     })
@@ -304,7 +310,10 @@ async fn post_enroll_via_relay(
     trusted_ca_pem: &str,
 ) -> Result<EnrollResponse> {
     within_exchange_budget("the enrollment request through the relay", async {
-        let stream = crate::client::dial_enrollment_through_relay(relay).await?;
+        // Held for the life of the exchange; see `fetch_enroll_trust_via_relay`.
+        let (stream, _pump) = crate::client::dial_enrollment_through_relay(relay)
+            .await?
+            .split();
         post_enroll_on_stream(
             stream,
             RELAY_ENROLL_SERVER_NAME,
@@ -2098,6 +2107,150 @@ mod tests {
         assert!(err.contains("did not complete within"), "got: {err}");
         assert!(err.contains("relay"), "got: {err}");
         server.abort();
+    }
+
+    /// A relay that admits the route and then goes inert leaves the enrollment
+    /// exchange with nothing to complete: the inner TLS handshake is never
+    /// answered. When the exchange is abandoned - its budget expiring, or the
+    /// caller dropping it - the whole future is discarded and NO code the
+    /// exchange wrote runs. Only the tunnel guard's destructor can retire the
+    /// pump, and a detached pump would sit here holding the route while every
+    /// retry added another.
+    ///
+    /// Real clock on purpose: a paused clock auto-advances through the setup
+    /// budget while the TLS and WebSocket handshakes are still in flight, so the
+    /// tunnel would never open and this test would prove nothing. Cancellation
+    /// stands in for the budget expiring - it is the same discarded future, and
+    /// it does not cost the test the full budget to observe.
+    #[tokio::test]
+    async fn an_abandoned_relay_enrollment_retires_its_pump() {
+        let _serial = crate::client::live_pumps::exclusive().await;
+        let (addr, opened, server) = relay_that_opens_then_stops_reading().await;
+        let relay = crate::client::RelayDial {
+            relay_addr: addr.to_string(),
+            relay_host: "localhost".into(),
+            node_id: "node-1".into(),
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_pin: None,
+            relay_tofu: false,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        };
+        let before = crate::client::live_pumps::count();
+        let completed_before = crate::client::live_pumps::completed();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fetch_enroll_trust_via_relay(&relay),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "the exchange must still be in flight when it is abandoned"
+        );
+        // Non-vacuity: without this the test would also pass if the tunnel had
+        // never opened and no pump had ever existed.
+        assert!(
+            opened.await.is_ok(),
+            "the relay must have admitted the route, so a pump really existed"
+        );
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            crate::client::live_pumps::count(),
+            before,
+            "an abandoned exchange must leave no relay pump behind"
+        );
+        // And it must have been retired where it stood. A pump that merely
+        // noticed its stream close would have run to the end of its body; one
+        // parked in a relay write - the state this relay creates - never does.
+        assert_eq!(
+            crate::client::live_pumps::completed(),
+            completed_before,
+            "the tunnel guard must abort the pump, not rely on it noticing"
+        );
+        server.abort();
+    }
+
+    /// Echo the relay subprotocol so the client's handshake completes.
+    ///
+    /// The error type is tungstenite's `ErrorResponse`, which carries a whole
+    /// HTTP response and so trips the large-error lint; the signature is the
+    /// library's, and this handshake never takes the error path.
+    #[allow(clippy::result_large_err)]
+    fn echo_subprotocol(
+        req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        if req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .is_some_and(|v| {
+                v.to_str()
+                    .is_ok_and(|v| v.contains(crate::relay_proto::SUBPROTOCOL))
+            })
+        {
+            resp.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                crate::relay_proto::SUBPROTOCOL
+                    .parse()
+                    .expect("static subprotocol"),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// A relay that completes its handshakes, admits the enrollment route, and
+    /// then reads nothing further.
+    async fn relay_that_opens_then_stops_reading() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (_, ca, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let (cert, key) =
+            crate::client_crypto::test_pki::gen_server_cert(&ca, &ca_key, &["localhost".into()]);
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&cert, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("relay outer TLS");
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_subprotocol)
+                .await
+                .expect("relay ws accept");
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg
+                    && matches!(
+                        crate::relay_proto::Control::from_json(t.as_str()),
+                        Ok(crate::relay_proto::Control::Enroll { .. })
+                    )
+                {
+                    break;
+                }
+            }
+            ws.send(Message::text(
+                crate::relay_proto::Control::Opened { conn_id: 7 }.to_json(),
+            ))
+            .await
+            .expect("send Opened");
+            let _ = opened_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        (addr, opened_rx, server)
     }
 
     #[tokio::test(start_paused = true)]

@@ -996,6 +996,66 @@ pub(crate) struct RelayTunnel {
     pump: tokio::task::JoinHandle<()>,
 }
 
+/// Owns a relay pump and aborts it when dropped.
+///
+/// Dropping a `JoinHandle` detaches the task; it does not stop it. A pump left
+/// that way keeps its relay route allocated and can stay parked in a DATA write,
+/// in its write-stall budget, or in the closing handshake, and nothing on the
+/// client can reach it again. This guard makes the cleanup structural: every way
+/// out of a scope holding one - success, `?`, a timeout dropping the whole
+/// future, a panic - runs the abort, so a caller cannot forget the path it did
+/// not think about.
+///
+/// Releasing the guard hands the task on to an owner that will keep it running,
+/// which is what the RPC path does when a session adopts its tunnel.
+pub struct RelayPumpGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl RelayPumpGuard {
+    /// Give up ownership without aborting, for a caller that takes over the
+    /// task's lifetime.
+    fn release(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+
+    /// Watch the guarded task without owning it. Test-only: the guard's whole
+    /// purpose is that nothing else needs to reach the pump.
+    #[cfg(test)]
+    fn abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.0.as_ref().map(|h| h.abort_handle())
+    }
+}
+
+impl Drop for RelayPumpGuard {
+    fn drop(&mut self) {
+        if let Some(pump) = self.0.take() {
+            pump.abort();
+        }
+    }
+}
+
+/// An enrollment tunnel: the plaintext byte stream the enrollment TLS runs over,
+/// and the guard that retires its pump.
+///
+/// Enrollment is the path with no session to hand the pump to - the exchange
+/// finishes, fails, or times out, and the tunnel is done either way - so the
+/// pump's lifetime is bound to this value rather than to a caller's discipline.
+///
+/// It has no `Drop` of its own so that [`Self::split`] can hand the stream and
+/// the guard out separately; the guard keeps its own destructor.
+pub struct EnrollmentTunnel {
+    io: tokio::io::DuplexStream,
+    pump: RelayPumpGuard,
+}
+
+impl EnrollmentTunnel {
+    /// Split into the stream to run TLS over and the guard to keep alive for as
+    /// long as that stream is in use. Hold the guard in the same scope as the
+    /// exchange: dropping it retires the pump.
+    pub fn split(self) -> (tokio::io::DuplexStream, RelayPumpGuard) {
+        (self.io, self.pump)
+    }
+}
+
 /// Run one step of relay setup against the shared absolute deadline.
 ///
 /// Every step of a setup passes through here with the SAME `deadline`, so the
@@ -1119,6 +1179,12 @@ async fn dial_through_relay_unbounded(relay: &RelayDial, route: RelayRoute) -> R
     // as DATA; inbound DATA payloads are written back for the inner TLS to read.
     let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
     let pump = tokio::spawn(async move {
+        // Counts this pump as live for as long as the task's future exists. Its
+        // destructor runs on a normal exit AND when the future is dropped by an
+        // abort, which is what lets a test observe that a tunnel was retired
+        // rather than merely asked to stop.
+        #[cfg(test)]
+        let _alive = live_pumps::Token::new();
         // Per-conn credit flow control. `send_window` gates how much we ship to
         // the relay before the daemon acks (so we never pin more than one window
         // of unsent inner bytes); `recv_drained` counts daemon->client bytes we
@@ -1227,7 +1293,14 @@ async fn dial_through_relay_unbounded(relay: &RelayDial, route: RelayRoute) -> R
             }
         }
         let _ = relay_io.shutdown().await;
-        let _ = futures_util::SinkExt::close(&mut sink).await;
+        // The closing handshake is a write to the same peer that may already
+        // have stopped reading, so it gets the same budget as a DATA frame. An
+        // unbounded close is how a pump that has finished its work still fails
+        // to finish its task.
+        let _ =
+            tokio::time::timeout(RELAY_WRITE_STALL, futures_util::SinkExt::close(&mut sink)).await;
+        #[cfg(test)]
+        live_pumps::mark_completed();
     });
 
     Ok(RelayTunnel {
@@ -1236,17 +1309,83 @@ async fn dial_through_relay_unbounded(relay: &RelayDial, route: RelayRoute) -> R
     })
 }
 
+/// Tracks how many relay pumps are alive, so a test can prove a tunnel was
+/// retired rather than merely abandoned.
+#[cfg(test)]
+pub(crate) mod live_pumps {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Token;
+
+    impl Token {
+        pub(crate) fn new() -> Self {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Relay pumps whose task future still exists.
+    pub(crate) fn count() -> usize {
+        LIVE.load(Ordering::SeqCst)
+    }
+
+    static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Recorded at the end of the pump body, which an abort never reaches.
+    pub(crate) fn mark_completed() {
+        COMPLETED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Pumps that ran to the end of their body.
+    ///
+    /// This is what separates a pump that was RETIRED from one that merely
+    /// noticed its stream had gone: dropping the local stream unparks a pump
+    /// sitting in its read arm, so "the task ended" alone proves nothing about
+    /// the guard. A pump parked in a relay write or its closing handshake has no
+    /// such escape, and only an abort ends it - leaving this count unchanged.
+    pub(crate) fn completed() -> usize {
+        COMPLETED.load(Ordering::SeqCst)
+    }
+
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Held by every test that creates or counts a relay pump, so the shared
+    /// count is never perturbed by a tunnel another test opened in parallel.
+    ///
+    /// An async lock because the tests hold it across awaits, which is exactly
+    /// what a blocking guard must not be held across.
+    pub(crate) async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+}
+
 /// Open the daemon's narrow enrollment endpoint through the nominated relay.
-/// The returned byte stream is still plaintext only to the caller; the caller
-/// must run the enrollment TLS client over it before sending pairing material.
 ///
-/// The pump handle is detached here rather than handed back: an enrollment is
-/// one short exchange, its pump ends on its own when the caller drops the
-/// stream, and the caller already runs the whole exchange under its own budget.
-pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
+/// The returned tunnel's stream is still plaintext only to the caller; the
+/// caller must run the enrollment TLS client over it before sending pairing
+/// material.
+///
+/// The pump is returned under a guard rather than detached. An enrollment
+/// exchange has no session to hand the pump to, and it can end in more ways than
+/// it can succeed: the response times out, the endpoint refuses the pairing
+/// code, the TLS handshake fails, or the whole future is dropped when its budget
+/// expires. Only some of those run code the caller wrote, so the cleanup belongs
+/// to a value that every one of them drops.
+pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<EnrollmentTunnel> {
     let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
     let tunnel = dial_through_relay(relay, RelayRoute::Enrollment, deadline).await?;
-    Ok(tunnel.io)
+    Ok(EnrollmentTunnel {
+        io: tunnel.io,
+        pump: RelayPumpGuard(Some(tunnel.pump)),
+    })
 }
 
 impl RpcClient {
@@ -1448,11 +1587,13 @@ impl RpcClient {
         // tunnel dial AND the inner handshake that runs over the finished tunnel.
         let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
         let RelayTunnel { io, pump } = dial_through_relay(relay, RelayRoute::Wss, deadline).await?;
+        // A tunnel that outlives a failed handshake keeps a relay route open that
+        // nothing will ever read. The guard makes that structural: every exit
+        // from here retires the pump unless it is explicitly released to a
+        // session that will keep it running.
+        let pump = RelayPumpGuard(Some(pump));
         let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
 
-        // A tunnel that outlives a failed handshake keeps a relay route open that
-        // nothing will ever read, so every exit from here past this point either
-        // hands the pump to the client or aborts it.
         let handshake = within_relay_setup(
             deadline,
             "the inner WSS handshake through the relay",
@@ -1468,14 +1609,10 @@ impl RpcClient {
             },
         )
         .await;
-        let (ws_stream, _response) = match handshake {
-            Ok(ok) => ok,
-            Err(e) => {
-                pump.abort();
-                return Err(e);
-            }
-        };
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, Some(pump)).await
+        // `?` here would drop the guard and retire the pump, which is exactly
+        // what a failed handshake wants.
+        let (ws_stream, _response) = handshake?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, pump.release()).await
     }
 
     /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
@@ -5360,9 +5497,14 @@ mod relay_transport_tests {
         )
         .await;
 
-        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
             .await
-            .expect("the tunnel opens");
+            .expect("the tunnel opens")
+            .split();
         let mut seen = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
 
@@ -5382,9 +5524,14 @@ mod relay_transport_tests {
     async fn a_frame_for_this_route_is_delivered() {
         let (addr, server) = relay_stub(7, vec![Message::binary(encode_data(7, b"MINE"))]).await;
 
-        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
             .await
-            .expect("the tunnel opens");
+            .expect("the tunnel opens")
+            .split();
         let mut buf = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut buf))
             .await
@@ -5414,9 +5561,14 @@ mod relay_transport_tests {
         )
         .await;
 
-        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
             .await
-            .expect("the tunnel opens");
+            .expect("the tunnel opens")
+            .split();
         let mut seen = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
 
@@ -5425,6 +5577,135 @@ mod relay_transport_tests {
             "a control frame for another route must end the tunnel: {seen:?}"
         );
         server.abort();
+    }
+
+    /// A relay stub that opens the route and then stops reading entirely: it
+    /// never answers, never acks, and never drains what the client writes. This
+    /// is the shape that parks a pump in a DATA write or its closing handshake.
+    async fn relay_stub_that_stops_reading(
+        conn_id: u64,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let (ca_pem, ca, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let _ = ca_pem;
+        let (cert, key) =
+            crate::client_crypto::test_pki::gen_server_cert(&ca, &ca_key, &["localhost".into()]);
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&cert, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("relay outer TLS");
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_subprotocol)
+                .await
+                .expect("relay ws accept");
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg
+                    && matches!(
+                        Control::from_json(t.as_str()),
+                        Ok(Control::Connect { .. } | Control::Enroll { .. })
+                    )
+                {
+                    break;
+                }
+            }
+            ws.send(Message::text(Control::Opened { conn_id }.to_json()))
+                .await
+                .expect("send Opened");
+            // From here the relay is inert: it holds the link open and reads
+            // nothing more.
+            std::future::pending::<()>().await;
+        });
+        (addr, server)
+    }
+
+    /// The enrollment tunnel has no session to hand its pump to, so dropping the
+    /// tunnel is the only thing that retires it. Proven against a relay that
+    /// opened the route and then stopped reading, which is the state that would
+    /// otherwise leave the task parked with the route still allocated.
+    #[tokio::test]
+    async fn dropping_an_enrollment_tunnel_retires_its_pump() {
+        let _serial = live_pumps::exclusive().await;
+        let (addr, server) = relay_stub_that_stops_reading(7).await;
+
+        let tunnel = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens");
+        let watch = tunnel
+            .pump
+            .abort_handle()
+            .expect("a fresh tunnel guards a live pump");
+        assert!(
+            !watch.is_finished(),
+            "the pump must be running while the tunnel is held"
+        );
+
+        let completed_before = live_pumps::completed();
+        drop(tunnel);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            watch.is_finished(),
+            "dropping the tunnel must retire its pump, not detach it"
+        );
+        // Ending is not enough. Dropping the stream also unparks a pump sitting
+        // in its read arm, so a detached pump would "finish" here too and this
+        // test would pass while proving nothing. The pump must have been
+        // ABORTED - stopped where it stood, without reaching the end of its
+        // body - because that is the only behaviour that also retires a pump
+        // parked in a relay write or its closing handshake.
+        assert_eq!(
+            live_pumps::completed(),
+            completed_before,
+            "the pump must be retired by the guard, not left to notice its stream closed"
+        );
+        server.abort();
+    }
+
+    /// The guard's contract on its own, independent of where the pump happens to
+    /// be parked: a task it owns does not outlive it.
+    #[tokio::test]
+    async fn a_pump_guard_retires_its_task_wherever_it_is_parked() {
+        let parked = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let watch = parked.abort_handle();
+        let guard = RelayPumpGuard(Some(parked));
+        assert!(!watch.is_finished());
+
+        drop(guard);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            watch.is_finished(),
+            "a task with no stream to notice must still be retired by its guard"
+        );
+    }
+
+    /// Releasing hands the task on intact: the RPC path adopts its tunnel into a
+    /// session that must keep running.
+    #[tokio::test]
+    async fn releasing_a_guard_keeps_the_task_running() {
+        let parked = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let watch = parked.abort_handle();
+        let guard = RelayPumpGuard(Some(parked));
+
+        let released = guard.release().expect("a live guard yields its task");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !watch.is_finished(),
+            "a released pump belongs to its new owner and must keep running"
+        );
+        released.abort();
     }
 
     /// Replacing a client must reclaim its relay route. Nothing else can: the
