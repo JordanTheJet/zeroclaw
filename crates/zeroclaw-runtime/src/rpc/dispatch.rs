@@ -490,6 +490,11 @@ pub struct RpcDispatcher {
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
+    /// Which registration of `tui_id` this connection owns. Created here: the
+    /// id alone cannot tell this connection's registration from a successor's
+    /// after a reconnect adopts the same id, and teardown must only remove its
+    /// own. `None` until `initialize` registers.
+    tui_epoch: Option<super::tui_identity::TuiEpoch>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
@@ -508,6 +513,7 @@ impl RpcDispatcher {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             authenticated: false,
             tui_id: None,
+            tui_epoch: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             peer_cert_fingerprint: None,
@@ -532,6 +538,14 @@ impl RpcDispatcher {
         self.tui_id.as_deref()
     }
 
+    /// This connection's registry registration: the TUI id and the epoch it was
+    /// registered under. Teardown must quote both, so that a connection whose
+    /// cleanup runs after a reconnect has already adopted the same id cannot
+    /// evict the live entry.
+    pub fn tui_registration(&self) -> Option<(&str, super::tui_identity::TuiEpoch)> {
+        Some((self.tui_id.as_deref()?, self.tui_epoch?))
+    }
+
     #[cfg(test)]
     pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
         self.tui_id = tui_id;
@@ -551,6 +565,10 @@ impl RpcDispatcher {
             rpc: Arc::clone(&self.rpc),
             authenticated: true,
             tui_id: self.tui_id.clone(),
+            // Same connection, so the same registration: this handle shares the
+            // parent's epoch rather than claiming one of its own. It never runs
+            // teardown; only the owning transport loop does.
+            tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
@@ -958,15 +976,15 @@ impl RpcDispatcher {
             if !self.ctx.tui_registry.verify(claimed_id, sig) {
                 return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI signature"));
             }
-            // Remove stale entry from previous connection before re-registering
-            self.ctx.tui_registry.unregister(claimed_id);
+            // No explicit removal of the previous connection's entry: the
+            // registration below replaces it under a fresh epoch, which is what
+            // marks that predecessor superseded.
             claimed_id.to_string()
         } else if let Some(claimed_id) = req.tui_id.as_deref() {
             // Client claims ID but no signature — accept only if signing disabled
             if self.ctx.tui_registry.signing_is_enabled() {
                 return Err(rpc_err(AUTH_REQUIRED, "TUI signature required"));
             }
-            self.ctx.tui_registry.unregister(claimed_id);
             claimed_id.to_string()
         } else {
             // Fresh connection — generate new ID
@@ -974,7 +992,8 @@ impl RpcDispatcher {
         };
 
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
-        self.ctx
+        let tui_epoch = self
+            .ctx
             .tui_registry
             .register(super::tui_identity::TuiEntry {
                 tui_id: tui_id.clone(),
@@ -988,6 +1007,7 @@ impl RpcDispatcher {
                 env: req.env,
             });
         self.tui_id = Some(tui_id.clone());
+        self.tui_epoch = Some(tui_epoch);
 
         // Bind the session's tui_id to the presenting client cert fingerprint
         // (mTLS peers only). The cert is the transport identity; the renew RPC
@@ -7999,6 +8019,61 @@ mod tests {
     /// `RpcApprovalChannel` can route `request_choice` over
     /// `elicitation/create`. Source-of-truth check: the dispatcher
     /// is the canonical owner; the test reads the field directly.
+    /// Wiring check for the registry's epoch guard: `initialize` must record the
+    /// epoch it registered under, so a displaced connection's teardown removes
+    /// its own registration and not the reconnect that adopted the same TUI id.
+    /// The registry enforces the rule; this proves the dispatcher supplies it.
+    #[tokio::test]
+    async fn a_reconnect_survives_the_displaced_connections_teardown() {
+        let (mut first, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&first.ctx);
+
+        first
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+            }))
+            .await
+            .expect("first initialize");
+        let (id, epoch_first) = first.tui_registration().expect("first registered");
+        let id = id.to_string();
+
+        // The client reconnects on a NEW connection, claiming the same id.
+        // Test registries are unsigned, so the claim is accepted as it would be
+        // with a valid signature.
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        let mut second =
+            RpcDispatcher::new(Arc::clone(&ctx), writer_tx, "wss:reconnect".to_string());
+        second
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+                "tui_id": id,
+            }))
+            .await
+            .expect("reconnect initialize");
+        let (_, epoch_second) = second.tui_registration().expect("reconnect registered");
+        assert_ne!(
+            epoch_first, epoch_second,
+            "a reconnect must register under its own epoch"
+        );
+
+        // The displaced connection's transport loop finally tears down.
+        ctx.tui_registry.unregister(&id, epoch_first);
+        assert_eq!(
+            ctx.tui_registry.list().len(),
+            1,
+            "the reconnect must survive the displaced connection's cleanup"
+        );
+        assert!(
+            ctx.tui_registry.get_env(&id).is_some(),
+            "the live TUI must still resolve its captured environment"
+        );
+
+        // The live connection's own teardown still works.
+        ctx.tui_registry.unregister(&id, epoch_second);
+        assert!(ctx.tui_registry.list().is_empty());
+    }
+
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
