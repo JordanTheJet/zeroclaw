@@ -2001,6 +2001,13 @@ mod tests {
     /// happily against a budget of a day.
     fn assert_spent_the_budget(waited: tokio::time::Duration) {
         let budget = std::time::Duration::from_secs(ENROLL_EXCHANGE_TIMEOUT_SECS);
+        // A LITERAL ceiling: bounds expressed only in terms of the constant
+        // under test move with it, so widening the budget to a day would still
+        // satisfy them. This one says what the budget is for.
+        assert!(
+            waited <= std::time::Duration::from_secs(60),
+            "the exchange budget must stay human-scale: {waited:?}"
+        );
         assert!(
             waited >= budget,
             "the exchange must run until its budget, not fail early: {waited:?}"

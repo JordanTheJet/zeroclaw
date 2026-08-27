@@ -483,6 +483,12 @@ pub async fn run(
     // disconnect-recovery path and the relay->direct re-probe migration.
     macro_rules! adopt_client {
         ($new_client:expr) => {{
+            // Transactional: `rpc` and the panes must always describe the SAME
+            // connection. The new client has to be installed first because the
+            // panes are built against it, so a failed rebuild puts the previous
+            // one back rather than leaving a live `rpc` beside panes that still
+            // hold the old, possibly dead, connection.
+            let previous = Arc::clone(&rpc);
             rpc = Arc::new($new_client);
             let resume_chat = (
                 chat_pane.current_session_id().map(String::from),
@@ -493,17 +499,33 @@ pub async fn run(
                 acp_pane.current_agent_alias().map(String::from),
             );
             match build_panes!(resume_chat, resume_acp) {
-                Ok(panes) => {
-                    dashboard_pane = panes.0;
-                    config_app = panes.1;
-                    doctor_pane = panes.2;
-                    acp_pane = panes.3;
-                    chat_pane = panes.4;
-                    logs_pane = panes.5;
-                    quickstart = panes.6;
+                Ok(mut panes) => {
+                    refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
+                    // Assigned as one tuple: every pane the builder produces is
+                    // adopted, and a pane added to `build_panes!` later cannot
+                    // be left behind on the old client without failing to
+                    // compile here.
+                    (
+                        dashboard_pane,
+                        config_app,
+                        doctor_pane,
+                        acp_pane,
+                        chat_pane,
+                        logs_pane,
+                        quickstart,
+                        sop_pane,
+                    ) = panes;
+                    // No pane holds the replaced connection any more. Nothing
+                    // else would ever stop it: its reader, writer, and relay
+                    // pump are detached tasks with no destructor to reach them.
+                    previous.shutdown();
                     true
                 }
-                Err(_) => false,
+                Err(_) => {
+                    let abandoned = std::mem::replace(&mut rpc, previous);
+                    abandoned.shutdown();
+                    false
+                }
             }
         }};
     }
@@ -679,44 +701,27 @@ pub async fn run(
                     let prev_sig = rpc.tui_sig().map(String::from);
                     // The connect prefers the direct path and falls back to the
                     // relay, so a reconnect lands on whichever leg is reachable.
-                    if let Ok((new_client, _leg)) = target
+                    if let Ok((new_client, leg)) = target
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
-                        rpc = Arc::new(new_client);
-                        let resume_chat = (
-                            chat_pane.current_session_id().map(String::from),
-                            chat_pane.current_agent_alias().map(String::from),
-                        );
-                        let resume_acp = (
-                            acp_pane.current_session_id().map(String::from),
-                            acp_pane.current_agent_alias().map(String::from),
-                        );
-                        match build_panes!(resume_chat, resume_acp) {
-                            Ok(mut panes) => {
-                                refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
-                                dashboard_pane = panes.0;
-                                config_app = panes.1;
-                                doctor_pane = panes.2;
-                                acp_pane = panes.3;
-                                chat_pane = panes.4;
-                                logs_pane = panes.5;
-                                quickstart = panes.6;
-                                sop_pane = panes.7;
-                                chrome_status.clear();
-                                chrome_status.tick(&rpc);
-                                reconnect_last_attempt = None;
-                                ephemeral_respawn_done = false;
-                                needs_intervention = false;
-                                continue;
-                            }
-                            Err(_) => {
-                                // Daemon flapped again mid-init. Stay in the
-                                // disconnected loop and retry on the next
-                                // throttle window rather than tearing down.
-                                continue;
-                            }
+                        // A reconnect may land on a DIFFERENT leg than the one
+                        // that dropped: direct can fall back to the relay, and a
+                        // relay session can come back direct. The leg is
+                        // committed only once the panes run on that client.
+                        let adopted = adopt_client!(new_client);
+                        active_leg = leg_after_adoption(adopted, active_leg, leg);
+                        if adopted {
+                            chrome_status.clear();
+                            chrome_status.tick(&rpc);
+                            reconnect_last_attempt = None;
+                            ephemeral_respawn_done = false;
+                            needs_intervention = false;
                         }
+                        // Adopted or not, go round again: a failed rebuild means
+                        // the daemon flapped mid-init, and the previous client is
+                        // back in place for the next throttle window.
+                        continue;
                     } else if owns_ephemeral && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
@@ -750,8 +755,13 @@ pub async fn run(
                     .connect_direct(prev_id.as_deref(), prev_sig.as_deref())
                     .await
                 {
-                    active_leg = crate::ActiveLeg::WssDirect;
-                    let _ = adopt_client!(direct);
+                    // Committed after the rebuild, not before: a probe that
+                    // connects but cannot be adopted leaves the session on the
+                    // relay, and claiming the direct leg there would stop the
+                    // re-probe that is still the only way back.
+                    let adopted = adopt_client!(direct);
+                    active_leg =
+                        leg_after_adoption(adopted, active_leg, crate::ActiveLeg::WssDirect);
                     continue;
                 }
             }
@@ -1105,6 +1115,27 @@ pub async fn run(
 /// A reconnect rebuilds every pane around the new RPC client. The SOP list is
 /// loaded on focus rather than at construction, so an already-visible SOP pane
 /// must run that same canonical refresh before replacing the disconnected pane.
+/// The transport leg to run with after an adoption attempt.
+///
+/// `connected` is the leg the routing source of truth actually dialled, which is
+/// not necessarily the one that dropped: a direct session reconnects onto the
+/// relay when the direct address is still down, and a relay session can come
+/// back direct. It is committed ONLY when the panes were rebuilt against that
+/// client, because `active_leg` names the connection the panes hold and the
+/// re-probe and failback loops read it to decide what to try next.
+///
+/// Discarding it leaves a direct-to-relay reconnect believing it is still
+/// direct, so the failback loop that would migrate it back never runs; the
+/// mirror case leaves a relay-to-direct reconnect believing it is on the relay,
+/// which re-probes a direct path it is already using.
+fn leg_after_adoption(
+    adopted: bool,
+    current: crate::ActiveLeg,
+    connected: crate::ActiveLeg,
+) -> crate::ActiveLeg {
+    if adopted { connected } else { current }
+}
+
 async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
     if mode == Mode::Sop {
         pane.refresh().await;
@@ -2441,5 +2472,71 @@ mod tests {
             Some("scout".into())
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+}
+
+#[cfg(test)]
+mod transport_leg_tests {
+    //! What the reconnect and failback paths do with the leg the routing source
+    //! of truth returns.
+    //!
+    //! `active_leg` is not decoration: the failback loop runs only while it says
+    //! `WssRelay`, so a leg that is dropped or committed early silently disables
+    //! the migration back to the direct path.
+
+    use super::leg_after_adoption;
+    use crate::ActiveLeg;
+
+    /// A direct session whose address is still down reconnects onto the relay.
+    /// Keeping `WssDirect` here is what stops the failback loop from ever
+    /// running, stranding the session on the relay for the rest of its life.
+    #[test]
+    fn a_direct_session_that_reconnects_on_the_relay_commits_the_relay_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssDirect, ActiveLeg::WssRelay);
+
+        assert_eq!(leg, ActiveLeg::WssRelay);
+        assert!(
+            leg == ActiveLeg::WssRelay,
+            "the failback loop's precondition must now hold"
+        );
+    }
+
+    /// The mirror case: a relay session that comes back on the direct path must
+    /// stop re-probing a direct address it is already using.
+    #[test]
+    fn a_relay_session_that_reconnects_direct_commits_the_direct_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssRelay, ActiveLeg::WssDirect);
+
+        assert_eq!(leg, ActiveLeg::WssDirect);
+        assert!(
+            leg != ActiveLeg::WssRelay,
+            "a direct session must not keep re-probing the path it is on"
+        );
+    }
+
+    /// A connection that could not be adopted is not the connection the panes
+    /// hold, so its leg must not be committed: the session is still on the old
+    /// one and must keep behaving that way.
+    #[test]
+    fn a_failed_adoption_keeps_the_leg_it_is_still_running_on() {
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssRelay, ActiveLeg::WssDirect),
+            ActiveLeg::WssRelay,
+            "a failed direct migration must leave the session on the relay"
+        );
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssDirect, ActiveLeg::WssRelay),
+            ActiveLeg::WssDirect
+        );
+    }
+
+    /// The local socket has no legs to migrate between; adoption must not
+    /// invent one.
+    #[test]
+    fn a_local_session_keeps_its_leg() {
+        assert_eq!(
+            leg_after_adoption(true, ActiveLeg::Local, ActiveLeg::Local),
+            ActiveLeg::Local
+        );
     }
 }

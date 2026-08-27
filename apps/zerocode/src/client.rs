@@ -21,6 +21,30 @@ const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// ONE absolute budget for the entire client-side relay setup: the TCP connect,
+/// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
+/// answer, and - on the RPC route - the inner WSS and mTLS handshake that runs
+/// over the finished tunnel.
+///
+/// Absolute rather than per phase: a fresh timeout per step lets an
+/// unresponsive relay spend one full budget on each of them, which is how a
+/// "bounded" setup still hangs for minutes. The daemon's own relay bridge bounds
+/// its outbound setup the same way and with the same figure, so a client and a
+/// daemon facing the same dead relay give up together instead of one waiting on
+/// the other.
+const RELAY_SETUP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A single outbound write to the relay may not stall longer than this. Mirrors
+/// the daemon bridge's write-stall bound, which is its dead-link interval: once
+/// the link is up the peer is expected to keep reading, and one that stops must
+/// not pin this pump - and the inner TLS stream behind it - forever.
+///
+/// Reads are deliberately NOT bounded this way. An idle session is legitimate:
+/// the operator may be reading rather than typing, and silence alone is not
+/// evidence of a dead link. Liveness of an established link is the keepalive
+/// layer's job, not the pump's.
+const RELAY_WRITE_STALL: Duration = Duration::from_secs(60);
+
 // ── Platform local-stream shim ──────────────────────────────────
 
 #[cfg(unix)]
@@ -627,8 +651,15 @@ fn route_inbound_frame(
 #[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
-    _read_task: tokio::task::JoinHandle<()>,
-    _router_task: tokio::task::JoinHandle<()>,
+    read_task: tokio::task::JoinHandle<()>,
+    router_task: tokio::task::JoinHandle<()>,
+    /// Drains the outbound queue into the transport. `None` on the local socket
+    /// path, whose writer is owned by its own reader loop.
+    writer_task: Option<tokio::task::JoinHandle<()>>,
+    /// The relay tunnel pump, when this client runs over a relay. Held so
+    /// replacing the client also reclaims the relay route instead of leaving a
+    /// pump reading a link nobody consumes.
+    relay_pump: Option<tokio::task::JoinHandle<()>>,
     pub server_version: String,
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
@@ -781,7 +812,20 @@ pub(crate) fn persist_relay_pin(path: &std::path::Path, pin: &str) {
 /// operator can confirm it interactively before it is remembered. Returns the
 /// SHA-256 pin the relay would be pinned to. The outer TLS is a metadata boundary;
 /// the inner mutual TLS to the daemon is unaffected (A2).
+///
+/// The probe runs under the same absolute setup budget as a real dial: it is
+/// the FIRST thing an interactive relay session does, and an unreachable or
+/// silent relay would otherwise hold the operator at a prompt that never
+/// resolves.
 pub async fn probe_relay_cert_pin(relay_addr: &str, relay_host: &str) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+    within_relay_setup(deadline, "the relay trust probe", async {
+        probe_relay_cert_pin_unbounded(relay_addr, relay_host).await
+    })
+    .await
+}
+
+async fn probe_relay_cert_pin_unbounded(relay_addr: &str, relay_host: &str) -> Result<String> {
     let tcp = tokio::net::TcpStream::connect(relay_addr)
         .await
         .with_context(|| format!("connecting to relay {relay_addr}"))?;
@@ -941,15 +985,71 @@ fn relay_outer_connector(
     Ok((outer, tofu_verifier))
 }
 
+/// A relay tunnel: the byte stream the inner TLS runs over, plus the pump task
+/// that moves DATA frames between that stream and the relay link.
+///
+/// The two travel together because dropping the stream is not what stops the
+/// pump - the pump owns the relay link and only notices a closed stream on its
+/// next read. An owner that replaces or abandons a tunnel aborts the pump.
+pub(crate) struct RelayTunnel {
+    io: tokio::io::DuplexStream,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+/// Run one step of relay setup against the shared absolute deadline.
+///
+/// Every step of a setup passes through here with the SAME `deadline`, so the
+/// budget is spent once across the whole sequence rather than renewed per phase.
+async fn within_relay_setup<T>(
+    deadline: tokio::time::Instant,
+    what: &str,
+    step: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout_at(deadline, step).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "{what} did not complete within the {}s relay setup budget; the relay is \
+             unreachable, or it accepted the connection and then stopped responding",
+            RELAY_SETUP_DEADLINE.as_secs()
+        ),
+    }
+}
+
+/// Send one frame to the relay under [`RELAY_WRITE_STALL`].
+///
+/// `false` means the link is unusable - errored, closed, or making no progress -
+/// and the caller must tear the tunnel down rather than keep waiting on it.
+async fn relay_send<S>(sink: &mut S, msg: tokio_tungstenite::tungstenite::Message) -> bool
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(RELAY_WRITE_STALL, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn dial_through_relay(
     relay: &RelayDial,
     route: RelayRoute,
-) -> Result<tokio::io::DuplexStream> {
+    deadline: tokio::time::Instant,
+) -> Result<RelayTunnel> {
+    within_relay_setup(
+        deadline,
+        "the relay tunnel setup",
+        dial_through_relay_unbounded(relay, route),
+    )
+    .await
+}
+
+/// The setup itself. Every caller reaches it through [`dial_through_relay`], so
+/// it always runs inside the shared deadline and needs no timeout of its own.
+async fn dial_through_relay_unbounded(relay: &RelayDial, route: RelayRoute) -> Result<RelayTunnel> {
     use crate::relay_proto::{
         ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
         encode_data,
     };
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -984,11 +1084,14 @@ async fn dial_through_relay(
 
     let (mut sink, mut stream) = relay_ws.split();
 
-    sink.send(Message::text(
-        route.open_control(relay.node_id.clone()).to_json(),
-    ))
+    if !relay_send(
+        &mut sink,
+        Message::text(route.open_control(relay.node_id.clone()).to_json()),
+    )
     .await
-    .context(route.send_context())?;
+    {
+        anyhow::bail!("{}", route.send_context());
+    }
 
     // Wait for the relay to pair us with the daemon (answer pings while waiting).
     let conn_id = loop {
@@ -1001,7 +1104,9 @@ async fn dial_through_relay(
                 _ => {}
             },
             Some(Ok(Message::Ping(p))) => {
-                let _ = sink.send(Message::Pong(p)).await;
+                if !relay_send(&mut sink, Message::Pong(p)).await {
+                    anyhow::bail!("the relay stopped accepting writes while opening the route");
+                }
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => return Err(anyhow::Error::new(e).context("relay reply")),
@@ -1013,7 +1118,7 @@ async fn dial_through_relay(
     // runs over. What the inner TLS writes to `client_io` is read here and shipped
     // as DATA; inbound DATA payloads are written back for the inner TLS to read.
     let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
-    tokio::spawn(async move {
+    let pump = tokio::spawn(async move {
         // Per-conn credit flow control. `send_window` gates how much we ship to
         // the relay before the daemon acks (so we never pin more than one window
         // of unsent inner bytes); `recv_drained` counts daemon->client bytes we
@@ -1021,15 +1126,20 @@ async fn dial_through_relay(
         let mut send_window = ConnWindow::new(INITIAL_WINDOW);
         let mut recv_drained: u32 = 0;
         // Grant the daemon our receive window up front.
-        let _ = sink
-            .send(Message::text(
+        if !relay_send(
+            &mut sink,
+            Message::text(
                 Control::Window {
                     conn_id,
                     credit: INITIAL_WINDOW,
                 }
                 .to_json(),
-            ))
-            .await;
+            ),
+        )
+        .await
+        {
+            return;
+        }
 
         let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
         loop {
@@ -1042,18 +1152,26 @@ async fn dial_through_relay(
                         // `n <= MAX_DATA_PAYLOAD` (buffer size) so this is already a
                         // single bounded chunk; the relay rejects anything larger.
                         send_window.debit(n);
-                        if sink
-                            .send(Message::binary(encode_data(conn_id, &buf[..n])))
-                            .await
-                            .is_err()
+                        if !relay_send(
+                            &mut sink,
+                            Message::binary(encode_data(conn_id, &buf[..n])),
+                        )
+                        .await
                         {
                             break;
                         }
                     }
                 },
                 msg = stream.next() => match msg {
-                    Some(Ok(Message::Binary(b))) => {
-                        if let Some((_, payload)) = decode_data(&b) {
+                    Some(Ok(Message::Binary(b))) => match decode_data(&b) {
+                        // This link carries exactly ONE route, chosen above. A
+                        // frame naming a different conn is another connection's
+                        // ciphertext or a forgery, so the relay is mis-routing or
+                        // compromised: tear the tunnel down rather than feed the
+                        // inner TLS bytes from an unknown source. Discarding
+                        // would keep a broken relay in service silently.
+                        Some((frame_conn, _)) if frame_conn != conn_id => break,
+                        Some((_, payload)) => {
                             if relay_io.write_all(payload).await.is_err() {
                                 break;
                             }
@@ -1061,27 +1179,47 @@ async fn dial_through_relay(
                             // Replenish the daemon's window once we have drained
                             // about half of it, amortizing the ack frames.
                             if recv_drained >= INITIAL_WINDOW / 2 {
-                                let _ = sink
-                                    .send(Message::text(
+                                if !relay_send(
+                                    &mut sink,
+                                    Message::text(
                                         Control::DataAck {
                                             conn_id,
                                             consumed: recv_drained,
                                         }
                                         .to_json(),
-                                    ))
-                                    .await;
+                                    ),
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                                 recv_drained = 0;
                             }
                         }
-                    }
+                        // Too short to carry a conn id: not attributable to any
+                        // route, so it is dropped without ending the tunnel.
+                        None => {}
+                    },
                     Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                        // Credit and close control for another conn is the same
+                        // routing fault as a mis-addressed DATA frame: acting on
+                        // it would let one route's peer resize or close this one.
+                        Ok(Control::Close { conn_id: c, .. })
+                        | Ok(Control::Window { conn_id: c, .. })
+                        | Ok(Control::DataAck { conn_id: c, .. })
+                            if c != conn_id =>
+                        {
+                            break;
+                        }
                         Ok(Control::Close { .. }) => break,
                         Ok(Control::Window { credit, .. }) => send_window.set(credit),
                         Ok(Control::DataAck { consumed, .. }) => send_window.ack(consumed),
                         _ => {}
                     },
                     Some(Ok(Message::Ping(p))) => {
-                        let _ = sink.send(Message::Pong(p)).await;
+                        if !relay_send(&mut sink, Message::Pong(p)).await {
+                            break;
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
@@ -1089,17 +1227,26 @@ async fn dial_through_relay(
             }
         }
         let _ = relay_io.shutdown().await;
-        let _ = sink.close().await;
+        let _ = futures_util::SinkExt::close(&mut sink).await;
     });
 
-    Ok(client_io)
+    Ok(RelayTunnel {
+        io: client_io,
+        pump,
+    })
 }
 
 /// Open the daemon's narrow enrollment endpoint through the nominated relay.
 /// The returned byte stream is still plaintext only to the caller; the caller
 /// must run the enrollment TLS client over it before sending pairing material.
+///
+/// The pump handle is detached here rather than handed back: an enrollment is
+/// one short exchange, its pump ends on its own when the caller drops the
+/// stream, and the caller already runs the whole exchange under its own budget.
 pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream> {
-    dial_through_relay(relay, RelayRoute::Enrollment).await
+    let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+    let tunnel = dial_through_relay(relay, RelayRoute::Enrollment, deadline).await?;
+    Ok(tunnel.io)
 }
 
 impl RpcClient {
@@ -1119,7 +1266,7 @@ impl RpcClient {
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             let mut w = write_half;
             while let Some(mut line) = writer_rx.recv().await {
                 if !line.ends_with('\n') {
@@ -1210,6 +1357,7 @@ impl RpcClient {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
+                writer_task.abort();
                 return Err(e);
             }
         };
@@ -1218,6 +1366,7 @@ impl RpcClient {
             Ok(init) => init,
             Err(e) => {
                 read_task.abort();
+                writer_task.abort();
                 return Err(e);
             }
         };
@@ -1227,8 +1376,10 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
-            _router_task: router_task,
+            read_task,
+            router_task,
+            writer_task: Some(writer_task),
+            relay_pump: None,
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
@@ -1275,7 +1426,8 @@ impl RpcClient {
         )
         .await
         .with_context(|| format!("WSS connect to {url}"))?;
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+        // No relay pump on the direct path: the socket IS the transport.
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, None).await
     }
 
     /// Connect to the daemon through a nominated relay.
@@ -1291,26 +1443,53 @@ impl RpcClient {
         tls: &ClientTls,
         relay: &RelayDial,
     ) -> Result<Self> {
-        let client_io = dial_through_relay(relay, RelayRoute::Wss).await?;
+        // ONE deadline for the whole client-side setup. It is created here, before
+        // the first packet, and every step below shares what is left of it: the
+        // tunnel dial AND the inner handshake that runs over the finished tunnel.
+        let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+        let RelayTunnel { io, pump } = dial_through_relay(relay, RelayRoute::Wss, deadline).await?;
         let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
-        let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
-            inner_url,
-            client_io,
-            Some(rpc_ws_config()),
-            Some(connector),
+
+        // A tunnel that outlives a failed handshake keeps a relay route open that
+        // nothing will ever read, so every exit from here past this point either
+        // hands the pump to the client or aborts it.
+        let handshake = within_relay_setup(
+            deadline,
+            "the inner WSS handshake through the relay",
+            async {
+                tokio_tungstenite::client_async_tls_with_config(
+                    inner_url,
+                    io,
+                    Some(rpc_ws_config()),
+                    Some(connector),
+                )
+                .await
+                .with_context(|| format!("WSS-over-relay to {inner_url} via {}", relay.relay_addr))
+            },
         )
-        .await
-        .with_context(|| format!("WSS-over-relay to {inner_url} via {}", relay.relay_addr))?;
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig).await
+        .await;
+        let (ws_stream, _response) = match handshake {
+            Ok(ok) => ok,
+            Err(e) => {
+                pump.abort();
+                return Err(e);
+            }
+        };
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, Some(pump)).await
     }
 
     /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
     /// the `initialize` handshake. Generic over the underlying transport so it
     /// serves both the direct (`TcpStream`) and relayed (`DuplexStream`) paths.
+    /// `relay_pump`, when present, is the tunnel pump this session runs over. The
+    /// session owns it from here: every error path below aborts it, and a
+    /// successful session hands it to the returned client so
+    /// [`RpcClient::shutdown`] can reclaim the relay route.
     async fn spawn_ws_session<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
+        relay_pump: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1321,7 +1500,7 @@ impl RpcClient {
         let (mut sink, mut stream) = ws_stream.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(line) = writer_rx.recv().await {
                 if sink.send(Message::Text(line.into())).await.is_err() {
                     break;
@@ -1411,10 +1590,20 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
+        // A failed initialize must not leave the transport running: the reader,
+        // the writer, and (on the relayed path) the tunnel pump all belong to a
+        // session that will never exist.
+        let abandon = |pump: &Option<tokio::task::JoinHandle<()>>| {
+            read_task.abort();
+            writer_task.abort();
+            if let Some(pump) = pump {
+                pump.abort();
+            }
+        };
         let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
-                read_task.abort();
+                abandon(&relay_pump);
                 return Err(e);
             }
         };
@@ -1422,7 +1611,7 @@ impl RpcClient {
         let init = match parse_initialize_response(&resp) {
             Ok(init) => init,
             Err(e) => {
-                read_task.abort();
+                abandon(&relay_pump);
                 return Err(e);
             }
         };
@@ -1432,8 +1621,10 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
-            _router_task: router_task,
+            read_task,
+            router_task,
+            writer_task: Some(writer_task),
+            relay_pump,
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
@@ -2282,12 +2473,24 @@ impl RpcClient {
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
+        Self::with_rpc_and_pump(outbound, None)
+    }
+
+    /// Test-only constructor that also attaches a relay pump handle, so a test
+    /// can observe that [`Self::shutdown`] reclaims the tunnel.
+    #[cfg(test)]
+    pub fn with_rpc_and_pump(
+        outbound: Arc<RpcOutbound>,
+        relay_pump: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             rpc: outbound,
-            _read_task: tokio::spawn(async {}),
-            _router_task: tokio::spawn(async {}),
+            read_task: tokio::spawn(async {}),
+            router_task: tokio::spawn(async {}),
+            writer_task: None,
+            relay_pump,
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
@@ -2298,6 +2501,35 @@ impl RpcClient {
             transport: Transport::Local,
             commands: Vec::new(),
         }
+    }
+
+    /// Stop this client's transport and release everything it holds open.
+    ///
+    /// A replaced client is not idle: its reader still owns the socket, its
+    /// writer still drains a queue, and on the relayed path its pump still holds
+    /// a route open on the relay. Nothing drops those - the tasks are detached,
+    /// and `RpcClient` has no destructor that could reach them - so a migration
+    /// that simply overwrote the `Arc` left the old connection running and the
+    /// old relay route allocated until the daemon or relay timed it out.
+    ///
+    /// Call this on the client being REPLACED, after the new one has been
+    /// adopted, and on a new client whose adoption failed. It is idempotent:
+    /// aborting a finished task is a no-op.
+    pub fn shutdown(&self) {
+        self.read_task.abort();
+        self.router_task.abort();
+        if let Some(writer) = &self.writer_task {
+            writer.abort();
+        }
+        if let Some(pump) = &self.relay_pump {
+            pump.abort();
+        }
+    }
+
+    /// Whether this client still holds a relay tunnel pump.
+    #[cfg(test)]
+    pub fn relay_pump_finished(&self) -> Option<bool> {
+        self.relay_pump.as_ref().map(|p| p.is_finished())
     }
 
     /// Transport protocol of this connection.
@@ -4864,4 +5096,355 @@ fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
     cfg.max_message_size = Some(RPC_WS_MAX);
     cfg.max_frame_size = Some(RPC_WS_MAX);
     cfg
+}
+
+#[cfg(test)]
+mod relay_transport_tests {
+    //! Client-side relay transport regressions: the setup budget, the pump's
+    //! write-stall bound, and route isolation on an established tunnel.
+    //!
+    //! The budget tests run on a paused clock and assert the ELAPSED virtual
+    //! time, not merely that an error came back. A test that only asserts the
+    //! error passes just as happily against a budget of a day, because a paused
+    //! clock auto-advances to whatever the next deadline happens to be.
+
+    use super::*;
+    use crate::relay_proto::{Control, SUBPROTOCOL, encode_data};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// A listener that completes the TCP accept and then never speaks.
+    async fn accept_then_silent_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (addr, server)
+    }
+
+    fn relay_dial_to(addr: std::net::SocketAddr) -> RelayDial {
+        RelayDial {
+            relay_addr: addr.to_string(),
+            relay_host: "localhost".into(),
+            node_id: "node-1".into(),
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_pin: None,
+            relay_tofu: false,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        }
+    }
+
+    /// The longest a person will wait at a prompt before deciding the tool is
+    /// hung. Deliberately a LITERAL, not derived from the constant under test:
+    /// an assertion written in terms of that constant moves with it, so widening
+    /// the budget to a day would still satisfy it. This is the bound that says
+    /// what the budget is FOR.
+    const HUMAN_SCALE_CEILING: Duration = Duration::from_secs(60);
+
+    fn assert_spent_the_setup_budget(waited: tokio::time::Duration) {
+        assert!(
+            waited <= HUMAN_SCALE_CEILING,
+            "the setup budget must stay human-scale: {waited:?}"
+        );
+        assert!(
+            waited >= RELAY_SETUP_DEADLINE,
+            "the setup must run until its budget, not fail early: {waited:?}"
+        );
+        assert!(
+            waited <= RELAY_SETUP_DEADLINE + Duration::from_secs(1),
+            "the setup must end AT its budget: {waited:?} against {RELAY_SETUP_DEADLINE:?}"
+        );
+    }
+
+    /// The relay fallback is what a client reaches when the direct path is
+    /// already down, so an unbounded setup here strands the session with no
+    /// route left to try.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_cannot_stall_the_rpc_connect() {
+        let (addr, server) = accept_then_silent_listener().await;
+        let relay = relay_dial_to(addr);
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            RpcClient::connect_wss_via_relay(
+                "wss://127.0.0.1/",
+                None,
+                None,
+                &ClientTls {
+                    skip_verify: true,
+                    ..Default::default()
+                },
+                &relay,
+            )
+            .await
+            .expect_err("a silent relay must not hold the connect")
+        );
+
+        assert_spent_the_setup_budget(started.elapsed());
+        assert!(err.contains("relay setup budget"), "got: {err}");
+        server.abort();
+    }
+
+    /// The interactive trust probe runs before the operator is asked to confirm
+    /// the pin, so a silent relay here hangs the prompt itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_cannot_stall_the_trust_probe() {
+        let (addr, server) = accept_then_silent_listener().await;
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            probe_relay_cert_pin(&addr.to_string(), "localhost")
+                .await
+                .expect_err("a silent relay must not hold the trust probe")
+        );
+
+        assert_spent_the_setup_budget(started.elapsed());
+        assert!(err.contains("relay trust probe"), "got: {err}");
+        server.abort();
+    }
+
+    /// A sink that accepts nothing, ever: the peer that stopped reading.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// An established link that stops making progress must not pin the pump
+    /// forever: the inner TLS stream behind it would block with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_write_that_never_progresses_gives_up() {
+        let mut sink = StalledSink;
+
+        let started = tokio::time::Instant::now();
+        let sent = relay_send(&mut sink, Message::text("ping")).await;
+        let waited = started.elapsed();
+
+        assert!(
+            !sent,
+            "a write that never progresses must be reported failed"
+        );
+        // The literal ceiling again: a stall bound that can grow without limit
+        // is the unbounded write this test exists to forbid.
+        assert!(
+            waited <= Duration::from_secs(120),
+            "the write-stall bound must stay bounded in human terms: {waited:?}"
+        );
+        assert!(
+            waited >= RELAY_WRITE_STALL && waited <= RELAY_WRITE_STALL + Duration::from_secs(1),
+            "the write must give up AT the stall bound: {waited:?}"
+        );
+    }
+
+    /// Echo the relay subprotocol back so the client's handshake completes.
+    ///
+    /// The error type is tungstenite's `ErrorResponse`, which carries a whole
+    /// HTTP response and so trips the large-error lint; the signature is the
+    /// library's, not ours, and this handshake never takes the error path.
+    #[allow(clippy::result_large_err)]
+    fn echo_subprotocol(
+        req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        if req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .is_some_and(|v| v.to_str().is_ok_and(|v| v.contains(SUBPROTOCOL)))
+        {
+            resp.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                SUBPROTOCOL.parse().expect("static subprotocol"),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// A relay stub that completes the outer TLS + WebSocket handshake, answers
+    /// the route request with `Opened { conn_id }`, and then sends `frames`.
+    async fn relay_stub(
+        conn_id: u64,
+        frames: Vec<Message>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let (ca_pem, ca, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let _ = ca_pem;
+        let (cert, key) =
+            crate::client_crypto::test_pki::gen_server_cert(&ca, &ca_key, &["localhost".into()]);
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&cert, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("relay outer TLS");
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_subprotocol)
+                .await
+                .expect("relay ws accept");
+
+            // Wait for the route request before opening it.
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg
+                    && matches!(
+                        Control::from_json(t.as_str()),
+                        Ok(Control::Connect { .. } | Control::Enroll { .. })
+                    )
+                {
+                    break;
+                }
+            }
+            ws.send(Message::text(Control::Opened { conn_id }.to_json()))
+                .await
+                .expect("send Opened");
+            for frame in frames {
+                if ws.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            // Hold the link open so the client's teardown is its own decision.
+            while ws.next().await.is_some() {}
+        });
+        (addr, server)
+    }
+
+    /// A relay that forwards another route's DATA frame is mis-routing or
+    /// injecting. The tunnel must end rather than hand those bytes to the inner
+    /// TLS, and the client must never see the foreign payload.
+    #[tokio::test]
+    async fn a_frame_for_another_route_tears_the_tunnel_down() {
+        let (addr, server) = relay_stub(
+            7,
+            vec![
+                Message::binary(encode_data(9, b"FOREIGN")),
+                Message::binary(encode_data(7, b"MINE")),
+            ],
+        )
+        .await;
+
+        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens");
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
+
+        assert!(
+            !seen.windows(7).any(|w| w == b"FOREIGN"),
+            "another route's payload must never reach the inner stream: {seen:?}"
+        );
+        assert!(
+            seen.is_empty(),
+            "the tunnel must end at the mis-addressed frame, before anything after it: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// The isolation check must not cost the tunnel its own traffic.
+    #[tokio::test]
+    async fn a_frame_for_this_route_is_delivered() {
+        let (addr, server) = relay_stub(7, vec![Message::binary(encode_data(7, b"MINE"))]).await;
+
+        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens");
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut buf))
+            .await
+            .expect("the payload must arrive")
+            .expect("read");
+
+        assert_eq!(&buf, b"MINE");
+        server.abort();
+    }
+
+    /// Control frames are routed too: credit for another conn must not resize
+    /// this one's window, and another conn's close must not end this tunnel.
+    #[tokio::test]
+    async fn control_for_another_route_tears_the_tunnel_down() {
+        let (addr, server) = relay_stub(
+            7,
+            vec![
+                Message::text(
+                    Control::Close {
+                        conn_id: 9,
+                        reason: "not yours".into(),
+                    }
+                    .to_json(),
+                ),
+                Message::binary(encode_data(7, b"MINE")),
+            ],
+        )
+        .await;
+
+        let mut io = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens");
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
+
+        assert!(
+            seen.is_empty(),
+            "a control frame for another route must end the tunnel: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// Replacing a client must reclaim its relay route. Nothing else can: the
+    /// pump is a detached task and `RpcClient` has no destructor.
+    #[tokio::test]
+    async fn shutdown_reclaims_the_relay_pump() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let pump = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let client = RpcClient::with_rpc_and_pump(Arc::new(RpcOutbound::new(tx)), Some(pump));
+        assert_eq!(client.relay_pump_finished(), Some(false));
+
+        client.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            client.relay_pump_finished(),
+            Some(true),
+            "the relay pump must not outlive the client that owned it"
+        );
+    }
 }
