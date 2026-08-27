@@ -426,7 +426,8 @@ api_key = "..."   # a ZeroRouter key (prefix `zcr_`); or inject from the env
 # uri = "https://zerorouter.ai/v1"  # a hosted or remote router; omit for the localhost default
 ```
 
-Self-hosted, OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is a
+Self-hosted, OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is
+currently in beta. It is a
 family of independently operated routers, so there is no canonical hosted
 default: the slot points at a locally running router at `http://localhost:8080/v1`.
 To reach the public deployment at `https://zerorouter.ai`, or any other remote
