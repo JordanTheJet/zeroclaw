@@ -25,7 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_relay_proto::{Control, SUBPROTOCOL};
+use zeroclaw_relay_proto::{Control, PEER_HINT_ENROLL, SUBPROTOCOL, encode_data};
 
 /// Mirrors the bridge's own `SETUP_DEADLINE`. The constant is module-private, so
 /// these tests assert the behaviour it produces with margins wide enough that
@@ -56,6 +56,10 @@ enum RelayBehavior {
     /// with pings so its outbound queue and socket fill behind a writer this
     /// relay will never drain again.
     WedgeAfterRegistration,
+    /// Complete registration, stop reading, saturate BOTH the shared outbound
+    /// queue and one conn's inbound queue, then open a sibling route. The
+    /// sibling dial is the proof that the shared reader never parked.
+    SaturateThenOpenSibling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +192,11 @@ async fn serve_stub_conn(
     }
     let _ = events.send(RelayEvent::Registered);
 
+    if matches!(behavior, RelayBehavior::SaturateThenOpenSibling) {
+        saturate_then_open_sibling(ws).await;
+        return;
+    }
+
     // From here the relay never reads again. Each ping the bridge receives costs
     // it one pong through its bounded outbound queue, so the queue fills behind
     // a writer whose socket nobody is draining.
@@ -209,6 +218,131 @@ async fn serve_stub_conn(
 async fn park<T>(held: T) {
     let _held = held;
     std::future::pending::<()>().await
+}
+
+/// Conn id the saturating stub wedges, and the sibling it probes with afterwards.
+const WEDGED_CONN: u64 = 1;
+const SIBLING_CONN: u64 = 2;
+/// Pings pushed to fill the bridge's 256-slot outbound queue behind a writer
+/// whose socket this relay has stopped draining. Each one costs the bridge a
+/// pong through that queue, so this is many times over what saturation needs.
+const SATURATING_PINGS: usize = 3_000;
+/// DATA frames pushed at `WEDGED_CONN` to fill its own 256-slot inbound queue.
+const SATURATING_DATA: usize = 400;
+/// How many `Open` frames are pushed purely to be refused while the outbound
+/// queue is full. `max_conns` is 1 and `WEDGED_CONN` holds the only slot, so the
+/// first few are refused `busy`; sent back to back they then outrun the
+/// `open_burst` of 3 and the rest are refused `rate_limited`. Both refusals are
+/// emitted by the shared reader, which is the point.
+const REFUSED_OPENS: u64 = 12;
+/// Real-clock pause before the sibling probe, so the `Open` rate bucket refills
+/// after the refusals above deliberately drained it.
+const BUCKET_REFILL: Duration = Duration::from_millis(300);
+
+/// Drive the reviewed cascade: register, stop reading, then saturate BOTH the
+/// shared outbound queue and one conn's inbound queue before asking the bridge
+/// to open a sibling route. If any notification on the shared reader path awaits
+/// the outbound queue, the reader parks here and the sibling `Open` is never
+/// processed.
+async fn saturate_then_open_sibling<S>(mut ws: WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let open_wedged = Control::Open {
+        conn_id: WEDGED_CONN,
+        peer_hint: None,
+    };
+    if ws.send(Message::text(open_wedged.to_json())).await.is_err() {
+        return;
+    }
+
+    // Fill the bridge's outbound queue first: from here every notification the
+    // shared reader wants to emit has nowhere to go.
+    let ping_payload = vec![0u8; 125];
+    for _ in 0..SATURATING_PINGS {
+        if ws
+            .send(Message::Ping(ping_payload.clone().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Capacity and rate refusals, both emitted by the shared reader with the
+    // outbound queue already full. `WEDGED_CONN` still holds the only slot, so
+    // the first few are refused `busy`; back to back they then outrun the open
+    // bucket and the rest are refused `rate_limited`.
+    for offset in 0..REFUSED_OPENS {
+        let open = Control::Open {
+            conn_id: 100 + offset,
+            peer_hint: None,
+        };
+        if ws.send(Message::text(open.to_json())).await.is_err() {
+            return;
+        }
+    }
+
+    // Now fill the wedged conn's inbound queue, so delivery hits the
+    // backpressure path that tears the route down and notifies the relay.
+    let data_payload = vec![0u8; 4096];
+    for _ in 0..SATURATING_DATA {
+        let frame = Message::binary(encode_data(WEDGED_CONN, &data_payload));
+        if ws.send(frame).await.is_err() {
+            return;
+        }
+    }
+
+    // Let the `Open` bucket refill before the probe: the refusals above drained
+    // it deliberately, and a rate-limited probe would prove nothing.
+    tokio::time::sleep(BUCKET_REFILL).await;
+
+    // The probe: a sibling route the shared reader can only open if it is still
+    // running. It targets the enrollment listener, which reports the dial.
+    let open_sibling = Control::Open {
+        conn_id: SIBLING_CONN,
+        peer_hint: Some(PEER_HINT_ENROLL.to_string()),
+    };
+    let _ = ws.send(Message::text(open_sibling.to_json())).await;
+    park(ws).await;
+}
+
+/// A loopback listener that accepts and never reads, so whatever the bridge
+/// writes to it backs up. Stands in for a wedged local WSS peer.
+async fn stalled_local_target() -> (String, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    let _ = socket.set_recv_buffer_size(4 * 1024);
+    socket
+        .bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let listener = socket.listen(16).expect("listen");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    (addr, task)
+}
+
+/// A loopback listener that reports every connection it accepts. This is the
+/// sibling probe: a dial arriving here proves the shared reader processed a
+/// frame that came in AFTER both queues were saturated.
+async fn reporting_local_target() -> (String, mpsc::UnboundedReceiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+            if tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    (addr, rx)
 }
 
 /// The bridge asks for the relay subprotocol, so the stub must grant it. The
@@ -243,6 +377,26 @@ where
         }
     }
     None
+}
+
+/// [`bridge_config`] with both loopback targets pointed at real listeners, so
+/// `Open` frames actually dial something.
+fn bridge_config_with_targets(
+    relay_addr: SocketAddr,
+    data_dir: &std::path::Path,
+    signing_key: Vec<u8>,
+    local_wss_addr: String,
+    local_enroll_addr: String,
+) -> zeroclaw_runtime::relay::RelayBridgeConfig {
+    zeroclaw_runtime::relay::RelayBridgeConfig {
+        local_wss_addr,
+        local_enroll_addr: Some(local_enroll_addr),
+        // Tight enough that the reader's capacity and rate refusals are both
+        // reachable while its outbound queue is saturated.
+        max_conns: 1,
+        open_burst: 3,
+        ..bridge_config(relay_addr, data_dir, signing_key)
+    }
 }
 
 fn bridge_config(
@@ -441,6 +595,63 @@ async fn cancellation_returns_while_parked_awaiting_the_challenge() {
 #[tokio::test]
 async fn cancellation_returns_while_parked_awaiting_registration() {
     assert_cancellation_during_setup_returns_promptly(RelayBehavior::SilentAtRegistered).await;
+}
+
+/// One backpressured connection must not freeze the node.
+///
+/// The shared reader demuxes every conn on the link and owns the `link_dead` and
+/// cancellation arms. If any notification it emits AWAITS the bounded outbound
+/// queue, then a relay that has stopped reading parks the reader there: sibling
+/// routes stop being served and teardown stops being observed for the writer's
+/// whole stall budget, rather than the backpressure staying isolated to the one
+/// conn that caused it.
+///
+/// The stub saturates both queues and then asks for a sibling route. The dial
+/// landing on the enrollment listener is the proof that the reader kept running.
+#[tokio::test]
+async fn a_saturated_link_still_serves_sibling_routes_and_stays_tearable() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (wedged_addr, _wedged_target) = stalled_local_target().await;
+    let (sibling_addr, mut sibling_dials) = reporting_local_target().await;
+
+    let mut relay = spawn_stub_relay(RelayBehavior::SaturateThenOpenSibling).await;
+    let dir = tempfile::tempdir().unwrap();
+    let signing_key = zeroclaw_runtime::relay::ensure_signing_key(dir.path()).unwrap();
+    let cancel = CancellationToken::new();
+
+    let bridge = tokio::spawn(zeroclaw_runtime::relay::run_relay_bridge(
+        bridge_config_with_targets(
+            relay.addr,
+            dir.path(),
+            signing_key,
+            wedged_addr,
+            sibling_addr,
+        ),
+        cancel.clone(),
+    ));
+    wait_for(
+        &mut relay.events,
+        RelayEvent::Registered,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // The sibling `Open` is the last frame the stub sends, after both queues are
+    // full. Real clock: the bridge's stall budgets are minutes away, so nothing
+    // but a live reader can produce this dial inside the window.
+    tokio::time::timeout(Duration::from_secs(20), sibling_dials.recv())
+        .await
+        .expect("a saturated link must still serve sibling routes")
+        .expect("sibling listener");
+
+    // ... and the node must still be tearable, not held until a write budget
+    // expires.
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), bridge)
+        .await
+        .expect("teardown must not wait on the saturated outbound queue")
+        .expect("bridge task")
+        .expect("clean shutdown");
 }
 
 /// An established relay that stops reading wedges every outbound producer: the

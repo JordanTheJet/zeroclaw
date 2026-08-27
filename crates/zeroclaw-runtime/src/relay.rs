@@ -710,12 +710,15 @@ async fn serve_established(
                                 // Fast-reject an OPEN flood before allocating conn
                                 // state or dialing a loopback mTLS handshake (A6).
                                 if !open_bucket.try_take() {
-                                    let _ = to_relay
-                                        .send(tungstenite_text(&Control::Close {
+                                    // No conn state was allocated, so the refusal
+                                    // is the only thing at stake: best-effort.
+                                    notify_relay(
+                                        &to_relay,
+                                        tungstenite_text(&Control::Close {
                                             conn_id,
                                             reason: "rate_limited".into(),
-                                        }))
-                                        .await;
+                                        }),
+                                    );
                                     continue;
                                 }
                                 let (local, is_enroll) = match open_route_target(
@@ -724,24 +727,28 @@ async fn serve_established(
                                 ) {
                                     Ok((addr, is_enroll)) => (addr.to_string(), is_enroll),
                                     Err(reason) => {
-                                        let _ = to_relay
-                                            .send(tungstenite_text(&Control::Close {
+                                        // Refused before any conn state exists.
+                                        notify_relay(
+                                            &to_relay,
+                                            tungstenite_text(&Control::Close {
                                                 conn_id,
                                                 reason: reason.into(),
-                                            }))
-                                            .await;
+                                            }),
+                                        );
                                         continue;
                                     }
                                 };
                                 let mut cs = conns.lock().await;
                                 if cs.len() >= cfg.max_conns {
                                     drop(cs);
-                                    let _ = to_relay
-                                        .send(tungstenite_text(&Control::Close {
+                                    // Nothing was admitted; the cap already held.
+                                    notify_relay(
+                                        &to_relay,
+                                        tungstenite_text(&Control::Close {
                                             conn_id,
                                             reason: "busy".into(),
-                                        }))
-                                        .await;
+                                        }),
+                                    );
                                 } else {
                                     let (tx, rx) = mpsc::channel::<ConnMsg>(256);
                                     // A child of the link token, so this conn is
@@ -802,9 +809,11 @@ async fn serve_established(
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(p)) => {
-                        let _ = to_relay
-                            .send(tokio_tungstenite::tungstenite::Message::Pong(p))
-                            .await;
+                        // A liveness courtesy. If the outbound queue is full the
+                        // writer is already stalled, and the keepalive watchdog
+                        // is what retires that link - parking the reader here to
+                        // answer a ping would only delay noticing it.
+                        notify_relay(&to_relay, tokio_tungstenite::tungstenite::Message::Pong(p));
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Pong(_)) => {}
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
@@ -1151,10 +1160,14 @@ async fn bridge_conn(
 
 /// Route one relay frame to a logical conn's bridge task WITHOUT blocking the
 /// shared relay-link reader (mirror of the zerorelay-side delivery rule).
-/// Sender cloned under the lock, guard dropped, delivery
-/// non-blocking. A full per-conn buffer means that conn's loopback write side
-/// is wedged: tear down only that conn and tell the relay, keeping every other
-/// bridged conn (and Open/Close handling) live.
+/// Sender cloned under the lock, guard dropped, delivery non-blocking.
+///
+/// A full per-conn buffer means that conn's loopback write side is wedged: tear
+/// down only that conn and tell the relay, keeping every other bridged conn (and
+/// Open/Close handling) live. Both halves of that have to be non-blocking to be
+/// true - the per-conn delivery AND the notification back to the relay. See
+/// [`notify_relay`]: awaiting the notification would have made this function
+/// freeze the very reader it exists to keep running.
 async fn deliver_conn_msg(
     conns: &Mutex<HashMap<u64, ConnHandle>>,
     to_relay: &mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
@@ -1174,15 +1187,39 @@ async fn deliver_conn_msg(
             conns.lock().await.remove(&conn_id);
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            // Route removed first, so this conn's bridge task is already
+            // cancelled and its cleanup guaranteed; the notification is then
+            // best-effort and never parks the shared reader.
             conns.lock().await.remove(&conn_id);
-            let _ = to_relay
-                .send(tungstenite_text(&Control::Close {
+            notify_relay(
+                to_relay,
+                tungstenite_text(&Control::Close {
                     conn_id,
                     reason: "conn_backpressured".into(),
-                }))
-                .await;
+                }),
+            );
         }
     }
+}
+
+/// Best-effort notification to the relay from the SHARED link reader.
+///
+/// Nothing on the reader path may AWAIT `to_relay`. The queue is bounded and its
+/// writer can be parked for a whole [`WRITE_STALL`] budget against a relay that
+/// has stopped reading, so one parked send there stops the reader polling its
+/// `link_dead` arm, demuxing for every other conn on the link, and observing
+/// teardown - turning one backpressured peer into a frozen node.
+///
+/// Every caller has already completed the authoritative local action before
+/// calling this: the `Open` was refused so no conn state exists, or the route
+/// was removed from the conn map (which cancels its bridge task). The frame is a
+/// courtesy the relay can also infer from its own pair timeout, so dropping it
+/// costs promptness, never correctness or cleanup.
+fn notify_relay(
+    to_relay: &mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    frame: tokio_tungstenite::tungstenite::Message,
+) {
+    let _ = to_relay.try_send(frame);
 }
 
 fn tungstenite_text(frame: &Control) -> tokio_tungstenite::tungstenite::Message {
