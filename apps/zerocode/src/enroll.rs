@@ -220,20 +220,63 @@ pub fn cached_profile(config_dir: &Path) -> Option<CachedProfile> {
     serde_json::from_slice(&raw).ok()
 }
 
+/// Wall-clock ceiling on ONE enrollment exchange, covering every step of it:
+/// the TCP connect (or the relay dial), the TLS handshake, the request write,
+/// and the bounded response read. The response deadline only starts once a TLS
+/// session exists, so without this an endpoint that never completes a connect or
+/// a handshake - unreachable, or accepting and then silent - holds the client
+/// forever.
+///
+/// 30s: the 15s response window nests inside it with room left for a slow
+/// connect and handshake on a poor link, so an exchange that is merely slow is
+/// not cut off before its own read deadline can report the real fault.
+///
+/// Deliberately per-exchange, not one budget over the whole enrollment: the
+/// operator's SAS confirmation sits between the trust fetch and the POST, and
+/// that prompt is a human with no deadline.
+const ENROLL_EXCHANGE_TIMEOUT_SECS: u64 = 30;
+
+/// Run one enrollment exchange under [`ENROLL_EXCHANGE_TIMEOUT_SECS`].
+async fn within_exchange_budget<T>(
+    what: &str,
+    exchange: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(ENROLL_EXCHANGE_TIMEOUT_SECS),
+        exchange,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "{what} did not complete within {ENROLL_EXCHANGE_TIMEOUT_SECS}s; the \
+             enrollment endpoint is unreachable, or it accepted the connection and \
+             then stopped responding"
+        ),
+    }
+}
+
 /// Fetch the daemon CA over provisional TLS. This preflight sends no pairing code
 /// and no CSR; the operator confirms the returned CA via SAS before it is trusted.
 async fn fetch_enroll_trust(host: &str, port: u16) -> Result<EnrollTrustResponse> {
-    let tcp = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
-    fetch_enroll_trust_on_stream(tcp, host, host).await
+    within_exchange_budget("the enrollment trust fetch", async {
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
+        fetch_enroll_trust_on_stream(tcp, host, host).await
+    })
+    .await
 }
 
 async fn fetch_enroll_trust_via_relay(
     relay: &crate::client::RelayDial,
 ) -> Result<EnrollTrustResponse> {
-    let stream = crate::client::dial_enrollment_through_relay(relay).await?;
-    fetch_enroll_trust_on_stream(stream, RELAY_ENROLL_SERVER_NAME, RELAY_ENROLL_SERVER_NAME).await
+    within_exchange_budget("the enrollment trust fetch through the relay", async {
+        let stream = crate::client::dial_enrollment_through_relay(relay).await?;
+        fetch_enroll_trust_on_stream(stream, RELAY_ENROLL_SERVER_NAME, RELAY_ENROLL_SERVER_NAME)
+            .await
+    })
+    .await
 }
 
 /// POST the CSR to the enrollment endpoint over TLS pinned to the operator-
@@ -245,10 +288,13 @@ async fn post_enroll(
     csr_pem: &str,
     trusted_ca_pem: &str,
 ) -> Result<EnrollResponse> {
-    let tcp = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
-    post_enroll_on_stream(tcp, host, host, code, csr_pem, trusted_ca_pem).await
+    within_exchange_budget("the enrollment request", async {
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
+        post_enroll_on_stream(tcp, host, host, code, csr_pem, trusted_ca_pem).await
+    })
+    .await
 }
 
 async fn post_enroll_via_relay(
@@ -257,15 +303,18 @@ async fn post_enroll_via_relay(
     csr_pem: &str,
     trusted_ca_pem: &str,
 ) -> Result<EnrollResponse> {
-    let stream = crate::client::dial_enrollment_through_relay(relay).await?;
-    post_enroll_on_stream(
-        stream,
-        RELAY_ENROLL_SERVER_NAME,
-        RELAY_ENROLL_SERVER_NAME,
-        code,
-        csr_pem,
-        trusted_ca_pem,
-    )
+    within_exchange_budget("the enrollment request through the relay", async {
+        let stream = crate::client::dial_enrollment_through_relay(relay).await?;
+        post_enroll_on_stream(
+            stream,
+            RELAY_ENROLL_SERVER_NAME,
+            RELAY_ENROLL_SERVER_NAME,
+            code,
+            csr_pem,
+            trusted_ca_pem,
+        )
+        .await
+    })
     .await
 }
 
@@ -498,6 +547,18 @@ const STAGED_PUBLISHED_MANIFEST: &str = ".published.manifest.tmp";
 /// so neither file can ever be parsed as the other.
 const PUBLISHED_MANIFEST_TAG: &str = "zerocode-published-v1";
 
+/// Lock file serialising credential publication within one config directory.
+const PUBLISH_LOCK: &str = ".publish.lock";
+
+/// How long to wait for another process's publication before refusing. One
+/// publication is four small writes and a few fsyncs, so a healthy contender
+/// clears in milliseconds; this absorbs a slow disk while keeping a stuck holder
+/// an actionable error rather than a hang.
+const PUBLISH_LOCK_WAIT_SECS: u64 = 5;
+
+/// Poll interval while waiting for the lock.
+const PUBLISH_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Error label for the in-progress marker, used in parse diagnostics.
 const MARKER_LABEL: &str = "publication marker";
 
@@ -598,6 +659,97 @@ fn mark_generation(staged: &StagedGeneration) -> Result<()> {
     sync_dir_where_supported(&staged.tls_dir)
 }
 
+/// Exclusive inter-process lock over one config directory's credential cache.
+///
+/// Publication stages under FIXED `.tmp` names and one FIXED marker, so two
+/// zerocode processes sharing a config directory interleave without this: one
+/// can classify a generation while the other overwrites the staged files under
+/// it, and the first then publishes a mixed set or records a manifest that
+/// describes neither generation. The crash-phase tests cannot see this, because
+/// it is a concurrency fault, not an interruption. The lock covers the whole
+/// stage -> mark -> rename -> record sequence, and the recovery/validation path
+/// that reads the same files.
+///
+/// `std::fs::File::try_lock` is the primitive: `flock(LOCK_EX)` on Unix,
+/// `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK` on Windows. One call, no
+/// dependency, and no platform-specific code to review. On Unix the lock is
+/// advisory, which binds every process that takes it - every zerocode - and
+/// leaves an operator's own edits to the directory unaffected.
+#[derive(Debug)]
+struct PublishLock {
+    file: std::fs::File,
+}
+
+impl PublishLock {
+    /// Take the lock, waiting up to `wait` for a concurrent publication to
+    /// finish. Bounded on purpose: a lock held by a wedged process must surface
+    /// as an error naming the file, never as an enrollment that hangs.
+    ///
+    /// The wait blocks the calling thread. Publication is already blocking file
+    /// I/O (every write is fsynced), and enrollment is a one-shot startup step,
+    /// so this does not introduce a new kind of stall.
+    fn acquire_within(tls_dir: &Path, wait: std::time::Duration) -> Result<Self> {
+        let path = tls_dir.join(PUBLISH_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "another process is publishing credentials and still holds {} \
+                             after {}s. Let the other zerocode finish enrolling or renewing, \
+                             then try again.",
+                            path.display(),
+                            wait.as_secs()
+                        );
+                    }
+                    std::thread::sleep(PUBLISH_LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+
+    fn acquire(tls_dir: &Path) -> Result<Self> {
+        Self::acquire_within(
+            tls_dir,
+            std::time::Duration::from_secs(PUBLISH_LOCK_WAIT_SECS),
+        )
+    }
+}
+
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock on both platforms; unlocking
+        // first makes the release explicit rather than a side effect of drop
+        // order. The lock file itself is left in place: it is the lock's
+        // identity, and removing it would let a later process take a lock on a
+        // different inode while this one is still held.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Lock a credential cache that already exists. `None` when the directory is
+/// absent: nothing was ever published there, so there is nothing to serialise
+/// and no reason for a read path to create the directory.
+fn lock_existing_cache(tls_dir: &Path) -> Result<Option<PublishLock>> {
+    if !tls_dir.exists() {
+        return Ok(None);
+    }
+    PublishLock::acquire(tls_dir).map(Some)
+}
+
 /// Replace `published` with `staged` in one step, on every platform.
 ///
 /// `std::fs::rename` IS the atomic-replace primitive here; its documented
@@ -669,8 +821,11 @@ fn install_material(tls_dir: &Path, material: &Material) -> Result<()> {
 ///
 /// Callers run this before READING the materials and before staging new ones,
 /// so an interrupted publication is repaired rather than observed.
-pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
-    let tls_dir = config_dir.join("tls");
+/// The recovery itself. The caller holds the publication lock, so the staged
+/// files and the marker cannot move under it. Reached from `cache_materials`
+/// before it stages, and from `recover_and_validate` at startup.
+fn finish_pending_publish_locked(tls_dir: &Path) -> Result<()> {
+    let tls_dir = tls_dir.to_path_buf();
     let marker = tls_dir.join(PUBLISH_MARKER);
     let raw = match std::fs::read_to_string(&marker) {
         Ok(raw) => raw,
@@ -758,8 +913,27 @@ pub(crate) fn finish_pending_publish(config_dir: &Path) -> Result<()> {
 /// before this record existed, which breaks working installs to guard a
 /// double-fault - the record write is ordered before the marker removal, so a
 /// filesystem that journals metadata in order never reaches it.
-pub fn validate_published_generation(config_dir: &Path) -> Result<()> {
+/// Recover an interrupted publication and then validate the published
+/// generation, under ONE lock.
+///
+/// This is what startup calls. Taking the lock once matters: with two separate
+/// acquisitions another process could complete a publication in the gap, and
+/// this run would then compare fresh credentials against the record it read a
+/// moment earlier and refuse a cache that is in fact coherent.
+pub fn recover_and_validate(config_dir: &Path) -> Result<()> {
     let tls_dir = config_dir.join("tls");
+    let Some(_lock) = lock_existing_cache(&tls_dir)? else {
+        return Ok(());
+    };
+    finish_pending_publish_locked(&tls_dir)
+        .context("completing an interrupted credential publication")?;
+    validate_published_generation_locked(&tls_dir)
+        .context("validating the published credential set")
+}
+
+/// The validation itself. The caller holds the publication lock.
+fn validate_published_generation_locked(tls_dir: &Path) -> Result<()> {
+    let tls_dir = tls_dir.to_path_buf();
     let record = tls_dir.join(PUBLISHED_MANIFEST);
     let raw = match std::fs::read_to_string(&record) {
         Ok(raw) => raw,
@@ -898,8 +1072,12 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
     // The directory entry must be durable before it holds credentials.
     sync_dir_where_supported(config_dir)?;
+    // Held across the whole sequence below: another zerocode sharing this config
+    // directory stages under the same fixed names, and an interleaving between
+    // the classification and the four renames publishes a mixed set.
+    let _lock = PublishLock::acquire(&tls_dir)?;
     // Repair an interrupted earlier publication before staging over it.
-    finish_pending_publish(config_dir)?;
+    finish_pending_publish_locked(&tls_dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -923,7 +1101,7 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
         ],
     )?;
     mark_generation(&staged)?;
-    finish_pending_publish(config_dir)
+    finish_pending_publish_locked(&tls_dir)
 }
 
 /// Write `bytes` to `path` and fsync them, so the content survives power loss
@@ -1075,6 +1253,26 @@ mod tests {
     // generation or refuses and keeps its marker. It never publishes a mixed
     // set (a NEW cert beside an OLD key), and it never clears the marker while
     // the recorded generation is incomplete.
+
+    /// Recovery from a config dir, taking the lock exactly as the production
+    /// entries do. `recover_and_validate` bundles recovery with validation;
+    /// these two seams let a test assert one step at a time.
+    fn finish_pending_publish(config_dir: &std::path::Path) -> Result<()> {
+        let tls_dir = config_dir.join("tls");
+        let Some(_lock) = lock_existing_cache(&tls_dir)? else {
+            return Ok(());
+        };
+        finish_pending_publish_locked(&tls_dir)
+    }
+
+    /// Validation from a config dir, taking the lock as production does.
+    fn validate_published_generation(config_dir: &std::path::Path) -> Result<()> {
+        let tls_dir = config_dir.join("tls");
+        let Some(_lock) = lock_existing_cache(&tls_dir)? else {
+            return Ok(());
+        };
+        validate_published_generation_locked(&tls_dir)
+    }
 
     /// The generation already published before the publication under test.
     const OLD: [&[u8]; MATERIAL_COUNT] = [b"OLD-CERT", b"OLD-CA", b"OLD-KEY", b"OLD-PROFILE"];
@@ -1465,6 +1663,176 @@ mod tests {
         validate_published_generation(dir.path()).expect("the refreshed record must validate");
     }
 
+    /// Take the publication lock the way a SECOND process would: a separate file
+    /// handle on the same lock file. On both platforms the lock is per-handle, so
+    /// this conflicts with the crate's own lock exactly as another process does.
+    fn foreign_lock(tls: &std::path::Path) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(tls.join(PUBLISH_LOCK))
+            .unwrap();
+        file.try_lock()
+            .expect("the lock must be free at this point");
+        file
+    }
+
+    /// A concurrent publication must not be able to interleave with this one.
+    /// While another holder has the lock, `cache_materials` must not have staged
+    /// anything; once the holder releases, it must complete a whole generation.
+    #[test]
+    fn a_concurrent_publication_cannot_interleave_with_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+
+        let held = foreign_lock(&tls);
+        let staged_during_hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = staged_during_hold.clone();
+        let watch_dir = tls.clone();
+        let holder = std::thread::spawn(move || {
+            // Hold long enough that a publication ignoring the lock would have
+            // staged and renamed well within the window.
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if STAGED_MATERIALS
+                    .iter()
+                    .any(|m| watch_dir.join(m.staged).exists())
+                {
+                    observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-1", daemon_ca, "dev_1"),
+            "key-gen-1",
+        )
+        .expect("publication must proceed once the lock is free");
+        let waited = started.elapsed();
+        holder.join().unwrap();
+
+        assert!(
+            !staged_during_hold.load(std::sync::atomic::Ordering::SeqCst),
+            "no credential may be staged while another process holds the lock"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "publication must wait for the lock, not race it (waited {waited:?})"
+        );
+        assert_eq!(
+            std::fs::read(tls.join("client.crt")).unwrap(),
+            b"cert-gen-1"
+        );
+        assert_record_matches_disk(&tls);
+        validate_published_generation(dir.path()).expect("the published set must be coherent");
+    }
+
+    /// A holder that never lets go must produce an actionable error naming the
+    /// lock file, not a hang.
+    #[test]
+    fn a_lock_that_is_never_released_fails_with_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let _held = foreign_lock(&tls);
+
+        let started = std::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            PublishLock::acquire_within(&tls, std::time::Duration::from_millis(120))
+                .expect_err("a lock held by another process must not block forever")
+        );
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait must be bounded"
+        );
+        assert!(err.contains(PUBLISH_LOCK), "got: {err}");
+        assert!(err.contains("another process"), "got: {err}");
+    }
+
+    /// The lock must be released when publication ends, or the next enrollment
+    /// on this machine deadlocks against a lock nobody holds.
+    #[test]
+    fn the_lock_is_released_after_publication_and_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-1", daemon_ca.clone(), "dev_1"),
+            "key-gen-1",
+        )
+        .expect("first publication must succeed");
+        drop(foreign_lock(&tls));
+
+        recover_and_validate(dir.path()).expect("startup must run against a published set");
+        drop(foreign_lock(&tls));
+
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-2", daemon_ca, "dev_2"),
+            "key-gen-2",
+        )
+        .expect("a renewal must be able to take the lock again");
+        assert_eq!(
+            std::fs::read(tls.join("client.crt")).unwrap(),
+            b"cert-gen-2"
+        );
+    }
+
+    /// Startup takes the same lock as publication. Reading a cache while another
+    /// process is mid-publication is how a coherent set gets reported as
+    /// inconsistent: the record is refreshed between the renames and the marker
+    /// removal, so an unlocked read can land on a generation the record does not
+    /// describe yet and refuse a machine that is fine.
+    #[test]
+    fn startup_waits_for_a_publication_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        cache_materials(
+            dir.path(),
+            &enroll_response("cert-gen-1", daemon_ca, "dev_1"),
+            "key-gen-1",
+        )
+        .expect("a published set to read");
+
+        let held = foreign_lock(&tls);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        recover_and_validate(dir.path()).expect("startup must succeed once the lock is free");
+        let waited = started.elapsed();
+        holder.join().unwrap();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "startup must wait for a publication in flight rather than read across it \
+             (waited {waited:?})"
+        );
+    }
+
+    /// A machine that has never enrolled has no credential directory. Startup
+    /// must not create one just to take a lock over nothing.
+    #[test]
+    fn startup_does_not_create_a_credential_directory_to_lock_it() {
+        let dir = tempfile::tempdir().unwrap();
+        recover_and_validate(dir.path()).expect("a machine with no credentials must start");
+        assert!(!dir.path().join("tls").exists());
+    }
+
     /// The marker and the record share a body format and a directory. Their tags
     /// keep them apart, so neither can be read as the other.
     #[test]
@@ -1609,6 +1977,120 @@ mod tests {
             msg.contains("exceeded") && msg.contains("refusing to buffer further"),
             "expected a size-cap refusal, got: {msg}"
         );
+    }
+
+    /// A listener that completes the TCP accept and then never speaks. The
+    /// response deadline cannot help here: it starts only once a TLS session
+    /// exists, and no handshake ever completes. Only the exchange budget ends
+    /// this. The accepted sockets are held so the peer sees no EOF.
+    async fn accept_then_silent_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (addr, server)
+    }
+
+    /// How long the exchange actually ran, on the paused clock. The clock
+    /// auto-advances to the next deadline, so this is the budget the code really
+    /// spent - a test that only asserts "an error came back" would pass just as
+    /// happily against a budget of a day.
+    fn assert_spent_the_budget(waited: tokio::time::Duration) {
+        let budget = std::time::Duration::from_secs(ENROLL_EXCHANGE_TIMEOUT_SECS);
+        assert!(
+            waited >= budget,
+            "the exchange must run until its budget, not fail early: {waited:?}"
+        );
+        assert!(
+            waited <= budget + std::time::Duration::from_secs(1),
+            "the exchange must end AT its budget: {waited:?} against a {budget:?} budget"
+        );
+    }
+
+    /// The CA preflight runs before anything is trusted, so a silent endpoint
+    /// here stalls `zerocode --enroll` before the operator is ever prompted.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_endpoint_cannot_stall_the_trust_fetch() {
+        let (addr, server) = accept_then_silent_listener().await;
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            fetch_enroll_trust(&addr.ip().to_string(), addr.port())
+                .await
+                .expect_err("a silent enrollment endpoint must not hold the client")
+        );
+
+        assert_spent_the_budget(started.elapsed());
+        assert!(err.contains("did not complete within"), "got: {err}");
+        assert!(
+            err.contains(&ENROLL_EXCHANGE_TIMEOUT_SECS.to_string()),
+            "the refusal must name the budget it spent, got: {err}"
+        );
+        server.abort();
+    }
+
+    /// The same guarantee on the POST exchange, which carries the pairing code
+    /// and the CSR.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_endpoint_cannot_stall_the_enrollment_request() {
+        let (addr, server) = accept_then_silent_listener().await;
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            post_enroll(
+                &addr.ip().to_string(),
+                addr.port(),
+                "270391",
+                "csr",
+                &daemon_ca
+            )
+            .await
+            .expect_err("a silent enrollment endpoint must not hold the client")
+        );
+
+        assert_spent_the_budget(started.elapsed());
+        assert!(err.contains("did not complete within"), "got: {err}");
+        server.abort();
+    }
+
+    /// The relayed path dials a relay rather than the daemon, so it needs its own
+    /// budget: a silent relay stalls in the outer WebSocket/TLS handshake, before
+    /// the enrollment stream that the response deadline would cover exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_cannot_stall_relayed_enrollment() {
+        let (addr, server) = accept_then_silent_listener().await;
+        let relay = crate::client::RelayDial {
+            relay_addr: addr.to_string(),
+            relay_host: "localhost".into(),
+            node_id: "node-1".into(),
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_pin: None,
+            relay_tofu: false,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            fetch_enroll_trust_via_relay(&relay)
+                .await
+                .expect_err("a silent relay must not hold the client")
+        );
+
+        assert_spent_the_budget(started.elapsed());
+        assert!(err.contains("did not complete within"), "got: {err}");
+        assert!(err.contains("relay"), "got: {err}");
+        server.abort();
     }
 
     #[tokio::test(start_paused = true)]

@@ -477,11 +477,7 @@ fn recover_then_read_credentials(
     cli_client_cert: Option<&str>,
     cfg_client_cert: &str,
 ) -> anyhow::Result<CredentialStartup> {
-    use anyhow::Context as _;
-    enroll::finish_pending_publish(config_dir)
-        .context("completing an interrupted credential publication")?;
-    enroll::validate_published_generation(config_dir)
-        .context("validating the published credential set")?;
+    enroll::recover_and_validate(config_dir)?;
     Ok(CredentialStartup {
         profile: enroll::cached_profile(config_dir),
         certless: enroll::is_certless(config_dir, cli_client_cert, cfg_client_cert),
