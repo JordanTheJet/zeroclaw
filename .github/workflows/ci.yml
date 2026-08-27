@@ -160,6 +160,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build the zerorelay image
         shell: bash
+        # The Dockerfile uses BuildKit-only RUN --mount cache instructions.
+        # Modern Docker defaults to BuildKit, but a legacy builder fails the
+        # documented command outright - require it explicitly so the job is
+        # reproducible anywhere.
+        env:
+          DOCKER_BUILDKIT: "1"
         run: docker build -f apps/zerorelay/Dockerfile -t zerorelay:smoke .
       - name: Fresh-volume non-root startup smoke (self-provisions TLS + healthcheck)
         shell: bash
