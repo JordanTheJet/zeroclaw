@@ -144,6 +144,13 @@ async fn zerocode_to_relay_to_daemon_full_path() {
                     let _ = ws.send(msg).await; // echo
                     let _ = ws.flush().await;
                 }
+                // Returning here would drop the stream and close the socket with
+                // neither a WebSocket Close nor a TLS close_notify, racing the
+                // echo the client is still reading: rustls surfaces that abrupt
+                // EOF as an error rather than the pending message. The real WSS
+                // listener closes cleanly, so this stands in for it by staying
+                // up until the client leaves.
+                while ws.next().await.is_some() {}
             });
         }
     });

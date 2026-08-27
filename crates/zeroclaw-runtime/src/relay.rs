@@ -48,6 +48,28 @@ enum ConnMsg {
     Ack(u32),
 }
 
+/// The link-side handle for one bridged connection: the inbound queue its
+/// bridge task reads, and the token that retires that task.
+///
+/// Cancellation is what lets a route close reach a bridge task that is NOT
+/// sitting in its select - one parked writing to the loopback socket, or parked
+/// sending into the shared relay queue. Dropping the handle cancels, so every
+/// removal from the conn map retires the task with no separate bookkeeping: a
+/// relay `Close`, a backpressured conn, or the map itself going away.
+struct ConnHandle {
+    tx: mpsc::Sender<ConnMsg>,
+    cancel: CancellationToken,
+}
+
+impl Drop for ConnHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Live bridged connections for one relay link, keyed by `conn_id`.
+type ConnMap = Arc<Mutex<HashMap<u64, ConnHandle>>>;
+
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A session up at least this long resets the backoff (transient drop).
@@ -75,6 +97,15 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(30);
 /// 15s per-`Open` pair timeout, so the bridge always abandons the dial before
 /// the relay abandons the route it is holding open for it.
 const LOCAL_DIAL_DEADLINE: Duration = Duration::from_secs(10);
+/// Bound on a loopback write that makes NO progress at all.
+///
+/// A local consumer that is merely slow is legitimate backpressure - the client
+/// is streaming faster than the daemon drains it - and killing that would break
+/// large requests, so this budget is reset on every byte that moves. What it
+/// ends is a consumer that has stopped reading entirely. It is also the budget
+/// the daemon's own WSS listener applies to a peer that stops reading, so a
+/// loopback consumer the daemon still considers alive is never retired here.
+const LOCAL_WRITE_STALL: Duration = Duration::from_secs(30);
 /// Bound on one outbound frame write once the link is established. The
 /// tungstenite sink reports no partial progress, so from here a relay that has
 /// stopped reading is indistinguishable from one that is merely slow; the bound
@@ -641,8 +672,7 @@ async fn serve_established(
 ) -> Result<()> {
     // Connection bookkeeping + the single outbound write path to the relay.
     let (to_relay, from_tasks) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
-    let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let link_dead = CancellationToken::new();
 
@@ -714,10 +744,17 @@ async fn serve_established(
                                         .await;
                                 } else {
                                     let (tx, rx) = mpsc::channel::<ConnMsg>(256);
-                                    cs.insert(conn_id, tx);
+                                    // A child of the link token, so this conn is
+                                    // retired both by its own route closing and
+                                    // by the whole link dying, and the bridge
+                                    // task only has to watch the one token.
+                                    let conn_cancel = link_dead.child_token();
+                                    cs.insert(
+                                        conn_id,
+                                        ConnHandle { tx, cancel: conn_cancel.clone() },
+                                    );
                                     drop(cs);
                                     let to_relay = to_relay.clone();
-                                    let link_dead = link_dead.clone();
                                     let conns = conns.clone();
                                     // For enroll-routed conns, share the port set
                                     // so the endpoint can classify the loopback
@@ -726,13 +763,17 @@ async fn serve_established(
                                         is_enroll.then(|| cfg.enroll_bridge_ports.clone()).flatten();
                                     zeroclaw_spawn::spawn!(async move {
                                         bridge_conn(
-                                            conn_id, &local, to_relay, rx, link_dead, conns,
+                                            conn_id, &local, to_relay, rx, conn_cancel, conns,
                                             bridge_ports,
                                         )
                                         .await;
                                     });
                                 }
                             }
+                            // Dropping the handle cancels the conn, which reaches
+                            // a bridge task parked in a loopback write or in a
+                            // send to the shared relay queue - neither of which
+                            // the task's own select can interrupt.
                             Ok(Control::Close { conn_id, .. }) => {
                                 conns.lock().await.remove(&conn_id);
                             }
@@ -927,6 +968,49 @@ fn bind_and_register(
     Ok((socket, remote, guard))
 }
 
+/// Await `op` unless this conn is retired first. `None` means the route closed
+/// (or the link died) while the operation was still parked.
+///
+/// Every await in a bridge task that can park on something outside the task -
+/// the loopback socket, the shared relay queue - goes through here or through
+/// [`write_local`]. An await that does not is one a route close cannot reach.
+async fn unless_cancelled<F: std::future::Future>(
+    cancel: &CancellationToken,
+    op: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        out = op => Some(out),
+    }
+}
+
+/// Write one inbound payload to the loopback stream, interruptible by a route
+/// close and bounded by lack of PROGRESS rather than by total time.
+///
+/// `write_all` is the wrong primitive here twice over: it cannot be interrupted,
+/// and it exposes no progress, so a slow-but-draining consumer and one that has
+/// stopped reading look identical from outside it. Writing chunk by chunk gives
+/// both - the budget is re-armed on every byte that moves, so legitimate
+/// backpressure is untouched, and [`LOCAL_WRITE_STALL`] only ever ends a
+/// consumer that has accepted nothing at all.
+///
+/// `false` means the payload was not fully delivered and the conn is finished.
+async fn write_local<W>(lw: &mut W, payload: &[u8], cancel: &CancellationToken) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut written = 0;
+    while written < payload.len() {
+        let chunk = tokio::time::timeout(LOCAL_WRITE_STALL, lw.write(&payload[written..]));
+        match unless_cancelled(cancel, chunk).await {
+            Some(Ok(Ok(n))) if n > 0 => written += n,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Bridge one logical connection: dial the selected loopback listener, accept the
 /// `Open`, and shuttle bytes both ways until either side ends.
 async fn bridge_conn(
@@ -934,8 +1018,10 @@ async fn bridge_conn(
     local_addr: &str,
     to_relay: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
     mut inbound: mpsc::Receiver<ConnMsg>,
-    link_dead: CancellationToken,
-    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>>,
+    // Retires THIS conn: a child of the link token, so it fires both when the
+    // relay closes this route and when the whole link dies.
+    cancel: CancellationToken,
+    conns: ConnMap,
     // Present only for enroll-routed conns: register our outbound source port
     // so the enrollment endpoint classifies this loopback peer as relay-routed.
     // A drop guard deregisters it however this task ends.
@@ -957,38 +1043,44 @@ async fn bridge_conn(
     let local_and_guard = match bind_and_register(local_addr, bridge_ports) {
         Ok((socket, remote, guard)) => {
             let dial = tokio::time::timeout(LOCAL_DIAL_DEADLINE, socket.connect(remote));
-            tokio::select! {
-                biased;
-                _ = link_dead.cancelled() => None,
-                outcome = dial => outcome.ok().and_then(|s| s.ok()).map(|s| (s, guard)),
-            }
+            unless_cancelled(&cancel, dial)
+                .await
+                .and_then(|outcome| outcome.ok())
+                .and_then(|s| s.ok())
+                .map(|s| (s, guard))
         }
         Err(_) => None,
     };
     let (local, _port_guard) = match local_and_guard {
         Some(v) => v,
         None => {
-            let _ = to_relay
-                .send(tungstenite_text(&Control::Close {
+            let _ = unless_cancelled(
+                &cancel,
+                to_relay.send(tungstenite_text(&Control::Close {
                     conn_id,
                     reason: "bridge_dial_failed".into(),
-                }))
-                .await;
+                })),
+            )
+            .await;
             conns.lock().await.remove(&conn_id);
             return;
         }
     };
     // Accept the connection to the relay (it tells the waiting client).
-    let _ = to_relay
-        .send(tungstenite_text(&Control::Opened { conn_id }))
-        .await;
+    let _ = unless_cancelled(
+        &cancel,
+        to_relay.send(tungstenite_text(&Control::Opened { conn_id })),
+    )
+    .await;
     // Grant the client our receive window for this conn up front.
-    let _ = to_relay
-        .send(tungstenite_text(&Control::Window {
+    let _ = unless_cancelled(
+        &cancel,
+        to_relay.send(tungstenite_text(&Control::Window {
             conn_id,
             credit: INITIAL_WINDOW,
-        }))
-        .await;
+        })),
+    )
+    .await;
 
     // Per-conn credit flow control (mirrors the client pump): `send_window` gates
     // loopback->relay bytes so one conn cannot monopolize the shared relay link
@@ -1001,35 +1093,40 @@ async fn bridge_conn(
     let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
     loop {
         tokio::select! {
-            _ = link_dead.cancelled() => break,
+            _ = cancel.cancelled() => break,
             // Pause reading the loopback when the send window is exhausted, until
             // a DataAck replenishes it.
             n = lr.read(&mut buf), if !send_window.is_blocked() => match n {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     send_window.debit(n);
-                    if to_relay
-                        .send(tokio_tungstenite::tungstenite::Message::binary(encode_data(conn_id, &buf[..n])))
-                        .await
-                        .is_err()
-                    {
+                    let queued = unless_cancelled(
+                        &cancel,
+                        to_relay.send(tokio_tungstenite::tungstenite::Message::binary(
+                            encode_data(conn_id, &buf[..n]),
+                        )),
+                    )
+                    .await;
+                    if !matches!(queued, Some(Ok(()))) {
                         break;
                     }
                 }
             },
             msg = inbound.recv() => match msg {
                 Some(ConnMsg::Data(p)) => {
-                    if lw.write_all(&p).await.is_err() {
+                    if !write_local(&mut lw, &p, &cancel).await {
                         break;
                     }
                     recv_drained = recv_drained.saturating_add(p.len() as u32);
                     if recv_drained >= INITIAL_WINDOW / 2 {
-                        let _ = to_relay
-                            .send(tungstenite_text(&Control::DataAck {
+                        let _ = unless_cancelled(
+                            &cancel,
+                            to_relay.send(tungstenite_text(&Control::DataAck {
                                 conn_id,
                                 consumed: recv_drained,
-                            }))
-                            .await;
+                            })),
+                        )
+                        .await;
                         recv_drained = 0;
                     }
                 }
@@ -1039,12 +1136,16 @@ async fn bridge_conn(
             },
         }
     }
-    let _ = to_relay
-        .send(tungstenite_text(&Control::Close {
+    // Skipped when this conn was retired: the relay closed the route, so it is
+    // not waiting to be told, and the send could park on a full queue.
+    let _ = unless_cancelled(
+        &cancel,
+        to_relay.send(tungstenite_text(&Control::Close {
             conn_id,
             reason: "bridge_closed".into(),
-        }))
-        .await;
+        })),
+    )
+    .await;
     conns.lock().await.remove(&conn_id);
 }
 
@@ -1055,7 +1156,7 @@ async fn bridge_conn(
 /// is wedged: tear down only that conn and tell the relay, keeping every other
 /// bridged conn (and Open/Close handling) live.
 async fn deliver_conn_msg(
-    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnMsg>>>,
+    conns: &Mutex<HashMap<u64, ConnHandle>>,
     to_relay: &mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
     conn_id: u64,
     msg: ConnMsg,
@@ -1063,7 +1164,7 @@ async fn deliver_conn_msg(
     let tx = {
         let map = conns.lock().await;
         match map.get(&conn_id) {
-            Some(tx) => tx.clone(),
+            Some(handle) => handle.tx.clone(),
             None => return,
         }
     };
@@ -1599,6 +1700,211 @@ mod link_liveness_tests {
         );
 
         reader.abort();
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here (the
+// `zeroclaw_spawn::spawn!` attribution rule is for production daemon tasks).
+#[allow(clippy::disallowed_methods)]
+mod conn_cancellation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn empty_port_set() -> crate::enroll::BridgePortSet {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    // A consumer that has accepted nothing at all is stopped, not slow, and the
+    // conn must not outlive that.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_write_ends_when_the_consumer_stops_reading() {
+        // `_reader` is held: dropping it would close the pipe and end the write
+        // for the wrong reason.
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        let cancel = CancellationToken::new();
+        let payload = vec![0u8; 64 * 1024];
+
+        let delivered = tokio::time::timeout(
+            LOCAL_WRITE_STALL * 2,
+            write_local(&mut writer, &payload, &cancel),
+        )
+        .await
+        .expect("the write must end on its own budget rather than hang");
+        assert!(
+            !delivered,
+            "a consumer that accepts nothing must not hold the conn open"
+        );
+    }
+
+    // The budget is on no progress, not on slow progress: a consumer that keeps
+    // draining, however little at a time, is legitimate backpressure and every
+    // byte still lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_write_survives_a_slow_but_draining_consumer() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let cancel = CancellationToken::new();
+        let payload = vec![0u8; 8 * 1024];
+
+        let drainer = tokio::spawn(async move {
+            let mut sink = vec![0u8; 256];
+            loop {
+                tokio::time::sleep(LOCAL_WRITE_STALL / 2).await;
+                if reader.read(&mut sink).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let delivered = tokio::time::timeout(
+            LOCAL_WRITE_STALL * 1000,
+            write_local(&mut writer, &payload, &cancel),
+        )
+        .await
+        .expect("a draining consumer must not hit the no-progress budget");
+        assert!(
+            delivered,
+            "backpressure from a draining consumer must not end the conn"
+        );
+
+        drainer.abort();
+    }
+
+    // Real clock: LOCAL_WRITE_STALL cannot expire inside the window asserted
+    // here, so a prompt return is cancellation's doing.
+    #[tokio::test]
+    async fn a_local_write_returns_on_cancellation() {
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        let cancel = CancellationToken::new();
+        let payload = vec![0u8; 64 * 1024];
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            })
+        };
+
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(2),
+            write_local(&mut writer, &payload, &cancel),
+        )
+        .await
+        .expect("a retired conn must not wait on the local consumer");
+        assert!(!delivered);
+
+        let _ = canceller.await;
+    }
+
+    /// Wait, on the real clock, until the feeder stops making progress. That
+    /// stall is the parked local write: the bridge task can only stop draining
+    /// its inbound queue once it is blocked writing to a peer that has stopped
+    /// reading.
+    async fn wait_until_stalled(fed: &AtomicUsize) {
+        let mut previous = 0;
+        let mut stalled = 0;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = fed.load(Ordering::Relaxed);
+            if now == previous && now > 0 {
+                stalled += 1;
+                if stalled >= 4 {
+                    return;
+                }
+            } else {
+                stalled = 0;
+            }
+            previous = now;
+        }
+        panic!("the bridge never parked on the local write");
+    }
+
+    // The reviewed hazard end to end: the relay closes a route while the bridge
+    // task is inside a local write. The task's own select cannot interrupt that
+    // write, so only the per-conn token can retire it - and until it does, the
+    // task and its registered source port are held.
+    #[tokio::test]
+    async fn a_route_close_retires_a_bridge_task_parked_on_the_local_write() {
+        // A local peer that accepts and then never reads, with the smallest
+        // receive buffer the kernel will grant so the write parks quickly.
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        let _ = socket.set_recv_buffer_size(4 * 1024);
+        socket
+            .bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+        let listener = socket.listen(8).expect("listen");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let local_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _held = stream;
+            std::future::pending::<()>().await
+        });
+
+        let ports = empty_port_set();
+        let (to_relay, _to_relay_rx) = mpsc::channel(64);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<ConnMsg>(4);
+        let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+        let conn_cancel = CancellationToken::new().child_token();
+        conns.lock().await.insert(
+            7,
+            ConnHandle {
+                tx: inbound_tx.clone(),
+                cancel: conn_cancel.clone(),
+            },
+        );
+
+        let task = {
+            let ports = ports.clone();
+            let conns = conns.clone();
+            tokio::spawn(async move {
+                bridge_conn(
+                    7,
+                    &addr,
+                    to_relay,
+                    inbound_rx,
+                    conn_cancel,
+                    conns,
+                    Some(ports),
+                )
+                .await;
+            })
+        };
+
+        // Feed until the write parks. The inbound queue is deliberately left
+        // open by this clone, so nothing but cancellation can end the task.
+        let fed = Arc::new(AtomicUsize::new(0));
+        let feeder = {
+            let fed = fed.clone();
+            tokio::spawn(async move {
+                while inbound_tx
+                    .send(ConnMsg::Data(vec![0u8; MAX_DATA_PAYLOAD]))
+                    .await
+                    .is_ok()
+                {
+                    fed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        wait_until_stalled(&fed).await;
+        assert!(
+            !ports.lock().expect("bridge port set lock").is_empty(),
+            "the parked conn must still hold its registered source port"
+        );
+
+        // Exactly what the reader loop does on a relay `Close`.
+        conns.lock().await.remove(&7);
+
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a route close must retire a bridge task parked on the local write")
+            .expect("bridge task");
+        assert!(
+            ports.lock().expect("bridge port set lock").is_empty(),
+            "retiring the conn must release its source port"
+        );
+
+        feeder.abort();
+        local_peer.abort();
     }
 }
 
