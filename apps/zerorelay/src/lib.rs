@@ -72,6 +72,31 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 /// established pump, not a bound on a single write.
 const REFUSAL_WRITE_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a write to a REGISTERED DAEMON's socket may make no progress before
+/// the relay declares that link dead.
+///
+/// The daemon link is long-lived and has no configured liveness policy of its
+/// own (`idle_timeout` governs client conns), so this is its liveness policy.
+/// The value matches the `DEAD_AFTER`/`WRITE_STALL` the daemon end of this same
+/// protocol uses to declare the link dead: with both ends on one timescale,
+/// neither keeps holding a link the other has already abandoned.
+///
+/// Unbounded, this write is the relay's worst wedge. `to_daemon` is a bounded
+/// channel, so a daemon that stops reading first parks the writer, then fills
+/// the channel, and then every path that sends into it - including the SHARED
+/// daemon reader - parks behind one unresponsive peer.
+const DAEMON_WRITE_STALL: Duration = Duration::from_secs(60);
+
+/// How long a client waits for its `Open` to reach the daemon before the relay
+/// gives up and refuses it.
+///
+/// Distinct from [`DAEMON_WRITE_STALL`] because the waiter is different: the
+/// client is still UN-ADMITTED here and holding a pre-admission permit, so a
+/// wedged daemon must not be able to pin permits for a minute. A healthy daemon
+/// drains a 256-slot channel instantly; needing longer than this means the link
+/// is wedged, and the client is refused exactly as if it were gone.
+const DAEMON_HANDOFF_BUDGET: Duration = Duration::from_secs(5);
+
 /// Which daemons may register a rendezvous on this relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
@@ -297,13 +322,44 @@ enum ConnEvent {
     /// Inner payload bytes from the daemon for this connection.
     Data(Vec<u8>),
     /// Daemon (or relay) is closing this connection.
-    Close(String),
+    ///
+    /// On a GRACEFUL daemon close this carries the route's cancellation handle.
+    /// Data the daemon sent just before closing is still queued AHEAD of this
+    /// event on the same FIFO, so the cancellation must not fire until the pump
+    /// has drained past it - otherwise teardown outruns the connection's own
+    /// last bytes and the client loses the tail of its response (a relayed
+    /// response whose peer closes right after writing loses its `close_notify`).
+    /// Abrupt closes - link death, backpressure shedding - pass `None` and keep
+    /// the immediate drop-cancel, because there is nothing worth draining.
+    Close(String, Option<tokio::sync::oneshot::Sender<()>>),
     /// Daemon -> client `Window { credit }`: (re)establish the client's send
     /// window for this conn (forwarded to the client; also seeds the relay guard).
     Window(u32),
     /// Daemon -> client `DataAck { consumed }`: replenish the client's send window.
     Ack(u32),
 }
+
+/// One live client route on a daemon link: where to deliver the daemon's frames,
+/// and the owner-cancellation handle for the task serving it.
+///
+/// Removing a route from the map drops this whole value, and dropping
+/// `_cancel_on_drop` resolves the owning task's cancellation future. That is
+/// deliberately structural: "the route is gone" and "the task serving it is
+/// cancelled" become the same event, so no removal site can forget to cancel.
+/// Without it, dropping the event sender only cancels a task that is actually
+/// polling its receiver - a task parked in a peer-controlled `send` never
+/// notices, keeps its socket and its `LiveConnGuard`, and (because the map entry
+/// is already gone) does not even count against `max_conns_per_node` any more.
+struct ConnRoute {
+    /// Daemon -> client control/data events for this conn.
+    events: mpsc::Sender<ConnEvent>,
+    /// Cancels the owning client task when this route leaves the map. Never
+    /// read: its `Drop` is the signal.
+    _cancel_on_drop: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The live client routes multiplexed over one daemon link, keyed by `conn_id`.
+type ConnRoutes = HashMap<u64, ConnRoute>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientRoute {
@@ -381,7 +437,7 @@ struct DaemonHandle {
     /// Serialized outbound channel to the daemon's WS writer task.
     to_daemon: mpsc::Sender<Message>,
     /// Live client connections multiplexed over this daemon link.
-    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+    conns: Arc<Mutex<ConnRoutes>>,
     /// Per-node usage counters (status surface).
     metrics: Arc<NodeMetrics>,
     /// Per-node client-connect rate limiter (A6).
@@ -770,6 +826,35 @@ where
     let _ = send_setup_control(ws, frame, deadline).await;
 }
 
+/// One write on an ESTABLISHED connection: bounded by that connection's
+/// liveness policy AND cancelled if its route is removed while the write pends.
+///
+/// Both halves are load-bearing. The pump's outer `select!` has an idle timer,
+/// but a `select!` only polls its branches between iterations: while a nested
+/// write is pending the idle timer is DEAD and the pump is blind. And dropping
+/// the event sender cannot interrupt a task already parked in `send`, so route
+/// removal alone would leave the task holding its socket and its
+/// `LiveConnGuard` while no longer counting against `max_conns_per_node` -
+/// letting the same wedge be recreated without bound. A peer that makes zero
+/// write progress for `idle_timeout` is already dead by the connection's own
+/// policy, so timing out here is not a new judgement about slow readers.
+///
+/// Returns false when the conn should be torn down (cancelled, stalled, or the
+/// link failed).
+async fn established_write<F, E>(
+    write: F,
+    idle: Duration,
+    cancelled: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool
+where
+    F: std::future::Future<Output = std::result::Result<(), E>>,
+{
+    tokio::select! {
+        _ = &mut *cancelled => false,
+        result = tokio::time::timeout(idle, write) => matches!(result, Ok(Ok(()))),
+    }
+}
+
 /// [`send_refusal`] for a connection whose socket has already been split: once
 /// the pump owns the halves, the goodbye frame goes out through the write half.
 ///
@@ -799,7 +884,7 @@ async fn deregister(
     inner: &Inner,
     node_id: &str,
     epoch: u64,
-    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    conns: &Mutex<ConnRoutes>,
     reason: &str,
 ) {
     {
@@ -809,10 +894,13 @@ async fn deregister(
         }
     }
     let drained: Vec<_> = conns.lock().await.drain().collect();
-    for (_, tx) in drained {
-        // Non-blocking: a stalled conn must not delay tearing down the rest;
-        // dropping the sender closes its channel regardless.
-        let _ = tx.try_send(ConnEvent::Close(reason.to_string()));
+    for (_, route) in drained {
+        // Non-blocking: a stalled conn must not delay tearing down the rest.
+        // Dropping the route closes its event channel and fires its
+        // cancellation, so each task ends whether or not this notice lands.
+        let _ = route
+            .events
+            .try_send(ConnEvent::Close(reason.to_string(), None));
     }
 }
 
@@ -822,7 +910,7 @@ struct RegistrationSlot {
     inner: Arc<Inner>,
     node_id: String,
     epoch: u64,
-    conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+    conns: Arc<Mutex<ConnRoutes>>,
 }
 
 /// Makes registration failure-atomic across the window where the relay is
@@ -849,7 +937,7 @@ impl RegistrationGuard {
         inner: Arc<Inner>,
         node_id: String,
         epoch: u64,
-        conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+        conns: Arc<Mutex<ConnRoutes>>,
     ) -> Self {
         Self {
             slot: Some(RegistrationSlot {
@@ -1055,8 +1143,7 @@ where
     // node-id <-> pubkey binding + last-writer-wins registration.
     let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
     let (to_daemon, mut from_clients) = mpsc::channel::<Message>(256);
-    let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
     // Owner cancellation for THIS link. A same-key re-registration will fire the
     // superseded link's own `supersede` so it tears down; this link parks on its
     // fresh one in the reader loop below.
@@ -1153,24 +1240,43 @@ where
 
     // Writer task: the single serialization point for everything sent to the
     // daemon (client Opens/Data/Closes + our Pongs).
+    //
+    // Every write is bounded by DAEMON_WRITE_STALL. Unbounded, this task is the
+    // relay's worst wedge: `to_daemon` is a bounded channel, so a daemon that
+    // stops reading parks the writer, fills the channel, and then parks every
+    // other path that sends into it - the shared daemon reader included. When a
+    // write makes no progress for the budget, the link is declared dead and
+    // `link_down` tears it down through the reader's normal deregister path, so
+    // the node-id is released and superseding/reclaim keep working.
+    let link_down = Arc::new(tokio::sync::Notify::new());
+    let writer_down = link_down.clone();
     let writer = tokio::spawn(async move {
         while let Some(msg) = from_clients.recv().await {
-            if sink.send(msg).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(DAEMON_WRITE_STALL, sink.send(msg)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(DAEMON_WRITE_STALL, sink.close()).await;
+        writer_down.notify_one();
     });
 
     // Reader loop: demultiplex daemon -> client. Every delivery clones the
     // conn's sender under the map lock, drops the guard, and hands off
     // non-blocking (see `deliver_conn_event`), so one stalled client can never
     // freeze delivery or teardown for the other conns on this node. The loop also
-    // breaks when this link is superseded by a newer same-key registration, so
-    // the old link is reclaimed rather than accumulating.
+    // breaks when this link is superseded by a newer same-key registration, or
+    // when the writer declared the link dead, so the old link is reclaimed
+    // rather than accumulating. Nothing in this loop may await a send into
+    // `to_daemon`: parking the shared reader on the daemon's own backlog is
+    // what would make one unresponsive peer freeze delivery, teardown, and the
+    // supersede signal for every other conn on the node.
     loop {
         let msg = tokio::select! {
             _ = supersede.notified() => break,
+            _ = link_down.notified() => break,
             m = stream.next() => match m {
                 Some(m) => m,
                 None => break,
@@ -1183,11 +1289,27 @@ where
                 }
                 Ok(Control::Close { conn_id, reason }) => {
                     let removed = conns.lock().await.remove(&conn_id);
-                    if let Some(tx) = removed {
-                        // Best effort: if the buffer is full, dropping `tx`
-                        // (the map held the last sender) closes the channel,
-                        // which tears the conn down just the same.
-                        let _ = tx.try_send(ConnEvent::Close(reason));
+                    if let Some(route) = removed {
+                        // GRACEFUL close: the daemon's final DATA frames may
+                        // still be queued ahead of this on the conn's FIFO, so
+                        // the route's cancellation travels INSIDE the close
+                        // event. It therefore cannot fire until the pump has
+                        // drained everything queued before it - the client gets
+                        // the tail of its response, then the close. Dropping the
+                        // route here instead cancelled the pump mid-queue and
+                        // lost those bytes.
+                        //
+                        // If the queue has no room the event (and the
+                        // cancellation with it) is dropped right here, which is
+                        // exactly the abrupt behaviour: a client that far behind
+                        // is not going to drain a graceful close either.
+                        let ConnRoute {
+                            events,
+                            _cancel_on_drop: cancel,
+                        } = route;
+                        let _ = events.try_send(ConnEvent::Close(reason, Some(cancel)));
+                        // `events` drops here, so once the queue is drained the
+                        // pump sees the channel close and exits regardless.
                     }
                 }
                 // Daemon -> client credit-window frames: route to the conn so the
@@ -1213,7 +1335,11 @@ where
                 }
             }
             Ok(Message::Ping(p)) => {
-                let _ = to_daemon.send(Message::Pong(p)).await;
+                // Non-blocking: this runs on the SHARED reader, so it must never
+                // wait on the daemon's own backlog. A dropped pong on a daemon
+                // that is not draining its socket is immaterial - that link is
+                // already on its way to DAEMON_WRITE_STALL.
+                let _ = to_daemon.try_send(Message::Pong(p));
             }
             Ok(Message::Pong(_)) => {}
             Ok(Message::Close(_)) | Err(_) => break,
@@ -1234,8 +1360,14 @@ where
 /// control keeps a well-behaved client inside it, so a full buffer means a
 /// stalled or misbehaving client: that ONE conn is torn down (map entry
 /// dropped, daemon notified) while every other conn on the node keeps flowing.
+///
+/// NOTHING here may await a send into `to_daemon`. This runs on the shared
+/// reader, and `to_daemon` is bounded: awaiting it would mean one unresponsive
+/// daemon could freeze demultiplexing, teardown and the supersede signal for
+/// every conn on the node while the relay tried to tell it about a single
+/// backpressured client.
 async fn deliver_conn_event(
-    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    conns: &Mutex<ConnRoutes>,
     to_daemon: &mpsc::Sender<Message>,
     conn_id: u64,
     ev: ConnEvent,
@@ -1243,7 +1375,7 @@ async fn deliver_conn_event(
     let tx = {
         let map = conns.lock().await;
         match map.get(&conn_id) {
-            Some(tx) => tx.clone(),
+            Some(route) => route.events.clone(),
             None => return,
         }
     };
@@ -1254,19 +1386,22 @@ async fn deliver_conn_event(
             conns.lock().await.remove(&conn_id);
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Backpressured past its credit-sized buffer: close only this
-            // conn. Removing the entry drops the last sender, so the client
-            // task observes channel closure whenever it unwedges.
+            // Backpressured past its credit-sized buffer: close only this conn.
+            // Removal comes FIRST and is what actually reclaims the route - it
+            // drops the event sender and fires the conn's cancellation, so the
+            // client task is torn down even if it is parked in a peer write.
             conns.lock().await.remove(&conn_id);
-            let _ = to_daemon
-                .send(Message::text(
-                    Control::Close {
-                        conn_id,
-                        reason: "client_backpressured".into(),
-                    }
-                    .to_json(),
-                ))
-                .await;
+            // Telling the daemon is then pure best-effort and NON-BLOCKING: on a
+            // daemon whose channel is full, awaiting this would park the shared
+            // reader on the very peer that caused the backpressure. That link is
+            // already headed for DAEMON_WRITE_STALL.
+            let _ = to_daemon.try_send(Message::text(
+                Control::Close {
+                    conn_id,
+                    reason: "client_backpressured".into(),
+                }
+                .to_json(),
+            ));
         }
     }
 }
@@ -1335,6 +1470,9 @@ where
 
     let conn_id = inner.next_conn.fetch_add(1, Ordering::Relaxed);
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnEvent>(256);
+    // Owner cancellation for THIS conn: the sender lives in the route map, so
+    // whoever removes the route cancels this task - even mid-write.
+    let (cancel_tx, mut cancelled) = tokio::sync::oneshot::channel::<()>();
     {
         let mut cs = conns.lock().await;
         if cs.len() >= inner.max_conns_per_node {
@@ -1342,23 +1480,35 @@ where
             send_refusal(&mut ws, &Control::error("busy", "node at capacity")).await;
             return Ok(());
         }
-        cs.insert(conn_id, conn_tx);
+        cs.insert(
+            conn_id,
+            ConnRoute {
+                events: conn_tx,
+                _cancel_on_drop: cancel_tx,
+            },
+        );
     }
     // Account the live conn for every exit path (drops decrement conns_live).
     let _live = LiveConnGuard::new(metrics.clone());
 
-    // Ask the daemon to open the logical connection.
-    if to_daemon
-        .send(Message::text(
-            Control::Open {
-                conn_id,
-                peer_hint: route.peer_hint().map(str::to_string),
-            }
-            .to_json(),
-        ))
-        .await
-        .is_err()
-    {
+    // Ask the daemon to open the logical connection. Bounded: the client is
+    // still un-admitted and holding a pre-admission permit, so a daemon that has
+    // stopped draining its channel must not be able to pin permits here. On
+    // expiry the client is refused exactly as if the link were gone.
+    if !matches!(
+        tokio::time::timeout(
+            DAEMON_HANDOFF_BUDGET,
+            to_daemon.send(Message::text(
+                Control::Open {
+                    conn_id,
+                    peer_hint: route.peer_hint().map(str::to_string),
+                }
+                .to_json(),
+            )),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         conns.lock().await.remove(&conn_id);
         send_refusal(&mut ws, &Control::error("no_such_node", "daemon gone")).await;
         return Ok(());
@@ -1376,7 +1526,7 @@ where
         while let Some(ev) = conn_rx.recv().await {
             match ev {
                 ConnEvent::Opened => return true,
-                ConnEvent::Close(_) => return false,
+                ConnEvent::Close(..) => return false,
                 // None of these should precede Opened; ignore until paired.
                 ConnEvent::Data(_) | ConnEvent::Window(_) | ConnEvent::Ack(_) => {}
             }
@@ -1387,16 +1537,20 @@ where
     .unwrap_or(false);
 
     if !paired {
+        // Route first, then a bounded best-effort notification: teardown must
+        // never depend on how fast the daemon is draining its channel.
         conns.lock().await.remove(&conn_id);
-        let _ = to_daemon
-            .send(Message::text(
+        let _ = tokio::time::timeout(
+            DAEMON_HANDOFF_BUDGET,
+            to_daemon.send(Message::text(
                 Control::Close {
                     conn_id,
                     reason: "pair_timeout".into(),
                 }
                 .to_json(),
-            ))
-            .await;
+            )),
+        )
+        .await;
         // Same courtesy, same budget: a client that asked for a route, never got
         // one, and is not reading must not park this task either.
         send_refusal_to_sink(
@@ -1416,14 +1570,13 @@ where
     // Routed through `release_conn` rather than `?` so the daemon is told to
     // drop its half; returning early here left the pairing half-open.
     let idle = inner.idle_timeout;
-    if !matches!(
-        tokio::time::timeout(
-            idle,
-            sink.send(Message::text(Control::Opened { conn_id }.to_json())),
-        )
-        .await,
-        Ok(Ok(()))
-    ) {
+    if !established_write(
+        sink.send(Message::text(Control::Opened { conn_id }.to_json())),
+        idle,
+        &mut cancelled,
+    )
+    .await
+    {
         return release_conn(&to_daemon, &conns, conn_id).await;
     }
 
@@ -1441,35 +1594,44 @@ where
     loop {
         let deadline = tokio::time::Instant::now() + idle;
         tokio::select! {
+            // Owner cancellation: whoever removed this route from the map ends
+            // the task, even if the removal raced a write below.
+            _ = &mut cancelled => break,
             _ = tokio::time::sleep_until(deadline) => break,
             ev = conn_rx.recv() => match ev {
                 Some(ConnEvent::Data(payload)) => {
-                    if sink.send(Message::binary(encode_data(conn_id, &payload))).await.is_err() {
+                    if !established_write(
+                        sink.send(Message::binary(encode_data(conn_id, &payload))),
+                        idle,
+                        &mut cancelled,
+                    )
+                    .await
+                    {
                         break;
                     }
                     metrics.frames_relayed.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(ConnEvent::Window(credit)) => {
                     c2d_window.set(credit);
-                    if sink
-                        .send(Message::text(Control::Window { conn_id, credit }.to_json()))
-                        .await
-                        .is_err()
-                    {
+                    if !established_write(
+                        sink.send(Message::text(Control::Window { conn_id, credit }.to_json())),
+                        idle,
+                        &mut cancelled,
+                    ).await {
                         break;
                     }
                 }
                 Some(ConnEvent::Ack(consumed)) => {
                     c2d_window.ack(consumed);
-                    if sink
-                        .send(Message::text(Control::DataAck { conn_id, consumed }.to_json()))
-                        .await
-                        .is_err()
-                    {
+                    if !established_write(
+                        sink.send(Message::text(Control::DataAck { conn_id, consumed }.to_json())),
+                        idle,
+                        &mut cancelled,
+                    ).await {
                         break;
                     }
                 }
-                Some(ConnEvent::Close(reason)) => {
+                Some(ConnEvent::Close(reason, _cancel)) => {
                     // Teardown courtesy: this conn is over either way, so the
                     // goodbye gets the refusal budget, not an open-ended await.
                     send_refusal_to_sink(&mut sink, &Control::Close { conn_id, reason }).await;
@@ -1499,40 +1661,44 @@ where
                         .await;
                         break;
                     }
-                    if to_daemon
-                        .send(Message::binary(encode_data(conn_id, payload)))
-                        .await
-                        .is_err()
-                    {
+                    // Forwarding onto the SHARED daemon link: bounded and
+                    // cancellable like every other established write, so one
+                    // client cannot park here on a daemon that has stopped
+                    // draining its channel.
+                    if !established_write(
+                        to_daemon.send(Message::binary(encode_data(conn_id, payload))),
+                        idle,
+                        &mut cancelled,
+                    ).await {
                         break;
                     }
                     metrics.frames_relayed.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(Ok(Message::Text(t))) => match Control::from_json(&t) {
-                    Ok(Control::Close { .. }) => break,
-                    // Client -> daemon credit-window frames: re-stamp the conn_id
-                    // and forward so the daemon's send window stays in sync.
-                    Ok(Control::Window { credit, .. }) => {
-                        if to_daemon
-                            .send(Message::text(Control::Window { conn_id, credit }.to_json()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                Some(Ok(Message::Text(t))) => {
+                    // Client -> daemon credit-window frames, re-stamped with the
+                    // authoritative conn_id in ONE place so a client cannot
+                    // touch another conn's window on the shared link.
+                    let forward = match Control::from_json(&t) {
+                        Ok(Control::Close { .. }) => break,
+                        Ok(Control::Window { credit, .. }) => {
+                            Some(Control::Window { conn_id, credit })
                         }
-                    }
-                    Ok(Control::DataAck { consumed, .. })
-                        if to_daemon
-                            .send(Message::text(
-                                Control::DataAck { conn_id, consumed }.to_json(),
-                            ))
-                            .await
-                            .is_err() =>
+                        Ok(Control::DataAck { consumed, .. }) => {
+                            Some(Control::DataAck { conn_id, consumed })
+                        }
+                        _ => None,
+                    };
+                    if let Some(frame) = forward
+                        && !established_write(
+                            to_daemon.send(Message::text(frame.to_json())),
+                            idle,
+                            &mut cancelled,
+                        )
+                        .await
                     {
                         break;
                     }
-                    _ => {}
-                },
+                }
                 Some(Ok(Message::Ping(p))) => {
                     // Peer-triggered and NOT credit-controlled: a client can
                     // ping and then stop reading, so unlike the DATA writes
@@ -1540,10 +1706,7 @@ where
                     // rule as the `Opened` write - established-connection
                     // traffic gets the established-connection budget, and
                     // missing it means the peer is gone, so break to teardown.
-                    if tokio::time::timeout(idle, sink.send(Message::Pong(p)))
-                        .await
-                        .is_err()
-                    {
+                    if !established_write(sink.send(Message::Pong(p)), idle, &mut cancelled).await {
                         break;
                     }
                 }
@@ -1567,21 +1730,30 @@ where
 /// reaped lazily only if the daemon happened to send something for that
 /// conn_id. Sharing one teardown is what keeps a half-finished pairing from
 /// lingering on the daemon side.
+///
+/// Route removal comes FIRST and the notification second, bounded. Reclaiming
+/// the route is the part that must always happen; telling the daemon is a
+/// courtesy to a peer that may itself be the reason we are here. Notifying
+/// first meant a client that was already gone kept its relay-side route - and
+/// so one of the node's `max_conns_per_node` slots - for as long as a stalled
+/// daemon took to drain its channel.
 async fn release_conn(
     to_daemon: &mpsc::Sender<Message>,
-    conns: &Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>,
+    conns: &Mutex<ConnRoutes>,
     conn_id: u64,
 ) -> Result<()> {
-    let _ = to_daemon
-        .send(Message::text(
+    conns.lock().await.remove(&conn_id);
+    let _ = tokio::time::timeout(
+        DAEMON_HANDOFF_BUDGET,
+        to_daemon.send(Message::text(
             Control::Close {
                 conn_id,
                 reason: "client_gone".into(),
             }
             .to_json(),
-        ))
-        .await;
-    conns.lock().await.remove(&conn_id);
+        )),
+    )
+    .await;
     Ok(())
 }
 
@@ -1680,21 +1852,41 @@ mod tests {
         assert!(map.contains_key(&IpAddr::from(std::net::Ipv4Addr::from(3u32))));
     }
 
+    /// Build a route with its cancellation handle, so a test can watch the
+    /// cancellation that removing the route from the map is supposed to fire.
+    fn test_route(
+        events: mpsc::Sender<ConnEvent>,
+    ) -> (ConnRoute, tokio::sync::oneshot::Receiver<()>) {
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        (
+            ConnRoute {
+                events,
+                _cancel_on_drop: cancel_tx,
+            },
+            cancel_rx,
+        )
+    }
+
     #[tokio::test]
     async fn backpressured_conn_is_closed_without_stalling_others() {
         // The shared daemon reader must never block on one conn's full
         // buffer, and only the stalled conn may be closed.
-        let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
         let (stalled_tx, mut stalled_rx) = mpsc::channel::<ConnEvent>(1);
         let (healthy_tx, mut healthy_rx) = mpsc::channel::<ConnEvent>(1);
         let (to_daemon, mut daemon_rx) = mpsc::channel::<Message>(8);
+        let (stalled_route, stalled_cancel) = test_route(stalled_tx);
+        let (healthy_route, healthy_cancel) = test_route(healthy_tx);
         {
             let mut map = conns.lock().await;
-            map.insert(1, stalled_tx);
-            map.insert(2, healthy_tx);
+            map.insert(1, stalled_route);
+            map.insert(2, healthy_route);
             // Fill conn 1's buffer so the next delivery hits Full.
-            map.get(&1).unwrap().try_send(ConnEvent::Opened).unwrap();
+            map.get(&1)
+                .unwrap()
+                .events
+                .try_send(ConnEvent::Opened)
+                .unwrap();
         }
 
         deliver_conn_event(&conns, &to_daemon, 1, ConnEvent::Data(vec![1])).await;
@@ -1715,6 +1907,23 @@ mod tests {
         // then None (its last sender was dropped with the map entry).
         assert!(matches!(stalled_rx.recv().await, Some(ConnEvent::Opened)));
         assert!(stalled_rx.recv().await.is_none());
+        // Channel closure only reaches a task that is POLLING it, so removal
+        // must also fire the route's cancellation - that is what reaches a task
+        // parked in a peer write. The healthy route keeps its cancellation
+        // un-fired, so this is removal and not a blanket teardown.
+        let mut stalled_cancel = stalled_cancel;
+        assert!(
+            stalled_cancel.try_recv().is_err(),
+            "the removed route's cancellation must have fired"
+        );
+        let mut healthy_cancel = healthy_cancel;
+        assert!(
+            matches!(
+                healthy_cancel.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a live route must NOT be cancelled"
+        );
         // A delivery to the now-unknown conn id is a silent no-op.
         deliver_conn_event(&conns, &to_daemon, 1, ConnEvent::Opened).await;
         assert!(daemon_rx.try_recv().is_err());
@@ -1924,9 +2133,12 @@ mod registration_tests {
     }
 
     /// The daemon side of a registration under test.
-    struct PeerLink {
-        ws: WebSocketStream<DuplexStream>,
+    pub(super) struct PeerLink {
+        pub(super) ws: WebSocketStream<DuplexStream>,
         kp: Ed25519KeyPair,
+        /// The signing key in PKCS#8, so a test can re-register the SAME node-id
+        /// with the SAME key (the supersede path; a fresh key gets node_taken).
+        pub(super) pkcs8: Vec<u8>,
         node_id: String,
         dead: Arc<AtomicBool>,
     }
@@ -1936,7 +2148,7 @@ mod registration_tests {
         /// the relay finished its FIRST setup write and is now parked reading,
         /// which is what makes the rest deterministic: the relay cannot write
         /// again until it has read the frame the test sends next.
-        async fn challenge(&mut self) -> Vec<u8> {
+        pub(super) async fn challenge(&mut self) -> Vec<u8> {
             match next_control(&mut self.ws).await {
                 Some(Control::Challenge { nonce }) => B64.decode(nonce.as_bytes()).expect("nonce"),
                 other => panic!("expected a challenge, got {other:?}"),
@@ -1945,7 +2157,7 @@ mod registration_tests {
 
         /// Answer a challenge with a valid `Register`, then stop. The peer does
         /// NOT read the confirmation that follows.
-        async fn register(&mut self, nonce: &[u8]) {
+        pub(super) async fn register(&mut self, nonce: &[u8]) {
             let sig = self.kp.sign(nonce).as_ref().to_vec();
             self.send_register(&sig).await;
         }
@@ -1980,7 +2192,7 @@ mod registration_tests {
     /// Start one `handle_daemon` registration over an in-memory link of
     /// `link_buffer` bytes per direction (small buffers let a peer that stops
     /// reading stall the relay's outbound setup writes).
-    async fn start_registration(
+    pub(super) async fn start_registration(
         server: &RelayServer,
         node_id: &str,
         link_buffer: usize,
@@ -1997,6 +2209,18 @@ mod registration_tests {
         link_buffer: usize,
         relay_token: Option<String>,
     ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
+        start_registration_keyed(server, node_id, link_buffer, relay_token, None).await
+    }
+
+    /// As [`start_registration_with`], reusing `pkcs8` when given so a test can
+    /// re-register the same node-id with the same key.
+    pub(super) async fn start_registration_keyed(
+        server: &RelayServer,
+        node_id: &str,
+        link_buffer: usize,
+        relay_token: Option<String>,
+        pkcs8: Option<Vec<u8>>,
+    ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
         let (peer_io, relay_io) = tokio::io::duplex(link_buffer);
         let dead = Arc::new(AtomicBool::new(false));
         let relay_ws = WebSocketStream::from_raw_socket(
@@ -2010,8 +2234,13 @@ mod registration_tests {
         .await;
         let peer_ws = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
 
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keypair");
-        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("keypair");
+        let pkcs8 = pkcs8.unwrap_or_else(|| {
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .expect("keypair")
+                .as_ref()
+                .to_vec()
+        });
+        let kp = Ed25519KeyPair::from_pkcs8(&pkcs8).expect("keypair");
         let pubkey = B64.encode(kp.public_key().as_ref());
 
         let inner = server.inner.clone();
@@ -2029,6 +2258,7 @@ mod registration_tests {
             PeerLink {
                 ws: peer_ws,
                 kp,
+                pkcs8,
                 node_id: node_id.to_string(),
                 dead,
             },
@@ -2301,18 +2531,163 @@ mod paired_client_tests {
     use super::*;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
+    /// Pair a client, hand it a DATA event, and stall its sink. Returns the
+    /// paired `conn_id` and the relay task; the client peer is never read.
+    async fn pair_then_stall(
+        server: &RelayServer,
+        node_id: &str,
+        daemon_rx: &mut mpsc::Receiver<Message>,
+        conns: &Arc<Mutex<ConnRoutes>>,
+        payload: Vec<u8>,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        u64,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        // Big enough for the small `Opened` frame, far too small for the DATA
+        // frame that follows: the pump is entered, then the write stalls.
+        let (peer_io, relay_io) = tokio::io::duplex(96);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+        let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
+        let node = node_id.to_string();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, node, ClientRoute::Wss, permit).await
+        });
+
+        let open = daemon_rx.recv().await.expect("the relay asks for an Open");
+        let conn_id = match Control::from_json(&open.into_text().expect("text frame")) {
+            Ok(Control::Open { conn_id, .. }) => conn_id,
+            other => panic!("expected an Open, got {other:?}"),
+        };
+        let events = conns
+            .lock()
+            .await
+            .get(&conn_id)
+            .map(|route| route.events.clone())
+            .expect("the relay registered the conn");
+        events
+            .send(ConnEvent::Opened)
+            .await
+            .expect("accept the pairing");
+        // Now a DATA frame the stalled client cannot absorb.
+        events
+            .send(ConnEvent::Data(payload))
+            .await
+            .expect("queue daemon data");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        (peer, conn_id, task)
+    }
+
+    /// The gap the `Opened`-only test left: a client that pairs, then stops
+    /// reading once DATA starts flowing. The pump's outer `select!` has an idle
+    /// timer, but a `select!` stops polling its branches while a nested write is
+    /// pending - so the idle policy was DEAD exactly when it was needed, and the
+    /// task kept its socket, its route and its `LiveConnGuard` indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn paired_client_that_stalls_on_data_is_reclaimed() {
+        let idle = Duration::from_secs(2);
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: idle,
+            max_pending_handshakes: 4,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node-data").await;
+
+        let started = tokio::time::Instant::now();
+        let (peer, conn_id, task) = pair_then_stall(
+            &server,
+            "node-data",
+            &mut daemon_rx,
+            &conns,
+            vec![0u8; 4096],
+        )
+        .await;
+
+        let finished = tokio::time::timeout(idle * 8, task).await;
+        assert!(
+            finished.is_ok(),
+            "a paired client stalled mid-DATA must be reaped by the idle policy"
+        );
+        assert!(
+            started.elapsed() < idle * 2,
+            "reclaimed after {:?}, past the {idle:?} liveness budget",
+            started.elapsed()
+        );
+
+        // Resources: the route, the daemon's half, and the live-conn accounting.
+        assert!(
+            !conns.lock().await.contains_key(&conn_id),
+            "the relay-side route must be reclaimed"
+        );
+        let status = server.status().await;
+        let node = status
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-data")
+            .expect("the node is still registered");
+        assert_eq!(
+            node.conns_live, 0,
+            "LiveConnGuard must have released the live-conn count"
+        );
+        drop(peer);
+    }
+
+    /// Route removal must reach a task that is parked in a peer write. Dropping
+    /// the event sender only wakes a task that is polling its receiver; the
+    /// route's cancellation is what reaches one that is not. Without it the task
+    /// lingered to its idle timeout while no longer counting against
+    /// `max_conns_per_node` - so the same wedge could be recreated without bound.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_route_cancels_a_task_parked_in_a_write() {
+        let idle = Duration::from_secs(60);
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: idle,
+            max_pending_handshakes: 4,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node-cancel").await;
+        let (peer, conn_id, task) = pair_then_stall(
+            &server,
+            "node-cancel",
+            &mut daemon_rx,
+            &conns,
+            vec![0u8; 4096],
+        )
+        .await;
+
+        // The task is parked in the DATA write with a long idle budget. Removing
+        // the route must end it now, not in a minute.
+        let removed_at = tokio::time::Instant::now();
+        conns.lock().await.remove(&conn_id);
+        let finished = tokio::time::timeout(idle / 2, task).await;
+        assert!(
+            finished.is_ok(),
+            "removing a route must cancel its task even mid-write"
+        );
+        assert!(
+            removed_at.elapsed() < idle / 2,
+            "cancellation took {:?}; it must not wait out the idle budget",
+            removed_at.elapsed()
+        );
+        drop(peer);
+    }
+
     /// Register a routable node directly, so the test can play the daemon
     /// without standing up a second handshake.
     async fn register_stub_daemon(
         server: &RelayServer,
         node_id: &str,
-    ) -> (
-        mpsc::Receiver<Message>,
-        Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
-    ) {
+    ) -> (mpsc::Receiver<Message>, Arc<Mutex<ConnRoutes>>) {
         let (to_daemon, daemon_rx) = mpsc::channel::<Message>(8);
-        let conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
         server.inner.daemons.lock().await.insert(
             node_id.to_string(),
             DaemonHandle {
@@ -2390,7 +2765,7 @@ mod paired_client_tests {
             .lock()
             .await
             .get(&conn_id)
-            .cloned()
+            .map(|route| route.events.clone())
             .expect("the relay registered the conn");
         conn_tx
             .send(ConnEvent::Opened)
@@ -2525,5 +2900,414 @@ mod refusal_bound_tests {
             "a later peer must be able to enter setup again"
         );
         drop((peer_a, peer_b));
+    }
+}
+
+/// A registered daemon that stops reading must not be able to wedge the relay
+/// (August review, follow-up). `to_daemon` is a bounded channel behind a writer
+/// task, so an unbounded writer let one unresponsive peer park the writer, fill
+/// the channel, and then park every path that sends into it - the SHARED daemon
+/// reader included. That would have cost per-connection isolation, teardown, and
+/// the supersede signal for every other conn on the node.
+#[cfg(test)]
+mod wedged_daemon_tests {
+    use super::registration_tests::{PeerLink, start_registration, start_registration_keyed};
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// Register a daemon over a link too small to drain, then STOP reading it
+    /// and fill its outbound channel to capacity. That is the real wedge: the
+    /// writer is parked on the socket and every further send into the channel
+    /// would block. Returns the peer and the relay task.
+    async fn wedge_a_daemon(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (PeerLink, tokio::task::JoinHandle<Result<()>>) {
+        let (mut peer, task) = start_registration(server, node_id, 96).await;
+        let nonce = peer.challenge().await;
+        peer.register(&nonce).await;
+        match next_control(&mut peer.ws).await {
+            Some(Control::Registered { .. }) => {}
+            other => panic!("the daemon must register before it wedges, got {other:?}"),
+        }
+
+        // Fill the daemon's outbound channel. The writer is stuck on a socket
+        // nobody is draining, so nothing leaves the queue.
+        let to_daemon = server
+            .inner
+            .daemons
+            .lock()
+            .await
+            .get(node_id)
+            .map(|h| h.to_daemon.clone())
+            .expect("the daemon registered");
+        // Repeat: the writer pulls a message off the queue and only parks once
+        // the socket buffer itself is saturated, so a single fill would leave
+        // the slots it drained free. Once it is parked mid-write nothing else
+        // leaves the queue and the channel stays full.
+        for _ in 0..8 {
+            let mut queued = 0;
+            while to_daemon.try_send(Message::text("filler")).is_ok() {
+                queued += 1;
+                assert!(queued < 10_000, "the daemon channel should be bounded");
+            }
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            to_daemon.try_send(Message::text("filler")).is_err(),
+            "the wedge must leave the daemon channel full and its writer parked"
+        );
+        (peer, task)
+    }
+
+    /// Spawn a client against `node_id` over a link of `link_buffer` bytes.
+    pub(super) async fn spawn_client_sized(
+        server: &RelayServer,
+        node_id: &str,
+        link_buffer: usize,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (peer_io, relay_io) = tokio::io::duplex(link_buffer);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+        let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
+        let node = node_id.to_string();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, node, ClientRoute::Wss, permit).await
+        });
+        (peer, task)
+    }
+
+    /// Spawn a client against `node_id` over a link big enough not to be the
+    /// bottleneck; the test cares about the DAEMON side stalling.
+    async fn spawn_client(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (peer_io, relay_io) = tokio::io::duplex(64 * 1024);
+        let relay_ws = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
+        let inner = server.inner.clone();
+        let permit = inner
+            .handshake_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a free handshake permit");
+        let node = node_id.to_string();
+        let task = tokio::spawn(async move {
+            handle_client(inner, relay_ws, node, ClientRoute::Wss, permit).await
+        });
+        (peer, task)
+    }
+
+    /// Paused clock: the wedge budgets elapse in no wall time.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_stops_reading_cannot_wedge_the_relay() {
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: Duration::from_secs(2),
+            max_pending_handshakes: 16,
+            ..RelayConfig::default()
+        });
+
+        // Two wedged daemons: one is superseded below, the other is left alone
+        // so its own writer budget has to reclaim it.
+        let (superseded_peer, superseded_task) = wedge_a_daemon(&server, "wedged-superseded").await;
+        let superseded_key = superseded_peer.pkcs8.clone();
+        let (abandoned_peer, abandoned_task) = wedge_a_daemon(&server, "wedged-abandoned").await;
+
+        // A healthy daemon on ANOTHER node, to prove the wedge does not spread.
+        let (mut healthy, healthy_task) = start_registration(&server, "healthy", 64 * 1024).await;
+        let nonce = healthy.challenge().await;
+        healthy.register(&nonce).await;
+        match next_control(&mut healthy.ws).await {
+            Some(Control::Registered { .. }) => {}
+            other => panic!("the healthy daemon must register, got {other:?}"),
+        }
+
+        // 1. A client asking for a wedged node is REFUSED within the handoff
+        //    budget instead of parking forever on the full channel - and gets
+        //    its pre-admission permit back.
+        let free_before = server.inner.handshake_permits.available_permits();
+        let (mut refused_peer, refused_task) = spawn_client(&server, "wedged-abandoned").await;
+        let asked_at = tokio::time::Instant::now();
+        let refused = tokio::time::timeout(PAIR_TIMEOUT * 4, refused_task).await;
+        assert!(
+            refused.is_ok(),
+            "a client must not park on a wedged daemon's full channel"
+        );
+        // Bounded by the HANDOFF budget specifically: the client never got as
+        // far as waiting to be paired, so this must land well inside
+        // PAIR_TIMEOUT.
+        assert!(
+            asked_at.elapsed() < PAIR_TIMEOUT,
+            "the client waited {:?} - that is the pairing timeout, not the handoff budget",
+            asked_at.elapsed()
+        );
+        match next_control(&mut refused_peer).await {
+            Some(Control::Error { code, .. }) => assert_eq!(code, "no_such_node"),
+            other => panic!("expected the daemon-gone refusal, got {other:?}"),
+        }
+        assert_eq!(
+            server.inner.handshake_permits.available_permits(),
+            free_before,
+            "a client refused by a wedged daemon must return its permit"
+        );
+
+        // 2. SIBLING TRAFFIC: a client on the healthy node still pairs while two
+        //    other nodes are wedged.
+        let (mut sibling_peer, sibling_task) = spawn_client(&server, "healthy").await;
+        let conn_id = loop {
+            match next_control(&mut healthy.ws).await {
+                Some(Control::Open { conn_id, .. }) => break conn_id,
+                Some(_) => {}
+                None => panic!("the healthy daemon never saw the sibling's Open"),
+            }
+        };
+        healthy
+            .ws
+            .send(Message::text(Control::Opened { conn_id }.to_json()))
+            .await
+            .expect("accept the sibling pairing");
+        match next_control(&mut sibling_peer).await {
+            Some(Control::Opened { conn_id: c }) => assert_eq!(c, conn_id),
+            other => panic!(
+                "a client on a healthy node must be served while others are wedged, got {other:?}"
+            ),
+        }
+
+        // 3. SUPERSEDE: the wedged daemon's reader is not parked, so a same-key
+        //    re-registration still reclaims the old link.
+        let (mut replacement, replacement_task) = start_registration_keyed(
+            &server,
+            "wedged-superseded",
+            64 * 1024,
+            None,
+            Some(superseded_key),
+        )
+        .await;
+        let nonce = replacement.challenge().await;
+        replacement.register(&nonce).await;
+        match next_control(&mut replacement.ws).await {
+            Some(Control::Registered { .. }) => {}
+            other => {
+                panic!("a same-key re-registration must supersede a wedged link, got {other:?}")
+            }
+        }
+        assert!(
+            tokio::time::timeout(DAEMON_WRITE_STALL * 2, superseded_task)
+                .await
+                .is_ok(),
+            "the superseded wedged link must be reclaimed, not left parked in its writer"
+        );
+
+        // 4. The abandoned wedge reclaims ITSELF: nobody supersedes it and its
+        //    daemon never speaks again, so only the writer's own stall budget
+        //    can declare the link dead and release the node-id. Unbounded, that
+        //    registration - and its node-id - would be held forever.
+        assert!(
+            tokio::time::timeout(DAEMON_WRITE_STALL * 2, abandoned_task)
+                .await
+                .is_ok(),
+            "a wedged daemon nobody supersedes must be reclaimed by its own write budget"
+        );
+        assert!(
+            !server
+                .inner
+                .daemons
+                .lock()
+                .await
+                .contains_key("wedged-abandoned"),
+            "the wedged node-id must be released back to the registry"
+        );
+
+        drop((sibling_peer, sibling_task, refused_peer));
+        drop((superseded_peer, abandoned_peer, replacement));
+        healthy_task.abort();
+        replacement_task.abort();
+    }
+}
+
+/// A graceful daemon close must not outrun the connection's own last bytes.
+/// The daemon's final DATA frames sit AHEAD of its `Close` on one FIFO, so
+/// retiring the route by dropping it - and firing the route cancellation -
+/// jumped that queue and cut the pump off mid-drain. Any relayed client whose
+/// peer closes right after writing lost the tail of its response.
+#[cfg(test)]
+mod graceful_close_tests {
+    use super::registration_tests::start_registration;
+    use super::wedged_daemon_tests::spawn_client_sized;
+    use super::*;
+
+    /// Read the next real message from a client link, answering pings.
+    async fn next_message(ws: &mut WebSocketStream<tokio::io::DuplexStream>) -> Option<Message> {
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Ping(p)) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(m) => return Some(m),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Register a daemon and pair one client to it. Returns both ends and the
+    /// paired conn_id.
+    async fn pair(
+        server: &RelayServer,
+        node_id: &str,
+        client_buffer: usize,
+    ) -> (
+        super::registration_tests::PeerLink,
+        WebSocketStream<tokio::io::DuplexStream>,
+        u64,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (mut daemon, daemon_task) = start_registration(server, node_id, 64 * 1024).await;
+        let nonce = daemon.challenge().await;
+        daemon.register(&nonce).await;
+        match next_control(&mut daemon.ws).await {
+            Some(Control::Registered { .. }) => {}
+            other => panic!("the daemon must register, got {other:?}"),
+        }
+
+        let (mut client, client_task) = spawn_client_sized(server, node_id, client_buffer).await;
+        let conn_id = loop {
+            match next_control(&mut daemon.ws).await {
+                Some(Control::Open { conn_id, .. }) => break conn_id,
+                Some(_) => {}
+                None => panic!("the daemon never saw the Open"),
+            }
+        };
+        daemon
+            .ws
+            .send(Message::text(Control::Opened { conn_id }.to_json()))
+            .await
+            .expect("accept the pairing");
+        match next_control(&mut client).await {
+            Some(Control::Opened { conn_id: c }) => assert_eq!(c, conn_id),
+            other => panic!("the client never saw Opened: {other:?}"),
+        }
+        (daemon, client, conn_id, daemon_task, client_task)
+    }
+
+    /// The ordering guarantee: bytes written just before a close still arrive,
+    /// and arrive BEFORE the close.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_close_delivers_the_tail_before_the_close() {
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: Duration::from_secs(2),
+            ..RelayConfig::default()
+        });
+        let (mut daemon, mut client, conn_id, daemon_task, client_task) =
+            pair(&server, "node-tail", 64 * 1024).await;
+
+        // The daemon writes its last bytes and closes immediately after, with
+        // no chance for the client to have drained in between.
+        daemon
+            .ws
+            .send(Message::binary(encode_data(conn_id, b"tail-bytes")))
+            .await
+            .expect("send the tail");
+        daemon
+            .ws
+            .send(Message::text(
+                Control::Close {
+                    conn_id,
+                    reason: "done".into(),
+                }
+                .to_json(),
+            ))
+            .await
+            .expect("close the conn");
+
+        match next_message(&mut client).await {
+            Some(Message::Binary(b)) => {
+                let (c, payload) = decode_data(&b).expect("a DATA frame");
+                assert_eq!(c, conn_id);
+                assert_eq!(
+                    payload, b"tail-bytes",
+                    "the tail written before the close must not be lost"
+                );
+            }
+            other => panic!("expected the tail DATA frame first, got {other:?}"),
+        }
+        match next_message(&mut client).await {
+            Some(Message::Text(t)) => assert!(
+                matches!(Control::from_json(&t), Ok(Control::Close { .. })),
+                "expected the close after the tail, got {t}"
+            ),
+            other => panic!("expected a Close after the tail, got {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), client_task)
+                .await
+                .is_ok(),
+            "the client task must retire once the graceful close is drained"
+        );
+        drop((daemon, client));
+        daemon_task.abort();
+    }
+
+    /// The graceful path must not become a new wedge: a client that stops
+    /// reading during the drain is still reclaimed by the idle budget, exactly
+    /// as an abrupt teardown would be.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_close_to_a_non_reading_client_is_still_bounded() {
+        let idle = Duration::from_secs(2);
+        let server = RelayServer::new(RelayConfig {
+            idle_timeout: idle,
+            ..RelayConfig::default()
+        });
+        // A link that fits the small `Opened` frame but not the DATA that
+        // follows; the client never reads again after pairing.
+        let (mut daemon, client, conn_id, daemon_task, client_task) =
+            pair(&server, "node-stuck-tail", 96).await;
+
+        let started = tokio::time::Instant::now();
+        daemon
+            .ws
+            .send(Message::binary(encode_data(conn_id, &[0u8; 4096])))
+            .await
+            .expect("send the tail");
+        daemon
+            .ws
+            .send(Message::text(
+                Control::Close {
+                    conn_id,
+                    reason: "done".into(),
+                }
+                .to_json(),
+            ))
+            .await
+            .expect("close the conn");
+
+        assert!(
+            tokio::time::timeout(idle * 8, client_task).await.is_ok(),
+            "a graceful close must not let a non-reading client park the relay"
+        );
+        assert!(
+            started.elapsed() < idle * 2,
+            "reclaimed after {:?}, past the {idle:?} liveness budget",
+            started.elapsed()
+        );
+        drop((daemon, client));
+        daemon_task.abort();
     }
 }
