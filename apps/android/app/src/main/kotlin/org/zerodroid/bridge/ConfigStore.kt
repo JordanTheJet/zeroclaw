@@ -339,6 +339,7 @@ class ConfigStore(private val ctx: Context) {
         L += "port = $gatewayPort"
         L += "allow_public_bind = false"
         L += "require_pairing = true"
+        L += GeneratedAgentTurnContract.gatewayTimeoutConfigLine()
         if (webDistDir != null) L += "web_dist_dir = ${tomlStr(webDistDir)}"
         L += GeneratedConfigPolicy.gatewayIsolation(
             gatewayPathPrefix,
@@ -353,7 +354,7 @@ class ConfigStore(private val ctx: Context) {
         L += GeneratedConfigPolicy.riskProfile(autonomous)
         L += "[runtime_profiles.coordinator]"
         L += "agentic = true"
-        L += "agentic_timeout_secs = 600"
+        L += GeneratedAgentTurnContract.agenticTimeoutConfigLine()
         L += "max_actions_per_hour = 1000"
         L += ""
         L += "[agents.$agentAlias]"

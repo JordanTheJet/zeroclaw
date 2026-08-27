@@ -41,8 +41,7 @@ object GatewayClient {
 
     private const val TAG = "zerodroid-gateway"
     private const val CONNECT_TIMEOUT_MS = 4_000
-    // Agent turns can be slow (model round-trip); give the read a generous ceiling.
-    private const val READ_TIMEOUT_MS = 120_000
+    private const val CONTROL_READ_TIMEOUT_MS = 120_000
 
     @Volatile private var cachedToken: String? = null
 
@@ -109,7 +108,10 @@ object GatewayClient {
         if (token != null) headers["Authorization"] = "Bearer $token"
         if (!webhookSecret.isNullOrBlank()) headers["X-Webhook-Secret"] = webhookSecret
         val (code, text) = httpPost(
-            base(port, pathPrefix) + "/webhook", body, headers
+            base(port, pathPrefix) + "/webhook",
+            body,
+            headers,
+            readTimeoutMs = GeneratedAgentTurnContract.CLIENT_READ_TIMEOUT_MS,
         )
         if (code == 401 || code == 403) {
             // Stale/absent token — re-pair once, then retry.
@@ -176,12 +178,16 @@ object GatewayClient {
     }
 
     /** POST [body] with [headers]; returns (statusCode, responseText). Connection errors propagate. */
-    private fun httpPost(urlStr: String, body: String, headers: Map<String, String>): Pair<Int, String> {
+    private fun httpPost(
+        urlStr: String,
+        body: String,
+        headers: Map<String, String>,
+        readTimeoutMs: Int = CONTROL_READ_TIMEOUT_MS,
+    ): Pair<Int, String> {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         return try {
             conn.requestMethod = "POST"
-            conn.connectTimeout = CONNECT_TIMEOUT_MS
-            conn.readTimeout = READ_TIMEOUT_MS
+            configureConnectionTimeouts(conn, readTimeoutMs)
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             for ((k, v) in headers) conn.setRequestProperty(k, v)
@@ -193,5 +199,11 @@ object GatewayClient {
         } finally {
             conn.disconnect()
         }
+    }
+
+    /** Apply the shared connect budget and this request class's read budget. */
+    internal fun configureConnectionTimeouts(conn: HttpURLConnection, readTimeoutMs: Int) {
+        conn.connectTimeout = CONNECT_TIMEOUT_MS
+        conn.readTimeout = readTimeoutMs
     }
 }

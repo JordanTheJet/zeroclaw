@@ -152,6 +152,10 @@ Four non-obvious couplings:
    first frame is derived from `RuntimeState.gatewayState` (not a purple placeholder) and follows
    later supervisor transitions. Purple remains only where CellClaw uses it: as the panel/action
    accent.
+5. **Request ownership.** Generated installs give the agent runtime and synchronous `/webhook`
+   route the same 600-second turn budget. The bubble waits 630 seconds, including a 30-second
+   response margin, so it cannot expose a retry while the original request may still be acting on
+   the phone.
 
 Generated installs put every gateway route under a random per-install path because Android shares
 TCP loopback across app UIDs. Pair-code minting additionally requires an app-private admin secret;

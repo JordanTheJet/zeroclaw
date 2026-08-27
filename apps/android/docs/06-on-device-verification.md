@@ -162,7 +162,7 @@ Record provider, model, date, and result locally. Never copy the credential into
 | Minimal agent turn | exact `READY` response |
 | Native tool call | invokes `android_device` and reports an independently verified value |
 | Vision (if supported) | describes a known harmless screenshot accurately |
-| Multi-step turn | completes beyond 30 seconds without `/webhook` 408 |
+| Multi-step turn | completes beyond 120 seconds without a client timeout or duplicate action |
 | 401/403/404/429 error | app displays the provider's real error and targeted hint |
 | Fallback model | primary failure advances to a configured fallback and reports that transition |
 
