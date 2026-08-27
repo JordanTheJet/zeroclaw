@@ -114,7 +114,7 @@ directories = "6.0"
 toml = "1.0"
 
 # JSON Schema generation for config export
-schemars = "1.2"
+schemars = { version = "1.2", optional = true }
 
 # Logging - minimal
 
@@ -199,6 +199,7 @@ non_row_features = [
 dist_extra_features = [
     "channel-matrix",
     "channel-lark",
+    "channel-git",
     "whatsapp-web",
 ]
 
@@ -266,7 +267,7 @@ gateway = [
     "dep:zeroclaw-gateway",
     "dep:axum", "dep:tower",
 ]
-schema-export = ["zeroclaw-config/schema-export"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards to zeroclaw-channels.
