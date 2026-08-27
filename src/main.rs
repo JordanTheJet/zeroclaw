@@ -10982,12 +10982,11 @@ mod tests {
     /// ACTIVE ledger row for a credential that was never published, and a retry
     /// used to add a SECOND active row for the same device rather than
     /// replacing the first.
-    #[test]
-    #[cfg(feature = "agent-runtime")]
     /// The drop-in copies into --out-dir are operator-facing credentials, not
     /// cosmetic output: a failure there must fail the command rather than
     /// report a successful issuance over a missing or stale ca.crt.
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn issue_client_cert_out_dir_drop_in_failure_fails_the_command() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = tempfile::tempdir().expect("out tempdir");
@@ -11022,6 +11021,8 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn issue_client_cert_rename_failure_leaves_an_undelivered_row_that_reconciles_away() {
         use zeroclaw_runtime::security::cert_ledger::{CertLedger, CertStatus, revoked_list_path};
         let dir = tempfile::tempdir().expect("tempdir");
