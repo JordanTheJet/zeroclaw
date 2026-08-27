@@ -16,7 +16,7 @@
 //! This module owns only the comparison and command construction; every
 //! user-facing string stays in the CLI so it routes through Fluent.
 
-use zeroclaw_infra::net_guard::normalize_egress_pattern;
+use zeroclaw_infra::net_guard::{egress_pattern_contains, normalize_egress_pattern};
 
 /// The config path holding an instance's granted allowlist.
 ///
@@ -117,9 +117,13 @@ pub struct EgressDeclarationDiff {
     pub declared: Vec<String>,
     /// Canonical granted destinations (what the entry actually permits).
     pub granted: Vec<String>,
-    /// Declared but not granted — denials waiting to happen.
+    /// Declared destinations **no grant covers** — denials waiting to happen.
+    /// Wildcard-containment aware: a declared host a granted `*.suffix` reaches
+    /// is not listed here, because the runtime would already permit it.
     pub declared_not_granted: Vec<String>,
-    /// Granted but no longer declared — left in place; informational only.
+    /// Granted destinations **the declaration does not cover** — left in place;
+    /// informational only. A grant already covered by the declaration is within
+    /// it, not beyond it, so it is not listed here.
     pub granted_not_declared: Vec<String>,
 }
 
@@ -147,20 +151,43 @@ impl EgressDeclarationDiff {
 
 /// Compare a manifest declaration against an entry's granted allowlist.
 ///
-/// Set comparison on canonical forms: a destination that differs only by
-/// authoring order or duplication is not a difference.
+/// Comparison is by **reachability**, not set membership, so the diagnostic
+/// agrees with what the runtime actually enforces. The runtime resolves a
+/// destination through wildcard containment
+/// ([`net_guard::egress_pattern_contains`][c]) — a granted `*.example.com`
+/// reaches `api.example.com` — so a declared host a grant already covers is not
+/// a gap. Plain set membership would report it as "declared but not granted"
+/// and tell the operator to grant a destination the runtime already permits,
+/// which is exactly the false positive this comparison must not produce.
+///
+/// Both sides use the same predicate, in the covering direction each needs:
+/// - `declared_not_granted`: a declared destination **no grant covers** — the
+///   actionable gap, a denial waiting to happen. This mirrors runtime
+///   reachability exactly.
+/// - `granted_not_declared`: a granted destination **the declaration does not
+///   cover** — informational only. A grant the declaration already covers is
+///   *within* the declaration (an operator who narrowed a declared
+///   `*.example.com` to one subdomain has not granted "beyond" it), so only
+///   genuinely broader or unrelated grants — a wider `*.example.com`, or the
+///   operator's own self-hosted destination — are surfaced.
+///
+/// Canonicalization still collapses order and duplication first, and the
+/// grammar keeps `*.example.com` and its apex `example.com` distinct: a suffix
+/// grant never covers its apex, so a declared apex stays a gap.
+///
+/// [c]: zeroclaw_infra::net_guard::egress_pattern_contains
 #[must_use]
 pub fn diff_declaration(declared: &[String], granted: &[String]) -> EgressDeclarationDiff {
     let declared = canonical_hosts(declared);
     let granted = canonical_hosts(granted);
     let declared_not_granted: Vec<String> = declared
         .iter()
-        .filter(|h| !granted.contains(h))
+        .filter(|d| !granted.iter().any(|g| egress_pattern_contains(g, d)))
         .cloned()
         .collect();
     let granted_not_declared: Vec<String> = granted
         .iter()
-        .filter(|h| !declared.contains(h))
+        .filter(|g| !declared.iter().any(|d| egress_pattern_contains(d, g)))
         .cloned()
         .collect();
     EgressDeclarationDiff {
@@ -326,9 +353,55 @@ mod tests {
     #[test]
     fn suffix_patterns_and_apex_are_distinct_destinations() {
         // The grammar treats `*.example.com` and `example.com` as different
-        // entries; the diff must not collapse them.
+        // entries, and containment never collapses them: a suffix grant does
+        // not cover its apex, and an exact grant does not cover a suffix.
         let diff = diff_declaration(&v(&["*.example.com"]), &v(&["example.com"]));
         assert_eq!(diff.declared_not_granted, v(&["*.example.com"]));
         assert_eq!(diff.granted_not_declared, v(&["example.com"]));
+    }
+
+    #[test]
+    fn a_declared_subdomain_covered_by_a_granted_wildcard_is_not_a_gap() {
+        // IftekharUddin's blocker: the runtime reaches `api.example.com` through
+        // a granted `*.example.com`, so the declaration-versus-grant diagnostic
+        // must NOT report it as an ungranted gap — it must never tell the
+        // operator to grant a destination that is already reachable.
+        let diff = diff_declaration(&v(&["api.example.com"]), &v(&["*.example.com"]));
+        assert!(
+            diff.declared_not_granted.is_empty(),
+            "a declared host a granted wildcard covers is already reachable, not a gap: {diff:?}"
+        );
+        // The broader grant is still surfaced informationally (left in place):
+        // `*.example.com` reaches more than the declared `api.example.com`.
+        assert_eq!(diff.granted_not_declared, v(&["*.example.com"]));
+
+        // Apex is NOT covered by the suffix, so a declared apex stays an
+        // actionable gap even when a `*.` of the same domain is granted.
+        let apex = diff_declaration(&v(&["example.com"]), &v(&["*.example.com"]));
+        assert_eq!(
+            apex.declared_not_granted,
+            v(&["example.com"]),
+            "`*.example.com` never covers its apex `example.com`"
+        );
+    }
+
+    #[test]
+    fn a_grant_within_a_declared_wildcard_is_not_reported_as_beyond_the_declaration() {
+        // The informational side, made symmetric with runtime containment: an
+        // operator who narrowed a declared `*.example.com` to a single
+        // subdomain has granted WITHIN the declaration, not beyond it, so
+        // `api.example.com` is not reported as "granted, no longer declared".
+        // The unmet remainder of the declared wildcard is still the actionable
+        // gap.
+        let diff = diff_declaration(&v(&["*.example.com"]), &v(&["api.example.com"]));
+        assert!(
+            diff.granted_not_declared.is_empty(),
+            "a grant the declaration covers is within it, not beyond it: {diff:?}"
+        );
+        assert_eq!(
+            diff.declared_not_granted,
+            v(&["*.example.com"]),
+            "the rest of the declared wildcard the narrow grant does not cover is still a gap"
+        );
     }
 }
