@@ -3333,9 +3333,32 @@ fn issue_wss_client_cert(
     // exactly these names under its <config-dir>/tls, so a client that copies this
     // directory needs no --tls-* flags at all.
     if has_out_dir {
-        let _ = std::fs::copy(&ca_cert, dest.join("ca.crt"));
-        let _ = std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes());
-        let _ = zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem);
+        // The primary publish above already succeeded; a failure here must
+        // still fail the command loudly - reporting success while the drop-in
+        // directory is missing or stale hands the operator dead credentials.
+        std::fs::copy(&ca_cert, dest.join("ca.crt")).with_context(|| {
+            format!(
+                "copy ca.crt into {}; the primary credentials were issued but this \
+                 drop-in directory is incomplete - fix the directory and re-run with \
+                 --force, or copy the published files by hand",
+                dest.display()
+            )
+        })?;
+        std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes()).with_context(|| {
+            format!(
+                "write client.crt into {}; the primary credentials were issued but \
+                 this drop-in directory is incomplete",
+                dest.display()
+            )
+        })?;
+        zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem)
+            .with_context(|| {
+                format!(
+                    "write client.key into {}; the primary credentials were issued but \
+                     this drop-in directory is incomplete",
+                    dest.display()
+                )
+            })?;
     }
 
     let cert_path_display = cert_path.display().to_string();
@@ -10961,6 +10984,44 @@ mod tests {
     /// replacing the first.
     #[test]
     #[cfg(feature = "agent-runtime")]
+    /// The drop-in copies into --out-dir are operator-facing credentials, not
+    /// cosmetic output: a failure there must fail the command rather than
+    /// report a successful issuance over a missing or stale ca.crt.
+    #[test]
+    fn issue_client_cert_out_dir_drop_in_failure_fails_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Obstruct the drop-in ca.crt with a non-empty directory so the copy
+        // fails after the primary named files were published.
+        let ca_dest = out.path().join("ca.crt");
+        std::fs::create_dir(&ca_dest).expect("obstruct ca.crt");
+        std::fs::write(ca_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_dropin_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an incomplete drop-in directory must fail the command")
+        .to_string();
+        assert!(
+            err.contains("ca.crt") && err.contains("drop-in"),
+            "the error must name the drop-in file and directory: {err}"
+        );
+        assert!(
+            err.contains("issued"),
+            "the error must say the primary credentials were still issued: {err}"
+        );
+    }
+
     fn issue_client_cert_rename_failure_leaves_an_undelivered_row_that_reconciles_away() {
         use zeroclaw_runtime::security::cert_ledger::{CertLedger, CertStatus, revoked_list_path};
         let dir = tempfile::tempdir().expect("tempdir");

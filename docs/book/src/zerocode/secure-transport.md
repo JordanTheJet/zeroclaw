@@ -288,11 +288,12 @@ hint *"give clients this as --relay-node"*; you can also read it from
 `<data_dir>/relay/node_id`. The daemon's stable registration key is created at
 `<data_dir>/relay/registration.key` (`0600`).
 
-Outer-cert trust precedence (highest first): `relay_insecure` > a stored pin at
-`<data_dir>/relay/relay_pin` (explicit or TOFU) > `tofu` > `relay_ca_path` >
-public roots. With `tofu = true` the observed relay leaf fingerprint is pinned to
-`<data_dir>/relay/relay_pin`, and enrollment hands that same pin to clients so
-they pin the identical leaf.
+Outer-cert trust precedence (highest first): `relay_insecure` >
+`relay_ca_path` > a stored pin at `<data_dir>/relay/relay_pin` (explicit or
+TOFU) > `tofu` > public roots. Configuring a CA therefore replaces a stale pin
+without deleting it. With `tofu = true` the observed relay leaf fingerprint is
+pinned to `<data_dir>/relay/relay_pin`, and enrollment hands that same pin to
+clients so they pin the identical leaf.
 
 ### 2c. (optional) node-id rotation and outer mTLS
 
@@ -556,10 +557,12 @@ the sweep until its next such activity; until then the certificate stays out of
 enrollment or renewal traffic - including a connection that fails to
 authenticate - is enough to reconcile it.
 
-Reconciled certificates are revoked, never deleted: they appear in
-`security list-client-certs` history and in `tls/revoked` exactly like an
-operator revocation, with the audit actor `reconcile:undelivered` so the trail
-distinguishes them. If a device reports that a certificate it *did* receive
+Reconciled certificates are revoked, never deleted: the row stays in the
+ledger and the fingerprint lands in `tls/revoked` exactly like an operator
+revocation, with the audit actor `reconcile:undelivered` so the trail
+distinguishes them. `security list-client-certs` shows ACTIVE certificates
+only, so a reconciled certificate disappears from that listing - during
+incident response, read `tls/revoked` or the audit log for revocation history. If a device reports that a certificate it *did* receive
 stopped working, look for that actor - it means the delivery record was lost,
 and the fix is to re-enroll or re-issue.
 
