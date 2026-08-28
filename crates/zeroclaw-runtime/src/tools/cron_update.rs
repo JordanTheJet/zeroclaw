@@ -109,7 +109,7 @@ impl Tool for CronUpdateTool {
                         },
                         "command": {
                             "type": "string",
-                            "description": "New shell command (for shell jobs)"
+                            "description": "New shell command for shell jobs, or agent prompt for agent jobs"
                         },
                         "prompt": {
                             "type": "string",
@@ -627,6 +627,11 @@ mod tests {
                 "patch schema missing field: {field}"
             );
         }
+        assert_eq!(
+            patch_props["command"]["description"].as_str(),
+            Some("New shell command for shell jobs, or agent prompt for agent jobs"),
+            "command description must document the agent-job compatibility mapping"
+        );
 
         // patch.schedule is a oneOf with exactly 3 variants: cron, at, every
         let one_of = schema["properties"]["patch"]["properties"]["schedule"]["oneOf"]
@@ -860,6 +865,56 @@ mod tests {
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             None,
             "empty allowed_tools patch should clear to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_patch_on_agent_job_updates_prompt_without_shell_policy() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Supervised;
+        risk_profile.allowed_commands = vec!["echo".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_agent_job(
+            &cfg,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "curl https://example.com" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.prompt.as_deref(), Some("curl https://example.com"));
+        assert_eq!(
+            updated.command, "",
+            "agent jobs must not persist patch.command on the unused command column"
         );
     }
 

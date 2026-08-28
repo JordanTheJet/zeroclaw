@@ -105,6 +105,9 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test apt install timeout and retry behavior
+        run: bash scripts/ci/apt_install.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
@@ -594,6 +597,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-lark` is outside `default-channels`, so the workspace run above
+      # does not execute Lark's feature-gated library regressions. This step
+      # exercises the URL-verification handler coverage added by PR #9110.
+      - name: Run Lark channel URL-verification tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
@@ -932,6 +943,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
+      - name: Check source-backed SOP syntax reference
+        run: cargo generate sop-syntax --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |
