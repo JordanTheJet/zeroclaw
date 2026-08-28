@@ -239,6 +239,44 @@ const REFUSED_OPENS: u64 = 12;
 /// after the refusals above deliberately drained it.
 const BUCKET_REFILL: Duration = Duration::from_millis(300);
 
+// ── Real-clock windows ───────────────────────────────────────────
+//
+// These tests deliberately run on the real clock: a virtual clock cannot tell a
+// task waiting on real socket readiness from an idle runtime, so auto-advance
+// would race the very I/O being timed. That makes every window below a load
+// sensitivity, so each is sized against MEASURED discrimination rather than a
+// guess, and each states what the failing alternative actually costs.
+
+/// Budget for the sibling dial on a saturated link.
+///
+/// A live reader produces this dial in ~0.4s unloaded: it is frame decoding with
+/// no timer anywhere in the path. A reader PARKED on the outbound queue never
+/// produces it at all - the writer's stall budget closes the queue underneath it
+/// and the reader then leaves through its `link_dead` arm instead of resuming
+/// the backlog. Both mutations of that path were held for 120s without a dial.
+/// So the discriminating gap is unbounded, not a race between two durations, and
+/// this window is sized purely for a contended runner: well over a hundred times
+/// the unloaded cost, and still incapable of admitting the failure mode.
+const SIBLING_DIAL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Budget for a cancelled bridge to return.
+///
+/// A healthy return is a token wake plus a task exit, with no I/O in the path.
+/// The discriminating alternative is a setup that ignores cancellation and runs
+/// to its full 30s `SETUP_DEADLINE` before the reconnect loop notices, so this
+/// stays clearly under that while giving a loaded runner the room it needs.
+const CANCEL_RETURN_WINDOW: Duration = Duration::from_secs(15);
+
+/// Budget for a stub-relay milestone (a connection accepted, a phase parked, a
+/// registration completed). The discriminating alternative is a milestone that
+/// never arrives, so this only has to outlast scheduling on a loaded runner.
+const MILESTONE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Budget for a link to tear down once its route is closed. Healthy teardown is
+/// immediate; the alternative this rules out is a teardown held until the
+/// writer's 60s stall budget expires, so it stays clearly under that.
+const TEARDOWN_WINDOW: Duration = Duration::from_secs(30);
+
 /// Drive the reviewed cascade: register, stop reading, then saturate BOTH the
 /// shared outbound queue and one conn's inbound queue before asking the bridge
 /// to open a sibling route. If any notification on the shared reader path awaits
@@ -285,6 +323,12 @@ where
 
     // Now fill the wedged conn's inbound queue, so delivery hits the
     // backpressure path that tears the route down and notifies the relay.
+    // Payloads have to be large enough to back up the wedged conn's LOCAL
+    // socket, not merely to fill its 256-slot queue: until that local write
+    // parks, its task keeps draining the queue and it never fills. Shrinking
+    // these to a token size makes the whole probe vacuous - the conn is never
+    // evicted, so it keeps holding the only conn slot and the sibling `Open`
+    // below is refused `busy` instead of dialing.
     let data_payload = vec![0u8; 4096];
     for _ in 0..SATURATING_DATA {
         let frame = Message::binary(encode_data(WEDGED_CONN, &data_payload));
@@ -299,6 +343,10 @@ where
 
     // The probe: a sibling route the shared reader can only open if it is still
     // running. It targets the enrollment listener, which reports the dial.
+    //
+    // This also depends on the backpressure eviction above having freed the
+    // single conn slot, so the dial proves two things at once: the reader kept
+    // running, and the conn that saturated it was actually torn down.
     let open_sibling = Control::Open {
         conn_id: SIBLING_CONN,
         peer_hint: Some(PEER_HINT_ENROLL.to_string()),
@@ -453,7 +501,9 @@ async fn wait_for(
 async fn wait_for_wedge(written: &AtomicU64) {
     let mut previous = 0;
     let mut stalled = 0;
-    for _ in 0..200 {
+    // Sized like the windows above: the alternative to a stall is a flood that
+    // never stalls, so only a loaded runner's slowness is being tolerated here.
+    for _ in 0..600 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let now = written.load(Ordering::Relaxed);
         if now == previous && now >= WEDGE_FLOOR {
@@ -489,18 +539,8 @@ async fn assert_setup_is_bounded_and_retries(behavior: RelayBehavior) {
         bridge_config(relay.addr, dir.path(), signing_key),
         cancel.clone(),
     ));
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Accepted,
-        Duration::from_secs(10),
-    )
-    .await;
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Parked,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Accepted, MILESTONE_WINDOW).await;
+    wait_for(&mut relay.events, RelayEvent::Parked, MILESTONE_WINDOW).await;
 
     // The parked setup holds nothing but its own deadline now, so the budget is
     // spent by advancing the clock rather than by waiting on it. The clock is
@@ -514,15 +554,10 @@ async fn assert_setup_is_bounded_and_retries(behavior: RelayBehavior) {
 
     tokio::time::advance(SETUP_DEADLINE).await;
     tokio::time::resume();
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Accepted,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Accepted, MILESTONE_WINDOW).await;
 
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), bridge).await;
+    let _ = tokio::time::timeout(TEARDOWN_WINDOW, bridge).await;
 }
 
 #[tokio::test]
@@ -562,15 +597,10 @@ async fn assert_cancellation_during_setup_returns_promptly(behavior: RelayBehavi
         bridge_config(relay.addr, dir.path(), signing_key),
         cancel.clone(),
     ));
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Parked,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Parked, MILESTONE_WINDOW).await;
 
     cancel.cancel();
-    tokio::time::timeout(Duration::from_secs(2), bridge)
+    tokio::time::timeout(CANCEL_RETURN_WINDOW, bridge)
         .await
         .expect("cancellation must return from a parked setup without waiting for the peer")
         .expect("bridge task")
@@ -629,17 +659,12 @@ async fn a_saturated_link_still_serves_sibling_routes_and_stays_tearable() {
         ),
         cancel.clone(),
     ));
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Registered,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Registered, MILESTONE_WINDOW).await;
 
     // The sibling `Open` is the last frame the stub sends, after both queues are
     // full. Real clock: the bridge's stall budgets are minutes away, so nothing
     // but a live reader can produce this dial inside the window.
-    tokio::time::timeout(Duration::from_secs(20), sibling_dials.recv())
+    tokio::time::timeout(SIBLING_DIAL_WINDOW, sibling_dials.recv())
         .await
         .expect("a saturated link must still serve sibling routes")
         .expect("sibling listener");
@@ -647,7 +672,7 @@ async fn a_saturated_link_still_serves_sibling_routes_and_stays_tearable() {
     // ... and the node must still be tearable, not held until a write budget
     // expires.
     cancel.cancel();
-    tokio::time::timeout(Duration::from_secs(5), bridge)
+    tokio::time::timeout(TEARDOWN_WINDOW, bridge)
         .await
         .expect("teardown must not wait on the saturated outbound queue")
         .expect("bridge task")
@@ -671,12 +696,7 @@ async fn an_established_relay_that_stops_reading_is_declared_dead_and_reconnecte
         bridge_config(relay.addr, dir.path(), signing_key),
         cancel.clone(),
     ));
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Registered,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Registered, MILESTONE_WINDOW).await;
     wait_for_wedge(&relay.written).await;
 
     // The wedge holds nothing but timers now, so the minute-scale budget is
@@ -692,13 +712,8 @@ async fn an_established_relay_that_stops_reading_is_declared_dead_and_reconnecte
 
     tokio::time::advance(DEAD_AFTER * 3).await;
     tokio::time::resume();
-    wait_for(
-        &mut relay.events,
-        RelayEvent::Accepted,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for(&mut relay.events, RelayEvent::Accepted, MILESTONE_WINDOW).await;
 
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), bridge).await;
+    let _ = tokio::time::timeout(TEARDOWN_WINDOW, bridge).await;
 }
