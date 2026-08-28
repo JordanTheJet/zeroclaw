@@ -60,6 +60,14 @@ const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
 
+/// Returns whether an application-level confirmation modal owns an input event.
+///
+/// Confirmation dialogs sit above every pane and intentionally consume paste
+/// events so text or file paths cannot mutate a hidden composer.
+fn confirmation_modal_owns_event(event: &Event, reload_confirm: bool, quit_confirm: bool) -> bool {
+    matches!(event, Event::Paste(_)) && (reload_confirm || quit_confirm)
+}
+
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
         Event::Mouse(mouse) => match mouse.kind {
@@ -806,6 +814,12 @@ pub async fn run(
             }
         })?;
         pending_event = next_pending;
+
+        if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
+            // The visible confirmation modal is the authoritative input
+            // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
 
         match input_event {
             Event::Key(key) => {
@@ -2078,6 +2092,36 @@ mod tests {
         assert_eq!(current, first);
         assert_eq!(pending, None);
         assert!(!read_ahead);
+    }
+
+    #[test]
+    fn confirmation_modals_consume_text_and_path_paste_before_pane_dispatch() {
+        let paste_payloads = ["hidden composer text", "/tmp/hidden-attachment.txt"];
+        let modal_states = [(true, false), (false, true), (true, true)];
+
+        for (reload_confirm, quit_confirm) in modal_states {
+            for payload in paste_payloads {
+                // Both plain text and path-shaped paste must stop at the
+                // application modal boundary before any pane sees the value.
+                let event = Event::Paste(payload.to_owned());
+                assert!(confirmation_modal_owns_event(
+                    &event,
+                    reload_confirm,
+                    quit_confirm
+                ));
+            }
+        }
+
+        assert!(!confirmation_modal_owns_event(
+            &Event::Paste("visible composer text".to_owned()),
+            false,
+            false
+        ));
+        assert!(!confirmation_modal_owns_event(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            true,
+            false
+        ));
     }
 
     #[test]

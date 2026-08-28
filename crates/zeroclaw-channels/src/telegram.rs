@@ -5927,21 +5927,47 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_bytes_builds_correct_form() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Keep this unit test hermetic: a fake token against the official API
+        // can wait indefinitely when CI networking degrades.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendPhoto$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let mention_only = false;
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
             mention_only,
-        );
+        )
+        .with_api_base(mock_server.uri());
         // Minimal valid PNG header bytes
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
-        let result = ch
-            .send_photo_bytes("123456", None, file_bytes, "test.png", None)
-            .await;
+        ch.send_photo_bytes("123456", None, file_bytes.clone(), "test.png", None)
+            .await
+            .expect("mock Telegram API should accept photo upload");
 
-        assert!(result.is_err());
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = &requests[0].body;
+        let form = String::from_utf8_lossy(body);
+        assert!(form.contains("name=\"chat_id\""));
+        assert!(form.contains("123456"));
+        assert!(form.contains("name=\"photo\""));
+        assert!(form.contains("filename=\"test.png\""));
+        assert!(
+            body.windows(file_bytes.len())
+                .any(|window| window == file_bytes),
+            "multipart body must contain the original photo bytes"
+        );
     }
 
     #[tokio::test]
