@@ -26,7 +26,6 @@ ignore = [
     # panic-on-drop prerequisite described by this advisory. Remove this entry
     # when the nostr-sdk 0.45 migration tracked in #9602 lands. The Security
     # job enforces the exact residual lockfile path before running cargo-deny.
-    { id = "RUSTSEC-2026-0253", reason = "lru 0.16 remains transitive through nostr-sdk 0.44; affected caches use EventId keys and unit values; nostr-sdk 0.45 migration tracked in #9602" },
 ]
 
 [licenses]
@@ -58,7 +57,6 @@ unused-allowed-license = "allow"
 multiple-versions = "deny"
 wildcards = "deny"
 deny = [
-    { crate = "lru:<0.18.2", wrappers = ["nostr-database", "nostr-relay-pool"], reason = "RUSTSEC-2026-0253; temporary Nostr cache exception tracked in #9602" },
 ]
 
 # Pre-existing duplicate-version crates as of 2026-07-01.
