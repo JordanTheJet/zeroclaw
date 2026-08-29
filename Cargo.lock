@@ -13737,7 +13737,6 @@ dependencies = [
  "tokio-executor-trait",
  "tokio-reactor-trait",
  "tokio-rustls",
- "tokio-socks",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
@@ -14336,7 +14335,6 @@ name = "zerocode"
 version = "0.8.4"
 dependencies = [
  "anyhow",
- "async-trait",
  "chrono",
  "clap",
  "crossterm",
