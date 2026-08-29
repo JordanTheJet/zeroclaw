@@ -227,8 +227,17 @@ const SIBLING_CONN: u64 = 2;
 /// whose socket this relay has stopped draining. Each one costs the bridge a
 /// pong through that queue, so this is many times over what saturation needs.
 const SATURATING_PINGS: usize = 3_000;
-/// DATA frames pushed at `WEDGED_CONN` to fill its own 256-slot inbound queue.
-const SATURATING_DATA: usize = 400;
+/// Ceiling on DATA bytes flooded at `WEDGED_CONN` while waiting for its
+/// eviction. The flood is synchronized on the observable outcome - the
+/// `conn_backpressured` Close from the daemon - not on a byte count: kernel
+/// socket buffering is platform-tuned (Linux auto-grows loopback buffers to
+/// megabytes where macOS parks in kilobytes), so any fixed count either
+/// under-fills one platform or wastes time on another. The cap only bounds a
+/// broken run, far above any plausible kernel buffering, and hitting it
+/// panics loudly instead of letting the probe go vacuous.
+const FLOOD_CAP_BYTES: usize = 64 * 1024 * 1024;
+/// DATA frames sent between eviction checks while flooding `WEDGED_CONN`.
+const FLOOD_BATCH: usize = 64;
 /// How many `Open` frames are pushed purely to be refused while the outbound
 /// queue is full. `max_conns` is 1 and `WEDGED_CONN` holds the only slot, so the
 /// first few are refused `busy`; sent back to back they then outrun the
@@ -321,19 +330,54 @@ where
         }
     }
 
-    // Now fill the wedged conn's inbound queue, so delivery hits the
-    // backpressure path that tears the route down and notifies the relay.
-    // Payloads have to be large enough to back up the wedged conn's LOCAL
-    // socket, not merely to fill its 256-slot queue: until that local write
-    // parks, its task keeps draining the queue and it never fills. Shrinking
-    // these to a token size makes the whole probe vacuous - the conn is never
-    // evicted, so it keeps holding the only conn slot and the sibling `Open`
-    // below is refused `busy` instead of dialing.
+    // Flood the wedged conn until the daemon OBSERVABLY evicts it: the
+    // backpressure path tears the route down and notifies this relay with a
+    // `conn_backpressured` Close. Synchronizing on that outcome - rather than
+    // any fixed frame count - is what makes the probe sound on every platform:
+    // the eviction requires the conn's local write to park, and how many bytes
+    // that takes is a kernel-tuning question (Linux absorbs megabytes on
+    // loopback where macOS parks in kilobytes). The outbound queue is not
+    // saturated at this point (the reader's notifications are best-effort by
+    // design), so the eviction Close is deliverable and the wait terminates.
     let data_payload = vec![0u8; 4096];
-    for _ in 0..SATURATING_DATA {
-        let frame = Message::binary(encode_data(WEDGED_CONN, &data_payload));
-        if ws.send(frame).await.is_err() {
-            return;
+    let mut flooded = 0usize;
+    let mut evicted = false;
+    'flood: while !evicted {
+        for _ in 0..FLOOD_BATCH {
+            let frame = Message::binary(encode_data(WEDGED_CONN, &data_payload));
+            if ws.send(frame).await.is_err() {
+                return;
+            }
+            flooded += data_payload.len();
+        }
+        assert!(
+            flooded <= FLOOD_CAP_BYTES,
+            "the wedged conn was never evicted after {flooded} flooded bytes; \
+             the backpressure premise did not hold on this platform"
+        );
+        // Drain EVERYTHING the daemon has sent - the ping phase left a queue
+        // of pong frames backed up behind the parked writer, and the eviction
+        // Close can only be enqueued once those drain. A drain that stops at
+        // the first non-Text frame throttles that to one pong per batch and
+        // the Close never fits (the first draft did exactly that, and the cap
+        // fired at precisely 256 batches). Only the wedged conn's
+        // backpressure Close ends the flood; all other traffic (pongs, Window
+        // credits, Opened, the earlier refusals) is expected noise.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    if let Ok(Control::Close { conn_id, reason }) = Control::from_json(t.as_str())
+                        && conn_id == WEDGED_CONN
+                        && reason == "conn_backpressured"
+                    {
+                        evicted = true;
+                        continue 'flood;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(_) => break,
+                Err(_) => break,
+            }
         }
     }
 
@@ -341,17 +385,38 @@ where
     // it deliberately, and a rate-limited probe would prove nothing.
     tokio::time::sleep(BUCKET_REFILL).await;
 
-    // The probe: a sibling route the shared reader can only open if it is still
-    // running. It targets the enrollment listener, which reports the dial.
-    //
-    // This also depends on the backpressure eviction above having freed the
-    // single conn slot, so the dial proves two things at once: the reader kept
-    // running, and the conn that saturated it was actually torn down.
+    // Re-apply outbound pressure for the probe, and this time do NOT drain:
+    // each ping costs the daemon a best-effort pong through the outbound
+    // queue behind a writer whose socket this relay has stopped reading. On
+    // platforms with small socket buffers this fills the queue outright;
+    // where the kernel absorbs more it is adversarial volume. This probe pins
+    // reader LIVENESS under that pressure plus a real eviction - it does not
+    // guarantee a full queue at the probe instant, because parking the writer
+    // is a kernel-tuning question no fixed count answers on every platform.
+    // The no-await-on-the-reader property itself is structural (every
+    // notification goes through the try_send-only `notify_relay`), and its
+    // per-site mutations were proven under small-buffer conditions where the
+    // queue genuinely fills.
+    for _ in 0..SATURATING_PINGS {
+        if ws.send(Message::Ping(vec![0u8; 125].into())).await.is_err() {
+            return;
+        }
+    }
+
+    // The probe: a sibling route the shared reader can only open if it is
+    // still running with the outbound queue full. It targets the enrollment
+    // listener, which reports the dial OUT-OF-BAND - the observation cannot
+    // depend on the saturated outbound path. The eviction above has provably
+    // freed the single conn slot, so a refused `busy` here would be a real
+    // reader defect, not setup noise - and the send itself must succeed for
+    // the probe to mean anything.
     let open_sibling = Control::Open {
         conn_id: SIBLING_CONN,
         peer_hint: Some(PEER_HINT_ENROLL.to_string()),
     };
-    let _ = ws.send(Message::text(open_sibling.to_json())).await;
+    ws.send(Message::text(open_sibling.to_json()))
+        .await
+        .expect("the sibling Open probe must reach the daemon");
     park(ws).await;
 }
 
