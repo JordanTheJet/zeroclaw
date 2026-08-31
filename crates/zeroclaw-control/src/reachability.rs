@@ -46,6 +46,27 @@
 //! without widening the actual separation would be the exact escalation the
 //! design forbids.
 //!
+//! ## Questions are reach-path foreclosures, not mechanisms
+//!
+//! The two separations named above are different mechanisms that close the
+//! same reach paths, so each [`IsolationQuestion`] is worded as the
+//! foreclosure it demands, and each deployment shape discharges it with the
+//! mechanism that shape actually has:
+//!
+//! - **Shape A — local daemon, distinct OS account**
+//!   ([`Evidence::from_local_daemon_proofs`]): kernel identity and DAC facts
+//!   (peer credentials, capability sets, TTY/socket ownership and modes).
+//! - **Shape B — host-spawned, sandbox-constructed requester**
+//!   ([`Evidence::from_ceremony_spawn`]): construction records of the spawn
+//!   the host itself performed (fd table at exec, session detachment,
+//!   pre-exec sandbox policy).
+//!
+//! A mechanism a shape does not have answers `None`, never a vacuous
+//! `Some(true)`: shape B cannot claim a distinct account, so it must instead
+//! prove the same authority was stripped by construction, and where its
+//! platform cannot prove enforcement (Darwin today) the answer stays `None`
+//! and the operator stays ineligible.
+//!
 //! ## Not modelled here
 //!
 //! The design lists egress, plugins, delegated credentials, integrations, and
@@ -109,16 +130,41 @@ impl std::fmt::Display for Reachability {
 ///
 /// Named so a refusal can say *which* proof was missing without inventing a
 /// string at the call site.
+///
+/// Each question names a **reach-path foreclosure**, not a mechanism: it asks
+/// whether a family of ways to reach the operator backchannel is provably
+/// closed, and different deployment shapes may close the same family with
+/// different mechanisms. Shape A (a local daemon serving a requester under a
+/// distinct OS account — [`Evidence::from_local_daemon_proofs`]) discharges
+/// them from kernel identity and DAC facts. Shape B (a requester the host
+/// itself spawned into a constructed, sandboxed environment) discharges them
+/// from construction records of that spawn. What never changes across shapes:
+/// the facts are raw, the verdict is computed in this module, and an
+/// undischarged question is a refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IsolationQuestion {
-    /// Does the requester provably run under an OS account distinct from the
-    /// one owning the operator's controlling terminal?
-    DistinctOsAccount,
-    /// Does an enforced sandbox provably exclude the operator backchannel — the
-    /// controlling terminal and the control socket — from the requester?
-    SandboxExcludesBackchannel,
+    /// Is the requester provably unable to wield the operator account's
+    /// ambient OS authority? Same-account processes normally inherit the
+    /// full authority of the account that owns the operator's terminal —
+    /// discharge requires either a genuinely distinct, unprivileged identity
+    /// (distinct uid + no overriding capabilities: shape A) or a
+    /// host-constructed environment that provably strips that authority
+    /// before the requester ever runs (no-new-privs, emptied capability
+    /// sets: shape B).
+    OperatorAmbientAuthority,
+    /// Are the backchannel objects — the operator's controlling terminal and
+    /// the control socket — provably out of the requester's reach? Discharge
+    /// requires either DAC facts excluding the requester's identity from
+    /// every object and its enclosing path (shape A's backchannel crux) or a
+    /// pre-exec sandbox policy whose recorded rules deny the requester those
+    /// objects, pty allocation included (shape B).
+    BackchannelObjectReach,
     /// Does the requester provably run outside the host process, so it cannot
     /// execute code in the process that performs the presence ceremony?
+    /// Being a separate process is necessary but not sufficient: the
+    /// process-inspection family (ptrace and its relatives) must also be
+    /// foreclosed, by identity boundary (shape A) or by recorded syscall
+    /// policy (shape B).
     OutsideHostProcess,
     /// Does the requester provably hold no shell or filesystem grant that would
     /// let it read the backchannel or the control socket?
@@ -133,8 +179,8 @@ impl IsolationQuestion {
     /// That direction is deliberate: a new way to reach an operator must
     /// default to "reachable", never be silently ignored.
     pub const ALL: &'static [Self] = &[
-        Self::DistinctOsAccount,
-        Self::SandboxExcludesBackchannel,
+        Self::OperatorAmbientAuthority,
+        Self::BackchannelObjectReach,
         Self::OutsideHostProcess,
         Self::NoShellOrFilesystemGrant,
     ];
@@ -143,8 +189,8 @@ impl IsolationQuestion {
     #[must_use]
     pub const fn wire(self) -> &'static str {
         match self {
-            Self::DistinctOsAccount => "distinct_os_account",
-            Self::SandboxExcludesBackchannel => "sandbox_excludes_backchannel",
+            Self::OperatorAmbientAuthority => "operator_ambient_authority",
+            Self::BackchannelObjectReach => "backchannel_object_reach",
             Self::OutsideHostProcess => "outside_host_process",
             Self::NoShellOrFilesystemGrant => "no_shell_or_filesystem_grant",
         }
@@ -176,10 +222,10 @@ impl std::fmt::Display for IsolationQuestion {
 /// and whose only direct constructor is test-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Evidence {
-    /// See [`IsolationQuestion::DistinctOsAccount`].
-    distinct_os_account: Option<bool>,
-    /// See [`IsolationQuestion::SandboxExcludesBackchannel`].
-    sandbox_excludes_backchannel: Option<bool>,
+    /// See [`IsolationQuestion::OperatorAmbientAuthority`].
+    operator_ambient_authority: Option<bool>,
+    /// See [`IsolationQuestion::BackchannelObjectReach`].
+    backchannel_object_reach: Option<bool>,
     /// See [`IsolationQuestion::OutsideHostProcess`].
     outside_host_process: Option<bool>,
     /// See [`IsolationQuestion::NoShellOrFilesystemGrant`].
@@ -194,8 +240,8 @@ impl Evidence {
     #[must_use]
     pub const fn unknown() -> Self {
         Self {
-            distinct_os_account: None,
-            sandbox_excludes_backchannel: None,
+            operator_ambient_authority: None,
+            backchannel_object_reach: None,
             outside_host_process: None,
             no_shell_or_filesystem_grant: None,
         }
@@ -214,7 +260,7 @@ impl Evidence {
     /// Each of the four questions is answered **only** from a genuine proof in
     /// `proofs`, and `None` — fail-closed — otherwise. See
     /// [`LocalDaemonProofs`] for the per-question logic and, in particular, the
-    /// soundness argument for the [`IsolationQuestion::SandboxExcludesBackchannel`]
+    /// soundness argument for the [`IsolationQuestion::BackchannelObjectReach`]
     /// crux.
     ///
     /// This lane builds the pure logic only. It does not obtain peer
@@ -225,10 +271,38 @@ impl Evidence {
     #[must_use]
     pub fn from_local_daemon_proofs(proofs: &LocalDaemonProofs) -> Self {
         Self {
-            distinct_os_account: proofs.distinct_os_account(),
-            sandbox_excludes_backchannel: proofs.sandbox_excludes_backchannel(),
+            operator_ambient_authority: proofs.operator_ambient_authority(),
+            backchannel_object_reach: proofs.backchannel_object_reach(),
             outside_host_process: proofs.outside_host_process(),
             no_shell_or_filesystem_grant: proofs.no_shell_or_filesystem_grant(),
+        }
+    }
+
+    /// Build evidence from the construction records of a spawn the host
+    /// itself performed — shape B, the same-account counterpart of
+    /// [`Self::from_local_daemon_proofs`].
+    ///
+    /// Everything the shape-A constructor's documentation says about safety
+    /// applies here with one aggravation: the spawned requester runs under
+    /// the operator's own uid, so there is no kernel identity boundary
+    /// behind these records — the discharge rests entirely on the recorded
+    /// sandbox policy. See [`crate::spawn::SpawnIsolation`] for the
+    /// per-question conjunctions, the platform gate (`Some(true)` only on
+    /// Linux; Darwin answers `None` until a Seatbelt-soundness proof
+    /// exists), and the ledger of what is deliberately not yet proven.
+    ///
+    /// This lane builds the pure logic only: no production spawner exists,
+    /// nothing constructs [`crate::spawn::SpawnIsolation`] in a shipped
+    /// build, and production still passes [`Self::unknown`] at the approve
+    /// site. The onboarding-ceremony spawner is a later lane and will be the
+    /// only production constructor of these records.
+    #[must_use]
+    pub fn from_ceremony_spawn(records: &crate::spawn::SpawnIsolation) -> Self {
+        Self {
+            operator_ambient_authority: records.operator_ambient_authority(),
+            backchannel_object_reach: records.backchannel_object_reach(),
+            outside_host_process: records.outside_host_process(),
+            no_shell_or_filesystem_grant: records.no_shell_or_filesystem_grant(),
         }
     }
 
@@ -247,8 +321,8 @@ impl Evidence {
     #[must_use]
     pub(crate) const fn fully_isolated() -> Self {
         Self {
-            distinct_os_account: Some(true),
-            sandbox_excludes_backchannel: Some(true),
+            operator_ambient_authority: Some(true),
+            backchannel_object_reach: Some(true),
             outside_host_process: Some(true),
             no_shell_or_filesystem_grant: Some(true),
         }
@@ -271,8 +345,8 @@ impl Evidence {
     #[must_use]
     pub const fn fixture_isolated() -> Self {
         Self {
-            distinct_os_account: Some(true),
-            sandbox_excludes_backchannel: Some(true),
+            operator_ambient_authority: Some(true),
+            backchannel_object_reach: Some(true),
             outside_host_process: Some(true),
             no_shell_or_filesystem_grant: Some(true),
         }
@@ -282,8 +356,8 @@ impl Evidence {
     #[must_use]
     pub const fn answer(&self, question: IsolationQuestion) -> Option<bool> {
         match question {
-            IsolationQuestion::DistinctOsAccount => self.distinct_os_account,
-            IsolationQuestion::SandboxExcludesBackchannel => self.sandbox_excludes_backchannel,
+            IsolationQuestion::OperatorAmbientAuthority => self.operator_ambient_authority,
+            IsolationQuestion::BackchannelObjectReach => self.backchannel_object_reach,
             IsolationQuestion::OutsideHostProcess => self.outside_host_process,
             IsolationQuestion::NoShellOrFilesystemGrant => self.no_shell_or_filesystem_grant,
         }
@@ -297,7 +371,7 @@ impl Evidence {
 /// The uid the OS reserves for the superuser.
 ///
 /// Named rather than written as a bare `0` because it is load-bearing in the
-/// [`IsolationQuestion::SandboxExcludesBackchannel`] crux: a *distinct* uid is
+/// [`IsolationQuestion::BackchannelObjectReach`] crux: a *distinct* uid is
 /// not enough on its own, because uid `0` is distinct from every ordinary uid
 /// yet bypasses the DAC and ptrace checks the crux relies on. A requester
 /// running as root is treated as able to reach any backchannel.
@@ -367,7 +441,7 @@ impl InspectedGrant {
     /// read+proposal grant qualifies. An empty grant trivially qualifies: it
     /// confers no domain at all, so it confers no dangerous one.
     #[must_use]
-    fn confers_no_shell_or_filesystem_domain(&self) -> bool {
+    pub(crate) fn confers_no_shell_or_filesystem_domain(&self) -> bool {
         self.read_domains
             .iter()
             .all(|domain| READ_DOMAINS_V1.contains(&domain.as_str()))
@@ -381,7 +455,7 @@ impl InspectedGrant {
 /// The OS family a set of backchannel facts was gathered on.
 ///
 /// The sandbox-exclusion argument in
-/// [`LocalDaemonProofs::sandbox_excludes_backchannel`] is Linux-specific: it
+/// [`LocalDaemonProofs::backchannel_object_reach`] is Linux-specific: it
 /// relies on Linux enforcing socket permission bits on `connect(2)`
 /// (`MAY_WRITE`), on Linux `ptrace` uid semantics, and on Linux discretionary
 /// access control on the terminal device. Socket-mode-on-connect is POSIX
@@ -434,7 +508,7 @@ pub enum UnixSocketKind {
 }
 
 /// A Linux capability that, if held by the requester, defeats one of the
-/// foreclosures the [`IsolationQuestion::SandboxExcludesBackchannel`] crux rests
+/// foreclosures the [`IsolationQuestion::BackchannelObjectReach`] crux rests
 /// on.
 ///
 /// A non-root uid is *not* automatically unprivileged: file and ambient
@@ -659,12 +733,12 @@ impl SocketFacts {
 /// A host attestation about who owns and can reach the operator's backchannel —
 /// its controlling terminal and the control socket.
 ///
-/// This is the input the [`IsolationQuestion::SandboxExcludesBackchannel`] crux
+/// This is the input the [`IsolationQuestion::BackchannelObjectReach`] crux
 /// requires. It carries only *facts* the host gathered — the platform it read
 /// them on, which backchannel shape they describe, and the raw stat facts of the
 /// terminal device and the socket — never a pre-collapsed "isolated" flag. The
 /// crux derives the verdict from these facts in
-/// [`LocalDaemonProofs::sandbox_excludes_backchannel`], so no caller can assert
+/// [`LocalDaemonProofs::backchannel_object_reach`], so no caller can assert
 /// an isolation the OS does not actually establish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackchannelOwnership {
@@ -770,10 +844,10 @@ impl LocalDaemonProofs {
 
     // -- the four questions, each answered only from a genuine proof ---------
 
-    /// [`IsolationQuestion::DistinctOsAccount`]: `Some(true)` iff both uids are
+    /// [`IsolationQuestion::OperatorAmbientAuthority`]: `Some(true)` iff both uids are
     /// known and different, `Some(false)` iff both are known and equal, `None`
     /// iff either is unknown.
-    fn distinct_os_account(&self) -> Option<bool> {
+    fn operator_ambient_authority(&self) -> Option<bool> {
         match (self.requester_uid, self.operator_uid) {
             (Some(requester), Some(operator)) => Some(requester != operator),
             _ => None,
@@ -801,7 +875,7 @@ impl LocalDaemonProofs {
             .map(InspectedGrant::confers_no_shell_or_filesystem_domain)
     }
 
-    /// [`IsolationQuestion::SandboxExcludesBackchannel`] — the crux, answered as
+    /// [`IsolationQuestion::BackchannelObjectReach`] — the crux, answered as
     /// conservatively as the module allows.
     ///
     /// # What this returns `Some(true)` for, and why it is sound
@@ -873,7 +947,7 @@ impl LocalDaemonProofs {
     ///   ancestor to be *operator*-owned, so a socket under a root-owned path
     ///   (`/run`, `/`) fails closed. That is conservative and safe; a later lane
     ///   may accept ancestors owned by a uid the requester is provably not.
-    fn sandbox_excludes_backchannel(&self) -> Option<bool> {
+    fn backchannel_object_reach(&self) -> Option<bool> {
         // Clause 1: every fact the argument rests on must be present. A missing
         // one is "cannot prove isolation", which stays `None` (never
         // `Some(false)`).
@@ -1014,7 +1088,7 @@ mod tests {
         );
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::DistinctOsAccount),
+            Some(IsolationQuestion::OperatorAmbientAuthority),
             "the refusal must name the first missing proof"
         );
     }
@@ -1033,9 +1107,11 @@ mod tests {
         for question in IsolationQuestion::ALL {
             let mut evidence = Evidence::fully_isolated();
             match question {
-                IsolationQuestion::DistinctOsAccount => evidence.distinct_os_account = None,
-                IsolationQuestion::SandboxExcludesBackchannel => {
-                    evidence.sandbox_excludes_backchannel = None;
+                IsolationQuestion::OperatorAmbientAuthority => {
+                    evidence.operator_ambient_authority = None
+                }
+                IsolationQuestion::BackchannelObjectReach => {
+                    evidence.backchannel_object_reach = None;
                 }
                 IsolationQuestion::OutsideHostProcess => evidence.outside_host_process = None,
                 IsolationQuestion::NoShellOrFilesystemGrant => {
@@ -1057,11 +1133,11 @@ mod tests {
         for question in IsolationQuestion::ALL {
             let mut evidence = Evidence::fully_isolated();
             match question {
-                IsolationQuestion::DistinctOsAccount => {
-                    evidence.distinct_os_account = Some(false);
+                IsolationQuestion::OperatorAmbientAuthority => {
+                    evidence.operator_ambient_authority = Some(false);
                 }
-                IsolationQuestion::SandboxExcludesBackchannel => {
-                    evidence.sandbox_excludes_backchannel = Some(false);
+                IsolationQuestion::BackchannelObjectReach => {
+                    evidence.backchannel_object_reach = Some(false);
                 }
                 IsolationQuestion::OutsideHostProcess => {
                     evidence.outside_host_process = Some(false);
@@ -1188,11 +1264,11 @@ mod tests {
     fn all_four_proofs_discharged_classifies_provably_isolated() {
         let evidence = Evidence::from_local_daemon_proofs(&all_discharged());
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(true)
         );
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             Some(true)
         );
         assert_eq!(
@@ -1229,12 +1305,12 @@ mod tests {
         assert!(!analysis.permits_approval());
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::DistinctOsAccount)
+            Some(IsolationQuestion::OperatorAmbientAuthority)
         );
     }
 
     #[test]
-    fn same_requester_and_operator_uid_disproves_distinct_os_account() {
+    fn same_requester_and_operator_uid_disproves_operator_ambient_authority() {
         // Mutation-check target 1: an implementation that answered `Some(true)`
         // when the uids are equal must fail this test.
         let proofs = LocalDaemonProofs::new(
@@ -1248,7 +1324,7 @@ mod tests {
         );
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(false),
             "equal uids are a proof the requester shares the operator's account"
         );
@@ -1256,37 +1332,43 @@ mod tests {
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::DistinctOsAccount)
+            Some(IsolationQuestion::OperatorAmbientAuthority)
         );
     }
 
     #[test]
-    fn unknown_requester_uid_leaves_distinct_os_account_unproven() {
+    fn unknown_requester_uid_leaves_operator_ambient_authority_unproven() {
         let mut proofs = all_discharged();
         proofs.requester_uid = None;
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
-        assert_eq!(evidence.answer(IsolationQuestion::DistinctOsAccount), None);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
+            None
+        );
         let analysis = classify(&identity(), &evidence);
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::DistinctOsAccount)
+            Some(IsolationQuestion::OperatorAmbientAuthority)
         );
     }
 
     #[test]
-    fn unknown_operator_uid_leaves_distinct_os_account_unproven() {
+    fn unknown_operator_uid_leaves_operator_ambient_authority_unproven() {
         let mut proofs = all_discharged();
         proofs.operator_uid = None;
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
-        assert_eq!(evidence.answer(IsolationQuestion::DistinctOsAccount), None);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
+            None
+        );
         // The crux also collapses without the operator uid, but distinct-account
         // is the first question, so it is what the refusal names.
         let analysis = classify(&identity(), &evidence);
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::DistinctOsAccount)
+            Some(IsolationQuestion::OperatorAmbientAuthority)
         );
     }
 
@@ -1399,7 +1481,7 @@ mod tests {
 
         // The other three are genuinely proven...
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(true)
         );
         assert_eq!(
@@ -1413,7 +1495,7 @@ mod tests {
         // ...yet the crux is unproven, and that alone makes the operator
         // ineligible.
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None
         );
         let analysis = classify(&identity(), &evidence);
@@ -1421,7 +1503,7 @@ mod tests {
         assert!(!analysis.permits_approval());
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::SandboxExcludesBackchannel)
+            Some(IsolationQuestion::BackchannelObjectReach)
         );
     }
 
@@ -1445,11 +1527,11 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(true)
         );
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a group-accessible socket is not a proof the requester is excluded from it"
         );
@@ -1457,13 +1539,13 @@ mod tests {
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::SandboxExcludesBackchannel)
+            Some(IsolationQuestion::BackchannelObjectReach)
         );
     }
 
     #[test]
     fn a_root_requester_is_distinct_but_still_fails_the_crux() {
-        // uid 0 is distinct from every ordinary uid, so `DistinctOsAccount` is
+        // uid 0 is distinct from every ordinary uid, so `OperatorAmbientAuthority` is
         // `Some(true)` — but root bypasses the DAC and ptrace checks the crux
         // rests on, so the crux must stay unproven. This is why a distinct uid
         // alone is insufficient.
@@ -1471,12 +1553,12 @@ mod tests {
         proofs.requester_uid = Some(ROOT_UID);
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(true),
             "root's uid is genuinely distinct from the operator's"
         );
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a root requester can reach any backchannel, so the crux stays unproven"
         );
@@ -1484,7 +1566,7 @@ mod tests {
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::SandboxExcludesBackchannel)
+            Some(IsolationQuestion::BackchannelObjectReach)
         );
     }
 
@@ -1509,7 +1591,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a backchannel owned by a third uid is not a proof the operator's is protected"
         );
@@ -1517,7 +1599,7 @@ mod tests {
         assert_eq!(analysis.reachability(), Reachability::Reachable);
         assert_eq!(
             analysis.unproven(),
-            Some(IsolationQuestion::SandboxExcludesBackchannel)
+            Some(IsolationQuestion::BackchannelObjectReach)
         );
     }
 
@@ -1552,7 +1634,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a socket whose parent chain is writable by another uid is not isolated"
         );
@@ -1577,7 +1659,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "an abstract-namespace socket has no mode and cannot be isolated"
         );
@@ -1597,7 +1679,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "an empty parent chain is not a proof the path is non-writable"
         );
@@ -1616,12 +1698,12 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            evidence.answer(IsolationQuestion::OperatorAmbientAuthority),
             Some(true),
             "the uid is genuinely distinct; privilege is a separate axis"
         );
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a non-root uid holding CAP_DAC_OVERRIDE is not unprivileged"
         );
@@ -1642,7 +1724,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "an ambient backchannel capability is not proof of an unprivileged requester"
         );
@@ -1656,7 +1738,7 @@ mod tests {
         proofs.requester_privilege = None;
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "an unread capability state cannot prove the requester is unprivileged"
         );
@@ -1672,7 +1754,7 @@ mod tests {
         proofs.requester_groups = Some(BTreeSet::from([REQUESTER_UID, TTY_GROUP_GID]));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a requester in the tty group can write a 0620 terminal"
         );
@@ -1692,7 +1774,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "an other-writable terminal is reachable by any uid"
         );
@@ -1706,7 +1788,7 @@ mod tests {
         proofs.requester_groups = None;
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "unknown group memberships cannot prove the requester is out of the tty group"
         );
@@ -1726,7 +1808,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "the Linux-specific argument does not hold on a non-Linux platform"
         );
@@ -1747,7 +1829,7 @@ mod tests {
         ));
         let evidence = Evidence::from_local_daemon_proofs(&proofs);
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             None,
             "a non-TTY backchannel is not covered by the terminal and socket facts"
         );
@@ -1762,7 +1844,7 @@ mod tests {
         // distinct non-root uid with an empty backchannel-relevant capset.
         let evidence = Evidence::from_local_daemon_proofs(&all_discharged());
         assert_eq!(
-            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            evidence.answer(IsolationQuestion::BackchannelObjectReach),
             Some(true),
             "genuinely isolating facts must discharge the crux"
         );
