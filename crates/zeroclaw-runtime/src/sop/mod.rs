@@ -493,8 +493,9 @@ pub fn delete_sop_typed(sops_dir: &Path, name: &str) -> std::result::Result<(), 
 /// entry is flushed afterwards, so on Unix the two steps are durable across a
 /// machine crash in the same order they were applied: an interrupted rename
 /// leaves the SOP either wholly moved or wholly not, never both places or
-/// neither. See [`sync_dir`] for what that does and does not promise per
-/// platform.
+/// neither. macOS honors the flush for ordering without draining the device
+/// cache, and Windows has no directory-sync primitive, so on those platforms
+/// that last step is the filesystem's to keep.
 ///
 /// Errors: `NotFound` if `from` is not an SOP directory, `AlreadyExists` if
 /// anything already occupies `to`, and `Other` for an invalid name (the same
