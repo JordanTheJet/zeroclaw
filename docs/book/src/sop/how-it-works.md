@@ -100,6 +100,10 @@ A rename:
 - refuses a target name that is already taken, so it can never merge two SOPs;
 - refuses a target that is not a single path component, the same check every
   other name-taking SOP operation applies;
+- refuses a source that is not a real directory sitting in the SOP root. A
+  symlink there would pass the name check and then redirect every read and write
+  at whatever it points to, so rename checks without following links and confirms
+  the source resolves inside the root before reading anything;
 - re-runs strict save validation, so it cannot put a definition back on disk
   that the authoring surface would have refused to write;
 - changes only the `[sop] name` value in `SOP.toml`, keeping that line's own
@@ -119,9 +123,18 @@ daemon that already loaded the old definition keeps running it until it reloads
 its SOPs, and run history, audit records, and anything else that captured the old
 name keeps the old name.
 
-Rename assumes one writer at a time, as saving and deleting do. Running the CLI
-against a SOP root a daemon is authoring into, or firing two renames at the same
-SOP at once, can interleave the manifest rewrite with another write; there is no
-cross-process lock on the SOP root.
+Authoring writes are serialized. Creating, saving, deleting, and renaming all
+take an advisory lock on a `.sop-authoring.lock` file in the SOP root before
+touching anything, so two of them cannot interleave even across processes: the
+CLI writing into a root a running daemon also authors into waits its turn rather
+than racing it. An authoring call that cannot take the lock within ten seconds
+fails rather than queueing indefinitely. Reads are not serialized and do not need
+to be, because every write lands through an atomic rename, so a reader sees one
+whole revision or the other.
+
+The rename guarantee is about ordering and visibility rather than durability.
+Each step commits through a rename, so both an ordinary reader and a killed
+process see one whole revision; the containing directories are not synchronized,
+so after a power loss the filesystem decides which of the two steps survived.
 
 For trigger routing and auth details, see [SOP Fan-In](./fan-in/overview.md).
