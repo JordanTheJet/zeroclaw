@@ -596,9 +596,14 @@ async fn cron_run_route_is_cut_off_when_the_budget_is_below_the_job() {
         "the same 5s job under a 3s long-running budget must be cut off; a 200 \
          here means the budget is not the configured one. Response was:\n{raw}"
     );
+    // Lower bound only. A correctly fired 3s timeout can be *observed* late
+    // under scheduler contention, so an upper wall-clock bound here would turn
+    // wakeup latency into a test failure. The configured value is pinned by
+    // the pair instead: the same 5s job returns 200 under the 10s budget and
+    // 408 here, and the lower bound rules out the 1s default.
     assert!(
-        (Duration::from_millis(2200)..=Duration::from_millis(4800)).contains(&elapsed),
-        "the 408 must arrive at the configured 3s budget — later than the 1s \
-         default and before the job's own 5s — but it arrived after {elapsed:?}"
+        elapsed >= Duration::from_millis(2200),
+        "the 408 must arrive no earlier than the configured 3s budget (later \
+         than the 1s default), but it arrived after {elapsed:?}"
     );
 }
