@@ -132,9 +132,12 @@ fails rather than queueing indefinitely. Reads are not serialized and do not nee
 to be, because every write lands through an atomic rename, so a reader sees one
 whole revision or the other.
 
-The rename guarantee is about ordering and visibility rather than durability.
 Each step commits through a rename, so both an ordinary reader and a killed
-process see one whole revision; the containing directories are not synchronized,
-so after a power loss the filesystem decides which of the two steps survived.
+process see one whole revision. The directory holding each renamed entry is
+flushed afterwards, so on Unix the ordering also survives a machine crash. macOS
+honors the flush for ordering without forcing the device cache to drain, and
+Windows has no directory-sync primitive, so on those platforms the last step of
+the guarantee is the filesystem's to keep rather than something ZeroClaw can
+force.
 
 For trigger routing and auth details, see [SOP Fan-In](./fan-in/overview.md).
