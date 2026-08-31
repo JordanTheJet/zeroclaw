@@ -488,10 +488,13 @@ pub fn delete_sop_typed(sops_dir: &Path, name: &str) -> std::result::Result<(), 
 /// outright the manifest is rolled back, leaving the SOP exactly as it was
 /// found.
 ///
-/// The guarantee is ordering and visibility, not durability. Each step lands
-/// through a rename, so a reader and a process killed mid-rename both see one
-/// whole revision. The containing directories are not synchronized, so after
-/// a power loss the filesystem decides which of the two steps survived.
+/// Each step commits through a rename, so a reader and a process killed
+/// mid-rename both see one whole revision. The directory holding each renamed
+/// entry is flushed afterwards, so on Unix the two steps are durable across a
+/// machine crash in the same order they were applied: an interrupted rename
+/// leaves the SOP either wholly moved or wholly not, never both places or
+/// neither. See [`sync_dir`] for what that does and does not promise per
+/// platform.
 ///
 /// Errors: `NotFound` if `from` is not an SOP directory, `AlreadyExists` if
 /// anything already occupies `to`, and `Other` for an invalid name (the same
@@ -553,6 +556,23 @@ pub fn rename_sop_typed(
             ));
         }
         return Err(SopAuthorError::Io(anyhow::Error::msg(msg)));
+    }
+    // The move already happened and is visible, so a failure to flush the SOP
+    // root cannot be reported as a failed rename: the caller would retry an
+    // operation that has in fact completed. Record it instead, because the
+    // only thing lost is the power-loss guarantee.
+    if let Err(e) = sync_dir(sops_dir) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error": format!("{e}"),
+                    "from": from,
+                    "to": to,
+                })),
+            "SOP rename committed but the SOP root could not be synchronized"
+        );
     }
     Ok(())
 }
@@ -640,6 +660,34 @@ fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
         tmp.as_file().set_permissions(existing.permissions())?;
     }
     tmp.persist(path).map_err(|e| anyhow::Error::new(e.error))?;
+    // Flushing the file is only half of it: until the directory entry that
+    // names it is on disk too, a power loss can take the rename back. This is
+    // fatal here because nothing has been committed yet, so failing leaves the
+    // SOP exactly as it was.
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// Flush a directory's entries so a rename into or out of it survives a
+/// machine crash, not just a process crash.
+///
+/// Unix exposes this as `fsync` on a handle to the directory itself. macOS
+/// honors it for ordering but does not force the device cache to drain the way
+/// `F_FULLFSYNC` would, so the guarantee there is the filesystem's rather than
+/// the hardware's. Windows has no equivalent: a directory handle needs backup
+/// semantics even to open, and `FlushFileBuffers` defines no durability
+/// contract for one, so ordering stays the filesystem's to keep.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    use anyhow::Context as _;
+
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("synchronizing directory {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1850,6 +1898,32 @@ mod tests {
         let mut sop = authoring_sop(vec![titled_step(1, step_title)]);
         sop.name = name.to_string();
         sop
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_dir_flushes_a_real_directory_and_reports_a_missing_one() {
+        // The rename's durability rests on this, so a silent no-op would be
+        // worse than a failure: it would leave the docs claiming a guarantee
+        // nothing delivers.
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).expect("an existing directory must synchronize");
+
+        let missing = dir.path().join("not-here");
+        let err = sync_dir(&missing).expect_err("a missing directory must not report success");
+        assert!(err.to_string().contains("synchronizing directory"), "{err}");
+    }
+
+    #[test]
+    fn write_file_atomic_survives_a_read_only_parent_by_failing_not_lying() {
+        // `write_file_atomic` now flushes the parent after persisting. The
+        // staging file lands in the same directory, so a directory that cannot
+        // be written fails before anything is replaced.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("SOP.toml");
+        let err = write_file_atomic(&target, "x = 1\n")
+            .expect_err("writing into a directory that does not exist must fail");
+        assert!(!target.exists(), "{err}");
     }
 
     #[cfg(unix)]
