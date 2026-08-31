@@ -1520,4 +1520,255 @@ mod tests {
             Some(IsolationQuestion::SandboxExcludesBackchannel)
         );
     }
+
+    // -----------------------------------------------------------------------
+    // The five hardened findings: each vector that previously answered
+    // `Some(true)` unsoundly now fails closed. Every test below spoils exactly
+    // one fact from `all_discharged` and asserts the crux answers `None`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_writable_socket_parent_directory_fails_the_crux() {
+        // Finding 1. The socket is a pathname `0600` socket owned by the
+        // operator, but an ancestor directory is other-writable, so a distinct
+        // uid could unlink and rebind the socket for a man-in-the-middle. Mutation
+        // check 1: dropping the parent-chain check makes this pass `Some(true)`.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::Linux,
+            BackchannelKind::ControllingTerminalAndSocket,
+            isolating_tty(),
+            SocketFacts::new(
+                UnixSocketKind::Pathname,
+                OPERATOR_UID,
+                0o600,
+                vec![
+                    DirectoryFacts::new(OPERATOR_UID, 0o700),
+                    // Other-writable: another uid can rewrite this directory's
+                    // entries and swap the socket beneath it.
+                    DirectoryFacts::new(OPERATOR_UID, 0o707),
+                ],
+            ),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "a socket whose parent chain is writable by another uid is not isolated"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn an_abstract_namespace_socket_fails_the_crux() {
+        // Finding 1. An abstract-namespace socket has no filesystem node and no
+        // permission bits, so it cannot be isolated by mode at all.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::Linux,
+            BackchannelKind::ControllingTerminalAndSocket,
+            isolating_tty(),
+            SocketFacts::new(
+                UnixSocketKind::Abstract,
+                OPERATOR_UID,
+                0o600,
+                vec![DirectoryFacts::new(OPERATOR_UID, 0o700)],
+            ),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "an abstract-namespace socket has no mode and cannot be isolated"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn an_empty_socket_parent_chain_fails_the_crux() {
+        // Finding 1, boundary. A recorded chain with no ancestors proves nothing
+        // about whether the path is writable, so it fails closed.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::Linux,
+            BackchannelKind::ControllingTerminalAndSocket,
+            isolating_tty(),
+            SocketFacts::new(UnixSocketKind::Pathname, OPERATOR_UID, 0o600, Vec::new()),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "an empty parent chain is not a proof the path is non-writable"
+        );
+    }
+
+    #[test]
+    fn a_requester_with_a_backchannel_capability_fails_the_crux() {
+        // Finding 2. A distinct, non-root uid that nonetheless holds
+        // `CAP_DAC_OVERRIDE` defeats the DAC foreclosures. Mutation check 2:
+        // dropping the capability check makes this pass `Some(true)`.
+        let mut proofs = all_discharged();
+        proofs.requester_privilege = Some(RequesterPrivilege::observed(
+            BTreeSet::from([BackchannelCapability::DacOverride]),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::DistinctOsAccount),
+            Some(true),
+            "the uid is genuinely distinct; privilege is a separate axis"
+        );
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "a non-root uid holding CAP_DAC_OVERRIDE is not unprivileged"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn a_backchannel_capability_in_the_ambient_set_alone_fails_the_crux() {
+        // Finding 2. Ambient (and permitted) capabilities count, not just
+        // effective: an ambient `CAP_SYS_PTRACE` survives `execve` and can be
+        // raised to effective, so it must fail closed even with an empty
+        // effective set.
+        let mut proofs = all_discharged();
+        proofs.requester_privilege = Some(RequesterPrivilege::observed(
+            BTreeSet::new(),
+            BTreeSet::new(),
+            BTreeSet::from([BackchannelCapability::SysPtrace]),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "an ambient backchannel capability is not proof of an unprivileged requester"
+        );
+    }
+
+    #[test]
+    fn an_unknown_requester_privilege_fails_the_crux() {
+        // Finding 2. If the host never read the capability state, privilege is
+        // not established, so the crux fails closed.
+        let mut proofs = all_discharged();
+        proofs.requester_privilege = None;
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "an unread capability state cannot prove the requester is unprivileged"
+        );
+    }
+
+    #[test]
+    fn a_group_writable_tty_with_the_requester_in_that_group_fails_the_crux() {
+        // Finding 3. The terminal is `0620` `chown user:tty`; if the requester is
+        // a member of the `tty` group it can write (inject into) the terminal.
+        // The `other` bits alone would say "isolated" — the group axis is what
+        // catches this.
+        let mut proofs = all_discharged();
+        proofs.requester_groups = Some(BTreeSet::from([REQUESTER_UID, TTY_GROUP_GID]));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "a requester in the tty group can write a 0620 terminal"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn a_world_writable_tty_fails_the_crux() {
+        // Finding 3. A terminal writable by `other` is reachable by any uid,
+        // regardless of group membership.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::Linux,
+            BackchannelKind::ControllingTerminalAndSocket,
+            TtyFacts::new(OPERATOR_UID, TTY_GROUP_GID, 0o622),
+            isolating_socket(),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "an other-writable terminal is reachable by any uid"
+        );
+    }
+
+    #[test]
+    fn an_unknown_requester_group_set_fails_the_crux() {
+        // Finding 3. Without the requester's group memberships, the host cannot
+        // prove it is outside the terminal's group, so the crux fails closed.
+        let mut proofs = all_discharged();
+        proofs.requester_groups = None;
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "unknown group memberships cannot prove the requester is out of the tty group"
+        );
+    }
+
+    #[test]
+    fn a_non_linux_platform_tag_fails_the_crux() {
+        // Finding 4. The DAC/`ptrace` argument is Linux-specific; on macOS (or
+        // any non-Linux platform) no proof exists yet. Mutation check 3: dropping
+        // the platform gate makes this pass `Some(true)`.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::MacOs,
+            BackchannelKind::ControllingTerminalAndSocket,
+            isolating_tty(),
+            isolating_socket(),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "the Linux-specific argument does not hold on a non-Linux platform"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn a_non_tty_backchannel_kind_fails_the_crux() {
+        // Finding 5. The GUI/D-Bus/Wayland exclusion is unchecked; an attestation
+        // for any backchannel other than a TTY controlling terminal plus the
+        // control socket fails closed.
+        let mut proofs = all_discharged();
+        proofs.backchannel = Some(BackchannelOwnership::new(
+            GatheredPlatform::Linux,
+            BackchannelKind::Other,
+            isolating_tty(),
+            isolating_socket(),
+        ));
+        let evidence = Evidence::from_local_daemon_proofs(&proofs);
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            None,
+            "a non-TTY backchannel is not covered by the terminal and socket facts"
+        );
+        assert!(!classify(&identity(), &evidence).permits_approval());
+    }
+
+    #[test]
+    fn the_positive_case_with_all_hardened_facts_is_provably_isolated() {
+        // The one path to `Some(true)`: Linux, a TTY+socket backchannel, a
+        // pathname `0600` socket under an operator-owned non-writable chain, a
+        // `0620` terminal whose `tty` group the requester is not in, and a
+        // distinct non-root uid with an empty backchannel-relevant capset.
+        let evidence = Evidence::from_local_daemon_proofs(&all_discharged());
+        assert_eq!(
+            evidence.answer(IsolationQuestion::SandboxExcludesBackchannel),
+            Some(true),
+            "genuinely isolating facts must discharge the crux"
+        );
+        let analysis = classify(&identity(), &evidence);
+        assert_eq!(analysis.reachability(), Reachability::ProvablyIsolated);
+        assert_eq!(analysis.unproven(), None);
+        assert!(analysis.permits_approval());
+    }
 }
