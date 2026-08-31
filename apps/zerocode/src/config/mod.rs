@@ -707,6 +707,7 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// the file — so validating the *candidate* alone is not enough. Only the
 /// latest document, which this function already loads, can answer whether the
 /// value about to be overwritten is the user's invalid canonical data.
+#[cfg(test)]
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
     persist_todotracker_with_intent(config_dir, section, TrackerWriteIntent::PreserveInvalid)
         .map(|_| ())
