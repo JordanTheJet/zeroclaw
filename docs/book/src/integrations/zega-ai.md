@@ -47,7 +47,7 @@ gateway and tries them in order:
 > **Pairing codes are case-sensitive, and their shape is configurable.**
 > `[gateway.pairing_code]` sets the length (`6`–`128`) and the character
 > family (`numeric`, `alphanumeric`, or `unambiguous`); the default is 32
-> case-sensitive alphanumeric characters. Transmit the code verbatim — do
+> case-sensitive alphanumeric characters. Transmit the code verbatim: do
 > not upper-case it, strip characters, or assume a fixed width.
 
 ### Enhanced route: `POST /api/pair`
