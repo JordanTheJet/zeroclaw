@@ -1,10 +1,17 @@
 package org.zerodroid.bridge
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GeneratedConfigPolicyTest {
+    @Test
+    fun retiredDeepSeekPrefillSelfHealsToCurrentFlashModel() {
+        assertEquals("deepseek-v4-flash", ProviderCatalog.defaultModel("deepseek"))
+        assertTrue("deepseek-chat" in ProviderCatalog.RETIRED_MODELS)
+    }
+
     @Test
     fun generatedGatewayUsesPrivateNamespaceAndSecondFactor() {
         val section = GeneratedConfigPolicy.gatewayIsolation(

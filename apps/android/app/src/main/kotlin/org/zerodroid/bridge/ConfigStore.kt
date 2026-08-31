@@ -17,7 +17,7 @@ object ProviderCatalog {
         // zeroclaw-providers/models_dev.rs uses), picking a current, tool-capable chat model per
         // provider rather than whatever was flagship when this map was written. Stale prefills are
         // not cosmetic: a withdrawn model 404s and reads as an auth failure.
-        "deepseek" to "deepseek-chat", "gemini" to "gemini-3-flash-preview",
+        "deepseek" to "deepseek-v4-flash", "gemini" to "gemini-3-flash-preview",
         "groq" to "openai/gpt-oss-120b", "xai" to "grok-4.6",
         "together" to "deepseek-ai/DeepSeek-V4-Flash-0731",
         "openai" to "gpt-5.6", "anthropic" to "claude-sonnet-5",
@@ -51,7 +51,8 @@ object ProviderCatalog {
     val RETIRED_MODELS = setOf(
         // Only add an id after seeing the provider actually reject it. Overriding a model the user
         // deliberately chose, on a guess, is worse than leaving a stale default in place.
-        "gemini-2.5-flash"   // observed: 404 "no longer available to new users"
+        "gemini-2.5-flash",  // observed: 404 "no longer available to new users"
+        "deepseek-chat",     // removed from the public DeepSeek catalog in August 2026
     )
     fun isLocal(id: String) = id in LOCAL
 }
