@@ -227,9 +227,7 @@ class NativeRuntime(private val ctx: Context, variant: String = "") {
             desc = desc.replace("[local]", "").replace("(configured)", "").trim()
             rows += ProviderInfo(id, desc.ifEmpty { id }, local || ProviderCatalog.isLocal(id))
         }
-        return rows.ifEmpty { ProviderCatalog.FALLBACK }
-            .distinctBy { it.id }
-            .sortedBy { it.label.lowercase() }
+        return ProviderCatalog.orderForPicker(rows.ifEmpty { ProviderCatalog.FALLBACK })
     }
 
     /** Mirror the bridge token into the agent's HOME so its shell tool can authenticate to 8470. */

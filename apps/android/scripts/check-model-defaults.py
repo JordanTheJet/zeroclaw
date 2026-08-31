@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the Android app's provider defaults against the public models.dev catalog.
+"""Validate the Android app's defaults against public provider model catalogs.
 
 This intentionally uses no provider credentials. It proves that every hosted default names a
-model the provider currently publishes, and that it supports tool calls wherever that provider
-offers a tool-capable model. It cannot prove credentials, quotas, or the provider's live API.
+model the provider currently publishes through models.dev or ZeroRouter, and that it supports tool
+calls wherever that provider offers a tool-capable model. It cannot prove credentials, quotas, or
+the provider's inference API.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ from pathlib import Path
 
 CATALOG_HOST = "models.dev"
 CATALOG_PATH = "/api.json"
+ZEROROUTER_CATALOG_HOST = "zerorouter.ai"
+ZEROROUTER_CATALOG_PATH = "/v1/models"
+MAX_CATALOG_BYTES = 16 * 1024 * 1024
 
 # The Android app's provider IDs do not always match models.dev's IDs.
 CATALOG_PROVIDER = {
@@ -46,7 +50,8 @@ CATALOG_PROVIDER = {
 }
 
 LOCAL_PROVIDERS = {"ollama", "llamacpp", "lmstudio", "vllm"}
-EXPECTED_DEFAULTS = set(CATALOG_PROVIDER) | LOCAL_PROVIDERS
+ROUTER_PROVIDERS = {"zerorouter"}
+EXPECTED_DEFAULTS = set(CATALOG_PROVIDER) | LOCAL_PROVIDERS | ROUTER_PROVIDERS
 
 
 def parse_defaults(config_store: Path) -> dict[str, str]:
@@ -58,9 +63,13 @@ def parse_defaults(config_store: Path) -> dict[str, str]:
     return dict(re.findall(r'"([^"]+)"\s+to\s+"([^"]+)"', body))
 
 
-def load_catalog(path: Path | None) -> dict:
-    if path:
-        return json.loads(path.read_text())
+def decode_catalog_body(payload: bytes, host: str, max_bytes: int = MAX_CATALOG_BYTES) -> dict:
+    if len(payload) > max_bytes:
+        raise RuntimeError(f"{host} response exceeds {max_bytes} bytes")
+    return json.loads(payload)
+
+
+def load_remote_json(host: str, path: str) -> dict:
     # python.org macOS installs do not always load the system trust store. Keep
     # verification enabled while preferring an explicit operator bundle, then
     # the standard Unix/macOS bundle when present.
@@ -70,22 +79,23 @@ def load_catalog(path: Path | None) -> dict:
     context = ssl.create_default_context(cafile=cert_file)
     for attempt in range(3):
         connection = http.client.HTTPSConnection(
-            CATALOG_HOST,
+            host,
             timeout=60,
             context=context,
         )
         try:
             connection.request(
                 "GET",
-                CATALOG_PATH,
+                path,
                 headers={"User-Agent": "zeroclaw-android-model-check"},
             )
             response = connection.getresponse()
             if response.status == 429 or response.status >= 500:
-                raise OSError(f"models.dev transient HTTP {response.status}")
+                raise OSError(f"{host} transient HTTP {response.status}")
             if response.status != 200:
-                raise RuntimeError(f"models.dev returned HTTP {response.status}")
-            return json.loads(response.read())
+                raise RuntimeError(f"{host} returned HTTP {response.status}")
+            payload = response.read(MAX_CATALOG_BYTES + 1)
+            return decode_catalog_body(payload, host)
         except (TimeoutError, OSError, http.client.HTTPException):
             if attempt == 2:
                 raise
@@ -93,6 +103,26 @@ def load_catalog(path: Path | None) -> dict:
         finally:
             connection.close()
     raise AssertionError("unreachable")
+
+
+def load_catalog(path: Path | None) -> dict:
+    if path:
+        return json.loads(path.read_text())
+    return load_remote_json(CATALOG_HOST, CATALOG_PATH)
+
+
+def load_zerorouter_catalog(path: Path | None) -> dict:
+    if path:
+        return json.loads(path.read_text())
+    return load_remote_json(ZEROROUTER_CATALOG_HOST, ZEROROUTER_CATALOG_PATH)
+
+
+def zerorouter_models(catalog: dict) -> dict[str, dict]:
+    return {
+        model["id"]: model
+        for model in catalog.get("data", [])
+        if isinstance(model, dict) and isinstance(model.get("id"), str)
+    }
 
 
 def validate_default_shape(defaults: dict[str, str]) -> list[str]:
@@ -113,6 +143,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--catalog", type=Path, help="Use a downloaded models.dev api.json")
     parser.add_argument(
+        "--zerorouter-catalog",
+        type=Path,
+        help="Use a downloaded ZeroRouter /v1/models response",
+    )
+    parser.add_argument(
         "--config-store",
         type=Path,
         default=Path(__file__).parents[1]
@@ -122,6 +157,7 @@ def main() -> int:
 
     defaults = parse_defaults(args.config_store)
     catalog = load_catalog(args.catalog)
+    router_catalog = load_zerorouter_catalog(args.zerorouter_catalog)
     errors = validate_default_shape(defaults)
 
     for provider, model in defaults.items():
@@ -129,15 +165,19 @@ def main() -> int:
             print(f"SKIP local  {provider:12} {model}")
             continue
 
-        catalog_id = CATALOG_PROVIDER.get(provider)
-        if not catalog_id or catalog_id not in catalog:
-            errors.append(f"{provider}: no models.dev provider mapping ({catalog_id!r})")
-            continue
-
-        models = catalog[catalog_id].get("models", {})
+        if provider == "zerorouter":
+            catalog_name = "zerorouter.ai/v1/models"
+            models = zerorouter_models(router_catalog)
+        else:
+            catalog_id = CATALOG_PROVIDER.get(provider)
+            if not catalog_id or catalog_id not in catalog:
+                errors.append(f"{provider}: no models.dev provider mapping ({catalog_id!r})")
+                continue
+            catalog_name = f"models.dev/{catalog_id}"
+            models = catalog[catalog_id].get("models", {})
         spec = models.get(model)
         if spec is None:
-            errors.append(f"{provider}: default {model!r} is not in models.dev/{catalog_id}")
+            errors.append(f"{provider}: default {model!r} is not in {catalog_name}")
             continue
 
         native_tools = bool(spec.get("tool_call"))

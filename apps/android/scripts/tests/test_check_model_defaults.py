@@ -13,6 +13,23 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DefaultShapeTest(unittest.TestCase):
+    def test_catalog_body_limit_rejects_oversized_success(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "response exceeds 2 bytes"):
+            MODULE.decode_catalog_body(b"{}\n", "catalog.test", max_bytes=2)
+
+    def test_zerorouter_catalog_is_indexed_by_model_id(self) -> None:
+        models = MODULE.zerorouter_models(
+            {
+                "data": [
+                    {"id": "google/gemini-3.7-flash", "tool_call": True},
+                    {"object": "model"},
+                ]
+            }
+        )
+
+        self.assertEqual(list(models), ["google/gemini-3.7-flash"])
+        self.assertTrue(models["google/gemini-3.7-flash"]["tool_call"])
+
     def test_empty_map_is_rejected(self) -> None:
         errors = MODULE.validate_default_shape({})
 

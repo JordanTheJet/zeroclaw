@@ -13,10 +13,11 @@ data class ProviderInfo(val id: String, val label: String, val local: Boolean = 
 object ProviderCatalog {
     /** Sensible default model per popular provider (prefill; the user can change it). */
     val DEFAULT_MODEL = mapOf(
-        // Refreshed 2026-08-16 against the models.dev catalog (the same source
-        // zeroclaw-providers/models_dev.rs uses), picking a current, tool-capable chat model per
-        // provider rather than whatever was flagship when this map was written. Stale prefills are
-        // not cosmetic: a withdrawn model 404s and reads as an auth failure.
+        // Refreshed against the public models.dev and ZeroRouter catalogs, picking a current,
+        // tool-capable chat model per provider rather than whatever was flagship when this map was
+        // written. Stale prefills are not cosmetic: a withdrawn model 404s and reads as an auth
+        // failure.
+        "zerorouter" to "google/gemini-3.7-flash",
         "deepseek" to "deepseek-v4-flash", "gemini" to "gemini-3-flash-preview",
         "groq" to "openai/gpt-oss-120b", "xai" to "grok-4.6",
         "together" to "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -36,12 +37,21 @@ object ProviderCatalog {
 
     /** Built-in fallback when the binary can't be queried. The live list supersedes this. */
     val FALLBACK: List<ProviderInfo> = listOf(
-        "deepseek" to "DeepSeek", "gemini" to "Google Gemini", "openai" to "OpenAI", "anthropic" to "Anthropic",
+        "zerorouter" to "ZeroRouter", "deepseek" to "DeepSeek", "gemini" to "Google Gemini",
+        "openai" to "OpenAI", "anthropic" to "Anthropic",
         "openrouter" to "OpenRouter", "groq" to "Groq", "xai" to "xAI (Grok)", "together" to "Together AI",
         "mistral" to "Mistral", "ollama" to "Ollama", "llamacpp" to "llama.cpp", "lmstudio" to "LM Studio"
-    ).map { ProviderInfo(it.first, it.second, it.first in LOCAL) }
+    ).map { ProviderInfo(it.first, it.second, it.first in LOCAL) }.let(::orderForPicker)
 
     fun defaultModel(id: String) = DEFAULT_MODEL[id] ?: ""
+
+    /** Keep the preferred router visible while retaining alphabetical order for every other row. */
+    fun orderForPicker(providers: List<ProviderInfo>): List<ProviderInfo> = providers
+        .distinctBy { it.id }
+        .sortedWith(
+            compareBy<ProviderInfo> { if (it.id == "zerorouter") 0 else 1 }
+                .thenBy { it.label.lowercase() }
+        )
 
     /**
      * Models a provider has withdrawn, which now answer 404 for everyone. A stored value from this

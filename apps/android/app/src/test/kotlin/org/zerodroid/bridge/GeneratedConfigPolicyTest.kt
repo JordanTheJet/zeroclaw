@@ -7,6 +7,20 @@ import org.junit.Test
 
 class GeneratedConfigPolicyTest {
     @Test
+    fun zeroRouterLeadsThePickerWithGeminiFlashDefault() {
+        val ordered = ProviderCatalog.orderForPicker(
+            listOf(
+                ProviderInfo("openai", "OpenAI"),
+                ProviderInfo("zerorouter", "ZeroRouter"),
+                ProviderInfo("anthropic", "Anthropic"),
+            )
+        )
+
+        assertEquals("zerorouter", ordered.first().id)
+        assertEquals("google/gemini-3.7-flash", ProviderCatalog.defaultModel("zerorouter"))
+    }
+
+    @Test
     fun retiredDeepSeekPrefillSelfHealsToCurrentFlashModel() {
         assertEquals("deepseek-v4-flash", ProviderCatalog.defaultModel("deepseek"))
         assertTrue("deepseek-chat" in ProviderCatalog.RETIRED_MODELS)
