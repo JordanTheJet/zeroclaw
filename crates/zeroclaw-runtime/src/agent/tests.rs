@@ -1565,7 +1565,8 @@ fn xml_dispatcher_emits_shared_tool_call_guidance() {
         "dispatcher prompt lost the emit-real-tags directive"
     );
     assert!(
-        instructions.contains("Example: User says"),
+        instructions
+            .contains("You MUST respond with a real call naming one of your available tools"),
         "dispatcher prompt lost the worked example"
     );
 }

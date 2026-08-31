@@ -23,6 +23,16 @@
 /// The text tells the model to emit real `<tool_call>` tags wrapping a JSON
 /// object with a top-level `name` and a nested `arguments` object.
 ///
+/// INVARIANT: every example here stays availability-neutral — it names the
+/// `tool_name` placeholder, never a concrete tool. Both consumers render this
+/// block against a *policy-filtered* tool slice (the XML dispatcher does not
+/// even emit the listing; `prompt::ToolsSection` advertises the filtered slice
+/// separately), so a concrete tool named here is guidance the prompt cannot
+/// guarantee. A `file_read`-only risk profile once got a prompt that listed
+/// `file_read` while commanding an unavailable `shell`. Naming a real tool in
+/// an example position is a prompt bug, not a wording preference; it is pinned
+/// by `rendered_prompts_never_prescribe_a_tool_outside_the_effective_slice`.
+///
 /// Callers that need a leading blank line before the heading push `'\n'`
 /// themselves; the constant deliberately starts at the heading so it can be
 /// embedded in prompts that already end with a separator.
@@ -38,9 +48,9 @@ To use a tool, wrap a JSON object in <tool_call></tool_call> tags:
 
 CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.
 
-Example: User says "what's the date?". You MUST respond with:
+Example: User says something that needs a tool. You MUST respond with a real call naming one of your available tools:
 <tool_call>
-{"name":"shell","arguments":{"command":"date"}}
+{"name": "tool_name", "arguments": {"param": "value"}}
 </tool_call>
 
 You may use multiple tool calls in a single response. After tool execution, results appear in <tool_result> tags. Continue reasoning with the results until you can give a final answer.
@@ -51,9 +61,10 @@ You may use multiple tool calls in a single response. After tool execution, resu
 mod tests {
     use super::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
     use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
-    use crate::agent::loop_::build_tool_instructions;
+    use crate::agent::loop_::{build_tool_instructions, build_tool_instructions_for_names};
     use crate::security::SecurityPolicy;
     use crate::tools::{Tool, default_tools};
+    use std::collections::HashSet;
 
     fn probe_tools() -> Vec<Box<dyn Tool>> {
         let security = std::sync::Arc::new(SecurityPolicy::from_risk_profile(
@@ -87,7 +98,11 @@ mod tests {
             "</tool_call>",
             r#"{"name": "tool_name", "arguments": {"param": "value"}}"#,
             "CRITICAL: Output actual <tool_call> tags",
-            "Example: User says",
+            // Pins the worked example by its imperative lead-in rather than
+            // by its JSON payload: the payload is now byte-identical to the
+            // idiom line above, so only this sentence proves the example
+            // survived — and that it stayed availability-neutral.
+            "You MUST respond with a real call naming one of your available tools",
         ] {
             assert!(
                 TOOL_CALL_PROTOCOL_INSTRUCTIONS.contains(required),
@@ -114,6 +129,85 @@ mod tests {
             loop_block.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
             "build_tool_instructions drifted from the shared block:\n{loop_block}"
         );
+    }
+
+    /// Regression for the availability-neutrality invariant.
+    ///
+    /// A policy-filtered registry that excludes `shell` must never render a
+    /// prompt that commands the model to call `shell` — or any other tool
+    /// outside the effective slice. The shared block used to hard-code a
+    /// `shell`/`date` worked example; because the XML dispatcher appends the
+    /// block whenever its effective slice is non-empty (while `ToolsSection`
+    /// advertises only that filtered slice), a `file_read`-only risk profile
+    /// got a prompt listing `file_read` and imperatively demanding `shell`.
+    ///
+    /// "Imperative example position" is checked as a JSON tool call naming a
+    /// tool (`"name": "x"`), which is the only place the block tells the model
+    /// what to emit. That keeps the assertion off prose in tool descriptions.
+    #[test]
+    fn rendered_prompts_never_prescribe_a_tool_outside_the_effective_slice() {
+        const EFFECTIVE: &str = "file_read";
+
+        let full_registry = probe_tools();
+        let foreign_names: Vec<String> = full_registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .filter(|name| name != EFFECTIVE)
+            .collect();
+        assert!(
+            foreign_names.iter().any(|name| name == "shell"),
+            "probe registry must still contain `shell`, or this regression proves nothing"
+        );
+
+        let mut effective_tools = probe_tools();
+        effective_tools.retain(|tool| tool.name() == EFFECTIVE);
+        assert_eq!(
+            effective_tools.len(),
+            1,
+            "expected exactly one `{EFFECTIVE}` tool in the default registry"
+        );
+        let effective_names: HashSet<&str> = HashSet::from([EFFECTIVE]);
+
+        // Every builder that can render the shared block against a filtered
+        // slice, including the policy-filtering entry point the risk profile
+        // actually goes through.
+        let rendered = [
+            (
+                "XmlToolDispatcher::prompt_instructions",
+                XmlToolDispatcher.prompt_instructions(&effective_tools),
+            ),
+            (
+                "build_tool_instructions",
+                build_tool_instructions(&effective_tools),
+            ),
+            (
+                "build_tool_instructions_for_names",
+                build_tool_instructions_for_names(&full_registry, &effective_names),
+            ),
+        ];
+
+        for (builder, prompt) in &rendered {
+            assert!(
+                !prompt.is_empty(),
+                "{builder} rendered nothing for a non-empty tool slice"
+            );
+            for foreign in &foreign_names {
+                for pattern in [
+                    format!(r#""name": "{foreign}""#),
+                    format!(r#""name":"{foreign}""#),
+                ] {
+                    assert!(
+                        !prompt.contains(&pattern),
+                        "{builder} prescribes unavailable tool `{foreign}` via {pattern:?}:\n{prompt}"
+                    );
+                }
+            }
+            // The neutral placeholder is what must survive in its place.
+            assert!(
+                prompt.contains(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#),
+                "{builder} lost the availability-neutral example:\n{prompt}"
+            );
+        }
     }
 
     /// Byte-identity pin for the loop_ builder: the shared block plus the
