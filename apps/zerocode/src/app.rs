@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -59,6 +61,234 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+const SGR_MOUSE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(50);
+const MAX_SGR_MOUSE_SEQUENCE_EVENTS: usize = 32;
+
+/// Reassembles SGR mouse sequences that crossterm exposed as individual key
+/// events after an input read split the sequence at the escape byte.
+///
+/// A complete sequence is converted back into the same `MouseEvent` that
+/// crossterm would have produced. Invalid or incomplete sequences are replayed
+/// in order, so ordinary Escape-prefixed keyboard input is not discarded.
+#[derive(Debug, Default)]
+struct SgrMouseEventDecoder {
+    pending: VecDeque<Event>,
+    candidate: Vec<Event>,
+    candidate_started_at: Option<Instant>,
+}
+
+impl SgrMouseEventDecoder {
+    fn feed(&mut self, event: Event) {
+        let output = if self.candidate.is_empty() {
+            if is_sgr_mouse_start(&event) {
+                self.candidate.push(event);
+                self.candidate_started_at = Some(Instant::now());
+                Vec::new()
+            } else {
+                vec![event]
+            }
+        } else {
+            self.candidate.push(event);
+            self.decode_candidate()
+        };
+        self.pending.extend(output);
+    }
+
+    fn next(&mut self) -> Option<Event> {
+        self.pending.pop_front()
+    }
+
+    fn push_front(&mut self, event: Event) {
+        self.pending.push_front(event);
+    }
+
+    fn poll_timeout(&self) -> Duration {
+        self.candidate_started_at
+            .map(|started| SGR_MOUSE_SEQUENCE_TIMEOUT.saturating_sub(started.elapsed()))
+            .unwrap_or(TICK)
+    }
+
+    fn flush_candidate(&mut self) -> bool {
+        if self.candidate.is_empty() {
+            return false;
+        }
+        self.pending.extend(self.candidate.drain(..));
+        self.candidate_started_at = None;
+        true
+    }
+
+    fn flush_timed_out_candidate(&mut self) -> bool {
+        let timed_out = self
+            .candidate_started_at
+            .is_some_and(|started| started.elapsed() >= SGR_MOUSE_SEQUENCE_TIMEOUT);
+        timed_out && self.flush_candidate()
+    }
+
+    fn read_ready(&mut self) -> Result<Option<Event>> {
+        self.read_ready_with(|| {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn read_ready_with<F>(&mut self, mut read_event: F) -> Result<Option<Event>>
+    where
+        F: FnMut() -> Result<Option<Event>>,
+    {
+        loop {
+            if let Some(event) = self.next() {
+                return Ok(Some(event));
+            }
+            let Some(event) = read_event()? else {
+                return Ok(None);
+            };
+            self.feed(event);
+        }
+    }
+
+    fn decode_candidate(&mut self) -> Vec<Event> {
+        if self.candidate.len() > MAX_SGR_MOUSE_SEQUENCE_EVENTS {
+            return self.replay_candidate();
+        }
+
+        let Some(chars) = self.candidate[1..]
+            .iter()
+            .map(key_event_char)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return self.replay_candidate();
+        };
+
+        let prefix = ['[', '<'];
+        for (index, expected) in prefix.iter().enumerate() {
+            let Some(actual) = chars.get(index) else {
+                return Vec::new();
+            };
+            if actual != expected {
+                return self.replay_candidate();
+            }
+        }
+
+        let Some(final_char) = chars.last().copied() else {
+            return Vec::new();
+        };
+        if !matches!(final_char, 'M' | 'm') {
+            if chars[2..]
+                .iter()
+                .all(|character| character.is_ascii_digit() || *character == ';')
+            {
+                return Vec::new();
+            }
+            return self.replay_candidate();
+        }
+
+        let Some(mouse) = parse_sgr_mouse(&chars) else {
+            return self.replay_candidate();
+        };
+        self.candidate.clear();
+        self.candidate_started_at = None;
+        vec![Event::Mouse(mouse)]
+    }
+
+    fn replay_candidate(&mut self) -> Vec<Event> {
+        self.candidate_started_at = None;
+        self.candidate.drain(..).collect()
+    }
+}
+
+fn is_sgr_mouse_start(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.code == KeyCode::Esc // keyguard: recognize terminal protocol escape, not an app chord
+                && key.kind == KeyEventKind::Press
+                && key.modifiers == KeyModifiers::NONE
+    )
+}
+
+fn key_event_char(event: &Event) -> Option<char> {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(character), // keyguard: extract terminal protocol byte
+            kind: KeyEventKind::Press,
+            ..
+        }) => Some(*character),
+        _ => None,
+    }
+}
+
+fn parse_sgr_mouse(chars: &[char]) -> Option<MouseEvent> {
+    let final_char = *chars.last()?;
+    let payload: String = chars[2..chars.len().checked_sub(1)?].iter().collect();
+    let payload = payload.strip_suffix(';').unwrap_or(payload.as_str());
+    let fields: Vec<_> = payload.split(';').collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let cb = fields[0].parse::<u8>().ok()?;
+    let column = fields[1].parse::<u16>().ok()?;
+    let row = fields[2].parse::<u16>().ok()?;
+    if column == 0 || row == 0 {
+        return None;
+    }
+
+    let (mut kind, modifiers) = parse_sgr_mouse_button(cb)?;
+    if final_char == 'm'
+        && let MouseEventKind::Down(button) = kind
+    {
+        kind = MouseEventKind::Up(button);
+    }
+
+    Some(MouseEvent {
+        kind,
+        column: column - 1,
+        row: row - 1,
+        modifiers,
+    })
+}
+
+fn parse_sgr_mouse_button(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 == 0b0010_0000;
+    let kind = match (button_number, dragging) {
+        (0, false) => MouseEventKind::Down(MouseButton::Left),
+        (1, false) => MouseEventKind::Down(MouseButton::Middle),
+        (2, false) => MouseEventKind::Down(MouseButton::Right),
+        (0, true) => MouseEventKind::Drag(MouseButton::Left),
+        (1, true) => MouseEventKind::Drag(MouseButton::Middle),
+        (2, true) => MouseEventKind::Drag(MouseButton::Right),
+        (3, false) => MouseEventKind::Up(MouseButton::Left),
+        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        (6, false) => MouseEventKind::ScrollLeft,
+        (7, false) => MouseEventKind::ScrollRight,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::NONE;
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some((kind, modifiers))
+}
+
+/// Returns whether an application-level confirmation modal owns an input event.
+///
+/// Confirmation dialogs sit above every pane and intentionally consume paste
+/// events so text or file paths cannot mutate a hidden composer.
+fn confirmation_modal_owns_event(event: &Event, reload_confirm: bool, quit_confirm: bool) -> bool {
+    matches!(event, Event::Paste(_)) && (reload_confirm || quit_confirm)
+}
 
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
@@ -385,6 +615,7 @@ pub async fn run(
     config_dir: &std::path::Path,
     target: &crate::ConnectTarget,
     owns_ephemeral: bool,
+    initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -397,6 +628,12 @@ pub async fn run(
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
+
+    // Which transport leg the live connection sits on, and when the direct path
+    // was last re-probed. While on the relay leg of a route that also has a
+    // direct address, the loop periodically retries direct and migrates back.
+    let mut active_leg = initial_leg;
+    let mut reprobe_last_attempt: Option<std::time::Instant> = None;
 
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
@@ -466,9 +703,64 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
-    let mut pending_event = None;
+    let mut input_decoder = SgrMouseEventDecoder::default();
 
-    loop {
+    // Adopt a freshly-connected client: rebuild every pane against it (a kept
+    // pane would still hold the dead client's notification receiver) while
+    // carrying the live sessions + agent aliases across the rebuild. Evaluates to
+    // `true` when the rebuild succeeded, `false` when the daemon flapped mid-init
+    // (the caller stays in its current state and retries). Shared by the
+    // disconnect-recovery path and the relay->direct re-probe migration.
+    macro_rules! adopt_client {
+        ($new_client:expr) => {{
+            // Transactional: `rpc` and the panes must always describe the SAME
+            // connection. The new client has to be installed first because the
+            // panes are built against it, so a failed rebuild puts the previous
+            // one back rather than leaving a live `rpc` beside panes that still
+            // hold the old, possibly dead, connection.
+            let previous = Arc::clone(&rpc);
+            rpc = Arc::new($new_client);
+            let resume_chat = (
+                chat_pane.current_session_id().map(String::from),
+                chat_pane.current_agent_alias().map(String::from),
+            );
+            let resume_acp = (
+                acp_pane.current_session_id().map(String::from),
+                acp_pane.current_agent_alias().map(String::from),
+            );
+            match build_panes!(resume_chat, resume_acp) {
+                Ok(mut panes) => {
+                    refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
+                    // Assigned as one tuple: every pane the builder produces is
+                    // adopted, and a pane added to `build_panes!` later cannot
+                    // be left behind on the old client without failing to
+                    // compile here.
+                    (
+                        dashboard_pane,
+                        config_app,
+                        doctor_pane,
+                        acp_pane,
+                        chat_pane,
+                        logs_pane,
+                        quickstart,
+                        sop_pane,
+                    ) = panes;
+                    // No pane holds the replaced connection any more. Nothing
+                    // else would ever stop it: its reader, writer, and relay
+                    // pump are detached tasks with no destructor to reach them.
+                    previous.shutdown();
+                    true
+                }
+                Err(_) => {
+                    let abandoned = std::mem::replace(&mut rpc, previous);
+                    abandoned.shutdown();
+                    false
+                }
+            }
+        }};
+    }
+
+    'event_loop: loop {
         // Draw
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -637,44 +929,29 @@ pub async fn run(
                     // our UID via HMAC signature verification.
                     let prev_id = rpc.tui_id().map(String::from);
                     let prev_sig = rpc.tui_sig().map(String::from);
-                    if let Ok(new_client) = target
+                    // The connect prefers the direct path and falls back to the
+                    // relay, so a reconnect lands on whichever leg is reachable.
+                    if let Ok((new_client, leg)) = target
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
-                        rpc = Arc::new(new_client);
-                        let resume_chat = (
-                            chat_pane.current_session_id().map(String::from),
-                            chat_pane.current_agent_alias().map(String::from),
-                        );
-                        let resume_acp = (
-                            acp_pane.current_session_id().map(String::from),
-                            acp_pane.current_agent_alias().map(String::from),
-                        );
-                        match build_panes!(resume_chat, resume_acp) {
-                            Ok(mut panes) => {
-                                refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
-                                dashboard_pane = panes.0;
-                                config_app = panes.1;
-                                doctor_pane = panes.2;
-                                acp_pane = panes.3;
-                                chat_pane = panes.4;
-                                logs_pane = panes.5;
-                                quickstart = panes.6;
-                                sop_pane = panes.7;
-                                chrome_status.clear();
-                                chrome_status.tick(&rpc);
-                                reconnect_last_attempt = None;
-                                ephemeral_respawn_done = false;
-                                needs_intervention = false;
-                                continue;
-                            }
-                            Err(_) => {
-                                // Daemon flapped again mid-init. Stay in the
-                                // disconnected loop and retry on the next
-                                // throttle window rather than tearing down.
-                                continue;
-                            }
+                        // A reconnect may land on a DIFFERENT leg than the one
+                        // that dropped: direct can fall back to the relay, and a
+                        // relay session can come back direct. The leg is
+                        // committed only once the panes run on that client.
+                        let adopted = adopt_client!(new_client);
+                        active_leg = leg_after_adoption(adopted, active_leg, leg);
+                        if adopted {
+                            chrome_status.clear();
+                            chrome_status.tick(&rpc);
+                            reconnect_last_attempt = None;
+                            ephemeral_respawn_done = false;
+                            needs_intervention = false;
                         }
+                        // Adopted or not, go round again: a failed rebuild means
+                        // the daemon flapped mid-init, and the previous client is
+                        // back in place for the next throttle window.
+                        continue;
                     } else if owns_ephemeral && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
@@ -685,13 +962,55 @@ pub async fn run(
             }
         }
 
-        let input_event = if let Some(pending) = pending_event.take() {
-            pending
-        } else {
-            // Poll for input with a timeout so live panes refresh periodically.
-            if !event::poll(TICK)? {
-                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        // Migrate back to the direct path once it becomes reachable again. Only
+        // runs while live on the relay leg of a route that also has a direct
+        // address; a successful probe adopts the direct client and rebuilds the
+        // panes against it. The probe is throttled and short-timeout, so the
+        // event loop keeps drawing between attempts.
+        if matches!(rpc.connection_state(), ConnectionState::Connected)
+            && active_leg == crate::ActiveLeg::WssRelay
+            && let crate::ConnectTarget::Wss(route) = target
+            && route.reprobe_secs > 0
+            && route.direct_url.is_some()
+        {
+            let now = std::time::Instant::now();
+            let due = reprobe_last_attempt
+                .map(|t| now.duration_since(t) >= Duration::from_secs(route.reprobe_secs))
+                .unwrap_or(true);
+            if due {
+                reprobe_last_attempt = Some(now);
+                let prev_id = rpc.tui_id().map(String::from);
+                let prev_sig = rpc.tui_sig().map(String::from);
+                if let Ok(direct) = route
+                    .connect_direct(prev_id.as_deref(), prev_sig.as_deref())
+                    .await
+                {
+                    // Committed after the rebuild, not before: a probe that
+                    // connects but cannot be adopted leaves the session on the
+                    // relay, and claiming the direct leg there would stop the
+                    // re-probe that is still the only way back.
+                    let adopted = adopt_client!(direct);
+                    active_leg =
+                        leg_after_adoption(adopted, active_leg, crate::ActiveLeg::WssDirect);
                     continue;
+                }
+            }
+        }
+
+        let input_event = loop {
+            if let Some(event) = input_decoder.next() {
+                break event;
+            }
+
+            // Poll for input with a timeout so live panes refresh periodically.
+            // A shorter deadline while an Escape-prefixed sequence is being
+            // assembled keeps an ordinary Escape key responsive.
+            if !event::poll(input_decoder.poll_timeout())? {
+                if input_decoder.flush_timed_out_candidate() {
+                    continue;
+                }
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue 'event_loop;
                 }
                 if mode == Mode::Dashboard {
                     dashboard_pane.tick().await;
@@ -712,18 +1031,21 @@ pub async fn run(
                     &mut chat_pane,
                 )
                 .await;
-                continue;
+                continue 'event_loop;
             }
-            event::read()?
+            input_decoder.feed(event::read()?);
         };
-        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
-            if event::poll(Duration::ZERO)? {
-                Ok(Some(event::read()?))
-            } else {
-                Ok(None)
-            }
-        })?;
-        pending_event = next_pending;
+        let (input_event, next_pending) =
+            coalesce_mouse_drag(input_event, || input_decoder.read_ready())?;
+        if let Some(next_pending) = next_pending {
+            input_decoder.push_front(next_pending);
+        }
+
+        if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
+            // The visible confirmation modal is the authoritative input
+            // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
 
         match input_event {
             Event::Key(key) => {
@@ -1033,6 +1355,27 @@ pub async fn run(
 /// A reconnect rebuilds every pane around the new RPC client. The SOP list is
 /// loaded on focus rather than at construction, so an already-visible SOP pane
 /// must run that same canonical refresh before replacing the disconnected pane.
+/// The transport leg to run with after an adoption attempt.
+///
+/// `connected` is the leg the routing source of truth actually dialled, which is
+/// not necessarily the one that dropped: a direct session reconnects onto the
+/// relay when the direct address is still down, and a relay session can come
+/// back direct. It is committed ONLY when the panes were rebuilt against that
+/// client, because `active_leg` names the connection the panes hold and the
+/// re-probe and failback loops read it to decide what to try next.
+///
+/// Discarding it leaves a direct-to-relay reconnect believing it is still
+/// direct, so the failback loop that would migrate it back never runs; the
+/// mirror case leaves a relay-to-direct reconnect believing it is on the relay,
+/// which re-probes a direct path it is already using.
+fn leg_after_adoption(
+    adopted: bool,
+    current: crate::ActiveLeg,
+    connected: crate::ActiveLeg,
+) -> crate::ActiveLeg {
+    if adopted { connected } else { current }
+}
+
 async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
     if mode == Mode::Sop {
         pane.refresh().await;
@@ -1831,12 +2174,41 @@ mod tests {
     use std::collections::VecDeque;
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        mouse_event_with_modifiers(kind, column, row, KeyModifiers::NONE)
+    }
+
+    fn mouse_event_with_modifiers(
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
             kind,
             column,
             row,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
         })
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn decode_sgr_sequence(sequence: &str) -> Vec<Event> {
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(key_event(KeyCode::Esc));
+        for character in sequence.chars() {
+            decoder.feed(key_event(KeyCode::Char(character)));
+        }
+        std::iter::from_fn(|| decoder.next()).collect()
+    }
+
+    fn split_sgr_events(sequence: &str) -> VecDeque<Event> {
+        sequence
+            .chars()
+            .map(|character| key_event(KeyCode::Char(character)))
+            .collect()
     }
 
     #[test]
@@ -1975,6 +2347,190 @@ mod tests {
         assert_eq!(current, first);
         assert_eq!(pending, None);
         assert!(!read_ahead);
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_vertical_wheel_events() {
+        for (sequence, kind) in [
+            ("[<64;32;17M", MouseEventKind::ScrollUp),
+            ("[<65;32;17M", MouseEventKind::ScrollDown),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 31, 16)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_click_and_release_events() {
+        for (sequence, kind) in [
+            ("[<0;3;4M", MouseEventKind::Down(MouseButton::Left)),
+            ("[<1;3;4M", MouseEventKind::Down(MouseButton::Middle)),
+            ("[<2;3;4M", MouseEventKind::Down(MouseButton::Right)),
+            ("[<3;3;4M", MouseEventKind::Up(MouseButton::Left)),
+            ("[<0;3;4m", MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 2, 3)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_drag_and_movement_events() {
+        for (sequence, kind) in [
+            ("[<32;5;6M", MouseEventKind::Drag(MouseButton::Left)),
+            ("[<33;5;6M", MouseEventKind::Drag(MouseButton::Middle)),
+            ("[<34;5;6M", MouseEventKind::Drag(MouseButton::Right)),
+            ("[<35;5;6M", MouseEventKind::Moved),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 4, 5)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_horizontal_wheel_events() {
+        for (sequence, kind) in [
+            ("[<66;10;11M", MouseEventKind::ScrollLeft),
+            ("[<67;10;11M", MouseEventKind::ScrollRight),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 9, 10)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_preserves_modifiers_and_coordinates() {
+        assert_eq!(
+            decode_sgr_sequence("[<93;1;2M"),
+            vec![mouse_event_with_modifiers(
+                MouseEventKind::ScrollDown,
+                0,
+                1,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            )]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_accepts_optional_delimiter_and_lowercase_release() {
+        assert_eq!(
+            decode_sgr_sequence("[<64;32;17;M"),
+            vec![mouse_event(MouseEventKind::ScrollUp, 31, 16)]
+        );
+        assert_eq!(
+            decode_sgr_sequence("[<0;32;17;m"),
+            vec![mouse_event(MouseEventKind::Up(MouseButton::Left), 31, 16)]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_rejects_multiple_empty_trailing_fields() {
+        let sequence = "[<64;32;17;;M";
+        let expected: Vec<Event> = std::iter::once(key_event(KeyCode::Esc))
+            .chain(
+                sequence
+                    .chars()
+                    .map(|character| key_event(KeyCode::Char(character))),
+            )
+            .collect();
+
+        assert_eq!(decode_sgr_sequence(sequence), expected);
+    }
+
+    #[test]
+    fn drag_read_ahead_reassembles_split_sgr_drag_without_leaking_escape() {
+        let first_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 4, 5);
+        let latest_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 7, 8);
+        let following_key = key_event(KeyCode::Char('x'));
+        let mut queued = VecDeque::from([key_event(KeyCode::Esc)]);
+        queued.extend(split_sgr_events("[<32;8;9M"));
+        queued.push_back(following_key.clone());
+        let mut decoder = SgrMouseEventDecoder::default();
+
+        let (current, pending) = coalesce_mouse_drag(first_drag, || {
+            decoder.read_ready_with(|| Ok(queued.pop_front()))
+        })
+        .expect("reassemble SGR drag during read-ahead");
+
+        assert_eq!(current, latest_drag);
+        assert_eq!(pending, Some(following_key.clone()));
+        assert!(decoder.candidate.is_empty());
+        assert!(queued.is_empty());
+
+        decoder.push_front(pending.expect("preserve following input"));
+        assert_eq!(decoder.next(), Some(following_key));
+    }
+
+    #[test]
+    fn invalid_escape_prefix_is_replayed_in_order() {
+        let original = vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        ];
+        let mut decoder = SgrMouseEventDecoder::default();
+        for event in original.iter().cloned() {
+            decoder.feed(event);
+        }
+
+        let decoded: Vec<Event> = std::iter::from_fn(|| decoder.next()).collect();
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn incomplete_escape_flush_preserves_the_escape_key() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+
+        assert_eq!(decoder.next(), None);
+        assert!(decoder.flush_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn delayed_input_flushes_an_expired_escape_before_the_next_tick() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+        decoder.candidate_started_at = Some(Instant::now() - SGR_MOUSE_SEQUENCE_TIMEOUT);
+
+        assert_eq!(decoder.poll_timeout(), Duration::ZERO);
+        assert!(decoder.flush_timed_out_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn confirmation_modals_consume_text_and_path_paste_before_pane_dispatch() {
+        let paste_payloads = ["hidden composer text", "/tmp/hidden-attachment.txt"];
+        let modal_states = [(true, false), (false, true), (true, true)];
+
+        for (reload_confirm, quit_confirm) in modal_states {
+            for payload in paste_payloads {
+                // Both plain text and path-shaped paste must stop at the
+                // application modal boundary before any pane sees the value.
+                let event = Event::Paste(payload.to_owned());
+                assert!(confirmation_modal_owns_event(
+                    &event,
+                    reload_confirm,
+                    quit_confirm
+                ));
+            }
+        }
+
+        assert!(!confirmation_modal_owns_event(
+            &Event::Paste("visible composer text".to_owned()),
+            false,
+            false
+        ));
+        assert!(!confirmation_modal_owns_event(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -2369,5 +2925,71 @@ mod tests {
             Some("scout".into())
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+}
+
+#[cfg(test)]
+mod transport_leg_tests {
+    //! What the reconnect and failback paths do with the leg the routing source
+    //! of truth returns.
+    //!
+    //! `active_leg` is not decoration: the failback loop runs only while it says
+    //! `WssRelay`, so a leg that is dropped or committed early silently disables
+    //! the migration back to the direct path.
+
+    use super::leg_after_adoption;
+    use crate::ActiveLeg;
+
+    /// A direct session whose address is still down reconnects onto the relay.
+    /// Keeping `WssDirect` here is what stops the failback loop from ever
+    /// running, stranding the session on the relay for the rest of its life.
+    #[test]
+    fn a_direct_session_that_reconnects_on_the_relay_commits_the_relay_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssDirect, ActiveLeg::WssRelay);
+
+        assert_eq!(leg, ActiveLeg::WssRelay);
+        assert!(
+            leg == ActiveLeg::WssRelay,
+            "the failback loop's precondition must now hold"
+        );
+    }
+
+    /// The mirror case: a relay session that comes back on the direct path must
+    /// stop re-probing a direct address it is already using.
+    #[test]
+    fn a_relay_session_that_reconnects_direct_commits_the_direct_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssRelay, ActiveLeg::WssDirect);
+
+        assert_eq!(leg, ActiveLeg::WssDirect);
+        assert!(
+            leg != ActiveLeg::WssRelay,
+            "a direct session must not keep re-probing the path it is on"
+        );
+    }
+
+    /// A connection that could not be adopted is not the connection the panes
+    /// hold, so its leg must not be committed: the session is still on the old
+    /// one and must keep behaving that way.
+    #[test]
+    fn a_failed_adoption_keeps_the_leg_it_is_still_running_on() {
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssRelay, ActiveLeg::WssDirect),
+            ActiveLeg::WssRelay,
+            "a failed direct migration must leave the session on the relay"
+        );
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssDirect, ActiveLeg::WssRelay),
+            ActiveLeg::WssDirect
+        );
+    }
+
+    /// The local socket has no legs to migrate between; adoption must not
+    /// invent one.
+    #[test]
+    fn a_local_session_keeps_its_leg() {
+        assert_eq!(
+            leg_after_adoption(true, ActiveLeg::Local, ActiveLeg::Local),
+            ActiveLeg::Local
+        );
     }
 }
