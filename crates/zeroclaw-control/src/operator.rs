@@ -1825,7 +1825,7 @@ mod tests {
         .expect_err("an operator the requester may reach must be ineligible");
         assert_eq!(err.code, OperatorErrorCode::OperatorIneligible);
         assert!(
-            err.detail.contains("distinct_os_account"),
+            err.detail.contains("operator_ambient_authority"),
             "the refusal must name the missing proof: {}",
             err.detail
         );

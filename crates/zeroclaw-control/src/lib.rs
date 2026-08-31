@@ -39,6 +39,7 @@ pub mod registry;
 pub mod registry_store;
 mod service;
 mod session;
+pub mod spawn;
 pub mod store;
 #[cfg(test)]
 mod test_support;
@@ -104,7 +105,11 @@ pub use proposal::{
     AgentProposal, PROPOSAL_MARKER, PersonalityFileProposal, ProposalError, ProposalErrorCode,
     ValidatedProposal, parse_proposal, revalidate_proposal, validate_proposal,
 };
-pub use reachability::{Evidence, IsolationQuestion, Reachability};
+pub use reachability::{
+    BackchannelKind, BackchannelOwnership, DirectoryFacts, Evidence, GatheredPlatform,
+    InspectedGrant, IsolationQuestion, LocalDaemonProofs, Reachability, RequesterOrigin,
+    RequesterPrivilege, SocketFacts, TtyFacts, UnixSocketKind,
+};
 pub use recovery::{RecoveryAction, RecoveryReport, VerifyReport, recover, verify};
 pub use registry_store::{RegistryStoreError, RegistryStoreErrorCode};
 pub use service::{
@@ -112,6 +117,10 @@ pub use service::{
     source_schema_is_current,
 };
 pub use session::{MAX_OPERATOR_TURNS, SessionError, SessionErrorCode, SessionTurn, ZeronaSession};
+pub use spawn::{
+    LandlockAllowlist, MountDenials, NamespaceDenials, SeccompDenials, SpawnIsolation,
+    SpawnPrivilegeFacts, SpawnProcessFacts, SpawnSandboxPolicy,
+};
 pub use store::{ControlPaths, StoreError, StoreErrorCode};
 
 /// A user-facing localization request. The CLI owns the Fluent catalogue and
