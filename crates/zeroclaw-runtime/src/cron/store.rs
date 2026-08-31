@@ -1333,6 +1333,7 @@ pub fn sync_declarative_jobs(
     // Validate declarations before touching the DB.
     for (id, decl) in decls {
         validate_decl(id, decl)?;
+        validate_sole_owner(config, id)?;
     }
 
     let now = Utc::now();
@@ -1532,6 +1533,34 @@ pub fn sync_declarative_jobs(
 }
 
 /// Validate a declarative cron job definition.
+/// Reject a declarative job that more than one enabled agent claims.
+///
+/// Caught here as well as at execution time so the failure surfaces at daemon
+/// start rather than at first fire. Ownership decides which allowlist,
+/// workspace, autonomy level, and action budget a scheduled command runs
+/// under, and `Config::agents` is a `HashMap`, so leaving two claimants in
+/// place would let map order pick the security policy and let a restart change
+/// it. Zero owners is not rejected here: a job can legitimately be declared
+/// before an agent adopts it, and execution refuses it anyway.
+///
+/// Like every other check in this validation pass, an error aborts the whole
+/// sync rather than skipping one job. That is deliberate and matches the
+/// existing contract, but it does mean one ambiguous job holds back every
+/// declarative job until the config is fixed.
+fn validate_sole_owner(config: &Config, id: &str) -> Result<()> {
+    let owners = super::enabled_cron_owners(config, id);
+    if owners.len() > 1 {
+        anyhow::bail!(
+            "Declarative cron job '{id}': claimed by {count} enabled agents ({owners}); \
+             exactly one agent must list it in [agents.<x>].cron_jobs so the job runs \
+             under a determinate security policy",
+            count = owners.len(),
+            owners = owners.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Result<()> {
     if id.trim().is_empty() {
         anyhow::bail!("Declarative cron job has empty id");
@@ -3720,6 +3749,89 @@ command = "test -f /var/run/sync.ready"
                 .values()
                 .all(|decl| decl.pre_hook.is_some() || decl.command.is_some())
         );
+    }
+
+    /// Add an enabled agent that claims `cron_alias`.
+    fn add_owner(config: &mut Config, alias: &str, cron_alias: &str) {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                cron_jobs: vec![cron_alias.to_string()],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn validate_sole_owner_rejects_two_enabled_claimants() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        add_owner(&mut config, "beta", "nightly");
+
+        let err = validate_sole_owner(&config, "nightly")
+            .expect_err("two enabled owners must not validate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claimed by 2 enabled agents"),
+            "unexpected: {msg}"
+        );
+        // Both claimants are named so the operator knows what to change.
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_sole_owner_accepts_one_owner_and_tolerates_none() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        assert!(validate_sole_owner(&config, "nightly").is_ok());
+
+        // A job nobody has adopted yet is not a validation error: execution
+        // refuses it, and rejecting here would block declaring a job before
+        // wiring up its agent.
+        assert!(validate_sole_owner(&config, "unclaimed").is_ok());
+    }
+
+    #[test]
+    fn validate_sole_owner_ignores_disabled_claimants() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        add_owner(&mut config, "retired", "nightly");
+        config
+            .agents
+            .get_mut("retired")
+            .expect("agent exists")
+            .enabled = false;
+
+        assert!(
+            validate_sole_owner(&config, "nightly").is_ok(),
+            "a disabled claimant is not a competing owner"
+        );
+    }
+
+    #[test]
+    fn sync_declarative_jobs_refuses_an_ambiguously_owned_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        add_owner(&mut config, "alpha", "contested");
+        add_owner(&mut config, "beta", "contested");
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            job_type: "shell".to_string(),
+            command: Some("echo hi".to_string()),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            ..Default::default()
+        };
+        let decls = decls_map(vec![("contested".to_string(), decl)]);
+
+        let err = sync_declarative_jobs(&config, &decls)
+            .expect_err("sync must refuse an ambiguously owned job");
+        assert!(err.to_string().contains("claimed by 2 enabled agents"));
     }
 
     #[test]

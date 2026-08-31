@@ -643,23 +643,6 @@ pub async fn run(
     }
 }
 
-/// Every enabled agent that lists `job_id` in its `cron_jobs`, sorted.
-///
-/// `Config::agents` is a `HashMap`, so "the first match" is whatever the map
-/// happens to yield. Collecting and sorting makes the set observable and the
-/// order stable, which is what lets the caller refuse an ambiguous owner
-/// instead of silently picking one.
-fn enabled_cron_owners<'a>(config: &'a Config, job_id: &str) -> Vec<&'a str> {
-    let mut owners: Vec<&str> = config
-        .agents
-        .iter()
-        .filter(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == job_id))
-        .map(|(alias, _)| alias.as_str())
-        .collect();
-    owners.sort_unstable();
-    owners
-}
-
 /// Resolve the single agent whose security policy a job executes under.
 ///
 /// Fails closed on ambiguity. If two enabled agents claim the same cron alias
@@ -670,7 +653,7 @@ fn enabled_cron_owners<'a>(config: &'a Config, job_id: &str) -> Vec<&'a str> {
 /// config error the operator has to resolve, not something to guess at,
 /// especially now that the job carries a config-declared `pre_hook`.
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Result<&'a str, String> {
-    let owners = enabled_cron_owners(config, &job.id);
+    let owners = super::enabled_cron_owners(config, &job.id);
     if owners.len() > 1 {
         return Err(format!(
             "cron job {id:?} is claimed by {count} enabled agents ({owners}); \
