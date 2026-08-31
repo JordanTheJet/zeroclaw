@@ -643,7 +643,45 @@ pub async fn run(
     }
 }
 
-fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
+/// Every enabled agent that lists `job_id` in its `cron_jobs`, sorted.
+///
+/// `Config::agents` is a `HashMap`, so "the first match" is whatever the map
+/// happens to yield. Collecting and sorting makes the set observable and the
+/// order stable, which is what lets the caller refuse an ambiguous owner
+/// instead of silently picking one.
+fn enabled_cron_owners<'a>(config: &'a Config, job_id: &str) -> Vec<&'a str> {
+    let mut owners: Vec<&str> = config
+        .agents
+        .iter()
+        .filter(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == job_id))
+        .map(|(alias, _)| alias.as_str())
+        .collect();
+    owners.sort_unstable();
+    owners
+}
+
+/// Resolve the single agent whose security policy a job executes under.
+///
+/// Fails closed on ambiguity. If two enabled agents claim the same cron alias
+/// there is no principled way to choose between them, and picking either would
+/// let `HashMap` iteration order decide which allowlist, workspace, autonomy
+/// level, and action budget a scheduled command runs under -- an order that can
+/// change across a restart with no configuration change at all. That is a
+/// config error the operator has to resolve, not something to guess at,
+/// especially now that the job carries a config-declared `pre_hook`.
+fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Result<&'a str, String> {
+    let owners = enabled_cron_owners(config, &job.id);
+    if owners.len() > 1 {
+        return Err(format!(
+            "cron job {id:?} is claimed by {count} enabled agents ({owners}); \
+             exactly one agent must list it in [agents.<x>].cron_jobs so the \
+             job runs under a determinate security policy",
+            id = job.id,
+            count = owners.len(),
+            owners = owners.join(", ")
+        ));
+    }
+
     // A declarative job's owner is whichever agent lists it in `cron_jobs`
     // today, not whichever alias happened to be stored when the row was first
     // synced. The stored alias is not refreshed when config membership moves,
@@ -651,9 +689,9 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
     // under the previous owner's allowed commands, workspace roots, autonomy,
     // and action budget. Live config is the source of truth here.
     if job.source == "declarative"
-        && let Some(alias) = config.agent_for_cron_job(&job.id)
+        && let Some(alias) = owners.first()
     {
-        return Some(alias);
+        return Ok(alias);
     }
 
     if !job.agent_alias.is_empty()
@@ -662,9 +700,15 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
             .iter()
             .find(|(alias, _)| alias.as_str() == job.agent_alias)
     {
-        return Some(alias.as_str());
+        return Ok(alias.as_str());
     }
-    config.agent_for_cron_job(&job.id)
+
+    owners.first().copied().ok_or_else(|| {
+        format!(
+            "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+            id = job.id
+        )
+    })
 }
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
@@ -799,14 +843,9 @@ async fn execute_job_now_with_runtime(
         );
     }
     use zeroclaw_log::Instrument;
-    let Some(agent_alias) = resolve_owning_agent(config, job) else {
-        return CronRunOutcome::executed(
-            false,
-            format!(
-                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
-                id = job.id
-            ),
-        );
+    let agent_alias = match resolve_owning_agent(config, job) {
+        Ok(alias) => alias,
+        Err(reason) => return CronRunOutcome::executed(false, reason),
     };
     let agent_alias = agent_alias.to_string();
     let security = match cron_security_policy(config, &agent_alias) {
@@ -1030,10 +1069,13 @@ async fn process_due_jobs(
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
-            let _ = release_job(config, &job.id);
-            return None;
+        let agent_alias = match resolve_owning_agent(config, &job) {
+            Ok(alias) => alias,
+            Err(reason) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "reason": reason})), "Cron job owner unresolved; refusing to run");
+                let _ = release_job(config, &job.id);
+                return None;
+            }
         };
         let agent_alias = agent_alias.to_owned();
         let security = match cron_security_policy(config, &agent_alias) {
@@ -4180,6 +4222,89 @@ mod tests {
         );
     }
 
+    /// Register a second enabled agent that also claims `cron_alias`.
+    fn add_rival_owner(config: &mut Config, alias: &str, cron_alias: &str) {
+        config.risk_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.providers.models.openrouter.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+        );
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{alias}").into(),
+                risk_profile: alias.into(),
+                runtime_profile: alias.into(),
+                cron_jobs: vec![cron_alias.to_string()],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn two_enabled_owners_refuse_to_resolve_instead_of_picking_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "contested", "exit 0", 30);
+
+        // A second enabled agent now claims the same alias. `Config::agents` is
+        // a HashMap, so "first match" would be decided by map order and could
+        // change across a restart, silently moving the job (and its
+        // config-declared hook) to a different security authority.
+        add_rival_owner(&mut config, "rival-owner", "contested");
+
+        let resolved = resolve_owning_agent(&config, &job);
+        assert!(
+            resolved.is_err(),
+            "ambiguous ownership must not resolve to an arbitrary agent, got {resolved:?}"
+        );
+        let reason = resolved.unwrap_err();
+        assert!(
+            reason.contains("claimed by 2 enabled agents"),
+            "unexpected: {reason}"
+        );
+        // Both claimants are named so the operator can fix the config.
+        assert!(reason.contains(TEST_AGENT) && reason.contains("rival-owner"));
+
+        // And the run refuses rather than executing under a coin-flip policy.
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        assert!(!result.success);
+        assert!(
+            !body_ran(&result),
+            "an unresolved owner must not run the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_rival_owner_does_not_make_ownership_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "one-live-owner", "exit 0", 30);
+
+        add_rival_owner(&mut config, "disabled-rival", "one-live-owner");
+        config
+            .agents
+            .get_mut("disabled-rival")
+            .expect("rival exists")
+            .enabled = false;
+
+        // Only enabled agents can own a job, so a disabled claimant is not a
+        // competing owner and resolution stays determinate.
+        assert_eq!(
+            resolve_owning_agent(&config, &job).as_deref(),
+            Ok(TEST_AGENT)
+        );
+    }
+
     #[tokio::test]
     async fn imperative_jobs_still_resolve_through_their_stored_alias() {
         let tmp = TempDir::new().unwrap();
@@ -4188,7 +4313,10 @@ mod tests {
 
         // Imperative rows carry their owner on the row; live `cron_jobs`
         // membership does not name them, so the stored alias must still win.
-        assert_eq!(resolve_owning_agent(&config, &job), Some(TEST_AGENT));
+        assert_eq!(
+            resolve_owning_agent(&config, &job).as_deref(),
+            Ok(TEST_AGENT)
+        );
     }
 
     // ── Startup recovery must not mutate a claimed row ───────────────
