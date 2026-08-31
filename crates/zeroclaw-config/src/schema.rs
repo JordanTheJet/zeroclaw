@@ -3801,13 +3801,15 @@ pub struct AliasedAgentConfig {
     /// denied outright, because the sandbox is built from the workspace
     /// dir alone and does not yet receive allowlist tiers. That denial is
     /// fail-closed, an availability gap, tracked by the open sandbox
-    /// tier-propagation PR. With the sandbox
-    /// disabled or pass-through, the shell's static argument scan accepts
-    /// a resolved path allowed for reading OR for writing, so this
-    /// read-only tier does not by itself stop a shell redirect writing
-    /// into `shared/`; that is a pre-existing property of every read-only
-    /// root (the `shared/skills/` wire included), and the OS sandbox, not
-    /// the tier, is the real write boundary for shell.
+    /// tier-propagation PR. With the sandbox disabled or pass-through, the
+    /// static argument scan is the only remaining boundary: a shell
+    /// REDIRECT target must belong to a write tier, so a redirect writing
+    /// into `shared/` is refused even with this flag on, and the same rule
+    /// covers every read-only root including the `shared/skills/` wire.
+    /// The residual limit is positional: for a non-redirect argument the
+    /// scan cannot tell a read from a write, so such an argument is still
+    /// accepted when the target is readable, and the OS sandbox remains
+    /// the complete write boundary for shell.
     ///
     /// Discoverability: glob-style path search goes through
     /// `SecurityPolicy::is_under_allowed_root`, which deliberately ignores

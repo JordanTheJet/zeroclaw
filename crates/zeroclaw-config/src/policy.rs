@@ -1390,10 +1390,32 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// Which way a shell redirection moves data.
+///
+/// The direction decides which policy tier the target must satisfy. A target
+/// that is only ever read (`<`) needs read access; a target that receives data
+/// (`>`, `>>`, `&>`) is a write and must sit on a tier that grants writes.
+/// `<>` opens the target read-write and counts as a write so the check fails
+/// closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RedirectionDirection {
+    Read,
+    Write,
+}
+
 enum RedirectionArgument<'a> {
-    Target { prefix: &'a str, target: &'a str },
-    NeedsNextToken { prefix: &'a str },
-    FdOnly { prefix: &'a str },
+    Target {
+        prefix: &'a str,
+        target: &'a str,
+        direction: RedirectionDirection,
+    },
+    NeedsNextToken {
+        prefix: &'a str,
+        direction: RedirectionDirection,
+    },
+    FdOnly {
+        prefix: &'a str,
+    },
     None,
 }
 
@@ -1402,6 +1424,21 @@ fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
         return RedirectionArgument::None;
     };
     let prefix = token[..marker_idx].trim();
+    // Direction comes from the contiguous run of redirection markers, not just
+    // the first one: `>>` and `&>` write, `<` reads, and `<>` (read-write) is
+    // classified as a write so the stricter tier applies.
+    let marker_run = {
+        let tail = &token[marker_idx..];
+        let end = tail
+            .find(|c: char| c != '<' && c != '>')
+            .unwrap_or(tail.len());
+        &tail[..end]
+    };
+    let direction = if marker_run.contains('>') {
+        RedirectionDirection::Write
+    } else {
+        RedirectionDirection::Read
+    };
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
     if let Some(after_amp) = rest.strip_prefix('&') {
@@ -1414,11 +1451,12 @@ fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        RedirectionArgument::NeedsNextToken { prefix }
+        RedirectionArgument::NeedsNextToken { prefix, direction }
     } else {
         RedirectionArgument::Target {
             prefix,
             target: trimmed,
+            direction,
         }
     }
 }
@@ -2641,6 +2679,43 @@ impl SecurityPolicy {
             }
             None
         };
+        // A redirect target that RECEIVES data is a write, so readability is
+        // not enough for it: it must sit on a tier that grants writes. This is
+        // unconditional and does not consult the sandbox, because the
+        // configurations that motivate it are exactly the ones with no
+        // enforcing sandbox to consult - `NoopSandbox`, an explicit `none`, and
+        // a failed auto-detection all execute the command unchanged. Checking
+        // here keeps the boundary in one place instead of splitting it across
+        // every sandbox backend.
+        let forbidden_write_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if !looks_like_path_for_shell(candidate, dialect) {
+                return None;
+            }
+            // Subsumes the read-tier string check: this returns false whenever
+            // `is_path_allowed_for_shell` does, and additionally rejects a
+            // target that is merely readable.
+            if !self.is_write_target_allowed_for_shell(candidate, dialect) {
+                return Some(candidate.to_string());
+            }
+            // Same symlink re-check as `forbidden_candidate`, minus the
+            // readable fallback: the resolved target must be writable.
+            if resolve_workspace {
+                match self.resolve_command_path_argument(candidate, dialect) {
+                    Some(resolved) if self.is_resolved_path_allowed(&resolved) => {}
+                    _ => return Some(candidate.to_string()),
+                }
+            }
+            None
+        };
+        let forbidden_redirect_target =
+            |target: &str, direction: RedirectionDirection| match direction {
+                RedirectionDirection::Write => forbidden_write_candidate(target),
+                RedirectionDirection::Read => forbidden_candidate(target),
+            };
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -2689,18 +2764,20 @@ impl SecurityPolicy {
             }
 
             let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
-            let mut next_is_redirect_target = false;
+            let mut next_redirect_direction: Option<RedirectionDirection> = None;
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
-                RedirectionArgument::Target { target, .. } => {
+                RedirectionArgument::Target {
+                    target, direction, ..
+                } => {
                     if !is_safe_device_redirect_target(target, dialect)
-                        && let Some(blocked) = forbidden_candidate(target)
+                        && let Some(blocked) = forbidden_redirect_target(target, direction)
                     {
                         return Some(blocked);
                     }
                 }
-                RedirectionArgument::NeedsNextToken { .. } => {
-                    next_is_redirect_target = true;
+                RedirectionArgument::NeedsNextToken { direction, .. } => {
+                    next_redirect_direction = Some(direction);
                 }
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
@@ -2711,12 +2788,11 @@ impl SecurityPolicy {
                     continue;
                 }
 
-                if next_is_redirect_target {
-                    next_is_redirect_target = false;
+                if let Some(direction) = next_redirect_direction.take() {
                     if is_safe_device_redirect_target(candidate, dialect) {
                         continue;
                     }
-                    if let Some(blocked) = forbidden_candidate(candidate) {
+                    if let Some(blocked) = forbidden_redirect_target(candidate, direction) {
                         return Some(blocked);
                     }
                     continue;
@@ -2727,22 +2803,26 @@ impl SecurityPolicy {
                 }
 
                 match parse_redirection_argument(candidate) {
-                    RedirectionArgument::Target { prefix, target } => {
+                    RedirectionArgument::Target {
+                        prefix,
+                        target,
+                        direction,
+                    } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
                         }
                         if is_safe_device_redirect_target(target, dialect) {
                             continue;
                         }
-                        if let Some(blocked) = forbidden_candidate(target) {
+                        if let Some(blocked) = forbidden_redirect_target(target, direction) {
                             return Some(blocked);
                         }
                     }
-                    RedirectionArgument::NeedsNextToken { prefix } => {
+                    RedirectionArgument::NeedsNextToken { prefix, direction } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
                         }
-                        next_is_redirect_target = true;
+                        next_redirect_direction = Some(direction);
                         continue;
                     }
                     RedirectionArgument::FdOnly { prefix } => {
@@ -2854,6 +2934,62 @@ impl SecurityPolicy {
         }
 
         self.is_path_allowed(&normalized)
+    }
+
+    /// Write-shaped counterpart to [`SecurityPolicy::is_path_allowed_for_shell`]:
+    /// is `path` on a tier that grants WRITES?
+    ///
+    /// Deliberately narrower than the read check, and it only ever ADDS a
+    /// denial. `is_path_allowed` treats membership in any tier as sufficient,
+    /// including `allowed_roots_read_only`. That is right for an argument that
+    /// may only be read, and wrong for one that is about to be written: it
+    /// would let a read grant be spent as a write. So a path inside a read-only
+    /// root is rejected here unless it is ALSO inside the workspace, an
+    /// `allowed_roots` entry, or an `allowed_roots_write_only` entry.
+    ///
+    /// Only absolute paths can be placed by the string tier. A relative target
+    /// is left to the caller's resolved check, which joins it onto the
+    /// workspace before testing.
+    fn is_write_target_allowed_for_shell(&self, path: &str, dialect: ShellDialect) -> bool {
+        if !self.is_path_allowed_for_shell(path, dialect) {
+            return false;
+        }
+
+        let normalized;
+        let path = if shell_uses_windows_path_syntax(dialect) {
+            normalized = path.replace('\\', "/");
+            normalized.as_str()
+        } else {
+            path
+        };
+        let expanded = expand_user_path(path);
+
+        // The null device is a legitimate write sink on every host, matching
+        // `is_path_allowed` and `is_resolved_path_allowed`.
+        if is_null_device(&expanded) {
+            return true;
+        }
+        if !expanded.is_absolute() {
+            return true;
+        }
+
+        let in_read_only_root = self
+            .allowed_roots_read_only
+            .iter()
+            .any(|root| expanded.starts_with(root));
+        if !in_read_only_root {
+            return true;
+        }
+
+        expanded.starts_with(&self.workspace_dir)
+            || self
+                .allowed_roots
+                .iter()
+                .any(|root| expanded.starts_with(root))
+            || self
+                .allowed_roots_write_only
+                .iter()
+                .any(|root| expanded.starts_with(root))
     }
 
     /// Resolve a shell command path argument to the canonical target used for
@@ -3538,19 +3674,30 @@ impl SecurityPolicy {
             //     widening. Tier propagation into the sandbox backends is
             //     a separate runtime change, tracked by the open sandbox tier-propagation PR.
             //
-            // (b) Under a DISABLED or pass-through sandbox, the shell's
-            //     static argument scan accepts a resolved path that is
-            //     allowed for reading OR for writing (`is_resolved_path_allowed`
-            //     || `is_resolved_path_readable`, earlier in this file), so
-            //     this read-only tier does not by itself stop a shell
-            //     redirect writing into `shared/`. That is a pre-existing,
-            //     deliberate property of EVERY read-only root — it already
-            //     applies to the `shared/skills/` wire pushed above on
-            //     master — and the scan's own comment says as much: a full
-            //     boundary needs the execution-time sandbox. The OS
-            //     sandbox, not this tier, is the real write boundary for
-            //     shell. The tier remains the boundary for the file tools,
-            //     which is what this flag governs.
+            // (b) Under a DISABLED or pass-through sandbox, the command
+            //     still runs unchanged, so the static argument scan is the
+            //     only boundary left. For the write-shaped position that
+            //     scan CAN identify, the shell redirect target, it now
+            //     requires membership in a WRITE tier
+            //     (`is_write_target_allowed_for_shell` plus
+            //     `is_resolved_path_allowed`, without the readable
+            //     fallback), so this read-only tier does stop a redirect
+            //     writing into `shared/`. That rule is unconditional: it
+            //     does not consult the sandbox, and it closes the same hole
+            //     for every read-only root, the `shared/skills/` wire
+            //     pushed above included.
+            //
+            //     The residual limit is positional, not tiered. For a
+            //     NON-redirect argument the scan cannot tell a read from a
+            //     write (`cp a shared/x` and `cat shared/x` are the same
+            //     shape to a command-agnostic scanner), so such an argument
+            //     is still accepted when the target is merely readable.
+            //     Closing that would require denying reads too, which would
+            //     defeat the point of the grant. The OS sandbox remains the
+            //     complete write boundary for shell; this tier is now an
+            //     enforced boundary for redirects specifically, and remains
+            //     the boundary for the file tools, which is what this flag
+            //     governs.
             //
             // Discoverability: `is_under_allowed_root` (glob-style path
             // search) deliberately reads only the read-write and
@@ -6982,6 +7129,182 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A read-only root grants READS. A shell redirect WRITES, so the target
+    /// must be on a write tier: being merely readable is not enough. Without
+    /// this, a read-only grant over `<install>/shared/` is spendable as a write
+    /// whenever no enforcing sandbox is active, because `NoopSandbox`, an
+    /// explicit `none` backend, and a failed auto-detection all run the command
+    /// unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn redirect_into_read_only_root_requires_write_tier() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_ro_redirect_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let shared = root.join("shared_readonly");
+        let skills = shared.join("skills");
+        let writable = root.join("writable_root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::write(shared.join("data.txt"), b"x").unwrap();
+        std::fs::write(skills.join("run.sh"), b"x").unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![writable.clone()],
+            allowed_roots_read_only: vec![shared.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Every write-shaped redirect form into the read-only root is blocked:
+        // overwrite of an existing file, creation of a new one, append, the
+        // inline (no-space) form, and the `shared/skills/` subtree that the
+        // code-enforced skills wire already exposed.
+        let blocked = [
+            format!("echo pwned > {}/data.txt", shared.display()),
+            format!("echo pwned > {}/new.txt", shared.display()),
+            format!("echo pwned >> {}/data.txt", shared.display()),
+            format!("echo pwned>{}/data.txt", shared.display()),
+            format!("echo pwned > {}/run.sh", skills.display()),
+            format!("echo pwned > {}/new_skill.sh", skills.display()),
+            format!("echo pwned 2> {}/err.log", shared.display()),
+            format!("echo pwned &> {}/both.log", shared.display()),
+        ];
+        for cmd in &blocked {
+            assert!(
+                policy.forbidden_workspace_path_argument(cmd).is_some(),
+                "a write-shaped redirect into a read-only root must be blocked: {cmd}"
+            );
+        }
+
+        // A workspace-relative target that reaches the read-only root through
+        // an in-workspace symlink exercises the RESOLVED half of the guard: the
+        // string tier cannot place a relative path, so only the resolved check
+        // (write tier, no readable fallback) can catch this one.
+        symlink(&shared, workspace.join("ro_link")).unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("echo pwned > ro_link/data.txt")
+                .is_some(),
+            "a redirect reaching a read-only root through a symlink must be blocked"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("cat < ro_link/data.txt"),
+            None,
+            "reading through that same symlink must remain allowed"
+        );
+
+        // Reads must be untouched: the direction is what changed, not the tier.
+        let allowed_reads = [
+            format!("cat {}/data.txt", shared.display()),
+            format!("cat < {}/data.txt", shared.display()),
+            format!("cat<{}/data.txt", shared.display()),
+            format!("sort < {}/data.txt", skills.display()),
+        ];
+        for cmd in &allowed_reads {
+            assert_eq!(
+                policy.forbidden_workspace_path_argument(cmd),
+                None,
+                "reading under a read-only root must remain allowed: {cmd}"
+            );
+        }
+
+        // No over-blocking of writes that were always legitimate.
+        let allowed_writes = [
+            "echo hi > out.txt".to_string(),
+            "echo hi > sub/out.txt".to_string(),
+            format!("echo hi > {}/out.txt", workspace.display()),
+            format!("echo hi > {}/out.txt", writable.display()),
+            "echo hi > /dev/null".to_string(),
+            "echo hi 2>/dev/null".to_string(),
+            "echo hi 2>&1".to_string(),
+        ];
+        for cmd in &allowed_writes {
+            assert_eq!(
+                policy.forbidden_workspace_path_argument(cmd),
+                None,
+                "a write to a write-tier target must remain allowed: {cmd}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The string-only variant (cron, whose cwd is not the workspace) enforces
+    /// the same direction rule for absolute targets.
+    #[cfg(unix)]
+    #[test]
+    fn string_only_scan_blocks_redirect_into_read_only_root() {
+        let shared = PathBuf::from("/shared-ro");
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            allowed_roots_read_only: vec![shared.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy
+                .forbidden_path_argument("echo pwned > /shared-ro/data.txt")
+                .as_deref(),
+            Some("/shared-ro/data.txt"),
+            "the string-only scan must block a write into a read-only root"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument("cat /shared-ro/data.txt"),
+            None,
+            "the string-only scan must still allow reads there"
+        );
+    }
+
+    /// `<>` opens its target read-write, so it is classified as a write and
+    /// fails closed rather than passing as a read.
+    #[test]
+    fn read_write_redirect_direction_is_classified_as_write() {
+        assert!(matches!(
+            parse_redirection_argument("<>file.txt"),
+            RedirectionArgument::Target {
+                direction: RedirectionDirection::Write,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_redirection_argument("<file.txt"),
+            RedirectionArgument::Target {
+                direction: RedirectionDirection::Read,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_redirection_argument(">>file.txt"),
+            RedirectionArgument::Target {
+                direction: RedirectionDirection::Write,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_redirection_argument("2>"),
+            RedirectionArgument::NeedsNextToken {
+                direction: RedirectionDirection::Write,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_redirection_argument("<"),
+            RedirectionArgument::NeedsNextToken {
+                direction: RedirectionDirection::Read,
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]
