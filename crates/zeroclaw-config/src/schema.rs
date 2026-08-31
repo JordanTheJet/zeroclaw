@@ -15,6 +15,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
 use tokio::fs::File;
@@ -69,8 +70,14 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 ];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
-static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
+static RUNTIME_PROXY_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyCachedClient>>> =
     OnceLock::new();
+
+struct RuntimeProxyCachedClient {
+    generation: u64,
+    client: reqwest::Client,
+}
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -321,6 +328,18 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub wss: WssConfig,
+
+    /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub relay: RelayConfig,
+
+    /// Certificate enrollment endpoint for certless clients (`[enroll]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub enroll: EnrollConfig,
 
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
@@ -1215,7 +1234,7 @@ pub struct QwenModelProviderConfig {
     pub base: ModelProviderConfig,
     #[serde(default)]
     pub endpoint: QwenEndpoint,
-    /// Auth flow. Defaults to `api_key`; set to `oauth` to use the vendor's
+    /// Auth flow. Defaults to `api_key`; set to `o_auth` to use the vendor's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
@@ -2644,7 +2663,7 @@ pub struct GeminiModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiModelProvider's
+    /// Auth flow. Defaults to `api_key`; `o_auth` uses GeminiModelProvider's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
@@ -3237,6 +3256,45 @@ impl FamilyEndpoint for KiloModelProviderConfig {
     }
 }
 
+// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ──
+
+/// ZeroRouter endpoint. ZeroRouter is a family of independently operated
+/// routers, so there is no canonical hosted default: the single variant
+/// points at the router container's own bind
+/// (`ZEROROUTER_BIND=0.0.0.0:8080`). A hosted deployment does run at
+/// `https://zerorouter.ai`, but it is one deployment among many rather than
+/// the family default, so operators reaching it — or any other remote
+/// router — set `base.uri`. [`ZEROROUTER_DEFAULT_URL`] is the canonical
+/// family default consumed by both schema and provider construction.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZerorouterEndpoint {
+    #[default]
+    Default,
+}
+
+/// Default API base for a locally running ZeroRouter.
+pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
+impl ModelEndpoint for ZerorouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => ZEROROUTER_DEFAULT_URL,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zerorouter"]
+pub struct ZerorouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -3356,6 +3414,7 @@ impl_default_family_endpoint! {
     VeniceModelProviderConfig,
     NearaiModelProviderConfig,
     NovitaModelProviderConfig,
+    ZerorouterModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
@@ -5074,6 +5133,17 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Maximum bytes accepted for a single HTTP/SSE JSON-RPC response body,
+    /// enforced at read time before the body is parsed or any embedded resource
+    /// is materialized. A compromised or misbehaving server cannot force an
+    /// unbounded response-body allocation. This is the *encoded wire* cap, not
+    /// the decoded materialization budget: `None`/`0` uses the built-in default
+    /// of 16,078,168 bytes, sized so a full 10 MiB decoded embedded-resource blob
+    /// (its base64 expansion plus JSON-RPC envelope headroom) still fits. The
+    /// separate 10 MiB figure is the decoded aggregate blob budget applied after
+    /// parsing, not this wire cap.
+    #[serde(default)]
+    pub max_response_bytes: Option<u64>,
     /// Resource URIs to read once at agent startup and inject into the system
     /// prompt as untrusted, server-origin context. Each is read via
     /// `resources/read` on this server; pins on a server that does not advertise
@@ -5157,6 +5227,12 @@ impl Default for McpConfig {
 /// a credential chain verifier. Until one exists the `vi_verify` tool is
 /// withheld from the model-visible registry, so neither key below enables
 /// verification of a credential. The library paths are unaffected.
+///
+/// Enabling the section reports that gap two ways. The runtime traces it at
+/// each config application, which needs log persistence to be on to reach a
+/// sink. `zeroclaw doctor` and the config API also report it as the
+/// `verifiable_intent_tool_withheld` validation warning, which stays available
+/// when persistence is off.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
@@ -7222,6 +7298,11 @@ pub struct GatewayClientAuthConfig {
     /// When non-empty, only client certs matching one of these fingerprints are accepted.
     #[serde(default)]
     pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty disables the check.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 impl Default for GatewayClientAuthConfig {
@@ -7231,8 +7312,43 @@ impl Default for GatewayClientAuthConfig {
             ca_cert_path: String::new(),
             require_client_cert: default_true(),
             pinned_certs: Vec::new(),
+            crl_path: String::new(),
         }
     }
+}
+
+/// Client certificate authentication (mTLS) for the remote WSS transport
+/// (`[wss.client_auth]`).
+///
+/// This mirrors [`GatewayClientAuthConfig`]; the two are distinct structs only
+/// because the `Configurable` derive binds the section prefix into the type. The
+/// verification logic itself is single-sourced in the `zeroclaw-tls` crate.
+///
+/// Unlike the gateway's variant there is no `require_client_cert` knob: the
+/// remote WSS plane is *always* mutually authenticated (there is no
+/// server-only-TLS path), so a client certificate is unconditionally required.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "wss.client_auth"]
+pub struct WssClientAuthConfig {
+    /// Use the bring-your-own CA below. When false (default) the daemon
+    /// auto-generates its own CA. The WSS plane is always mutually authenticated
+    /// either way; this does NOT toggle whether a client certificate is required.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded CA certificate used to verify client certificates.
+    #[serde(default)]
+    pub ca_cert_path: String,
+    /// Optional SHA-256 fingerprints for certificate pinning. When non-empty,
+    /// only client certs matching one of these fingerprints are accepted.
+    #[serde(default)]
+    pub pinned_certs: Vec<String>,
+    /// Optional path to a revoked-fingerprint list (one SHA-256 hex per line). A
+    /// client cert whose fingerprint is listed is refused at the handshake (A5);
+    /// the file is re-read when it changes. Empty (default) makes the daemon use
+    /// its ledger-materialized list at `<data_dir>/tls/revoked`.
+    #[serde(default)]
+    pub crl_path: String,
 }
 
 /// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).
@@ -7259,6 +7375,50 @@ pub struct WssConfig {
     /// Path to the PEM-encoded server private key file.
     #[serde(default)]
     pub key_path: String,
+    /// Extra Subject Alternative Names for the AUTO-GENERATED server certificate
+    /// (hostnames and/or IPs a remote client uses to reach this daemon, e.g.
+    /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
+    /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
+    /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// Ignored when you bring your own server certificate via `cert_path`.
+    #[serde(default)]
+    pub sans: Vec<String>,
+    /// Client certificate authentication (mutual TLS) for the remote WSS plane.
+    /// When the listener is enabled, the remote plane is always mutually
+    /// authenticated; this section supplies the CA and pinning policy.
+    #[serde(default)]
+    #[nested]
+    pub client_auth: Option<WssClientAuthConfig>,
+    /// Ceiling on sockets past `accept()` that have not yet finished the TLS
+    /// handshake and WebSocket upgrade (default: 256). The remote plane is
+    /// Internet-facing, so this bounds the state an UNAUTHENTICATED peer can
+    /// hold; beyond it, new sockets are dropped at accept rather than queued.
+    #[serde(default = "default_wss_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// One absolute deadline, in seconds, covering TLS accept AND the
+    /// WebSocket upgrade (default: 10). A single budget for the whole setup
+    /// sequence, not a fresh window per phase; the heartbeat only starts once
+    /// a session is established.
+    #[serde(default = "default_wss_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Ceiling on concurrently established WSS sessions (default: 64). Bounds
+    /// the steady state that survives authentication; with the 32 MiB parser
+    /// envelope this is also the aggregate parser-memory ceiling (64 x 32 MiB
+    /// = 2 GiB by default), so raise it as a deliberate host-memory decision.
+    #[serde(default = "default_wss_max_sessions")]
+    pub max_sessions: usize,
+    /// Ceiling on concurrent sessions presenting ONE client certificate
+    /// (default: 8). `max_sessions` alone lets a single admitted (or stolen,
+    /// pre-revocation) credential occupy every session and its parser
+    /// envelope; this bounds what one credential can reserve.
+    #[serde(default = "default_wss_max_sessions_per_client")]
+    pub max_sessions_per_client: usize,
+    /// How long, in seconds, a partially-received message may be held by the
+    /// parser while control frames keep the connection alive (default: 60).
+    /// Also the deadline for the slowest legitimate full-size request; raise
+    /// it on slow links rather than disabling the bound.
+    #[serde(default = "default_wss_incomplete_message_timeout_secs")]
+    pub incomplete_message_timeout_secs: u64,
 }
 
 impl Default for WssConfig {
@@ -7269,8 +7429,80 @@ impl Default for WssConfig {
             port: default_wss_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            sans: Vec::new(),
+            client_auth: None,
+            max_pending_handshakes: default_wss_max_pending_handshakes(),
+            handshake_timeout_secs: default_wss_handshake_timeout_secs(),
+            max_sessions: default_wss_max_sessions(),
+            max_sessions_per_client: default_wss_max_sessions_per_client(),
+            incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
     }
+}
+
+/// Nominated-relay client (`[relay]`).
+///
+/// When enabled, the daemon keeps a persistent outbound connection to a relay
+/// and registers `node_id`, so clients behind NAT can reach it *through* the
+/// relay. The relay is a blind forwarder: the inner client<->daemon mTLS still
+/// terminates at the daemon's WSS listener and is never decrypted by the relay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "relay"]
+pub struct RelayConfig {
+    /// Enable the relay bridge (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay address to connect to, as `host:port`.
+    #[serde(default)]
+    pub url: String,
+    /// Opaque node-id this daemon registers under (clients dial this id). Leave
+    /// empty (recommended) to auto-mint and persist a random 128-bit capability at
+    /// `<data_dir>/relay/node_id`; set it only to pin a specific id. It must stay
+    /// unguessable and is decoupled from the cert - do NOT use a name or a cert
+    /// thumbprint (a guessable/derivable id lets attackers probe and flood you).
+    #[serde(default)]
+    pub node_id: String,
+    /// Relay account token presented at registration (admission credential).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    pub token: String,
+    /// PEM CA to trust for the relay's OWN (outer) TLS certificate. When set,
+    /// this explicit CA takes precedence over remembered/TOFU relay pins. Empty
+    /// uses the built-in public roots unless a stored pin or `tofu` is active.
+    #[serde(default)]
+    pub relay_ca_path: String,
+    /// Server name to expect on the relay's outer certificate. Empty derives it
+    /// from the host portion of `url`.
+    #[serde(default)]
+    pub relay_host: String,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    #[serde(default)]
+    pub relay_insecure: bool,
+    /// Trust-on-first-use for the relay's OUTER certificate (default false): accept
+    /// the first leaf seen and pin it at `<data_dir>/relay/relay_pin` thereafter
+    /// (the pin is also handed to enrolling clients). Opt-in; ignored once a pin is
+    /// stored or `relay_ca_path` is set. A configured relay CA also bypasses any
+    /// previously stored TOFU pin. The outer TLS is a metadata boundary, not the
+    /// RPC boundary (the inner mTLS is); see threat A2.
+    #[serde(default)]
+    pub tofu: bool,
+    /// PEM cert/key the daemon presents to the relay on the OUTER TLS layer
+    /// (outer-mTLS variant), required only when the relay sets
+    /// `outer_client_auth = required`. Empty presents no outer client cert. This is
+    /// separate from the inner mTLS client identity.
+    #[serde(default)]
+    pub outer_client_cert: String,
+    #[serde(default)]
+    pub outer_client_key: String,
+    /// Auto-rotate the auto-minted node-id every N days (default 0 = never).
+    /// Rotation mints a fresh id, registers it alongside the old one for a short
+    /// grace window (so in-flight clients keep working), then retires the old id;
+    /// the new id reaches clients in-band on their next certificate renewal. Only
+    /// applies when `node_id` is empty (an operator-pinned id is never rotated).
+    #[serde(default)]
+    pub node_id_rotation_days: u64,
 }
 
 fn default_wss_bind() -> String {
@@ -7279,6 +7511,68 @@ fn default_wss_bind() -> String {
 
 fn default_wss_port() -> u16 {
     9781
+}
+
+fn default_wss_max_pending_handshakes() -> usize {
+    256
+}
+
+fn default_wss_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_wss_max_sessions() -> usize {
+    64
+}
+
+fn default_wss_max_sessions_per_client() -> usize {
+    8
+}
+
+fn default_wss_incomplete_message_timeout_secs() -> u64 {
+    60
+}
+
+fn default_enroll_bind() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_enroll_port() -> u16 {
+    9782
+}
+
+/// Certificate enrollment endpoint (`[enroll]`).
+///
+/// The dedicated, narrowly scoped bootstrap surface a *certless* client reaches
+/// for its FIRST certificate. It is server-authenticated TLS (the daemon proves
+/// itself; the client confirms the CA via the pairing short-auth-string) plus a
+/// pairing-code gate. It accepts exactly one operation: submit a CSR, receive a
+/// signed cert + the CA chain + the relay profile. This is NOT a fallback on the
+/// always-mTLS RPC plane (that plane stays mutually authenticated with no
+/// weakenable path); it is a separate minimal endpoint with its own auth model.
+/// The daemon owns the CA, so this endpoint works with no gateway.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "enroll"]
+pub struct EnrollConfig {
+    /// Enable the enrollment endpoint (default: false). Requires `[wss]` enabled
+    /// (it hands out certs for that mutually authenticated plane) and a daemon CA
+    /// private key (auto-generated, or BYO with key); when the CA key is absent
+    /// the endpoint fails closed and certs must be provisioned out of band.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address the enrollment endpoint binds on.
+    #[serde(default = "default_enroll_bind")]
+    pub bind: String,
+    /// Port the enrollment endpoint listens on.
+    #[serde(default = "default_enroll_port")]
+    pub port: u16,
+    /// Reserved for a future migration flow. The first FOSS release rejects any
+    /// non-empty value because code-less enrollment needs an explicit client-side
+    /// trust anchor before certs can be cached. Leave empty to require the normal
+    /// pairing-code-gated path.
+    #[serde(default)]
+    pub allow_unpaired_enrollment: String,
 }
 
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
@@ -10461,7 +10755,25 @@ fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
     RUNTIME_PROXY_CONFIG.get_or_init(|| RwLock::new(ProxyConfig::default()))
 }
 
-fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Client>> {
+fn runtime_proxy_config_generation() -> u64 {
+    RUNTIME_PROXY_CONFIG_GENERATION.load(Ordering::Acquire)
+}
+
+fn bump_runtime_proxy_config_generation() {
+    let _ = RUNTIME_PROXY_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn runtime_proxy_current_generation() -> u64 {
+    match runtime_proxy_state().read() {
+        Ok(_guard) => runtime_proxy_config_generation(),
+        Err(poisoned) => {
+            let _guard = poisoned.into_inner();
+            runtime_proxy_config_generation()
+        }
+    }
+}
+
+fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, RuntimeProxyCachedClient>> {
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -10494,19 +10806,36 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
-        Ok(guard) => guard.get(cache_key).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(cache_key).cloned(),
+        Ok(guard) => guard
+            .get(cache_key)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.client.clone()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .get(cache_key)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.client.clone()),
     }
 }
 
-fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
+fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    if generation != runtime_proxy_current_generation() {
+        return;
+    }
+
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
-            guard.insert(cache_key, client);
+            if generation == runtime_proxy_config_generation() {
+                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+            }
         }
         Err(poisoned) => {
-            poisoned.into_inner().insert(cache_key, client);
+            let mut guard = poisoned.into_inner();
+            if generation == runtime_proxy_config_generation() {
+                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+            }
         }
     }
 }
@@ -10515,20 +10844,30 @@ pub fn set_runtime_proxy_config(config: ProxyConfig) {
     match runtime_proxy_state().write() {
         Ok(mut guard) => {
             *guard = config;
+            bump_runtime_proxy_config_generation();
         }
         Err(poisoned) => {
-            *poisoned.into_inner() = config;
+            let mut guard = poisoned.into_inner();
+            *guard = config;
+            bump_runtime_proxy_config_generation();
         }
     }
 
     clear_runtime_proxy_client_cache();
 }
 
-pub fn runtime_proxy_config() -> ProxyConfig {
+fn runtime_proxy_config_snapshot() -> (u64, ProxyConfig) {
     match runtime_proxy_state().read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+        Ok(guard) => (runtime_proxy_config_generation(), guard.clone()),
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            (runtime_proxy_config_generation(), guard.clone())
+        }
     }
+}
+
+pub fn runtime_proxy_config() -> ProxyConfig {
+    runtime_proxy_config_snapshot().1
 }
 
 pub fn apply_runtime_proxy_to_builder(
@@ -10544,7 +10883,8 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
         return client;
     }
 
-    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
+    let (generation, config) = runtime_proxy_config_snapshot();
+    let builder = config.apply_to_reqwest_builder(reqwest::Client::builder(), service_key);
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -10557,7 +10897,7 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
         );
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -10572,10 +10912,11 @@ pub fn build_runtime_proxy_client_with_timeouts(
         return client;
     }
 
+    let (generation, config) = runtime_proxy_config_snapshot();
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let builder = config.apply_to_reqwest_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -10588,7 +10929,43 @@ pub fn build_runtime_proxy_client_with_timeouts(
         );
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
+    client
+}
+
+pub fn build_runtime_proxy_client_with_read_timeout(
+    service_key: &str,
+    read_timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = format!(
+        "{}|timeout=none|connect_timeout={}|read_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        connect_timeout_secs,
+        read_timeout_secs,
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let (generation, config) = runtime_proxy_config_snapshot();
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    let builder = config.apply_to_reqwest_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build proxied read-timeout client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -10661,6 +11038,7 @@ fn build_explicit_proxy_client(
         return client;
     }
 
+    let generation = runtime_proxy_current_generation();
     let mut builder = reqwest::Client::builder();
     if let Some(t) = timeout_secs {
         builder = builder.timeout(std::time::Duration::from_secs(t));
@@ -10673,7 +11051,7 @@ fn build_explicit_proxy_client(
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "proxy_url": proxy_url, "error": format!("{}", error)})), "Failed to build channel proxy client: ");
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -12366,7 +12744,10 @@ pub struct WebhookAuditConfig {
     pub tool_patterns: Vec<String>,
     /// Include tool call arguments in the audit payload. Default: `false`.
     ///
-    /// Be mindful of sensitive data — arguments may contain secrets or PII.
+    /// Arguments are scrubbed for common credentials and recognised inline
+    /// image markers before export, but may still contain unrecognised secrets
+    /// or personal data.
+    /// The destination controls retention of exported payloads.
     #[serde(default)]
     pub include_args: bool,
     /// Maximum size (in bytes) of serialised arguments included in a single
@@ -18850,6 +19231,8 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -20210,6 +20593,40 @@ impl Config {
         }
     }
 
+    /// Report that opting into `[verifiable_intent]` does not currently enable
+    /// credential verification, because `vi_verify` is withheld from the
+    /// model-visible registry until a chain verifier exists.
+    ///
+    /// The runtime already traces this at config load. That trace reaches a
+    /// sink only when log persistence is on, so under
+    /// `observability.log_persistence = "none"` it is delivered nowhere. This
+    /// warning is the channel that survives: `zeroclaw doctor` prints the
+    /// structured list to stdout and the config API returns it in its
+    /// response, neither of which depends on the log writer.
+    ///
+    /// Same class as `memory_config_knob_inert` — a knob that is set, accepted,
+    /// and currently has no runtime consumer.
+    ///
+    /// The change that re-registers `vi_verify` must delete this check and the
+    /// runtime trace together, or an operator is told the capability is
+    /// unavailable while the model is calling it.
+    fn collect_verifiable_intent_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.verifiable_intent.enabled {
+            return;
+        }
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+            "verifiable_intent.enabled is set, but the vi_verify tool is withheld from the \
+             model-visible registry until a credential chain verifier exists. Enabling the \
+             section does not enable credential verification on commerce tool calls. The \
+             issuance and verification library paths are unaffected.",
+            "verifiable_intent.enabled",
+        ));
+    }
+
     /// Collect non-fatal validation warnings — config that loads and
     /// validates successfully (`validate()` returns `Ok(())`) but will fail
     /// at runtime because of a logical inconsistency the schema cannot
@@ -20236,6 +20653,7 @@ impl Config {
         // warning when the more specific cross-provider diagnostic already
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
+        self.collect_verifiable_intent_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -21675,9 +22093,25 @@ impl Config {
         // Non-fatal validation warnings: surfaced both via tracing (CLI sees
         // on stderr) and via Config::collect_warnings (gateway HTTP returns
         // structured to dashboard callers). Single source of truth lives in
-        // collect_warnings; emit each one to tracing here so the existing
-        // log behavior is preserved.
+        // collect_warnings; emit them to tracing here so the existing log
+        // behavior is preserved, with the single documented exception below.
         for w in self.collect_warnings() {
+            // One code is held back from this loop on purpose. The runtime
+            // already records the withheld-capability notice itself, with an
+            // explicit `System` category and the same code and path, once at
+            // every config application. Records emitted here carry no category
+            // and are stored as `internal`, which the dashboard Logs view hides
+            // by default, so tracing it here as well leaves a hidden second copy
+            // of a notice an operator is supposed to read. Every command that
+            // loads config a second time inside a live process writes that pair.
+            //
+            // `collect_warnings` still returns it, so `zeroclaw doctor` and the
+            // config API report it exactly as before; only this tracing copy is
+            // dropped. The change that re-registers the tool retires this skip
+            // together with the runtime record it defers to.
+            if w.code == crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD {
+                continue;
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -27795,6 +28229,8 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -28750,6 +29186,8 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            relay: RelayConfig::default(),
+            enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
@@ -32437,10 +32875,7 @@ api_token = "tok"
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
-        match runtime_proxy_client_cache().read() {
-            Ok(guard) => guard.contains_key(cache_key),
-            Err(poisoned) => poisoned.into_inner().contains_key(cache_key),
-        }
+        runtime_proxy_cached_client(cache_key).is_some()
     }
 
     #[test]
@@ -32495,6 +32930,98 @@ api_token = "tok"
 
         let _ = build_runtime_proxy_client(&service_key);
         assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn runtime_proxy_client_cache_reuses_read_timeout_profile_key() {
+        let _env_guard = env_override_lock().await;
+        let service_key = format!(
+            "model_provider.cache_read_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = format!(
+            "{}|timeout=none|connect_timeout=10|read_timeout=300",
+            service_key.trim().to_ascii_lowercase(),
+        );
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn runtime_proxy_client_cache_rejects_stale_generation_insert() {
+        let _env_guard = env_override_lock().await;
+        let service_key = format!(
+            "model_provider.cache_generation_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
+
+        clear_runtime_proxy_client_cache();
+        let stale_generation = runtime_proxy_config_generation();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://reload.example:8080".to_string()),
+            ..Default::default()
+        });
+
+        match runtime_proxy_client_cache().write() {
+            Ok(mut guard) => {
+                guard.insert(
+                    cache_key.clone(),
+                    RuntimeProxyCachedClient {
+                        generation: stale_generation,
+                        client: reqwest::Client::new(),
+                    },
+                );
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.insert(
+                    cache_key.clone(),
+                    RuntimeProxyCachedClient {
+                        generation: stale_generation,
+                        client: reqwest::Client::new(),
+                    },
+                );
+            }
+        }
+        assert!(
+            !runtime_proxy_cache_contains(&cache_key),
+            "old-generation cache entries must not be visible after reload"
+        );
+        clear_runtime_proxy_client_cache();
+
+        set_runtime_proxy_cached_client(
+            cache_key.clone(),
+            stale_generation,
+            reqwest::Client::new(),
+        );
+        assert!(
+            !runtime_proxy_cache_contains(&cache_key),
+            "old-policy client builds must not repopulate the cache after reload"
+        );
+
+        set_runtime_proxy_cached_client(
+            cache_key.clone(),
+            runtime_proxy_config_generation(),
+            reqwest::Client::new(),
+        );
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     #[test]
@@ -34127,6 +34654,97 @@ group_policy = "disabled"
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
         );
+    }
+
+    /// The section is opt-in, so an operator who has not touched it is told
+    /// nothing.
+    #[test]
+    async fn verifiable_intent_disabled_does_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(!config.verifiable_intent.enabled);
+
+        assert!(
+            !config
+                .collect_warnings()
+                .iter()
+                .any(|w| w.code == "verifiable_intent_tool_withheld"),
+        );
+    }
+
+    /// Opting in produces the structured warning. This is the delivery path
+    /// that survives `observability.log_persistence = "none"`, since
+    /// `zeroclaw doctor` prints this list to stdout and the config API returns
+    /// it, neither of which goes through the log writer.
+    #[test]
+    async fn verifiable_intent_enabled_warns_that_the_tool_is_withheld() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.verifiable_intent.enabled = true;
+
+        let warnings = config.collect_warnings();
+        let withheld: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.code == "verifiable_intent_tool_withheld")
+            .collect();
+
+        assert_eq!(withheld.len(), 1, "exactly one notice, got {warnings:?}");
+        assert_eq!(withheld[0].path, "verifiable_intent.enabled");
+        assert!(
+            withheld[0].message.contains("vi_verify"),
+            "the message must name the withheld tool: {}",
+            withheld[0].message
+        );
+    }
+
+    /// Every `LogPersistence` variant, walked through a `match` rather than
+    /// listed.
+    ///
+    /// Adding a variant makes the `match` non-exhaustive, so a new policy forces
+    /// a decision here instead of being covered silently. An array literal keeps
+    /// compiling unchanged and covers one policy less.
+    ///
+    /// The compile error is the whole of the guarantee. An arm returning `None`
+    /// satisfies it while leaving the variant out of the returned list, so this
+    /// forces the update to be considered rather than making it correct.
+    fn every_log_persistence() -> Vec<LogPersistence> {
+        let mut all = Vec::new();
+        let mut next = Some(LogPersistence::None);
+        while let Some(policy) = next {
+            all.push(policy);
+            next = match policy {
+                LogPersistence::None => Some(LogPersistence::Rolling),
+                LogPersistence::Rolling => Some(LogPersistence::Full),
+                LogPersistence::Full => Some(LogPersistence::Rotating),
+                LogPersistence::Rotating => None,
+            };
+        }
+        all
+    }
+
+    /// The config surface does not consult the observability policy, which is
+    /// the property that makes it a second channel rather than a second copy
+    /// of the same one. Asserting it here pins the independence at the unit
+    /// level; the process-level proof lives in the component test.
+    ///
+    /// Every current variant is covered rather than the three that motivated the
+    /// change. See [`every_log_persistence`] for the extent of that.
+    #[test]
+    async fn verifiable_intent_warning_is_independent_of_log_persistence() {
+        for policy in every_log_persistence() {
+            let mut config = Config::default();
+            suppress_semantic_memory_warning(&mut config);
+            config.verifiable_intent.enabled = true;
+            config.observability.log_persistence = policy;
+
+            assert!(
+                config
+                    .collect_warnings()
+                    .iter()
+                    .any(|w| w.code == "verifiable_intent_tool_withheld"),
+                "the notice must survive log_persistence = {policy:?}",
+            );
+        }
     }
 
     #[cfg(unix)]
