@@ -5145,6 +5145,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             pinned_resources: vec![],
             tls_ca_cert_path: None,
+            max_response_bytes: None,
         });
         let agent_alias = "ops".to_string();
         config.mcp_bundles.insert(
