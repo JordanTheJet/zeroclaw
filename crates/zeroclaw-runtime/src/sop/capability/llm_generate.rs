@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use zeroclaw_api::model_provider::{ChatResponse, ModelProvider};
+use zeroclaw_providers::ProviderDispatch;
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
@@ -235,7 +236,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
         let prompt = prompt.to_string();
         super::bridge::run_bridged_anyhow(
             async move {
-                provider
+                ProviderDispatch::new(provider)
                     .chat_with_system(system.as_deref(), &prompt, &model, None)
                     .await
             },
@@ -550,12 +551,11 @@ mod tests {
         let cap = LlmGenerateCapability::new(Some(adapter));
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
         assert!(!out.success);
-        assert_eq!(
-            out.error.as_deref(),
-            Some(
-                "llm.generate: model call failed: The model provider returned an invalid semantic completion."
-            )
+        let expected = format!(
+            "llm.generate: model call failed: {}",
+            crate::agent::semantic_empty_terminal_completion_message(None)
         );
+        assert_eq!(out.error.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -564,12 +564,11 @@ mod tests {
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
 
         assert!(!out.success);
-        assert_eq!(
-            out.error.as_deref(),
-            Some(
-                "llm.generate: model call failed: The model provider returned an invalid semantic completion."
-            )
+        let expected = format!(
+            "llm.generate: model call failed: {}",
+            crate::agent::semantic_empty_terminal_completion_message(None)
         );
+        assert_eq!(out.error.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
