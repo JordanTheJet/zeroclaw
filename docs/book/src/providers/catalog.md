@@ -434,6 +434,11 @@ locally at `http://localhost:8080/v1` or anywhere else, set `uri` explicitly.
 A key minted on one router does not authenticate on another, so `api_key`
 must come from the deployment `uri` points at.
 
+Beyond the chat-completions wire this slot speaks, ZeroRouter also serves the
+OpenAI Responses API inbound (`POST /v1/responses`), so Responses-wire
+clients, such as a Codex CLI `model_provider` with `wire_api = "responses"`,
+can point at the same deployment and key directly.
+
 The `/v1/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing
 and its prompt/completion pricing come live from the router itself without a
 credential; because it is queried live, it is the source that carries pricing
