@@ -1674,7 +1674,10 @@ mod connection_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let daemon_pid = loop {
             if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                break pid.trim().parse::<u32>().expect("parse daemon pid");
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    break pid.parse::<u32>().expect("parse daemon pid");
+                }
             }
             assert!(
                 owner.try_wait().expect("poll signal owner").is_none(),
