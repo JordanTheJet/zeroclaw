@@ -29,3 +29,27 @@ export function planSopSave(editingName: string | null, draftName: string): SopS
   if (draftName === editingName) return { kind: 'save' };
   return { kind: 'save-then-rename', from: editingName, to: draftName };
 }
+
+/**
+ * Turn a failed SOP request into something worth showing an author.
+ *
+ * The SOP routes answer with `{"error": "..."}` rather than the structured
+ * envelope `apiFetch` knows how to unwrap, so its fallback stringifies the
+ * whole body into the message. Left alone that puts raw JSON in front of the
+ * author; the sentence inside it is the part they can act on.
+ */
+export function sopErrorText(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const body = raw.match(/^API \d+: (.*)$/s)?.[1];
+  if (!body) return raw;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+      const inner = (parsed as { error: unknown }).error;
+      if (typeof inner === 'string' && inner.length > 0) return inner;
+    }
+  } catch {
+    // Not JSON after all; the raw text is the best available message.
+  }
+  return raw;
+}

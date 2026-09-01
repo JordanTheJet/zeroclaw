@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { planSopSave } from './sopSavePlan.ts';
+import { planSopSave, sopErrorText } from './sopSavePlan.ts';
 
 test('a draft that was never loaded from disk is a create', () => {
   assert.deepEqual(planSopSave(null, 'deploy-prod'), { kind: 'create' });
@@ -46,4 +46,23 @@ test('an emptied name is still a rename, left for the daemon to reject', () => {
     from: 'deploy',
     to: '',
   });
+});
+
+test('a SOP route error is reduced to the sentence the author can act on', () => {
+  assert.equal(
+    sopErrorText(new Error('API 409: {"error":"SOP \'deploy-staging\' already exists"}')),
+    "SOP 'deploy-staging' already exists",
+  );
+});
+
+test('a non-JSON API failure keeps its original text', () => {
+  assert.equal(sopErrorText(new Error('API 500: Internal Server Error')), 'API 500: Internal Server Error');
+});
+
+test('an error that is not an API envelope is passed through untouched', () => {
+  assert.equal(sopErrorText(new Error('Failed to fetch')), 'Failed to fetch');
+});
+
+test('a non-Error rejection is stringified rather than dropped', () => {
+  assert.equal(sopErrorText('boom'), 'boom');
 });

@@ -3,7 +3,7 @@ import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-r
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
-import { planSopSave } from './sopSavePlan';
+import { planSopSave, sopErrorText } from './sopSavePlan';
 import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor } from '@/components/SopCalls';
@@ -1917,7 +1917,7 @@ export function SopEditor() {
     //     would write a second SOP and strand the original, and moving first
     //     would leave a renamed SOP holding unsaved edits if the save failed.
     const plan = planSopSave(editingName, draft.name);
-    const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    const message = sopErrorText;
 
     if (plan.kind === 'save-then-rename') {
       saveSop({ ...draft, name: plan.from })
