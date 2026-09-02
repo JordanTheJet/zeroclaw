@@ -548,6 +548,11 @@ async fn handle_socket(
     } else {
         agent.seed_history_with_event(&stored_messages)
     };
+    // How many persisted messages this connection's history already reflects.
+    // Checked against the transcript under the session permit before every
+    // turn, so a socket that reconnected behind a detached turn does not run
+    // on the snapshot it loaded above.
+    let mut persisted_watermark = stored_messages.len();
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
@@ -619,6 +624,7 @@ async fn handle_socket(
                         &pending_approvals,
                         &mut ping_interval,
                         &ws_memory,
+                        &mut persisted_watermark,
                         &content,
                         &session_key,
                         &session_id,
@@ -794,6 +800,7 @@ async fn handle_socket(
                     &pending_approvals,
                     &mut ping_interval,
                     &ws_memory,
+                    &mut persisted_watermark,
                     &content,
                     &session_key,
                     &session_id,
@@ -903,18 +910,21 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
+/// Returns how many messages were appended, so the caller can advance its
+/// persisted-transcript watermark by exactly what landed on disk.
 fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
-) {
+) -> usize {
     // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
     // re-create the row that `DELETE /api/sessions/{id}` just wiped.
     if !backend.session_exists(session_key) {
-        return;
+        return 0;
     }
+    let mut appended = 0;
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
@@ -922,8 +932,46 @@ fn persist_conversation_messages(
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        if backend.append(session_key, message).is_ok() {
+            appended += 1;
+        }
     }
+    appended
+}
+
+/// Rebuild a connection's execution history from the persisted transcript
+/// when another writer advanced it since this connection last incorporated
+/// it — typically the detached turn a reconnecting socket queued behind. Must
+/// run while holding the session permit, so the transcript cannot move again
+/// before the turn that follows. Clears before re-seeding so nothing is
+/// duplicated; returns the trim notice re-seeding may produce.
+fn refresh_history_if_advanced(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+    persisted_watermark: &mut usize,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    let persisted = backend.load(session_key);
+    if persisted.len() == *persisted_watermark {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "session_key": session_key,
+                "known_messages": *persisted_watermark,
+                "persisted_messages": persisted.len(),
+            })
+        ),
+        "session transcript advanced since this connection loaded it; rebuilding execution history"
+    );
+    *persisted_watermark = persisted.len();
+    agent.clear_history();
+    if persisted.is_empty() {
+        return None;
+    }
+    agent.seed_history_with_event(&persisted)
 }
 
 /// One frame from the client socket, as seen by the mid-turn forward loop.
@@ -1044,6 +1092,9 @@ async fn process_chat_message(
     pending_approvals: &PendingApprovals,
     ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
+    // Persisted messages this connection's history already reflects; advanced
+    // by exactly what this turn persists.
+    persisted_watermark: &mut usize,
     content: &str,
     session_key: &str,
     session_id: &str,
@@ -1053,6 +1104,22 @@ async fn process_chat_message(
 ) -> bool {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
+
+    // The caller holds the session permit. A socket that connected while a
+    // detached turn was still running seeded its history from a transcript
+    // that turn has since extended; rebuild from the persisted transcript
+    // before running on the stale snapshot.
+    if let Some(ref backend) = state.session_backend
+        && let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        }) =
+            refresh_history_if_advanced(backend.as_ref(), agent, session_key, persisted_watermark)
+    {
+        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    }
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
@@ -1406,7 +1473,7 @@ async fn process_chat_message(
             if still_exists {
                 match &result {
                     Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
+                        *persisted_watermark += persist_conversation_messages(
                             backend.as_ref(),
                             session_key,
                             &error.new_messages,
@@ -1427,7 +1494,9 @@ async fn process_chat_message(
                             // here; `persist_conversation_messages` already
                             // re-checks internally.
                             if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
+                                if backend.append(session_key, &assistant_msg).is_ok() {
+                                    *persisted_watermark += 1;
+                                }
                             }
                         }
                     }
@@ -1442,7 +1511,9 @@ async fn process_chat_message(
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
                         if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
+                            if backend.append(session_key, &assistant_msg).is_ok() {
+                                *persisted_watermark += 1;
+                            }
                         }
                     }
                 }
@@ -1489,7 +1560,11 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                *persisted_watermark += persist_conversation_messages(
+                    backend.as_ref(),
+                    session_key,
+                    &outcome.new_messages,
+                );
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1597,7 +1672,8 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                *persisted_watermark +=
+                    persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
             }
 
             // Set session state to error
@@ -1958,22 +2034,28 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         state: AppState,
         backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
         gateway_addr: std::net::SocketAddr,
-        /// One `()` per streaming request the provider fixture receives.
-        request_seen: tokio::sync::mpsc::UnboundedReceiver<()>,
-        release: tokio::sync::watch::Sender<bool>,
+        /// The body of every streaming request the provider fixture receives,
+        /// in arrival order.
+        request_seen: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        /// How many parked completions may finish; the n-th request finishes
+        /// once this reaches n.
+        released: tokio::sync::watch::Sender<usize>,
         servers: Vec<tokio::task::JoinHandle<()>>,
         _tmp: tempfile::TempDir,
     }
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
-            let (request_seen_tx, request_seen) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let (release, release_rx) = tokio::sync::watch::channel(false);
+            let (request_seen_tx, request_seen) =
+                tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+            let (released, released_rx) = tokio::sync::watch::channel(0usize);
+            let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mock_app = Router::new().route(
                 "/v1/messages",
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
-                    let mut release_rx = release_rx.clone();
+                    let mut released_rx = released_rx.clone();
+                    let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     async move {
                         assert_eq!(
                             request["stream"].as_bool(),
@@ -1981,13 +2063,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                             "gateway chat turns stream from the provider"
                         );
                         let head = futures_util::stream::once(async move {
-                            let _ = request_seen_tx.send(());
+                            let _ = request_seen_tx.send(request);
                             Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
                                 PARKED_STREAM_HEAD.as_bytes(),
                             ))
                         });
                         let tail = futures_util::stream::once(async move {
-                            let _ = release_rx.wait_for(|released| *released).await;
+                            let _ = released_rx.wait_for(|released| *released >= index).await;
                             Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
                         });
                         (
@@ -2074,7 +2156,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 backend,
                 gateway_addr,
                 request_seen,
-                release,
+                released,
                 servers: vec![mock_server, gateway_server],
                 _tmp: tmp,
             }
@@ -2097,19 +2179,22 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         /// Send a chat message and block until the provider fixture holds the
         /// turn's streaming request, i.e. the turn is provably in flight.
-        async fn start_parked_turn(&mut self, client: &mut WsClient, content: &str) {
-            client
-                .send(ClientMessage::Text(
-                    serde_json::json!({"type": "message", "content": content})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .expect("chat message");
-            tokio::time::timeout(Duration::from_secs(5), self.request_seen.recv())
+        /// Returns that request body.
+        async fn start_parked_turn(
+            &mut self,
+            client: &mut WsClient,
+            content: &str,
+        ) -> serde_json::Value {
+            send_chat(client, content).await;
+            self.next_provider_request().await
+        }
+
+        /// The next streaming request the provider fixture receives.
+        async fn next_provider_request(&mut self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), self.request_seen.recv())
                 .await
                 .expect("provider request deadline")
-                .expect("provider fixture observes the turn's request");
+                .expect("provider fixture observes the turn's request")
         }
 
         /// A live turn holds its abort token for the session for its whole
@@ -2129,9 +2214,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .map(|state| state.state)
         }
 
-        /// Let the parked completion finish with `PARKED_TURN_RESPONSE`.
-        fn release(&self) {
-            let _ = self.release.send(true);
+        /// Let the next parked completion finish with `PARKED_TURN_RESPONSE`.
+        fn release_next(&self) {
+            self.released.send_modify(|released| *released += 1);
         }
 
         /// Wait until the gateway has finished the turn: the abort token is
@@ -2153,6 +2238,40 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 server.abort();
             }
         }
+    }
+
+    async fn send_chat(client: &mut WsClient, content: &str) {
+        client
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": content})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("chat message");
+    }
+
+    /// `(role, text)` per message of an Anthropic-shaped request body, with
+    /// block-array content flattened to its concatenated text.
+    fn provider_messages(request: &serde_json::Value) -> Vec<(String, String)> {
+        request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|message| {
+                let role = message["role"].as_str().unwrap_or_default().to_string();
+                let text = match &message["content"] {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Array(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                (role, text)
+            })
+            .collect()
     }
 
     async fn next_text_frame(client: &mut WsClient) -> serde_json::Value {
@@ -2222,7 +2341,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
 
         // Nobody is attached; let the provider finish the turn.
-        fixture.release();
+        fixture.release_next();
         fixture.wait_for_turn_to_settle(&session_key).await;
 
         let transcript = fixture.backend.load(&session_key);
@@ -2250,6 +2369,109 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         assert_eq!(session_start["resumed"], true);
         assert_eq!(session_start["message_count"], transcript.len());
         drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up() {
+        run_ws_regression(
+            "ws-detach-reconnect-history",
+            reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner,
+        );
+    }
+
+    async fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner() {
+        // A socket that reconnects while the detached turn is still running
+        // seeds its agent from the transcript as persisted at that moment. Its
+        // follow-up waits for that turn on the session permit and must then
+        // run on the transcript the turn persisted, not on the stale snapshot.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "detach-reconnect";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let first_prompt = "start the long task";
+        let follow_up = "now continue from where that left off";
+
+        let (mut first, _) = fixture.connect(session_id).await;
+        let first_request = fixture.start_parked_turn(&mut first, first_prompt).await;
+        let first_messages = provider_messages(&first_request);
+        assert!(
+            matches!(first_messages.last(), Some((role, text)) if role == "user" && text.ends_with(first_prompt)),
+            "the first turn carries its own prompt: {first_messages:?}"
+        );
+        disconnect_viewer(first).await;
+        assert!(fixture.has_live_turn(&session_key));
+
+        // Reconnect before the detached turn finishes: nothing is persisted
+        // yet, so this socket's history snapshot is empty.
+        let (mut second, session_start) = fixture.connect(session_id).await;
+        assert_eq!(session_start["resumed"], false);
+        assert_eq!(session_start["message_count"], 0);
+
+        // The follow-up queues behind the running turn on the session permit;
+        // it must not start a concurrent turn.
+        send_chat(&mut second, follow_up).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the detached turn is still the live turn"
+        );
+        assert!(
+            fixture.request_seen.try_recv().is_err(),
+            "the follow-up waits for the permit instead of reaching the provider"
+        );
+
+        // Let the first turn finish. The queued follow-up then runs, and its
+        // provider request must include what the first turn persisted.
+        fixture.release_next();
+        let second_request = fixture.next_provider_request().await;
+        let messages = provider_messages(&second_request);
+        let tail: Vec<(&str, &str)> = messages
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|(role, text)| (role.as_str(), text.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                tail.as_slice(),
+                [("user", earlier), ("assistant", PARKED_TURN_RESPONSE), ("user", latest)]
+                    if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
+            ),
+            "the follow-up runs on the transcript the detached turn persisted: {messages:?}"
+        );
+
+        // The follow-up completes on the attached socket with its own response.
+        fixture.release_next();
+        let done = loop {
+            let frame = next_text_frame(&mut second).await;
+            match frame["type"].as_str() {
+                Some("done") => break frame,
+                Some("error") => panic!("follow-up turn failed: {frame}"),
+                _ => {}
+            }
+        };
+        assert_eq!(done["full_response"], PARKED_TURN_RESPONSE);
+        fixture.wait_for_turn_to_settle(&session_key).await;
+
+        let transcript = fixture.backend.load(&session_key);
+        let turns: Vec<(&str, &str)> = transcript
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                turns.as_slice(),
+                [
+                    ("user", earlier),
+                    ("assistant", PARKED_TURN_RESPONSE),
+                    ("user", latest),
+                    ("assistant", PARKED_TURN_RESPONSE),
+                ] if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
+            ),
+            "both turns persist in order without duplication: {turns:?}"
+        );
+        drop(second);
         fixture.shutdown();
     }
 
@@ -2301,7 +2523,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .any(|message| message.content.contains(PARKED_TURN_RESPONSE)),
             "the aborted turn never received the provider's response"
         );
-        fixture.release();
+        fixture.release_next();
         fixture.shutdown();
     }
 
