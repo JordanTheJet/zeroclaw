@@ -3472,7 +3472,17 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb74634707bebd0ce645a981148e8fb8c7bccd4c33c652aeffd28bf2f96d555a"
 dependencies = [
- "fluent-bundle",
+ "fluent-bundle 0.15.3",
+ "unic-langid",
+]
+
+[[package]]
+name = "fluent"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8137a6d5a2c50d6b0ebfcb9aaa91a28154e0a70605f112d30cb0cd4a78670477"
+dependencies = [
+ "fluent-bundle 0.16.0",
  "unic-langid",
 ]
 
@@ -3488,6 +3498,22 @@ dependencies = [
  "intl_pluralrules",
  "rustc-hash 1.1.0",
  "self_cell 0.10.3",
+ "smallvec",
+ "unic-langid",
+]
+
+[[package]]
+name = "fluent-bundle"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01203cb8918f5711e73891b347816d932046f95f54207710bda99beaeb423bf4"
+dependencies = [
+ "fluent-langneg",
+ "fluent-syntax 0.12.0",
+ "intl-memoizer",
+ "intl_pluralrules",
+ "rustc-hash 2.1.2",
+ "self_cell 1.2.2",
  "smallvec",
  "unic-langid",
 ]
@@ -8821,6 +8847,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
 dependencies = [
  "bitflags 2.13.1",
+ "chrono",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink",
@@ -14009,6 +14036,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-cron"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "fluent 0.17.0",
+ "fluent-bundle 0.16.0",
+ "futures-util",
+ "libc",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "unic-langid",
+ "uuid",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-log",
+]
+
+[[package]]
 name = "zeroclaw-desktop"
 version = "0.8.5"
 dependencies = [
@@ -14336,7 +14389,7 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "fluent",
+ "fluent 0.16.1",
  "futures-util",
  "glob",
  "hex",
@@ -14500,7 +14553,7 @@ dependencies = [
  "chrono",
  "directories",
  "fantoccini",
- "fluent",
+ "fluent 0.16.1",
  "futures-util",
  "glob",
  "hex",
@@ -14552,7 +14605,7 @@ dependencies = [
  "clap",
  "crossterm",
  "directories",
- "fluent",
+ "fluent 0.16.1",
  "futures-util",
  "hex",
  "inkjet",
