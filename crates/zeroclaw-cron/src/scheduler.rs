@@ -898,20 +898,22 @@ async fn execute_job_now_with_runtime(
     .await
 }
 
-fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
-    let mut policy = base.clone();
+/// Tools that must not be available to a cron agent job.
+///
+/// A scheduled run rewriting its own schedule is a foot-gun, so cron excludes
+/// the scheduler-mutation tools by default. An explicit `allowed_tools` on the
+/// job means the operator has already stated the exact surface, so cron does
+/// not add to it.
+fn cron_agent_excluded_tools(job: &CronJob) -> Vec<String> {
     if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
-        return policy;
+        return Vec::new();
     }
-
-    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
-    for tool in CRON_AGENT_DEFAULT_EXCLUDED_TOOLS {
-        if !excluded.iter().any(|existing| existing == tool) {
-            excluded.push((*tool).to_string());
-        }
-    }
-    policy
+    CRON_AGENT_DEFAULT_EXCLUDED_TOOLS
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect()
 }
+
 
 fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
     match target {
@@ -1270,6 +1272,7 @@ async fn run_agent_job(
         model: model_override,
         session_path,
         allowed_tools: job.allowed_tools.clone(),
+        excluded_tools: cron_agent_excluded_tools(job),
         uses_memory: job.uses_memory,
     };
 
