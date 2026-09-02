@@ -27,6 +27,7 @@ use tokio::time::{self, Duration};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronPreHookDecl};
 
+use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use crate::security::SecurityPolicy;
 
 /// Exit code a precondition uses to request a clean skip.
@@ -42,7 +43,17 @@ pub const STATUS_PRECONDITION_FAILED: &str = "precondition_failed";
 /// avoid work, so its diagnostics stay small even when the hook is chatty.
 const MAX_PRE_HOOK_OUTPUT_BYTES: usize = 4096;
 
-const TRUNCATION_MARKER: &str = "\n… [pre_hook output truncated]";
+/// Operator-facing marker appended when hook output was capped.
+///
+/// Built at call time rather than held as a `const` because the text is
+/// localized; the leading separator stays literal since it is layout, not
+/// prose.
+fn truncation_marker() -> String {
+    format!(
+        "\n… {}",
+        get_required_cli_string("cron-pre-hook-output-truncated")
+    )
+}
 
 /// What a precondition decided about the run that follows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,13 +97,13 @@ pub(crate) async fn evaluate(
     let command = hook.command.trim();
     if command.is_empty() {
         return PreconditionOutcome::Failed {
-            output: "pre_hook has an empty command".to_string(),
+            output: get_required_cli_string("cron-pre-hook-empty-command"),
         };
     }
 
     if hook.timeout_secs == 0 {
         return PreconditionOutcome::Failed {
-            output: "pre_hook timeout_secs must be at least 1".to_string(),
+            output: get_required_cli_string("cron-pre-hook-invalid-timeout"),
         };
     }
 
@@ -104,24 +115,22 @@ pub(crate) async fn evaluate(
     // advertise a guarantee that does not hold.
     if !cancellation_is_enforceable(config.runtime.kind) {
         return PreconditionOutcome::Failed {
-            output: format!(
-                "pre_hook is not supported under the {} runtime: a timeout cannot \
-                 terminate work started inside it, so the gate's deadline could \
-                 not be enforced",
-                config.runtime.kind.as_wire()
+            output: get_required_cli_string_with_args(
+                "cron-pre-hook-runtime-unsupported",
+                &[("runtime", config.runtime.kind.as_wire())],
             ),
         };
     }
 
     if !security.can_act() {
         return PreconditionOutcome::Failed {
-            output: "blocked by security policy: autonomy is read-only".to_string(),
+            output: get_required_cli_string("cron-pre-hook-blocked-read-only"),
         };
     }
 
     if security.is_rate_limited() {
         return PreconditionOutcome::Failed {
-            output: "blocked by security policy: rate limit exceeded".to_string(),
+            output: get_required_cli_string("cron-pre-hook-blocked-rate-limited"),
         };
     }
 
@@ -138,13 +147,16 @@ pub(crate) async fn evaluate(
 
     if let Some(path) = security.forbidden_path_argument(command) {
         return PreconditionOutcome::Failed {
-            output: format!("blocked by security policy: forbidden path argument: {path}"),
+            output: get_required_cli_string_with_args(
+                "cron-pre-hook-blocked-forbidden-path",
+                &[("path", &path.to_string())],
+            ),
         };
     }
 
     if !security.record_action() {
         return PreconditionOutcome::Failed {
-            output: "blocked by security policy: action budget exhausted".to_string(),
+            output: get_required_cli_string("cron-pre-hook-blocked-budget"),
         };
     }
 
@@ -152,7 +164,10 @@ pub(crate) async fn evaluate(
         Ok(process) => process,
         Err(error) => {
             return PreconditionOutcome::Failed {
-                output: format!("pre_hook shell setup error: {error}"),
+                output: get_required_cli_string_with_args(
+                    "cron-pre-hook-shell-setup-error",
+                    &[("error", &error.to_string())],
+                ),
             };
         }
     };
@@ -174,7 +189,10 @@ pub(crate) async fn evaluate(
         Ok(child) => child,
         Err(error) => {
             return PreconditionOutcome::Failed {
-                output: format!("pre_hook spawn error: {error}"),
+                output: get_required_cli_string_with_args(
+                    "cron-pre-hook-spawn-error",
+                    &[("error", &error.to_string())],
+                ),
             };
         }
     };
@@ -202,13 +220,19 @@ pub(crate) async fn evaluate(
             Ok((out, err, Ok(status))) => (out, err, status),
             Ok((_, _, Err(error))) => {
                 return PreconditionOutcome::Failed {
-                    output: format!("pre_hook wait error: {error}"),
+                    output: get_required_cli_string_with_args(
+                        "cron-pre-hook-wait-error",
+                        &[("error", &error.to_string())],
+                    ),
                 };
             }
             Err(_) => {
                 terminate_process_tree(&mut child, child_pid).await;
                 return PreconditionOutcome::Failed {
-                    output: format!("pre_hook timed out after {}s", hook.timeout_secs),
+                    output: get_required_cli_string_with_args(
+                        "cron-pre-hook-timed-out",
+                        &[("seconds", &hook.timeout_secs.to_string())],
+                    ),
                 };
             }
         };
@@ -221,7 +245,10 @@ pub(crate) async fn evaluate(
         Some(0) => PreconditionOutcome::Proceed,
         Some(PRECONDITION_SKIP_EXIT_CODE) => PreconditionOutcome::Skip {
             output: describe(
-                &format!("pre_hook requested skip (exit {PRECONDITION_SKIP_EXIT_CODE})"),
+                &get_required_cli_string_with_args(
+                    "cron-pre-hook-skip",
+                    &[("code", &PRECONDITION_SKIP_EXIT_CODE.to_string())],
+                ),
                 &stdout,
                 &stderr,
                 capped,
@@ -229,7 +256,10 @@ pub(crate) async fn evaluate(
         },
         Some(code) => PreconditionOutcome::Failed {
             output: describe(
-                &format!("pre_hook failed (exit {code})"),
+                &get_required_cli_string_with_args(
+                    "cron-pre-hook-failed",
+                    &[("code", &code.to_string())],
+                ),
                 &stdout,
                 &stderr,
                 capped,
@@ -238,7 +268,10 @@ pub(crate) async fn evaluate(
         // No exit code means the hook was terminated by a signal.
         None => PreconditionOutcome::Failed {
             output: describe(
-                &format!("pre_hook terminated without an exit code ({status})"),
+                &get_required_cli_string_with_args(
+                    "cron-pre-hook-terminated",
+                    &[("status", &status.to_string())],
+                ),
                 &stdout,
                 &stderr,
                 capped,
@@ -344,7 +377,7 @@ fn describe(headline: &str, stdout: &str, stderr: &str, capped: bool) -> String 
         stderr.trim()
     );
     if capped {
-        body.push_str(TRUNCATION_MARKER);
+        body.push_str(&truncation_marker());
     }
     truncate(&body)
 }
@@ -354,13 +387,14 @@ fn truncate(output: &str) -> String {
         return output.to_string();
     }
 
-    let mut cutoff = MAX_PRE_HOOK_OUTPUT_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+    let marker = truncation_marker();
+    let mut cutoff = MAX_PRE_HOOK_OUTPUT_BYTES.saturating_sub(marker.len());
     while cutoff > 0 && !output.is_char_boundary(cutoff) {
         cutoff -= 1;
     }
 
     let mut truncated = output[..cutoff].to_string();
-    truncated.push_str(TRUNCATION_MARKER);
+    truncated.push_str(&marker);
     truncated
 }
 
@@ -430,12 +464,87 @@ mod tests {
         let truncated = truncate(&long);
 
         assert!(truncated.len() <= MAX_PRE_HOOK_OUTPUT_BYTES);
-        assert!(truncated.ends_with(TRUNCATION_MARKER));
+        assert!(truncated.ends_with(&truncation_marker()));
         // Round-tripping proves no multi-byte char was cut in half.
         assert_eq!(
             truncated,
             String::from_utf8(truncated.clone().into_bytes()).unwrap()
         );
+    }
+
+    /// Keys this module renders with no interpolation.
+    const GATE_KEYS_PLAIN: &[&str] = &[
+        "cron-pre-hook-empty-command",
+        "cron-pre-hook-invalid-timeout",
+        "cron-pre-hook-blocked-read-only",
+        "cron-pre-hook-blocked-rate-limited",
+        "cron-pre-hook-blocked-budget",
+        "cron-pre-hook-output-truncated",
+    ];
+
+    /// Keys this module renders with arguments, paired with a sample value
+    /// that must survive into the rendered string.
+    const GATE_KEYS_WITH_ARGS: &[(&str, &str, &str)] = &[
+        ("cron-pre-hook-runtime-unsupported", "runtime", "docker"),
+        (
+            "cron-pre-hook-blocked-forbidden-path",
+            "path",
+            "/etc/shadow",
+        ),
+        ("cron-pre-hook-shell-setup-error", "error", "no shell"),
+        ("cron-pre-hook-spawn-error", "error", "permission denied"),
+        ("cron-pre-hook-wait-error", "error", "interrupted"),
+        ("cron-pre-hook-timed-out", "seconds", "45"),
+        ("cron-pre-hook-skip", "code", "10"),
+        ("cron-pre-hook-failed", "code", "3"),
+        ("cron-pre-hook-terminated", "status", "signal: 9"),
+    ];
+
+    /// A missing key does not fail the build, it silently degrades the
+    /// operator-facing result, so the catalogue contract is asserted here.
+    #[test]
+    fn every_gate_key_resolves_in_the_catalogue() {
+        for key in GATE_KEYS_PLAIN {
+            let rendered = get_required_cli_string(key);
+            assert!(
+                !rendered.contains(key),
+                "missing catalogue entry for {key}: got {rendered}"
+            );
+            assert!(
+                !rendered.trim().is_empty(),
+                "empty catalogue entry for {key}"
+            );
+        }
+        for (key, arg, sample) in GATE_KEYS_WITH_ARGS {
+            let rendered = get_required_cli_string_with_args(key, &[(arg, sample)]);
+            assert!(
+                !rendered.contains(key),
+                "missing catalogue entry for {key}: got {rendered}"
+            );
+        }
+    }
+
+    /// Every argument-bearing key must actually place its argument. A dropped
+    /// interpolation is worse than a missing string: the exit code and runtime
+    /// name are exactly what an operator acts on.
+    #[test]
+    fn gate_keys_interpolate_their_arguments() {
+        for (key, arg, sample) in GATE_KEYS_WITH_ARGS {
+            let rendered = get_required_cli_string_with_args(key, &[(arg, sample)]);
+            assert!(
+                rendered.contains(sample),
+                "{key} dropped its {arg} argument: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_statuses_are_not_localized() {
+        // The machine-readable statuses are a wire contract shared with the
+        // API, tools, and stored history. They must stay stable regardless of
+        // locale, so they deliberately have no catalogue entry.
+        assert_eq!(STATUS_SKIPPED_PRECONDITION, "skipped_precondition");
+        assert_eq!(STATUS_PRECONDITION_FAILED, "precondition_failed");
     }
 
     #[test]
@@ -484,9 +593,9 @@ mod tests {
     #[test]
     fn describe_marks_output_that_was_capped() {
         let marked = describe("headline", "out", "err", true);
-        assert!(marked.ends_with(TRUNCATION_MARKER));
+        assert!(marked.ends_with(&truncation_marker()));
         let unmarked = describe("headline", "out", "err", false);
-        assert!(!unmarked.ends_with(TRUNCATION_MARKER));
+        assert!(!unmarked.ends_with(&truncation_marker()));
     }
 
     #[test]
