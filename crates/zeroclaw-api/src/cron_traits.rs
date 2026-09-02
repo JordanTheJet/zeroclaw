@@ -37,6 +37,13 @@ pub struct CronAgentRequest {
     pub session_path: std::path::PathBuf,
     /// Optional per-run tool allowlist.
     pub allowed_tools: Option<Vec<String>>,
+    /// Tools cron requires the host to exclude from this run.
+    ///
+    /// Cron narrows scheduler-mutation tools out of its own agent jobs so a
+    /// scheduled run cannot rewrite the schedule that started it. The host
+    /// must apply these on top of whatever the agent's profile allows; a host
+    /// that ignores them widens the run beyond what cron admitted.
+    pub excluded_tools: Vec<String>,
     /// Whether memory context is recalled and injected for this run.
     pub uses_memory: bool,
 }
