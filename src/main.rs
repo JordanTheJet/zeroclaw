@@ -4724,6 +4724,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
     }
+    if config.retired_node_transport_config {
+        eprintln!(
+            "{}",
+            t(
+                "cli-config-section-retired-node-transport",
+                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     // Must follow the trace sink init above, or the record has no destination.

@@ -138,6 +138,11 @@ pub struct Config {
     /// path on stderr so an operator cannot miss the retired channel.
     #[serde(skip)]
     pub retired_wati_config_sections: Vec<String>,
+    /// Whether a retired `[node_transport]` section was present before
+    /// migration and typed deserialization erased it. Never serialized; the
+    /// CLI surfaces upgrade guidance without retaining the retired secret.
+    #[serde(skip)]
+    pub retired_node_transport_config: bool,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -565,12 +570,6 @@ pub struct Config {
     #[nested]
     #[group = "Integrations"]
     pub jira: JiraConfig,
-
-    /// Secure inter-node transport configuration (`[node_transport]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Network"]
-    pub node_transport: NodeTransportConfig,
 
     /// Knowledge graph configuration (`[knowledge]`).
     #[serde(default)]
@@ -7598,72 +7597,6 @@ pub struct EnrollConfig {
     /// pairing-code-gated path.
     #[serde(default)]
     pub allow_unpaired_enrollment: String,
-}
-
-/// Secure transport configuration for inter-node communication (`[node_transport]`).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "node_transport"]
-pub struct NodeTransportConfig {
-    /// Enable the secure transport layer.
-    #[serde(default = "default_node_transport_enabled")]
-    pub enabled: bool,
-    /// Shared secret for HMAC authentication between nodes.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub shared_secret: String,
-    /// Maximum age of signed requests in seconds (replay protection).
-    #[serde(default = "default_max_request_age")]
-    pub max_request_age_secs: i64,
-    /// Require HTTPS for all node communication.
-    #[serde(default = "default_require_https")]
-    pub require_https: bool,
-    /// Allow specific node IPs/CIDRs.
-    #[serde(default)]
-    pub allowed_peers: Vec<String>,
-    /// Path to TLS certificate file.
-    #[serde(default)]
-    pub tls_cert_path: Option<String>,
-    /// Path to TLS private key file.
-    #[serde(default)]
-    pub tls_key_path: Option<String>,
-    /// Require client certificates (mutual TLS).
-    #[serde(default)]
-    pub mutual_tls: bool,
-    /// Maximum number of connections per peer.
-    #[serde(default = "default_connection_pool_size")]
-    pub connection_pool_size: usize,
-}
-
-fn default_node_transport_enabled() -> bool {
-    true
-}
-fn default_max_request_age() -> i64 {
-    300
-}
-fn default_require_https() -> bool {
-    true
-}
-fn default_connection_pool_size() -> usize {
-    4
-}
-
-impl Default for NodeTransportConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_node_transport_enabled(),
-            shared_secret: String::new(),
-            max_request_age_secs: default_max_request_age(),
-            require_https: default_require_https(),
-            allowed_peers: Vec::new(),
-            tls_cert_path: None,
-            tls_key_path: None,
-            mutual_tls: false,
-            connection_pool_size: default_connection_pool_size(),
-        }
-    }
 }
 
 // ── Composio (managed tool surface) ─────────────────────────────
@@ -19229,6 +19162,7 @@ impl Default for Config {
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
+            retired_node_transport_config: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -19295,7 +19229,6 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
-            node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
@@ -20077,6 +20010,9 @@ impl Config {
                 if crate::migration::V1_LEGACY_KEYS.contains(&key.as_str()) {
                     return false;
                 }
+                if key.as_str() == "node_transport" {
+                    return false;
+                }
                 let mut t = toml::Table::new();
                 t.insert((*key).clone(), raw[key.as_str()].clone());
                 let consumed = toml::to_string(&t)
@@ -20109,6 +20045,15 @@ impl Config {
             })
             .map(|root| format!("{root}.wati"))
             .collect()
+    }
+
+    /// Detect the retired top-level transport section without retaining any
+    /// of its values, including `shared_secret`.
+    fn has_retired_node_transport_config(raw_toml: &str) -> bool {
+        raw_toml
+            .parse::<toml::Table>()
+            .ok()
+            .is_some_and(|raw| raw.contains_key("node_transport"))
     }
 
     /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
@@ -20376,6 +20321,19 @@ impl Config {
                     )
                 );
             }
+            let retired_node_transport_config = Self::has_retired_node_transport_config(&contents);
+            if retired_node_transport_config {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "retired_config": "node_transport",
+                        })),
+                    "Retired `[node_transport]` config is ignored because the legacy HMAC node \
+                     transport was removed. Delete the section from config.toml."
+                );
+            }
 
             // Deserialize the config with the standard TOML parser.
             //
@@ -20413,6 +20371,7 @@ impl Config {
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
             config.retired_wati_config_sections = retired_wati_config_sections;
+            config.retired_node_transport_config = retired_node_transport_config;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -28131,6 +28090,7 @@ auto_save = true
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
+            retired_node_transport_config: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -28312,7 +28272,6 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
-            node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
@@ -29203,6 +29162,7 @@ default_temperature = 0.7
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
+            retired_node_transport_config: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -29270,7 +29230,6 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
-            node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
@@ -29373,7 +29332,6 @@ default_temperature = 0.7
             "rotation-credential-a".into(),
             "rotation-credential-b".into(),
         ];
-        config.node_transport.shared_secret = "node-shared-credential".into();
         config.nodes.auth_token = Some("nodes-auth-credential".into());
         config.observability.backend = ObservabilityBackend::Otel;
         config.observability.otel_headers = Some(HashMap::from([(
@@ -29584,14 +29542,6 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(&stored.reliability.api_keys[1]).unwrap(),
             "rotation-credential-b"
-        );
-
-        assert!(crate::secrets::SecretStore::is_encrypted(
-            &stored.node_transport.shared_secret
-        ));
-        assert_eq!(
-            store.decrypt(&stored.node_transport.shared_secret).unwrap(),
-            "node-shared-credential"
         );
 
         let nodes_auth = stored.nodes.auth_token.as_deref().unwrap();
@@ -32121,6 +32071,52 @@ api_token = "legacy-placeholder-token"
                 "warning must never copy retired WATI credentials into logs: {logs}"
             );
         }
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_warns_for_retired_node_transport_without_logging_secret() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let install = temp_home.join("profile");
+        fs::create_dir_all(&install).await.unwrap();
+        fs::write(
+            install.join("config.toml"),
+            r#"schema_version = 3
+
+[node_transport]
+enabled = true
+shared_secret = "retired-node-transport-sentinel"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let _home_guard = EnvValueGuard::set("HOME", &temp_home);
+        let _workspace_guard = EnvValueGuard::set("ZEROCLAW_WORKSPACE", &install);
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let mut rx = capture_log_events();
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+        let logs = drain_captured(&mut rx);
+
+        assert!(config.retired_node_transport_config);
+        assert!(
+            logs.contains("Retired `[node_transport]` config is ignored"),
+            "missing retirement warning: {logs}"
+        );
+        assert!(
+            logs.contains("\"retired_config\":\"node_transport\""),
+            "warning must carry structured retirement attribution: {logs}"
+        );
+        assert!(
+            !logs.contains("retired-node-transport-sentinel"),
+            "warning must never copy the retired shared secret into logs: {logs}"
+        );
 
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -38328,6 +38324,34 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             .is_empty()
         );
         assert!(Config::retired_wati_config_sections("not toml {{{").is_empty());
+    }
+
+    #[test]
+    async fn retired_node_transport_detector_keeps_only_presence() {
+        assert!(Config::has_retired_node_transport_config(
+            "schema_version = 3\n[node_transport]\nshared_secret = \"sentinel-secret\"\n",
+        ));
+        assert!(!Config::has_retired_node_transport_config(
+            "schema_version = 3\n[nodes]\nenabled = true\n",
+        ));
+        assert!(!Config::has_retired_node_transport_config("not toml {{{"));
+    }
+
+    #[test]
+    async fn retired_node_transport_absent_from_current_schema_and_defaults() {
+        let serialized = toml::to_string(&Config::default()).expect("default config serializes");
+        assert!(!serialized.contains("node_transport"));
+
+        #[cfg(feature = "schema-export")]
+        {
+            let schema = schemars::schema_for!(Config);
+            let schema_json = serde_json::to_value(&schema).expect("schema serializes");
+            let properties = schema_json
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("Config schema has top-level properties");
+            assert!(!properties.contains_key("node_transport"));
+        }
     }
 
     #[test]

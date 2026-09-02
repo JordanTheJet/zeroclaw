@@ -348,7 +348,8 @@ pub fn default_tools_with_runtime(
     ]
 }
 
-pub fn register_skill_tools(
+#[cfg(test)]
+pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
@@ -359,18 +360,20 @@ pub fn register_skill_tools(
 /// Register skill-defined tools with full context for builtin kinds.
 /// `unfiltered_registry` provides the pre-policy tool list for `kind = "builtin"`
 /// delegation.
-pub fn register_skill_tools_with_context(
+#[cfg(test)]
+pub(crate) fn register_skill_tools_with_context(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
 ) {
-    register_skill_tools_with_context_and_runtime(
+    register_skill_tools_with_context_and_runtime_optional_nat64(
         tools_registry,
         skills,
         security,
         unfiltered_registry,
         Arc::new(NativeRuntime::new()),
+        Some(&[]),
     );
 }
 
@@ -380,6 +383,27 @@ pub fn register_skill_tools_with_context_and_runtime(
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
     runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) {
+    register_skill_tools_with_context_and_runtime_optional_nat64(
+        tools_registry,
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+        Some(nat64_prefixes),
+    );
+}
+
+/// Internal scoped assembly seam. `None` omits only HTTP tools after an invalid
+/// NAT64 configuration; other skill kinds continue through their normal path.
+pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+    runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) {
     if skills.is_empty() {
         return;
@@ -387,11 +411,12 @@ pub fn register_skill_tools_with_context_and_runtime(
 
     let before = tools_registry.len();
     let policy = Arc::clone(&security);
-    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
+    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
         security,
         unfiltered_registry,
         runtime,
+        nat64_prefixes,
     );
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()

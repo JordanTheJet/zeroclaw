@@ -24,7 +24,7 @@ use zeroclaw_api::jsonrpc::{
     JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
@@ -2666,54 +2666,14 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let mut messages = Vec::new();
+        let mut acp_session_found = false;
 
-        // Try the raw id first (channel sessions store as-is), then
-        // prefixed variants for RPC/gateway-originated sessions.
-        let candidates = [
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ];
-        let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
-        for key in &candidates {
-            let loaded = backend.load(key);
-            if !loaded.is_empty() {
-                raw = loaded;
-                break;
-            }
-        }
-
-        if raw.is_empty()
-            && let Some(store) = self.ctx.acp_session_store.as_ref()
-        {
+        if let Some(store) = self.ctx.acp_session_store.as_ref() {
             match store.load_session(&req.session_id) {
                 Ok(Some(data)) => {
-                    raw = data
-                        .messages
-                        .into_iter()
-                        .filter_map(|m| {
-                            match m {
-                            zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                text: Some(t),
-                                ..
-                            } if !t.is_empty() => {
-                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
-                            }
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                ..
-                            }
-                            | zeroclaw_api::model_provider::ConversationMessage::ToolResults(_) => {
-                                None
-                            }
-                        }
-                        })
-                        .collect();
+                    acp_session_found = true;
+                    messages = conversation_message_entries(&data.messages);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2725,17 +2685,45 @@ impl RpcDispatcher {
             }
         }
 
-        let total = raw.len();
+        if !acp_session_found {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+
+            // Try the raw id first (channel sessions store as-is), then
+            // prefixed variants for RPC/gateway-originated sessions.
+            let candidates = [
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ];
+            for key in &candidates {
+                let loaded = backend.load(key);
+                if !loaded.is_empty() {
+                    messages = loaded
+                        .into_iter()
+                        .map(|message| MessageEntry {
+                            role: message.role,
+                            content: message.content,
+                            kind: MessageEntryKind::Message,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                        })
+                        .collect();
+                    break;
+                }
+            }
+        }
+
+        let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
         let start = end.saturating_sub(limit);
-        let messages: Vec<MessageEntry> = raw[start..end]
-            .iter()
-            .map(|m| MessageEntry {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
+        let messages = messages[start..end].to_vec();
 
         to_result(SessionMessagesResult {
             session_id: req.session_id,
@@ -4985,6 +4973,101 @@ impl RpcDispatcher {
         );
         self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
+}
+
+fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
+    let mut entries = Vec::new();
+    let mut tool_entries_by_id =
+        std::collections::HashMap::<String, std::collections::VecDeque<usize>>::new();
+
+    for message in messages {
+        match message {
+            ConversationMessage::Chat(chat) => entries.push(MessageEntry {
+                role: chat.role.clone(),
+                content: chat.content.clone(),
+                kind: MessageEntryKind::Message,
+                tool_call_id: None,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+            }),
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        kind: MessageEntryKind::Message,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                    });
+                }
+
+                for call in tool_calls {
+                    let index = entries.len();
+                    tool_entries_by_id
+                        .entry(call.id.clone())
+                        .or_default()
+                        .push_back(index);
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: format!("Tool call: {}\n{}", call.name, call.arguments),
+                        kind: MessageEntryKind::ToolCall,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_name: Some(call.name.clone()),
+                        tool_input: Some(
+                            serde_json::from_str(&call.arguments)
+                                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                        ),
+                        tool_output: None,
+                    });
+                }
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    let output = result.content.clone();
+                    let entry_index = tool_entries_by_id
+                        .get_mut(&result.tool_call_id)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    if tool_entries_by_id
+                        .get(&result.tool_call_id)
+                        .is_some_and(std::collections::VecDeque::is_empty)
+                    {
+                        tool_entries_by_id.remove(&result.tool_call_id);
+                    }
+                    if let Some(entry) = entry_index.and_then(|index| entries.get_mut(index)) {
+                        entry.tool_output = Some(output.clone());
+                        entry.content.push_str("\nResult:\n");
+                        entry.content.push_str(&output);
+                    } else {
+                        entries.push(MessageEntry {
+                            role: "tool".to_string(),
+                            content: format!(
+                                "Tool result: {}\n{}",
+                                if result.tool_name.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &result.tool_name
+                                },
+                                output
+                            ),
+                            kind: MessageEntryKind::ToolResult,
+                            tool_call_id: Some(result.tool_call_id.clone()),
+                            tool_name: (!result.tool_name.is_empty())
+                                .then(|| result.tool_name.clone()),
+                            tool_input: None,
+                            tool_output: Some(output),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    entries
 }
 
 fn response_id_key(id: &Value) -> Option<String> {
@@ -9171,6 +9254,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conversation_message_entries_projects_typed_tool_exchange() {
+        use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("I will inspect both files".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "call-2".into(),
+                    content: "contents".into(),
+                    tool_name: "read".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    content: "/tmp".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "orphan".into(),
+                    content: "late result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].kind, MessageEntryKind::Message);
+        assert_eq!(entries[1].content, "I will inspect both files");
+        assert_eq!(entries[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(entries[2].tool_output.as_deref(), Some("/tmp"));
+        assert_eq!(entries[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(entries[3].tool_output.as_deref(), Some("contents"));
+        assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
+        assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
+        assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn conversation_message_entries_pairs_duplicate_tool_ids_in_order() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "first".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "second".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "first result".into(),
+                    tool_name: "first".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "second result".into(),
+                    tool_name: "second".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tool_name.as_deref(), Some("first"));
+        assert_eq!(entries[0].tool_output.as_deref(), Some("first result"));
+        assert_eq!(entries[1].tool_name.as_deref(), Some("second"));
+        assert_eq!(entries[1].tool_output.as_deref(), Some("second result"));
+    }
+
+    #[test]
+    fn persisted_transcript_projection_survives_active_history_trim() {
+        use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let durable = vec![
+            ConversationMessage::Chat(ChatMessage::user("old question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "old-call".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "old-call".into(),
+                content: "/tmp".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+            ConversationMessage::Chat(ChatMessage::user("new question")),
+            ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+        ];
+
+        let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
+            durable.clone(),
+            2,
+            false,
+        );
+        assert!(active.trimmed);
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+
+        let transcript = conversation_message_entries(&durable);
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| entry.content == "old question")
+        );
+        assert!(transcript.iter().any(|entry| {
+            entry.tool_call_id.as_deref() == Some("old-call")
+                && entry.tool_output.as_deref() == Some("/tmp")
+        }));
+    }
+
     #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
@@ -9233,14 +9466,13 @@ mod tests {
             )
             .expect("append turn");
 
-        // Sanity: the unified backend really is empty for this id under any
-        // candidate key. If this ever changes the test below stops being a
-        // regression for the ACP-store fallback.
-        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
-            assert!(
-                chat_backend.load(&key).is_empty(),
-                "precondition: unified backend has no rows for {key}"
-            );
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .expect("seed colliding unified backend row");
+
+        assert_eq!(chat_backend.load(sid).len(), 1);
+        for key in [format!("rpc_{sid}"), format!("gw_{sid}")] {
+            assert!(chat_backend.load(&key).is_empty());
         }
 
         let result = dispatcher
@@ -9252,12 +9484,12 @@ mod tests {
 
         assert_eq!(parsed.session_id, sid);
         assert_eq!(
-            parsed.total, 3,
+            parsed.total, 5,
             "ACP-backed sessions must report their full replayable message count"
         );
         assert_eq!(
             parsed.messages.len(),
-            3,
+            5,
             "ACP-backed sessions must replay their persisted messages, not a blank transcript"
         );
         assert_eq!(parsed.messages[0].role, "user");
@@ -9270,8 +9502,122 @@ mod tests {
              on that row, so dropping it would lose visible turns from the \
              replayed transcript"
         );
-        assert_eq!(parsed.messages[2].role, "assistant");
-        assert_eq!(parsed.messages[2].content, "ack from prior turn");
+        assert_eq!(parsed.messages[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(
+            parsed.messages[2].tool_output.as_deref(),
+            Some("log contents")
+        );
+        assert_eq!(parsed.messages[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(parsed.messages[3].tool_output.as_deref(), Some("no errors"));
+        assert_eq!(parsed.messages[4].role, "assistant");
+        assert_eq!(parsed.messages[4].content, "ack from prior turn");
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .all(|entry| !entry.content.contains("stale backend collision")),
+            "a colliding generic backend row must not override canonical ACP history"
+        );
+
+        let page = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": sid,
+                "limit": 2,
+                "before_index": 3
+            }))
+            .await
+            .expect("paginated session/messages should succeed");
+        let page: SessionMessagesResult = from_value(page).expect("paginated result shape");
+        assert_eq!(page.total, 5);
+        assert_eq!(page.start, 1);
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[0].content, "let me check the logs");
+        assert_eq!(page.messages[1].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn session_messages_keeps_plain_backend_projection() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        chat_backend
+            .append("rpc-plain", &ChatMessage::user("hello"))
+            .unwrap();
+        chat_backend
+            .append("rpc-plain", &ChatMessage::assistant("world"))
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": "rpc-plain" }))
+            .await
+            .expect("plain session/messages should succeed");
+        let parsed: SessionMessagesResult = from_value(result).unwrap();
+        assert_eq!(parsed.total, 2);
+        assert!(parsed.messages.iter().all(|entry| {
+            entry.kind == MessageEntryKind::Message
+                && entry.tool_call_id.is_none()
+                && entry.tool_output.is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_messages_does_not_mask_malformed_acp_history_with_backend_fallback() {
+        use rusqlite::{Connection, params};
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-malformed-history";
+
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("checking".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "bad-call".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .unwrap();
+
+        let conn = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+        conn.execute(
+            "UPDATE acp_tool_calls SET event_kind = 'malformed' WHERE tool_call_id = ?1",
+            params!["bad-call"],
+        )
+        .unwrap();
+
+        let error = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect_err("malformed ACP history must fail closed");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("Failed to load ACP session messages")
+        );
     }
 
     #[tokio::test]
