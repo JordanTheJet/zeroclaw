@@ -22,7 +22,7 @@ That combination has no answer for the ordinary case: accepted work lands on a s
 
 The cron precondition gate went through [#10220](https://github.com/zeroclaw-labs/zeroclaw/pull/10220), then a proposed one-off exception, and finally the full extraction in [#10557](https://github.com/zeroclaw-labs/zeroclaw/pull/10557). The extraction was the right outcome, but it was reached by building two complete alternatives and discarding one. A contributor should be able to establish whether extraction is required before implementing it twice.
 
-[#10410](https://github.com/zeroclaw-labs/zeroclaw/pull/10410) kept shared config and agent-lifecycle coordination in the runtime rather than invent a lifecycle crate ahead of the planned daemon extraction. Moving that code to `zeroclaw-infra` would invert an existing dependency, since config already depends on infra. Extracting early would therefore establish a boundary the roadmap does not want. That decision is still waiting on repository-level acceptance.
+[#10410](https://github.com/zeroclaw-labs/zeroclaw/pull/10410) kept shared config and agent-lifecycle coordination in the runtime rather than invent a lifecycle crate ahead of the planned daemon extraction. The rationale offered for that placement is that moving the code to `zeroclaw-infra` would invert an existing dependency, since config already depends on infra, and that extracting early would establish a boundary the roadmap does not intend. That is the argument for an exception there, not a settled conclusion: the placement has not been accepted, and #10410 needs its own explicit disposition under whatever process this record establishes.
 
 [#10179](https://github.com/zeroclaw-labs/zeroclaw/pull/10179) hit the same rule, but its transport had no receiving caller. Retirement, or an explicit ownership decision, was the better answer there than any exception.
 
@@ -41,7 +41,15 @@ An approved exception names all four of:
 - **Permitted scope.** The specific paths the exception covers. Not a subsystem in the abstract.
 - **Intended destination.** The crate the code is expected to move to, so the exception describes a delay rather than a reversal.
 - **Approving authority.** Who granted it.
-- **Expiry or review condition.** What ends it: a named extraction landing, a release, or a review date.
+- **Expiry or review condition.** What ends it, or when it is reconsidered. The record must say which of the two it is, because they behave differently (see below).
+
+### What expiry means
+
+An exception either **expires** or comes up for **review**, and the record says which.
+
+An expiry ends the permission. Further additions to the covered scope then need Core Team renewal. It does not require removing code that already landed under the exception: the permission lapses forward, not backward, and unwinding what was already accepted is the extraction's job rather than a consequence of a date passing.
+
+A review condition does not end anything by itself. It obliges the Core Team to reconsider, and the outcome of that reconsideration is renewal, expiry, or extraction.
 
 ### How it is granted
 
@@ -49,9 +57,21 @@ The record is created before the feature merges, and separately from it. A featu
 
 An exception requires a concrete supported use case. Code with no receiving caller does not qualify; retirement or an explicit ownership decision is the correct answer there.
 
+### How an individual exception is recorded
+
+An exception is granted the same way any other repository decision is: through review on a pull request that adds the entry to the active-exception table in the owning crate's `AGENTS.md`, approved by the Core Team. No separate mechanism, and no approval outside the normal review rules.
+
+The entry is the record. A decision that exists only in a review thread has not been made, because nothing later reading the contract would find it.
+
 ### What an exception is not
 
 An exception permits continued work on a subsystem the holding crate already contains. It never permits introducing a new subsystem there, and it does not generalise from one subsystem to another. Granting one for cron says nothing about the daemon.
+
+## Adoption
+
+This record turns an unconditional prohibition into a permission under stated conditions, which makes it a governance and contribution-process change rather than an ordinary documentation edit. [FND-003 §8](../../foundations/fnd-003-governance.md) governs that route.
+
+Adopting it is therefore the Core Team's decision to take and record explicitly, including which route under FND-003 §8 applies. This pull request is the concrete proposal, not the adoption. Until that decision is recorded, the unconditional instruction stands and no exception has been granted.
 
 ## Consequences
 

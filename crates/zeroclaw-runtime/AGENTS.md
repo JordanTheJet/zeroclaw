@@ -8,7 +8,9 @@ Do not add new functionality here, unless the Core Team has granted a recorded e
 
 Extraction is the default. The Core Team may grant a bounded exception when immediate extraction would require a disproportionate refactor, or would establish a crate boundary the roadmap does not intend. See [ADR-016](../../docs/book/src/architecture/decisions/ADR-016-holding-crate-exceptions.md).
 
-An exception must name its permitted scope, intended destination, approving authority, and expiry or review condition, and must be recorded before the feature it covers merges. A feature pull request cannot grant itself one: the contract it would be waiving is the one constraining it.
+An exception must name its permitted scope, intended destination, approving authority, and either an expiry or a review condition, and must be recorded before the feature it covers merges. An expiry ends the permission, so further additions need Core Team renewal; it does not require removing code that already landed. A review condition only obliges reconsideration.
+
+An exception is granted by adding its row to the table below through normal review, approved by the Core Team. The row is the record: a decision that lives only in a review thread has not been made. A feature pull request cannot grant itself one: the contract it would be waiving is the one constraining it.
 
 An exception requires a concrete supported use case. Code with no receiving caller does not qualify; retirement or an explicit ownership decision is the right answer there.
 
@@ -16,7 +18,7 @@ An exception permits continued work on a subsystem already held here. It never p
 
 ### Active exceptions
 
-| Scope | Destination | Approved by | Expires |
+| Scope | Destination | Approved by | Expires or reviewed |
 | --- | --- | --- | --- |
 | _(none)_ | | | |
 
