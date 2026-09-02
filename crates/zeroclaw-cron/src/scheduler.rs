@@ -1,17 +1,17 @@
-use crate::cron::precondition::{
+use crate::precondition::{
     self, PreconditionOutcome, STATUS_PRECONDITION_FAILED, STATUS_SKIPPED_PRECONDITION,
 };
-use crate::cron::store::{
+use crate::store::{
     RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
     persist_run_result,
 };
-use crate::cron::{
+use crate::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
     clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
     sync_declarative_jobs,
 };
 use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-use crate::security::SecurityPolicy;
+use zeroclaw_config::policy::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -68,6 +68,50 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
+
+/// Process health reporter, supplied by the host.
+///
+/// Registered rather than threaded through every call site, matching how the
+/// delivery seam below already works. Unregistered defaults to a no-op, so an
+/// embedding that does not run a health registry simply reports nothing
+/// instead of failing.
+static HEALTH: std::sync::OnceLock<std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>> =
+    std::sync::OnceLock::new();
+
+/// Register the health reporter. First registration wins.
+pub fn register_health_reporter(
+    reporter: std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>,
+) {
+    let _ = HEALTH.set(reporter);
+}
+
+fn mark_ok(component: &str) {
+    if let Some(h) = HEALTH.get() {
+        h.mark_ok(component);
+    }
+}
+
+fn mark_error(component: &str, reason: &str) {
+    if let Some(h) = HEALTH.get() {
+        h.mark_error(component, reason);
+    }
+}
+
+/// Agent-job executor, supplied by the host.
+///
+/// Cron decides when a job runs and whether policy permits it; the runtime
+/// runs the agent. Without a registered executor an agent job fails with a
+/// clear message rather than silently reporting success.
+static AGENT_EXECUTOR: std::sync::OnceLock<
+    std::sync::Arc<dyn zeroclaw_api::cron_traits::CronAgentExecutor>,
+> = std::sync::OnceLock::new();
+
+/// Register the agent executor. First registration wins.
+pub fn register_agent_executor(
+    executor: std::sync::Arc<dyn zeroclaw_api::cron_traits::CronAgentExecutor>,
+) {
+    let _ = AGENT_EXECUTOR.set(executor);
+}
 
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
@@ -510,7 +554,7 @@ pub async fn run(
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+    mark_ok(SCHEDULER_COMPONENT);
 
     // ── Declarative job sync: reconcile config-defined jobs with the DB.
     let mut jobs_with_builtin = config.cron.clone();
@@ -607,12 +651,12 @@ pub async fn run(
         tokio::select! {
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
-                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                mark_ok(SCHEDULER_COMPONENT);
 
                 let jobs = match due_jobs(&config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
-                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                        mark_error(SCHEDULER_COMPONENT, &e.to_string());
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -632,7 +676,7 @@ pub async fn run(
                 process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
             _ = cancel.cancelled() => {
-                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                mark_ok(SCHEDULER_COMPONENT);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -890,7 +934,7 @@ async fn execute_job_with_retry(
 
     let needs_runtime = matches!(job.job_type, JobType::Shell) || pre_hook.is_some();
     let owned_runtime = if needs_runtime && runtime.is_none() {
-        match crate::platform::create_runtime(&config.runtime) {
+        match zeroclaw_config::platform::create_runtime(&config.runtime) {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 let output = format!("shell setup error: {error}");
@@ -1049,7 +1093,7 @@ async fn process_due_jobs(
     event_tx: &EventBroadcast,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
-    crate::health::mark_component_ok(component);
+    mark_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
@@ -1122,7 +1166,7 @@ async fn execute_and_persist_job(
     job: &CronJob,
     component: &str,
 ) -> ScheduledRunReport {
-    crate::health::mark_component_ok(component);
+    mark_ok(component);
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
@@ -1211,90 +1255,38 @@ async fn run_agent_job(
     let run_session_id = uuid::Uuid::new_v4().to_string();
     let session_path = cron_agent_session_path(&job.session_target, &run_session_id);
 
-    let subagent_span = zeroclaw_log::info_span!(
-        "subagent",
-        category = "cron",
-        agent_alias = %agent_alias,
-        cron_job_id = %job.id,
-        run_id = %run_session_id,
-        spawn_site = "cron",
-    );
-
-    let run_security = cron_agent_run_policy(security, job);
-    let run_overrides = crate::agent::loop_::AgentRunOverrides {
-        security: Some(Arc::new(run_security)),
-        memory: None,
-        is_subagent: false,
-        // `uses_memory = false` fully opts the job out of the engine's
-        // memory-context injection (stateless digest jobs)...
-        suppress_memory_inject: !job.uses_memory,
-        // ...and makes the run memory-free end to end: the loop binds a
-        // `NoneMemory` backend and drops the persistent memory tools, so a
-        // `uses_memory = false` job can neither recall/store through a real
-        // backend nor reach one via advertised memory tools
-        memory_free: !job.uses_memory,
-        // Cron runs are short-lived and one-shot — no cross-turn reuse
-        // contract, so the per-call `connect_all` path inside
-        // `agent::run` is the correct choice. The daemon heartbeat
-        // worker is the only `mcp_registry` supplier.
-        mcp_registry: None,
-    };
-    let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
-                )
-                .instrument(subagent_span),
-            )
-            .await
-        }
+    // Everything above is cron's own business: policy admission, the action
+    // budget, the prompt envelope, and which session path the run belongs to.
+    // Executing the agent is not, so it goes across the seam.
+    //
+    // The request carries policy *inputs* rather than a built `SecurityPolicy`.
+    // `zeroclaw-api` is the leaf trait crate and cannot see `zeroclaw-config`
+    // types, and inverting that would be a dependency cycle. The host rebuilds
+    // the effective policy from the alias and these narrowing lists.
+    let request = zeroclaw_api::cron_traits::CronAgentRequest {
+        job_id: job.id.clone(),
+        agent_alias: agent_alias.to_string(),
+        prompt: prefixed_prompt,
+        model: model_override,
+        session_path,
+        allowed_tools: job.allowed_tools.clone(),
+        uses_memory: job.uses_memory,
     };
 
-    match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
-        Err(e) => {
-            if matches!(job.session_target, SessionTarget::Isolated) {
-                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "cli:{}",
-                    session_path.display()
-                ));
-                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                    config,
-                    agent_alias,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.api_key.as_deref()),
-                )
-                .await
-                {
-                    let _ = mem.purge_session(&mem_session_key).await;
-                }
-            }
-            (false, format!("agent job failed: {e}"))
-        }
-    }
+    let Some(executor) = AGENT_EXECUTOR.get() else {
+        // Fail loudly rather than report a success nobody performed.
+        return (
+            false,
+            "agent job failed: no cron agent executor registered \
+             (register_agent_executor was not called by the host)"
+                .to_string(),
+        );
+    };
+
+    let run = executor.run_agent_job(request).await;
+    (run.success, run.output)
 }
+
 
 async fn persist_job_result(
     config: &Config,
@@ -1565,7 +1557,7 @@ async fn run_job_command_with_runtime_and_timeout(
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
     if let Err(error) =
-        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
+        crate::validate_shell_command_with_security(runtime, security, &job.command, approved)
     {
         return (false, error.to_string());
     }
@@ -1643,7 +1635,7 @@ async fn run_job_command(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
-    let runtime = match crate::platform::create_runtime(&config.runtime) {
+    let runtime = match zeroclaw_config::platform::create_runtime(&config.runtime) {
         Ok(runtime) => runtime,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
@@ -1657,7 +1649,7 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
 ) -> (bool, String) {
-    let runtime = match crate::platform::create_runtime(&config.runtime) {
+    let runtime = match zeroclaw_config::platform::create_runtime(&config.runtime) {
         Ok(runtime) => runtime,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
@@ -1675,8 +1667,8 @@ async fn run_job_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cron::{self, DeliveryConfig};
-    use crate::security::SecurityPolicy;
+    use crate::{self, DeliveryConfig};
+    use zeroclaw_config::policy::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
     use zeroclaw_config::schema::{Config, RuntimeKind};
@@ -1688,7 +1680,7 @@ mod tests {
         command: &str,
         workspace_dir: &std::path::Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let runtime = crate::platform::create_runtime(&config.runtime)?;
+        let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
         runtime.build_shell_command(command, workspace_dir)
     }
 
@@ -1785,7 +1777,7 @@ mod tests {
         CronJob {
             id: "test-job".into(),
             expression: "* * * * *".into(),
-            schedule: crate::cron::Schedule::Cron {
+            schedule: crate::Schedule::Cron {
                 expr: "* * * * *".into(),
                 tz: None,
             },
@@ -1929,7 +1921,7 @@ mod tests {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
 
-    fn agent_job_with_schedule(schedule: crate::cron::Schedule) -> CronJob {
+    fn agent_job_with_schedule(schedule: crate::Schedule) -> CronJob {
         CronJob {
             job_type: JobType::Agent,
             schedule,
@@ -1940,7 +1932,7 @@ mod tests {
     #[test]
     fn high_frequency_daily_cron_is_not_flagged() {
         // `0 6 * * *` fires once per day — must never warn regardless of when the check runs
-        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+        let job = agent_job_with_schedule(crate::Schedule::Cron {
             expr: "0 6 * * *".into(),
             tz: Some("America/Chicago".into()),
         });
@@ -1949,7 +1941,7 @@ mod tests {
 
     #[test]
     fn high_frequency_every_4min_cron_is_flagged() {
-        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+        let job = agent_job_with_schedule(crate::Schedule::Cron {
             expr: "*/4 * * * *".into(),
             tz: None,
         });
@@ -1959,7 +1951,7 @@ mod tests {
     #[test]
     fn high_frequency_every_5min_cron_is_not_flagged() {
         // Exactly 5 minutes is acceptable (threshold is strictly less than 5)
-        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+        let job = agent_job_with_schedule(crate::Schedule::Cron {
             expr: "*/5 * * * *".into(),
             tz: None,
         });
@@ -1968,7 +1960,7 @@ mod tests {
 
     #[test]
     fn high_frequency_every_interval_below_threshold_is_flagged() {
-        let job = agent_job_with_schedule(crate::cron::Schedule::Every {
+        let job = agent_job_with_schedule(crate::Schedule::Every {
             every_ms: 4 * 60 * 1000, // 4 minutes
         });
         assert!(is_high_frequency_agent_job(&job));
@@ -1976,7 +1968,7 @@ mod tests {
 
     #[test]
     fn high_frequency_every_interval_at_threshold_is_not_flagged() {
-        let job = agent_job_with_schedule(crate::cron::Schedule::Every {
+        let job = agent_job_with_schedule(crate::Schedule::Every {
             every_ms: 5 * 60 * 1000, // exactly 5 minutes
         });
         assert!(!is_high_frequency_agent_job(&job));
@@ -1987,7 +1979,7 @@ mod tests {
         // Shell jobs are exempt regardless of frequency
         let job = CronJob {
             job_type: JobType::Shell,
-            schedule: crate::cron::Schedule::Every {
+            schedule: crate::Schedule::Every {
                 every_ms: 60 * 1000, // 1 minute
             },
             ..test_job("echo test")
@@ -2298,7 +2290,7 @@ mod tests {
             .allowed_commands = vec!["cat".into()];
         let job = test_job("cat ..\\secret.txt");
         let security = test_security(&config);
-        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+        let runtime = zeroclaw_config::platform::NativeRuntime::with_shell("pwsh".into());
 
         let (success, output) =
             run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
@@ -2324,7 +2316,7 @@ mod tests {
             .allowed_commands = vec!["git".into()];
         let job = test_job("git --% push origin main");
         let security = test_security(&config);
-        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+        let runtime = zeroclaw_config::platform::NativeRuntime::with_shell("pwsh".into());
 
         let (success, output) =
             run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
@@ -2351,7 +2343,7 @@ mod tests {
             .allowed_commands = vec!["cat".into()];
         let job = test_job("cat E'nv:'PATH");
         let security = test_security(&config);
-        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+        let runtime = zeroclaw_config::platform::NativeRuntime::with_shell("pwsh".into());
 
         let (success, output) =
             run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
@@ -2450,7 +2442,7 @@ mod tests {
             .risk_profiles
             .entry(TEST_AGENT.into())
             .or_default()
-            .level = crate::security::AutonomyLevel::ReadOnly;
+            .level = zeroclaw_config::policy::AutonomyLevel::ReadOnly;
         let job = test_job("echo should-not-run");
         let security = test_security(&config);
 
@@ -2640,7 +2632,7 @@ mod tests {
         );
         config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
         config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
-            crate::security::AutonomyLevel::Full;
+            zeroclaw_config::policy::AutonomyLevel::Full;
 
         let mut security = test_security(&config);
         let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
@@ -2713,7 +2705,7 @@ mod tests {
             .risk_profiles
             .entry(TEST_AGENT.into())
             .or_default()
-            .level = crate::security::AutonomyLevel::ReadOnly;
+            .level = zeroclaw_config::policy::AutonomyLevel::ReadOnly;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
@@ -2753,7 +2745,7 @@ mod tests {
         let config = test_config(&tmp).await;
         let component = unique_component("scheduler-idle");
 
-        crate::health::mark_component_error(&component, "pre-existing error");
+        mark_error(&component, &"pre-existing error");
         process_due_jobs(&config, Vec::new(), &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
@@ -2770,7 +2762,7 @@ mod tests {
         let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
         let component = unique_component("scheduler-fail");
 
-        crate::health::mark_component_ok(&component);
+        mark_ok(&component);
         process_due_jobs(&config, vec![job], &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
@@ -2811,7 +2803,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        crate::cron::store::reset_write_connection_count_for_tests(&config);
+        crate::store::reset_write_connection_count_for_tests(&config);
         let success = persist_job_result(
             &config,
             &job,
@@ -2824,7 +2816,7 @@ mod tests {
 
         assert!(success);
         assert_eq!(
-            crate::cron::store::write_connection_count_for_tests(&config),
+            crate::store::write_connection_count_for_tests(&config),
             1
         );
     }
@@ -2915,7 +2907,7 @@ mod tests {
             &config,
             TEST_AGENT,
             Some("one-shot".into()),
-            crate::cron::Schedule::At { at },
+            crate::Schedule::At { at },
             "Hello",
             SessionTarget::Isolated,
             None,
@@ -2951,7 +2943,7 @@ mod tests {
             &config,
             TEST_AGENT,
             Some("one-shot".into()),
-            crate::cron::Schedule::At { at },
+            crate::Schedule::At { at },
             "Hello",
             SessionTarget::Isolated,
             None,
@@ -2988,7 +2980,7 @@ mod tests {
             &config,
             "test-agent",
             Some("one-shot".into()),
-            crate::cron::Schedule::At { at },
+            crate::Schedule::At { at },
             "Hello",
             SessionTarget::Isolated,
             None,
@@ -3001,7 +2993,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        crate::cron::store::reset_write_connection_count_for_tests(&config);
+        crate::store::reset_write_connection_count_for_tests(&config);
         let success = persist_job_result(
             &config,
             &job,
@@ -3014,7 +3006,7 @@ mod tests {
 
         assert!(!success);
         assert_eq!(
-            crate::cron::store::write_connection_count_for_tests(&config),
+            crate::store::write_connection_count_for_tests(&config),
             1
         );
     }
@@ -3180,7 +3172,7 @@ mod tests {
             &config,
             TEST_AGENT,
             Some("announce-job".into()),
-            crate::cron::Schedule::Cron {
+            crate::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
@@ -3301,7 +3293,7 @@ mod tests {
             &config,
             TEST_AGENT,
             Some("at-no-autodelete".into()),
-            crate::cron::Schedule::At { at },
+            crate::Schedule::At { at },
             "Hello",
             SessionTarget::Isolated,
             None,
@@ -3567,9 +3559,9 @@ mod tests {
             allowed_commands: vec!["Write-Output".into(), "echo".into()],
             ..SecurityPolicy::default()
         };
-        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
+        let runtime = zeroclaw_config::platform::create_runtime(&config.runtime).unwrap();
 
-        crate::cron::validate_shell_command_with_security(
+        crate::validate_shell_command_with_security(
             runtime.as_ref(),
             &security,
             "Write-Output $PSHOME",
@@ -3577,7 +3569,7 @@ mod tests {
         )
         .expect("documented read-only PowerShell command should pass");
         assert!(
-            crate::cron::validate_shell_command_with_security(
+            crate::validate_shell_command_with_security(
                 runtime.as_ref(),
                 &security,
                 "echo ([System.IO.File]::Delete('important.txt'))",

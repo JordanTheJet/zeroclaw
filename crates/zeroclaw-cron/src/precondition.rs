@@ -28,7 +28,7 @@ use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronPreHookDecl};
 
 use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-use crate::security::SecurityPolicy;
+use zeroclaw_config::policy::SecurityPolicy;
 
 /// Exit code a precondition uses to request a clean skip.
 pub const PRECONDITION_SKIP_EXIT_CODE: i32 = 10;

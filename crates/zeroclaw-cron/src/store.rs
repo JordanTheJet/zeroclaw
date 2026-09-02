@@ -1,4 +1,4 @@
-use crate::cron::{
+use crate::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
 };
@@ -2052,7 +2052,7 @@ mod tests {
         let config = test_config(&tmp);
         let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
 
-        crate::cron::update_shell_job_with_approval(
+        crate::update_shell_job_with_approval(
             &config,
             "some-other-agent",
             &job.id,
@@ -3995,7 +3995,7 @@ command = "test -f /var/run/sync.ready"
         let schedule_json = serde_json::to_string(&job.schedule).unwrap();
         let delivery_json = serde_json::to_string(&job.delivery).unwrap();
         let allowed_tools_json =
-            crate::cron::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
+            crate::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
         with_initialized_connection(config, |conn| {
             conn.execute(
                 "INSERT INTO cron_jobs
