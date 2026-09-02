@@ -338,7 +338,7 @@ pub struct ChannelMessage {
     /// when the platform supports multiple bot instances. Session-key
     /// construction uses this so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
-    /// for channels without an alias concept (webhook, cli).
+    /// for channels without an alias concept (cli).
     pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
@@ -419,6 +419,46 @@ pub enum ProgressEvent {
     RunningTool,
     CompactingContext,
     FinalizingResponse,
+}
+
+/// Origin of a rendered draft-progress entry.
+///
+/// Channels may display both variants identically, but must retain this value
+/// while coalescing updates so provider reasoning cannot be mistaken for
+/// generated status chrome when their rendered text happens to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProgressKind {
+    /// Generated lifecycle or tool-status chrome.
+    Status,
+    /// Raw provider reasoning explicitly enabled for the channel.
+    Reasoning,
+}
+
+/// Rendered draft-progress text paired with its semantic origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProgress {
+    /// Semantic source retained independently from the display string.
+    pub kind: DraftProgressKind,
+    /// Channel-ready display text after redaction.
+    pub text: String,
+}
+
+impl DraftProgress {
+    /// Create a generated status or tool-progress entry.
+    pub fn status(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Status,
+            text: text.into(),
+        }
+    }
+
+    /// Create a provider-reasoning entry.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Reasoning,
+            text: text.into(),
+        }
+    }
 }
 
 impl RoomVisibility {
@@ -831,6 +871,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Show a batch of progress updates without discarding their source kind.
+    ///
+    /// The default preserves compatibility for channels that only need text;
+    /// channels that coalesce semantically different progress should override
+    /// this method and keep the kind through their local draft buffer.
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> anyhow::Result<()> {
+        let texts = progress
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        self.update_draft_progress_batch(recipient, message_id, &texts)
+            .await
+    }
+
     /// Show localized lifecycle progress produced from a typed runtime event.
     /// Unlike raw tool status text, this input is trusted channel chrome.
     async fn update_draft_lifecycle(
@@ -1195,6 +1254,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
+                marker: None,
             },
         ]);
 
