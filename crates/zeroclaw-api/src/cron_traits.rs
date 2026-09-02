@@ -37,6 +37,14 @@ pub struct CronAgentRequest {
     pub session_path: std::path::PathBuf,
     /// Optional per-run tool allowlist.
     pub allowed_tools: Option<Vec<String>>,
+    /// Workspace the scheduler resolved for this run.
+    ///
+    /// The scheduler's effective policy can carry a workspace that differs
+    /// from the agent's default, and a run has to execute in that one. The
+    /// host rebuilds the policy from the alias, so without this the rebuild
+    /// would silently substitute the agent default and undo the scheduler's
+    /// choice.
+    pub workspace_dir: std::path::PathBuf,
     /// Tools cron requires the host to exclude from this run.
     ///
     /// Cron narrows scheduler-mutation tools out of its own agent jobs so a

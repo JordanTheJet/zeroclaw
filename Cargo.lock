@@ -13974,6 +13974,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
@@ -14169,6 +14170,7 @@ name = "zeroclaw-cron"
 version = "0.8.5"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "chrono-tz",
  "cron",
@@ -14183,12 +14185,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "unic-langid",
  "uuid",
+ "which",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-plugins",
+ "zeroclaw-spawn",
 ]
 
 [[package]]
@@ -14285,6 +14291,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-hardware",
  "zeroclaw-infra",
  "zeroclaw-log",
@@ -14337,7 +14344,9 @@ name = "zeroclaw-infra"
 version = "0.8.5"
 dependencies = [
  "anyhow",
+ "chardetng",
  "chrono",
+ "encoding_rs",
  "parking_lot",
  "portable-atomic",
  "rusqlite",
@@ -14347,6 +14356,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "windows",
  "zeroclaw-api",
  "zeroclaw-log",
  "zeroclaw-spawn",
@@ -14521,7 +14531,6 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chacha20poly1305",
- "chardetng",
  "chrono",
  "chrono-tz",
  "console",
@@ -14529,7 +14538,6 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "directories",
- "encoding_rs",
  "filetime",
  "fluent 0.16.1",
  "futures-util",
@@ -14586,6 +14594,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",

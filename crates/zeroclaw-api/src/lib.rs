@@ -3,8 +3,8 @@
 pub mod a2a_wire;
 pub mod agent;
 pub mod attribution;
-pub mod cron_traits;
 pub mod channel;
+pub mod cron_traits;
 pub mod elicitation;
 pub mod grants;
 pub mod hook;

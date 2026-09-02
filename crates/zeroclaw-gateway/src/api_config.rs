@@ -1746,7 +1746,7 @@ async fn rename_residue_exists(
     let cfg = state.config.read().clone();
 
     // Cron jobs still owned by `from`.
-    if zeroclaw_runtime::cron::list_jobs_by_agent(&cfg, from)
+    if zeroclaw_cron::list_jobs_by_agent(&cfg, from)
         .map(|jobs| !jobs.is_empty())
         .unwrap_or(false)
     {
@@ -3489,10 +3489,9 @@ mod tests {
         config.runtime_profiles.entry("default".into()).or_default();
 
         // Seed an owned-state row (a cron job) under `from` - the move-probe.
-        zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
-            .expect("seed cron job");
+        zeroclaw_cron::add_job(&config, "from", "* * * * *", "echo hi").expect("seed cron job");
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+            zeroclaw_cron::list_jobs_by_agent(&config, "from")
                 .unwrap()
                 .len(),
             1
@@ -3514,14 +3513,14 @@ mod tests {
         );
         // Owned state did NOT move: the cron job stays under `from`.
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+            zeroclaw_cron::list_jobs_by_agent(&config, "from")
                 .unwrap()
                 .len(),
             1,
             "cron must stay under `from` when persist fails (no premature move)"
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
+            zeroclaw_cron::list_jobs_by_agent(&config, "to")
                 .unwrap()
                 .is_empty(),
             "cron must NOT have moved to `to` when persist fails"
@@ -3556,8 +3555,7 @@ mod tests {
         // Create the agent's default workspace dir so the move has something to move.
         let old_ws = config.agent_workspace_dir("from");
         std::fs::create_dir_all(&old_ws).unwrap();
-        zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
-            .expect("seed cron job");
+        zeroclaw_cron::add_job(&config, "from", "* * * * *", "echo hi").expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
         let body = RenameMapKeyBody {
@@ -3574,14 +3572,14 @@ mod tests {
         assert!(!state.config.read().agents.contains_key("from"));
         // Cron re-pointed to `to` - the move happened, after a successful persist.
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
+            zeroclaw_cron::list_jobs_by_agent(&config, "to")
                 .unwrap()
                 .len(),
             1,
             "cron moves to `to` once persist succeeds"
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+            zeroclaw_cron::list_jobs_by_agent(&config, "from")
                 .unwrap()
                 .is_empty()
         );
@@ -3618,7 +3616,7 @@ mod tests {
 
         // Seed the lagging owned state + workspace under `from` (added while
         // `from` is still a known agent so cron::add_job validates).
-        zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
+        zeroclaw_cron::add_job(&config, "from", "* * * * *", "echo hi")
             .expect("seed lagged cron job under `from`");
         let old_ws = config.agent_workspace_dir("from");
         std::fs::create_dir_all(&old_ws).unwrap();
@@ -3653,14 +3651,14 @@ mod tests {
 
         // Owned state converged onto `to`.
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
+            zeroclaw_cron::list_jobs_by_agent(&config, "to")
                 .unwrap()
                 .len(),
             1,
             "lagged cron re-points to `to` on resume"
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+            zeroclaw_cron::list_jobs_by_agent(&config, "from")
                 .unwrap()
                 .is_empty(),
             "no cron left under `from` after convergence"
@@ -4307,10 +4305,9 @@ mod tests {
         let old_ws = config.agent_workspace_dir("victim");
         std::fs::create_dir_all(&old_ws).unwrap();
         // Seed an owned-state row (a cron job) under `victim` — the delete probe.
-        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
-            .expect("seed cron job");
+        zeroclaw_cron::add_job(&config, "victim", "* * * * *", "echo hi").expect("seed cron job");
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+            zeroclaw_cron::list_jobs_by_agent(&config, "victim")
                 .unwrap()
                 .len(),
             1
@@ -4327,7 +4324,7 @@ mod tests {
         );
         // Owned state did NOT move: the cron job stays under `victim`.
         assert_eq!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+            zeroclaw_cron::list_jobs_by_agent(&config, "victim")
                 .unwrap()
                 .len(),
             1,
@@ -4369,8 +4366,7 @@ mod tests {
         config.runtime_profiles.entry("default".into()).or_default();
         let old_ws = config.agent_workspace_dir("victim");
         std::fs::create_dir_all(&old_ws).unwrap();
-        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
-            .expect("seed cron job");
+        zeroclaw_cron::add_job(&config, "victim", "* * * * *", "echo hi").expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
@@ -4384,7 +4380,7 @@ mod tests {
         );
         // Cron job purged: the cascade ran after a successful persist.
         assert!(
-            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "victim")
+            zeroclaw_cron::list_jobs_by_agent(&config, "victim")
                 .unwrap()
                 .is_empty(),
             "cron purged once persist succeeds"
@@ -4441,8 +4437,7 @@ mod tests {
         // Drop a real file inside the workspace so the cascade has something
         // to archive (and so we can detect a successful archive).
         std::fs::write(old_ws.join("marker.txt"), b"hi").unwrap();
-        zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
-            .expect("seed cron job");
+        zeroclaw_cron::add_job(&config, "victim", "* * * * *", "echo hi").expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;

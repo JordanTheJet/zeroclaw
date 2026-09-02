@@ -23,7 +23,7 @@ static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
 static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -46,7 +46,7 @@ fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     ));
 }
 
-pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+pub fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     let mut claims = LIVE_AGENT_CLAIM_TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -57,8 +57,8 @@ pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str
     ));
 }
 
-#[cfg(test)]
-pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+#[cfg(any(test, feature = "test-util"))]
+pub fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     let mut failures = FORCED_RELEASE_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -72,8 +72,8 @@ pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
 
 /// Seed a claim carrying `lock_token`, as another process or an older build
 /// would have left it. `None` reproduces a row claimed before tokens existed.
-#[cfg(test)]
-pub(crate) fn force_claim_for_tests(
+#[cfg(any(test, feature = "test-util"))]
+pub fn force_claim_for_tests(
     config: &Config,
     job_id: &str,
     lock_token: Option<&str>,
@@ -88,7 +88,7 @@ pub(crate) fn force_claim_for_tests(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn should_force_release_failure(config: &Config) -> bool {
     FORCED_RELEASE_FAILURES
         .lock()
@@ -1014,7 +1014,7 @@ fn claim_with_live_token(
 
 /// Release an agent claim only when it still owns the supplied token.
 pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if should_force_release_failure(config) {
         anyhow::bail!("forced cron lock release failure for test");
     }
@@ -1951,12 +1951,7 @@ fn with_existing_initialized_connection<T>(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| {
-        format!(
-            "Failed to open existing cron DB: {}",
-            db_path.display().to_string()
-        )
-    })?;
+    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 
@@ -1979,16 +1974,12 @@ pub(super) fn with_initialized_connection<T>(
     }
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create cron directory: {}",
-                parent.display().to_string()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
     }
 
     let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+        .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 
