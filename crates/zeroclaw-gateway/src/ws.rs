@@ -1158,14 +1158,14 @@ async fn process_chat_message(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
-    // The socket is a viewer of the turn, not its owner (#8559, #7759). Once
-    // the client is gone — close frame, transport error, end of stream, or a
-    // failed write — this loop stops touching the socket but keeps draining
-    // `event_rx` so the agent runs to completion and persists its real
-    // response. Only the explicit abort path (`cancel_token`, reached through
+    // The socket is a viewer of the turn, not its owner. Once the client is
+    // gone — close frame, transport error, end of stream, or a failed write —
+    // this loop stops touching the socket but keeps draining `event_rx` so the
+    // agent runs to completion and persists its real response. Only the
+    // explicit abort path (`cancel_token`, reached through
     // `POST /api/sessions/{id}/abort`) cancels a turn. The socket arms are
-    // *disabled* once the client is gone rather than `continue`d: re-polling
-    // a closed receiver is the #6514 hot loop.
+    // *disabled* once the client is gone rather than `continue`d: re-polling a
+    // closed receiver hot-loops the select and starves the abort endpoint.
     let forward_fut = async {
         let mut cancel_drained = false;
         let mut client_gone = false;
@@ -2193,8 +2193,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     async fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist_inner() {
-        // Regression for #8559 / #7759: navigating away, closing the tab, or a
-        // dropped connection must not cancel a running agent turn. The turn
+        // Regression: navigating away, closing the tab, or a dropped
+        // connection must not cancel a running agent turn. The turn
         // finishes unattended, persists its real response, and a later socket
         // on the same session resumes the completed transcript.
         let mut fixture = ParkedTurnFixture::spawn().await;
@@ -2263,8 +2263,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     async fn session_abort_still_cancels_a_detached_turn_inner() {
         // The explicit abort endpoint remains the one thing that cancels a
-        // turn, and it keeps working after the viewer has gone (#6514 stays
-        // fixed: the detached turn does not hot-loop or outlive an abort).
+        // turn, and it keeps working after the viewer has gone: the detached
+        // turn neither hot-loops nor outlives an abort.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "detach-then-abort";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
@@ -2881,9 +2881,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     // The mid-turn `client_msg` arm in `forward_fut` must classify stream-end
     // / close / error frames as "client gone" so the arm can be *disabled*: a
-    // bare `continue` re-polls the closed receiver and hot-loops the select
-    // (#6514). A gone client must not cancel the turn (#8559); that contract
-    // is proved at the route boundary by
+    // bare `continue` re-polls the closed receiver and hot-loops the select,
+    // starving the abort endpoint. A gone client must not cancel the turn;
+    // that contract is proved at the route boundary by
     // `websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist`.
     #[test]
     fn mid_turn_client_frames_classify_close_err_and_stream_end_as_gone() {
