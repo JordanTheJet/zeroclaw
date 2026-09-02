@@ -9,7 +9,7 @@
 //! `precondition_failed`, and `already_in_flight` are a wire contract shared
 //! with the API, the tools, and stored history; they must not vary by locale.
 
-use fluent_bundle::{FluentArgs, FluentBundle, FluentResource, FluentValue};
+use fluent::{FluentArgs, FluentBundle, FluentResource, FluentValue};
 use unic_langid::LanguageIdentifier;
 
 /// English catalogue, compiled in so a missing locale directory degrades to
