@@ -10,6 +10,7 @@ relates-to:
   - docs/book/src/foundations/fnd-001-intentional-architecture.md
   - docs/book/src/architecture/background-work-lifecycle.md
   - https://github.com/zeroclaw-labs/zeroclaw/issues/5607
+  - https://github.com/zeroclaw-labs/zeroclaw/issues/10546
 ---
 
 # ADR-016: Cron Is Extracted Into Its Own Crate, With a Bounded Exception Until It Is
@@ -49,7 +50,7 @@ This exception is deliberately narrow. It permits continuing work on a subsystem
 
 ### The obligation attached to it
 
-The exception is granted against a tracked extraction with acceptance criteria, not against an intention. If that issue is closed without extraction, or goes stale, the exception lapses and cron work returns to being blocked on extraction.
+The exception is granted against [#10546](https://github.com/zeroclaw-labs/zeroclaw/issues/10546), a tracked extraction with acceptance criteria, not against an intention. If that issue is closed without extraction, or goes stale, the exception lapses and cron work returns to being blocked on extraction.
 
 ## Consequences
 
@@ -67,4 +68,4 @@ ADR-016 remains proposed until all of the following hold:
 - `crates/zeroclaw-runtime/src/cron` is gone, not merely re-exported.
 - The cron crate depends on security policy, config, and delivery through their existing contracts, and none of those depends on cron.
 - `crates/zeroclaw-runtime/AGENTS.md` no longer names cron as awaiting extraction.
-- The bounded extraction issue is closed by the extraction, not by expiry.
+- [#10546](https://github.com/zeroclaw-labs/zeroclaw/issues/10546) is closed by the extraction, not by expiry.
