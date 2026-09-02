@@ -141,19 +141,31 @@ export function AgentChatInner({
     setInput(value);
   }, []);
 
+  // `saveDraft` is bound to the conversation on screen when it was created.
+  // A deferred writer (an upload that lands after the operator switched
+  // conversations) reads the current text from `inputValueRef`, so it must
+  // also write under the current key; using the key it captured would park
+  // the text in the old conversation while showing it in the new one.
+  // Resolve both at invocation time. Whether a deferred writer should instead
+  // be dropped after a switch is the caller's decision.
+  const saveDraftRef = useRef(saveDraft);
+  saveDraftRef.current = saveDraft;
+
   /**
    * Single writer for the live composer text. Every change to what the
    * operator has typed (keystrokes, slash-command completion, a marker
    * appended by a later feature) goes through here so the per-conversation
    * draft store stays in step with the textarea. A bare `setInput` would leave
    * the stored draft behind and lose the change on the next conversation
-   * switch. Accepts a value or an updater over the latest text.
+   * switch. Accepts a value or an updater over the latest text; both the text
+   * and the draft key are the ones current when it runs, not when it was
+   * captured.
    */
   const applyInput = useCallback((next: string | ((prev: string) => string)) => {
     const value = typeof next === 'function' ? next(inputValueRef.current) : next;
     writeInput(value);
-    saveDraft(value);
-  }, [writeInput, saveDraft]);
+    saveDraftRef.current(value);
+  }, [writeInput]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
   // with a single '/' and the token still matches at least one command.
