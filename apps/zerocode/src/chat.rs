@@ -16,7 +16,9 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-use crate::attachment::{PendingAttachment, build_attachments_json, cleanup_attachment_temps};
+use crate::attachment::{
+    CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
+};
 use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
     method, parse_session_update,
@@ -26,6 +28,12 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
+#[cfg(test)]
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{
+    TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+};
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
@@ -37,6 +45,16 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+
+fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
+    if let Some(cleanup) = cleanup {
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&cleanup);
+    }
+    message
+}
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -102,6 +120,11 @@ pub(crate) struct Chat {
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
+    /// Request-form `session/prompt` completions. Terminal notifications remain
+    /// transcript authority; this channel only prevents a lost terminal frame
+    /// from leaving the matching local turn stuck in flight.
+    prompt_completion_tx: mpsc::Sender<PromptCompletion>,
+    prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
@@ -122,16 +145,17 @@ pub(crate) struct Chat {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
-    todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
-    todo_settings_loaded: bool,
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
+    /// Inbound `elicitation/create` requests that arrived while the pane was
+    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
+    /// Rather than auto-cancel a legitimately-owned prompt during that
+    /// transient window — which silently drops the agent's `ask_user` — we
+    /// hold it here and retry installation on subsequent drains until it
+    /// either matches (modal installed) or its grace deadline expires (then
+    /// answered `cancel`, unblocking the daemon's tool call). See
+    /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
@@ -174,6 +198,12 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
+struct PromptCompletion {
+    session_id: String,
+    turn_generation: u64,
+    error: Option<String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -182,6 +212,7 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
+        let (prompt_completion_tx, prompt_completion_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -192,6 +223,8 @@ impl Chat {
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
+            prompt_completion_tx,
+            prompt_completion_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -203,8 +236,6 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
-            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            todo_settings_loaded: false,
             help_requested: false,
             deferred_elicitations: Vec::new(),
         }
@@ -418,14 +449,38 @@ impl Chat {
         }
     }
 
-    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        if !self.todo_settings_loaded {
-            self.todo_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
-                self.todo_settings =
-                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
+    /// Resolve the local `[todotracker]` settings from `zerocode-config.toml`.
+    /// Called at every session boundary (new / restart / switch) so the file
+    /// stays the single source of truth and a Config-pane save takes effect on
+    /// the next transition.
+    ///
+    /// On a load failure (e.g. an invalid `ZEROCODE_todotracker__*` override or
+    /// a malformed section) the `fallback` is returned rather than hard
+    /// defaults, so a transient error does not silently reset a user's tracker
+    /// layout/visibility to the built-ins. The failure is logged so it can be
+    /// diagnosed.
+    fn resolve_todo_settings(
+        fallback: crate::todo_tracker::TodoTrackerSettings,
+    ) -> crate::todo_tracker::TodoTrackerSettings {
+        match crate::config::resolve_todo_tracker_checked(&crate::i18n::config_dir()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!(
+                    "zerocode: resolving [todotracker] failed ({error:#}); keeping current settings"
+                );
+                fallback
             }
         }
+    }
+
+    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+        // TodoWrite display is a ZeroCode UI concern owned by
+        // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
+        // — so read it from the local config file (honoring `--config-dir` /
+        // `ZEROCLAW_CONFIG_DIR`), not over RPC. A fresh pane has no prior
+        // tracker, so a load failure falls back to the built-in defaults.
+        let todo_settings =
+            Self::resolve_todo_settings(crate::todo_tracker::TodoTrackerSettings::default());
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
@@ -461,10 +516,13 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
+                // `todo_settings` is resolved fresh at this boundary from
+                // `zerocode-config.toml` (the canonical owner); the removed
+                // `self.todo_settings` cache was the stale cross-session copy.
                 let mut state = ChatState::with_shared_commands(
                     session.session_id,
                     agent_alias.to_string(),
-                    self.todo_settings,
+                    todo_settings,
                     self.rpc.commands(),
                 );
                 state.cwd = session.workspace_dir;
@@ -475,7 +533,7 @@ impl Chat {
                 if let Some(sid) = resumed_sid
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
-                    state.load_history(msgs.messages);
+                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -560,7 +618,8 @@ impl Chat {
             Ok(s) => {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
-                state.reset_for_session(s.session_id, None);
+                let current = state.todo_tracker.settings();
+                state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
                 state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
@@ -594,6 +653,36 @@ impl Chat {
             }
         }
         if applied {
+            self.pump_queue();
+        }
+    }
+
+    fn drain_prompt_completions(&mut self) {
+        let mut settled = false;
+        while let Ok(completion) = self.prompt_completion_rx.try_recv() {
+            let ChatPhase::Active(ref mut state) = self.phase else {
+                continue;
+            };
+            if state.session_id != completion.session_id
+                || state.turn_generation != completion.turn_generation
+                || !state.turn_in_flight
+            {
+                continue;
+            }
+
+            // The response proves the handler returned, but only the missing
+            // terminal notification distinguishes completed from cancelled or
+            // failed. Settle conservatively so queued work cannot auto-run.
+            state.settle_turn_from_prompt_response();
+            if let Some(error) = completion.error {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-queue-dispatch-failed",
+                    &[("error", &error)],
+                ));
+            }
+            settled = true;
+        }
+        if settled {
             self.pump_queue();
         }
     }
@@ -805,31 +894,129 @@ impl Chat {
         }
     }
 
+    async fn cancel_active_turn_for_injection(&mut self) {
+        let session_id = match self.phase {
+            ChatPhase::Active(ref state)
+                if state.turn_in_flight && !matches!(state.turn_status, TurnStatus::Cancelling) =>
+            {
+                state.session_id.clone()
+            }
+            _ => return,
+        };
+        let result = self.rpc.session_cancel(&session_id).await;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            if result.is_ok() {
+                state.enter_cancelling();
+            } else {
+                state.commit_turn(String::new(), false);
+            }
+        }
+    }
+
+    async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
+        match request {
+            ChatContextMenuRequest::CopyTranscript(target) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                if !state.copy_text_and_clear_selection(&target.text) {
+                    return;
+                }
+                match target.kind {
+                    CopyHitKind::Code => {
+                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group));
+                    }
+                    CopyHitKind::Message | CopyHitKind::Transcript => {
+                        state.set_overlay_copy_feedback(target.rect);
+                    }
+                }
+            }
+            ChatContextMenuRequest::Queue { id, action } => match action {
+                ChatContextMenuAction::SendNow => {
+                    let promoted = match self.phase {
+                        ChatPhase::Active(ref mut state) => state.promote_queued_by_id(id),
+                        _ => false,
+                    };
+                    if promoted {
+                        self.cancel_active_turn_for_injection().await;
+                        self.pump_queue();
+                    }
+                }
+                ChatContextMenuAction::Copy => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let Some(text) = state.queued_text(id).filter(|text| !text.is_empty()) else {
+                        return;
+                    };
+                    crate::mouse::copy_osc52(&text);
+                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                }
+                ChatContextMenuAction::Edit => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let composer_busy = !state.input_bar.input().trim().is_empty()
+                        || state.input_bar.has_pending_attachments();
+                    if composer_busy {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-queue-edit-busy",
+                            ))));
+                        state.mark_dirty_append();
+                    } else if let Some((text, attachments)) = state.take_queued_for_edit(id) {
+                        state.input_bar.load_for_edit(text, attachments);
+                    }
+                }
+                ChatContextMenuAction::Delete => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state.delete_queued_by_id(id);
+                    }
+                }
+            },
+        }
+    }
+
     fn pump_queue(&mut self) {
         let next = match self.phase {
             ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
             _ => None,
         };
-        let Some(msg) = next else { return };
+        let Some(QueuedMessage {
+            text, attachments, ..
+        }) = next
+        else {
+            return;
+        };
         let sid = match self.phase {
             ChatPhase::Active(ref state) => state.session_id.clone(),
-            _ => return,
+            _ => {
+                let _ = cleanup_attachment_temps(&attachments);
+                return;
+            }
         };
 
         let transport = self.rpc.transport();
-        let attachments_json = if msg.attachments.is_empty() {
+        let attachments_json = if attachments.is_empty() {
             Vec::new()
         } else {
-            match build_attachments_json(&msg.attachments, transport) {
+            match build_attachments_json(&attachments, transport) {
                 Ok(json) => json,
                 Err(e) => {
                     if let ChatPhase::Active(ref mut state) = self.phase {
+                        let cleanup_report = cleanup_attachment_temps(&attachments);
+                        state.surface_cleanup_report(cleanup_report);
                         state
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(
                                 crate::i18n::t_args(
                                     "zc-queue-dispatch-failed",
-                                    &[("error", &e.to_string())],
+                                    // The anyhow context includes the local
+                                    // attachment path. Keep it out of the
+                                    // transcript; the cleanup notice already
+                                    // reports the bounded, actionable count.
+                                    &[("error", &e.root_cause().to_string())],
                                 ),
                             )));
                         state.mark_dirty_append();
@@ -840,29 +1027,54 @@ impl Chat {
         };
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            let att_names: Vec<String> =
-                msg.attachments.iter().map(|a| a.filename.clone()).collect();
-            let text = if msg.text.is_empty() {
+            let att_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+            let prompt = if text.is_empty() {
                 None
             } else {
-                Some(msg.text.clone())
+                Some(text.clone())
             };
-            state.push_user_message(text, att_names);
+            state.own_active_turn_attachments(attachments);
+            state.push_user_message(prompt, att_names);
+        } else {
+            let _ = cleanup_attachment_temps(&attachments);
+            return;
         }
-        self.spawn_prompt(sid, msg.text, attachments_json);
+        let turn_generation = match self.phase {
+            ChatPhase::Active(ref state) => state.turn_generation,
+            _ => return,
+        };
+        self.spawn_prompt(sid, turn_generation, text, attachments_json);
     }
 
-    fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
+    fn spawn_prompt(
+        &self,
+        sid: String,
+        turn_generation: u64,
+        prompt: String,
+        attachments_json: Vec<serde_json::Value>,
+    ) {
         let rpc_arc = self.rpc_out.clone();
+        let completion_tx = self.prompt_completion_tx.clone();
         tokio::spawn(async move {
             let mut params = serde_json::json!({
-                "session_id": sid,
+                "session_id": &sid,
                 "prompt": prompt,
             });
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
             }
-            rpc_arc.notify(method::SESSION_PROMPT, params).await;
+            let error = rpc_arc
+                .request(method::SESSION_PROMPT, params)
+                .await
+                .err()
+                .map(|e| format!("{} ({})", e.message, e.code));
+            let _ = completion_tx
+                .send(PromptCompletion {
+                    session_id: sid,
+                    turn_generation,
+                    error,
+                })
+                .await;
         });
     }
 
@@ -929,6 +1141,7 @@ impl Chat {
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
+        self.drain_prompt_completions();
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
@@ -1272,30 +1485,37 @@ impl Chat {
             return false;
         }
 
-        // The transcript context menu is modal within an active chat. Handle
+        // The transcript or queue context menu is modal within an active chat. Handle
         // it before selection clearing or input dispatch so Esc cannot leak
         // into the editor and Enter cannot submit a prompt.
-        if state.copy_context_menu.is_some() {
+        if state.context_menu.is_some() {
             use crate::keymap::ModalAction;
-            match ModalAction::from_chord(&key) {
-                Some(ModalAction::Confirm) => {
-                    state.activate_copy_context_menu();
+            let request = match ModalAction::from_chord(&key) {
+                Some(ModalAction::Up) => {
+                    state.context_menu_select_step(-1);
+                    None
                 }
+                Some(ModalAction::Down) => {
+                    state.context_menu_select_step(1);
+                    None
+                }
+                Some(ModalAction::Confirm) => state.take_context_menu_request(),
                 Some(ModalAction::Cancel) => {
-                    state.dismiss_copy_context_menu();
+                    state.dismiss_context_menu();
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(request) = request {
+                self.execute_context_menu_request(request).await;
             }
             return false;
         }
 
-        // The attachment manager is modal within the input surface. Higher
-        // overlays above have already had first refusal; handle it before queue,
-        // browse, and other pane-level shortcuts.
-        if state.pending_approval().is_none() && state.input_bar.has_attachment_manager() {
-            state.clear_mouse_highlight();
-            let _ = state.input_bar.handle_key(key);
-            state.mark_dirty_full();
+        // Input-bar overlays are modal within the input surface. Higher
+        // overlays above have already had first refusal; handle them before
+        // queue, browse, and other pane-level shortcuts.
+        if state.handle_input_bar_overlay_key(key) {
             return false;
         }
 
@@ -1323,22 +1543,22 @@ impl Chat {
                     state.queue_select_step(1);
                     return false;
                 }
-                Some(QAction::QueueDelete) if state.queue_sidebar_open() => {
-                    state.delete_selected_queued();
-                    return false;
-                }
-                Some(QAction::QueueEdit) if state.queue_sidebar_open() => {
-                    let bar_busy = !state.input_bar.input().trim().is_empty()
-                        || state.input_bar.has_pending_attachments();
-                    if bar_busy {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
-                            ))));
-                        state.mark_dirty_append();
-                    } else if let Some((text, attachments)) = state.take_selected_for_edit() {
-                        state.input_bar.load_for_edit(text, attachments);
+                Some(
+                    action @ (QAction::QueueSendNow
+                    | QAction::QueueCopy
+                    | QAction::QueueDelete
+                    | QAction::QueueEdit),
+                ) if state.queue_sidebar_open() => {
+                    let action = match action {
+                        QAction::QueueSendNow => ChatContextMenuAction::SendNow,
+                        QAction::QueueCopy => ChatContextMenuAction::Copy,
+                        QAction::QueueEdit => ChatContextMenuAction::Edit,
+                        QAction::QueueDelete => ChatContextMenuAction::Delete,
+                        _ => unreachable!(),
+                    };
+                    if let Some(id) = state.selected_queue_id() {
+                        let request = ChatContextMenuRequest::Queue { id, action };
+                        self.execute_context_menu_request(request).await;
                     }
                     return false;
                 }
@@ -1408,7 +1628,7 @@ impl Chat {
 
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
-        if state.pending_approval().is_none() && !state.in_browse_mode() {
+        if state.composer_owns_text_input() {
             let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
@@ -1423,25 +1643,15 @@ impl Chat {
                     state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
-                    if enq.is_ok()
-                        && state.turn_in_flight
-                        && !matches!(state.turn_status, TurnStatus::Cancelling)
-                    {
-                        let sid = state.session_id.clone();
-                        let res = self.rpc.session_cancel(&sid).await;
-                        if let ChatPhase::Active(ref mut state) = self.phase {
-                            if res.is_ok() {
-                                state.enter_cancelling();
-                            } else {
-                                state.commit_turn(String::new(), false);
-                            }
-                        }
+                    if enq.is_ok() {
+                        self.cancel_active_turn_for_injection().await;
                     }
                     self.after_enqueue(enq);
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
-                    state.set_info_notice(msg);
+                    let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+                    state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
                     return false;
                 }
                 InputBarAction::ToggleThinking => {
@@ -1467,7 +1677,10 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::ClearQueue(idx) => {
-                    let notice = state.clear_queue_cmd(idx);
+                    let notice = append_cleanup_notice(
+                        state.clear_queue_cmd(idx),
+                        state.input_bar.take_cleanup_report().notice(),
+                    );
                     state.set_info_notice(notice);
                     return false;
                 }
@@ -1525,7 +1738,12 @@ impl Chat {
                     Self::open_provider_picker(&rpc, state).await;
                     return false;
                 }
-                InputBarAction::Consumed => return false,
+                InputBarAction::Consumed => {
+                    if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+                        state.set_info_notice(message);
+                    }
+                    return false;
+                }
                 InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
             }
         }
@@ -1836,13 +2054,18 @@ impl Chat {
 
         let _ = rpc.session_close(&state.session_id).await;
         state.session_overlay = SessionOverlay::None;
-        state.reset_for_session(new_sid.clone(), new_name);
+        let current = state.todo_tracker.settings();
+        state.reset_for_session(
+            new_sid.clone(),
+            new_name,
+            Self::resolve_todo_settings(current),
+        );
         state.agent_alias = agent_alias.clone();
         state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
         if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages);
+            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
         }
     }
 
@@ -2225,9 +2448,14 @@ impl Chat {
 
         if let ChatPhase::Active(ref mut state) = self.phase {
             // The file explorer renders above every parent overlay.
-            if state.input_bar.has_file_explorer() && state.input_bar.handle_mouse(mouse) {
-                state.clear_mouse_highlight();
-                return;
+            if state.input_bar.has_file_explorer() {
+                let consumed = state.input_bar.handle_mouse(mouse);
+                let cleanup_report = state.input_bar.take_cleanup_report();
+                state.surface_cleanup_report(cleanup_report);
+                if consumed {
+                    state.clear_mouse_highlight();
+                    return;
+                }
             }
 
             if state.model_picker.is_open() {
@@ -2289,24 +2517,24 @@ impl Chat {
                 return;
             }
 
-            if state.copy_context_menu.is_some() {
+            if state.context_menu.is_some() {
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let activate = state
-                            .copy_context_menu
-                            .as_ref()
-                            .is_some_and(|menu| menu.action_contains(mouse.column, mouse.row));
-                        if activate {
-                            state.activate_copy_context_menu();
+                        let request = if state.context_menu_select_at(mouse.column, mouse.row) {
+                            state.take_context_menu_request()
                         } else {
-                            state.dismiss_copy_context_menu();
+                            state.dismiss_context_menu();
+                            None
+                        };
+                        if let Some(request) = request {
+                            self.execute_context_menu_request(request).await;
                         }
                         return;
                     }
                     MouseEventKind::Down(MouseButton::Right)
                     | MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollDown => {
-                        state.dismiss_copy_context_menu();
+                        state.dismiss_context_menu();
                     }
                     MouseEventKind::Drag(MouseButton::Left)
                     | MouseEventKind::Up(MouseButton::Left) => return,
@@ -2314,7 +2542,10 @@ impl Chat {
                 }
             }
 
-            if state.input_bar.handle_mouse(mouse) {
+            let input_bar_consumed = state.input_bar.handle_mouse(mouse);
+            let cleanup_report = state.input_bar.take_cleanup_report();
+            state.surface_cleanup_report(cleanup_report);
+            if input_bar_consumed {
                 state.clear_mouse_highlight();
                 return;
             }
@@ -2346,6 +2577,15 @@ impl Chat {
             // conversation handler, so clicks select queued items and the wheel
             // scrolls the queue rather than the transcript.
             if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
+                let opens_context_menu =
+                    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                        || (cfg!(target_os = "macos")
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && mouse.modifiers.contains(KM::CONTROL));
+                if opens_context_menu {
+                    state.open_queue_context_menu(col, row);
+                    return;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
                     MouseEventKind::ScrollDown => state.queue_scroll_by(3),
@@ -2414,7 +2654,7 @@ impl Chat {
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && mouse.modifiers.contains(KM::CONTROL));
             if opens_context_menu {
-                state.open_copy_context_menu(col, row);
+                state.open_transcript_context_menu(col, row);
                 return;
             }
 
@@ -2561,12 +2801,19 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        if state.turn_in_flight {
+        // Bracketed paste bypasses the keyboard handlers that give modal and
+        // browse surfaces first refusal. Consult the same composer-ownership
+        // decision before routing it into the input bar so neither text nor a
+        // path-like attachment can mutate hidden state.
+        if !state.composer_owns_text_input() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
-            state.set_info_notice(msg);
+            let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+            state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
+        } else if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+            state.set_info_notice(message);
         }
     }
 
@@ -2627,6 +2874,8 @@ impl Chat {
     pub(crate) fn clear_input(&mut self) {
         if let ChatPhase::Active(s) = &mut self.phase {
             s.input_bar.reset();
+            let cleanup_report = s.input_bar.take_cleanup_report();
+            s.surface_cleanup_report(cleanup_report);
             s.mark_dirty_full();
         }
     }
@@ -3275,6 +3524,14 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
             crate::i18n::t("zc-queue-help-nav"),
         ),
         E::key(
+            chord_label(A::QueueSendNow),
+            crate::i18n::t("zc-queue-help-inject"),
+        ),
+        E::key(
+            chord_label(A::QueueCopy),
+            crate::i18n::t("zc-chat-context-menu-copy"),
+        ),
+        E::key(
             chord_label(A::QueueDelete),
             crate::i18n::t("zc-queue-help-delete"),
         ),
@@ -3663,8 +3920,19 @@ fn message_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-message-copied")
 }
 
+#[cfg(test)]
 fn context_menu_copy_label() -> String {
     crate::i18n::t("zc-chat-context-menu-copy")
+}
+
+fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+    let key = match action {
+        ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
+        ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
+    };
+    crate::i18n::t(key)
 }
 
 fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
@@ -3690,16 +3958,24 @@ fn should_copy_action(
     }
 }
 
-fn copy_context_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
+fn context_menu_rect(
+    column: u16,
+    row: u16,
+    bounds: Rect,
+    actions: &[ChatContextMenuAction],
+) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
-    if bounds.width < 3 || bounds.height < 3 {
+    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
         return None;
     }
-    let width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
-        .min(bounds.width)
-        .max(3);
-    let height = 3;
+    let label_width = actions
+        .iter()
+        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .max()
+        .unwrap_or(0);
+    let width = (label_width + 4).min(bounds.width).max(3);
+    let height = (actions.len() as u16 + 2).min(bounds.height);
     let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
     let max_y = bounds
         .y
@@ -3732,49 +4008,6 @@ fn header_fence_lang(line: &Line<'static>) -> Option<String> {
 /// Users pasting into a terminal expect raw commands, not fenced blocks.
 fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
-}
-
-/// Wrapped screen-row count for a single cached line at the given width.
-fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
-    Paragraph::new(vec![borrow_line(line)])
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
-}
-
-fn row_breaks_for_line(line: &Line<'static>, width: u16) -> Vec<TranscriptRowBreak> {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let visual_lines = crate::input_bar::wrap_visual_lines(&text, width);
-    let expected_rows = usize::from(wrapped_rows(line, width));
-    if visual_lines.len() != expected_rows {
-        return vec![TranscriptRowBreak::Hard; expected_rows];
-    }
-
-    visual_lines
-        .iter()
-        .enumerate()
-        .map(|(index, current)| {
-            let Some(previous) = index.checked_sub(1).and_then(|i| visual_lines.get(i)) else {
-                return TranscriptRowBreak::Hard;
-            };
-            let gap = &text[previous.end..current.start];
-            if !gap.is_empty() && !gap.chars().all(|ch| ch == '\u{200b}') {
-                TranscriptRowBreak::SoftSpace
-            } else {
-                TranscriptRowBreak::SoftConcat
-            }
-        })
-        .collect()
-}
-
-fn row_breaks_for_lines(lines: &[Line<'static>], width: u16) -> Vec<TranscriptRowBreak> {
-    lines
-        .iter()
-        .flat_map(|line| row_breaks_for_line(line, width))
-        .collect()
 }
 
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
@@ -3853,19 +4086,6 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     let center = anchor.x.saturating_add(anchor.width / 2);
     let x = center.saturating_sub(cells / 2);
     Some(Rect::new(x, anchor.y, cells, 1))
-}
-
-fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
-    let spans: Vec<Span<'a>> = line
-        .spans
-        .iter()
-        .map(|s| Span::styled(s.content.as_ref(), s.style))
-        .collect();
-    let mut out = Line::from(spans).style(line.style);
-    if let Some(a) = line.alignment {
-        out = out.alignment(a);
-    }
-    out
 }
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
@@ -4031,7 +4251,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
-    render_copy_context_menu(f, state);
+    render_context_menu(f, state);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -4061,38 +4281,7 @@ fn capture_transcript_snapshot(
     body: Rect,
     row_breaks: Vec<TranscriptRowBreak>,
 ) {
-    use unicode_width::UnicodeWidthStr;
-
-    let cells = {
-        let buffer = f.buffer_mut();
-        let mut cells = Vec::with_capacity(usize::from(body.width) * usize::from(body.height));
-        for y in body.y..body.y.saturating_add(body.height) {
-            let mut column = 0;
-            while column < body.width {
-                let symbol = buffer[(body.x + column, y)].symbol().to_string();
-                let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
-                    .max(1)
-                    .min(body.width - column);
-                cells.push(TranscriptCell {
-                    symbol,
-                    span_start: column,
-                });
-                for _ in 1..width {
-                    cells.push(TranscriptCell {
-                        symbol: String::new(),
-                        span_start: column,
-                    });
-                }
-                column += width;
-            }
-        }
-        cells
-    };
-    state.set_transcript_snapshot(TranscriptSnapshot {
-        area: body,
-        cells,
-        row_breaks,
-    });
+    state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -4101,19 +4290,7 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    let Some((start, end)) = snapshot.selection_bounds(selection) else {
-        return;
-    };
-
-    let buffer = f.buffer_mut();
-    for row in 0..snapshot.area.height {
-        for column in 0..snapshot.area.width {
-            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
-                buffer[(snapshot.area.x + column, snapshot.area.y + row)]
-                    .set_style(theme::selected_bg_style());
-            }
-        }
-    }
+    snapshot.render_selection(f, selection, theme::selected_bg_style());
 }
 
 fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
@@ -4194,18 +4371,27 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
     }
 }
 
-fn render_copy_context_menu(f: &mut Frame, state: &ChatState) {
-    let Some(menu) = &state.copy_context_menu else {
+fn render_context_menu(f: &mut Frame, state: &ChatState) {
+    let Some(menu) = &state.context_menu else {
         return;
     };
     f.render_widget(Clear, menu.rect);
+    let lines = menu
+        .target
+        .actions()
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let style = if index == menu.selected {
+                theme::accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                theme::body_style()
+            };
+            Line::from(Span::styled(context_menu_action_label(*action), style))
+        })
+        .collect::<Vec<_>>();
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            context_menu_copy_label(),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center)
-        .block(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::accent_style()),
@@ -5156,22 +5342,81 @@ struct CopyHitRegion {
     group: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CopyContextMenu {
-    rect: Rect,
-    target: CopyHitRegion,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatContextMenuAction {
+    SendNow,
+    Copy,
+    Edit,
+    Delete,
 }
 
-impl CopyContextMenu {
-    fn action_contains(&self, column: u16, row: u16) -> bool {
-        self.rect.width > 2
-            && self.rect.height > 2
-            && mouse::in_rect(
-                column,
-                row,
-                Rect::new(self.rect.x + 1, self.rect.y + 1, self.rect.width - 2, 1),
-            )
+const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::SendNow,
+    ChatContextMenuAction::Copy,
+    ChatContextMenuAction::Edit,
+    ChatContextMenuAction::Delete,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuTarget {
+    Transcript(CopyHitRegion),
+    Queue(u64),
+}
+
+impl ChatContextMenuTarget {
+    fn actions(&self) -> &'static [ChatContextMenuAction] {
+        match self {
+            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatContextMenu {
+    rect: Rect,
+    target: ChatContextMenuTarget,
+    selected: usize,
+}
+
+impl ChatContextMenu {
+    fn selected_action(&self) -> Option<ChatContextMenuAction> {
+        self.target.actions().get(self.selected).copied()
+    }
+
+    fn select_step(&mut self, delta: isize) {
+        let count = self.target.actions().len();
+        if count > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
+
+    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
+        if self.rect.width <= 2 || self.rect.height <= 2 {
+            return None;
+        }
+        let inner = Rect::new(
+            self.rect.x + 1,
+            self.rect.y + 1,
+            self.rect.width - 2,
+            self.rect.height - 2,
+        );
+        if !mouse::in_rect(column, row, inner) {
+            return None;
+        }
+        let index = usize::from(row.saturating_sub(inner.y));
+        (index < self.target.actions().len()).then_some(index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuRequest {
+    CopyTranscript(CopyHitRegion),
+    Queue {
+        id: u64,
+        action: ChatContextMenuAction,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5184,191 +5429,6 @@ enum CopyFeedbackTarget {
 struct CopyFeedback {
     target: CopyFeedbackTarget,
     shown_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CellPoint {
-    column: u16,
-    row: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscriptSelection {
-    anchor: CellPoint,
-    head: CellPoint,
-    dragged: bool,
-}
-
-impl TranscriptSelection {
-    fn normalized(self) -> (CellPoint, CellPoint) {
-        if (self.anchor.row, self.anchor.column) <= (self.head.row, self.head.column) {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptCell {
-    symbol: String,
-    span_start: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptRowBreak {
-    Hard,
-    SoftSpace,
-    SoftConcat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptSnapshot {
-    area: Rect,
-    cells: Vec<TranscriptCell>,
-    /// Separator before each visible row, derived from source wrap ranges.
-    row_breaks: Vec<TranscriptRowBreak>,
-}
-
-impl TranscriptSnapshot {
-    fn point_at(&self, column: u16, row: u16) -> Option<CellPoint> {
-        if !mouse::in_rect(column, row, self.area) {
-            return None;
-        }
-        Some(CellPoint {
-            column: column - self.area.x,
-            row: row - self.area.y,
-        })
-    }
-
-    fn cell(&self, point: CellPoint) -> Option<&TranscriptCell> {
-        if point.column >= self.area.width || point.row >= self.area.height {
-            return None;
-        }
-        let index =
-            usize::from(point.row) * usize::from(self.area.width) + usize::from(point.column);
-        self.cells.get(index)
-    }
-
-    fn has_text_at(&self, point: CellPoint) -> bool {
-        let Some(cell) = self.cell(point) else {
-            return false;
-        };
-        self.cell(CellPoint {
-            column: cell.span_start,
-            row: point.row,
-        })
-        .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
-    }
-
-    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
-        let first =
-            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        let last = (0..self.area.width)
-            .rev()
-            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        Some((first, last))
-    }
-
-    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
-        if let Some((first, last)) = self.row_text_bounds(point.row) {
-            point.column = point.column.clamp(first, last);
-        }
-        point
-    }
-
-    fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
-        if !selection.dragged {
-            return None;
-        }
-        let (mut start, mut end) = selection.normalized();
-        start = self.clamp_outer_whitespace(start);
-        end = self.clamp_outer_whitespace(end);
-        start.column = self.cell(start)?.span_start;
-        let end_cell = self.cell(end)?;
-        let origin = self.cell(CellPoint {
-            column: end_cell.span_start,
-            row: end.row,
-        })?;
-        end.column = end_cell
-            .span_start
-            .saturating_add(
-                (unicode_width::UnicodeWidthStr::width(origin.symbol.as_str()) as u16)
-                    .max(1)
-                    .saturating_sub(1),
-            )
-            .min(self.area.width.saturating_sub(1));
-        Some((start, end))
-    }
-
-    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
-        (point.row, point.column) >= (start.row, start.column)
-            && (point.row, point.column) <= (end.row, end.column)
-    }
-
-    fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
-        if self.cells.is_empty() {
-            return None;
-        }
-
-        let (start, end) = self.selection_bounds(selection)?;
-        let start_row = usize::from(start.row);
-        let end_row = usize::from(end.row);
-        let mut text = String::new();
-
-        for row_idx in start_row..=end_row {
-            let first_col = if row_idx == start_row {
-                start.column
-            } else {
-                0
-            };
-            let last_col = if row_idx == end_row {
-                end.column
-            } else {
-                self.area.width.saturating_sub(1)
-            };
-
-            let mut row_text = String::new();
-            for column in first_col..=last_col {
-                let point = CellPoint {
-                    column,
-                    row: row_idx as u16,
-                };
-                let Some(cell) = self.cell(point) else {
-                    continue;
-                };
-                if cell.span_start == column {
-                    row_text.push_str(&cell.symbol);
-                }
-            }
-            let row_text = row_text.trim_end_matches(' ');
-            if row_idx > start_row {
-                match self
-                    .row_breaks
-                    .get(row_idx)
-                    .copied()
-                    .unwrap_or(TranscriptRowBreak::Hard)
-                {
-                    TranscriptRowBreak::Hard => text.push('\n'),
-                    TranscriptRowBreak::SoftSpace => text.push(' '),
-                    TranscriptRowBreak::SoftConcat => {}
-                }
-            }
-            text.push_str(row_text);
-        }
-
-        text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
-    }
-
-    fn selection_anchor_rect(&self, selection: TranscriptSelection) -> Option<Rect> {
-        if !selection.dragged {
-            return None;
-        }
-        let (start, end) = selection.normalized();
-        let y = self.area.y.saturating_add(start.row);
-        let height = end.row.saturating_sub(start.row).saturating_add(1);
-        Some(Rect::new(self.area.x, y, self.area.width, height))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5409,12 +5469,19 @@ pub struct ChatState {
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
     pub input_bar: InputBarState,
+    /// Attachments owned by the currently dispatched turn. Once an input-bar
+    /// submission leaves the composer, this is the sole owner until the turn
+    /// reaches a terminal outcome.
+    active_turn_attachments: Vec<PendingAttachment>,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Monotonic local turn identity. Prompt responses use it to avoid
+    /// settling a newer queued turn after the prior terminal notification.
+    turn_generation: u64,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -5454,8 +5521,8 @@ pub struct ChatState {
     copy_hit_regions: Vec<CopyHitRegion>,
     /// Full code-block targets used by right-click context-menu resolution.
     context_copy_regions: Vec<CopyHitRegion>,
-    /// Active one-action transcript context menu.
-    copy_context_menu: Option<CopyContextMenu>,
+    /// Active transcript or queue context menu.
+    context_menu: Option<ChatContextMenu>,
     /// Temporary `[Copied]` overlay for copy labels.
     copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
@@ -5560,12 +5627,14 @@ impl ChatState {
             git_hash: None,
             git_branch_last_fetch: None,
             input_bar: InputBarState::with_shared_commands(commands),
+            active_turn_attachments: Vec::new(),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_generation: 0,
             turn_had_streaming_text: false,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -5580,7 +5649,7 @@ impl ChatState {
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
-            copy_context_menu: None,
+            context_menu: None,
             copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
@@ -5624,6 +5693,43 @@ impl ChatState {
         // Full is sticky — don't downgrade.
     }
 
+    /// Whether text input currently belongs to the composer rather than a
+    /// modal, picker, explorer, or transcript-browse surface.
+    fn composer_owns_text_input(&self) -> bool {
+        !self.model_picker.is_open()
+            && self.pending_elicitation().is_none()
+            && self.pending_approval().is_none()
+            && matches!(self.session_overlay, SessionOverlay::None)
+            && self.context_menu.is_none()
+            && !self.input_bar.has_file_explorer()
+            && !self.input_bar.has_attachment_manager()
+            && !self.in_browse_mode()
+    }
+
+    /// Route a key to an input-bar-owned overlay and retain its user feedback.
+    /// Returns true only when that overlay consumed the key before pane-level
+    /// shortcuts get a chance to process it.
+    fn handle_input_bar_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.pending_approval().is_some()
+            || (!self.input_bar.has_file_explorer() && !self.input_bar.has_attachment_manager())
+        {
+            return false;
+        }
+
+        self.clear_mouse_highlight();
+        let action = self.input_bar.handle_key(key);
+        let cleanup_notice = self.input_bar.take_cleanup_report().notice();
+        // Explorer confirmation can reject an attachment (for example a file
+        // over the size limit). Preserve that feedback instead of swallowing it.
+        if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(append_cleanup_notice(message, cleanup_notice));
+        } else if let Some(message) = cleanup_notice {
+            self.set_info_notice(message);
+        }
+        self.mark_dirty_full();
+        true
+    }
+
     fn mark_dirty_full(&mut self) {
         self.dirty = LinesDirty::Full;
     }
@@ -5632,7 +5738,7 @@ impl ChatState {
         self.transcript_selection = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
     }
 
@@ -5714,12 +5820,12 @@ impl ChatState {
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
             || !self.browse_multi.is_empty();
-        if lines_changed || self.copy_context_menu.is_some() || self.copy_feedback.is_some() {
+        if lines_changed || self.context_menu.is_some() || self.copy_feedback.is_some() {
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
             self.browse_multi.clear();
-            self.copy_context_menu = None;
+            self.context_menu = None;
             self.copy_feedback = None;
         }
         if lines_changed {
@@ -5773,11 +5879,11 @@ impl ChatState {
         self.yank_selection()
     }
 
-    fn dismiss_copy_context_menu(&mut self) {
-        self.copy_context_menu = None;
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu = None;
     }
 
-    fn open_copy_context_menu(&mut self, column: u16, row: u16) -> bool {
+    fn open_transcript_context_menu(&mut self, column: u16, row: u16) -> bool {
         let Some(bounds) = self
             .transcript_snapshot
             .as_ref()
@@ -5835,31 +5941,71 @@ impl ChatState {
         let Some(target) = target else {
             return false;
         };
-        let Some(rect) = copy_context_menu_rect(column, row, bounds) else {
+        let target = ChatContextMenuTarget::Transcript(target);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
             return false;
         };
-        self.copy_context_menu = Some(CopyContextMenu { rect, target });
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
         true
     }
 
-    fn activate_copy_context_menu(&mut self) -> bool {
-        let Some(menu) = self.copy_context_menu.take() else {
+    fn open_queue_context_menu(&mut self, column: u16, row: u16) -> bool {
+        let id = self
+            .queue_item_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(id, _)| *id);
+        let (Some(id), Some(bounds)) = (id, self.queue_sidebar_rect) else {
             return false;
         };
-        if menu.target.text.is_empty() {
+        self.select_queued_by_id(id);
+        let target = ChatContextMenuTarget::Queue(id);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
             return false;
-        }
-
-        self.copy_text_and_clear_selection(&menu.target.text);
-        match menu.target.kind {
-            CopyHitKind::Code => {
-                self.set_copy_feedback(CopyFeedbackTarget::Code(menu.target.group));
-            }
-            CopyHitKind::Message | CopyHitKind::Transcript => {
-                self.set_overlay_copy_feedback(menu.target.rect);
-            }
-        }
+        };
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
+        self.mark_dirty_full();
         true
+    }
+
+    fn context_menu_select_step(&mut self, delta: isize) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.select_step(delta);
+            self.mark_dirty_full();
+        }
+    }
+
+    fn context_menu_select_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return false;
+        };
+        let Some(index) = menu.action_at(column, row) else {
+            return false;
+        };
+        menu.selected = index;
+        true
+    }
+
+    fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
+        let menu = self.context_menu.take()?;
+        let action = menu.selected_action()?;
+        match (menu.target, action) {
+            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
+                Some(ChatContextMenuRequest::CopyTranscript(target))
+            }
+            (ChatContextMenuTarget::Queue(id), action) => {
+                Some(ChatContextMenuRequest::Queue { id, action })
+            }
+            (ChatContextMenuTarget::Transcript(_), _) => None,
+        }
     }
 
     /// Yank a single entry's body text for explicit copy actions.
@@ -5908,7 +6054,7 @@ impl ChatState {
         self.browse_anchor = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
         self.mark_dirty_full();
     }
@@ -5927,8 +6073,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some(cur.saturating_sub(n));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_sub(n);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom = false;
         self.mark_dirty_full();
     }
@@ -5947,8 +6094,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some((cur + n).min(len - 1));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_add(n).min(len - 1);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom =
             self.scroll_offset >= self.last_total_rows.saturating_sub(self.last_inner_height);
         self.mark_dirty_full();
@@ -6659,10 +6807,27 @@ impl ChatState {
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.mark_dirty_append();
+        self.settle_turn_lifecycle(clean);
+    }
+
+    fn settle_turn_from_prompt_response(&mut self) {
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
+        self.flush_streaming_thought();
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
+        self.mark_dirty_append();
+        self.settle_turn_lifecycle(false);
+    }
+
+    fn settle_turn_lifecycle(&mut self, clean: bool) {
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
-        self.input_bar.cleanup_temps();
+        let mut cleanup_report = self.cleanup_active_turn_attachments();
+        cleanup_report.merge(self.input_bar.take_cleanup_report());
+        self.surface_cleanup_report(cleanup_report);
         if !clean && !self.resume_override && !self.message_queue.is_empty() {
             self.queue_paused = true;
         }
@@ -6694,12 +6859,22 @@ impl ChatState {
         });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
         self.turn_status = TurnStatus::Working;
         self.turn_started_at = Instant::now();
+    }
+
+    fn own_active_turn_attachments(&mut self, attachments: Vec<PendingAttachment>) {
+        debug_assert!(self.active_turn_attachments.is_empty());
+        self.active_turn_attachments = attachments;
+    }
+
+    fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
+        cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
     }
 
     const QUEUE_CAP: usize = 32;
@@ -6720,10 +6895,14 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
         if pending >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -6745,9 +6924,13 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         if self.message_queue.len() >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -6835,6 +7018,12 @@ impl ChatState {
     /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
+    }
+
+    fn surface_cleanup_report(&mut self, report: CleanupReport) {
+        if let Some(message) = report.notice() {
+            self.set_info_notice(message);
+        }
     }
 
     fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
@@ -6968,25 +7157,88 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    pub fn delete_selected_queued(&mut self) {
-        let Some(id) = self.queue_sel else { return };
-        if let Some(pos) = self.message_queue.iter().position(|m| m.id == id) {
-            if let Some(msg) = self.message_queue.remove(pos) {
-                cleanup_attachment_temps(&msg.attachments);
-            }
-            let ids = self.editable_ids();
-            self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
+    fn selected_queue_id(&self) -> Option<u64> {
+        self.queue_sel
+            .filter(|id| self.message_queue.iter().any(|message| message.id == *id))
+    }
+
+    fn queued_text(&self, id: u64) -> Option<String> {
+        self.message_queue
+            .iter()
+            .find(|message| message.id == id)
+            .map(|message| message.text.clone())
+    }
+
+    fn promote_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        let pending = self.message_queue[position].status == QueueItemStatus::Pending;
+        if pending {
+            let Some(mut message) = self.message_queue.remove(position) else {
+                return false;
+            };
+            message.status = QueueItemStatus::Injected;
+            let insert_at = self
+                .message_queue
+                .iter()
+                .position(|queued| queued.status == QueueItemStatus::Pending)
+                .unwrap_or(self.message_queue.len());
+            self.message_queue.insert(insert_at, message);
+        }
+        let resumed = self.resume_queue();
+        if self.turn_in_flight {
+            self.resume_override = true;
+        }
+        if pending || resumed {
             self.mark_dirty_full();
+        }
+        true
+    }
+
+    fn delete_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        if let Some(message) = self.message_queue.remove(position) {
+            let cleanup_report = cleanup_attachment_temps(&message.attachments);
+            self.surface_cleanup_report(cleanup_report);
+        }
+        let ids = self.editable_ids();
+        self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
+        self.mark_dirty_full();
+        true
+    }
+
+    #[cfg(test)]
+    pub fn delete_selected_queued(&mut self) {
+        if let Some(id) = self.selected_queue_id() {
+            self.delete_queued_by_id(id);
         }
     }
 
-    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
-        let id = self.queue_sel?;
-        let pos = self.message_queue.iter().position(|m| m.id == id)?;
-        let msg = self.message_queue.remove(pos)?;
+    fn take_queued_for_edit(&mut self, id: u64) -> Option<(String, Vec<PendingAttachment>)> {
+        let position = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)?;
+        let message = self.message_queue.remove(position)?;
         self.queue_sel = self.editable_ids().first().copied();
         self.mark_dirty_full();
-        Some((msg.text, msg.attachments))
+        Some((message.text, message.attachments))
+    }
+
+    #[cfg(test)]
+    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
+        self.take_queued_for_edit(self.selected_queue_id()?)
     }
 
     /// Slash-command queue removal. `None` clears the whole queue; `Some(n)`
@@ -7000,9 +7252,12 @@ impl ChatState {
                 if count == 0 {
                     return crate::i18n::t("zc-queue-clear-empty");
                 }
-                self.clear_queue();
+                let cleanup_report = self.clear_queue();
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
             Some(n) => {
                 if count == 0 {
@@ -7015,35 +7270,50 @@ impl ChatState {
                     );
                 }
                 let pos = n - 1;
+                let mut cleanup_report = CleanupReport::default();
                 if let Some(msg) = self.message_queue.remove(pos) {
-                    cleanup_attachment_temps(&msg.attachments);
+                    cleanup_report = cleanup_attachment_temps(&msg.attachments);
                     if self.queue_sel == Some(msg.id) {
                         let ids = self.editable_ids();
                         self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
                     }
                 }
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
         }
     }
 
-    fn clear_queue(&mut self) {
+    fn clear_queue(&mut self) -> CleanupReport {
+        let mut cleanup_report = CleanupReport::default();
         for msg in self.message_queue.drain(..) {
-            cleanup_attachment_temps(&msg.attachments);
+            cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
         self.next_queue_id = 0;
         self.queue_paused = false;
         self.resume_override = false;
         self.queue_sel = None;
+        cleanup_report
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let display = if strip_runtime_enrichment {
+                        strip_enrichment_prefix(&m.content)
+                    } else {
+                        &m.content
+                    };
+                    if self.first_message.is_none() && !display.trim().is_empty() {
+                        self.first_message = Some(display.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -7060,12 +7330,23 @@ impl ChatState {
         self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
-    pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
+    /// Re-materialize this pane's state for a newly-entered session.
+    ///
+    /// `todo_settings` is resolved fresh by the caller at the transition
+    /// boundary so restart and saved-session switch pick up Config-pane edits,
+    /// exactly like a brand-new session does.
+    pub fn reset_for_session(
+        &mut self,
+        session_id: String,
+        name: Option<String>,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) {
         self.session_id = session_id;
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
         self.input_bar.reset();
+        let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
@@ -7074,7 +7355,7 @@ impl ChatState {
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
         self.dirty = LinesDirty::Full;
         self.cached_entry_count = 0;
@@ -7083,6 +7364,7 @@ impl ChatState {
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.turn_in_flight = false;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.browse_cursor = None;
@@ -7101,8 +7383,29 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
-        self.clear_queue();
+        // The TodoWrite plan is per-session; drop it (and its show/hide state)
+        // so a switched-to session doesn't inherit the previous plan's tasks.
+        // Rebuilding from freshly resolved settings also applies any Config-pane
+        // edit made since this pane's `ChatState` was constructed.
+        self.todo_tracker.reset_for_session(todo_settings);
+        cleanup_report.merge(self.cleanup_active_turn_attachments());
+        cleanup_report.merge(self.clear_queue());
+        self.surface_cleanup_report(cleanup_report);
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from an ACP-persisted user
+/// message. ACP stores the Agent's provider-visible history, while normal Chat
+/// sessions store raw prompts and must preserve an identical user-authored
+/// prefix. Content without the runtime envelope passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -7207,6 +7510,23 @@ pub async fn open_editor_for_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Async env-lock for `#[tokio::test]` cases that resolve config through
+    /// environment variables and hold the guard across await points. Serializes
+    /// on a dedicated async mutex and, internally, on the shared sync
+    /// `env_test_lock` so sync and async env tests never run concurrently.
+    /// Lives here (not in `test_support`) because only the bin target has async
+    /// env-dependent tests, so keeping it module-local avoids a lib-target
+    /// dead-code suppression.
+    async fn env_test_lock_async() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        static ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let async_guard = ASYNC_LOCK.lock().await;
+        let sync_guard = crate::test_support::env_test_lock();
+        (async_guard, sync_guard)
+    }
 
     fn state() -> ChatState {
         ChatState::new(
@@ -7523,7 +7843,7 @@ mod tests {
             .max(3);
 
         assert_eq!(
-            copy_context_menu_rect(29, 12, bounds),
+            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
             Some(Rect::new(
                 bounds.x + bounds.width - menu_width,
                 bounds.y + bounds.height - 3,
@@ -7531,8 +7851,18 @@ mod tests {
                 3,
             ))
         );
-        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().x, bounds.x);
-        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().y, bounds.y);
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .x,
+            bounds.x
+        );
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .y,
+            bounds.y
+        );
     }
 
     #[test]
@@ -7544,10 +7874,13 @@ mod tests {
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 30, 3), &["hello"]));
         state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
 
-        assert!(state.open_copy_context_menu(35, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert!(state.open_transcript_context_menu(35, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
     }
 
     #[test]
@@ -7564,23 +7897,32 @@ mod tests {
             dragged: true,
         });
 
-        assert!(state.open_copy_context_menu(12, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        assert!(state.open_transcript_context_menu(12, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
 
-        state.dismiss_copy_context_menu();
-        assert!(state.open_copy_context_menu(10, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        state.dismiss_context_menu();
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
 
-        state.dismiss_copy_context_menu();
+        state.dismiss_context_menu();
         state.clear_transcript_selection();
-        assert!(state.open_copy_context_menu(10, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
     }
 
     #[test]
@@ -7602,8 +7944,8 @@ mod tests {
         });
 
         assert!(state.current_selection_text().is_empty());
-        assert!(!state.open_copy_context_menu(10, 5));
-        assert!(state.copy_context_menu.is_none());
+        assert!(!state.open_transcript_context_menu(10, 5));
+        assert!(state.context_menu.is_none());
     }
 
     #[test]
@@ -7624,11 +7966,14 @@ mod tests {
             group: 7,
         });
 
-        assert!(state.open_copy_context_menu(2, 2));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Code);
-        assert_eq!(menu.target.text, "echo hi");
-        assert_eq!(menu.target.group, 7);
+        assert!(state.open_transcript_context_menu(2, 2));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Code);
+        assert_eq!(target.text, "echo hi");
+        assert_eq!(target.group, 7);
     }
 
     #[test]
@@ -7645,11 +7990,11 @@ mod tests {
         state.browse_cursor = Some(0);
         state.dirty = LinesDirty::Clean;
 
-        assert!(state.open_copy_context_menu(1, 0));
+        assert!(state.open_transcript_context_menu(1, 0));
         assert_eq!(state.dirty, LinesDirty::Clean);
-        state.dismiss_copy_context_menu();
+        state.dismiss_context_menu();
 
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert_eq!(state.browse_cursor, Some(0));
         assert!(state.info_message.is_none());
         assert_eq!(state.copy_feedback, None);
@@ -7657,7 +8002,7 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_activation_copies_target_and_clears_stale_selection() {
+    fn context_menu_request_keeps_the_exact_transcript_target() {
         let mut state = state();
         state
             .entries
@@ -7669,27 +8014,26 @@ mod tests {
             dragged: true,
         });
         state.browse_cursor = Some(0);
-        state.copy_context_menu = Some(CopyContextMenu {
+        state.context_menu = Some(ChatContextMenu {
             rect: Rect::new(0, 0, 8, 3),
-            target: CopyHitRegion {
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
                 text: "hello".to_string(),
                 kind: CopyHitKind::Message,
                 group: 0,
-            },
+            }),
+            selected: 0,
         });
 
-        assert!(state.activate_copy_context_menu());
-        assert!(state.copy_context_menu.is_none());
-        assert_eq!(state.transcript_selection, None);
-        assert_eq!(state.browse_cursor, None);
-        assert!(state.info_message.is_some());
+        let request = state.take_context_menu_request().expect("copy request");
+        assert!(state.context_menu.is_none());
         assert!(matches!(
-            state.copy_feedback,
-            Some(CopyFeedback {
-                target: CopyFeedbackTarget::Overlay(_),
+            request,
+            ChatContextMenuRequest::CopyTranscript(CopyHitRegion {
+                kind: CopyHitKind::Message,
+                text,
                 ..
-            })
+            }) if text == "hello"
         ));
     }
 
@@ -7928,7 +8272,11 @@ mod tests {
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));
         state.finish_transcript_drag();
-        state.reset_for_session("sess-2".to_string(), None);
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert_eq!(state.transcript_selection, None);
         assert!(state.transcript_snapshot.is_none());
     }
@@ -8363,6 +8711,25 @@ mod tests {
         serde_json::from_str(&line).expect("RPC request should be JSON")
     }
 
+    /// Answer every follow-up request a transition emits (session/close,
+    /// model identity refresh, history load) with a permissive empty result,
+    /// until the pane goes quiet. Keeps transition tests focused on the
+    /// behavior under test rather than on exact RPC choreography.
+    async fn drain_pending_requests(rx: &mut mpsc::Receiver<String>, rpc: &RpcOutbound) {
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("RPC request should be JSON");
+            if let Some(id) = request["id"].as_str() {
+                rpc.dispatch_response(
+                    id,
+                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
+                    None,
+                );
+            }
+        }
+    }
+
     fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
         let id = request["id"]
             .as_str()
@@ -8585,6 +8952,303 @@ mod tests {
         assert!(stage1.is_open());
     }
 
+    // ── Session-transition settings reload ──────────────────────────────────
+    //
+    // `zerocode-config.toml` is the single source of truth for TodoWrite
+    // display. A fresh session obviously reloads it, but restart and
+    // saved-session switch reuse the existing `ChatState`, so they must
+    // re-resolve the file too — otherwise a Config-pane edit silently fails to
+    // apply until zerocode is restarted. These drive the real transition
+    // helpers (`restart_session_for_state` / `switch_to_session_entry`), not a
+    // direct `reset_for_session` call.
+
+    struct ConfigDirGuard(Option<String>);
+    impl ConfigDirGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+            // SAFETY: these tests serialize on `config_dir_test_lock()`.
+            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
+            Self(prev)
+        }
+    }
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: these tests serialize on `config_dir_test_lock()`.
+            match &self.0 {
+                Some(v) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", v) },
+                None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
+            }
+        }
+    }
+
+    /// Write a `[todotracker]` section with a distinctive width/location.
+    fn write_tracker_config(dir: &std::path::Path, width: u16, enabled_at_start: bool) {
+        crate::config::persist_todotracker(
+            dir,
+            &crate::config::TodoTrackerSection {
+                enabled: true,
+                enabled_at_start,
+                location: crate::config::TodoTrackerLocation::Bottom,
+                width,
+                max_height: 7,
+            },
+        )
+        .expect("test config write should succeed");
+    }
+
+    #[tokio::test]
+    async fn restart_reloads_local_todo_settings() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // Session starts with the tracker configured one way...
+        write_tracker_config(dir.path(), 30, false);
+        let mut state = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker(),
+        );
+        assert_eq!(state.todo_tracker.width(), 30);
+
+        // ...then the user edits the Config pane mid-session.
+        write_tracker_config(dir.path(), 44, true);
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+
+        let restart = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+                state
+            })
+        };
+
+        // The restart opens the replacement session first, then closes the old
+        // one; `refresh_model_identity` follows. Answer each in arrival order.
+        let new = next_rpc_request(&mut rx, "restart should open a new session").await;
+        assert_eq!(new["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc_out,
+            &new,
+            serde_json::json!({ "session_id": "sess-2", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc_out).await;
+
+        let state = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+
+        assert_eq!(
+            state.todo_tracker.width(),
+            44,
+            "restart must re-resolve zerocode-config.toml, not reuse the old layout"
+        );
+        assert!(
+            state.todo_tracker.is_visible(),
+            "restart must honor the newly saved enabled_at_start"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_switch_reloads_local_todo_settings() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        write_tracker_config(dir.path(), 30, false);
+        let mut state = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker(),
+        );
+        assert_eq!(state.todo_tracker.width(), 30);
+
+        write_tracker_config(dir.path(), 44, true);
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+
+        let entry = crate::client::SessionEntry {
+            session_id: "sess-9".to_string(),
+            session_key: "sess-9".to_string(),
+            created_at: "2026-07-07T00:00:00Z".to_string(),
+            last_activity: "2026-07-07T00:05:00Z".to_string(),
+            message_count: 0,
+            agent_alias: Some("myagent".to_string()),
+            channel_id: None,
+            name: Some("Other work".to_string()),
+        };
+
+        let switch = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::switch_to_session_entry(&client, PaneKind::Chat, &mut state, entry).await;
+                state
+            })
+        };
+
+        let rehydrate = next_rpc_request(&mut rx, "switch should rehydrate the target").await;
+        assert_eq!(rehydrate["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc_out,
+            &rehydrate,
+            serde_json::json!({ "session_id": "sess-9", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc_out).await;
+
+        let state = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("switch should finish")
+            .unwrap();
+
+        assert_eq!(
+            state.todo_tracker.width(),
+            44,
+            "session switch must re-resolve zerocode-config.toml"
+        );
+        assert!(
+            state.todo_tracker.is_visible(),
+            "session switch must honor the newly saved enabled_at_start"
+        );
+    }
+
+    // A transition-time config load failure (here: an unknown, hard-erroring
+    // `ZEROCODE_todotracker__*` override) must NOT silently reset the tracker
+    // to built-in defaults. `resolve_todo_settings` returns the supplied
+    // fallback so a restart/switch keeps the user's current layout.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_load_error() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // The in-use settings differ from the built-in defaults.
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+        assert_ne!(
+            current,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            "fallback must be distinguishable from defaults for this test to mean anything"
+        );
+
+        // An unknown override makes `ensure_and_load` hard-error.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        assert!(
+            crate::config::ensure_and_load(dir.path()).is_err(),
+            "precondition: the bogus override should make resolution fail"
+        );
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a load error must keep the current settings, not reset to defaults"
+        );
+    }
+
+    // A malformed on-disk `[todotracker]` section is tolerated by
+    // `load_persisted` (defaults substituted), which previously let a botched
+    // manual edit silently reset the live tracker on restart/switch. The
+    // checked transition resolver must instead treat it as an error and keep
+    // the current settings.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_malformed_disk_section() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // A hand-edited, malformed section on disk (width is not a number).
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = \"oops\"\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a malformed on-disk section must keep current settings, not reset to defaults"
+        );
+    }
+
+    // An explicit zero dimension must fail visibly at the session boundary
+    // rather than normalizing to 1. At *this* layer, "fail visibly" means the
+    // transition keeps the user's current settings and logs the error instead
+    // of silently rendering a collapsed 1-cell tracker.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
+    // Same contract via the canonical environment surface.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
     #[tokio::test]
     async fn open_picker_makes_chat_claim_text_input() {
         // While the picker is open the pane is modal (claims text-input so
@@ -8766,20 +9430,13 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("start_session should fetch todotracker config")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "config/list");
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
-
-        // Third request must be session_new_with_id carrying the prior id for
+        // Second request must be session_new_with_id carrying the prior id for
         // the prior agent — NOT a fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
+        //
+        // No config/list fetch precedes it: TodoWrite tracker settings are
+        // ZeroCode-local (`zerocode-config.toml`), resolved without a daemon
+        // round-trip, so session start goes straight to `session/new`.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("reconnect should reattach the prior session")
@@ -8928,11 +9585,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "resume should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Enter should resume selected session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -9042,11 +9694,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "fresh start should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Esc should start a fresh session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -9111,12 +9758,6 @@ mod tests {
         .await;
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
-        let request =
-            next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request =
             next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
@@ -9803,14 +10444,14 @@ mod tests {
             "modifier-click outside browse mode should not select the whole message"
         );
         assert_eq!(
-            state.copy_context_menu.is_some(),
+            state.context_menu.is_some(),
             cfg!(target_os = "macos"),
             "Control+click should open the context menu only on macOS"
         );
     }
 
     #[tokio::test]
-    async fn right_click_copy_context_menu_activation_runs_through_mouse_boundary() {
+    async fn right_click_context_menu_activation_runs_through_mouse_boundary() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -9844,7 +10485,7 @@ mod tests {
             let ChatPhase::Active(state) = &chat.phase else {
                 panic!("expected active chat");
             };
-            let menu = state.copy_context_menu.as_ref().expect("menu opens");
+            let menu = state.context_menu.as_ref().expect("menu opens");
             assert!(state.info_message.is_none());
             (menu.rect.x + 1, menu.rect.y + 1)
         };
@@ -9863,7 +10504,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert!(state.info_message.is_some());
         assert!(matches!(
             state.copy_feedback,
@@ -9875,7 +10516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outside_click_dismisses_copy_context_menu_without_copying() {
+    async fn outside_click_dismisses_context_menu_without_copying() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -9907,7 +10548,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_some());
+        assert!(state.context_menu.is_some());
         chat.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -9922,7 +10563,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert!(state.info_message.is_none());
         assert!(state.copy_feedback.is_none());
     }
@@ -11255,6 +11896,144 @@ mod tests {
         }
     }
 
+    fn clipboard_att(path: &std::path::Path, filename: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: path.to_path_buf(),
+            mime_type: "image/png".to_string(),
+            filename: filename.to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_attachments_are_cleaned_on_completion_without_touching_user_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "send attachments".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert_eq!(state.active_turn_attachments.len(), 2);
+        assert!(clipboard_path.exists());
+        state.commit_turn(String::new(), true);
+
+        assert!(
+            !clipboard_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(state.active_turn_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_cleans_dispatched_clipboard_temp_and_reports_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard-temp");
+        std::fs::create_dir(&clipboard_path).expect("create forced-failure path");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "cannot serialize".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(!state.turn_in_flight);
+        assert!(state.active_turn_attachments.is_empty());
+        assert!(
+            clipboard_path.exists(),
+            "failed cleanup must leave the path"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("1 temporary file"))
+        );
+        let clipboard_path = clipboard_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => !text.contains(clipboard_path.as_ref()),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn completion_does_not_delete_an_unsent_composer_attachment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("composer.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+
+        let mut active = state();
+        active.input_bar.load_for_edit(
+            String::new(),
+            vec![clipboard_att(&clipboard_path, "composer.png")],
+        );
+        active.turn_in_flight = true;
+
+        active.commit_turn(String::new(), false);
+
+        assert!(clipboard_path.exists());
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
+    }
+
     #[test]
     fn enqueue_dispatches_immediately_when_idle() {
         let mut s = state();
@@ -11327,6 +12106,240 @@ mod tests {
         s.turn_in_flight = false;
         assert_eq!(s.take_next_dispatchable().unwrap().text, "urgent");
         assert_eq!(s.take_next_dispatchable().unwrap().text, "pending1");
+    }
+
+    #[test]
+    fn queue_action_send_now_preserves_payload_and_injected_fifo() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("already urgent".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("ordinary one".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("promote me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.enqueue_message("ordinary two".to_string(), Vec::new())
+            .unwrap();
+        let promoted_id = s.message_queue[2].id;
+        s.queue_paused = true;
+
+        assert!(s.promote_queued_by_id(promoted_id));
+        assert!(!s.queue_paused());
+        assert!(s.resume_override);
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "already urgent",
+                "promote me",
+                "ordinary one",
+                "ordinary two"
+            ]
+        );
+        let promoted = &s.message_queue[1];
+        assert_eq!(promoted.id, promoted_id);
+        assert_eq!(promoted.status, QueueItemStatus::Injected);
+        assert_eq!(promoted.attachments.len(), 1);
+        assert_eq!(promoted.attachments[0].filename, "keep.txt");
+    }
+
+    #[test]
+    fn queue_action_send_now_is_idempotent_for_injected_items() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("first".to_string(), Vec::new()).unwrap();
+        s.inject_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+
+        assert!(s.promote_queued_by_id(second_id));
+        assert!(s.promote_queued_by_id(second_id));
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_targets_clicked_id_and_orders_actions() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("first".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+        s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        s.queue_item_rects = vec![
+            (s.message_queue[0].id, Rect::new(41, 3, 28, 2)),
+            (second_id, Rect::new(41, 5, 28, 2)),
+        ];
+
+        assert!(s.open_queue_context_menu(45, 5));
+        assert_eq!(s.queue_sel, Some(second_id));
+        let menu = s.context_menu.as_ref().expect("queue menu opens");
+        assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
+        assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
+
+        s.context_menu_select_step(1);
+        assert_eq!(
+            s.take_context_menu_request(),
+            Some(ChatContextMenuRequest::Queue {
+                id: second_id,
+                action: ChatContextMenuAction::Copy,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_navigation_clamps_at_boundaries() {
+        let target = ChatContextMenuTarget::Queue(1);
+        let mut menu = ChatContextMenu {
+            rect: Rect::new(0, 0, 16, 6),
+            target,
+            selected: 0,
+        };
+
+        menu.select_step(-1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::SendNow));
+        menu.selected = QUEUE_CONTEXT_ACTIONS.len() - 1;
+        menu.select_step(1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::Delete));
+    }
+
+    #[test]
+    fn queue_action_copy_lookup_does_not_mutate_queue() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("copy me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.ensure_queue_selection();
+        let id = s.selected_queue_id().unwrap();
+        let before_selection = s.queue_sel;
+
+        assert_eq!(s.queued_text(id).as_deref(), Some("copy me"));
+        assert_eq!(s.queue_len(), 1);
+        assert_eq!(s.queue_sel, before_selection);
+        assert_eq!(s.message_queue[0].id, id);
+        assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
+        assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_requests_cancel_only_once() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("send now".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let first = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::SESSION_CANCEL);
+        let request_id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            Some(serde_json::json!({"session_id":"sess-1","cancelled":true})),
+            None,
+        );
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("send now should finish after cancel response")
+            .unwrap();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(matches!(state.turn_status, TurnStatus::Cancelling));
+        assert_eq!(state.message_queue[0].status, QueueItemStatus::Injected);
+
+        chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+            id,
+            action: ChatContextMenuAction::SendNow,
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "an already-cancelling turn must not emit another cancel request"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_dispatches_after_cancel_failure() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("recover me".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let action = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let cancel_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let cancel: serde_json::Value = serde_json::from_str(&cancel_line).unwrap();
+        let request_id = cancel["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: -32000,
+                message: "cancel failed".to_string(),
+                data: None,
+            }),
+        );
+        let chat = tokio::time::timeout(Duration::from_secs(2), action)
+            .await
+            .expect("failed cancellation should settle locally")
+            .unwrap();
+        let prompt_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("promoted item should dispatch after cancel failure")
+            .expect("writer channel open");
+        let prompt: serde_json::Value = serde_json::from_str(&prompt_line).unwrap();
+        assert_eq!(prompt["method"], method::SESSION_PROMPT);
+        assert_eq!(prompt["params"]["prompt"], "recover me");
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert!(!state.queue_paused());
+        assert!(state.message_queue.is_empty());
     }
 
     #[test]
@@ -11619,7 +12632,11 @@ mod tests {
             target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),
             shown_at: Instant::now(),
         });
-        s.reset_for_session("sess-2".to_string(), None);
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert_eq!(s.queue_len(), 0);
         assert!(!s.queue_paused());
         assert!(
@@ -11766,38 +12783,159 @@ mod tests {
     fn reset_for_session_clears_first_message() {
         let mut s = state();
         s.push_user_message(Some("ask".to_string()), Vec::new());
-        s.reset_for_session("sess-2".to_string(), None);
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert!(s.first_message.is_none());
+    }
+
+    #[test]
+    fn reset_for_session_clears_todo_plan() {
+        // A TodoWrite plan belongs to the session that produced it, so
+        // switching sessions must not leave the previous session's tasks
+        // rendered in the pane.
+        use crate::wire::{PlanEntry, PlanPriority, PlanStatus};
+        let mut s = state();
+        s.todo_tracker.set_plan(vec![
+            PlanEntry {
+                content: "task one".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+            PlanEntry {
+                content: "task two".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+        ]);
+        assert_eq!(s.todo_tracker.total(), 2);
+
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        assert_eq!(
+            s.todo_tracker.total(),
+            0,
+            "a session switch must drop the previous session's TodoWrite plan"
+        );
+        assert!(!s.todo_tracker.is_visible());
     }
 
     #[test]
     fn load_history_replays_transcript_and_seeds_first_message() {
         use crate::client::MessageEntry;
         let mut s = state();
-        s.reset_for_session("sess-resume".to_string(), None);
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         let before = s.entries.len();
-        s.load_history(vec![
-            MessageEntry {
-                role: "user".to_string(),
-                content: "first ask".to_string(),
-            },
-            MessageEntry {
-                role: "assistant".to_string(),
-                content: "reply".to_string(),
-            },
-            MessageEntry {
-                role: "system".to_string(),
-                content: "ignored".to_string(),
-            },
-            MessageEntry {
-                role: "user".to_string(),
-                content: "second ask".to_string(),
-            },
-        ]);
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "first ask".to_string(),
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "reply".to_string(),
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "ignored".to_string(),
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "second ask".to_string(),
+                },
+            ],
+            false,
+        );
         // User + assistant + user replayed; system dropped.
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+            }],
+            true,
+        );
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+            }],
+            true,
+        );
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+            }],
+            true,
+        );
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn load_history_preserves_literal_timestamp_example_for_chat_sessions() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        let literal = "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nthis is user-authored";
+
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: literal.to_string(),
+            }],
+            false,
+        );
+
+        assert_eq!(s.first_message.as_deref(), Some(literal));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
@@ -11911,7 +13049,11 @@ mod tests {
     fn reset_for_session_clears_pending_elicitation() {
         let mut s = state();
         s.set_pending_elicitation(single_elicitation());
-        s.reset_for_session("sess-2".to_string(), None);
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         assert!(
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
@@ -11947,10 +13089,147 @@ mod tests {
     }
 
     fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+        test_chat_with_transport(crate::client::Transport::Local)
+    }
+
+    fn test_chat_with_transport(
+        transport: crate::client::Transport,
+    ) -> (Chat, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let client = Arc::new(RpcClient::with_rpc_transport(rpc, transport));
         (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_settles_turn_when_terminal_update_is_lagged() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_queue();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+        assert_eq!(request["method"], method::SESSION_PROMPT);
+
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "done"
+                }),
+            })
+            .unwrap();
+        notif_tx
+            .send(RpcNotification {
+                method: "unrelated".to_string(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        assert!(
+            active_state(&mut chat).turn_in_flight,
+            "the lagged terminal frame reproduces the stale in-flight state"
+        );
+        active_state(&mut chat)
+            .enqueue_message("wait for explicit resume".to_string(), Vec::new())
+            .unwrap();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(!active.turn_in_flight);
+        assert!(matches!(active.turn_status, TurnStatus::Idle));
+        assert!(active.queue_paused());
+        assert_eq!(active.queue_len(), 1);
+        assert!(
+            active
+                .entries()
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
+            "the lifecycle fence must not invent the dropped final transcript content"
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_prompt_completion_does_not_settle_next_queued_turn() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_queue();
+        let first_generation = active_state(&mut chat).turn_generation;
+        let first_request =
+            next_rpc_request(&mut writer_rx, "first prompt request should be sent").await;
+        active_state(&mut chat)
+            .enqueue_message("second".to_string(), Vec::new())
+            .unwrap();
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "done"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let second_generation = active_state(&mut chat).turn_generation;
+        assert_ne!(second_generation, first_generation);
+        assert!(active_state(&mut chat).turn_in_flight);
+        let second_request =
+            next_rpc_request(&mut writer_rx, "second prompt request should be sent").await;
+        assert_ne!(second_request["id"], first_request["id"]);
+
+        respond_ok(&chat.rpc_out, &first_request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(
+            active.turn_in_flight,
+            "the prior response fence must not settle the newly dispatched turn"
+        );
+        assert_eq!(
+            active
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::AgentMessage(_)))
+                .count(),
+            1,
+            "the surviving terminal notification must commit exactly once"
+        );
+    }
+
+    #[test]
+    fn restored_session_state_is_idle() {
+        let mut active = state();
+        active.push_user_message(Some("old prompt".to_string()), Vec::new());
+        active.reset_for_session(
+            "sess-restored".to_string(),
+            Some("restored".to_string()),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        assert!(!active.turn_in_flight);
+        assert!(matches!(active.turn_status, TurnStatus::Idle));
     }
 
     fn chat_with_active_input(kind: PaneKind) -> Chat {
@@ -11969,6 +13248,168 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    #[tokio::test]
+    async fn active_turn_paste_populates_composer_and_queues_on_submit() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.clear_input();
+        state.turn_in_flight = true;
+
+        chat.handle_paste("pasted while active");
+
+        let state = active_state(&mut chat);
+        assert_eq!(state.input_bar.input(), "pasted while active");
+        assert!(state.turn_in_flight);
+
+        let InputBarAction::Submit { text, attachments } =
+            state.input_bar.submit_current_input_for_test()
+        else {
+            panic!("pasted input must submit normally");
+        };
+        state
+            .enqueue_message(text.unwrap_or_default(), attachments)
+            .expect("pasted input queues during an active turn");
+
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            state.take_next_dispatchable().is_none(),
+            "an active turn must not dispatch the queued pasted input"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_composer_while_approval_is_pending() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+
+        chat.handle_paste(" must not reach the composer");
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_hidden_composer_when_another_surface_owns_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut cases = Vec::new();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        cases.push(("model picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_elicitation = Some(single_elicitation());
+        cases.push(("elicitation", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        cases.push(("session picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 5),
+            target: ChatContextMenuTarget::Queue(1),
+            selected: 0,
+        });
+        cases.push(("context menu", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("already-attached.png"),
+            mime_type: "image/png".into(),
+            filename: "already-attached.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        state.input_bar.clear_input();
+        state.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            state
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("attachment manager", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(matches!(
+            active_state(&mut chat)
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("file explorer", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        cases.push(("browse mode", chat));
+
+        let attachment_path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        for (surface, mut chat) in cases {
+            let state = active_state(&mut chat);
+            let original_input = state.input_bar.input().to_string();
+            let original_attachment_count = state.input_bar.pending_attachments().len();
+
+            chat.handle_paste(" hidden text");
+            chat.handle_paste(&attachment_path);
+
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.input_bar.input(),
+                original_input,
+                "{surface} must keep pasted text out of the hidden composer"
+            );
+            assert_eq!(
+                state.input_bar.pending_attachments().len(),
+                original_attachment_count,
+                "{surface} must not create hidden attachments from pasted paths"
+            );
+        }
+    }
+
+    #[test]
+    fn file_explorer_attachment_error_reaches_info_notice() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Keep the explorer listing deterministic and let the guard clean up
+        // the oversized fixture even when an assertion fails.
+        let temp_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let oversized_path = temp_dir.path().join("oversized.bin");
+        let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
+        file.set_len(10 * 1024 * 1024 + 1)
+            .expect("make attachment exceed the 10 MiB limit");
+
+        let mut state = state();
+        state
+            .input_bar
+            .open_file_explorer_for_test(oversized_path.clone());
+
+        assert!(
+            state.handle_input_bar_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,))
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| !notice.text.is_empty()),
+            "a rejected file-explorer attachment must produce visible feedback regardless of locale"
+        );
+        assert!(!state.input_bar.has_file_explorer());
     }
 
     #[tokio::test]

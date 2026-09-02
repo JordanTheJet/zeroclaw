@@ -68,15 +68,37 @@ macro_rules! keyactions {
             /// Bindings after applying any runtime override for `TAG`;
             /// falls back to the compile-time table when none is active.
             /// Sparse: an un-overridden variant keeps its default chords.
+            ///
+            /// An explicitly bound chord outranks a merely retained default,
+            /// whichever action declares it first. Without that, shipping a new
+            /// default chord would silently take a chord the operator had
+            /// already assigned elsewhere, because dispatch takes the first
+            /// match in declaration order.
+            ///
+            /// The claim is tested with `Chord::same_key`, not `==`: dispatch
+            /// compares platform-normalised modifiers, so on darwin an explicit
+            /// `super+a` and a retained `ctrl+a` are one chord there and two
+            /// here. Raw equality left the shadowed default in the table and
+            /// the operator's own binding lost to it.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
                 };
+                let claimed: Vec<Chord> = Self::variants()
+                    .iter()
+                    .filter_map(|v| over.get(&v.variant_name()))
+                    .flatten()
+                    .cloned()
+                    .collect();
                 let mut out: Vec<(Chord, $name)> = Vec::new();
                 for v in Self::variants() {
                     let chords = match over.get(&v.variant_name()) {
                         Some(cs) => cs.clone(),
-                        None => v.default_chords(),
+                        None => v
+                            .default_chords()
+                            .into_iter()
+                            .filter(|c| !claimed.iter().any(|k| k.same_key(c)))
+                            .collect(),
                     };
                     for c in chords {
                         out.push((c, *v));
@@ -173,6 +195,8 @@ keyactions! {
         PauseResumeQueue        [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "pause/resume queue",
         QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
         QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
+        QueueSendNow            [Chord::with(KeyCode::Char('s'), KeyModifiers::ALT)] => "send queued now",
+        QueueCopy               [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "copy queued",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
         QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
@@ -201,6 +225,10 @@ keyactions! {
         BeginSearch      [Chord::char('/')] => "search",
         ClearSearch      [Chord::char('c')] => "clear search",
         CopyDetail       [Chord::char('y')] => "copy detail",
+        CopySelection    [
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)),
+        ] => "copy selection/row",
         IncreaseLevel    [Chord::char('+'), Chord::char('=')] => "verbosity up",
         DecreaseLevel    [Chord::char('-')] => "verbosity down",
     }
@@ -329,7 +357,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
-        DeletePreviousWord [Chord::ctrl('w')] => "delete previous word",
+        DeletePreviousWord [Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
         ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",
@@ -357,6 +385,8 @@ keyactions! {
     pub enum FileExplorerAction ("file_explorer") {
         Up           [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down         [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
+        PageUp       [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown     [Chord::key(KeyCode::PageDown)] => "page down",
         JumpStart    [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd      [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
         EnterDir     [Chord::char('l'), Chord::key(KeyCode::Right)] => "enter dir",
@@ -375,6 +405,10 @@ keyactions! {
         Accept    [Chord::key(KeyCode::Enter)] => "accept",
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        Up        [Chord::key(KeyCode::Up)] => "prev",
+        Down      [Chord::key(KeyCode::Down)] => "next",
+        PageUp    [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown  [Chord::key(KeyCode::PageDown)] => "page down",
     }
 }
 
@@ -425,6 +459,14 @@ mod tests {
         assert_eq!(
             ChatTabAction::from_chord(&terminal_copy),
             Some(ChatTabAction::CopyAllVisible)
+        );
+        assert_eq!(
+            LogsTabAction::from_chord(&command_c),
+            Some(LogsTabAction::CopySelection)
+        );
+        assert_eq!(
+            LogsTabAction::from_chord(&terminal_copy),
+            Some(LogsTabAction::CopySelection)
         );
     }
 }
