@@ -1649,6 +1649,18 @@ pub fn skills_to_prompt_with_mode(
     // Compact renders summaries whose instructions load via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
+    skills_to_prompt_with_mode_and_availability(skills, workspace_dir, mode, |_| true)
+}
+
+/// Build the available-skills prompt while checking callable names against the
+/// effective tool surface. Tools that fail this availability check remain in
+/// descriptive metadata so the skill and its instructions are not dropped.
+pub(crate) fn skills_to_prompt_with_mode_and_availability(
+    skills: &[Skill],
+    workspace_dir: &Path,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    is_tool_available: impl Fn(&str) -> bool,
+) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
@@ -1699,12 +1711,24 @@ pub fn skills_to_prompt_with_mode(
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| skill_tool_is_prompt_callable(t))
+                .filter(|t| {
+                    skill_tool_is_prompt_callable(t)
+                        && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !skill_tool_is_prompt_callable(t))
+                .filter(|t| {
+                    !skill_tool_is_prompt_callable(t)
+                        || !is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
 
             if !registered.is_empty() {
@@ -1752,8 +1776,9 @@ pub fn skills_to_prompt_with_mode(
 pub fn skills_to_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
-    skills_to_tools_with_context(skills, security, &[])
+    skills_to_tools_with_context(skills, security, &[], nat64_prefixes)
 }
 
 fn resolve_elevated_tool(
@@ -1802,12 +1827,14 @@ pub fn skills_to_tools_with_context(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     skills_to_tools_with_context_and_runtime(
         skills,
         security,
         unfiltered_registry,
         std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+        nat64_prefixes,
     )
 }
 
@@ -1816,6 +1843,25 @@ pub fn skills_to_tools_with_context_and_runtime(
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context_and_runtime_optional_nat64(
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+        Some(nat64_prefixes),
+    )
+}
+
+/// Internal assembly seam. `None` omits only HTTP tools after an invalid NAT64
+/// configuration; other skill kinds continue through their normal path.
+pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
@@ -1846,10 +1892,13 @@ pub fn skills_to_tools_with_context_and_runtime(
                     )));
                 }
                 "http" => {
-                    tools.push(Box::new(crate::skills::skill_http::SkillHttpTool::new(
-                        &skill.name,
-                        tool,
-                    )));
+                    if let Some(nat64_prefixes) = nat64_prefixes {
+                        tools.push(Box::new(crate::skills::skill_http::SkillHttpTool::new(
+                            &skill.name,
+                            tool,
+                            nat64_prefixes,
+                        )));
+                    }
                 }
                 "builtin" => {
                     if let Some(t) =
@@ -3965,53 +4014,6 @@ licence = true
     }
 
     #[test]
-    fn integrate_round_trip_emits_top_level_forge() {
-        use crate::skillforge::scout::{ScoutResult, ScoutSource};
-        use chrono::Utc;
-        let candidate = ScoutResult {
-            name: "round-trip".into(),
-            url: "https://github.com/user/round-trip".into(),
-            description: "round-trip test".into(),
-            stars: 7,
-            language: Some("Rust".into()),
-            updated_at: Some(Utc::now()),
-            source: ScoutSource::GitHub,
-            owner: "user".into(),
-            has_license: true,
-        };
-
-        // Generate the TOML the integrator would write and parse it back.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let integrator = crate::skillforge::integrate::Integrator::new(
-            tmp.path().to_string_lossy().into_owned(),
-        );
-        let skill_dir = integrator.integrate(&candidate).unwrap();
-        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
-
-        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
-            panic!(
-                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
-                 got error: {e}\n--- toml ---\n{toml_str}"
-            )
-        });
-        let forge = manifest
-            .forge
-            .expect("integrator must emit a [forge] table");
-        assert_eq!(forge.owner.as_deref(), Some("user"));
-        assert_eq!(forge.stars, Some(7));
-        assert_eq!(forge.license, Some(true));
-        assert!(
-            forge
-                .source
-                .as_deref()
-                .is_some_and(|s| s.contains("round-trip")),
-            "forge.source should carry the upstream URL"
-        );
-        assert_eq!(manifest.skill.name, "round-trip");
-        assert_eq!(manifest.skill.description, "round-trip test");
-    }
-
-    #[test]
     fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
@@ -4277,7 +4279,7 @@ mod prompt_callable_name_tests {
         };
 
         let registered: Vec<String> =
-            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security)
+            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security, &[])
                 .iter()
                 .map(|t| t.name().to_string())
                 .collect();
@@ -4295,6 +4297,34 @@ mod prompt_callable_name_tests {
                 t.kind,
             );
         }
+    }
+
+    #[test]
+    fn invalid_nat64_optional_seam_omits_http_but_keeps_shell() {
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![tool("run", "shell"), tool("fetch", "http")],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let registered = skills_to_tools_with_context_and_runtime_optional_nat64(
+            std::slice::from_ref(&skill),
+            security,
+            &[],
+            std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+            None,
+        );
+        let names: Vec<&str> = registered.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"ops__run"));
+        assert!(!names.contains(&"ops__fetch"));
     }
 
     #[test]

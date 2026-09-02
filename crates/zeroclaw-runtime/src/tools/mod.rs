@@ -348,7 +348,8 @@ pub fn default_tools_with_runtime(
     ]
 }
 
-pub fn register_skill_tools(
+#[cfg(test)]
+pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
@@ -359,18 +360,20 @@ pub fn register_skill_tools(
 /// Register skill-defined tools with full context for builtin kinds.
 /// `unfiltered_registry` provides the pre-policy tool list for `kind = "builtin"`
 /// delegation.
-pub fn register_skill_tools_with_context(
+#[cfg(test)]
+pub(crate) fn register_skill_tools_with_context(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
 ) {
-    register_skill_tools_with_context_and_runtime(
+    register_skill_tools_with_context_and_runtime_optional_nat64(
         tools_registry,
         skills,
         security,
         unfiltered_registry,
         Arc::new(NativeRuntime::new()),
+        Some(&[]),
     );
 }
 
@@ -380,6 +383,27 @@ pub fn register_skill_tools_with_context_and_runtime(
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
     runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) {
+    register_skill_tools_with_context_and_runtime_optional_nat64(
+        tools_registry,
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+        Some(nat64_prefixes),
+    );
+}
+
+/// Internal scoped assembly seam. `None` omits only HTTP tools after an invalid
+/// NAT64 configuration; other skill kinds continue through their normal path.
+pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+    runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) {
     if skills.is_empty() {
         return;
@@ -387,11 +411,12 @@ pub fn register_skill_tools_with_context_and_runtime(
 
     let before = tools_registry.len();
     let policy = Arc::clone(&security);
-    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
+    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
         security,
         unfiltered_registry,
         runtime,
+        nat64_prefixes,
     );
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
@@ -439,7 +464,10 @@ pub fn register_skill_tools_with_context_and_runtime(
     );
 }
 
-pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
+pub async fn collect_mcp_elevation_arcs(
+    registry: &Arc<McpRegistry>,
+    security: &Arc<zeroclaw_config::policy::SecurityPolicy>,
+) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
     for name in registry.tool_names() {
         if let Some(def) = registry.get_tool_def(&name).await {
@@ -447,6 +475,7 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
                 name,
                 def,
                 Arc::clone(registry),
+                Arc::clone(security),
             )));
         }
     }
@@ -518,6 +547,35 @@ pub struct AllToolsResult {
     /// be trusted. `None` when no agents are configured.
     #[cfg(test)]
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
+}
+
+impl AllToolsResult {
+    /// Wrap an already-built tool vector as `assemble` INPUT, with every
+    /// side-channel handle empty. This mints an `AllToolsResult` (the input to
+    /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
+    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
+    /// fields are all `pub`, so a caller could already hand-roll this literal;
+    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// paths that already own a fixed / pre-filtered tool set (the skill-review
+    /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
+    /// route it through `assemble` only to seal it: they pass `skills: &[]`,
+    /// `connect_mcp: false`, `connect_peripherals: false`, so the empty handles
+    /// here are never read by the assembly. `pub` (not `pub(crate)`) so the
+    /// out-of-crate `zeroclaw-eval` harness can reach it.
+    pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self {
+            tools,
+            delegate_handle: None,
+            ask_user_handle: None,
+            channel_room_handle: None,
+            reaction_handle: Arc::new(RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            #[cfg(test)]
+            delegate_tool: None,
+        }
+    }
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -739,7 +797,17 @@ pub fn all_tools_with_runtime(
     let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        runtime_kind,
+        Some(&security.workspace_dir),
+        &sandbox_extra_roots,
+    );
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -800,7 +868,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronListTool::new(config.clone(), agent_alias)),
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
@@ -815,9 +883,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new_with_runtime(
             config.clone(),
             security.clone(),
+            agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
