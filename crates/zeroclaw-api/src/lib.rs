@@ -2,8 +2,8 @@
 
 pub mod agent;
 pub mod attribution;
-pub mod cron_traits;
 pub mod channel;
+pub mod cron_traits;
 pub mod elicitation;
 pub mod hook;
 pub mod ingress;

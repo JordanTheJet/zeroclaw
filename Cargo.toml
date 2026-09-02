@@ -78,6 +78,7 @@ path = "src/lib.rs"
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-cron.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, features = ["clap"] }
