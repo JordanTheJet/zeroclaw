@@ -131,6 +131,29 @@ export function AgentChatInner({
   const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
   const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [input, setInput] = useState(draft);
+  // Mirror of `input` for writers that run after an await (an attachment
+  // marker landing once the operator has typed more). A functional update
+  // against React state alone could not also hand the final value to the draft
+  // store, so the updater form of applyInput resolves against this instead.
+  const inputValueRef = useRef(input);
+  const writeInput = useCallback((value: string) => {
+    inputValueRef.current = value;
+    setInput(value);
+  }, []);
+
+  /**
+   * Single writer for the live composer text. Every change to what the
+   * operator has typed (keystrokes, slash-command completion, a marker
+   * appended by a later feature) goes through here so the per-conversation
+   * draft store stays in step with the textarea. A bare `setInput` would leave
+   * the stored draft behind and lose the change on the next conversation
+   * switch. Accepts a value or an updater over the latest text.
+   */
+  const applyInput = useCallback((next: string | ((prev: string) => string)) => {
+    const value = typeof next === 'function' ? next(inputValueRef.current) : next;
+    writeInput(value);
+    saveDraft(value);
+  }, [writeInput, saveDraft]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
   // with a single '/' and the token still matches at least one command.
@@ -157,8 +180,8 @@ export function AgentChatInner({
   // Load that conversation's draft explicitly; useState's initializer only ran
   // for the first session and cannot provide this synchronization by itself.
   useEffect(() => {
-    setInput(draft);
-  }, [draftKey, draft]);
+    writeInput(draft);
+  }, [draftKey, draft, writeInput]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
@@ -279,7 +302,7 @@ export function AgentChatInner({
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
     }
     setShowCommandHint(false);
-    setInput('');
+    writeInput('');
     clearDraft();
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
@@ -302,8 +325,7 @@ export function AgentChatInner({
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    setInput(value);
-    saveDraft(value);
+    applyInput(value);
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
@@ -320,10 +342,9 @@ export function AgentChatInner({
     setShowCommandHint(false);
     const takesArgs = spec.usage.includes('[');
     const value = `/${spec.name}${takesArgs ? ' ' : ''}`;
-    setInput(value);
-    saveDraft(value);
+    applyInput(value);
     inputRef.current?.focus();
-  }, [saveDraft]);
+  }, [applyInput]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
     ? matchCommands(input.slice(1))
