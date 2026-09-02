@@ -235,6 +235,12 @@ export function AgentProvider({
   const modelSwitchSocketRef = useRef<SessionSocket | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  // Socket generation that delivered the live `approval_request`, or null.
+  // A parked approval dies with the socket that carried it (the gateway
+  // auto-denies the request_id when that socket closes), so only that socket's
+  // close may clear the banner; a stale close must not wipe an approval a
+  // newer socket owns. See the onClose handler in attachSocketCallbacks.
+  const approvalSocketVersionRef = useRef<number | null>(null);
   const localMessageMutationVersionRef = useRef(0);
   // Rebuild callbacks intentionally retain the dependency shape already on
   // master. These mirrors still make their async work use the latest session
@@ -627,11 +633,17 @@ export function AgentProvider({
     };
 
     ws.onClose = (ev: CloseEvent) => {
-      // Clear pending approval ahead of the version guard: even if this is a
-      // stale socket whose other state we don't want to write, the parked
-      // request_id is gone on the server side regardless and the banner must
-      // not survive the close.
-      setPendingApproval(null);
+      // A parked approval belongs to the socket that delivered it: the gateway
+      // auto-denies that request_id when its socket closes, so the banner must
+      // not survive this close even when the socket is already stale. But
+      // ownership, not staleness, decides. A session switch disconnects the
+      // outgoing socket without detaching this callback, so after A -> B the
+      // browser can deliver A's close once B is current and holds its own
+      // approval; A owns nothing live any more and must leave B's banner alone.
+      if (approvalSocketVersionRef.current === version) {
+        approvalSocketVersionRef.current = null;
+        setPendingApproval(null);
+      }
       if (version !== wsVersionRef.current) return;
       setConnected(false);
 
@@ -676,6 +688,9 @@ export function AgentProvider({
 
     ws.onMessage = (msg: WsMessage) => {
       if (version !== wsVersionRef.current) return;
+      if (msg.type === 'approval_request' && msg.request_id) {
+        approvalSocketVersionRef.current = version;
+      }
       handleWsMessage(msg);
     };
   }, [handleWsMessage]);

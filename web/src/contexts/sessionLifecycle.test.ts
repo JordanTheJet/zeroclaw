@@ -744,6 +744,47 @@ test('composer drafts follow agent and session without crossing conversations', 
   await unmount(mounted.renderer);
 });
 
+test('a late close from the previous session socket cannot clear the active approval', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  // A parks an approval, then the operator switches to B. The switch resets
+  // A's transcript state, so A's approval is already gone before B is current.
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'approval_request', request_id: 'req-A', tool: 'shell', timeout_secs: 120,
+    });
+  });
+  assert.equal(mounted.context().pendingApproval?.requestId, 'req-A');
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.equal(mounted.context().pendingApproval, null);
+  assert.equal(runtime.sockets[0]?.disconnectCalls, 1);
+
+  await openSocket(runtime, 1);
+  await act(async () => {
+    runtime.sockets[1]!.emitMessage({
+      type: 'approval_request', request_id: 'req-B', tool: 'shell', timeout_secs: 120,
+    });
+  });
+  assert.equal(mounted.context().pendingApproval?.requestId, 'req-B');
+
+  // The browser delivers A's close asynchronously, after B is current and has
+  // its own approval parked. A owns nothing live any more; B's banner stays.
+  await act(async () => { runtime.sockets[0]!.emitClose(1000); });
+  assert.equal(mounted.context().pendingApproval?.requestId, 'req-B');
+
+  // B's own close still drops B's approval: the gateway auto-denies the parked
+  // request when the socket that carried it goes away.
+  await act(async () => { runtime.sockets[1]!.emitClose(1006); });
+  assert.equal(mounted.context().pendingApproval, null);
+  await unmount(mounted.renderer);
+});
+
 test('session switch disconnects both the effect-owned and replacement sockets', async () => {
   const runtime = new FakeSessionRuntime();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
