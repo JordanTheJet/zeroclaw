@@ -10,6 +10,7 @@ use crate::cron::{
     clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
     sync_declarative_jobs,
 };
+use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -418,9 +419,9 @@ async fn run_manual_job_inner(
                 job,
                 started_at,
                 STATUS_ALREADY_IN_FLIGHT,
-                format!(
-                    "cron job {id:?} is already in flight; manual trigger refused",
-                    id = job.id
+                get_required_cli_string_with_args(
+                    "cron-manual-refused-in-flight",
+                    &[("id", &job.id)],
                 ),
             );
         }
@@ -438,9 +439,9 @@ async fn run_manual_job_inner(
                 job,
                 started_at,
                 "error",
-                format!(
-                    "failed to claim cron job {id:?} for a manual run: {e}",
-                    id = job.id
+                get_required_cli_string_with_args(
+                    "cron-manual-claim-failed",
+                    &[("id", &job.id), ("error", &e.to_string())],
                 ),
             );
         }
@@ -655,13 +656,13 @@ pub async fn run(
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Result<&'a str, String> {
     let owners = super::enabled_cron_owners(config, &job.id);
     if owners.len() > 1 {
-        return Err(format!(
-            "cron job {id:?} is claimed by {count} enabled agents ({owners}); \
-             exactly one agent must list it in [agents.<x>].cron_jobs so the \
-             job runs under a determinate security policy",
-            id = job.id,
-            count = owners.len(),
-            owners = owners.join(", ")
+        return Err(get_required_cli_string_with_args(
+            "cron-owner-ambiguous",
+            &[
+                ("id", &job.id),
+                ("count", &owners.len().to_string()),
+                ("owners", &owners.join(", ")),
+            ],
         ));
     }
 
@@ -913,7 +914,7 @@ async fn execute_job_with_retry(
     if let Some(hook) = pre_hook {
         let Some(runtime) = runtime else {
             return CronRunOutcome::PreconditionFailed {
-                output: "pre_hook setup error: runtime missing for cron precondition".to_string(),
+                output: get_required_cli_string("cron-pre-hook-runtime-missing"),
             };
         };
         match precondition::evaluate(config, runtime, security, hook).await {
