@@ -1708,12 +1708,7 @@ fn with_existing_initialized_connection<T>(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| {
-        format!(
-            "Failed to open existing cron DB: {}",
-            db_path.display().to_string()
-        )
-    })?;
+    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 
@@ -1736,16 +1731,12 @@ fn with_initialized_connection<T>(
     }
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create cron directory: {}",
-                parent.display().to_string()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
     }
 
     let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+        .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 

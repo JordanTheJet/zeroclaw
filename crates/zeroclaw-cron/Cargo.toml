@@ -31,5 +31,11 @@ unic-langid = "0.9"
 libc = "0.2"
 
 [dev-dependencies]
+# The scheduler's delivery tests stand up a real HTTP endpoint and spawn a
+# server task, so these are test-only rather than part of the crate's surface.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+zeroclaw-spawn.workspace = true
 tempfile = "3"
+toml = "0.9"
+which = "8"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

@@ -1,3 +1,4 @@
+use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use crate::precondition::{
     self, PreconditionOutcome, STATUS_PRECONDITION_FAILED, STATUS_SKIPPED_PRECONDITION,
 };
@@ -10,8 +11,6 @@ use crate::{
     clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
     sync_declarative_jobs,
 };
-use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-use zeroclaw_config::policy::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -20,6 +19,7 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
@@ -75,8 +75,9 @@ pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Valu
 /// delivery seam below already works. Unregistered defaults to a no-op, so an
 /// embedding that does not run a health registry simply reports nothing
 /// instead of failing.
-static HEALTH: std::sync::OnceLock<std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>> =
-    std::sync::OnceLock::new();
+static HEALTH: std::sync::OnceLock<
+    std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>,
+> = std::sync::OnceLock::new();
 
 /// Register the health reporter. First registration wins.
 pub fn register_health_reporter(
@@ -421,7 +422,7 @@ pub async fn run_manual_job(
     run_manual_job_inner(config, job, context, event_tx, None, false).await
 }
 
-pub(crate) async fn run_manual_job_with_runtime(
+pub async fn run_manual_job_with_runtime(
     config: &Config,
     job: &CronJob,
     context: CronDeliveryContext,
@@ -914,7 +915,6 @@ fn cron_agent_excluded_tools(job: &CronJob) -> Vec<String> {
         .collect()
 }
 
-
 fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
     match target {
         SessionTarget::Main => std::path::PathBuf::from("main"),
@@ -1272,6 +1272,7 @@ async fn run_agent_job(
         model: model_override,
         session_path,
         allowed_tools: job.allowed_tools.clone(),
+        workspace_dir: security.workspace_dir.clone(),
         excluded_tools: cron_agent_excluded_tools(job),
         uses_memory: job.uses_memory,
     };
@@ -1289,7 +1290,6 @@ async fn run_agent_job(
     let run = executor.run_agent_job(request).await;
     (run.success, run.output)
 }
-
 
 async fn persist_job_result(
     config: &Config,
@@ -1670,10 +1670,48 @@ async fn run_job_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{self, DeliveryConfig};
-    use zeroclaw_config::policy::SecurityPolicy;
+    // These tests moved in with the code and still address the module by its
+    // old name. Aliasing keeps them readable rather than rewriting hundreds of
+    // call sites; without it `cron::` resolves to the schedule-parsing crate.
+    use crate as cron;
+
+    /// Records what the scheduler reports, standing in for the host registry.
+    ///
+    /// Registration is first-wins and the whole test binary shares one
+    /// process, so this is installed once and read by every health test.
+    #[derive(Default)]
+    struct RecordingHealth {
+        ok: parking_lot::Mutex<Vec<String>>,
+        errors: parking_lot::Mutex<Vec<String>>,
+    }
+
+    static RECORDING_HEALTH: std::sync::LazyLock<std::sync::Arc<RecordingHealth>> =
+        std::sync::LazyLock::new(|| {
+            let reporter = std::sync::Arc::new(RecordingHealth::default());
+            register_health_reporter(reporter.clone());
+            reporter
+        });
+
+    impl zeroclaw_api::cron_traits::CronHealthReporter for RecordingHealth {
+        fn mark_ok(&self, component: &str) {
+            self.ok.lock().push(component.to_string());
+        }
+        fn mark_error(&self, component: &str, _reason: &str) {
+            self.errors.lock().push(component.to_string());
+        }
+    }
+
+    fn recorded_health_ok() -> Vec<String> {
+        RECORDING_HEALTH.ok.lock().clone()
+    }
+
+    fn recorded_health_errors() -> Vec<String> {
+        RECORDING_HEALTH.errors.lock().clone()
+    }
+    use crate::DeliveryConfig;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
+    use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
@@ -1804,21 +1842,6 @@ mod tests {
             last_status: None,
             last_output: None,
         }
-    }
-
-    #[test]
-    fn cron_agent_run_policy_uses_scheduler_workspace() {
-        let workspace = std::path::PathBuf::from("/tmp/zeroclaw-cron-agent-workspace");
-        let security = SecurityPolicy {
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        };
-        let mut job = test_job("");
-        job.job_type = JobType::Agent;
-
-        let policy = cron_agent_run_policy(&security, &job);
-
-        assert_eq!(policy.workspace_dir, workspace);
     }
 
     struct PowerShellProbeRuntime {
@@ -2003,13 +2026,12 @@ mod tests {
     }
 
     #[test]
-    fn cron_agent_run_policy_excludes_scheduler_mutation_tools_by_default() {
-        let security = SecurityPolicy::default();
+    fn cron_excludes_scheduler_mutation_tools_from_agent_jobs_by_default() {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = None;
 
-        let policy = cron_agent_run_policy(&security, &job);
+        let excluded = cron_agent_excluded_tools(&job);
 
         for tool in [
             "cron_add",
@@ -2019,29 +2041,32 @@ mod tests {
             "schedule",
         ] {
             assert!(
-                !policy.is_tool_allowed(tool),
+                excluded.iter().any(|t| t == tool),
                 "{tool} must be excluded from default cron agent runs"
             );
         }
-        assert!(
-            policy.is_tool_allowed("http_request"),
-            "non-scheduler tools remain available when the base policy is unrestricted"
-        );
+        // Cron names only what it wants removed. Everything else is the
+        // agent profile's business, and cron does not speak for it.
+        assert!(!excluded.iter().any(|t| t == "http_request"));
     }
 
     #[test]
-    fn cron_agent_run_policy_respects_explicit_allowed_tools() {
-        let security = SecurityPolicy::default();
+    fn cron_adds_no_exclusions_when_the_job_names_its_own_tools() {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = Some(vec!["cron_add".into()]);
 
-        let policy = cron_agent_run_policy(&security, &job);
+        // An explicit allowlist means the operator already stated the exact
+        // surface, including deliberate scheduler automation. Cron does not
+        // second-guess it.
+        assert!(cron_agent_excluded_tools(&job).is_empty());
+    }
 
-        assert!(
-            policy.is_tool_allowed("cron_add"),
-            "explicit cron job allowed_tools should remain the override for intentional scheduler automation"
-        );
+    #[test]
+    fn cron_adds_no_exclusions_for_shell_jobs() {
+        let job = test_job("echo hi");
+        assert!(matches!(job.job_type, JobType::Shell));
+        assert!(cron_agent_excluded_tools(&job).is_empty());
     }
 
     #[tokio::test]
@@ -2544,160 +2569,132 @@ mod tests {
         assert!(output.contains("always_missing_for_retry_test"));
     }
 
+    /// Cron reports an executor failure as a job failure.
+    ///
+    /// Replaces a pre-extraction test that asserted an agent run fails without
+    /// a provider key. Why the run failed is the host executor's business now;
+    /// what cron still owns is not swallowing that failure or reporting it as
+    /// success.
     #[tokio::test]
-    async fn run_agent_job_returns_error_without_provider_key() {
+    async fn agent_job_failure_from_the_executor_is_reported_as_failure() {
+        std::sync::LazyLock::force(&RECORDING_EXECUTOR);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
-        job.prompt = Some("Say hello".into());
+        job.prompt = Some(format!("Say hello {EXECUTOR_FAILURE_SENTINEL}"));
         let security = test_security(&config);
 
         let (success, output) =
             Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert!(output.contains("agent job failed:"), "unexpected: {output}");
     }
 
-    #[tokio::test]
-    async fn agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency() {
-        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
-        use tokio::net::TcpListener;
-        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+    /// Prompt marker that makes the stub executor report failure.
+    const EXECUTOR_FAILURE_SENTINEL: &str = "__cron_stub_should_fail__";
 
-        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let fail_first_request = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let requests_for_handler = Arc::clone(&requests);
-        let fail_first_for_handler = Arc::clone(&fail_first_request);
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                requests_for_handler.lock().unwrap().push(body.clone());
-                let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
-                    })
-                });
-                let fail_this_request =
-                    fail_first_for_handler.swap(false, std::sync::atomic::Ordering::SeqCst);
-                async move {
-                    if fail_this_request {
-                        return (StatusCode::OK, "not-json").into_response();
+    /// Records what cron hands across the executor seam.
+    struct RecordingExecutor {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<zeroclaw_api::cron_traits::CronAgentRequest>>>,
+    }
+
+    impl zeroclaw_api::cron_traits::CronAgentExecutor for RecordingExecutor {
+        fn run_agent_job<'a>(
+            &'a self,
+            request: zeroclaw_api::cron_traits::CronAgentRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = zeroclaw_api::cron_traits::CronAgentRun>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let fail = request.prompt.contains(EXECUTOR_FAILURE_SENTINEL);
+            self.seen.lock().push(request);
+            Box::pin(async move {
+                if fail {
+                    zeroclaw_api::cron_traits::CronAgentRun {
+                        success: false,
+                        output: "agent job failed: stub executor was asked to fail".to_string(),
                     }
-                    if has_tool_result {
-                        return Json(serde_json::json!({
-                            "choices": [{"message": {"content": "done"}}]
-                        }))
-                        .into_response();
+                } else {
+                    zeroclaw_api::cron_traits::CronAgentRun {
+                        success: true,
+                        output: "done".to_string(),
                     }
-                    Json(serde_json::json!({
-                        "choices": [{
-                            "message": {
-                                "content": null,
-                                "tool_calls": [{
-                                    "id": "call-shell",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "shell",
-                                        "arguments": "{\"command\":\"pwd\"}"
-                                    }
-                                }]
-                            }
-                        }]
-                    }))
-                    .into_response()
                 }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+            })
+        }
+    }
 
+    static RECORDING_EXECUTOR: std::sync::LazyLock<
+        std::sync::Arc<parking_lot::Mutex<Vec<zeroclaw_api::cron_traits::CronAgentRequest>>>,
+    > = std::sync::LazyLock::new(|| {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        register_agent_executor(std::sync::Arc::new(RecordingExecutor {
+            seen: seen.clone(),
+        }));
+        seen
+    });
+
+    /// The scheduler's workspace must survive the crate boundary.
+    ///
+    /// Ported from the pre-extraction test added by the scheduler-workspace
+    /// fix. That test asserted end to end that shell output came from the
+    /// scheduler's workspace; agent execution now lives behind the executor
+    /// seam, so this asserts the half cron still owns: that the resolved
+    /// workspace is what cron hands over, on the retry path and under
+    /// concurrency. The end-to-end half belongs with the host executor.
+    #[tokio::test]
+    async fn cron_hands_the_scheduler_workspace_across_the_executor_seam() {
+        let seen = std::sync::LazyLock::force(&RECORDING_EXECUTOR).clone();
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.memory.backend = "none".to_string();
-        config.memory.auto_save = false;
-        config.reliability.scheduler_retries = 1;
-        config.reliability.provider_backoff_ms = 1;
-        config.providers.models.ollama.insert(
-            "default".to_string(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("cron-workspace-test-model".to_string()),
-                    timeout_secs: Some(5),
-                    uri: Some(format!("http://{address}")),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
-        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
-            zeroclaw_config::policy::AutonomyLevel::Full;
+        let config = test_config(&tmp).await;
 
         let mut security = test_security(&config);
         let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
         std::fs::create_dir_all(&scheduler_workspace).unwrap();
         security.workspace_dir = scheduler_workspace.clone();
-        let expected_workspace = security.workspace_dir.clone();
-        assert_ne!(expected_workspace, config.agent_workspace_dir(TEST_AGENT));
+        assert_ne!(
+            scheduler_workspace,
+            config.agent_workspace_dir(TEST_AGENT),
+            "the test is only meaningful when the scheduler workspace differs from the agent default"
+        );
+
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Print the current workspace directory".into());
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
+        let before = seen.lock().len();
+
         let outcome = Box::pin(execute_job_with_retry(
             &config, &security, TEST_AGENT, &job, None, false,
         ))
         .await;
-        let (success, output) = (outcome.is_success(), outcome.into_output());
-        assert!(success, "retrying cron agent run failed: {output}");
-        assert_eq!(output, "done");
+        assert!(outcome.is_success(), "{}", outcome.clone().into_output());
 
-        let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
-        assert!(
-            sequential.0,
-            "repeated cron agent run failed: {:?}",
-            sequential.1
-        );
-
-        let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
+        let (a, b, c) = tokio::join!(
             run_agent_job(&config, &security, TEST_AGENT, &job),
             run_agent_job(&config, &security, TEST_AGENT, &job),
             run_agent_job(&config, &security, TEST_AGENT, &job),
         );
-        for result in [concurrent_a, concurrent_b, concurrent_c] {
+        for result in [a, b, c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
         }
 
-        let requests = requests.lock().unwrap();
-        let tool_results: Vec<&str> = requests
-            .iter()
-            .filter_map(|request| {
-                request["messages"].as_array()?.iter().find_map(|message| {
-                    (message.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
-                        .then(|| message.get("content")?.as_str())
-                        .flatten()
-                })
-            })
-            .collect();
-        assert_eq!(
-            tool_results.len(),
-            5,
-            "each successful run must execute shell once"
-        );
-        for tool_result in tool_results {
-            assert!(
-                tool_result.contains(expected_workspace.to_string_lossy().as_ref()),
-                "shell output must come from the scheduler workspace {:?}, got {tool_result:?}",
-                expected_workspace
+        let requests = seen.lock();
+        let ours = &requests[before..];
+        assert_eq!(ours.len(), 4, "one request per run, retries included");
+        for request in ours {
+            assert_eq!(
+                request.workspace_dir, scheduler_workspace,
+                "the scheduler workspace must not be replaced by the agent default"
             );
+            assert_eq!(request.agent_alias, TEST_AGENT);
         }
-
-        server.abort();
     }
 
     #[tokio::test]
@@ -2744,33 +2741,40 @@ mod tests {
 
     #[tokio::test]
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
+        // Force reporter registration before anything can report.
+        std::sync::LazyLock::force(&RECORDING_HEALTH);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let component = unique_component("scheduler-idle");
+        let component = unique_component("idle-health");
 
-        mark_error(&component, &"pre-existing error");
-        process_due_jobs(&config, Vec::new(), &component, &None).await;
+        // An idle poll still has to report liveness, otherwise a silent
+        // scheduler is indistinguishable from one with nothing to do.
+        process_due_jobs(&config, vec![], &component, &None).await;
 
-        let snapshot = crate::health::snapshot_json();
-        let entry = &snapshot["components"][component.as_str()];
-        assert_eq!(entry["status"], "ok");
-        assert!(entry["last_ok"].as_str().is_some());
-        assert!(entry["last_error"].is_null());
+        assert!(
+            recorded_health_ok().iter().any(|c| c == &component),
+            "an idle poll must still mark the component healthy"
+        );
     }
 
     #[tokio::test]
     async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
+        // Force reporter registration before anything can report.
+        std::sync::LazyLock::force(&RECORDING_HEALTH);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
-        let component = unique_component("scheduler-fail");
+        let component = unique_component("failure-health");
+        let job = test_job("definitely_not_a_real_command_xyz");
 
-        mark_ok(&component);
         process_due_jobs(&config, vec![job], &component, &None).await;
 
-        let snapshot = crate::health::snapshot_json();
-        let entry = &snapshot["components"][component.as_str()];
-        assert_eq!(entry["status"], "ok");
+        // A failing job is a job problem, not a scheduler problem. The
+        // scheduler completed its poll, so it stays healthy.
+        assert!(recorded_health_ok().iter().any(|c| c == &component));
+        assert!(
+            !recorded_health_errors().iter().any(|c| c == &component),
+            "a failed job must not mark the scheduler itself unhealthy"
+        );
     }
 
     #[tokio::test]
@@ -2818,10 +2822,7 @@ mod tests {
         .success;
 
         assert!(success);
-        assert_eq!(
-            crate::store::write_connection_count_for_tests(&config),
-            1
-        );
+        assert_eq!(crate::store::write_connection_count_for_tests(&config), 1);
     }
 
     #[tokio::test]
@@ -3008,10 +3009,7 @@ mod tests {
         .success;
 
         assert!(!success);
-        assert_eq!(
-            crate::store::write_connection_count_for_tests(&config),
-            1
-        );
+        assert_eq!(crate::store::write_connection_count_for_tests(&config), 1);
     }
 
     #[tokio::test]

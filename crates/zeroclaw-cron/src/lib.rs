@@ -1,6 +1,6 @@
-use zeroclaw_config::policy::SecurityPolicy;
 use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 pub mod i18n;
@@ -33,7 +33,7 @@ pub use types::{
 
 /// Channel names exposed by the cron tool schemas. Actual runtime delivery is
 /// provided by the registered channel delivery handler, not this static enum.
-pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+pub const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "telegram",
     "discord",
     "slack",
@@ -60,7 +60,7 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
 ///
 /// Built from `CRON_DELIVERY_SCHEMA_CHANNELS` so the supported types stay
 /// declared once.
-pub(crate) fn cron_delivery_channel_pattern() -> String {
+pub fn cron_delivery_channel_pattern() -> String {
     format!(
         "^({})(\\.[A-Za-z0-9_-]+)?$",
         CRON_DELIVERY_SCHEMA_CHANNELS.join("|")
@@ -123,7 +123,7 @@ pub fn validate_shell_command_with_security(
         })
 }
 
-pub(crate) fn add_shell_job_with_runtime(
+pub fn add_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -303,7 +303,7 @@ pub fn update_shell_job_with_approval(
     )
 }
 
-pub(crate) fn update_shell_job_with_runtime(
+pub fn update_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -349,7 +349,7 @@ pub fn add_once_validated(
     )
 }
 
-pub(crate) fn add_once_validated_with_runtime(
+pub fn add_once_validated_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -396,7 +396,7 @@ pub fn add_once_at_validated(
     )
 }
 
-pub(crate) fn add_once_at_validated_with_runtime(
+pub fn add_once_at_validated_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -642,8 +642,8 @@ mod validate_delivery_tests {
 #[cfg(test)]
 mod remap_agent_command_tests {
     use super::*;
-    use zeroclaw_config::policy::AutonomyLevel;
     use tempfile::TempDir;
+    use zeroclaw_config::policy::AutonomyLevel;
 
     const TEST_AGENT: &str = "test-agent";
 

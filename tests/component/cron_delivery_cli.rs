@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use zeroclaw_config::schema::Config;
-use zeroclaw_runtime::cron;
+use zeroclaw_cron as cron;
 
 /// `locale = "en"` is pinned so stdout assertions do not depend on the
 /// environment; `config_dir_locale_regression.rs` shows config drives locale.
