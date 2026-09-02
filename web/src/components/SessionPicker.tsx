@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Check, ChevronDown, MessagesSquare, Pencil, Plus, Trash2, X } from 'lucide-react';
 import { useAgent } from '@/contexts/AgentContext';
 import { getSessions } from '@/lib/api';
@@ -51,6 +51,11 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const storesConversations = sessionPersistence === true;
 
   const [open, setOpen] = useState(false);
+  // Links the trigger to the panel it discloses. The panel is a plain list of
+  // buttons and editors, not an ARIA menu: it carries disclosure semantics
+  // (aria-expanded + aria-controls) rather than promising menu keyboard
+  // behaviour it does not implement.
+  const panelId = useId();
   const [rows, setRows] = useState<SessionRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -176,16 +181,25 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     resetRowActions();
   }, [resetRowActions]);
 
+  // Activating New or a row unmounts the control that had focus. Hand focus
+  // back to the trigger, as Escape does, so a keyboard user is not dropped
+  // onto <body>. Outside clicks go through closeMenu directly and leave focus
+  // wherever the operator clicked.
+  const closeMenuAndRefocus = useCallback(() => {
+    closeMenu();
+    triggerRef.current?.focus();
+  }, [closeMenu]);
+
   const handleNew = useCallback(() => {
-    if (startNewSession()) closeMenu();
-  }, [startNewSession, closeMenu]);
+    if (startNewSession()) closeMenuAndRefocus();
+  }, [startNewSession, closeMenuAndRefocus]);
 
   const handleSelect = useCallback((id: string) => {
     // Selecting the row already on screen is still a completed picker action.
     // goToSession correctly reports false for that no-op, but the menu should
     // dismiss just as it does after selecting a different conversation.
-    if (id === sessionId || goToSession(id)) closeMenu();
-  }, [sessionId, goToSession, closeMenu]);
+    if (id === sessionId || goToSession(id)) closeMenuAndRefocus();
+  }, [sessionId, goToSession, closeMenuAndRefocus]);
 
   const commitRename = useCallback(async (id: string) => {
     const name = renameDraft.trim();
@@ -237,8 +251,8 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
           setOpen(true);
           void load();
         }}
-        aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? panelId : undefined}
         title={t('agent.sessions')}
         className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
       >
@@ -248,7 +262,12 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       </button>
 
       {open && (
-        <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-h-80 overflow-y-auto">
+        <div
+          id={panelId}
+          role="group"
+          aria-label={t('agent.sessions')}
+          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-h-80 overflow-y-auto"
+        >
           {storesConversations ? (
             <button
               type="button"
