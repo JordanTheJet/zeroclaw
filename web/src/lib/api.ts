@@ -52,6 +52,23 @@ export class ApiError extends Error {
 }
 
 /**
+ * A non-2xx response whose body is not a structured `ApiError` envelope, such
+ * as the session endpoints' `{"error": "..."}` bodies. Carries the HTTP status
+ * so a caller can branch on it (`404` = already gone) without regex-matching
+ * the message. The message keeps the historical `API <status>: <body>` text,
+ * so callers that only read `err.message` see no change.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    body: string,
+  ) {
+    super(`API ${status}: ${body}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
  * Stable config-API error codes, sourced from the generated OpenAPI schema
  * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
  * a backend rename or a typo fails `tsc` here instead of silently regressing
@@ -141,8 +158,8 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!result.ok) {
-    // Try to parse a structured ConfigApiError envelope. Falls back to a
-    // plain Error when the body is non-JSON or doesn't match the shape.
+    // Try to parse a structured ConfigApiError envelope. Falls back to an
+    // HttpError (status only) when the body is non-JSON or doesn't match.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
@@ -162,7 +179,7 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new HttpError(result.status, result.text || result.statusText);
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with

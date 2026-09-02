@@ -65,6 +65,9 @@ interface ConfigPutRequest {
   comment?: string;
 }
 let configPutCalls: ConfigPutRequest[] = [];
+// Session ids the mocked gateway reports as already gone / failing on DELETE.
+let missingSessions = new Set<string>();
+let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
 
 globalThis.fetch = async (input, init) => {
@@ -88,6 +91,18 @@ globalThis.fetch = async (input, init) => {
     // out-of-order list responses can be reproduced deterministically.
     body = { sessions: sessionsResponder ? await sessionsResponder() : listedSessions };
   }
+  else if (/\/api\/sessions\/[^/]+$/.test(url) && init?.method === 'DELETE') {
+    // The gateway's real DELETE contract: a plain `{"error": ...}` body, not
+    // the structured ConfigApiError envelope, on a missing row.
+    const id = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
+    if (deleteFailures.has(id)) {
+      return new Response('{"error":"backend failure"}', { status: 500 });
+    }
+    if (missingSessions.has(id)) {
+      return new Response('{"error":"Session not found"}', { status: 404 });
+    }
+    body = { deleted: true, session_id: id };
+  }
   else return new Response('{"error":"not found"}', { status: 404 });
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -96,6 +111,7 @@ globalThis.fetch = async (input, init) => {
 };
 
 const { AgentProvider, useAgent } = await import('./AgentContext.tsx');
+const { deleteSession, HttpError, ApiError } = await import('../lib/api.ts');
 const { DraftContext } = await import('../hooks/useDraft.ts');
 const { AgentChatInner } = await import('../pages/AgentChat.tsx');
 const { MemoryRouter } = await import('react-router-dom');
@@ -327,6 +343,8 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
 beforeEach(() => {
   storage.clear();
   configPutCalls = [];
+  missingSessions = new Set();
+  deleteFailures = new Set();
   configPutHandler = null;
   sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
@@ -610,6 +628,63 @@ test('delete preserves inactive state and moves an active session exactly once',
   assert.equal(mounted.context().sessionPersistence, null);
   assert.equal(storage.getItem('zeroclaw_chat_history_v1:A'), null);
   assert.equal(runtime.sockets[1]?.sessionId, 'C');
+  await unmount(mounted.renderer);
+});
+
+test('the gateway\'s plain 404 on DELETE surfaces as a status-bearing HttpError', async () => {
+  missingSessions.add('gone');
+  await assert.rejects(deleteSession('gone'), (err: unknown) => (
+    err instanceof HttpError
+    && !(err instanceof ApiError)
+    && err.status === 404
+    && err.message === 'API 404: {"error":"Session not found"}'
+  ));
+  assert.deepEqual(await deleteSession('present'), { deleted: true, session_id: 'present' });
+});
+
+test('deleting an active row the gateway no longer has is treated as deleted', async () => {
+  // The picker lists the active conversation even when GET /api/sessions
+  // lacks it (another client deleted it, or no turn is stored yet). Deleting
+  // that row goes through the real wrapper and hits the real 404 contract.
+  const runtime = new FakeSessionRuntime();
+  runtime.mintedIds.push('C');
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('C', () => Promise.resolve(messagesResponse('C', true)));
+  runtime.queueDelete('A', () => deleteSession('A'));
+  missingSessions.add('A');
+  storage.setItem('zeroclaw_chat_history_v1:A', '{"messages":[]}');
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => { await mounted.context().removeSession('A'); });
+  await settle();
+  assert.deepEqual(runtime.deleteCalls, ['A']);
+  assert.equal(mounted.context().sessionId, 'C');
+  assert.equal(storage.getItem('zeroclaw_chat_history_v1:A'), null);
+  assert.equal(runtime.sockets[1]?.sessionId, 'C');
+  await unmount(mounted.renderer);
+});
+
+test('a non-404 delete failure keeps the active row and its cache', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.mintedIds.push('C');
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueDelete('A', () => deleteSession('A'));
+  deleteFailures.add('A');
+  storage.setItem('zeroclaw_chat_history_v1:A', '{"messages":[]}');
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => {
+    await assert.rejects(mounted.context().removeSession('A'), (err: unknown) => (
+      err instanceof HttpError && err.status === 500
+    ));
+  });
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.equal(storage.getItem('zeroclaw_chat_history_v1:A'), '{"messages":[]}');
+  assert.equal(runtime.sockets.length, 1);
   await unmount(mounted.renderer);
 });
 

@@ -11,6 +11,7 @@ import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
 import {
   ApiError,
+  HttpError,
   getProp,
   putProp,
   resolveAliasSource,
@@ -1112,10 +1113,14 @@ export function AgentProvider({
       await sessionRuntimeRef.current.delete(targetSessionId);
     } catch (err) {
       // 404 means the gateway has nothing stored for this conversation, which
-      // is already the outcome the operator asked for. Anything else is a real
-      // failure — the transcript is still on the server, so say so instead of
-      // quietly dropping the row and implying it is gone.
-      if (!(err instanceof ApiError) || err.status !== 404) throw err;
+      // is already the outcome the operator asked for: a row another client
+      // deleted, or one the picker still shows as "Not saved yet". The session
+      // endpoints answer with a plain `{"error": ...}` body rather than the
+      // structured envelope, so read the status from either error shape.
+      // Anything else is a real failure — the transcript is still on the
+      // server, so say so instead of quietly dropping the row.
+      const status = err instanceof ApiError || err instanceof HttpError ? err.status : undefined;
+      if (status !== 404) throw err;
     }
     // The browser cache is a second copy of the same transcript; a delete that
     // leaves it behind is not a delete.
