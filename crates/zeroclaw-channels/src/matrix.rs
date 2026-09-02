@@ -29,8 +29,8 @@ use matrix_sdk::{
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
-    RoomVisibility, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
+    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
 };
 use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode, TranscriptionConfig};
 use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
@@ -381,7 +381,7 @@ mod streaming {
         DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
     };
 
-    use super::{MatrixStreamMode, markers};
+    use super::{DraftProgress, DraftProgressKind, MatrixStreamMode, markers};
 
     const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
 
@@ -434,7 +434,7 @@ mod streaming {
         pub event_id: OwnedEventId,
         pub thread_anchor: Option<OwnedEventId>,
         /// Source of truth for the current visible progress window.
-        pub lines: VecDeque<String>,
+        pub lines: VecDeque<DraftProgress>,
         /// Last body confirmed by a successful Matrix edit, used to decide
         /// whether retained drafts need a final flush.
         pub last_text: String,
@@ -614,69 +614,100 @@ mod streaming {
     /// oldest entries once the configured window is full. A zero limit
     /// intentionally means "unlimited".
     pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
-        let text = normalize_matrix_progress_line(text);
-        if text.is_empty() {
+        push_single_progress(draft, legacy_single_progress(text), max_lines);
+    }
+
+    /// Classify callers of the legacy text-only API using the historical
+    /// display convention. Typed callers bypass this heuristic.
+    pub(super) fn legacy_single_progress(text: &str) -> DraftProgress {
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        DraftProgress {
+            kind,
+            text: text.to_string(),
+        }
+    }
+
+    /// Append progress while retaining the source kind supplied by the
+    /// orchestrator, including when reasoning renders like generated status.
+    pub(super) fn push_single_progress(
+        draft: &mut SingleDraft,
+        progress: DraftProgress,
+        max_lines: usize,
+    ) {
+        let progress = normalize_matrix_progress(progress);
+        if progress.text.is_empty() {
             return;
         }
-        if merge_single_progress_line(draft, &text) {
+        if merge_single_progress_line(draft, &progress) {
             trim_single_visible_lines(draft, max_lines);
             return;
         }
-        draft.lines.push_back(text);
+        draft.lines.push_back(progress);
         trim_single_visible_lines(draft, max_lines);
     }
 
     /// Reasoning arrives as provider stream fragments. Keep it as one Matrix
     /// transcript entry and let `draft_update_interval_ms` decide how often
     /// that growing text is edited into the room.
-    fn merge_single_progress_line(draft: &mut SingleDraft, text: &str) -> bool {
-        if let Some(incoming_round) = single_thinking_status_round(text)
+    fn merge_single_progress_line(draft: &mut SingleDraft, progress: &DraftProgress) -> bool {
+        if let Some(incoming_round) = single_thinking_status_round(progress)
             && let Some(existing) = draft.lines.back_mut()
             && is_single_thinking_status(existing)
         {
             if incoming_round >= single_thinking_status_round(existing).unwrap_or(0) {
-                *existing = text.to_string();
+                *existing = progress.clone();
             }
             return true;
         }
 
-        if let Some(fragment) = text.strip_prefix(REASONING_FULL_PREFIX)
+        if let Some(fragment) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
             && let Some(existing) = draft.lines.back_mut()
-            && existing.starts_with(REASONING_FULL_PREFIX)
-            && !is_single_thinking_status(existing)
+            && is_single_reasoning_progress(existing)
         {
-            existing.push_str(fragment);
+            existing.text.push_str(fragment);
             return true;
         }
 
         false
     }
 
-    fn single_thinking_status_round(text: &str) -> Option<usize> {
-        thinking_status_round(text)
+    fn single_thinking_status_round(progress: &DraftProgress) -> Option<usize> {
+        matches!(progress.kind, DraftProgressKind::Status)
+            .then(|| thinking_status_round(&progress.text))
+            .flatten()
     }
 
-    fn is_single_thinking_status(text: &str) -> bool {
-        single_thinking_status_round(text).is_some()
+    fn is_single_thinking_status(progress: &DraftProgress) -> bool {
+        single_thinking_status_round(progress).is_some()
     }
 
-    fn is_single_reasoning_progress(text: &str) -> bool {
-        text.starts_with(REASONING_FULL_PREFIX) && !is_single_thinking_status(text)
+    fn is_single_reasoning_progress(progress: &DraftProgress) -> bool {
+        matches!(progress.kind, DraftProgressKind::Reasoning)
+            && progress.text.starts_with(REASONING_FULL_PREFIX)
     }
 
-    fn visible_line_count(text: &str) -> usize {
-        single_render_line(text).split('\n').count().max(1)
+    fn visible_line_count(progress: &DraftProgress) -> usize {
+        single_render_line(progress).split('\n').count().max(1)
     }
 
-    fn trim_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+    fn trim_visible_lines_from_front(
+        progress: &DraftProgress,
+        remove_lines: usize,
+    ) -> DraftProgress {
         if remove_lines == 0 {
-            return text.to_string();
+            return progress.clone();
         }
 
-        let rendered = single_render_line(text);
-        let total = visible_line_count(rendered);
+        let rendered = single_render_line(progress);
+        let total = visible_line_count(progress);
         if remove_lines >= total {
-            return String::new();
+            let mut empty = progress.clone();
+            empty.text.clear();
+            return empty;
         }
 
         let retained = rendered
@@ -684,10 +715,16 @@ mod streaming {
             .skip(remove_lines)
             .collect::<Vec<_>>()
             .join("\n");
-        if text.starts_with(REASONING_FULL_PREFIX) && !retained.starts_with(REASONING_FULL_PREFIX) {
+        let text = if is_single_reasoning_progress(progress)
+            && !retained.starts_with(REASONING_FULL_PREFIX)
+        {
             format!("{REASONING_FULL_PREFIX}{retained}")
         } else {
             retained
+        };
+        DraftProgress {
+            kind: progress.kind,
+            text,
         }
     }
 
@@ -695,11 +732,7 @@ mod streaming {
         if max_lines == 0 {
             return;
         }
-        let mut total_lines = draft
-            .lines
-            .iter()
-            .map(|line| visible_line_count(line))
-            .sum::<usize>();
+        let mut total_lines = draft.lines.iter().map(visible_line_count).sum::<usize>();
         while total_lines > max_lines {
             let remove_lines = total_lines - max_lines;
             let Some(front) = draft.lines.front_mut() else {
@@ -722,12 +755,27 @@ mod streaming {
     /// re-rendering a retained draft.
     /// Tool/status progress remains one logical line; only raw reasoning gets
     /// real newlines.
+    #[cfg(test)]
     pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
-        if is_thinking_status_text(text) {
-            return text.to_string();
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        normalize_matrix_progress(DraftProgress {
+            kind,
+            text: text.to_string(),
+        })
+        .text
+    }
+
+    fn normalize_matrix_progress(mut progress: DraftProgress) -> DraftProgress {
+        if is_single_thinking_status(&progress) {
+            return progress;
         }
 
-        let preserve_newlines = is_single_reasoning_progress(text);
+        let preserve_newlines = is_single_reasoning_progress(&progress);
+        let text = progress.text;
         let mut normalized = String::with_capacity(text.len().saturating_mul(2));
         let mut chars = text.trim_end_matches(&['\r', '\n'][..]).chars().peekable();
         let mut line_start = true;
@@ -780,14 +828,15 @@ mod streaming {
                 line_start = false;
             }
         }
-        normalized
+        progress.text = normalized;
+        progress
     }
 
-    fn single_render_line(line: &str) -> &str {
-        if is_single_thinking_status(line) {
-            line.trim_end_matches('\n')
+    fn single_render_line(progress: &DraftProgress) -> &str {
+        if is_single_thinking_status(progress) {
+            progress.text.trim_end_matches('\n')
         } else {
-            line
+            &progress.text
         }
     }
 
@@ -801,9 +850,9 @@ mod streaming {
         draft
             .lines
             .iter()
-            .flat_map(|line| {
-                if let Some(reasoning) = line.strip_prefix(REASONING_FULL_PREFIX)
-                    && !is_single_thinking_status(line)
+            .flat_map(|progress| {
+                if let Some(reasoning) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
+                    && is_single_reasoning_progress(progress)
                 {
                     reasoning
                         .split('\n')
@@ -814,7 +863,7 @@ mod streaming {
                         .collect::<Vec<_>>()
                 } else {
                     vec![VisibleProgressUnit {
-                        text: single_render_line(line).to_string(),
+                        text: single_render_line(progress).to_string(),
                         reasoning: false,
                     }]
                 }
@@ -4169,7 +4218,23 @@ impl MatrixChannel {
         message_id: &str,
         texts: &[String],
     ) -> Result<()> {
-        if texts.is_empty() {
+        let progress = texts
+            .iter()
+            .map(|text| streaming::legacy_single_progress(text))
+            .collect::<Vec<_>>();
+        self.single_update_typed_progress_batch(recipient, message_id, &progress)
+            .await
+    }
+
+    /// Publish a coalesced Matrix progress batch while retaining each entry's
+    /// semantic source through the channel-local draft buffer.
+    async fn single_update_typed_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        if progress.is_empty() {
             return Ok(());
         }
         let key = streaming_key(recipient, message_id)?;
@@ -4179,8 +4244,12 @@ impl MatrixChannel {
             let Some(draft) = streaming::single_for_update(&mut state, &key) else {
                 return Ok(());
             };
-            for text in texts {
-                streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+            for entry in progress {
+                streaming::push_single_progress(
+                    draft,
+                    entry.clone(),
+                    self.config.stream_draft_lines,
+                );
             }
 
             let visible_text =
@@ -4503,6 +4572,28 @@ impl Channel for MatrixChannel {
             MatrixStreamMode::Partial => {
                 for text in texts {
                     self.update_draft_progress(recipient, message_id, text)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_typed_progress_batch(recipient, message_id, progress)
+                    .await
+            }
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
+                for entry in progress {
+                    self.update_draft_progress(recipient, message_id, &entry.text)
                         .await?;
                 }
                 Ok(())
@@ -6499,10 +6590,10 @@ mod tests {
             SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
             insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
             normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
-            partial_visible_text, push_single_progress_line, single_cancel_deletes_draft,
-            single_contains, single_edit_interval_elapsed, single_finalize_plan,
-            single_render_changed, single_retained_draft_action, single_visible_text_with_budget,
-            single_visible_text_with_edit_budget,
+            partial_visible_text, push_single_progress, push_single_progress_line,
+            single_cancel_deletes_draft, single_contains, single_edit_interval_elapsed,
+            single_finalize_plan, single_render_changed, single_retained_draft_action,
+            single_visible_text_with_budget, single_visible_text_with_edit_budget,
         };
         use matrix_sdk::config::SyncSettings;
         use matrix_sdk::ruma::{
@@ -6521,7 +6612,7 @@ mod tests {
             Mock, MockServer, ResponseTemplate,
             matchers::{body_partial_json, method, path_regex},
         };
-        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_api::channel::{Channel, DraftProgress, DraftProgressKind, SendMessage};
         use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
         use zeroclaw_runtime::agent::loop_::{
             DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
@@ -6728,8 +6819,8 @@ mod tests {
             push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}efgh"), 10);
 
             let retained = draft.lines.front().expect("reasoning line retained");
-            assert_eq!(retained, &format!("{REASONING_FULL_PREFIX}abcdefgh"));
-            assert!(retained.len() > max_bytes);
+            assert_eq!(retained.text, format!("{REASONING_FULL_PREFIX}abcdefgh"));
+            assert!(retained.text.len() > max_bytes);
         }
 
         #[test]
@@ -6747,6 +6838,25 @@ mod tests {
                 single_visible_text_with_budget(&draft, usize::MAX),
                 format!("{THINKING_STATUS_PREFIX}Thinking...\n{REASONING_FULL_PREFIX}The answer")
             );
+        }
+
+        #[test]
+        fn single_reasoning_preserves_kind_when_text_matches_thinking_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            let reasoning = format!("{REASONING_FULL_PREFIX}Thinking...\n");
+
+            // Preserve source identity even though the two raw strings match.
+            push_single_progress(&mut draft, DraftProgress::status(status.clone()), 10);
+            push_single_progress(&mut draft, DraftProgress::reasoning(reasoning.clone()), 10);
+
+            assert_eq!(
+                status, reasoning,
+                "the regression requires an exact collision"
+            );
+            assert_eq!(draft.lines.len(), 2);
+            assert_eq!(draft.lines[0].kind, DraftProgressKind::Status);
+            assert_eq!(draft.lines[1].kind, DraftProgressKind::Reasoning);
         }
 
         #[test]

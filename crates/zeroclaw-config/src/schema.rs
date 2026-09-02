@@ -37131,6 +37131,36 @@ stream_tool_arguments = [
     }
 
     #[test]
+    async fn set_prop_materializes_missing_nested_option_only_on_success() {
+        let mut config = Config::default();
+        assert!(config.gateway.tls.is_none());
+
+        // Probing an absent Option<T> must not leave a phantom section when
+        // the dotted path is unrelated or the target value is invalid.
+        assert!(config.set_prop("gateway.tls.nonexistent", "value").is_err());
+        assert!(config.gateway.tls.is_none());
+        assert!(
+            config
+                .set_prop("gateway.tls.enabled", "not-a-bool")
+                .is_err()
+        );
+        assert!(config.gateway.tls.is_none());
+
+        config
+            .set_prop("gateway.tls.cert_path", "/tmp/zeroclaw-test-cert.pem")
+            .expect("a valid child write should materialize its missing parent");
+        assert_eq!(
+            config
+                .gateway
+                .tls
+                .as_ref()
+                .expect("successful write should commit the parent")
+                .cert_path,
+            "/tmp/zeroclaw-test-cert.pem",
+        );
+    }
+
+    #[test]
     async fn prop_is_secret_static_check() {
         assert!(MatrixConfig::prop_is_secret("channels.matrix.access_token"));
         assert!(MatrixConfig::prop_is_secret("channels.matrix.recovery_key"));
