@@ -278,8 +278,13 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
               {t('agent.session_new')}
             </button>
           ) : (
+            // `null` means storage is not confirmed yet (capability request
+            // pending, or hydration failed); only an explicit `false` proves
+            // the gateway keeps no conversations. Say which one it is.
             <p className="px-3 py-2 text-xs text-pc-text-muted">
-              {t('agent.sessions_not_stored')}
+              {sessionPersistence === false
+                ? t('agent.sessions_not_stored')
+                : t('agent.sessions_unavailable')}
             </p>
           )}
 

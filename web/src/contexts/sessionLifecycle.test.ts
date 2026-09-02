@@ -383,6 +383,10 @@ for (const scenario of ['unknown', 'disabled'] as const) {
 
     const buttons = mounted.renderer.root.findAllByType('button');
     assert.equal(buttons.some((button) => nodeText(button).includes('New conversation')), false);
+    // Unknown storage must not be reported as confirmed-disabled storage.
+    const notice = mounted.renderer.root.findAllByType('p').map(nodeText).join(' | ');
+    assert.equal(notice.includes('does not store conversations'), scenario === 'disabled');
+    assert.equal(notice.includes('session storage is confirmed'), scenario === 'unknown');
     const second = buttons.find((button) => nodeText(button).includes('Second'));
     assert.equal(second?.props.disabled, true);
 
