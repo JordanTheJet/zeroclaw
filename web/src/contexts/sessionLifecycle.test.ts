@@ -692,6 +692,66 @@ test('a non-404 delete failure keeps the active row and its cache', async () => 
   await unmount(mounted.renderer);
 });
 
+test('a listing fetched before an active delete cannot resurrect the deleted row', async () => {
+  // The picker refresh started by reopening the menu is still in flight when
+  // the operator deletes the active row. The post-delete refresh must not
+  // coalesce onto that pre-delete GET and report its rows as the newest.
+  const runtime = new FakeSessionRuntime();
+  runtime.mintedIds.push('C');
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('C', () => Promise.resolve(messagesResponse('C', true)));
+  runtime.queueDelete('A', () => deleteSession('A'));
+  const preDelete = new Deferred<Array<Record<string, unknown>>>();
+  let listingCalls = 0;
+  sessionsResponder = () => {
+    listingCalls += 1;
+    // 1: the mount-time load, resolved at once so rows A/B are on screen.
+    // 2: the refresh started by reopening the picker, held open across the
+    //    delete (the pre-delete snapshot). Later: the gateway's post-delete
+    //    state.
+    if (listingCalls === 1) return Promise.resolve(listedSessions);
+    if (listingCalls === 2) return preDelete.promise;
+    return Promise.resolve(listedSessions.filter((s) => s.session_id !== 'A'));
+  };
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  // Reopening the picker starts the refresh that is still in flight during
+  // the delete, while the rows from the mount-time load remain clickable.
+  const trigger = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props.title === 'Conversations');
+  assert.ok(trigger);
+  await act(async () => { trigger.props.onClick(); });
+  await settle();
+
+  const deleteButton = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Delete conversation: First');
+  assert.ok(deleteButton, 'active row A ("First") should expose a delete action');
+  await act(async () => { deleteButton.props.onClick(); });
+  const confirm = mounted.renderer.root.findAllByType('button')
+    .find((button) => nodeText(button) === 'Delete');
+  assert.ok(confirm);
+  await act(async () => { await confirm.props.onClick(); });
+  await settle();
+  assert.equal(mounted.context().sessionId, 'C');
+  assert.deepEqual(runtime.deleteCalls, ['A']);
+
+  // Now the pre-delete listing lands, carrying the deleted row. The menu is
+  // still open from the delete, so no new refresh starts: whatever the rows
+  // show here is what the operator sees.
+  await act(async () => { preDelete.resolve(listedSessions); });
+  await settle();
+  const rows = mounted.renderer.root.findAllByType('button')
+    .map(nodeText)
+    .filter((text) => /^(First|Second|Conversation C)/.test(text));
+  assert.equal(rows.some((text) => text.startsWith('First')), false,
+    `deleted row resurrected: ${rows.join(' | ')}`);
+  assert.ok(rows.some((text) => text.startsWith('Second')));
+  assert.ok(rows.some((text) => text.startsWith('Conversation C')));
+  assert.ok(listingCalls >= 3, `post-delete refresh must issue a fresh listing request (calls: ${listingCalls})`);
+  await unmount(mounted.renderer);
+});
+
 test('a late active delete cannot replace a newer selected session', async () => {
   const runtime = new FakeSessionRuntime();
   const deleteA = new Deferred<{ deleted: boolean }>();

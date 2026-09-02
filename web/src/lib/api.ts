@@ -97,6 +97,21 @@ interface RawResult {
 // genuinely-overlapping requests, never caches stale data.
 const inFlightGets = new Map<string, Promise<RawResult>>();
 
+/**
+ * Drop any in-flight coalesced GET for `path` so the next caller performs a
+ * fresh request. Callers already awaiting the shared request still receive
+ * its payload; the point is that a read started after a mutation can never
+ * attach to a request that began before it and report pre-mutation state as
+ * the newest result. Mutating endpoints call this for the listings they
+ * affect.
+ */
+function invalidateInFlightGet(path: string): void {
+  const suffix = ` ${apiOrigin}${basePath}${path}`;
+  for (const key of [...inFlightGets.keys()]) {
+    if (key.endsWith(suffix)) inFlightGets.delete(key);
+  }
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
@@ -143,7 +158,11 @@ export async function apiFetch<T = unknown>(
     if (existing) {
       result = await existing;
     } else {
-      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      // Remove only our own entry on settle: invalidateInFlightGet may have
+      // replaced it with a newer request that must keep coalescing.
+      const pending: Promise<RawResult> = doFetch().finally(() => {
+        if (inFlightGets.get(coalesceKey) === pending) inFlightGets.delete(coalesceKey);
+      });
       inFlightGets.set(coalesceKey, pending);
       result = await pending;
     }
@@ -2138,7 +2157,7 @@ export function renameSession(
   return apiFetch<{ session_id: string; name: string }>(
     `/api/sessions/${encodeURIComponent(id)}`,
     { method: "PUT", body: JSON.stringify({ name }) },
-  );
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
@@ -2149,10 +2168,14 @@ export function renameSession(
 export function deleteSession(
   sessionKey: string,
 ): Promise<{ deleted: boolean }> {
+  // A listing fetched before this delete settled must not be what a
+  // post-delete refresh reports: it would list the row just removed. Also on
+  // failure — a 404 means another client already deleted it, so an in-flight
+  // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionKey)}`,
     { method: "DELETE" },
-  );
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
