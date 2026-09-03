@@ -26221,6 +26221,33 @@ untrusted_outbound_redact = false
     }
 
     #[test]
+    async fn multimodal_defaults_sit_at_the_effective_ceiling() {
+        // The default is deliberately the clamp ceiling: an operator who never
+        // configures `[multimodal]` should be able to send an ordinary photo.
+        // If either number moves, move it here too rather than incidentally.
+        let cfg = MultimodalConfig::default();
+        assert_eq!(cfg.max_image_size_mb, 20);
+        assert_eq!(cfg.effective_limits(), (4, 20));
+    }
+
+    #[test]
+    async fn multimodal_effective_limits_clamp_out_of_range_values() {
+        let cfg = MultimodalConfig {
+            max_images: 99,
+            max_image_size_mb: 512,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (16, 20));
+
+        let cfg = MultimodalConfig {
+            max_images: 0,
+            max_image_size_mb: 0,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (1, 1));
+    }
+
+    #[test]
     async fn http_request_config_default_has_correct_values() {
         let cfg = HttpRequestConfig::default();
         assert_eq!(cfg.timeout_secs, 30);
