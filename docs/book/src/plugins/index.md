@@ -345,6 +345,13 @@ before the rename fails with `Unknown property`; applying the printed steps in
 the printed order works. `plugin list` diagnoses this and never edits your
 config itself.
 
+If a row grants an entry the runtime rejects (a single-label wildcard such as
+`*.com`, say), the config loader only warns about it, but the runtime refuses
+the whole allowlist and denies every request. `plugin list` names the rejected
+entry and prints a grant command that leaves it out; on a pre-1.0 row that
+command follows the rename as before. Applying it replaces the rejected list
+with one the runtime accepts.
+
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare
 against.

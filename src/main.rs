@@ -3105,35 +3105,73 @@ fn egress_grant_gap_lines(
         });
         match plan_egress_gap(&instance_key, &declared, &state) {
             EgressGapPlan::Nothing => {}
-            EgressGapPlan::Grant { missing, command } => {
-                let hosts = missing.join(", ");
-                lines.push(format!(
-                    "  {}",
-                    ta(
-                        "cli-plugin-egress-gap",
-                        &[("name", &package), ("hosts", &hosts), ("command", &command)],
-                        "This plugin declares destinations its entry does not grant."
-                    )
-                ));
+            EgressGapPlan::Grant {
+                missing,
+                invalid,
+                command,
+            } => {
+                if !invalid.is_empty() {
+                    // The row holds an entry the runtime rejects, which makes
+                    // it refuse the whole allowlist: the command is the repair
+                    // because it carries only the entries the runtime accepts.
+                    let bad = invalid.join(", ");
+                    lines.push(format!(
+                        "  {}",
+                        ta(
+                            "cli-plugin-egress-invalid-grant",
+                            &[("name", &package), ("hosts", &bad), ("command", &command)],
+                            "This plugin's config entry grants a destination the runtime \
+                             rejects; replace the grant with the printed command."
+                        )
+                    ));
+                }
+                if !missing.is_empty() {
+                    let hosts = missing.join(", ");
+                    lines.push(format!(
+                        "  {}",
+                        ta(
+                            "cli-plugin-egress-gap",
+                            &[("name", &package), ("hosts", &hosts), ("command", &command)],
+                            "This plugin declares destinations its entry does not grant."
+                        )
+                    ));
+                }
             }
             EgressGapPlan::Migrate {
                 legacy_row,
                 missing,
+                invalid,
                 grant: Some(command),
             } => {
-                // The declaration still lacks destinations after the rename:
-                // the numbered two-step, rename first so the grant command
-                // addresses a row that exists.
-                let hosts = missing.join(", ");
-                lines.push(format!(
-                    "  {}",
-                    ta(
-                        "cli-plugin-egress-gap-legacy",
-                        &[("name", &package), ("hosts", &hosts)],
-                        "This plugin declares destinations its entry does not grant, \
-                         and its grant is still on a legacy config row."
-                    )
-                ));
+                // Something still has to change after the rename — an
+                // uncovered destination, a rejected entry, or both — so this
+                // is the numbered two-step: rename first so the grant command
+                // addresses a row that exists. Neither headline carries the
+                // command, because it only resolves after the rename.
+                if !invalid.is_empty() {
+                    let bad = invalid.join(", ");
+                    lines.push(format!(
+                        "  {}",
+                        ta(
+                            "cli-plugin-egress-invalid-grant-legacy",
+                            &[("name", &package), ("hosts", &bad)],
+                            "This plugin's config entry grants a destination the runtime \
+                             rejects, and its grant is still on a legacy config row."
+                        )
+                    ));
+                }
+                if !missing.is_empty() {
+                    let hosts = missing.join(", ");
+                    lines.push(format!(
+                        "  {}",
+                        ta(
+                            "cli-plugin-egress-gap-legacy",
+                            &[("name", &package), ("hosts", &hosts)],
+                            "This plugin declares destinations its entry does not grant, \
+                             and its grant is still on a legacy config row."
+                        )
+                    ));
+                }
                 lines.push(format!(
                     "    {}",
                     ta(
@@ -3160,10 +3198,11 @@ fn egress_grant_gap_lines(
                 grant: None,
                 ..
             } => {
-                // The authored grant already covers the declaration, but the
-                // runtime does not read the row it sits on: the rename alone
-                // restores reach, and no grant command is offered because one
-                // would only replace a list the operator already has right.
+                // The authored grant already covers the declaration with
+                // entries the runtime accepts, but the runtime does not read
+                // the row it sits on: the rename alone restores reach, and no
+                // grant command is offered because one would only replace a
+                // list the operator already has right.
                 lines.push(format!(
                     "  {}",
                     ta(
@@ -13686,6 +13725,73 @@ mod tests {
                 .expect("gap lines must build")
                 .is_empty(),
             "a canonical row that covers the declaration has nothing to report"
+        );
+    }
+
+    /// REGRESSION (rejected authored entry): the legacy row grants `*.com`,
+    /// which the grammar rejects as a single-label wildcard, but a hand-edited
+    /// config survives `load_or_init`, which only warns. The containment
+    /// relation trusts its inputs, so `*.com` "covers" the declared `api.com`,
+    /// and a planner that let the row vouch for itself would print the rename
+    /// alone. After that rename the runtime builds the policy from the row,
+    /// rejects `*.com`, and denies every request. The diagnostic must name the
+    /// rejected entry, still print the rename, and print a grant command that
+    /// leaves the rejected entry out, so following the steps yields a policy
+    /// the runtime accepts.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_the_runtime_rejects_is_named_and_kept_out_of_the_printed_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry("weather-tool", &["*.com"])];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the rejected entry must be named so the operator can find it: {rendered}"
+        );
+        assert!(
+            rendered.contains(&instance_key),
+            "the rename must still be printed: {rendered}"
+        );
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("zeroclaw config set"))
+            .expect("a rejected entry must force a grant command, since the rename alone would put a refused allowlist in effect");
+        let command_value = grant_line
+            .split('"')
+            .nth(1)
+            .expect("the grant command must quote its value");
+        assert!(
+            command_value.contains("api.com") && !command_value.contains("*.com"),
+            "the command must carry the declaration and leave the rejected entry out: {grant_line}"
+        );
+
+        // Follow the printed steps: rename, then apply. The resulting grant is
+        // one the runtime accepts, and the diagnostic goes quiet.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the printed command must succeed after the rename");
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(granted, vec!["api.com".to_string()]);
+        assert!(
+            crate::plugins::egress_ceremony::partition_valid_hosts(&granted)
+                .1
+                .is_empty(),
+            "the repaired grant must hold only entries the runtime accepts: {granted:?}"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a repaired canonical row that covers the declaration has nothing to report"
         );
     }
 

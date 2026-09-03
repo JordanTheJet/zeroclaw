@@ -813,7 +813,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [EgressStringCase<'_>; 14] = [
+        let cases: [EgressStringCase<'_>; 16] = [
             (
                 "cli-plugin-egress-seeded",
                 &[("name", "weather-tool"), ("count", "2")],
@@ -906,6 +906,23 @@ mod tests {
                 ],
                 &["weather-tool", key],
             ),
+            // A granted entry the runtime rejects. The canonical arm carries
+            // the repair command inline; the legacy arm must not, because the
+            // command only resolves after the rename (asserted below).
+            (
+                "cli-plugin-egress-invalid-grant",
+                &[
+                    ("name", "weather-tool"),
+                    ("hosts", "*.com"),
+                    ("command", command.as_str()),
+                ],
+                &["weather-tool", "*.com", command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-invalid-grant-legacy",
+                &[("name", "weather-tool"), ("hosts", "*.com")],
+                &["weather-tool", "*.com"],
+            ),
         ];
 
         for (source, locale) in [
@@ -966,6 +983,21 @@ mod tests {
                 !inert.contains("zeroclaw config set"),
                 "cli-plugin-egress-legacy-inert in {locale} must not offer a grant \
                  command; got: {inert:?}"
+            );
+
+            let invalid_legacy = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-invalid-grant-legacy",
+                &[("name", "weather-tool"), ("hosts", "*.com")],
+            )
+            .unwrap_or_else(|| {
+                panic!("cli-plugin-egress-invalid-grant-legacy should format in {locale}")
+            });
+            assert!(
+                !invalid_legacy.contains("zeroclaw config set"),
+                "cli-plugin-egress-invalid-grant-legacy in {locale} must leave the \
+                 repair command to the ordered steps; got: {invalid_legacy:?}"
             );
         }
     }

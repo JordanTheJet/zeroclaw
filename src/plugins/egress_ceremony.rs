@@ -211,6 +211,39 @@ pub fn should_report_diff(diff: &EgressDeclarationDiff) -> bool {
     !diff.declared.is_empty() && !diff.is_empty()
 }
 
+/// Split a grant list into the entries the runtime will accept and the ones it
+/// will reject, keeping the rejected ones verbatim so they can be named.
+///
+/// [`canonical_hosts`] deliberately preserves grammar-invalid entries so a
+/// diff never hides what is on disk. But an invalid entry must not take part
+/// in coverage: `egress_pattern_contains` trusts its inputs, so a rejected
+/// `*.com` would "cover" `api.com`. And it must not be carried into a printed
+/// `config set`, because the runtime's `EgressPolicy::new` rejects the
+/// **whole** allowlist on one bad entry and the instance is then denied
+/// everything. `Config::load_or_init` warns and continues on validation
+/// failure, so this state is reachable in production, not only in a
+/// hand-edited file that never loaded.
+#[must_use]
+pub fn partition_valid_hosts(raw: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match normalize_egress_pattern(trimmed) {
+            Ok(canonical) => valid.push(canonical),
+            Err(_) => invalid.push(trimmed.to_string()),
+        }
+    }
+    valid.sort();
+    valid.dedup();
+    invalid.sort();
+    invalid.dedup();
+    (valid, invalid)
+}
+
 /// Where one instance's egress grant lives, and whether the runtime honors it.
 ///
 /// This is the distinction the gap diagnostic has to keep straight. The runtime
@@ -279,21 +312,28 @@ pub enum EgressGapPlan {
     /// Every declared destination is enforced: nothing to report.
     Nothing,
     /// Declared destinations the runtime denies, plus the one command that
-    /// grants them without revoking anything already granted.
+    /// grants them without revoking anything already granted. `invalid` names
+    /// granted entries the runtime rejects; they are excluded from `command`,
+    /// which therefore doubles as the repair, since one rejected entry makes
+    /// the runtime refuse the whole allowlist.
     Grant {
         missing: Vec<String>,
+        invalid: Vec<String>,
         command: String,
     },
     /// The grant is stranded on a legacy row, so the rename is always required:
     /// the runtime enforces nothing until it happens. `missing` is what the
     /// declaration still lacks *after* the rename brings the authored grant
-    /// into effect, and `grant` is the command that closes that remainder —
-    /// `None` when the authored grant already covers the declaration, because
-    /// then the rename alone restores reach and an extra `config set` would
-    /// only risk replacing a list the operator already has right.
+    /// into effect, `invalid` names authored entries the runtime would reject
+    /// once it does, and `grant` is the command that closes both. It is `None`
+    /// only when the authored grant already covers the declaration and every
+    /// entry is one the runtime accepts, because then the rename alone
+    /// restores reach and an extra `config set` would only risk replacing a
+    /// list the operator already has right.
     Migrate {
         legacy_row: String,
         missing: Vec<String>,
+        invalid: Vec<String>,
         grant: Option<String>,
     },
 }
@@ -311,13 +351,18 @@ pub fn plan_egress_gap(
 ) -> EgressGapPlan {
     match state {
         EgressGrantState::Enforced { granted } => {
-            let diff = diff_declaration(declared, granted);
-            if diff.declared_not_granted.is_empty() {
+            // Only entries the runtime accepts take part in coverage, and only
+            // they are carried into the command; a rejected entry is named
+            // and forces a repair even when the declaration is covered.
+            let (valid, invalid) = partition_valid_hosts(granted);
+            let diff = diff_declaration(declared, &valid);
+            if diff.declared_not_granted.is_empty() && invalid.is_empty() {
                 return EgressGapPlan::Nothing;
             }
             EgressGapPlan::Grant {
                 command: egress_set_command(instance_key, &diff.union()),
                 missing: diff.declared_not_granted,
+                invalid,
             }
         }
         EgressGrantState::Stranded {
@@ -327,13 +372,18 @@ pub fn plan_egress_gap(
             // Compare against what the rename WILL enforce, not against the
             // (empty) grant the runtime enforces today: the rename is planned
             // unconditionally, so the only open question is whether a grant
-            // step has to follow it.
-            let diff = diff_declaration(declared, authored);
-            let grant = (!diff.declared_not_granted.is_empty())
+            // step has to follow it. It must when a declared destination is
+            // still uncovered, and it must when the authored list holds an
+            // entry the runtime rejects, because the rename alone would then
+            // bring an allowlist into effect that the runtime refuses whole.
+            let (valid, invalid) = partition_valid_hosts(authored);
+            let diff = diff_declaration(declared, &valid);
+            let grant = (!diff.declared_not_granted.is_empty() || !invalid.is_empty())
                 .then(|| egress_set_command(instance_key, &diff.union()));
             EgressGapPlan::Migrate {
                 legacy_row: legacy_row.clone(),
                 missing: diff.declared_not_granted,
+                invalid,
                 grant,
             }
         }
@@ -590,6 +640,7 @@ mod tests {
             EgressGapPlan::Migrate {
                 legacy_row: "weather-tool".to_string(),
                 missing: Vec::new(),
+                invalid: Vec::new(),
                 grant: None,
             }
         );
@@ -623,6 +674,7 @@ mod tests {
         let EgressGapPlan::Migrate {
             legacy_row,
             missing,
+            invalid,
             grant: Some(command),
         } = plan
         else {
@@ -630,6 +682,7 @@ mod tests {
         };
         assert_eq!(legacy_row, "weather-tool");
         assert_eq!(missing, v(&["api2.example.com"]));
+        assert!(invalid.is_empty());
         assert_eq!(
             command,
             egress_set_command(
@@ -664,6 +717,7 @@ mod tests {
             ),
             EgressGapPlan::Grant {
                 missing: v(&["api2.example.com"]),
+                invalid: Vec::new(),
                 command: egress_set_command(key, &v(&["api.example.com", "api2.example.com"])),
             }
         );
@@ -678,5 +732,70 @@ mod tests {
             ),
             EgressGapPlan::Grant { .. }
         ));
+    }
+
+    #[test]
+    fn partition_keeps_rejected_entries_out_of_the_valid_list_but_names_them() {
+        let (valid, invalid) = partition_valid_hosts(&v(&[
+            "api.example.com",
+            "*.com",
+            " api.example.com ",
+            "",
+            "*.example.com",
+        ]));
+        assert_eq!(valid, v(&["*.example.com", "api.example.com"]));
+        // `*.com` wildcards a single label, which the grammar rejects; it is
+        // named verbatim rather than dropped, so the operator can find it.
+        assert_eq!(invalid, v(&["*.com"]));
+    }
+
+    #[test]
+    fn a_rejected_authored_entry_never_covers_and_is_kept_out_of_the_command() {
+        // The containment relation trusts its inputs, so a rejected `*.com`
+        // would "cover" `api.com` and a naive planner would print the rename
+        // alone. After that rename the runtime would build the policy from
+        // the row, reject `*.com`, and deny every request. The plan must name
+        // the entry, keep the rename, and print a grant that omits it.
+        let key = "zpi1_k";
+        let state = EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(&["*.com"]),
+        };
+        let plan = plan_egress_gap(key, &v(&["api.com"]), &state);
+        let EgressGapPlan::Migrate {
+            missing,
+            invalid,
+            grant: Some(command),
+            ..
+        } = plan
+        else {
+            panic!("a rejected entry must force the grant step: {plan:?}");
+        };
+        assert_eq!(missing, v(&["api.com"]), "`*.com` covers nothing");
+        assert_eq!(invalid, v(&["*.com"]));
+        assert_eq!(command, egress_set_command(key, &v(&["api.com"])));
+        assert!(
+            !command.contains("*.com"),
+            "the repair must not carry the rejected entry forward: {command}"
+        );
+    }
+
+    #[test]
+    fn a_canonical_row_with_a_rejected_entry_is_reported_as_a_repair_even_when_covered() {
+        // Enforced path: the declaration is covered by a valid entry, but the
+        // row also holds `*.com`, so the runtime refuses the whole allowlist.
+        // Silence here would report a fully denied instance as healthy.
+        let key = "zpi1_k";
+        let state = EgressGrantState::Enforced {
+            granted: v(&["api.com", "*.com"]),
+        };
+        assert_eq!(
+            plan_egress_gap(key, &v(&["api.com"]), &state),
+            EgressGapPlan::Grant {
+                missing: Vec::new(),
+                invalid: v(&["*.com"]),
+                command: egress_set_command(key, &v(&["api.com"])),
+            }
+        );
     }
 }
