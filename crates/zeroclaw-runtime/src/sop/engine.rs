@@ -1773,6 +1773,21 @@ impl SopEngine {
         }
     }
 
+    /// Drop any active producer key pointing at this run.
+    ///
+    /// The active-key lookup coalesces a later producer onto whatever run the
+    /// key names for as long as that run stays in `active_runs`. A caller that
+    /// starts a run it will not drive therefore has to withdraw the key, or the
+    /// next producer is handed a run nothing is advancing instead of doing the
+    /// work itself — the key would suppress real work rather than duplicate it.
+    ///
+    /// Only the key is withdrawn. The run is untouched, because a caller that
+    /// cannot drive it is also not the right place to decide its fate.
+    pub fn forget_active_dispatch_dedup_for_run(&mut self, run_id: &str) {
+        self.active_dispatch_dedup
+            .retain(|(_, existing)| existing != run_id);
+    }
+
     /// Start a new SOP run. Returns the first action to take.
     /// Deterministic SOPs are automatically routed to `start_deterministic_run`.
     /// Enforce the SOP's admission policy at a start entrypoint. `Admit` proceeds;
