@@ -3096,16 +3096,27 @@ fn egress_grant_gap_lines(
 
     let mut lines = Vec::new();
     for (_, instance_key) in manifest_config_entries(manifest)? {
-        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        // Resolve the row the operator's current grant actually lives on. The
+        // canonical `zpi1_` row is what `entry_egress` and the grant command
+        // address, but on a pre-typed-config install that row is absent and the
+        // grant is stranded on a package-name row. There the legacy row's
+        // `egress_hosts` IS the operator's current grant, so the diff, the gap
+        // check, and the migrate-then-grant command must all read it: `config
+        // set` REPLACES the list, and a command built from the (empty) canonical
+        // grant would silently drop an operator-authored host the manifest does
+        // not also declare. The canonical path (no stranded row) is unchanged —
+        // `grant_source` is the instance key there, so `granted` is read exactly
+        // as before.
+        let legacy_row = stranded_legacy_grant_row(&instance_key, &legacy_candidates, &row_names);
+        let grant_source = legacy_row.as_deref().unwrap_or(instance_key.as_str());
+        let (granted, _private) = config.plugins.entry_egress(grant_source);
         let diff = diff_declaration(&declared, &granted);
         if diff.declared_not_granted.is_empty() {
             continue;
         }
         let hosts = diff.declared_not_granted.join(", ");
         let command = egress_set_command(&instance_key, &diff.union());
-        let Some(legacy_row) =
-            stranded_legacy_grant_row(&instance_key, &legacy_candidates, &row_names)
-        else {
+        let Some(legacy_row) = legacy_row else {
             lines.push(format!(
                 "  {}",
                 ta(
@@ -13358,6 +13369,85 @@ mod tests {
             config.plugins.entries[0].egress_hosts,
             vec!["api.example.com".to_string()],
             "the diagnostic must not rewrite the operator's grant"
+        );
+    }
+
+    /// REGRESSION (operator-grant loss): the legacy row carries a grant the
+    /// operator authored themselves — a self-hosted `gitea.example.net` the
+    /// manifest never declares — alongside a declared `api.example.com`. The
+    /// manifest also declares a new `api2.example.com` the row does not grant.
+    ///
+    /// The migrate-then-grant command must be built from the LEGACY row's grant
+    /// unioned with the declaration, not from the empty canonical row. `config
+    /// set` REPLACES the list, so following the printed instructions verbatim
+    /// (rename the row, then run the grant command) must not silently delete the
+    /// operator-only `gitea.example.net`. This end-to-end applies the printed
+    /// command's value through the real config setter and proves all three hosts
+    /// survive. The sibling legacy test above cannot catch this: its sole grant
+    /// is also declared, so the empty-vs-legacy union is identical there.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_legacy_migration_command_preserves_an_operator_only_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+
+        // A pre-typed-config row: package-name keyed, granting one declared host
+        // AND one operator-authored host the manifest does not declare.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("zeroclaw config set"))
+            .expect("the migrate ceremony must still print a grant command");
+        // The command double-quotes its value; take what is between the quotes.
+        let command_value = grant_line
+            .split('"')
+            .nth(1)
+            .expect("the grant command must quote its value");
+        assert!(
+            command_value.contains("gitea.example.net"),
+            "the printed command must carry the operator-only grant forward: {grant_line}"
+        );
+
+        // Follow the printed instructions verbatim: (1) rename the legacy row to
+        // the canonical instance key, then (2) apply the grant command's value
+        // through the real config setter — the same path `zeroclaw config set`
+        // takes. `config set` REPLACES the list, so the row's grant after this is
+        // exactly the command's value.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the grant command must succeed after the rename");
+
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert!(
+            granted.contains(&"gitea.example.net".to_string()),
+            "the operator-only grant must survive the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api2.example.com".to_string()),
+            "the newly declared host must be granted by the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api.example.com".to_string()),
+            "the already-granted declared host must survive too: {granted:?}"
         );
     }
 
