@@ -593,6 +593,13 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
+    # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
+    # without running it. Zero failures across 22 red runs and no bench-fix
+    # commit in 6 months, and its narrow form was introduced by #8896 as a
+    # measurement slice for #7108 rather than as coverage. Master, merge-queue
+    # and manual runs still execute it, so benches cannot rot undetected before
+    # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
