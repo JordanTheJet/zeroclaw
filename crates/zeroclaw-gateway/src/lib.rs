@@ -1622,12 +1622,6 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
-        .route(
-            "/api/upload",
-            post(api_upload::handle_upload).layer(axum::extract::DefaultBodyLimit::max(
-                api_upload::UPLOAD_BODY_CEILING_BYTES,
-            )),
-        )
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
@@ -1956,6 +1950,29 @@ pub async fn run_gateway(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
+
+    // The dashboard image upload lives on its own sub-router so it can opt out
+    // of the 64 KB gateway-wide RequestBodyLimitLayer, which is sized for JSON
+    // control-plane bodies and would otherwise reject any real image before the
+    // route's own ceiling runs. The route keeps the extractor-level
+    // DefaultBodyLimit at the same ceiling; the per-request size check against
+    // live `multimodal.max_image_size_mb` happens inside the handler.
+    let upload_router: Router = Router::new()
+        .route(
+            "/api/upload",
+            post(api_upload::handle_upload).layer(axum::extract::DefaultBodyLimit::max(
+                api_upload::UPLOAD_BODY_CEILING_BYTES,
+            )),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api_upload::UPLOAD_BODY_CEILING_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+    let inner = inner.merge(upload_router);
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
