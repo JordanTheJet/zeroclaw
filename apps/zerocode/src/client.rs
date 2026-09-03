@@ -4214,21 +4214,59 @@ pub struct MemoryGetResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionMessagesResult {
     pub messages: Vec<MessageEntry>,
-    /// Total persisted messages for the session. With `start`, lets
+    /// Total projected entries for the session. With `start`, lets
     /// the Sessions pane size scrollback affordances without keeping
     /// the full history in memory.
     #[serde(default)]
     pub total: usize,
-    /// Index of `messages[0]` in the full persisted history.
+    /// Index of `messages[0]` in the full projected history.
     #[serde(default)]
     pub start: usize,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub kind: MessageEntryKind,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod message_entry_kind_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_message_entry_kind_remains_readable() {
+        let entry: MessageEntry = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "future entry",
+            "kind": "future_kind"
+        }))
+        .expect("unknown additive kind should remain readable");
+
+        assert_eq!(entry.kind, MessageEntryKind::Unknown);
+    }
 }
 
 impl MessageEntry {

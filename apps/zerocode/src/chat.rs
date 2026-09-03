@@ -487,19 +487,16 @@ impl Chat {
         // the daemon-retained session, its persisted history, and its cwd.
         let resume = self.resume_session_id.take();
         // A resume must not re-point the session at the TUI's launch directory:
-        // pass no cwd so the daemon keeps the retained session's own cwd. Only
-        // a fresh session derives a cwd from the transport / caller.
+        // pass no cwd so the daemon keeps the retained session's own cwd.
+        //
+        // A fresh session also passes no cwd unless the user explicitly picked
+        // one (the remote ACP CWD picker). That lets the daemon resolve the
+        // selected agent's configured workspace instead of forcing the TUI's
+        // launch directory — for Local and WSS alike. An explicit
+        // caller-supplied cwd still wins over that default.
         let cwd_str: Option<String> = if resume.is_some() {
             None
-        } else if self.rpc.transport() == crate::client::Transport::Local {
-            // Over Unix socket, pass local CWD so the agent works in the
-            // directory the TUI was launched from.
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
         } else {
-            // Over WSS the server uses the agent's workspace dir unless the
-            // user supplies one.
             cwd_override
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
@@ -530,10 +527,20 @@ impl Chat {
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
                 // empty history. Fresh sessions have nothing to load.
-                if let Some(sid) = resumed_sid
-                    && let Ok(msgs) = self.rpc.session_messages(&sid).await
-                {
-                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
+                if let Some(sid) = resumed_sid {
+                    match self.rpc.session_messages(&sid).await {
+                        Ok(msgs) => {
+                            state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp)
+                        }
+                        Err(e) => {
+                            let _ = self.rpc.session_close(&sid).await;
+                            self.phase = ChatPhase::Error(crate::i18n::t_args(
+                                "zc-chat-session-switch-error",
+                                &[("error", &e.to_string())],
+                            ));
+                            return;
+                        }
+                    }
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -603,16 +610,14 @@ impl Chat {
             });
         }
 
-        let local_cwd = if rpc.transport() == crate::client::Transport::Local {
-            std::env::current_dir().ok()
-        } else {
-            None
-        };
-        let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
+        // A restart mints a fresh session: pass no cwd so the daemon resolves
+        // the selected agent's configured workspace rather than the TUI's
+        // launch directory. The remote ACP path above re-prompts via the CWD
+        // picker, so only that explicit choice overrides the agent workspace.
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str, None).await
+            rpc.session_new_acp(&alias, None, None).await
         } else {
-            rpc.session_new(&alias, cwd_str).await
+            rpc.session_new(&alias, None).await
         };
         match new_session {
             Ok(s) => {
@@ -2052,6 +2057,20 @@ impl Chat {
             }
         };
 
+        let history = match rpc.session_messages(&new_sid).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                let _ = rpc.session_close(&new_sid).await;
+                state.session_overlay = SessionOverlay::None;
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-chat-session-switch-error",
+                    &[("error", &e.to_string())],
+                )));
+                state.mark_dirty_full();
+                return;
+            }
+        };
+
         let _ = rpc.session_close(&state.session_id).await;
         state.session_overlay = SessionOverlay::None;
         let current = state.todo_tracker.settings();
@@ -2064,9 +2083,7 @@ impl Chat {
         state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
-        if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
-        }
+        state.load_history(history.messages, pane_kind == PaneKind::Acp);
     }
 
     /// Apply a session override (model and/or model_provider) to the active
@@ -3700,6 +3717,21 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn bounded_tool_output(raw_output: String) -> String {
+    const MAX_OUTPUT: usize = 16 * 1024;
+    const TRUNCATION_MARKER: &str = "…[truncated]";
+    if raw_output.len() > MAX_OUTPUT {
+        let content_limit = MAX_OUTPUT.saturating_sub(TRUNCATION_MARKER.len());
+        format!(
+            "{}{}",
+            truncate_utf8(&raw_output, content_limit),
+            TRUNCATION_MARKER
+        )
+    } else {
+        raw_output
+    }
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -5306,6 +5338,9 @@ enum LinesDirty {
     Full,
 }
 
+const MAX_RENDERED_ENTRIES: usize = 1_000;
+const RENDER_WINDOW_SHIFT_ENTRIES: usize = MAX_RENDERED_ENTRIES / 2;
+
 /// Scrollbar drag captured on mouse-down on the track.
 #[derive(Debug, Clone, Copy)]
 struct ScrollbarDrag {
@@ -6170,14 +6205,24 @@ impl ChatState {
             self.dirty = LinesDirty::Full;
             self.cached_render_width = width;
         }
-        const MAX_RENDERED_ENTRIES: usize = 1_000;
         let total = self.entries.len();
         let natural_start = total.saturating_sub(MAX_RENDERED_ENTRIES);
-        let start = if let Some((lo, _hi)) = self.browse_range() {
-            natural_start.min(lo)
-        } else {
+        let mut start = if self.pinned_to_bottom || self.cached_render_width == 0 {
             natural_start
+        } else {
+            self.cached_render_start.min(natural_start)
         };
+        if let Some(cursor) = self.browse_cursor {
+            if cursor < start {
+                start = cursor;
+            } else if cursor >= start.saturating_add(MAX_RENDERED_ENTRIES) {
+                start = cursor
+                    .saturating_add(1)
+                    .saturating_sub(MAX_RENDERED_ENTRIES);
+            }
+        }
+        start = start.min(natural_start);
+        let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
 
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
@@ -6185,7 +6230,7 @@ impl ChatState {
             let show_thoughts = self.show_thoughts;
             let mut new_lines = Vec::new();
             let mut new_ranges = Vec::new();
-            for (rel_idx, entry) in self.entries[render_from..].iter().enumerate() {
+            for (rel_idx, entry) in self.entries[render_from..end].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
                 render_entry_into(
@@ -6209,7 +6254,7 @@ impl ChatState {
                 .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
-            self.cached_entry_count = total - start;
+            self.cached_entry_count = end - start;
             self.dirty = LinesDirty::Clean;
             self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
             self.rebuild_screen_ranges(width);
@@ -6220,7 +6265,7 @@ impl ChatState {
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
         let show_thoughts = self.show_thoughts;
-        for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
+        for (rel_idx, entry) in self.entries[start..end].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
             render_entry_into(
@@ -6238,7 +6283,7 @@ impl ChatState {
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
-        self.cached_entry_count = total - start;
+        self.cached_entry_count = end - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
         self.cached_total_rows = self.compute_cached_rows(width);
@@ -6446,17 +6491,66 @@ impl ChatState {
         .line_count(width) as u16
     }
 
+    fn render_window_end(&self) -> usize {
+        self.cached_render_start
+            .saturating_add(self.cached_entry_count)
+            .min(self.entries.len())
+    }
+
+    fn shift_render_window(&mut self, new_start: usize) {
+        if self.cached_render_width == 0 || new_start == self.cached_render_start {
+            return;
+        }
+
+        let anchor = self
+            .cached_screen_ranges
+            .iter()
+            .find(|(_, _lo, hi, _)| *hi > self.scroll_offset)
+            .map(|(idx, lo, _hi, _)| (*idx, self.scroll_offset.saturating_sub(*lo)));
+
+        self.cached_render_start = new_start;
+        self.dirty = LinesDirty::Full;
+        self.rebuild_lines(self.cached_render_width);
+        self.last_total_rows = self.cached_total_rows;
+
+        if let Some((anchor_idx, intra_entry_row)) = anchor
+            && let Some((_, lo, _hi, _)) = self
+                .cached_screen_ranges
+                .iter()
+                .find(|(idx, _, _, _)| *idx == anchor_idx)
+        {
+            self.scroll_offset = lo.saturating_add(intra_entry_row);
+        }
+    }
+
     pub fn scroll_up(&mut self, lines: u16) {
         self.clear_transcript_selection();
         self.pinned_to_bottom = false;
+        if lines > self.scroll_offset && self.cached_render_start > 0 {
+            let new_start = self
+                .cached_render_start
+                .saturating_sub(RENDER_WINDOW_SHIFT_ENTRIES);
+            self.shift_render_window(new_start);
+        }
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
         self.clear_transcript_selection();
-        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        let mut max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        if self.scroll_offset.saturating_add(lines) > max
+            && self.render_window_end() < self.entries.len()
+        {
+            let natural_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+            let new_start = self
+                .cached_render_start
+                .saturating_add(RENDER_WINDOW_SHIFT_ENTRIES)
+                .min(natural_start);
+            self.shift_render_window(new_start);
+            max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        }
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
-        if self.scroll_offset >= max {
+        if self.scroll_offset >= max && self.render_window_end() == self.entries.len() {
             self.pinned_to_bottom = true;
         }
     }
@@ -6472,11 +6566,15 @@ impl ChatState {
     pub fn scroll_to_top(&mut self) {
         self.clear_transcript_selection();
         self.pinned_to_bottom = false;
+        self.cached_render_start = 0;
+        self.mark_dirty_full();
         self.scroll_offset = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.clear_transcript_selection();
+        self.cached_render_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+        self.mark_dirty_full();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
@@ -6686,14 +6784,8 @@ impl ChatState {
                 ..
             } => {
                 // Cap stored output so large tool responses (bash, file reads) don't
-                // accumulate unboundedly.  The renderer already truncates to 200 chars
-                // for display; 16 KB gives clipboard users a generous but bounded copy.
-                const MAX_RAW_OUTPUT: usize = 16 * 1024;
-                let raw_output = if raw_output.len() > MAX_RAW_OUTPUT {
-                    format!("{}…[truncated]", truncate_utf8(&raw_output, MAX_RAW_OUTPUT))
-                } else {
-                    raw_output
-                };
+                // accumulate unboundedly. The same bound is applied to restored cards.
+                let raw_output = bounded_tool_output(raw_output);
                 for entry in self.entries.iter_mut().rev() {
                     if let ChatEntry::Tool {
                         tool_call_id: id,
@@ -7305,6 +7397,54 @@ impl ChatState {
         strip_runtime_enrichment: bool,
     ) {
         for m in messages {
+            match m.kind {
+                crate::client::MessageEntryKind::ToolCall => {
+                    let input_json = m
+                        .tool_input
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok())
+                        .unwrap_or_else(|| "null".to_string());
+                    self.entries.push(ChatEntry::Tool {
+                        tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
+                        name: Arc::<str>::from(
+                            m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                        ),
+                        input_json: Arc::<str>::from(input_json),
+                        result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
+                    });
+                    continue;
+                }
+                crate::client::MessageEntryKind::ToolResult => {
+                    let tool_call_id = m.tool_call_id.unwrap_or_default();
+                    let output = bounded_tool_output(m.tool_output.unwrap_or(m.content));
+                    if let Some(ChatEntry::Tool { result, .. }) =
+                        self.entries.iter_mut().rev().find(|entry| {
+                            matches!(
+                                entry,
+                                ChatEntry::Tool {
+                                    tool_call_id: id,
+                                    result: None,
+                                    ..
+                                } if id.as_ref() == tool_call_id
+                            )
+                        })
+                    {
+                        *result = Some(Arc::<str>::from(output));
+                    } else {
+                        self.entries.push(ChatEntry::Tool {
+                            tool_call_id: Arc::<str>::from(tool_call_id),
+                            name: Arc::<str>::from(
+                                m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                            input_json: Arc::<str>::from("null"),
+                            result: Some(Arc::<str>::from(output)),
+                        });
+                    }
+                    continue;
+                }
+                crate::client::MessageEntryKind::Message
+                | crate::client::MessageEntryKind::Unknown => {}
+            }
             match m.role() {
                 crate::client::MessageRole::User => {
                     let display = if strip_runtime_enrichment {
@@ -8813,6 +8953,79 @@ mod tests {
     }
 
     #[test]
+    fn long_transcript_navigation_reaches_oldest_entry_with_a_bounded_render_window() {
+        let mut s = state();
+        s.entries.clear();
+        for i in 0..2_200 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+
+        assert_eq!(s.cached_render_start, 1_200);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+
+        s.last_total_rows = s.cached_total_rows;
+        s.last_inner_height = 20;
+        s.scroll_offset = 0;
+        s.pinned_to_bottom = false;
+        let previous_top = s.cached_render_start;
+
+        s.page_up();
+
+        assert_eq!(s.cached_render_start, 700);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        let previous_top_row = s
+            .cached_screen_ranges
+            .iter()
+            .find(|(idx, _, _, _)| *idx == previous_top)
+            .map(|(_, lo, _, _)| *lo)
+            .expect("the previous top entry remains in the shifted window");
+        assert_eq!(
+            previous_top_row.saturating_sub(s.scroll_offset),
+            s.last_inner_height,
+            "Page Up preserves the prior top anchor before moving it down one viewport"
+        );
+
+        s.scroll_to_top();
+        s.rebuild_lines(80);
+
+        assert_eq!(s.cached_render_start, 0);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(
+            s.cached_screen_ranges.first().map(|(idx, _, _, _)| *idx),
+            Some(0),
+            "jump-to-start exposes the oldest transcript entry"
+        );
+
+        let mut browse = state();
+        browse.entries = s.entries.clone();
+        browse.mark_dirty_full();
+        browse.rebuild_lines(80);
+        browse.last_total_rows = browse.cached_total_rows;
+        browse.last_inner_height = 20;
+        browse.enter_browse_mode();
+        browse.rebuild_lines(80);
+
+        browse.browse_move_up(1_200, true);
+        browse.rebuild_lines(80);
+
+        let cursor = browse.browse_cursor.expect("browse cursor");
+        assert_eq!(cursor, 999);
+        assert_eq!(browse.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert!(
+            browse
+                .cached_screen_ranges
+                .iter()
+                .any(|(idx, _, _, _)| *idx == cursor),
+            "an extended selection wider than the cache keeps its active cursor rendered"
+        );
+    }
+
+    #[test]
     fn title_shows_agent_uid_provider_model() {
         let mut s = ChatState::new(
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
@@ -9791,6 +10004,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        // `with_rpc` defaults to Local transport — the path that used to leak
+        // the TUI's launch directory into `session/new`.
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "fresh chat should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        // Regression guard: a fresh local session must not send the TUI's
+        // launch directory as cwd. Omitting it lets the daemon resolve the
+        // selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+
+        init.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should list recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        let request = next_rpc_request(&mut rx, "fresh ACP should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        assert!(params["cwd"].is_null());
+
+        init.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        // Regression guard: restart must not re-point the session at the TUI's
+        // launch directory either.
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+    }
+
+    #[tokio::test]
     async fn agent_picker_click_selects_row() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (tx, _rx) = mpsc::channel::<String>(16);
@@ -9886,15 +10222,6 @@ mod tests {
             }),
         );
 
-        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
-        assert_eq!(request["method"], method::SESSION_CLOSE);
-        assert_eq!(request["params"]["session_id"], "sess-old");
-        respond_ok(&rpc, &request, serde_json::json!({}));
-
-        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "double-click should load history").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
         assert_eq!(request["params"]["session_id"], "sess-new");
@@ -9909,6 +10236,15 @@ mod tests {
                 "start": 0
             }),
         );
+
+        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let chat = tokio::time::timeout(Duration::from_secs(2), switch)
             .await
@@ -9995,6 +10331,96 @@ mod tests {
             .expect("failed switch should surface an info-bar error");
         assert!(info.text.contains("Failed to switch session"));
         assert!(info.text.contains("Session not found"));
+    }
+
+    #[tokio::test]
+    async fn session_picker_history_error_keeps_old_session() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        state.session_overlay = SessionOverlay::List {
+            sessions: vec![crate::client::SessionEntry {
+                session_id: "sess-broken".to_string(),
+                session_key: "sess-broken".to_string(),
+                created_at: "2026-07-07T00:00:00Z".to_string(),
+                last_activity: "2026-07-07T00:01:00Z".to_string(),
+                message_count: 1,
+                agent_alias: Some("beta".to_string()),
+                channel_id: None,
+                name: Some("Broken work".to_string()),
+            }],
+            list_state,
+        };
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: overlay_area.x + 2,
+            row: overlay_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "switch should resume selected session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-broken",
+                "workspace_dir": "/tmp/broken"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "switch should load history before replacing state").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "malformed ACP history",
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "failed restore should close resumed session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-broken");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("failed history restore should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("failed history restore should keep the old session active");
+        };
+        assert_eq!(state.session_id, "sess-old");
+        assert_eq!(state.agent_alias, "alpha");
+        assert!(matches!(state.session_overlay, SessionOverlay::None));
+        let info = state
+            .info_message
+            .as_ref()
+            .expect("failed history restore should surface an error");
+        assert!(info.text.contains("Failed to switch session"));
+        assert!(info.text.contains("malformed ACP history"));
     }
 
     #[tokio::test]
@@ -12843,18 +13269,22 @@ mod tests {
                 MessageEntry {
                     role: "user".to_string(),
                     content: "first ask".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "assistant".to_string(),
                     content: "reply".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "system".to_string(),
                     content: "ignored".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "user".to_string(),
                     content: "second ask".to_string(),
+                    ..Default::default()
                 },
             ],
             false,
@@ -12878,6 +13308,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12905,6 +13336,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12915,6 +13347,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12931,11 +13364,82 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: literal.to_string(),
+                ..Default::default()
             }],
             false,
         );
 
         assert_eq!(s.first_message.as_deref(), Some(literal));
+    }
+
+    #[test]
+    fn load_history_matches_tool_result_to_call_id() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "Tool call: shell\n{}".to_string(),
+                    kind: MessageEntryKind::ToolCall,
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    tool_input: Some(serde_json::json!({"command": "pwd"})),
+                    tool_output: None,
+                },
+                MessageEntry {
+                    role: "tool".to_string(),
+                    content: "Tool result: shell\n/tmp".to_string(),
+                    kind: MessageEntryKind::ToolResult,
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    tool_input: None,
+                    tool_output: Some("/tmp".to_string()),
+                },
+            ],
+            false,
+        );
+
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::Tool {
+                tool_call_id,
+                name,
+                result: Some(result),
+                ..
+            }] if tool_call_id.as_ref() == "call-1"
+                && name.as_ref() == "shell"
+                && result.as_ref() == "/tmp"
+        ));
+    }
+
+    #[test]
+    fn load_history_bounds_restored_tool_output_like_live_updates() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(
+            vec![MessageEntry {
+                role: "assistant".to_string(),
+                content: "tool call".to_string(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("shell".to_string()),
+                tool_input: Some(serde_json::json!({})),
+                tool_output: Some("λ".repeat(9_000)),
+            }],
+            false,
+        );
+
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::Tool {
+                result: Some(result),
+                ..
+            }] if result.ends_with("…[truncated]")
+                && result.len() <= 16 * 1024
+        ));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
