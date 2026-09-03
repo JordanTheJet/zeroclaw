@@ -1106,6 +1106,33 @@ jobs:
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
 
+  # ── TEMPORARY EXPERIMENT — remove once it has reported ────────────────────
+  # Question it answers: will Blacksmith serve a fork-origin pull_request run,
+  # and does `vars` really resolve empty there? Every compile-heavy job selects
+  # its runner from `vars.CI_USE_BLACKSMITH`, which is unreadable in fork PRs,
+  # so all of them fall back to ubuntu-latest and lose their warm cache. This
+  # job hardcodes the Blacksmith label to test the premise directly.
+  #
+  # Deliberately absent from `gate.needs`: if Blacksmith declines fork PRs this
+  # never gets a runner and fails at its own timeout, in isolation, blocking
+  # nothing. Delete this whole job once the answer is recorded.
+  blacksmith-fork-canary:
+    name: Blacksmith Fork Canary (temporary)
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Report runner identity and toggle visibility
+        run: |
+          echo "runner_name      = ${RUNNER_NAME:-<unset>}"
+          echo "runner_os/arch   = ${RUNNER_OS}/${RUNNER_ARCH}"
+          echo "event_name       = ${{ github.event_name }}"
+          echo "is_fork_pr       = ${{ github.event.pull_request.head.repo.fork }}"
+          echo "head_repo        = ${{ github.event.pull_request.head.repo.full_name }}"
+          # The central claim under test: this is expected to print empty on a
+          # fork PR and 'true' on a same-repo run.
+          echo "CI_USE_BLACKSMITH= '${{ vars.CI_USE_BLACKSMITH }}'"
+          nproc --all | sed 's/^/vcpu             = /'
+
   gate:
     name: CI Required Gate
     if: always()
