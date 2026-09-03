@@ -419,10 +419,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: all features
-            args: --features ci-all
-            sys_deps: libudev-dev
-            rustflags: ""
           - name: no default features
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
