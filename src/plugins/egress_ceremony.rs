@@ -214,27 +214,25 @@ pub fn should_report_diff(diff: &EgressDeclarationDiff) -> bool {
 /// Split a grant list into the entries the runtime will accept and the ones it
 /// will reject, keeping the rejected ones verbatim so they can be named.
 ///
-/// [`canonical_hosts`] deliberately preserves grammar-invalid entries so a
-/// diff never hides what is on disk. But an invalid entry must not take part
-/// in coverage: `egress_pattern_contains` trusts its inputs, so a rejected
-/// `*.com` would "cover" `api.com`. And it must not be carried into a printed
-/// `config set`, because the runtime's `EgressPolicy::new` rejects the
-/// **whole** allowlist on one bad entry and the instance is then denied
-/// everything. `Config::load_or_init` warns and continues on validation
-/// failure, so this state is reachable in production, not only in a
-/// hand-edited file that never loaded.
+/// Every entry is judged by `normalize_egress_pattern` exactly as the runtime
+/// judges it — on the raw bytes, with no trimming and no skipping — so an
+/// entry with boundary whitespace or an empty entry is rejected here because
+/// it is rejected there. [`canonical_hosts`] deliberately preserves invalid
+/// entries so a diff never hides what is on disk; this split exists because an
+/// invalid entry must not take part in coverage (`egress_pattern_contains`
+/// trusts its inputs, so a rejected `*.com` would "cover" `api.com`) and must
+/// not be carried into a printed `config set`.
+///
+/// This decides which *entries* count; whether the runtime accepts the *row*
+/// is [`runtime_rejection`]'s call, and only that.
 #[must_use]
 pub fn partition_valid_hosts(raw: &[String]) -> (Vec<String>, Vec<String>) {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for entry in raw {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match normalize_egress_pattern(trimmed) {
+        match normalize_egress_pattern(entry) {
             Ok(canonical) => valid.push(canonical),
-            Err(_) => invalid.push(trimmed.to_string()),
+            Err(_) => invalid.push(entry.clone()),
         }
     }
     valid.sort();
@@ -242,6 +240,41 @@ pub fn partition_valid_hosts(raw: &[String]) -> (Vec<String>, Vec<String>) {
     invalid.sort();
     invalid.dedup();
     (valid, invalid)
+}
+
+/// What the runtime needs, besides the row itself, to decide whether it will
+/// accept a grant: the deployment's `security.nat64_prefixes` and the
+/// per-instance connection ceiling. Both live in the same config as the row;
+/// the diagnostic passes them through untouched so its verdict is the
+/// runtime's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRuntimeInputs {
+    pub nat64_prefixes: Vec<String>,
+    pub max_connections_per_instance: usize,
+}
+
+/// Ask the runtime whether it would refuse this row, and if so, why.
+///
+/// This is the one source of truth for acceptance. The diagnostic does not
+/// re-implement the grammar, the private-carve-out containment rule, or any
+/// other rule: it builds the policy exactly as the runtime's
+/// `plugin_egress_policy` does at request time and returns the constructor's
+/// own error text. Anything this accepts, the runtime enforces; anything it
+/// rejects, the runtime refuses whole, and the instance is denied everything.
+#[must_use]
+pub fn runtime_rejection(
+    hosts: &[String],
+    allow_private: &[String],
+    runtime: &EgressRuntimeInputs,
+) -> Option<String> {
+    zeroclaw_plugins::egress::EgressPolicy::new(
+        hosts,
+        allow_private,
+        &runtime.nat64_prefixes,
+        runtime.max_connections_per_instance,
+    )
+    .err()
+    .map(|error| error.to_string())
 }
 
 /// Where one instance's egress grant lives, and whether the runtime honors it.
@@ -267,123 +300,171 @@ pub fn partition_valid_hosts(raw: &[String]) -> (Vec<String>, Vec<String>) {
 /// them by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressGrantState {
-    /// The grant the runtime reads: the canonical row's allowlist, or empty
-    /// when no row exists. Enforcement and authorship agree here.
-    Enforced { granted: Vec<String> },
+    /// The grant the runtime reads: the canonical row's allowlist and private
+    /// carve-outs, or empty when no row exists. Enforcement and authorship
+    /// agree here.
+    Enforced {
+        granted: Vec<String>,
+        allow_private: Vec<String>,
+    },
     /// The canonical row is absent and the operator's grant sits on a legacy
     /// package-name row the runtime does not read. Nothing is enforced until
-    /// the row is renamed; `authored` is what the rename brings into effect
-    /// and what any grant command must carry forward.
+    /// the row is renamed; `authored` and `allow_private` are what the rename
+    /// brings into effect and what any grant command must carry forward.
     Stranded {
         legacy_row: String,
         authored: Vec<String>,
+        allow_private: Vec<String>,
     },
 }
 
 /// Resolve where an instance's grant lives from the rows present in config.
 ///
-/// `granted_on` reads a row's allowlist by name (the caller's
-/// `PluginsConfig::entry_egress`); passing it in keeps this module free of the
-/// config types and lets the decision be tested against a plain lookup.
+/// `granted_on` reads a row's `(egress_hosts, egress_allow_private)` by name
+/// (the caller's `PluginsConfig::entry_egress`); passing it in keeps this module
+/// free of the config types and lets the decision be tested against a plain
+/// lookup.
 #[must_use]
 pub fn resolve_grant_state(
     instance_key: &str,
     legacy_candidates: &[String],
     row_names: &[String],
-    granted_on: impl Fn(&str) -> Vec<String>,
+    granted_on: impl Fn(&str) -> (Vec<String>, Vec<String>),
 ) -> EgressGrantState {
     match stranded_legacy_grant_row(instance_key, legacy_candidates, row_names) {
         Some(legacy_row) => {
-            let authored = granted_on(&legacy_row);
+            let (authored, allow_private) = granted_on(&legacy_row);
             EgressGrantState::Stranded {
                 legacy_row,
                 authored,
+                allow_private,
             }
         }
-        None => EgressGrantState::Enforced {
-            granted: granted_on(instance_key),
-        },
+        None => {
+            let (granted, allow_private) = granted_on(instance_key);
+            EgressGrantState::Enforced {
+                granted,
+                allow_private,
+            }
+        }
     }
 }
 
 /// What `plugin list` has to tell the operator about one instance.
+///
+/// Three facts travel with a report, each from a different judge:
+/// - `missing`: declared destinations no accepted grant covers (containment,
+///   over the entries the runtime accepts);
+/// - `invalid`: the individual granted entries the grammar rejects, named so
+///   the operator can find them;
+/// - `rejected`: the runtime's own reason for refusing the row as it stands
+///   (for a stranded row: as the rename would bring it into effect). This is
+///   [`runtime_rejection`]'s verdict and covers everything the grammar and
+///   the private-carve-out rule reject, not only the entries in `invalid`.
+///
+/// `repair_incomplete` is the runtime's reason for *still* refusing the row
+/// after the printed command is applied. The command carries only accepted
+/// hosts, so the only thing that can remain is a private carve-out no host
+/// grants; the operator must fix `egress_allow_private` by hand, and the
+/// report says so rather than calling the command a complete repair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressGapPlan {
-    /// Every declared destination is enforced: nothing to report.
+    /// The declaration is covered and the runtime accepts the row as it is.
     Nothing,
-    /// Declared destinations the runtime denies, plus the one command that
-    /// grants them without revoking anything already granted. `invalid` names
-    /// granted entries the runtime rejects; they are excluded from `command`,
-    /// which therefore doubles as the repair, since one rejected entry makes
-    /// the runtime refuse the whole allowlist.
+    /// A canonical (or absent) row: destinations the runtime denies and/or a
+    /// row the runtime refuses, plus the one command that grants the
+    /// declaration with every accepted existing host kept.
     Grant {
         missing: Vec<String>,
         invalid: Vec<String>,
+        rejected: Option<String>,
+        repair_incomplete: Option<String>,
         command: String,
     },
-    /// The grant is stranded on a legacy row, so the rename is always required:
-    /// the runtime enforces nothing until it happens. `missing` is what the
-    /// declaration still lacks *after* the rename brings the authored grant
-    /// into effect, `invalid` names authored entries the runtime would reject
-    /// once it does, and `grant` is the command that closes both. It is `None`
-    /// only when the authored grant already covers the declaration and every
-    /// entry is one the runtime accepts, because then the rename alone
-    /// restores reach and an extra `config set` would only risk replacing a
-    /// list the operator already has right.
+    /// The grant is stranded on a legacy row, so the rename is always
+    /// required: the runtime enforces nothing until it happens. `grant` is
+    /// `None` only when the rename alone yields a row the runtime accepts
+    /// that covers the declaration; otherwise the grant command follows the
+    /// rename, because renaming alone would put a refused or incomplete
+    /// allowlist into effect.
     Migrate {
         legacy_row: String,
         missing: Vec<String>,
         invalid: Vec<String>,
+        rejected: Option<String>,
+        repair_incomplete: Option<String>,
         grant: Option<String>,
     },
 }
 
 /// Decide what to report for one instance from its declaration and grant state.
 ///
-/// Pure: the caller renders the plan through Fluent. Keeping the decision here
-/// means the "is migration needed?" rule is a unit-testable function rather
-/// than control flow interleaved with string formatting.
+/// Pure apart from consulting the runtime's own policy constructor: the caller
+/// renders the plan through Fluent. Keeping the decision here means the
+/// "is migration needed?" and "would the runtime accept this?" rules are
+/// unit-testable functions rather than control flow interleaved with string
+/// formatting.
 #[must_use]
 pub fn plan_egress_gap(
     instance_key: &str,
     declared: &[String],
     state: &EgressGrantState,
+    runtime: &EgressRuntimeInputs,
 ) -> EgressGapPlan {
     match state {
-        EgressGrantState::Enforced { granted } => {
-            // Only entries the runtime accepts take part in coverage, and only
-            // they are carried into the command; a rejected entry is named
-            // and forces a repair even when the declaration is covered.
+        EgressGrantState::Enforced {
+            granted,
+            allow_private,
+        } => {
+            // Coverage is judged over the entries the runtime accepts; whether
+            // the row as a whole is accepted is the runtime's call.
             let (valid, invalid) = partition_valid_hosts(granted);
+            let rejected = runtime_rejection(granted, allow_private, runtime);
             let diff = diff_declaration(declared, &valid);
-            if diff.declared_not_granted.is_empty() && invalid.is_empty() {
+            if diff.declared_not_granted.is_empty() && rejected.is_none() {
                 return EgressGapPlan::Nothing;
             }
+            let union = diff.union();
+            let repair_incomplete = runtime_rejection(&union, allow_private, runtime);
             EgressGapPlan::Grant {
-                command: egress_set_command(instance_key, &diff.union()),
+                command: egress_set_command(instance_key, &union),
                 missing: diff.declared_not_granted,
                 invalid,
+                rejected,
+                repair_incomplete,
             }
         }
         EgressGrantState::Stranded {
             legacy_row,
             authored,
+            allow_private,
         } => {
-            // Compare against what the rename WILL enforce, not against the
-            // (empty) grant the runtime enforces today: the rename is planned
-            // unconditionally, so the only open question is whether a grant
-            // step has to follow it. It must when a declared destination is
-            // still uncovered, and it must when the authored list holds an
-            // entry the runtime rejects, because the rename alone would then
-            // bring an allowlist into effect that the runtime refuses whole.
+            // Compare against what the rename WILL bring into effect, not
+            // against the (empty) grant the runtime enforces today: the rename
+            // is planned unconditionally, so the open question is whether a
+            // grant step has to follow it. It must when a declared destination
+            // is still uncovered, and it must when the runtime would refuse
+            // the row the rename produces, because renaming alone would then
+            // put a refused allowlist into effect.
             let (valid, invalid) = partition_valid_hosts(authored);
+            let rejected = runtime_rejection(authored, allow_private, runtime);
             let diff = diff_declaration(declared, &valid);
-            let grant = (!diff.declared_not_granted.is_empty() || !invalid.is_empty())
-                .then(|| egress_set_command(instance_key, &diff.union()));
+            let needs_grant = !diff.declared_not_granted.is_empty() || rejected.is_some();
+            let (grant, repair_incomplete) = if needs_grant {
+                let union = diff.union();
+                (
+                    Some(egress_set_command(instance_key, &union)),
+                    runtime_rejection(&union, allow_private, runtime),
+                )
+            } else {
+                (None, None)
+            };
             EgressGapPlan::Migrate {
                 legacy_row: legacy_row.clone(),
                 missing: diff.declared_not_granted,
                 invalid,
+                rejected,
+                repair_incomplete,
                 grant,
             }
         }
@@ -584,6 +665,28 @@ mod tests {
         );
     }
 
+    fn rt() -> EgressRuntimeInputs {
+        EgressRuntimeInputs {
+            nat64_prefixes: Vec::new(),
+            max_connections_per_instance: 4,
+        }
+    }
+
+    fn enforced(granted: &[&str]) -> EgressGrantState {
+        EgressGrantState::Enforced {
+            granted: v(granted),
+            allow_private: Vec::new(),
+        }
+    }
+
+    fn stranded(authored: &[&str]) -> EgressGrantState {
+        EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(authored),
+            allow_private: Vec::new(),
+        }
+    }
+
     #[test]
     fn grant_state_separates_what_is_enforced_from_what_was_authored() {
         let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
@@ -591,9 +694,9 @@ mod tests {
         // Stands in for `entry_egress`: only the legacy row carries hosts.
         let lookup = |row: &str| {
             if row == "weather-tool" {
-                v(&["api.example.com", "gitea.example.net"])
+                (v(&["api.example.com", "gitea.example.net"]), Vec::new())
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         };
 
@@ -601,26 +704,19 @@ mod tests {
         // authored grant is carried through for the command to preserve.
         assert_eq!(
             resolve_grant_state(key, &legacy, &v(&["weather-tool"]), lookup),
-            EgressGrantState::Stranded {
-                legacy_row: "weather-tool".to_string(),
-                authored: v(&["api.example.com", "gitea.example.net"]),
-            }
+            stranded(&["api.example.com", "gitea.example.net"])
         );
         // Canonical row present: what is enforced is that row's grant (here
         // nothing), never the leftover legacy row's.
         assert_eq!(
             resolve_grant_state(key, &legacy, &v(&[key, "weather-tool"]), lookup),
-            EgressGrantState::Enforced {
-                granted: Vec::new()
-            }
+            enforced(&[])
         );
         // No rows at all: enforced-empty, not stranded — renaming nothing
         // would not help, and the grant command is the right next step.
         assert_eq!(
             resolve_grant_state(key, &legacy, &[], lookup),
-            EgressGrantState::Enforced {
-                granted: Vec::new()
-            }
+            enforced(&[])
         );
     }
 
@@ -629,34 +725,35 @@ mod tests {
         // The false negative this split exists to make impossible: the
         // authored grant covers the declaration, so a diff against it is
         // empty — but the runtime enforces nothing until the rename. The plan
-        // must be Migrate, and with nothing left to grant, no command.
+        // must be Migrate, and with nothing left to grant and a row the
+        // runtime accepts, no command.
         let key = "zpi1_k";
-        let state = EgressGrantState::Stranded {
-            legacy_row: "weather-tool".to_string(),
-            authored: v(&["api.example.com", "gitea.example.net"]),
-        };
+        let state = stranded(&["api.example.com", "gitea.example.net"]);
         assert_eq!(
-            plan_egress_gap(key, &v(&["api.example.com"]), &state),
+            plan_egress_gap(key, &v(&["api.example.com"]), &state, &rt()),
             EgressGapPlan::Migrate {
                 legacy_row: "weather-tool".to_string(),
                 missing: Vec::new(),
                 invalid: Vec::new(),
+                rejected: None,
+                repair_incomplete: None,
                 grant: None,
             }
         );
         // A wildcard that covers the declaration is the same case.
-        let wild = EgressGrantState::Stranded {
-            legacy_row: "weather-tool".to_string(),
-            authored: v(&["*.example.com"]),
-        };
         assert!(matches!(
-            plan_egress_gap(key, &v(&["api.example.com"]), &wild),
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &stranded(&["*.example.com"]),
+                &rt()
+            ),
             EgressGapPlan::Migrate { grant: None, .. }
         ));
         // Even with nothing declared: the operator's own grant is inert until
         // the rename, and `config set` cannot target the row until then.
         assert!(matches!(
-            plan_egress_gap(key, &[], &state),
+            plan_egress_gap(key, &[], &state, &rt()),
             EgressGapPlan::Migrate { grant: None, .. }
         ));
     }
@@ -666,15 +763,19 @@ mod tests {
         // The grant-loss case: the grant step must carry the operator-only
         // host forward, because `config set` replaces the list.
         let key = "zpi1_k";
-        let state = EgressGrantState::Stranded {
-            legacy_row: "weather-tool".to_string(),
-            authored: v(&["api.example.com", "gitea.example.net"]),
-        };
-        let plan = plan_egress_gap(key, &v(&["api.example.com", "api2.example.com"]), &state);
+        let state = stranded(&["api.example.com", "gitea.example.net"]);
+        let plan = plan_egress_gap(
+            key,
+            &v(&["api.example.com", "api2.example.com"]),
+            &state,
+            &rt(),
+        );
         let EgressGapPlan::Migrate {
             legacy_row,
             missing,
             invalid,
+            rejected,
+            repair_incomplete,
             grant: Some(command),
         } = plan
         else {
@@ -683,6 +784,11 @@ mod tests {
         assert_eq!(legacy_row, "weather-tool");
         assert_eq!(missing, v(&["api2.example.com"]));
         assert!(invalid.is_empty());
+        assert_eq!(rejected, None, "a valid row is not refused");
+        assert_eq!(
+            repair_incomplete, None,
+            "the union is a row the runtime accepts"
+        );
         assert_eq!(
             command,
             egress_set_command(
@@ -695,14 +801,13 @@ mod tests {
     #[test]
     fn an_enforced_grant_plans_exactly_as_the_canonical_diagnostic_always_did() {
         let key = "zpi1_k";
-        // Covered (through the wildcard): nothing to say.
+        // Covered (through the wildcard) and accepted: nothing to say.
         assert_eq!(
             plan_egress_gap(
                 key,
                 &v(&["api.example.com"]),
-                &EgressGrantState::Enforced {
-                    granted: v(&["*.example.com"])
-                }
+                &enforced(&["*.example.com"]),
+                &rt()
             ),
             EgressGapPlan::Nothing
         );
@@ -711,31 +816,32 @@ mod tests {
             plan_egress_gap(
                 key,
                 &v(&["api.example.com", "api2.example.com"]),
-                &EgressGrantState::Enforced {
-                    granted: v(&["api.example.com"])
-                }
+                &enforced(&["api.example.com"]),
+                &rt()
             ),
             EgressGapPlan::Grant {
                 missing: v(&["api2.example.com"]),
                 invalid: Vec::new(),
+                rejected: None,
+                repair_incomplete: None,
                 command: egress_set_command(key, &v(&["api.example.com", "api2.example.com"])),
             }
         );
         // No row at all reads as enforced-empty: every declared host is a gap.
         assert!(matches!(
-            plan_egress_gap(
-                key,
-                &v(&["api.example.com"]),
-                &EgressGrantState::Enforced {
-                    granted: Vec::new()
-                }
-            ),
+            plan_egress_gap(key, &v(&["api.example.com"]), &enforced(&[]), &rt()),
             EgressGapPlan::Grant { .. }
         ));
+        // No row and nothing declared: an empty grant is a row the runtime
+        // accepts (it means no reach), so there is nothing to report.
+        assert_eq!(
+            plan_egress_gap(key, &[], &enforced(&[]), &rt()),
+            EgressGapPlan::Nothing
+        );
     }
 
     #[test]
-    fn partition_keeps_rejected_entries_out_of_the_valid_list_but_names_them() {
+    fn partition_judges_raw_entries_exactly_as_the_runtime_does() {
         let (valid, invalid) = partition_valid_hosts(&v(&[
             "api.example.com",
             "*.com",
@@ -744,9 +850,37 @@ mod tests {
             "*.example.com",
         ]));
         assert_eq!(valid, v(&["*.example.com", "api.example.com"]));
-        // `*.com` wildcards a single label, which the grammar rejects; it is
-        // named verbatim rather than dropped, so the operator can find it.
-        assert_eq!(invalid, v(&["*.com"]));
+        // `*.com` wildcards a single label; the padded entry has boundary
+        // whitespace; the empty entry is empty. The runtime rejects all three
+        // on the raw bytes, so no trimming or skipping may rescue them here.
+        assert_eq!(invalid, v(&["", " api.example.com ", "*.com"]));
+    }
+
+    #[test]
+    fn runtime_rejection_is_the_policy_constructors_verdict() {
+        let ok = runtime_rejection(&v(&["api.example.com"]), &[], &rt());
+        assert_eq!(ok, None);
+        let empty = runtime_rejection(&[], &[], &rt());
+        assert_eq!(empty, None, "an empty grant is accepted and means no reach");
+        let padded = runtime_rejection(&v(&[" api.example.com "]), &[], &rt())
+            .expect("boundary whitespace is refused");
+        assert!(padded.contains("whitespace"), "{padded}");
+        let carveout =
+            runtime_rejection(&v(&["api.example.com"]), &v(&["other.example.com"]), &rt())
+                .expect("a carve-out no host grants is refused");
+        assert!(carveout.contains("not granted"), "{carveout}");
+        let bad_limit = runtime_rejection(
+            &v(&["api.example.com"]),
+            &[],
+            &EgressRuntimeInputs {
+                nat64_prefixes: Vec::new(),
+                max_connections_per_instance: 0,
+            },
+        );
+        assert!(
+            bad_limit.is_some(),
+            "a zero ceiling is refused like the runtime refuses it"
+        );
     }
 
     #[test]
@@ -757,14 +891,12 @@ mod tests {
         // the row, reject `*.com`, and deny every request. The plan must name
         // the entry, keep the rename, and print a grant that omits it.
         let key = "zpi1_k";
-        let state = EgressGrantState::Stranded {
-            legacy_row: "weather-tool".to_string(),
-            authored: v(&["*.com"]),
-        };
-        let plan = plan_egress_gap(key, &v(&["api.com"]), &state);
+        let plan = plan_egress_gap(key, &v(&["api.com"]), &stranded(&["*.com"]), &rt());
         let EgressGapPlan::Migrate {
             missing,
             invalid,
+            rejected,
+            repair_incomplete,
             grant: Some(command),
             ..
         } = plan
@@ -773,29 +905,115 @@ mod tests {
         };
         assert_eq!(missing, v(&["api.com"]), "`*.com` covers nothing");
         assert_eq!(invalid, v(&["*.com"]));
-        assert_eq!(command, egress_set_command(key, &v(&["api.com"])));
         assert!(
-            !command.contains("*.com"),
-            "the repair must not carry the rejected entry forward: {command}"
+            rejected
+                .expect("the runtime refuses the row")
+                .contains("*.com")
         );
+        assert_eq!(repair_incomplete, None, "the union is accepted");
+        assert_eq!(command, egress_set_command(key, &v(&["api.com"])));
+        assert!(!command.contains("*.com"), "{command}");
     }
 
     #[test]
-    fn a_canonical_row_with_a_rejected_entry_is_reported_as_a_repair_even_when_covered() {
-        // Enforced path: the declaration is covered by a valid entry, but the
-        // row also holds `*.com`, so the runtime refuses the whole allowlist.
-        // Silence here would report a fully denied instance as healthy.
+    fn a_padded_entry_is_refused_like_the_runtime_refuses_it_and_the_command_repairs_it() {
+        // A grant the runtime refuses for boundary whitespace, on a canonical
+        // row that otherwise covers the declaration. A planner that trimmed
+        // before judging would call this healthy while every request is
+        // denied. The repair carries the canonical declared host and leaves
+        // the padded entry behind.
         let key = "zpi1_k";
-        let state = EgressGrantState::Enforced {
-            granted: v(&["api.com", "*.com"]),
+        let plan = plan_egress_gap(
+            key,
+            &v(&["api.example.com"]),
+            &enforced(&[" api.example.com "]),
+            &rt(),
+        );
+        let EgressGapPlan::Grant {
+            missing,
+            invalid,
+            rejected,
+            repair_incomplete,
+            command,
+        } = plan
+        else {
+            panic!("a refused row must be reported: {plan:?}");
         };
         assert_eq!(
-            plan_egress_gap(key, &v(&["api.com"]), &state),
-            EgressGapPlan::Grant {
-                missing: Vec::new(),
-                invalid: v(&["*.com"]),
-                command: egress_set_command(key, &v(&["api.com"])),
-            }
+            missing,
+            v(&["api.example.com"]),
+            "a refused entry covers nothing"
         );
+        assert_eq!(invalid, v(&[" api.example.com "]));
+        assert!(
+            rejected
+                .expect("the runtime refuses the row")
+                .contains("whitespace")
+        );
+        assert_eq!(repair_incomplete, None);
+        assert_eq!(command, egress_set_command(key, &v(&["api.example.com"])));
+    }
+
+    #[test]
+    fn an_ungranted_private_carveout_forces_the_grant_step_and_is_reported_as_incomplete() {
+        // The hosts are valid and cover the declaration, so a host-only
+        // planner would offer the rename alone. But `egress_allow_private`
+        // names a host no grant covers, and the runtime refuses the whole row
+        // for it. The rename must not be offered alone, and because the
+        // printed command only replaces the hosts, the report must say the
+        // carve-out still has to be fixed by hand.
+        let key = "zpi1_k";
+        let state = EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(&["api.example.com"]),
+            allow_private: v(&["other.example.com"]),
+        };
+        let plan = plan_egress_gap(key, &v(&["api.example.com"]), &state, &rt());
+        let EgressGapPlan::Migrate {
+            missing,
+            rejected,
+            repair_incomplete,
+            grant,
+            ..
+        } = plan
+        else {
+            panic!("expected a migrate plan: {plan:?}");
+        };
+        assert!(missing.is_empty(), "the hosts cover the declaration");
+        assert!(
+            rejected
+                .expect("the runtime refuses the row")
+                .contains("not granted")
+        );
+        assert!(
+            grant.is_some(),
+            "the rename alone would put a refused row into effect"
+        );
+        assert!(
+            repair_incomplete
+                .expect("the command replaces only the hosts")
+                .contains("egress_allow_private")
+        );
+
+        // Same row, canonical: reported as a repair even though the
+        // declaration is covered — silence would call a denied instance
+        // healthy.
+        let plan = plan_egress_gap(
+            key,
+            &v(&["api.example.com"]),
+            &EgressGrantState::Enforced {
+                granted: v(&["api.example.com"]),
+                allow_private: v(&["other.example.com"]),
+            },
+            &rt(),
+        );
+        assert!(matches!(
+            plan,
+            EgressGapPlan::Grant {
+                rejected: Some(_),
+                repair_incomplete: Some(_),
+                ..
+            }
+        ));
     }
 }

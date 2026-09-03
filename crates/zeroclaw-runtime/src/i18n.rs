@@ -813,7 +813,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [EgressStringCase<'_>; 16] = [
+        let cases: [EgressStringCase<'_>; 17] = [
             (
                 "cli-plugin-egress-seeded",
                 &[("name", "weather-tool"), ("count", "2")],
@@ -913,15 +913,30 @@ mod tests {
                 "cli-plugin-egress-invalid-grant",
                 &[
                     ("name", "weather-tool"),
-                    ("hosts", "*.com"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
                     ("command", command.as_str()),
                 ],
                 &["weather-tool", "*.com", command.as_str()],
             ),
             (
                 "cli-plugin-egress-invalid-grant-legacy",
-                &[("name", "weather-tool"), ("hosts", "*.com")],
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
+                ],
                 &["weather-tool", "*.com"],
+            ),
+            // Printed when the command repairs the hosts but a private
+            // carve-out would still be refused: it must name the row's
+            // `egress_allow_private` path so the operator can fix it by hand.
+            (
+                "cli-plugin-egress-repair-incomplete",
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"other.example.com\" is not granted"),
+                    ("key", key),
+                ],
+                &["weather-tool", key, "egress_allow_private"],
             ),
         ];
 
@@ -989,7 +1004,10 @@ mod tests {
                 source,
                 locale,
                 "cli-plugin-egress-invalid-grant-legacy",
-                &[("name", "weather-tool"), ("hosts", "*.com")],
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
+                ],
             )
             .unwrap_or_else(|| {
                 panic!("cli-plugin-egress-invalid-grant-legacy should format in {locale}")

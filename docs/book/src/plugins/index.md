@@ -345,12 +345,18 @@ before the rename fails with `Unknown property`; applying the printed steps in
 the printed order works. `plugin list` diagnoses this and never edits your
 config itself.
 
-If a row grants an entry the runtime rejects (a single-label wildcard such as
-`*.com`, say), the config loader only warns about it, but the runtime refuses
-the whole allowlist and denies every request. `plugin list` names the rejected
-entry and prints a grant command that leaves it out; on a pre-1.0 row that
-command follows the rename as before. Applying it replaces the rejected list
-with one the runtime accepts.
+`plugin list` judges a row with the same policy constructor the runtime uses
+at request time, so its verdict is the runtime's. If the runtime would refuse
+the row (a single-label wildcard such as `*.com`, an entry with boundary
+whitespace, or an `egress_allow_private` carve-out no granted host covers), the
+config loader only warns about it, but the runtime refuses the whole allowlist
+and denies every request. `plugin list` prints the runtime's reason and a grant
+command built only from the entries the runtime accepts; on a pre-1.0 row that
+command follows the rename, and the rename is never offered alone for a row the
+runtime would refuse. The printed command replaces `egress_hosts` only. If a
+private carve-out would still be refused afterwards, the report says so and
+names the row's `egress_allow_private` path, since that has to be fixed by
+hand.
 
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare
