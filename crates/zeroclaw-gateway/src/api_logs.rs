@@ -79,7 +79,13 @@ fn attribution_keys_for_response() -> Vec<String> {
 /// drift between them.
 #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
 pub(crate) fn load_logs_response(filter: &LogFilter, limit: usize) -> anyhow::Result<LogsResponse> {
-    let Some(path) = zeroclaw_log::current_log_path() else {
+    // The storage-aware accessor, not the configured one. `current_log_path`
+    // reports the path the writer was configured with whatever the storage
+    // mode, so a daemon running `log_persistence = "none"` would answer
+    // `persistence_enabled: true` and then serve whatever stale file happened
+    // to sit at that path. The RPC twin already reads `active_log_path`; this
+    // is the same question, so it reads the same source of truth.
+    let Some(path) = zeroclaw_log::active_log_path() else {
         return Ok(LogsResponse {
             events: Vec::new(),
             next_cursor: None,
