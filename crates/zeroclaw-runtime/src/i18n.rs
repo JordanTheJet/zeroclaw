@@ -813,7 +813,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [EgressStringCase<'_>; 13] = [
+        let cases: [EgressStringCase<'_>; 14] = [
             (
                 "cli-plugin-egress-seeded",
                 &[("name", "weather-tool"), ("count", "2")],
@@ -893,6 +893,19 @@ mod tests {
                 &[("command", command.as_str())],
                 &[command.as_str()],
             ),
+            // The migrate-only arm: the authored grant already covers the
+            // declaration, so the rename alone restores reach. Like the legacy
+            // headline it must name both the row to rename and the key to give
+            // it, and (asserted below) it must never carry a grant command.
+            (
+                "cli-plugin-egress-legacy-inert",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key],
+            ),
         ];
 
         for (source, locale) in [
@@ -932,6 +945,27 @@ mod tests {
                 !headline.contains("zeroclaw config set"),
                 "cli-plugin-egress-gap-legacy in {locale} must leave the grant \
                  command to the ordered steps; got: {headline:?}"
+            );
+
+            // The migrate-only headline exists precisely because nothing is
+            // left to grant after the rename: a catalogue that folds a
+            // `config set` into it would hand the operator a command that
+            // replaces a list they already have right.
+            let inert = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-legacy-inert",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+            )
+            .unwrap_or_else(|| panic!("cli-plugin-egress-legacy-inert should format in {locale}"));
+            assert!(
+                !inert.contains("zeroclaw config set"),
+                "cli-plugin-egress-legacy-inert in {locale} must not offer a grant \
+                 command; got: {inert:?}"
             );
         }
     }

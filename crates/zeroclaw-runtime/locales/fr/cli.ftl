@@ -755,6 +755,7 @@ cli-plugin-egress-gap = {$name} : déclare {$hosts}, que son entrée de configur
 cli-plugin-egress-gap-legacy = {$name} : déclare {$hosts}, que son entrée de configuration n'accorde pas — les requêtes vers ces destinations sont refusées. Sa ligne de configuration utilise encore le format de clé antérieur à 1.0 : migrez la ligne avant d'accorder.
 cli-plugin-egress-migrate-step = 1) migrez la ligne : renommez la ligne [[plugins.entries]] nommée « {$legacy} » en « {$key} » dans votre fichier de configuration, puis enregistrez. `zeroclaw plugin info {$name}` affiche cette clé.
 cli-plugin-egress-grant-step = 2) accordez : {$command}
+cli-plugin-egress-legacy-inert = {$name} : sa ligne de configuration utilise encore le format de clé antérieur à 1.0, que le runtime ne lit pas — son autorisation de sortie n'est pas en vigueur et les requêtes sont refusées. Renommez la ligne [[plugins.entries]] nommée « {$legacy} » en « {$key} » dans votre fichier de configuration, puis enregistrez. `zeroclaw plugin info {$name}` affiche cette clé.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.

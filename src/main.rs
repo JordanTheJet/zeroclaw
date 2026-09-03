@@ -3059,23 +3059,21 @@ fn print_egress_grant_gaps(
 /// on a legacy install the migration step has to come before the grant
 /// command, and a test that could only inspect stdout could not pin that.
 ///
-/// The reported gap and the command that closes it are two different
-/// questions. `entry_egress` resolves the grant by the canonical `zpi1_` key,
-/// so a pre-typed-config install whose row is still keyed by the package name
-/// reads back as "grants nothing" and is reported as a gap. But
-/// `plugins.entries.<key>.…` only resolves rows already in live config, so the
-/// grant command would fail against a key with no row. When the grant is
-/// stranded on such a row, print the documented rename first and the grant
-/// second, explicitly numbered: applied in that order they work, and applied
-/// in the printed order there is no way to run the failing one first.
+/// The decision itself lives in [`crate::plugins::egress_ceremony`]:
+/// `resolve_grant_state` separates the grant the runtime enforces (the
+/// canonical `zpi1_` row, and only that) from the grant the operator authored
+/// (stranded on a package-name row on a pre-typed-config install), and
+/// `plan_egress_gap` derives the report from that split. A stranded row always
+/// gets the rename printed, because nothing is enforced until it happens; the
+/// grant command follows only when the declaration still lacks destinations
+/// after the rename, and it always carries the authored grant forward because
+/// `config set` replaces the list. This function only renders the plan.
 #[cfg(feature = "plugins-wasm")]
 fn egress_grant_gap_lines(
     config: &crate::config::schema::Config,
     manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<String>> {
-    use crate::plugins::egress_ceremony::{
-        diff_declaration, egress_set_command, stranded_legacy_grant_row,
-    };
+    use crate::plugins::egress_ceremony::{EgressGapPlan, plan_egress_gap, resolve_grant_state};
     use zeroclaw::plugins::PluginPermission;
 
     if !manifest.permissions.contains(&PluginPermission::HttpClient) {
@@ -3096,66 +3094,91 @@ fn egress_grant_gap_lines(
 
     let mut lines = Vec::new();
     for (_, instance_key) in manifest_config_entries(manifest)? {
-        // Resolve the row the operator's current grant actually lives on. The
-        // canonical `zpi1_` row is what `entry_egress` and the grant command
-        // address, but on a pre-typed-config install that row is absent and the
-        // grant is stranded on a package-name row. There the legacy row's
-        // `egress_hosts` IS the operator's current grant, so the diff, the gap
-        // check, and the migrate-then-grant command must all read it: `config
-        // set` REPLACES the list, and a command built from the (empty) canonical
-        // grant would silently drop an operator-authored host the manifest does
-        // not also declare. The canonical path (no stranded row) is unchanged —
-        // `grant_source` is the instance key there, so `granted` is read exactly
-        // as before.
-        let legacy_row = stranded_legacy_grant_row(&instance_key, &legacy_candidates, &row_names);
-        let grant_source = legacy_row.as_deref().unwrap_or(instance_key.as_str());
-        let (granted, _private) = config.plugins.entry_egress(grant_source);
-        let diff = diff_declaration(&declared, &granted);
-        if diff.declared_not_granted.is_empty() {
-            continue;
+        // `resolve_grant_state` answers the two questions this diagnostic must
+        // keep apart — what the runtime enforces (the canonical `zpi1_` row,
+        // and only that) versus what the operator authored (which, on a
+        // pre-typed-config install, is stranded on a package-name row the
+        // runtime never reads). `plan_egress_gap` turns the answer into the
+        // report; this function only renders it.
+        let state = resolve_grant_state(&instance_key, &legacy_candidates, &row_names, |row| {
+            config.plugins.entry_egress(row).0
+        });
+        match plan_egress_gap(&instance_key, &declared, &state) {
+            EgressGapPlan::Nothing => {}
+            EgressGapPlan::Grant { missing, command } => {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap",
+                        &[("name", &package), ("hosts", &hosts), ("command", &command)],
+                        "This plugin declares destinations its entry does not grant."
+                    )
+                ));
+            }
+            EgressGapPlan::Migrate {
+                legacy_row,
+                missing,
+                grant: Some(command),
+            } => {
+                // The declaration still lacks destinations after the rename:
+                // the numbered two-step, rename first so the grant command
+                // addresses a row that exists.
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap-legacy",
+                        &[("name", &package), ("hosts", &hosts)],
+                        "This plugin declares destinations its entry does not grant, \
+                         and its grant is still on a legacy config row."
+                    )
+                ));
+                lines.push(format!(
+                    "    {}",
+                    ta(
+                        "cli-plugin-egress-migrate-step",
+                        &[
+                            ("name", &package),
+                            ("legacy", &legacy_row),
+                            ("key", &instance_key),
+                        ],
+                        "1) migrate the row: rename it to the instance key, then save."
+                    )
+                ));
+                lines.push(format!(
+                    "    {}",
+                    ta(
+                        "cli-plugin-egress-grant-step",
+                        &[("command", &command)],
+                        "2) grant the destinations with the printed command."
+                    )
+                ));
+            }
+            EgressGapPlan::Migrate {
+                legacy_row,
+                grant: None,
+                ..
+            } => {
+                // The authored grant already covers the declaration, but the
+                // runtime does not read the row it sits on: the rename alone
+                // restores reach, and no grant command is offered because one
+                // would only replace a list the operator already has right.
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-legacy-inert",
+                        &[
+                            ("name", &package),
+                            ("legacy", &legacy_row),
+                            ("key", &instance_key),
+                        ],
+                        "This plugin's egress grant is on a legacy config row the runtime \
+                         does not read; rename the row to the instance key to put it in effect."
+                    )
+                ));
+            }
         }
-        let hosts = diff.declared_not_granted.join(", ");
-        let command = egress_set_command(&instance_key, &diff.union());
-        let Some(legacy_row) = legacy_row else {
-            lines.push(format!(
-                "  {}",
-                ta(
-                    "cli-plugin-egress-gap",
-                    &[("name", &package), ("hosts", &hosts), ("command", &command),],
-                    "This plugin declares destinations its entry does not grant."
-                )
-            ));
-            continue;
-        };
-        lines.push(format!(
-            "  {}",
-            ta(
-                "cli-plugin-egress-gap-legacy",
-                &[("name", &package), ("hosts", &hosts)],
-                "This plugin declares destinations its entry does not grant, \
-                 and its grant is still on a legacy config row."
-            )
-        ));
-        lines.push(format!(
-            "    {}",
-            ta(
-                "cli-plugin-egress-migrate-step",
-                &[
-                    ("name", &package),
-                    ("legacy", &legacy_row),
-                    ("key", &instance_key),
-                ],
-                "1) migrate the row: rename it to the instance key, then save."
-            )
-        ));
-        lines.push(format!(
-            "    {}",
-            ta(
-                "cli-plugin-egress-grant-step",
-                &[("command", &command)],
-                "2) grant the destinations with the printed command."
-            )
-        ));
     }
     Ok(lines)
 }
@@ -13595,6 +13618,74 @@ mod tests {
         assert!(
             granted.contains(&"api.example.com".to_string()),
             "the already-granted declared host must survive too: {granted:?}"
+        );
+    }
+
+    /// REGRESSION (silent inert grant): the legacy row's grant already covers
+    /// everything the manifest declares, so a declaration-versus-grant diff
+    /// against that row is empty. But the runtime never reads a package-name
+    /// row — it resolves the grant by the canonical `zpi1_` key, which has no
+    /// row — so every request is denied until the operator renames the row.
+    /// The diagnostic must still print the rename. Using the stranded row to
+    /// decide *whether* to speak, rather than only *what command to offer*,
+    /// made this case silent: the state that most needed the instruction
+    /// produced no output at all.
+    ///
+    /// No grant command is offered: the rename alone puts the existing grant
+    /// in effect, and `config set` would only replace a list that is already
+    /// right.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_that_already_covers_the_declaration_still_prints_the_rename() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+
+        // The legacy row grants everything declared, plus an operator host.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the runtime resolves NO grant by the canonical key, so the plugin \
+             has no reach however complete the legacy row looks"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            !lines.is_empty(),
+            "a stranded grant is inert; the diagnostic must not report it as healthy"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the rename instruction must name the legacy row and the key to give it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("zeroclaw config set"),
+            "nothing is missing after the rename, so no grant command may be offered — \
+             `config set` would only replace a list the operator already has right: {rendered}"
+        );
+
+        // Follow the printed instruction: the rename alone restores reach, and
+        // once the row is canonical there is nothing left to report.
+        config.plugins.entries[0].name = instance_key.clone();
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec![
+                "api.example.com".to_string(),
+                "gitea.example.net".to_string()
+            ],
+            "after the rename the runtime reads the authored grant unchanged"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a canonical row that covers the declaration has nothing to report"
         );
     }
 

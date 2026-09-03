@@ -752,6 +752,7 @@ cli-plugin-egress-gap = {$name}: declara {$hosts}, que su entrada de configuraci
 cli-plugin-egress-gap-legacy = {$name}: declara {$hosts}, que su entrada de configuración no concede — las solicitudes a esos destinos se deniegan. Su fila de configuración todavía usa el formato de clave anterior a 1.0, así que migra la fila antes de conceder:
 cli-plugin-egress-migrate-step = 1) migra la fila: cambia el nombre de la fila [[plugins.entries]] llamada '{$legacy}' por '{$key}' en tu archivo de configuración y guarda. `zeroclaw plugin info {$name}` muestra esa clave.
 cli-plugin-egress-grant-step = 2) concede: {$command}
+cli-plugin-egress-legacy-inert = {$name}: su fila de configuración todavía usa el formato de clave anterior a 1.0, que el runtime no lee — su concesión de egreso no está en vigor y las solicitudes se deniegan. Cambia el nombre de la fila [[plugins.entries]] llamada '{$legacy}' por '{$key}' en tu archivo de configuración y guarda. `zeroclaw plugin info {$name}` muestra esa clave.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.

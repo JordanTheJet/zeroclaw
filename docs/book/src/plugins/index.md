@@ -331,12 +331,19 @@ plugin whose destination is deployment configuration (a self-hosted Gitea, a
 LAN Nextcloud) cannot have that host declared by its author, so you author it.
 
 When the instance's row still carries a pre-1.0 key (a package name rather than
-the `zpi1_…` key), `plugin list` prints the rename described above first and
-numbers the two steps. Dotted `plugins.entries.<key>.…` paths only resolve rows
-already present in live config, so a `zeroclaw config set` against the
-canonical key fails with `Unknown property` until the row is renamed. Applying
-the printed steps in the printed order works; `plugin list` diagnoses this and
-never edits your config itself.
+the `zpi1_…` key), `plugin list` always prints the rename described above,
+because the runtime resolves a grant by the `zpi1_…` key alone: whatever that
+row grants is not in effect, and requests are denied, until it is renamed. If
+the row's grant already covers everything the manifest declares, the rename is
+the whole instruction: no `zeroclaw config set` is offered, since it would
+only replace a list you already have right. If the declaration still names
+destinations the row does not grant, the rename is step one and the grant
+command is step two, and that command carries the row's existing grant forward
+so it revokes nothing you authored. Dotted `plugins.entries.<key>.…` paths
+only resolve rows already present in live config, so running the grant command
+before the rename fails with `Unknown property`; applying the printed steps in
+the printed order works. `plugin list` diagnoses this and never edits your
+config itself.
 
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare

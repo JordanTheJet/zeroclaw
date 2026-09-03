@@ -211,6 +211,135 @@ pub fn should_report_diff(diff: &EgressDeclarationDiff) -> bool {
     !diff.declared.is_empty() && !diff.is_empty()
 }
 
+/// Where one instance's egress grant lives, and whether the runtime honors it.
+///
+/// This is the distinction the gap diagnostic has to keep straight. The runtime
+/// resolves an instance's allowlist by its canonical `zpi1_` key and nothing
+/// else, so a grant an operator authored on a pre-typed-config row (keyed by
+/// the package name) is **not in effect** — the plugin has no network reach —
+/// even though it is exactly the list the operator wants carried forward. Two
+/// questions, two answers:
+///
+/// - *What does the runtime enforce?* decides whether there is a gap and
+///   whether a migration is needed. For a stranded row the answer is "nothing".
+/// - *What has the operator authored?* decides what a printed command must
+///   carry, because `config set` replaces the list and must not revoke a host
+///   the operator wrote themselves.
+///
+/// Collapsing the two into one list is how both prior defects happened: read
+/// the enforced (empty) grant for both and the printed command drops the
+/// operator's hosts; read the authored grant for both and a row that already
+/// covers the declaration is reported as healthy while every request is still
+/// denied. The variants make the split explicit so a caller cannot conflate
+/// them by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressGrantState {
+    /// The grant the runtime reads: the canonical row's allowlist, or empty
+    /// when no row exists. Enforcement and authorship agree here.
+    Enforced { granted: Vec<String> },
+    /// The canonical row is absent and the operator's grant sits on a legacy
+    /// package-name row the runtime does not read. Nothing is enforced until
+    /// the row is renamed; `authored` is what the rename brings into effect
+    /// and what any grant command must carry forward.
+    Stranded {
+        legacy_row: String,
+        authored: Vec<String>,
+    },
+}
+
+/// Resolve where an instance's grant lives from the rows present in config.
+///
+/// `granted_on` reads a row's allowlist by name (the caller's
+/// `PluginsConfig::entry_egress`); passing it in keeps this module free of the
+/// config types and lets the decision be tested against a plain lookup.
+#[must_use]
+pub fn resolve_grant_state(
+    instance_key: &str,
+    legacy_candidates: &[String],
+    row_names: &[String],
+    granted_on: impl Fn(&str) -> Vec<String>,
+) -> EgressGrantState {
+    match stranded_legacy_grant_row(instance_key, legacy_candidates, row_names) {
+        Some(legacy_row) => {
+            let authored = granted_on(&legacy_row);
+            EgressGrantState::Stranded {
+                legacy_row,
+                authored,
+            }
+        }
+        None => EgressGrantState::Enforced {
+            granted: granted_on(instance_key),
+        },
+    }
+}
+
+/// What `plugin list` has to tell the operator about one instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressGapPlan {
+    /// Every declared destination is enforced: nothing to report.
+    Nothing,
+    /// Declared destinations the runtime denies, plus the one command that
+    /// grants them without revoking anything already granted.
+    Grant {
+        missing: Vec<String>,
+        command: String,
+    },
+    /// The grant is stranded on a legacy row, so the rename is always required:
+    /// the runtime enforces nothing until it happens. `missing` is what the
+    /// declaration still lacks *after* the rename brings the authored grant
+    /// into effect, and `grant` is the command that closes that remainder —
+    /// `None` when the authored grant already covers the declaration, because
+    /// then the rename alone restores reach and an extra `config set` would
+    /// only risk replacing a list the operator already has right.
+    Migrate {
+        legacy_row: String,
+        missing: Vec<String>,
+        grant: Option<String>,
+    },
+}
+
+/// Decide what to report for one instance from its declaration and grant state.
+///
+/// Pure: the caller renders the plan through Fluent. Keeping the decision here
+/// means the "is migration needed?" rule is a unit-testable function rather
+/// than control flow interleaved with string formatting.
+#[must_use]
+pub fn plan_egress_gap(
+    instance_key: &str,
+    declared: &[String],
+    state: &EgressGrantState,
+) -> EgressGapPlan {
+    match state {
+        EgressGrantState::Enforced { granted } => {
+            let diff = diff_declaration(declared, granted);
+            if diff.declared_not_granted.is_empty() {
+                return EgressGapPlan::Nothing;
+            }
+            EgressGapPlan::Grant {
+                command: egress_set_command(instance_key, &diff.union()),
+                missing: diff.declared_not_granted,
+            }
+        }
+        EgressGrantState::Stranded {
+            legacy_row,
+            authored,
+        } => {
+            // Compare against what the rename WILL enforce, not against the
+            // (empty) grant the runtime enforces today: the rename is planned
+            // unconditionally, so the only open question is whether a grant
+            // step has to follow it.
+            let diff = diff_declaration(declared, authored);
+            let grant = (!diff.declared_not_granted.is_empty())
+                .then(|| egress_set_command(instance_key, &diff.union()));
+            EgressGapPlan::Migrate {
+                legacy_row: legacy_row.clone(),
+                missing: diff.declared_not_granted,
+                grant,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +532,151 @@ mod tests {
             v(&["*.example.com"]),
             "the rest of the declared wildcard the narrow grant does not cover is still a gap"
         );
+    }
+
+    #[test]
+    fn grant_state_separates_what_is_enforced_from_what_was_authored() {
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let legacy = v(&["weather-tool"]);
+        // Stands in for `entry_egress`: only the legacy row carries hosts.
+        let lookup = |row: &str| {
+            if row == "weather-tool" {
+                v(&["api.example.com", "gitea.example.net"])
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Canonical row absent, legacy row present: stranded, and the
+        // authored grant is carried through for the command to preserve.
+        assert_eq!(
+            resolve_grant_state(key, &legacy, &v(&["weather-tool"]), lookup),
+            EgressGrantState::Stranded {
+                legacy_row: "weather-tool".to_string(),
+                authored: v(&["api.example.com", "gitea.example.net"]),
+            }
+        );
+        // Canonical row present: what is enforced is that row's grant (here
+        // nothing), never the leftover legacy row's.
+        assert_eq!(
+            resolve_grant_state(key, &legacy, &v(&[key, "weather-tool"]), lookup),
+            EgressGrantState::Enforced {
+                granted: Vec::new()
+            }
+        );
+        // No rows at all: enforced-empty, not stranded — renaming nothing
+        // would not help, and the grant command is the right next step.
+        assert_eq!(
+            resolve_grant_state(key, &legacy, &[], lookup),
+            EgressGrantState::Enforced {
+                granted: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn a_stranded_grant_always_plans_the_rename_even_when_it_covers_the_declaration() {
+        // The false negative this split exists to make impossible: the
+        // authored grant covers the declaration, so a diff against it is
+        // empty — but the runtime enforces nothing until the rename. The plan
+        // must be Migrate, and with nothing left to grant, no command.
+        let key = "zpi1_k";
+        let state = EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(&["api.example.com", "gitea.example.net"]),
+        };
+        assert_eq!(
+            plan_egress_gap(key, &v(&["api.example.com"]), &state),
+            EgressGapPlan::Migrate {
+                legacy_row: "weather-tool".to_string(),
+                missing: Vec::new(),
+                grant: None,
+            }
+        );
+        // A wildcard that covers the declaration is the same case.
+        let wild = EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(&["*.example.com"]),
+        };
+        assert!(matches!(
+            plan_egress_gap(key, &v(&["api.example.com"]), &wild),
+            EgressGapPlan::Migrate { grant: None, .. }
+        ));
+        // Even with nothing declared: the operator's own grant is inert until
+        // the rename, and `config set` cannot target the row until then.
+        assert!(matches!(
+            plan_egress_gap(key, &[], &state),
+            EgressGapPlan::Migrate { grant: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_stranded_grant_with_an_uncovered_declaration_plans_the_rename_then_a_union_grant() {
+        // The grant-loss case: the grant step must carry the operator-only
+        // host forward, because `config set` replaces the list.
+        let key = "zpi1_k";
+        let state = EgressGrantState::Stranded {
+            legacy_row: "weather-tool".to_string(),
+            authored: v(&["api.example.com", "gitea.example.net"]),
+        };
+        let plan = plan_egress_gap(key, &v(&["api.example.com", "api2.example.com"]), &state);
+        let EgressGapPlan::Migrate {
+            legacy_row,
+            missing,
+            grant: Some(command),
+        } = plan
+        else {
+            panic!("expected a migrate plan with a grant step: {plan:?}");
+        };
+        assert_eq!(legacy_row, "weather-tool");
+        assert_eq!(missing, v(&["api2.example.com"]));
+        assert_eq!(
+            command,
+            egress_set_command(
+                key,
+                &v(&["api.example.com", "api2.example.com", "gitea.example.net"])
+            )
+        );
+    }
+
+    #[test]
+    fn an_enforced_grant_plans_exactly_as_the_canonical_diagnostic_always_did() {
+        let key = "zpi1_k";
+        // Covered (through the wildcard): nothing to say.
+        assert_eq!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &EgressGrantState::Enforced {
+                    granted: v(&["*.example.com"])
+                }
+            ),
+            EgressGapPlan::Nothing
+        );
+        // A gap: the union command against the canonical key.
+        assert_eq!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com", "api2.example.com"]),
+                &EgressGrantState::Enforced {
+                    granted: v(&["api.example.com"])
+                }
+            ),
+            EgressGapPlan::Grant {
+                missing: v(&["api2.example.com"]),
+                command: egress_set_command(key, &v(&["api.example.com", "api2.example.com"])),
+            }
+        );
+        // No row at all reads as enforced-empty: every declared host is a gap.
+        assert!(matches!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &EgressGrantState::Enforced {
+                    granted: Vec::new()
+                }
+            ),
+            EgressGapPlan::Grant { .. }
+        ));
     }
 }

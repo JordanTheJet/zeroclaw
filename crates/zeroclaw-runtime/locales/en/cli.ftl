@@ -843,6 +843,7 @@ cli-plugin-egress-gap = {$name}: declares {$hosts}, which its config entry does 
 cli-plugin-egress-gap-legacy = {$name}: declares {$hosts}, which its config entry does not grant — requests there are denied. Its config row still uses the pre-1.0 key format, so migrate the row before granting:
 cli-plugin-egress-migrate-step = 1) migrate the row: rename the [[plugins.entries]] row named '{$legacy}' to '{$key}' in your config file, then save. `zeroclaw plugin info {$name}` prints that key.
 cli-plugin-egress-grant-step = 2) grant: {$command}
+cli-plugin-egress-legacy-inert = {$name}: its config row still uses the pre-1.0 key format, which the runtime does not read — its egress grant is not in effect and requests are denied. Rename the [[plugins.entries]] row named '{$legacy}' to '{$key}' in your config file, then save. `zeroclaw plugin info {$name}` prints that key.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
