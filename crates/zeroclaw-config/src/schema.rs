@@ -16416,7 +16416,8 @@ pub struct TelegramConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -16631,7 +16632,8 @@ pub struct DiscordConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -16791,7 +16793,8 @@ pub struct SlackConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -16995,7 +16998,8 @@ pub struct MattermostConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
     /// Seconds to wait for operator approval on `always_ask` tools before
@@ -17116,7 +17120,8 @@ pub struct WebhookConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 
@@ -17174,7 +17179,8 @@ pub struct IMessageConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -17344,7 +17350,8 @@ pub struct MatrixConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -17518,7 +17525,8 @@ pub struct SignalConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -17850,7 +17858,8 @@ pub struct WhatsAppConfig {
     /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
     /// and this value is `0`, the pacing wrapper substitutes
     /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
-    /// newest send is dropped and a `WARN` is logged.
+    /// newest send is dropped, a `WARN` is logged, and the send returns an
+    /// error so the caller is never told a dropped message was delivered.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
