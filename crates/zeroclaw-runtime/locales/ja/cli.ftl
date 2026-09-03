@@ -756,6 +756,7 @@ cli-plugin-egress-legacy-inert = {$name}: 設定行が 1.0 より前のキー形
 cli-plugin-egress-invalid-grant = {$name}: ランタイムが送信許可を拒否しています（{$reason}）— 修正するまですべてのリクエストが拒否されます。次のコマンドで許可を置き換えてください: {$command}
 cli-plugin-egress-invalid-grant-legacy = {$name}: ランタイムが送信許可を拒否しています（{$reason}）— 修正するまですべてのリクエストが拒否されます。設定行が 1.0 より前のキー形式のままなので、行を移行してから許可を置き換えてください:
 cli-plugin-egress-repair-incomplete = {$name}: 表示されたコマンドを実行してもランタイムは許可を拒否したままです（{$reason}）。`plugins.entries.{$key}.egress_allow_private` を許可済みホストに合わせて修正するか、その例外を削除してください。
+cli-plugin-egress-deployment-rejected = ランタイムはこのデプロイのすべてのプラグイン送信ポリシーを拒否しています（{$reason}）。修正するまでどのプラグインの許可も有効になりません。`security.nat64_prefixes` と `plugins.limits.max_connections_per_instance` を確認してください。
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。

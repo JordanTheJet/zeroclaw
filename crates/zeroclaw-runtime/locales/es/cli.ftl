@@ -756,6 +756,7 @@ cli-plugin-egress-legacy-inert = {$name}: su fila de configuración todavía usa
 cli-plugin-egress-invalid-grant = {$name}: el runtime rechaza su concesión de egreso ({$reason}) — todas las solicitudes se deniegan hasta que se corrija. Reemplaza la concesión con: {$command}
 cli-plugin-egress-invalid-grant-legacy = {$name}: el runtime rechaza su concesión de egreso ({$reason}) — todas las solicitudes se deniegan hasta que se corrija. Su fila de configuración todavía usa el formato de clave anterior a 1.0, así que migra la fila y luego reemplaza la concesión:
 cli-plugin-egress-repair-incomplete = {$name}: después del comando impreso el runtime seguiría rechazando la concesión ({$reason}). Corrige `plugins.entries.{$key}.egress_allow_private` para que coincida con los hosts concedidos, o elimina la excepción.
+cli-plugin-egress-deployment-rejected = El runtime rechaza todas las políticas de egreso de complementos en esta instalación ({$reason}), así que ninguna concesión puede tener efecto hasta que se corrija. Revisa `security.nat64_prefixes` y `plugins.limits.max_connections_per_instance`.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.

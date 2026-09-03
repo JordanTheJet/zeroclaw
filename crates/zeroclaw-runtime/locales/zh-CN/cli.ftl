@@ -755,6 +755,7 @@ cli-plugin-egress-legacy-inert = {$name}：其配置行仍使用 1.0 之前的�
 cli-plugin-egress-invalid-grant = {$name}：运行时拒绝其出站授权（{$reason}）— 在修复之前所有请求都会被拒绝。请用以下命令替换授权：{$command}
 cli-plugin-egress-invalid-grant-legacy = {$name}：运行时拒绝其出站授权（{$reason}）— 在修复之前所有请求都会被拒绝。其配置行仍使用 1.0 之前的键格式，请先迁移该行，然后替换授权：
 cli-plugin-egress-repair-incomplete = {$name}：执行打印的命令后，运行时仍会拒绝该授权（{$reason}）。请修正 `plugins.entries.{$key}.egress_allow_private` 使其与已授权的主机一致，或删除该例外。
+cli-plugin-egress-deployment-rejected = 运行时拒绝此部署中所有插件的出站策略（{$reason}），在修复之前任何插件的授权都无法生效。请检查 `security.nat64_prefixes` 和 `plugins.limits.max_connections_per_instance`。
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。

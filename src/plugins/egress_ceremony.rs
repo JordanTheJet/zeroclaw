@@ -253,28 +253,93 @@ pub struct EgressRuntimeInputs {
     pub max_connections_per_instance: usize,
 }
 
+/// Which part of the deployment a refusal points at, so the report names a
+/// path the operator can actually change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionScope {
+    /// The row itself: a host pattern the grammar rejects, or a private
+    /// carve-out no granted host covers. Editing the row's `egress_hosts` or
+    /// `egress_allow_private` is the fix.
+    Row,
+    /// The deployment: `security.nat64_prefixes` or
+    /// `plugins.limits.max_connections_per_instance`. Every instance is
+    /// refused alike, and no row edit changes it, so it is reported once by
+    /// the caller and never as a row repair.
+    Deployment,
+}
+
+/// The runtime's refusal of a policy, with the scope it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRejection {
+    pub scope: RejectionScope,
+    pub reason: String,
+}
+
 /// Ask the runtime whether it would refuse this row, and if so, why.
 ///
 /// This is the one source of truth for acceptance. The diagnostic does not
 /// re-implement the grammar, the private-carve-out containment rule, or any
 /// other rule: it builds the policy exactly as the runtime's
 /// `plugin_egress_policy` does at request time and returns the constructor's
-/// own error text. Anything this accepts, the runtime enforces; anything it
-/// rejects, the runtime refuses whole, and the instance is denied everything.
+/// own error, classified by what it points at. Anything this accepts, the
+/// runtime enforces; anything it rejects, the runtime refuses whole, and the
+/// instance is denied everything.
+///
+/// The constructor checks the connection ceiling first, then the hosts, then
+/// the carve-outs, then the NAT64 prefixes. So a bad ceiling masks row
+/// problems until it is fixed, while bad NAT64 prefixes never hide a row
+/// problem. The report follows that precedence rather than guessing.
 #[must_use]
 pub fn runtime_rejection(
     hosts: &[String],
     allow_private: &[String],
     runtime: &EgressRuntimeInputs,
-) -> Option<String> {
-    zeroclaw_plugins::egress::EgressPolicy::new(
+) -> Option<RuntimeRejection> {
+    use zeroclaw_plugins::egress::{EgressError, EgressPolicy};
+    match EgressPolicy::new(
         hosts,
         allow_private,
         &runtime.nat64_prefixes,
         runtime.max_connections_per_instance,
-    )
-    .err()
-    .map(|error| error.to_string())
+    ) {
+        Ok(_) => None,
+        Err(error) => {
+            let scope = match &error {
+                EgressError::InvalidNat64Prefix(_) | EgressError::InvalidConnectionLimit => {
+                    RejectionScope::Deployment
+                }
+                _ => RejectionScope::Row,
+            };
+            Some(RuntimeRejection {
+                scope,
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
+/// The row-scoped half of [`runtime_rejection`]: the reason the runtime
+/// refuses this row for what is *in* the row, or `None` when the row is fine
+/// or the refusal is deployment-wide (which the caller reports separately).
+#[must_use]
+pub fn row_rejection(
+    hosts: &[String],
+    allow_private: &[String],
+    runtime: &EgressRuntimeInputs,
+) -> Option<String> {
+    runtime_rejection(hosts, allow_private, runtime)
+        .filter(|rejection| rejection.scope == RejectionScope::Row)
+        .map(|rejection| rejection.reason)
+}
+
+/// The deployment-wide verdict on its own: would the runtime refuse even an
+/// empty row? An empty grant is always accepted (it means no reach), so any
+/// refusal here comes from the deployment inputs alone.
+#[must_use]
+pub fn deployment_rejection(runtime: &EgressRuntimeInputs) -> Option<String> {
+    runtime_rejection(&[], &[], runtime)
+        .filter(|rejection| rejection.scope == RejectionScope::Deployment)
+        .map(|rejection| rejection.reason)
 }
 
 /// Where one instance's egress grant lives, and whether the runtime honors it.
@@ -362,11 +427,14 @@ pub fn resolve_grant_state(
 ///   [`runtime_rejection`]'s verdict and covers everything the grammar and
 ///   the private-carve-out rule reject, not only the entries in `invalid`.
 ///
-/// `repair_incomplete` is the runtime's reason for *still* refusing the row
-/// after the printed command is applied. The command carries only accepted
-/// hosts, so the only thing that can remain is a private carve-out no host
-/// grants; the operator must fix `egress_allow_private` by hand, and the
-/// report says so rather than calling the command a complete repair.
+/// `repair_incomplete` is the runtime's row-scoped reason for *still*
+/// refusing the row after the printed command is applied. The command
+/// carries only accepted hosts, so the only row-scoped thing that can remain
+/// is a private carve-out no host grants; the operator must fix
+/// `egress_allow_private` by hand, and the report says so rather than calling
+/// the command a complete repair. Deployment-wide refusals (NAT64 prefixes,
+/// the connection ceiling) are never attributed to a row: the caller reports
+/// them once, naming their own config paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressGapPlan {
     /// The declaration is covered and the runtime accepts the row as it is.
@@ -419,13 +487,13 @@ pub fn plan_egress_gap(
             // Coverage is judged over the entries the runtime accepts; whether
             // the row as a whole is accepted is the runtime's call.
             let (valid, invalid) = partition_valid_hosts(granted);
-            let rejected = runtime_rejection(granted, allow_private, runtime);
+            let rejected = row_rejection(granted, allow_private, runtime);
             let diff = diff_declaration(declared, &valid);
             if diff.declared_not_granted.is_empty() && rejected.is_none() {
                 return EgressGapPlan::Nothing;
             }
             let union = diff.union();
-            let repair_incomplete = runtime_rejection(&union, allow_private, runtime);
+            let repair_incomplete = row_rejection(&union, allow_private, runtime);
             EgressGapPlan::Grant {
                 command: egress_set_command(instance_key, &union),
                 missing: diff.declared_not_granted,
@@ -447,14 +515,14 @@ pub fn plan_egress_gap(
             // the row the rename produces, because renaming alone would then
             // put a refused allowlist into effect.
             let (valid, invalid) = partition_valid_hosts(authored);
-            let rejected = runtime_rejection(authored, allow_private, runtime);
+            let rejected = row_rejection(authored, allow_private, runtime);
             let diff = diff_declaration(declared, &valid);
             let needs_grant = !diff.declared_not_granted.is_empty() || rejected.is_some();
             let (grant, repair_incomplete) = if needs_grant {
                 let union = diff.union();
                 (
                     Some(egress_set_command(instance_key, &union)),
-                    runtime_rejection(&union, allow_private, runtime),
+                    row_rejection(&union, allow_private, runtime),
                 )
             } else {
                 (None, None)
@@ -857,30 +925,108 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejection_is_the_policy_constructors_verdict() {
-        let ok = runtime_rejection(&v(&["api.example.com"]), &[], &rt());
-        assert_eq!(ok, None);
-        let empty = runtime_rejection(&[], &[], &rt());
-        assert_eq!(empty, None, "an empty grant is accepted and means no reach");
+    fn runtime_rejection_is_the_policy_constructors_verdict_with_its_scope() {
+        assert_eq!(
+            runtime_rejection(&v(&["api.example.com"]), &[], &rt()),
+            None
+        );
+        assert_eq!(
+            runtime_rejection(&[], &[], &rt()),
+            None,
+            "an empty grant is accepted and means no reach"
+        );
         let padded = runtime_rejection(&v(&[" api.example.com "]), &[], &rt())
             .expect("boundary whitespace is refused");
-        assert!(padded.contains("whitespace"), "{padded}");
+        assert_eq!(padded.scope, RejectionScope::Row);
+        assert!(padded.reason.contains("whitespace"), "{}", padded.reason);
         let carveout =
             runtime_rejection(&v(&["api.example.com"]), &v(&["other.example.com"]), &rt())
                 .expect("a carve-out no host grants is refused");
-        assert!(carveout.contains("not granted"), "{carveout}");
-        let bad_limit = runtime_rejection(
-            &v(&["api.example.com"]),
-            &[],
-            &EgressRuntimeInputs {
-                nat64_prefixes: Vec::new(),
-                max_connections_per_instance: 0,
-            },
-        );
+        assert_eq!(carveout.scope, RejectionScope::Row);
         assert!(
-            bad_limit.is_some(),
-            "a zero ceiling is refused like the runtime refuses it"
+            carveout.reason.contains("not granted"),
+            "{}",
+            carveout.reason
         );
+
+        // Deployment-wide refusals point at the deployment, not the row.
+        let bad_nat64 = EgressRuntimeInputs {
+            nat64_prefixes: v(&["2001:db8::/97"]),
+            max_connections_per_instance: 4,
+        };
+        let refused = runtime_rejection(&v(&["api.example.com"]), &[], &bad_nat64)
+            .expect("a malformed NAT64 prefix list is refused");
+        assert_eq!(refused.scope, RejectionScope::Deployment);
+        let zero = EgressRuntimeInputs {
+            nat64_prefixes: Vec::new(),
+            max_connections_per_instance: 0,
+        };
+        assert_eq!(
+            runtime_rejection(&v(&["api.example.com"]), &[], &zero)
+                .expect("a zero ceiling is refused")
+                .scope,
+            RejectionScope::Deployment
+        );
+        // The split halves agree with the whole.
+        assert!(deployment_rejection(&bad_nat64).is_some());
+        assert!(deployment_rejection(&zero).is_some());
+        assert_eq!(deployment_rejection(&rt()), None);
+        assert_eq!(
+            row_rejection(&v(&["api.example.com"]), &[], &bad_nat64),
+            None
+        );
+        assert!(row_rejection(&v(&[" api.example.com "]), &[], &rt()).is_some());
+    }
+
+    #[test]
+    fn a_deployment_wide_refusal_is_never_attributed_to_a_row() {
+        // The row is valid and covers the declaration; only the deployment's
+        // NAT64 list is malformed. The plan must not call the row refused, must
+        // not print a no-op command, and must not point at
+        // `egress_allow_private`. The caller reports the deployment refusal
+        // once, on its own.
+        let key = "zpi1_k";
+        let bad_nat64 = EgressRuntimeInputs {
+            nat64_prefixes: v(&["2001:db8::/97"]),
+            max_connections_per_instance: 16,
+        };
+        assert_eq!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &enforced(&["api.example.com"]),
+                &bad_nat64
+            ),
+            EgressGapPlan::Nothing
+        );
+        assert!(matches!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &stranded(&["api.example.com"]),
+                &bad_nat64
+            ),
+            EgressGapPlan::Migrate {
+                rejected: None,
+                repair_incomplete: None,
+                grant: None,
+                ..
+            }
+        ));
+        // A genuine row problem still surfaces under a bad NAT64 list, because
+        // the constructor judges the hosts before the prefixes.
+        assert!(matches!(
+            plan_egress_gap(
+                key,
+                &v(&["api.example.com"]),
+                &enforced(&[" api.example.com "]),
+                &bad_nat64
+            ),
+            EgressGapPlan::Grant {
+                rejected: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

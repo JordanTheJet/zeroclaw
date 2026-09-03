@@ -356,7 +356,10 @@ command follows the rename, and the rename is never offered alone for a row the
 runtime would refuse. The printed command replaces `egress_hosts` only. If a
 private carve-out would still be refused afterwards, the report says so and
 names the row's `egress_allow_private` path, since that has to be fixed by
-hand.
+hand. A refusal that is not about the row at all, a malformed
+`security.nat64_prefixes` or a zero `plugins.limits.max_connections_per_instance`,
+refuses every plugin's policy alike; `plugin list` reports it once, naming
+those two paths, and never as a per-plugin grant repair.
 
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare

@@ -759,6 +759,7 @@ cli-plugin-egress-legacy-inert = {$name} : sa ligne de configuration utilise enc
 cli-plugin-egress-invalid-grant = {$name} : le runtime rejette son autorisation de sortie ({$reason}) — chaque requête est refusée tant que ce n'est pas corrigé. Remplacez l'autorisation par : {$command}
 cli-plugin-egress-invalid-grant-legacy = {$name} : le runtime rejette son autorisation de sortie ({$reason}) — chaque requête est refusée tant que ce n'est pas corrigé. Sa ligne de configuration utilise encore le format de clé antérieur à 1.0 : migrez la ligne, puis remplacez l'autorisation.
 cli-plugin-egress-repair-incomplete = {$name} : après la commande affichée, le runtime rejetterait encore l'autorisation ({$reason}). Corrigez `plugins.entries.{$key}.egress_allow_private` pour qu'il corresponde aux hôtes autorisés, ou supprimez l'exception.
+cli-plugin-egress-deployment-rejected = Le runtime rejette toutes les politiques de sortie des plugins de ce déploiement ({$reason}) : aucune autorisation ne peut prendre effet tant que ce n'est pas corrigé. Vérifiez `security.nat64_prefixes` et `plugins.limits.max_connections_per_instance`.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.

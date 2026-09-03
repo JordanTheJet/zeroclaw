@@ -3040,6 +3040,9 @@ fn print_egress_grant_gaps(
     host: &zeroclaw::plugins::host::PluginHost,
     plugins: &[zeroclaw::plugins::PluginInfo],
 ) -> Result<()> {
+    if let Some(line) = egress_deployment_gap_line(config) {
+        println!("{line}");
+    }
     for p in plugins {
         let Some(manifest) = host.manifest(&p.name) else {
             continue;
@@ -3049,6 +3052,39 @@ fn print_egress_grant_gaps(
         }
     }
     Ok(())
+}
+
+/// The runtime's inputs to a plugin egress policy that live outside any one
+/// row: the same values `plugin_egress_policy` hands the constructor, so the
+/// diagnostic's verdict is the runtime's.
+#[cfg(feature = "plugins-wasm")]
+fn egress_runtime_inputs(
+    config: &crate::config::schema::Config,
+) -> crate::plugins::egress_ceremony::EgressRuntimeInputs {
+    crate::plugins::egress_ceremony::EgressRuntimeInputs {
+        nat64_prefixes: config.security.nat64_prefixes.clone(),
+        max_connections_per_instance: config.plugins.limits.max_connections_per_instance,
+    }
+}
+
+/// One line, printed once, when the runtime would refuse *every* plugin
+/// egress policy in this deployment: a malformed `security.nat64_prefixes`
+/// or a zero `plugins.limits.max_connections_per_instance`. No row edit
+/// changes that, so it is reported here with its own paths and never as a
+/// per-plugin grant repair.
+#[cfg(feature = "plugins-wasm")]
+fn egress_deployment_gap_line(config: &crate::config::schema::Config) -> Option<String> {
+    let reason =
+        crate::plugins::egress_ceremony::deployment_rejection(&egress_runtime_inputs(config))?;
+    Some(format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-deployment-rejected",
+            &[("reason", &reason)],
+            "The runtime rejects every plugin egress policy in this deployment; check \
+             security.nat64_prefixes and plugins.limits.max_connections_per_instance."
+        )
+    ))
 }
 
 /// The lines [`print_egress_grant_gaps`] emits for one installed package,
@@ -3073,9 +3109,7 @@ fn egress_grant_gap_lines(
     config: &crate::config::schema::Config,
     manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<String>> {
-    use crate::plugins::egress_ceremony::{
-        EgressGapPlan, EgressRuntimeInputs, plan_egress_gap, resolve_grant_state,
-    };
+    use crate::plugins::egress_ceremony::{EgressGapPlan, plan_egress_gap, resolve_grant_state};
     use zeroclaw::plugins::PluginPermission;
 
     if !manifest.permissions.contains(&PluginPermission::HttpClient) {
@@ -3095,10 +3129,9 @@ fn egress_grant_gap_lines(
         .collect();
     // The same inputs `plugin_egress_policy` hands the policy constructor at
     // request time, so the diagnostic's verdict on a row is the runtime's.
-    let runtime = EgressRuntimeInputs {
-        nat64_prefixes: config.security.nat64_prefixes.clone(),
-        max_connections_per_instance: config.plugins.limits.max_connections_per_instance,
-    };
+    // Deployment-wide refusals are reported once by the caller; this report
+    // only ever attributes a refusal to the row itself.
+    let runtime = egress_runtime_inputs(config);
 
     let mut lines = Vec::new();
     for (_, instance_key) in manifest_config_entries(manifest)? {
@@ -13904,6 +13937,63 @@ mod tests {
             runtime_accepts_row(&config, &instance_key),
             "the repaired row must be one the runtime's own constructor accepts"
         );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty()
+        );
+    }
+
+    /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
+    /// and covers the declaration; only `security.nat64_prefixes` is
+    /// malformed, which the config loader only warns about. The runtime refuses
+    /// every policy for it. A report that ran the constructor and attributed
+    /// any failure to the row would call this grant refused, print a no-op
+    /// command replacing the hosts with themselves, and tell the operator to
+    /// fix `egress_allow_private` — none of which touches the prefix list. The
+    /// per-plugin report must stay silent for the row, and the deployment
+    /// line must name the responsible paths, once.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_deployment_wide_refusal_is_reported_once_with_its_own_paths_not_as_a_row_repair() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+        }];
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert!(
+            lines.is_empty(),
+            "a deployment-wide refusal must not be attributed to the row: {lines:?}"
+        );
+        let deployment = egress_deployment_gap_line(&config)
+            .expect("the deployment refusal must be reported on its own");
+        assert!(
+            deployment.contains("security.nat64_prefixes")
+                && deployment.contains("max_connections_per_instance"),
+            "the deployment line must name the paths that fix it: {deployment}"
+        );
+        assert!(
+            !deployment.contains("egress_allow_private")
+                && !deployment.contains("zeroclaw config set"),
+            "the deployment line must not offer a row repair: {deployment}"
+        );
+
+        // Fix the deployment: the row was fine all along, so nothing remains.
+        config.security.nat64_prefixes.clear();
+        assert!(runtime_accepts_row(&config, &instance_key));
+        assert_eq!(egress_deployment_gap_line(&config), None);
         assert!(
             egress_grant_gap_lines(&config, &manifest)
                 .expect("gap lines must build")

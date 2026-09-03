@@ -813,7 +813,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [EgressStringCase<'_>; 17] = [
+        let cases: [EgressStringCase<'_>; 18] = [
             (
                 "cli-plugin-egress-seeded",
                 &[("name", "weather-tool"), ("count", "2")],
@@ -937,6 +937,16 @@ mod tests {
                     ("key", key),
                 ],
                 &["weather-tool", key, "egress_allow_private"],
+            ),
+            // A deployment-wide refusal names its own config paths, verbatim
+            // in every catalogue, and never a row repair.
+            (
+                "cli-plugin-egress-deployment-rejected",
+                &[("reason", "invalid NAT64 prefix configuration")],
+                &[
+                    "security.nat64_prefixes",
+                    "plugins.limits.max_connections_per_instance",
+                ],
             ),
         ];
 
