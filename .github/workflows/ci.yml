@@ -132,7 +132,11 @@ jobs:
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -171,7 +175,7 @@ jobs:
 
   relay-container-smoke:
     name: Relay Container Fresh-Volume Smoke
-    needs: [relay-container-smoke-changes]
+    needs: [fmt, relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -241,7 +245,11 @@ jobs:
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -280,7 +288,7 @@ jobs:
 
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
-    needs: [windows-clippy-tools-changes]
+    needs: [fmt, windows-clippy-tools-changes]
     if: needs.windows-clippy-tools-changes.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -699,7 +707,11 @@ jobs:
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -742,7 +754,7 @@ jobs:
 
   parallel-runtime-test:
     name: Parallel Runtime Test
-    needs: [parallel-runtime-test-changes]
+    needs: [fmt, parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
     runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
@@ -855,7 +867,11 @@ jobs:
   # skipped, so a job that should run never is.
   path-changes:
     name: Detect changed paths
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -912,7 +928,7 @@ jobs:
 
   nix-eval:
     name: Nix Module Eval
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -927,7 +943,7 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -969,7 +985,7 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1052,7 +1068,7 @@ jobs:
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
