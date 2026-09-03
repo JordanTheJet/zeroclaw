@@ -111,6 +111,9 @@ jobs:
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
+      - name: Test CLI and hardware path-label ownership
+        run: bash scripts/ci/path_labeler_matrix.test.sh
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     needs: [fmt]
@@ -666,6 +669,14 @@ jobs:
       # exercises the URL-verification handler coverage added by PR #9110.
       - name: Run Lark channel URL-verification tests
         run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-matrix` is outside `default-channels`, so the workspace run
+      # above does not execute Matrix's feature-gated library regressions. This
+      # step covers transcription-provider resolution for the Matrix channel.
+      - name: Run Matrix transcription provider resolution tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::tests::transcription_provider_resolution"
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
