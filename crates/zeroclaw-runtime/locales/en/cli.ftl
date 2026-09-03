@@ -741,6 +741,7 @@ cli-security-status-risk-profile = Risk profile: {$v}
 cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
+cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -749,6 +750,7 @@ cli-security-status-warnings = Warnings:   {$v}
 cli-security-status-warnings-none = Warnings:   none
 cli-security-status-warning-agent-disabled = agent is disabled
 cli-security-status-warning-sandbox-disabled = sandboxing is disabled for this agent risk profile
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = additional OS sandboxing is disabled; Docker runtime containment remains active
 cli-security-status-warning-sandbox-none = active sandbox is application-layer only
 cli-security-status-warning-sandbox-fallback = requested sandbox backend `{$requested}` fell back to `{$active}`
 cli-security-status-warning-workspace-not-restricted = workspace-only filesystem policy is disabled
