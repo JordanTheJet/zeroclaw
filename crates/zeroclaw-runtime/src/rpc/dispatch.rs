@@ -4581,10 +4581,9 @@ impl RpcDispatcher {
         for result in &results {
             match result {
                 crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
-                    // This surface starts the run but hands off no driver
-                    // (tracked in #10513), so a first action that needs one
-                    // leaves the run sitting in `active_runs` with nothing to
-                    // advance it. Leaving the producer key pointing at it would
+                    // This surface starts the run but hands off no driver, so
+                    // a first action that needs one leaves the run sitting in
+                    // `active_runs` with nothing to advance it. Leaving the producer key pointing at it would
                     // make the next Git or reconciliation producer coalesce onto
                     // that stalled run instead of doing the work — the key would
                     // suppress real work rather than deduplicate it. Withdraw the
@@ -6294,8 +6293,8 @@ mod tests {
         (dispatcher, engine, run_id, temp)
     }
 
-    /// This surface starts a run and hands off no driver (#10513), so a first
-    /// action needing one leaves the run active with nothing advancing it. If
+    /// This surface starts a run and hands off no driver, so a first action
+    /// needing one leaves the run active with nothing advancing it. If
     /// the producer key kept pointing at it, the next Git or reconciliation
     /// producer would coalesce onto that stalled run and skip its own work — the
     /// key would suppress real work rather than deduplicate it.
