@@ -2940,13 +2940,8 @@ fn print_egress_grant_ceremony(package: &str, instance_key: &str, granted: &[Str
 }
 
 /// Print the declaration-versus-grant difference for an instance row that
-/// already exists, and change nothing.
-///
-/// This is the security invariant of the ceremony: a package upgrade whose
-/// declaration grew must not extend an existing grant. The operator applies the
-/// difference deliberately, with the exact command printed here. The comparison
-/// reads the same `zpi1_` row `entry_config` resolves against, so "granted"
-/// means the one allowlist the runtime enforces.
+/// already exists, and change nothing. [`existing_egress_grant_lines`] builds
+/// what this prints.
 #[cfg(feature = "plugins-wasm")]
 fn report_existing_egress_grant(
     config: &crate::config::schema::Config,
@@ -2954,68 +2949,149 @@ fn report_existing_egress_grant(
     instance_key: &str,
     declared_egress: &[String],
 ) {
-    use crate::plugins::egress_ceremony::{
-        diff_declaration, egress_set_command, should_report_diff,
-    };
-    let (granted, _private) = config.plugins.entry_egress(instance_key);
-    let diff = diff_declaration(declared_egress, &granted);
-    if !should_report_diff(&diff) {
-        return;
+    for line in existing_egress_grant_lines(config, package, instance_key, declared_egress) {
+        println!("{line}");
     }
-    if !diff.declared_not_granted.is_empty() {
-        println!(
-            "{}",
-            ta(
+}
+
+/// The lines `plugin install` prints for an instance row that already exists.
+///
+/// This is the security invariant of the ceremony: a package upgrade whose
+/// declaration grew must not extend an existing grant. The operator applies the
+/// difference deliberately, with the exact command printed here. The comparison
+/// reads the same `zpi1_` row `entry_config` resolves against, so "granted"
+/// means the one allowlist the runtime enforces.
+///
+/// Install and `plugin list` answer the same question — is this grant usable?
+/// — so they consult the same runtime-backed planner. If the runtime would
+/// refuse the row as it stands, the same verdict line `plugin list` prints
+/// comes first, with the runtime's own reason and the repair command; the
+/// upgrade difference is then computed over the entries the runtime accepts,
+/// so the apply-command never carries a rejected entry forward; and if a
+/// private carve-out would still be refused after that command, the same
+/// incomplete-repair line follows. Under a deployment-wide refusal nothing is
+/// printed here: the caller reports that once, with its own paths, and a
+/// per-row command would imply the grant could take effect when it cannot.
+#[cfg(feature = "plugins-wasm")]
+fn existing_egress_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::{
+        EgressGapPlan, EgressGrantState, deployment_rejection, diff_declaration,
+        egress_set_command, partition_valid_hosts, plan_egress_gap, should_report_diff,
+    };
+    let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Vec::new();
+    }
+    let (granted, allow_private) = config.plugins.entry_egress(instance_key);
+    let state = EgressGrantState::Enforced {
+        granted: granted.clone(),
+        allow_private,
+    };
+    let plan = plan_egress_gap(instance_key, declared_egress, &state, &runtime);
+    let mut lines = Vec::new();
+
+    // The runtime's verdict on the row as it stands, in the same words
+    // `plugin list` uses.
+    let (rejected, repair_incomplete) = match &plan {
+        EgressGapPlan::Grant {
+            rejected,
+            repair_incomplete,
+            ..
+        } => (rejected.clone(), repair_incomplete.clone()),
+        EgressGapPlan::Nothing | EgressGapPlan::Migrate { .. } => (None, None),
+    };
+    if let (Some(reason), EgressGapPlan::Grant { command, .. }) = (&rejected, &plan) {
+        lines.push(egress_invalid_grant_line(package, reason, command));
+    }
+
+    // The upgrade difference, over the entries the runtime accepts.
+    let (accepted, _rejected_entries) = partition_valid_hosts(&granted);
+    let diff = diff_declaration(declared_egress, &accepted);
+    if should_report_diff(&diff) {
+        if !diff.declared_not_granted.is_empty() {
+            lines.push(ta(
                 "cli-plugin-egress-declared-not-granted",
                 &[
                     ("name", package),
                     ("count", &diff.declared_not_granted.len().to_string()),
                 ],
-                "This plugin declares destinations its config entry does not grant."
-            )
-        );
-        for host in &diff.declared_not_granted {
-            println!(
-                "  {}",
-                ta("cli-plugin-egress-added", &[("host", host)], "+ host")
-            );
-        }
-        println!(
-            "{}",
-            ta(
+                "This plugin declares destinations its config entry does not grant.",
+            ));
+            for host in &diff.declared_not_granted {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-added", &[("host", host)], "+ host")
+                ));
+            }
+            lines.push(ta(
                 "cli-plugin-egress-apply-command",
                 &[("command", &egress_set_command(instance_key, &diff.union()))],
-                "Grant them with the printed command."
-            )
-        );
-    }
-    if !diff.granted_not_declared.is_empty() {
-        println!(
-            "{}",
-            ta(
+                "Grant them with the printed command.",
+            ));
+        }
+        if !diff.granted_not_declared.is_empty() {
+            lines.push(ta(
                 "cli-plugin-egress-granted-not-declared",
                 &[
                     ("name", package),
                     ("count", &diff.granted_not_declared.len().to_string()),
                 ],
-                "This entry grants destinations the manifest no longer declares."
-            )
-        );
-        for host in &diff.granted_not_declared {
-            println!(
-                "  {}",
-                ta("cli-plugin-egress-removed", &[("host", host)], "- host")
-            );
+                "This entry grants destinations the manifest no longer declares.",
+            ));
+            for host in &diff.granted_not_declared {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-removed", &[("host", host)], "- host")
+                ));
+            }
         }
-    }
-    println!(
-        "{}",
-        ta(
+        lines.push(ta(
             "cli-plugin-egress-never-extended",
             &[("name", package)],
-            "Installing a package never extends an existing egress grant."
+            "Installing a package never extends an existing egress grant.",
+        ));
+    }
+
+    if let Some(reason) = &repair_incomplete {
+        lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+    }
+    lines
+}
+
+/// The one line both surfaces print when the runtime refuses a canonical row:
+/// the runtime's reason, and the command that replaces the grant with only
+/// the entries it accepts.
+#[cfg(feature = "plugins-wasm")]
+fn egress_invalid_grant_line(package: &str, reason: &str, command: &str) -> String {
+    format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-invalid-grant",
+            &[("name", package), ("reason", reason), ("command", command)],
+            "The runtime rejects this plugin's egress grant; replace it with the printed \
+             command."
         )
-    );
+    )
+}
+
+/// The one line both surfaces print when the printed command repairs the
+/// hosts but a private carve-out would still be refused.
+#[cfg(feature = "plugins-wasm")]
+fn egress_repair_incomplete_line(package: &str, reason: &str, instance_key: &str) -> String {
+    format!(
+        "    {}",
+        ta(
+            "cli-plugin-egress-repair-incomplete",
+            &[("name", package), ("reason", reason), ("key", instance_key)],
+            "After the printed command the runtime would still reject the grant; fix \
+             egress_allow_private by hand."
+        )
+    )
 }
 
 /// The migration diagnostic, on the surface an operator already
@@ -3041,7 +3117,10 @@ fn print_egress_grant_gaps(
     plugins: &[zeroclaw::plugins::PluginInfo],
 ) -> Result<()> {
     if let Some(line) = egress_deployment_gap_line(config) {
+        // Every plugin's policy is refused alike, and no per-plugin command
+        // can take effect until this is fixed, so no per-plugin lines follow.
         println!("{line}");
+        return Ok(());
     }
     for p in plugins {
         let Some(manifest) = host.manifest(&p.name) else {
@@ -3109,7 +3188,9 @@ fn egress_grant_gap_lines(
     config: &crate::config::schema::Config,
     manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<String>> {
-    use crate::plugins::egress_ceremony::{EgressGapPlan, plan_egress_gap, resolve_grant_state};
+    use crate::plugins::egress_ceremony::{
+        deployment_rejection, plan_egress_gap, resolve_grant_state,
+    };
     use zeroclaw::plugins::PluginPermission;
 
     if !manifest.permissions.contains(&PluginPermission::HttpClient) {
@@ -3129,9 +3210,14 @@ fn egress_grant_gap_lines(
         .collect();
     // The same inputs `plugin_egress_policy` hands the policy constructor at
     // request time, so the diagnostic's verdict on a row is the runtime's.
-    // Deployment-wide refusals are reported once by the caller; this report
-    // only ever attributes a refusal to the row itself.
+    // Under a deployment-wide refusal this prints nothing: the caller reports
+    // that once, with its own paths, and a per-row command would imply the
+    // grant could take effect when it cannot. This report only ever
+    // attributes a refusal to the row itself.
     let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Ok(Vec::new());
+    }
 
     let mut lines = Vec::new();
     for (_, instance_key) in manifest_config_entries(manifest)? {
@@ -3145,159 +3231,140 @@ fn egress_grant_gap_lines(
         let state = resolve_grant_state(&instance_key, &legacy_candidates, &row_names, |row| {
             config.plugins.entry_egress(row)
         });
-        match plan_egress_gap(&instance_key, &declared, &state, &runtime) {
-            EgressGapPlan::Nothing => {}
-            EgressGapPlan::Grant {
-                missing,
-                rejected,
-                repair_incomplete,
-                command,
-                ..
-            } => {
-                if let Some(reason) = &rejected {
-                    // The runtime refuses the row as it stands, so every
-                    // request is denied. The command is the repair, because
-                    // it carries only the entries the runtime accepts.
-                    lines.push(format!(
-                        "  {}",
-                        ta(
-                            "cli-plugin-egress-invalid-grant",
-                            &[
-                                ("name", &package),
-                                ("reason", reason),
-                                ("command", &command)
-                            ],
-                            "The runtime rejects this plugin's egress grant; replace it with \
-                             the printed command."
-                        )
-                    ));
-                }
-                if !missing.is_empty() {
-                    let hosts = missing.join(", ");
-                    lines.push(format!(
-                        "  {}",
-                        ta(
-                            "cli-plugin-egress-gap",
-                            &[("name", &package), ("hosts", &hosts), ("command", &command)],
-                            "This plugin declares destinations its entry does not grant."
-                        )
-                    ));
-                }
-                if let Some(reason) = &repair_incomplete {
-                    lines.push(format!(
-                        "    {}",
-                        ta(
-                            "cli-plugin-egress-repair-incomplete",
-                            &[
-                                ("name", &package),
-                                ("reason", reason),
-                                ("key", &instance_key)
-                            ],
-                            "After the printed command the runtime would still reject the \
-                             grant; fix egress_allow_private by hand."
-                        )
-                    ));
-                }
+        lines.extend(render_egress_gap_plan(
+            &package,
+            &instance_key,
+            &plan_egress_gap(&instance_key, &declared, &state, &runtime),
+        ));
+    }
+    Ok(lines)
+}
+
+/// Render one instance's plan as the lines `plugin list` prints. Shared with
+/// the install-time existing-row report through the two line helpers below,
+/// so both surfaces describe a refused row in exactly the same words.
+#[cfg(feature = "plugins-wasm")]
+fn render_egress_gap_plan(
+    package: &str,
+    instance_key: &str,
+    plan: &crate::plugins::egress_ceremony::EgressGapPlan,
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::EgressGapPlan;
+    let mut lines = Vec::new();
+    match plan {
+        EgressGapPlan::Nothing => {}
+        EgressGapPlan::Grant {
+            missing,
+            rejected,
+            repair_incomplete,
+            command,
+            ..
+        } => {
+            if let Some(reason) = rejected {
+                // The runtime refuses the row as it stands, so every request
+                // is denied. The command is the repair, because it carries
+                // only the entries the runtime accepts.
+                lines.push(egress_invalid_grant_line(package, reason, command));
             }
-            EgressGapPlan::Migrate {
-                legacy_row,
-                missing,
-                rejected,
-                repair_incomplete,
-                grant: Some(command),
-                ..
-            } => {
-                // Something still has to change after the rename — an
-                // uncovered destination, a row the runtime refuses, or both —
-                // so this is the numbered two-step: rename first so the grant
-                // command addresses a row that exists. Neither headline
-                // carries the command, because it only resolves after the
-                // rename.
-                if let Some(reason) = &rejected {
-                    lines.push(format!(
-                        "  {}",
-                        ta(
-                            "cli-plugin-egress-invalid-grant-legacy",
-                            &[("name", &package), ("reason", reason)],
-                            "The runtime rejects this plugin's egress grant, and its grant \
-                             is still on a legacy config row."
-                        )
-                    ));
-                }
-                if !missing.is_empty() {
-                    let hosts = missing.join(", ");
-                    lines.push(format!(
-                        "  {}",
-                        ta(
-                            "cli-plugin-egress-gap-legacy",
-                            &[("name", &package), ("hosts", &hosts)],
-                            "This plugin declares destinations its entry does not grant, \
-                             and its grant is still on a legacy config row."
-                        )
-                    ));
-                }
-                lines.push(format!(
-                    "    {}",
-                    ta(
-                        "cli-plugin-egress-migrate-step",
-                        &[
-                            ("name", &package),
-                            ("legacy", &legacy_row),
-                            ("key", &instance_key),
-                        ],
-                        "1) migrate the row: rename it to the instance key, then save."
-                    )
-                ));
-                lines.push(format!(
-                    "    {}",
-                    ta(
-                        "cli-plugin-egress-grant-step",
-                        &[("command", &command)],
-                        "2) grant the destinations with the printed command."
-                    )
-                ));
-                if let Some(reason) = &repair_incomplete {
-                    lines.push(format!(
-                        "    {}",
-                        ta(
-                            "cli-plugin-egress-repair-incomplete",
-                            &[
-                                ("name", &package),
-                                ("reason", reason),
-                                ("key", &instance_key)
-                            ],
-                            "After the printed command the runtime would still reject the \
-                             grant; fix egress_allow_private by hand."
-                        )
-                    ));
-                }
-            }
-            EgressGapPlan::Migrate {
-                legacy_row,
-                grant: None,
-                ..
-            } => {
-                // The rename alone yields a row the runtime accepts that
-                // covers the declaration: no grant command is offered, because
-                // one would only replace a list the operator already has
-                // right.
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
                 lines.push(format!(
                     "  {}",
                     ta(
-                        "cli-plugin-egress-legacy-inert",
-                        &[
-                            ("name", &package),
-                            ("legacy", &legacy_row),
-                            ("key", &instance_key),
-                        ],
-                        "This plugin's egress grant is on a legacy config row the runtime \
-                         does not read; rename the row to the instance key to put it in effect."
+                        "cli-plugin-egress-gap",
+                        &[("name", package), ("hosts", &hosts), ("command", command)],
+                        "This plugin declares destinations its entry does not grant."
                     )
                 ));
             }
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            missing,
+            rejected,
+            repair_incomplete,
+            grant: Some(command),
+            ..
+        } => {
+            // Something still has to change after the rename — an uncovered
+            // destination, a row the runtime refuses, or both — so this is the
+            // numbered two-step: rename first so the grant command addresses a
+            // row that exists. Neither headline carries the command, because
+            // it only resolves after the rename.
+            if let Some(reason) = rejected {
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-invalid-grant-legacy",
+                        &[("name", package), ("reason", reason)],
+                        "The runtime rejects this plugin's egress grant, and its grant is \
+                         still on a legacy config row."
+                    )
+                ));
+            }
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap-legacy",
+                        &[("name", package), ("hosts", &hosts)],
+                        "This plugin declares destinations its entry does not grant, and \
+                         its grant is still on a legacy config row."
+                    )
+                ));
+            }
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-migrate-step",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "1) migrate the row: rename it to the instance key, then save."
+                )
+            ));
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-grant-step",
+                    &[("command", command)],
+                    "2) grant the destinations with the printed command."
+                )
+            ));
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            grant: None,
+            ..
+        } => {
+            // The rename alone yields a row the runtime accepts that covers the
+            // declaration: no grant command is offered, because one would only
+            // replace a list the operator already has right.
+            lines.push(format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-legacy-inert",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "This plugin's egress grant is on a legacy config row the runtime does \
+                     not read; rename the row to the instance key to put it in effect."
+                )
+            ));
         }
     }
-    Ok(lines)
+    lines
 }
 
 /// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
@@ -3391,7 +3458,14 @@ async fn seed_plugin_config_entries(
 
     // Rows that already existed — an upgrade, a reinstall, or an
     // operator-authored row. Never auto-extend: report the difference
-    // and leave `egress_hosts` exactly as the operator left it.
+    // and leave `egress_hosts` exactly as the operator left it. A
+    // deployment-wide refusal is reported once, here, and the per-row report
+    // then stays silent for the same reason `plugin list` does.
+    if !existing.is_empty()
+        && let Some(line) = egress_deployment_gap_line(config)
+    {
+        println!("{line}");
+    }
     for instance_key in existing {
         report_existing_egress_grant(config, package, instance_key, declared_egress);
     }
@@ -13701,10 +13775,7 @@ mod tests {
             .find(|line| line.contains("zeroclaw config set"))
             .expect("the migrate ceremony must still print a grant command");
         // The command double-quotes its value; take what is between the quotes.
-        let command_value = grant_line
-            .split('"')
-            .nth(1)
-            .expect("the grant command must quote its value");
+        let command_value = printed_command_value(grant_line);
         assert!(
             command_value.contains("gitea.example.net"),
             "the printed command must carry the operator-only grant forward: {grant_line}"
@@ -13736,6 +13807,21 @@ mod tests {
             granted.contains(&"api.example.com".to_string()),
             "the already-granted declared host must survive too: {granted:?}"
         );
+    }
+
+    /// The quoted value of the `zeroclaw config set` command printed on `line`.
+    /// A verdict line also carries the runtime's reason, which quotes the
+    /// offending entry, so the value is read after the command, not from the
+    /// first quote on the line.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn printed_command_value(line: &str) -> &str {
+        let start = line
+            .find("zeroclaw config set")
+            .expect("the line must carry a config set command");
+        line[start..]
+            .split('"')
+            .nth(1)
+            .expect("the printed command must quote its value")
     }
 
     /// The runtime's own acceptance check for a row, with the same inputs the
@@ -13855,10 +13941,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("zeroclaw config set"))
             .expect("a refused row must force a grant command, since the rename alone would put a refused allowlist in effect");
-        let command_value = grant_line
-            .split('"')
-            .nth(1)
-            .expect("the grant command must quote its value");
+        let command_value = printed_command_value(grant_line);
         assert!(
             command_value.contains("api.com") && !command_value.contains("*.com"),
             "the command must carry the declaration and leave the rejected entry out: {grant_line}"
@@ -13923,10 +14006,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("zeroclaw config set"))
             .expect("a refused row must be offered a repair command");
-        let command_value = grant_line
-            .split('"')
-            .nth(1)
-            .expect("the grant command must quote its value");
+        let command_value = printed_command_value(grant_line);
         config
             .set_prop(
                 &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
@@ -13945,20 +14025,26 @@ mod tests {
     }
 
     /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
-    /// and covers the declaration; only `security.nat64_prefixes` is
-    /// malformed, which the config loader only warns about. The runtime refuses
-    /// every policy for it. A report that ran the constructor and attributed
-    /// any failure to the row would call this grant refused, print a no-op
-    /// command replacing the hosts with themselves, and tell the operator to
-    /// fix `egress_allow_private` — none of which touches the prefix list. The
-    /// per-plugin report must stay silent for the row, and the deployment
-    /// line must name the responsible paths, once.
+    /// but does not cover the whole declaration; only `security.nat64_prefixes`
+    /// is malformed, which the config loader only warns about. The runtime
+    /// refuses every policy for it. A report that ran the constructor and
+    /// attributed any failure to the row would call the grant refused and tell
+    /// the operator to fix `egress_allow_private`; a report that merely
+    /// filtered the deployment error out would still print a per-row grant
+    /// command, implying the grant could take effect when it cannot. The
+    /// per-plugin report must stay silent, and the deployment line must name
+    /// the responsible paths, once. Once the deployment is fixed, the real gap
+    /// is reported as usual.
     #[test]
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
     fn a_deployment_wide_refusal_is_reported_once_with_its_own_paths_not_as_a_row_repair() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let mut config = config_in_dir(tmp.path());
-        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
         let instance_key = expected_instance_key(&manifest);
         config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
             name: instance_key.clone(),
@@ -13975,7 +14061,18 @@ mod tests {
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
         assert!(
             lines.is_empty(),
-            "a deployment-wide refusal must not be attributed to the row: {lines:?}"
+            "no per-row line may print under a deployment-wide refusal, not even for \
+             the real gap: {lines:?}"
+        );
+        assert!(
+            existing_egress_grant_lines(
+                &config,
+                "weather-tool",
+                &instance_key,
+                &manifest.egress.hosts
+            )
+            .is_empty(),
+            "the install-time report follows the same rule"
         );
         let deployment = egress_deployment_gap_line(&config)
             .expect("the deployment refusal must be reported on its own");
@@ -13990,14 +14087,123 @@ mod tests {
             "the deployment line must not offer a row repair: {deployment}"
         );
 
-        // Fix the deployment: the row was fine all along, so nothing remains.
+        // Fix the deployment: the row's real gap is now reported as usual.
         config.security.nat64_prefixes.clear();
-        assert!(runtime_accepts_row(&config, &instance_key));
         assert_eq!(egress_deployment_gap_line(&config), None);
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            egress_grant_gap_lines(&config, &manifest)
-                .expect("gap lines must build")
-                .is_empty()
+            lines[0].contains("api2.example.com") && lines[0].contains("zeroclaw config set"),
+            "the uncovered destination and its command are reported once the deployment \
+             is accepted: {lines:?}"
+        );
+    }
+
+    /// REGRESSION (install and list must agree): a canonical row whose hosts
+    /// cover the declaration but whose `egress_allow_private` names a host no
+    /// grant covers. The host-only upgrade diff is empty, so a reinstall that
+    /// looked only at hosts would print nothing while the runtime refuses the
+    /// row and denies every request. The install-time report must print the
+    /// same runtime verdict `plugin list` prints, word for word, including
+    /// that the printed command alone does not complete the repair.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_reports_the_runtime_verdict_for_an_existing_row_with_an_ungranted_carveout() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: vec!["other.example.com".to_string()],
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("not granted"),
+            "the runtime's reason must be reported at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("zeroclaw config set"),
+            "a repair command must be offered at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("egress_allow_private"),
+            "the command alone does not complete the repair, and install must say so: {rendered}"
+        );
+
+        // Same words as `plugin list`: both surfaces share one renderer.
+        let list = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        for line in &list {
+            assert!(
+                install.contains(line),
+                "install must print every verdict line list prints; missing {line:?} in {install:?}"
+            );
+        }
+    }
+
+    /// REGRESSION (install and list must agree, rejected entry): a canonical
+    /// row granting `*.com`, which the runtime rejects. The install-time
+    /// report must name the runtime's reason and offer a command whose value
+    /// leaves the rejected entry out, rather than staying silent or printing a
+    /// replacement that carries it forward.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_names_a_rejected_host_entry_and_keeps_it_out_of_the_apply_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["*.com".to_string()],
+            egress_allow_private: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the reason names the entry: {rendered}"
+        );
+        for line in install
+            .iter()
+            .filter(|line| line.contains("zeroclaw config set"))
+        {
+            let value = printed_command_value(line);
+            assert!(
+                value.contains("api.com") && !value.contains("*.com"),
+                "every printed command must carry the declaration and leave the rejected \
+                 entry out: {line}"
+            );
+        }
+        assert!(
+            install
+                .iter()
+                .any(|line| line.contains("zeroclaw config set")),
+            "a repair command must be offered: {rendered}"
         );
     }
 

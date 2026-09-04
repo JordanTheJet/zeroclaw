@@ -359,7 +359,10 @@ names the row's `egress_allow_private` path, since that has to be fixed by
 hand. A refusal that is not about the row at all, a malformed
 `security.nat64_prefixes` or a zero `plugins.limits.max_connections_per_instance`,
 refuses every plugin's policy alike; `plugin list` reports it once, naming
-those two paths, and never as a per-plugin grant repair.
+those two paths, prints no per-plugin lines until it is fixed, and never
+offers a per-plugin grant repair for it. `plugin install` reports an existing
+row with the same verdict, in the same words, so install and list never
+disagree about whether a grant is usable.
 
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare
