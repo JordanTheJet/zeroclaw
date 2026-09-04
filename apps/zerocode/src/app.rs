@@ -2705,8 +2705,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(
@@ -2745,8 +2750,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         switch_mode(
@@ -2852,8 +2862,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(

@@ -13973,12 +13973,14 @@ mod tests {
                     "outcome": "completed",
                     "content": "done"
                 }),
+                received_at: Instant::now(),
             })
             .unwrap();
         notif_tx
             .send(RpcNotification {
                 method: "unrelated".to_string(),
                 params: serde_json::Value::Null,
+                received_at: Instant::now(),
             })
             .unwrap();
 
@@ -14036,6 +14038,7 @@ mod tests {
                     "outcome": "completed",
                     "content": "done"
                 }),
+                received_at: Instant::now(),
             })
             .unwrap();
         chat.drain_notifications();
