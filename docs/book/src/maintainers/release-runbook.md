@@ -319,6 +319,7 @@ Everything else is skipped with a logged reason:
 ```
 ==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:crates (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
 ==> skip daily-audit:advisories (not on dry-run-safe allowlist)
@@ -351,7 +352,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`publish`, `docker`): the
+- Environment-gated jobs (`publish`, `docker`, and the crates publisher): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -385,15 +386,17 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Two jobs are gated by GitHub environment protection rules. When each becomes
+Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve both when they appear:
+Approve all three when they appear. Approve `crates-io` only after its tokenless
+package preflight is green:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
 | `docker` | `docker` | Pushes images to GHCR |
+| `crates-io` | `crates / Publish to crates.io` | Publishes the verified 23-crate workspace in dependency order |
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
