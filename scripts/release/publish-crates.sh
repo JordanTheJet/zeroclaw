@@ -62,6 +62,7 @@ need cargo
 need jq
 need curl
 need python3
+need git
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -71,6 +72,30 @@ fi
 if [[ -n "$EXPECTED_VERSION" && "$VERSION" != "$EXPECTED_VERSION" ]]; then
   echo "error: workspace version is $VERSION but $EXPECTED_VERSION was requested." >&2
   echo "       Run scripts/release/bump-version.sh first." >&2
+  exit 1
+fi
+
+# The root package intentionally includes the generated, gitignored web/dist
+# tree. Both workflow jobs build it immediately before invoking this script,
+# so Cargo needs --allow-dirty to package those files. Keep that exception
+# narrow: tracked changes or ordinary untracked files mean the checkout is not
+# the immutable release source and must fail before any registry operation.
+if ! git diff --quiet -- || ! git diff --cached --quiet --; then
+  echo "error: tracked files changed after the release checkout; refusing to publish." >&2
+  git status --short --untracked-files=no >&2
+  exit 1
+fi
+untracked="$(git ls-files --others --exclude-standard)"
+if [[ -n "$untracked" ]]; then
+  echo "error: untracked, non-ignored files are present; refusing to publish:" >&2
+  while IFS= read -r path; do
+    echo "       $path" >&2
+  done <<<"$untracked"
+  exit 1
+fi
+if [[ ! -s web/dist/index.html ]]; then
+  echo "error: web/dist/index.html is missing or empty." >&2
+  echo "       Run cargo web build before publishing." >&2
   exit 1
 fi
 
@@ -245,7 +270,7 @@ if [[ $EXECUTE -eq 0 ]]; then
   # unpublished workspace dependencies resolve without any upload. Select only
   # the coordinated release set; `--workspace` would also package independent
   # 0.1.x crates that merely share this repository.
-  publish_args=(cargo publish --dry-run --locked)
+  publish_args=(cargo publish --dry-run --locked --allow-dirty)
   for crate in "${PUBLISHABLE[@]}"; do
     publish_args+=(-p "$crate")
   done
@@ -356,7 +381,7 @@ for crate in $ORDER; do
   attempt=1
   log="$(mktemp)"
   while true; do
-    if cargo publish -p "$crate" --locked --no-verify 2>&1 | tee "$log"; then
+    if cargo publish -p "$crate" --locked --no-verify --allow-dirty 2>&1 | tee "$log"; then
       break
     fi
     # Throttling is not failure. Back off and retry rather than abandoning a
