@@ -195,14 +195,14 @@ authoritative automation.
 | Secret | Used by |
 |---|---|
 | `AUR_SSH_KEY` | `pub-aur.yml` |
-| `CARGO_REGISTRY_TOKEN` | `crates-io` environment, consumed only by the `pub-crates.yml` publish job; v0.8.5 needs `publish-new` for `zerorelay`, `zeroclaw-relay-proto`, and `zeroclaw-tls`, while later coordinated updates need `publish-update` |
+| `CARGO_REGISTRY_TOKEN` | Repository secret explicitly passed to `pub-crates.yml` and referenced only by its protected publish job; v0.8.5 needs `publish-new` for `zerorelay`, `zeroclaw-relay-proto`, and `zeroclaw-tls`, while later coordinated updates need `publish-update` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
 | `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`, `release-stable-manual.yml`, `scoop-bucket-canary.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
-Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. Store `CARGO_REGISTRY_TOKEN` as an environment secret, not a repository secret, and require a reviewer on the `crates-io` environment. The token is then available only to the irreversible publish job after approval. The tokenless preflight packages the same immutable release commit before an approver can release the token.
+Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. Store `CARGO_REGISTRY_TOKEN` as a repository secret and map only that named secret into the reusable publisher. The called workflow references it only in the irreversible publish step, whose job requires approval through the `crates-io` environment; the tokenless preflight neither references nor exports it. The preflight packages the same immutable release commit before an approver can start the publish job.
 
 Most crates in the coordinated release set already exist and are eligible for
 crates.io trusted publishing. The v0.8.5 release additionally creates

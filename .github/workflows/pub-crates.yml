@@ -26,6 +26,10 @@ on:
         required: false
         default: false
         type: boolean
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: "Repository-scoped crates.io token; referenced only by the protected publish job"
+        required: true
   workflow_dispatch:
     inputs:
       release_tag:
@@ -217,7 +221,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "::error::The crates-io environment secret CARGO_REGISTRY_TOKEN is required to publish."
+            echo "::error::The repository secret CARGO_REGISTRY_TOKEN is required to publish."
             echo "::error::Mint one at https://crates.io/settings/tokens. A crate that does not"
             echo "::error::yet exist needs the publish-new scope, not just publish-update."
             exit 1

@@ -1224,6 +1224,8 @@ jobs:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_sha: ${{ github.sha }}
       dry_run: false
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
   scoop:
     name: Update Scoop Manifest
     needs: [validate, publish]

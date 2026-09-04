@@ -407,8 +407,21 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     }
     let crates_call = yaml_block(&release, "  crates:\n");
     assert!(
-        !crates_call.contains("CARGO_REGISTRY_TOKEN"),
-        "the caller must not pass a repository secret; the protected crates-io environment owns it"
+        crates_call
+            .contains("secrets:\n      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+        "the reusable crates.io workflow must receive the existing repository secret explicitly"
+    );
+    assert!(
+        !crates_call.contains("secrets: inherit"),
+        "the crates.io caller must pass only the named registry secret"
+    );
+
+    let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
+    assert!(
+        workflow_call.contains(
+            "secrets:\n      CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: true"
+        ),
+        "the reusable publisher must declare the explicitly mapped registry secret"
     );
 
     let preflight = yaml_block(&publisher, "  preflight:\n");
@@ -427,7 +440,7 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     }
     assert!(
         !preflight.contains("CARGO_REGISTRY_TOKEN"),
-        "the reversible preflight must never receive the registry token"
+        "the reversible preflight must never reference the registry token"
     );
     for required in [
         "environment:\n      name: crates-io",
