@@ -350,8 +350,8 @@ pub struct WhatsAppWebChannel {
     /// does and the safer of the two readings of zero.
     approval_timeout_secs: u64,
     /// Bot handle for shutdown.
-    /// whatsapp-rust 0.6: `Bot::run()` now returns `BotHandle` (a Future + abort)
-    /// rather than a tokio JoinHandle directly (oxidezap/whatsapp-rust BotHandle wrapper).
+    /// Handle returned by `Bot::spawn` in whatsapp-rust 0.7 (a Future + abort)
+    /// rather than a tokio JoinHandle directly.
     bot_handle: Arc<Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
     /// Client handle for sending messages and typing indicators
     client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
@@ -731,7 +731,7 @@ impl WhatsAppWebChannel {
                 .await
                 .ok()
                 .flatten()
-                .map(|entry| entry.phone_number)
+                .map(|entry| entry.phone_number.to_string())
         } else {
             None
         };
@@ -748,18 +748,39 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Fan a delivered batch out to the per-message handler, in arrival order.
+    ///
+    /// whatsapp-rust 0.7 replaced `Event::Message(msg, info)` with
+    /// `Event::Messages(batch)`. Live traffic still arrives as a batch of one;
+    /// an offline drain delivers one batch per durable commit. Each message is
+    /// dispatched through its own call so that a per-message early return skips
+    /// only that message: inlining the loop into the handler body would turn
+    /// each of its early returns into "abandon the rest of the batch".
     #[cfg(feature = "whatsapp-web")]
     async fn handle_inbound_message_event(
         event: &wacore::types::events::Event,
         client: &whatsapp_rust::Client,
         context: &WhatsAppInboundContext,
     ) {
-        use wacore::proto_helpers::MessageExt;
-        use wacore_binary::jid::JidExt as _;
-
-        let wacore::types::events::Event::Message(msg, info) = event else {
+        let wacore::types::events::Event::Messages(batch) = event else {
             return;
         };
+
+        for inbound in batch.messages.iter() {
+            Self::handle_one_inbound_message(&inbound.message, &inbound.info, client, context)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_one_inbound_message(
+        msg: &waproto::whatsapp::Message,
+        info: &wacore::types::message::MessageInfo,
+        client: &whatsapp_rust::Client,
+        context: &WhatsAppInboundContext,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        use wacore_binary::jid::JidExt as _;
 
         let sender_jid = info.source.sender.clone();
         let sender_alt = info.source.sender_alt.clone();
@@ -1031,7 +1052,7 @@ impl WhatsAppWebChannel {
             return;
         }
 
-        let voice_text = if let Some(ref audio) = msg.audio_message {
+        let voice_text = if let Some(audio) = msg.audio_message.as_option() {
             let is_ptt = audio.ptt == Some(true);
             let non_ptt_enabled = context
                 .transcription_config
@@ -1399,33 +1420,36 @@ impl WhatsAppWebChannel {
         use wacore::proto_helpers::MessageExt;
         let base = msg.get_base_message();
 
-        if let Some(ref ext) = base.extended_text_message
-            && let Some(ref ctx) = ext.context_info
+        // waproto 0.7 renders optional submessages as `MessageField` rather than
+        // `Option<Box<_>>`, so each arm reads through `as_option()`. Order is
+        // load-bearing: the first populated variant wins, as before.
+        if let Some(ext) = base.extended_text_message.as_option()
+            && let Some(ctx) = ext.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref img) = base.image_message
-            && let Some(ref ctx) = img.context_info
+        if let Some(img) = base.image_message.as_option()
+            && let Some(ctx) = img.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref vid) = base.video_message
-            && let Some(ref ctx) = vid.context_info
+        if let Some(vid) = base.video_message.as_option()
+            && let Some(ctx) = vid.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref doc) = base.document_message
-            && let Some(ref ctx) = doc.context_info
+        if let Some(doc) = base.document_message.as_option()
+            && let Some(ctx) = doc.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref aud) = base.audio_message
-            && let Some(ref ctx) = aud.context_info
+        if let Some(aud) = base.audio_message.as_option()
+            && let Some(ctx) = aud.context_info.as_option()
         {
             return Some(ctx);
         }
-        if let Some(ref stk) = base.sticker_message
-            && let Some(ref ctx) = stk.context_info
+        if let Some(stk) = base.sticker_message.as_option()
+            && let Some(ctx) = stk.context_info.as_option()
         {
             return Some(ctx);
         }
@@ -1437,7 +1461,7 @@ impl WhatsAppWebChannel {
     fn extract_quoted_message(
         msg: &waproto::whatsapp::Message,
     ) -> Option<&waproto::whatsapp::Message> {
-        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
+        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_option())
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1508,7 +1532,7 @@ impl WhatsAppWebChannel {
 
         let base = msg.get_base_message();
 
-        if let Some(ref image) = base.image_message {
+        if let Some(image) = base.image_message.as_option() {
             let mime = image
                 .mimetype
                 .clone()
@@ -1519,7 +1543,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                image.as_ref() as &dyn Downloadable,
+                image as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1527,7 +1551,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref video) = base.video_message {
+        if let Some(video) = base.video_message.as_option() {
             let mime = video
                 .mimetype
                 .clone()
@@ -1538,7 +1562,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                video.as_ref() as &dyn Downloadable,
+                video as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1546,7 +1570,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if include_audio && let Some(ref audio) = base.audio_message {
+        if include_audio && let Some(audio) = base.audio_message.as_option() {
             let mime = audio
                 .mimetype
                 .clone()
@@ -1557,7 +1581,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                audio.as_ref() as &dyn Downloadable,
+                audio as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1565,7 +1589,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref sticker) = base.sticker_message {
+        if let Some(sticker) = base.sticker_message.as_option() {
             let mime = sticker
                 .mimetype
                 .clone()
@@ -1576,7 +1600,7 @@ impl WhatsAppWebChannel {
             );
             Self::push_downloaded_attachment(
                 client,
-                sticker.as_ref() as &dyn Downloadable,
+                sticker as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1594,19 +1618,19 @@ impl WhatsAppWebChannel {
         use wacore::proto_helpers::MessageExt;
         let base = msg.get_base_message();
 
-        if base.sticker_message.is_some() {
+        if base.sticker_message.is_set() {
             return "[Sticker]".to_string();
         }
-        if base.image_message.is_some() {
+        if base.image_message.is_set() {
             return "[Image]".to_string();
         }
-        if base.video_message.is_some() {
+        if base.video_message.is_set() {
             return "[Video]".to_string();
         }
-        if base.document_message.is_some() {
+        if base.document_message.is_set() {
             return "[Document]".to_string();
         }
-        if let Some(ref loc) = base.location_message {
+        if let Some(loc) = base.location_message.as_option() {
             // Live locations are silently ignored — they stream
             // periodic updates and have no meaningful static content.
             if loc.is_live == Some(true) {
@@ -1741,15 +1765,14 @@ impl WhatsAppWebChannel {
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
-        // whatsapp-rust 0.6: UploadResponse cryptographic fields became
-        // `[u8; 32]` for type safety. Pull the Vec<u8> copies before
-        // consuming the strings so the partial-move on `upload.direct_path`
-        // doesn't bite.
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        // UploadResponse cryptographic fields are `[u8; 32]`, and the
+        // `_vec()` helpers are gone. Copy them out before consuming the
+        // strings so the partial-move on `upload.direct_path` doesn't bite.
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let voice_msg = waproto::whatsapp::Message {
-            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+            audio_message: waproto::whatsapp::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(media_key),
@@ -1760,7 +1783,8 @@ impl WhatsAppWebChannel {
                 ptt: Some(true),
                 seconds: Some(estimated_seconds),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
 
@@ -1810,12 +1834,12 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
 
-        let media_key = upload.media_key_vec();
-        let file_enc_sha256 = upload.file_enc_sha256_vec();
-        let file_sha256 = upload.file_sha256_vec();
+        let media_key = upload.media_key.to_vec();
+        let file_enc_sha256 = upload.file_enc_sha256.to_vec();
+        let file_sha256 = upload.file_sha256.to_vec();
         let outgoing = match marker.kind {
             WhatsAppMediaKind::Image => waproto::whatsapp::Message {
-                image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                image_message: waproto::whatsapp::message::ImageMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(media_key),
@@ -1824,11 +1848,12 @@ impl WhatsAppWebChannel {
                     file_length: Some(upload.file_length),
                     mimetype: Some(mime),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 ..Default::default()
             },
             WhatsAppMediaKind::Video => waproto::whatsapp::Message {
-                video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
+                video_message: waproto::whatsapp::message::VideoMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(media_key),
@@ -1837,14 +1862,15 @@ impl WhatsAppWebChannel {
                     file_length: Some(upload.file_length),
                     mimetype: Some(mime),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 ..Default::default()
             },
             WhatsAppMediaKind::Audio | WhatsAppMediaKind::Voice => {
                 #[allow(clippy::cast_possible_truncation)]
                 let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
                 waproto::whatsapp::Message {
-                    audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                    audio_message: waproto::whatsapp::message::AudioMessage {
                         url: Some(upload.url),
                         direct_path: Some(upload.direct_path),
                         media_key: Some(media_key),
@@ -1855,7 +1881,8 @@ impl WhatsAppWebChannel {
                         ptt: Some(matches!(marker.kind, WhatsAppMediaKind::Voice)),
                         seconds: Some(estimated_seconds),
                         ..Default::default()
-                    })),
+                    }
+                    .into(),
                     ..Default::default()
                 }
             }
@@ -1866,7 +1893,7 @@ impl WhatsAppWebChannel {
                     .unwrap_or("attachment")
                     .to_string();
                 waproto::whatsapp::Message {
-                    document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
+                    document_message: waproto::whatsapp::message::DocumentMessage {
                         url: Some(upload.url),
                         direct_path: Some(upload.direct_path),
                         media_key: Some(media_key),
@@ -1877,7 +1904,8 @@ impl WhatsAppWebChannel {
                         file_name: Some(file_name.clone()),
                         title: Some(file_name),
                         ..Default::default()
-                    })),
+                    }
+                    .into(),
                     ..Default::default()
                 }
             }
@@ -1898,13 +1926,14 @@ impl WhatsAppWebChannel {
         loc: &WhatsAppLocation,
     ) -> Result<()> {
         let outgoing = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+            location_message: waproto::whatsapp::message::LocationMessage {
                 degrees_latitude: Some(loc.lat),
                 degrees_longitude: Some(loc.lng),
                 name: loc.name.clone(),
                 address: loc.address.clone(),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         Box::pin(client.send_message(to.clone(), outgoing))
@@ -2802,7 +2831,7 @@ impl Channel for WhatsAppWebChannel {
             let configured_push_name = self.push_name.clone();
 
             let mut builder = Bot::builder()
-                .with_backend(backend)
+                .with_backend_arc(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
                 .with_runtime(TokioRuntime)
@@ -2825,11 +2854,11 @@ impl Channel for WhatsAppWebChannel {
                     let inbound_context = inbound_context.clone();
                     let configured_push_name = configured_push_name.clone();
                     async move {
-                        // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
-                        // per so we match against `&*event` to get a
-                        // `&Event` reference and bind variant fields by ref.
+                        // Event handlers receive `Arc<Event>`, so match on
+                        // `&*event` to get a `&Event` and bind variant fields
+                        // by reference.
                         match &*event {
-                            Event::Message(_, _) => {
+                            Event::Messages(_) => {
                                 Self::handle_inbound_message_event(
                                     event.as_ref(),
                                     &client,
@@ -2844,10 +2873,8 @@ impl Channel for WhatsAppWebChannel {
                                     "WhatsApp Web connected successfully",
                                 );
                                 WhatsAppWebChannel::reset_retry(&retry_count);
-                                let device = client
-                                    .persistence_manager()
-                                    .get_device_snapshot()
-                                    .await;
+                                // 0.7 returns the snapshot directly, not a future.
+                                let device = client.persistence_manager().get_device_snapshot();
                                 // Resolve bot identity from the device store
                                 if mention_only {
                                     if let Some(ref pn) = device.pn
@@ -2914,7 +2941,8 @@ impl Channel for WhatsAppWebChannel {
                             Event::StreamError(stream_error) => {
                                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
-                            Event::PairingCode { code, .. } => {
+                            Event::PairingCode(pairing) => {
+                                let code = &pairing.code;
                                 crate::login_events::LoginEvent::PairCode { code: code.as_str() }
                                     .emit(
                                     "whatsapp",
@@ -2925,7 +2953,8 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
-                            Event::PairingQrCode { code, .. } => {
+                            Event::PairingQrCode(qr) => {
+                                let code = &qr.code;
                                 crate::login_events::LoginEvent::Qr {
                                     payload: code.as_str(),
                                     image_url: None,
@@ -2980,11 +3009,12 @@ impl Channel for WhatsAppWebChannel {
                 );
             }
 
-            let mut bot = builder.build().await?;
+            let bot = builder.build().await?;
             *self.client.lock() = Some(bot.client());
 
-            // Run the bot
-            let bot_handle = bot.run().await?;
+            // `run` consumes and drives the bot in place in 0.7; `spawn`
+            // returns the abortable handle this channel owns.
+            let bot_handle = bot.spawn();
 
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
@@ -3015,11 +3045,9 @@ impl Channel for WhatsAppWebChannel {
                 let _ = handle.await;
             }
 
-            // Drop bot/device so the SQLite connection is closed
-            // before we remove session files (releases WAL/SHM locks).
-            // `backend` was moved into the builder, so dropping `bot`
-            // releases the last Arc reference to the storage backend.
-            drop(bot);
+            // The spawned handle owned the bot and released its backend
+            // reference when the aborted task was awaited above. Drop the
+            // separate device reference before removing SQLite session files.
             drop(device);
 
             if should_reconnect {
@@ -3368,6 +3396,28 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    /// Wrap one message in the single-entry batch that 0.7 delivers for live
+    /// traffic, so tests keep expressing "one inbound message" directly.
+    #[cfg(feature = "whatsapp-web")]
+    fn single_message_event(
+        message: std::sync::Arc<waproto::whatsapp::Message>,
+        info: std::sync::Arc<wacore::types::message::MessageInfo>,
+    ) -> wacore::types::events::Event {
+        use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+        // Both types are #[non_exhaustive]; bon builders are the supported
+        // construction path. `hook_committed` defaults to false.
+        let inbound = InboundMessage::builder()
+            .message(message)
+            .info(info)
+            .build();
+        wacore::types::events::Event::Messages(
+            MessageBatch::builder()
+                .messages(std::sync::Arc::from(vec![inbound]))
+                .origin(BatchOrigin::Live)
+                .build(),
+        )
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -4187,7 +4237,6 @@ mod tests {
     async fn whatsapp_client_persistent_lid_mapping_drives_allowlist() {
         use wacore::store::CacheStore;
         use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
-        use wacore::types::events::Event;
         use wacore::types::message::{MessageInfo, MessageSource};
         use whatsapp_rust::bot::Bot;
         use whatsapp_rust::{CacheConfig, CacheStores, TokioRuntime};
@@ -4219,7 +4268,7 @@ mod tests {
 
         let cache = Arc::new(TestCacheStore::default());
         let bot = Bot::builder()
-            .with_backend(store.clone())
+            .with_backend_arc(store.clone())
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
@@ -4277,7 +4326,7 @@ mod tests {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let message_event = |lid: &str| {
-            Event::Message(
+            single_message_event(
                 Arc::new(waproto::whatsapp::Message {
                     conversation: Some("persistent LID mapping".to_string()),
                     ..Default::default()
@@ -4339,7 +4388,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn inbound_path_enforces_chat_policy_under_both_modes() {
-        use wacore::types::events::Event;
         use wacore::types::message::{MessageInfo, MessageSource};
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
@@ -4354,7 +4402,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
         let bot = Bot::builder()
-            .with_backend(store)
+            .with_backend_arc(store)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
@@ -4376,7 +4424,7 @@ mod tests {
             } else {
                 sender_jid.clone()
             };
-            Event::Message(
+            single_message_event(
                 Arc::new(waproto::whatsapp::Message {
                     conversation: Some("policy probe".to_string()),
                     ..Default::default()
@@ -4477,7 +4525,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn inbound_path_keeps_self_chat_bypass_personal_only() {
-        use wacore::types::events::Event;
         use wacore::types::message::{MessageInfo, MessageSource};
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
@@ -4492,7 +4539,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
         let bot = Bot::builder()
-            .with_backend(store)
+            .with_backend_arc(store)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
@@ -4507,7 +4554,7 @@ mod tests {
             let jid: Jid = format!("{OPERATOR}@s.whatsapp.net")
                 .parse()
                 .expect("operator jid parses");
-            Event::Message(
+            single_message_event(
                 Arc::new(waproto::whatsapp::Message {
                     conversation: Some("note to self".to_string()),
                     ..Default::default()
@@ -4734,20 +4781,20 @@ mod tests {
         mentioned_jids: &[&str],
     ) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            extended_text_message: Some(Box::new(
-                waproto::whatsapp::message::ExtendedTextMessage {
-                    text: Some("expand the previous response".to_string()),
-                    context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
-                        participant: Some(participant.to_string()),
-                        mentioned_jid: mentioned_jids
-                            .iter()
-                            .map(|jid| (*jid).to_string())
-                            .collect(),
-                        ..Default::default()
-                    })),
+            extended_text_message: waproto::whatsapp::message::ExtendedTextMessage {
+                text: Some("expand the previous response".to_string()),
+                context_info: waproto::whatsapp::ContextInfo {
+                    participant: Some(participant.to_string()),
+                    mentioned_jid: mentioned_jids
+                        .iter()
+                        .map(|jid| (*jid).to_string())
+                        .collect(),
                     ..Default::default()
-                },
-            )),
+                }
+                .into(),
+                ..Default::default()
+            }
+            .into(),
             ..Default::default()
         }
     }
@@ -4758,15 +4805,17 @@ mod tests {
         quoted_message: Option<waproto::whatsapp::Message>,
     ) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
+            sticker_message: waproto::whatsapp::message::StickerMessage {
                 mimetype: Some("image/webp".to_string()),
-                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                context_info: waproto::whatsapp::ContextInfo {
                     participant: Some(participant.to_string()),
-                    quoted_message: quoted_message.map(Box::new),
+                    quoted_message: quoted_message.into(),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         }
     }
@@ -4774,17 +4823,19 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn image_mention(mentioned_jids: &[&str]) -> waproto::whatsapp::Message {
         waproto::whatsapp::Message {
-            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+            image_message: waproto::whatsapp::message::ImageMessage {
                 mimetype: Some("image/jpeg".to_string()),
-                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                context_info: waproto::whatsapp::ContextInfo {
                     mentioned_jid: mentioned_jids
                         .iter()
                         .map(|jid| (*jid).to_string())
                         .collect(),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         }
     }
@@ -4986,16 +5037,17 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn extract_quoted_message_reads_media_context_info() {
         let quoted = waproto::whatsapp::Message {
-            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+            image_message: waproto::whatsapp::message::ImageMessage {
                 mimetype: Some("image/png".to_string()),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         let msg = sticker_reply("200@lid", Some(quoted));
         let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
             .expect("sticker reply should expose the quoted message");
-        assert!(quoted.image_message.is_some());
+        assert!(quoted.image_message.is_set());
     }
 
     #[test]
@@ -5026,12 +5078,13 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_parses_static_location() {
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+            location_message: waproto::whatsapp::message::LocationMessage {
                 degrees_latitude: Some(40.7128),
                 degrees_longitude: Some(-74.0060),
                 name: Some("NYC".into()),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         assert_eq!(
@@ -5044,12 +5097,13 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_skips_live_location() {
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+            location_message: waproto::whatsapp::message::LocationMessage {
                 degrees_latitude: Some(40.7128),
                 degrees_longitude: Some(-74.0060),
                 is_live: Some(true),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         assert_eq!(
@@ -5063,11 +5117,12 @@ mod tests {
     fn media_fallback_content_skips_missing_coordinates() {
         // Missing longitude — should silently drop, not fabricate 0,0
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+            location_message: waproto::whatsapp::message::LocationMessage {
                 degrees_latitude: Some(40.7128),
                 degrees_longitude: None,
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         assert_eq!(
@@ -5076,11 +5131,12 @@ mod tests {
         );
         // Missing latitude
         let msg = waproto::whatsapp::Message {
-            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+            location_message: waproto::whatsapp::message::LocationMessage {
                 degrees_latitude: None,
                 degrees_longitude: Some(-74.0060),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
         assert_eq!(
@@ -5705,7 +5761,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn approval_reply_is_intercepted_by_the_inbound_handler() {
-        use wacore::types::events::Event;
         use wacore::types::message::{MessageInfo, MessageSource};
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
@@ -5719,7 +5774,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
         let bot = Bot::builder()
-            .with_backend(store.clone())
+            .with_backend_arc(store.clone())
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
@@ -5762,7 +5817,7 @@ mod tests {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
 
-        let reply_event = Event::Message(
+        let reply_event = single_message_event(
             Arc::new(waproto::whatsapp::Message {
                 conversation: Some(format!("{token} yes")),
                 ..Default::default()
@@ -5834,7 +5889,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn every_decision_round_trips_from_the_send_seam_through_interception() {
-        use wacore::types::events::Event;
         use wacore::types::message::{MessageInfo, MessageSource};
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
@@ -5848,7 +5902,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
         let bot = Bot::builder()
-            .with_backend(store.clone())
+            .with_backend_arc(store.clone())
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
@@ -5925,7 +5979,7 @@ mod tests {
                     .recv()
                     .await
                     .expect("the send hook must publish the token before the wait");
-                let reply_event = Event::Message(
+                let reply_event = single_message_event(
                     Arc::new(waproto::whatsapp::Message {
                         conversation: Some(format!("{token} {word}")),
                         ..Default::default()
