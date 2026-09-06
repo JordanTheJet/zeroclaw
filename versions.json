@@ -1,0 +1,9 @@
+{
+  "stable": null,
+  "versions": [
+    {
+      "label": "Development (master)",
+      "tag": "master"
+    }
+  ]
+}
