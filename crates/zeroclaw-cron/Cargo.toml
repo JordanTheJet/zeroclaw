@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Cron scheduling and job lifecycle for ZeroClaw: schedule parsing, the job and run store, declarative reconciliation, in-flight claim ownership, precondition gates, and run-outcome classification."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-api.workspace = true

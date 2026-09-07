@@ -3,7 +3,7 @@ name = "zeroclaw-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Miscellaneous ZeroClaw subsystems: security, observability, gateway, cron, SOP, skills, hardware, TUI, and more."
+description = "Miscellaneous ZeroClaw subsystems: security, observability, gateway, SOP, skills, hardware, TUI, and more."
 repository.workspace = true
 publish = true
 
