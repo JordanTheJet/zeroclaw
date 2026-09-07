@@ -3374,6 +3374,9 @@ fn render_egress_gap_plan(
 /// resolution, which only matches entries already present in live config.
 /// Idempotent: existing entries and operator values remain untouched — an
 /// existing row's `egress_hosts` is reported against, never rewritten.
+/// A pre-typed-config row keyed by the package name is unsupported beta state:
+/// refuse before creating a canonical row and print the same ordered update
+/// guidance as `plugin list`. The operator's old row remains untouched.
 #[cfg(feature = "plugins-wasm")]
 async fn seed_plugin_config_entries(
     config: &mut crate::config::schema::Config,
@@ -3408,7 +3411,33 @@ async fn seed_plugin_config_entries(
 
     let mut created = Vec::new();
     let mut existing = Vec::new();
+    let legacy_candidates = [package.to_string()];
     for (_, instance_key) in entries {
+        let row_names: Vec<String> = config
+            .plugins
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let state = crate::plugins::egress_ceremony::resolve_grant_state(
+            instance_key,
+            &legacy_candidates,
+            &row_names,
+            |row| config.plugins.entry_egress(row),
+        );
+        if matches!(
+            state,
+            crate::plugins::egress_ceremony::EgressGrantState::Stranded { .. }
+        ) {
+            let plan = crate::plugins::egress_ceremony::plan_egress_gap(
+                instance_key,
+                declared_egress,
+                &state,
+                &egress_runtime_inputs(config),
+            );
+            let guidance = render_egress_gap_plan(package, instance_key, &plan);
+            anyhow::bail!("{}", guidance.join("\n"));
+        }
         if config
             .create_map_key("plugins.entries", instance_key)
             .map_err(anyhow::Error::msg)?
@@ -14471,6 +14500,142 @@ mod tests {
                 .iter()
                 .any(|e| e.name == instance_key),
             "the retry must seed the instance-key row"
+        );
+    }
+
+    /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves
+    /// its package-name config row behind. Reinstall must refuse before it
+    /// creates a second, canonical row, print the same ordered update guidance
+    /// as `plugin list`, and roll the package publication back. The unsupported
+    /// row remains untouched for the operator to update deliberately.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_refuses_a_legacy_row_without_creating_or_mutating_config() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        let operator_host = "gitea.internal.example.com";
+        let mut legacy =
+            legacy_package_named_entry("weather-tool", &["api.example.com", operator_host]);
+        legacy.egress_allow_private = vec![operator_host.to_string()];
+        config.plugins.entries.push(legacy);
+        config.mark_dirty("plugins.entries.weather-tool");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            source_arg,
+            |_name| {},
+        ))
+        .await
+        .expect_err("an unsupported package-name row must refuse reinstall");
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("rolled back"),
+            "the error must say the attempted package publication was undone: {rendered}"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the warning must name the unsupported row and canonical key: {rendered}"
+        );
+        let update_at = rendered
+            .find("rename")
+            .expect("the first update step must describe the row rename");
+        let grant_at = rendered
+            .find("zeroclaw config set")
+            .expect("the second update step must carry the grant command");
+        assert!(
+            update_at < grant_at,
+            "the update step must precede the grant command: {rendered}"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none(),
+            "the refused install must not leave the package loaded"
+        );
+        assert!(
+            !plugins.path().join("weather-tool").exists(),
+            "the refused install must remove the published package directory"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(entry.name, "weather-tool");
+        assert_eq!(
+            entry.config.get("api_key").map(String::as_str),
+            Some("operator-secret"),
+            "private config must remain untouched"
+        );
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string(), operator_host.to_string()],
+            "reinstall must not replace or widen the unsupported row's grant"
+        );
+        assert_eq!(
+            entry.egress_allow_private,
+            vec![operator_host.to_string()],
+            "the private-address carve-out must remain untouched"
+        );
+        assert!(
+            !config
+                .plugins
+                .entries
+                .iter()
+                .any(|candidate| candidate.name == instance_key),
+            "refusal must happen before canonical-row creation"
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&instance_key),
+            (Vec::new(), Vec::new()),
+            "no canonical runtime state may be materialized"
+        );
+
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(
+            after, before,
+            "the failed install must leave the on-disk beta config byte-identical"
         );
     }
 }

@@ -316,6 +316,11 @@ without you typing anything:
   grants that the manifest no longer declares, and the exact command that
   applies the addition. A package update therefore cannot widen its own network
   reach; you apply the difference deliberately.
+- A reinstall that finds an unsupported **pre-1.0 package-name row** refuses
+  before creating a canonical row and prints the same ordered update steps as
+  `plugin list`. The failed install rolls back, and the old `config`,
+  `egress_hosts`, and `egress_allow_private` values remain untouched until you
+  update the beta configuration and retry.
 
 The printed command carries the union of the existing grant and the
 declaration, because `zeroclaw config set` replaces a list rather than

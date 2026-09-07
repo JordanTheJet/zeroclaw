@@ -582,6 +582,12 @@ list` reports the same gap as a standing diagnostic. Declare the destinations
 your code actually contacts, and treat a growing declaration as something every
 operator has to approve on every upgrade.
 
+If reinstall finds an unsupported pre-typed-config row keyed by the package
+name, install refuses before creating the derived `zpi1_…` row and prints the
+same ordered update steps as `plugin list`. The package install rolls back and
+the old private config and both egress lists stay untouched until the operator
+updates the beta configuration and retries.
+
 Plugins whose destination is deployment configuration (a self-hosted Gitea, a
 LAN Nextcloud) should declare nothing here. The operator authors that grant
 directly on the instance row, and a manifest that declares nothing is never
