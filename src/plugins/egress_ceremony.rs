@@ -39,13 +39,45 @@ pub fn egress_hosts_path(instance_key: &str) -> String {
 /// therefore pass the union (see [`EgressDeclarationDiff::union`]), not just the
 /// additions. The value is double-quoted because suffix patterns start with `*`
 /// and a bare `*.example.com` would be glob-expanded by the operator's shell.
+///
+/// The command addresses `config_dir` explicitly. `--config-dir` (and the
+/// `ZEROCLAW_CONFIG_DIR` it sets) is process-local, so a command copied out of
+/// `zeroclaw --config-dir /srv/a plugin list` and pasted into the operator's
+/// shell would otherwise load the ambient default configuration. The canonical
+/// row key names the package, capability and binding but not the profile, so
+/// that command would replace *another* profile's allowlist with a list
+/// computed from this one. Every printed command therefore carries the
+/// directory it was computed against, shell-quoted.
 #[must_use]
-pub fn egress_set_command(instance_key: &str, hosts: &[String]) -> String {
+pub fn egress_set_command(
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    hosts: &[String],
+) -> String {
     format!(
-        "zeroclaw config set {} \"{}\"",
+        "{} config set {} \"{}\"",
+        zeroclaw_invocation(config_dir),
         egress_hosts_path(instance_key),
         hosts.join(",")
     )
+}
+
+/// `zeroclaw --config-dir '<dir>'`: the invocation prefix every printed
+/// operator command starts with, so it acts on the configuration the operator
+/// inspected rather than whichever one their shell resolves by default.
+#[must_use]
+pub fn zeroclaw_invocation(config_dir: &std::path::Path) -> String {
+    format!(
+        "zeroclaw --config-dir {}",
+        shell_single_quote(&config_dir.to_string_lossy())
+    )
+}
+
+/// Quote `raw` for a POSIX shell: single quotes protect every character but
+/// the single quote itself, which is closed, escaped and reopened.
+#[must_use]
+pub fn shell_single_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 /// The legacy `[[plugins.entries]]` row an instance's grant is stranded on, if
@@ -474,6 +506,7 @@ pub enum EgressGapPlan {
 /// formatting.
 #[must_use]
 pub fn plan_egress_gap(
+    config_dir: &std::path::Path,
     instance_key: &str,
     declared: &[String],
     state: &EgressGrantState,
@@ -495,7 +528,7 @@ pub fn plan_egress_gap(
             let union = diff.union();
             let repair_incomplete = row_rejection(&union, allow_private, runtime);
             EgressGapPlan::Grant {
-                command: egress_set_command(instance_key, &union),
+                command: egress_set_command(config_dir, instance_key, &union),
                 missing: diff.declared_not_granted,
                 invalid,
                 rejected,
@@ -521,7 +554,7 @@ pub fn plan_egress_gap(
             let (grant, repair_incomplete) = if needs_grant {
                 let union = diff.union();
                 (
-                    Some(egress_set_command(instance_key, &union)),
+                    Some(egress_set_command(config_dir, instance_key, &union)),
                     row_rejection(&union, allow_private, runtime),
                 )
             } else {
@@ -541,6 +574,26 @@ pub fn plan_egress_gap(
 
 #[cfg(test)]
 mod tests {
+    /// The configuration every test command is computed against.
+    fn dir() -> &'static std::path::Path {
+        std::path::Path::new("/srv/zeroclaw/profile-a")
+    }
+
+    #[test]
+    fn every_printed_command_targets_the_selected_configuration_shell_quoted() {
+        let awkward = std::path::Path::new("/tmp/it's here/profile a");
+        let command =
+            super::egress_set_command(awkward, "zpi1_k", &["api.example.com".to_string()]);
+        assert_eq!(
+            command,
+            "zeroclaw --config-dir '/tmp/it'\\''s here/profile a' config set \
+             plugins.entries.zpi1_k.egress_hosts \"api.example.com\""
+        );
+        assert!(
+            command.starts_with(&super::zeroclaw_invocation(awkward)),
+            "the grant command must start with the selected-configuration invocation"
+        );
+    }
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {
@@ -630,11 +683,12 @@ mod tests {
         // package name: that is the row `entry_config` resolves against, so
         // config and grant stay on one row.
         let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
-        let cmd = egress_set_command(key, &v(&["api.example.com", "*.cdn.example.com"]));
+        let cmd = egress_set_command(dir(), key, &v(&["api.example.com", "*.cdn.example.com"]));
         assert_eq!(
             cmd,
             format!(
-                "zeroclaw config set plugins.entries.{key}.egress_hosts \"api.example.com,*.cdn.example.com\""
+                "{} config set plugins.entries.{key}.egress_hosts \"api.example.com,*.cdn.example.com\"",
+                zeroclaw_invocation(dir())
             )
         );
         assert!(
@@ -798,7 +852,7 @@ mod tests {
         let key = "zpi1_k";
         let state = stranded(&["api.example.com", "gitea.example.net"]);
         assert_eq!(
-            plan_egress_gap(key, &v(&["api.example.com"]), &state, &rt()),
+            plan_egress_gap(dir(), key, &v(&["api.example.com"]), &state, &rt()),
             EgressGapPlan::Migrate {
                 legacy_row: "weather-tool".to_string(),
                 missing: Vec::new(),
@@ -811,6 +865,7 @@ mod tests {
         // A wildcard that covers the declaration is the same case.
         assert!(matches!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com"]),
                 &stranded(&["*.example.com"]),
@@ -821,7 +876,7 @@ mod tests {
         // Even with nothing declared: the operator's own grant is inert until
         // the rename, and `config set` cannot target the row until then.
         assert!(matches!(
-            plan_egress_gap(key, &[], &state, &rt()),
+            plan_egress_gap(dir(), key, &[], &state, &rt()),
             EgressGapPlan::Migrate { grant: None, .. }
         ));
     }
@@ -833,6 +888,7 @@ mod tests {
         let key = "zpi1_k";
         let state = stranded(&["api.example.com", "gitea.example.net"]);
         let plan = plan_egress_gap(
+            dir(),
             key,
             &v(&["api.example.com", "api2.example.com"]),
             &state,
@@ -860,6 +916,7 @@ mod tests {
         assert_eq!(
             command,
             egress_set_command(
+                dir(),
                 key,
                 &v(&["api.example.com", "api2.example.com", "gitea.example.net"])
             )
@@ -872,6 +929,7 @@ mod tests {
         // Covered (through the wildcard) and accepted: nothing to say.
         assert_eq!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com"]),
                 &enforced(&["*.example.com"]),
@@ -882,6 +940,7 @@ mod tests {
         // A gap: the union command against the canonical key.
         assert_eq!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com", "api2.example.com"]),
                 &enforced(&["api.example.com"]),
@@ -892,18 +951,22 @@ mod tests {
                 invalid: Vec::new(),
                 rejected: None,
                 repair_incomplete: None,
-                command: egress_set_command(key, &v(&["api.example.com", "api2.example.com"])),
+                command: egress_set_command(
+                    dir(),
+                    key,
+                    &v(&["api.example.com", "api2.example.com"])
+                ),
             }
         );
         // No row at all reads as enforced-empty: every declared host is a gap.
         assert!(matches!(
-            plan_egress_gap(key, &v(&["api.example.com"]), &enforced(&[]), &rt()),
+            plan_egress_gap(dir(), key, &v(&["api.example.com"]), &enforced(&[]), &rt()),
             EgressGapPlan::Grant { .. }
         ));
         // No row and nothing declared: an empty grant is a row the runtime
         // accepts (it means no reach), so there is nothing to report.
         assert_eq!(
-            plan_egress_gap(key, &[], &enforced(&[]), &rt()),
+            plan_egress_gap(dir(), key, &[], &enforced(&[]), &rt()),
             EgressGapPlan::Nothing
         );
     }
@@ -992,6 +1055,7 @@ mod tests {
         };
         assert_eq!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com"]),
                 &enforced(&["api.example.com"]),
@@ -1001,6 +1065,7 @@ mod tests {
         );
         assert!(matches!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com"]),
                 &stranded(&["api.example.com"]),
@@ -1017,6 +1082,7 @@ mod tests {
         // the constructor judges the hosts before the prefixes.
         assert!(matches!(
             plan_egress_gap(
+                dir(),
                 key,
                 &v(&["api.example.com"]),
                 &enforced(&[" api.example.com "]),
@@ -1037,7 +1103,7 @@ mod tests {
         // the row, reject `*.com`, and deny every request. The plan must name
         // the entry, keep the rename, and print a grant that omits it.
         let key = "zpi1_k";
-        let plan = plan_egress_gap(key, &v(&["api.com"]), &stranded(&["*.com"]), &rt());
+        let plan = plan_egress_gap(dir(), key, &v(&["api.com"]), &stranded(&["*.com"]), &rt());
         let EgressGapPlan::Migrate {
             missing,
             invalid,
@@ -1057,7 +1123,7 @@ mod tests {
                 .contains("*.com")
         );
         assert_eq!(repair_incomplete, None, "the union is accepted");
-        assert_eq!(command, egress_set_command(key, &v(&["api.com"])));
+        assert_eq!(command, egress_set_command(dir(), key, &v(&["api.com"])));
         assert!(!command.contains("*.com"), "{command}");
     }
 
@@ -1070,6 +1136,7 @@ mod tests {
         // the padded entry behind.
         let key = "zpi1_k";
         let plan = plan_egress_gap(
+            dir(),
             key,
             &v(&["api.example.com"]),
             &enforced(&[" api.example.com "]),
@@ -1097,7 +1164,10 @@ mod tests {
                 .contains("whitespace")
         );
         assert_eq!(repair_incomplete, None);
-        assert_eq!(command, egress_set_command(key, &v(&["api.example.com"])));
+        assert_eq!(
+            command,
+            egress_set_command(dir(), key, &v(&["api.example.com"]))
+        );
     }
 
     #[test]
@@ -1114,7 +1184,7 @@ mod tests {
             authored: v(&["api.example.com"]),
             allow_private: v(&["other.example.com"]),
         };
-        let plan = plan_egress_gap(key, &v(&["api.example.com"]), &state, &rt());
+        let plan = plan_egress_gap(dir(), key, &v(&["api.example.com"]), &state, &rt());
         let EgressGapPlan::Migrate {
             missing,
             rejected,
@@ -1145,6 +1215,7 @@ mod tests {
         // declaration is covered — silence would call a denied instance
         // healthy.
         let plan = plan_egress_gap(
+            dir(),
             key,
             &v(&["api.example.com"]),
             &EgressGrantState::Enforced {

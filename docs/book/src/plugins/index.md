@@ -318,7 +318,11 @@ without you typing anything:
   reach; you apply the difference deliberately.
 - A reinstall that finds an unsupported **pre-1.0 package-name row** refuses
   before creating a canonical row and prints the same ordered update steps as
-  `plugin list`. The failed install rolls back, and the old `config`,
+  `plugin list`. Like `plugin list`, it reports a deployment-wide refusal (a
+  malformed `security.nat64_prefixes`, a zero
+  `plugins.limits.max_connections_per_instance`) once, on its own, and prints
+  no row steps that could not take effect until that is fixed. The failed
+  install rolls back before it announces anything, and the old `config`,
   `egress_hosts`, and `egress_allow_private` values remain untouched until you
   update the beta configuration and retry.
 
@@ -326,6 +330,16 @@ The printed command carries the union of the existing grant and the
 declaration, because `zeroclaw config set` replaces a list rather than
 appending to it. Running it as printed adds the declared destinations without
 dropping a host you authored yourself.
+
+Every printed command also begins with `zeroclaw --config-dir '<dir>'`, naming
+the configuration directory it was computed against. `--config-dir` (and the
+`ZEROCLAW_CONFIG_DIR` it sets) only affects the process you pass it to, so a
+command copied out of `zeroclaw --config-dir /srv/a plugin list` would
+otherwise act on whichever configuration your shell resolves by default. The
+`zpi1_…` row key names the package, capability and binding but not the
+profile, so that command would replace a different profile's allowlist with a
+list computed from this one. The directory is shell-quoted; paste the command
+as printed.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
 for every installed plugin holding `http_client`, one line naming the

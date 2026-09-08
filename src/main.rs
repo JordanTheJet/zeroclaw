@@ -2905,7 +2905,12 @@ fn declared_egress_hosts(
 /// as a bare token they would have to transcribe. A manifest that declares
 /// nothing prints nothing.
 #[cfg(feature = "plugins-wasm")]
-fn print_egress_grant_ceremony(package: &str, instance_key: &str, granted: &[String]) {
+fn print_egress_grant_ceremony(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    granted: &[String],
+) {
     use crate::plugins::egress_ceremony::egress_set_command;
     if granted.is_empty() {
         return;
@@ -2933,7 +2938,10 @@ fn print_egress_grant_ceremony(package: &str, instance_key: &str, granted: &[Str
         "{}",
         ta(
             "cli-plugin-egress-edit-command",
-            &[("command", &egress_set_command(instance_key, granted))],
+            &[(
+                "command",
+                &egress_set_command(config_dir, instance_key, granted)
+            )],
             "Edit this grant later with the printed command."
         )
     );
@@ -2992,7 +3000,13 @@ fn existing_egress_grant_lines(
         granted: granted.clone(),
         allow_private,
     };
-    let plan = plan_egress_gap(instance_key, declared_egress, &state, &runtime);
+    let plan = plan_egress_gap(
+        egress_command_config_dir(config),
+        instance_key,
+        declared_egress,
+        &state,
+        &runtime,
+    );
     let mut lines = Vec::new();
 
     // The runtime's verdict on the row as it stands, in the same words
@@ -3030,7 +3044,14 @@ fn existing_egress_grant_lines(
             }
             lines.push(ta(
                 "cli-plugin-egress-apply-command",
-                &[("command", &egress_set_command(instance_key, &diff.union()))],
+                &[(
+                    "command",
+                    &egress_set_command(
+                        egress_command_config_dir(config),
+                        instance_key,
+                        &diff.union(),
+                    ),
+                )],
                 "Grant them with the printed command.",
             ));
         }
@@ -3146,6 +3167,19 @@ fn egress_runtime_inputs(
     }
 }
 
+/// The configuration directory every printed grant command addresses. The
+/// loaded config's path is the resolved one — `--config-dir` and
+/// `ZEROCLAW_CONFIG_DIR` are already folded in — so a command copied from this
+/// process acts on the profile the operator inspected, not on whichever one
+/// their shell resolves by default.
+#[cfg(feature = "plugins-wasm")]
+fn egress_command_config_dir(config: &crate::config::schema::Config) -> &std::path::Path {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
 /// One line, printed once, when the runtime would refuse *every* plugin
 /// egress policy in this deployment: a malformed `security.nat64_prefixes`
 /// or a zero `plugins.limits.max_connections_per_instance`. No row edit
@@ -3234,7 +3268,13 @@ fn egress_grant_gap_lines(
         lines.extend(render_egress_gap_plan(
             &package,
             &instance_key,
-            &plan_egress_gap(&instance_key, &declared, &state, &runtime),
+            &plan_egress_gap(
+                egress_command_config_dir(config),
+                &instance_key,
+                &declared,
+                &state,
+                &runtime,
+            ),
         ));
     }
     Ok(lines)
@@ -3376,7 +3416,9 @@ fn render_egress_gap_plan(
 /// existing row's `egress_hosts` is reported against, never rewritten.
 /// A pre-typed-config row keyed by the package name is unsupported beta state:
 /// refuse before creating a canonical row and print the same ordered update
-/// guidance as `plugin list`. The operator's old row remains untouched.
+/// guidance as `plugin list` — including its rule that a deployment-wide
+/// refusal is reported once, on its own, with no row steps that could not
+/// take effect. The operator's old row remains untouched.
 #[cfg(feature = "plugins-wasm")]
 async fn seed_plugin_config_entries(
     config: &mut crate::config::schema::Config,
@@ -3429,7 +3471,16 @@ async fn seed_plugin_config_entries(
             state,
             crate::plugins::egress_ceremony::EgressGrantState::Stranded { .. }
         ) {
+            // Same contract as `plugin list` and the existing-row report: under
+            // a deployment-wide refusal no per-row command can take effect, so
+            // the refusal is reported once, with its own paths, and the
+            // rename-then-grant steps wait until it is fixed. The install is
+            // still refused: the stranded row is unsupported state either way.
+            if let Some(line) = egress_deployment_gap_line(config) {
+                anyhow::bail!("{line}");
+            }
             let plan = crate::plugins::egress_ceremony::plan_egress_gap(
+                egress_command_config_dir(config),
                 instance_key,
                 declared_egress,
                 &state,
@@ -3481,7 +3532,12 @@ async fn seed_plugin_config_entries(
                      `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
                 )
             );
-            print_egress_grant_ceremony(package, instance_key, &granted);
+            print_egress_grant_ceremony(
+                egress_command_config_dir(config),
+                package,
+                instance_key,
+                &granted,
+            );
         }
     }
 
@@ -3520,8 +3576,9 @@ async fn seed_plugin_config_entries(
 /// never silently swallowed.
 ///
 /// `announce_installed` prints the call site's own "installed" message once the
-/// publish succeeds, so the two install paths keep their distinct user-facing
-/// text.
+/// publish *and* the seeding have both succeeded, so the two install paths keep
+/// their distinct user-facing text and a rolled-back install never reports
+/// success first.
 #[cfg(feature = "plugins-wasm")]
 async fn publish_and_seed_plugin(
     host: &mut zeroclaw::plugins::host::PluginHost,
@@ -3537,14 +3594,18 @@ async fn publish_and_seed_plugin(
     let seed_result: Result<()> = async {
         let config_entries = installed_plugin_config_entries(host, &name)?;
         let declared = declared_egress_hosts(host, &name);
-        announce_installed(&name);
         Box::pin(seed_plugin_config_entries(
             config,
             &name,
             &config_entries,
             &declared,
         ))
-        .await
+        .await?;
+        // Only now is the install committed: a seed refusal below rolls the
+        // publish back, and an install that is about to be undone must never
+        // have announced success.
+        announce_installed(&name);
+        Ok(())
     }
     .await;
 
@@ -13676,6 +13737,7 @@ mod tests {
         );
         assert!(
             lines[0].contains(&crate::plugins::egress_ceremony::egress_set_command(
+                egress_command_config_dir(&config),
                 &instance_key,
                 &[
                     "api.example.com".to_string(),
@@ -13730,18 +13792,20 @@ mod tests {
         // rename, so it must never be the first thing offered.
         let grant_at = lines
             .iter()
-            .position(|line| line.contains("zeroclaw config set"))
+            .position(|line| line.contains("config set plugins.entries"))
             .expect("the grant command must still be printed");
         let migrate_at = lines
             .iter()
-            .position(|line| line.contains(&instance_key) && !line.contains("zeroclaw config set"))
+            .position(|line| {
+                line.contains(&instance_key) && !line.contains("config set plugins.entries")
+            })
             .expect("a migration line naming the canonical key must be printed");
         assert!(
             migrate_at < grant_at,
             "the rename must precede the grant command: {lines:?}"
         );
         assert!(
-            !lines[0].contains("zeroclaw config set"),
+            !lines[0].contains("config set plugins.entries"),
             "the bare grant command must not lead the report: {lines:?}"
         );
 
@@ -13801,7 +13865,7 @@ mod tests {
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
         let grant_line = lines
             .iter()
-            .find(|line| line.contains("zeroclaw config set"))
+            .find(|line| line.contains("config set plugins.entries"))
             .expect("the migrate ceremony must still print a grant command");
         // The command double-quotes its value; take what is between the quotes.
         let command_value = printed_command_value(grant_line);
@@ -13845,7 +13909,7 @@ mod tests {
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
     fn printed_command_value(line: &str) -> &str {
         let start = line
-            .find("zeroclaw config set")
+            .find("config set plugins.entries")
             .expect("the line must carry a config set command");
         line[start..]
             .split('"')
@@ -13911,7 +13975,7 @@ mod tests {
             "the rename instruction must name the legacy row and the key to give it: {rendered}"
         );
         assert!(
-            !rendered.contains("zeroclaw config set"),
+            !rendered.contains("config set plugins.entries"),
             "nothing is missing after the rename and the runtime accepts the row, so no \
              grant command may be offered: {rendered}"
         );
@@ -13968,7 +14032,7 @@ mod tests {
         );
         let grant_line = lines
             .iter()
-            .find(|line| line.contains("zeroclaw config set"))
+            .find(|line| line.contains("config set plugins.entries"))
             .expect("a refused row must force a grant command, since the rename alone would put a refused allowlist in effect");
         let command_value = printed_command_value(grant_line);
         assert!(
@@ -14033,7 +14097,7 @@ mod tests {
         );
         let grant_line = lines
             .iter()
-            .find(|line| line.contains("zeroclaw config set"))
+            .find(|line| line.contains("config set plugins.entries"))
             .expect("a refused row must be offered a repair command");
         let command_value = printed_command_value(grant_line);
         config
@@ -14112,7 +14176,7 @@ mod tests {
         );
         assert!(
             !deployment.contains("egress_allow_private")
-                && !deployment.contains("zeroclaw config set"),
+                && !deployment.contains("config set plugins.entries"),
             "the deployment line must not offer a row repair: {deployment}"
         );
 
@@ -14122,7 +14186,8 @@ mod tests {
         let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].contains("api2.example.com") && lines[0].contains("zeroclaw config set"),
+            lines[0].contains("api2.example.com")
+                && lines[0].contains("config set plugins.entries"),
             "the uncovered destination and its command are reported once the deployment \
              is accepted: {lines:?}"
         );
@@ -14165,7 +14230,7 @@ mod tests {
             "the runtime's reason must be reported at install: {rendered}"
         );
         assert!(
-            rendered.contains("zeroclaw config set"),
+            rendered.contains("config set plugins.entries"),
             "a repair command must be offered at install: {rendered}"
         );
         assert!(
@@ -14219,7 +14284,7 @@ mod tests {
         );
         for line in install
             .iter()
-            .filter(|line| line.contains("zeroclaw config set"))
+            .filter(|line| line.contains("config set plugins.entries"))
         {
             let value = printed_command_value(line);
             assert!(
@@ -14231,7 +14296,7 @@ mod tests {
         assert!(
             install
                 .iter()
-                .any(|line| line.contains("zeroclaw config set")),
+                .any(|line| line.contains("config set plugins.entries")),
             "a repair command must be offered: {rendered}"
         );
     }
@@ -14554,15 +14619,27 @@ hosts = ["api.example.com", "api2.example.com"]
 
         let plugins = tempfile::tempdir().expect("plugins dir");
         let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
         let err = Box::pin(publish_and_seed_plugin(
             &mut host,
             &mut config,
             source_arg,
-            |_name| {},
+            |_name| announced.set(true),
         ))
         .await
         .expect_err("an unsupported package-name row must refuse reinstall");
         let rendered = format!("{err:#}");
+        assert!(
+            !announced.get(),
+            "a refused install must never announce success before rolling back"
+        );
+        assert!(
+            rendered.contains(&crate::plugins::egress_ceremony::zeroclaw_invocation(
+                config_dir.path()
+            )),
+            "the printed grant command must address the configuration the install \
+             ran against: {rendered}"
+        );
 
         assert!(
             rendered.contains("rolled back"),
@@ -14576,7 +14653,7 @@ hosts = ["api.example.com", "api2.example.com"]
             .find("rename")
             .expect("the first update step must describe the row rename");
         let grant_at = rendered
-            .find("zeroclaw config set")
+            .find("config set plugins.entries")
             .expect("the second update step must carry the grant command");
         assert!(
             update_at < grant_at,
@@ -14636,6 +14713,236 @@ hosts = ["api.example.com", "api2.example.com"]
         assert_eq!(
             after, before,
             "the failed install must leave the on-disk beta config byte-identical"
+        );
+    }
+
+    /// REGRESSION (install follows `plugin list`'s deployment contract): a
+    /// stranded package-name row *and* a deployment the runtime refuses
+    /// outright. The legacy-install refusal must report the deployment paths
+    /// once and print no rename-then-grant steps, because no row command can
+    /// take effect until the deployment is fixed. Install is still refused and
+    /// still rolled back, announcing nothing.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_under_a_deployment_wide_refusal_reports_the_deployment_once_without_row_steps()
+     {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        config.plugins.entries.push(legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        ));
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        config.mark_dirty("plugins.entries.weather-tool");
+        config.mark_dirty("security.nat64_prefixes");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            source_arg,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("a stranded row must refuse reinstall under a deployment refusal too");
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("security.nat64_prefixes")
+                && rendered.contains("max_connections_per_instance"),
+            "the refusal must name the deployment paths that fix it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("config set plugins.entries") && !rendered.contains("rename"),
+            "no rename or grant step may print under a deployment-wide refusal, \
+             exactly as `plugin list` prints none: {rendered}"
+        );
+        assert!(
+            rendered.contains("rolled back"),
+            "the attempted publish must still be undone: {rendered}"
+        );
+        assert!(
+            !announced.get(),
+            "a refused install must not announce success"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none()
+                && !plugins.path().join("weather-tool").exists(),
+            "the refused install must leave no package behind"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row"
+        );
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(after, before, "the on-disk config must be byte-identical");
+
+        // Fix the deployment: the same reinstall now prints the ordered
+        // rename-then-grant steps it always did.
+        config.security.nat64_prefixes.clear();
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            source_arg,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("the stranded row still refuses reinstall");
+        let rendered = format!("{err:#}");
+        let rename_at = rendered.find("rename").expect("the rename step returns");
+        let grant_at = rendered
+            .find("zeroclaw --config-dir")
+            .expect("the grant step returns, addressing this configuration");
+        assert!(
+            rename_at < grant_at,
+            "rename precedes the grant: {rendered}"
+        );
+        assert!(!announced.get());
+    }
+
+    /// REGRESSION (two profiles, one canonical key): the printed grant command
+    /// must act on the configuration the operator inspected. `--config-dir` is
+    /// process-local, so a command that omitted it would, pasted into the
+    /// operator's shell, address the ambient profile — and the canonical row
+    /// key is identical across profiles, so it would replace *that* profile's
+    /// allowlist with a list computed from this one. Applying the printed
+    /// command through the real setter against the directory it names changes
+    /// profile A and leaves profile B's grant byte-for-byte intact.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_printed_command_targets_the_inspected_profile_and_leaves_the_other_alone() {
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let row = |hosts: &[&str]| crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+        };
+
+        let dir_a = tempfile::tempdir().expect("profile a");
+        let mut profile_a = config_in_dir(dir_a.path());
+        profile_a.plugins.entries = vec![row(&["api.example.com"])];
+        profile_a.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+
+        let dir_b = tempfile::tempdir().expect("profile b");
+        let mut profile_b = config_in_dir(dir_b.path());
+        profile_b.plugins.entries = vec![row(&["api.example.com", "gitea.b.example.net"])];
+        profile_b.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_b.save_dirty())
+            .await
+            .expect("save profile b");
+        let b_before = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+
+        // Both surfaces that print a grant command for profile A.
+        let install_lines = existing_egress_grant_lines(
+            &profile_a,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let list_lines =
+            egress_grant_gap_lines(&profile_a, &manifest).expect("gap lines must build");
+        let invocation_a = crate::plugins::egress_ceremony::zeroclaw_invocation(dir_a.path());
+        let invocation_b = crate::plugins::egress_ceremony::zeroclaw_invocation(dir_b.path());
+        for (surface, lines) in [("install", &install_lines), ("list", &list_lines)] {
+            let command = lines
+                .iter()
+                .find(|line| line.contains("config set"))
+                .unwrap_or_else(|| panic!("{surface} must print the grant command: {lines:?}"));
+            assert!(
+                command.contains(&invocation_a),
+                "{surface}'s command must address profile A's directory: {command}"
+            );
+            assert!(
+                !command.contains(&invocation_b)
+                    && !command.contains(&dir_b.path().to_string_lossy().to_string()),
+                "{surface}'s command must not mention profile B: {command}"
+            );
+            // The directory the command names is exactly the one it was
+            // computed against, so the operator's shell resolves the same
+            // profile this process did.
+            let named = command
+                .split("--config-dir '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("the command carries a quoted --config-dir");
+            assert_eq!(std::path::Path::new(named), dir_a.path());
+        }
+
+        // Apply the printed value through the real setter against the
+        // directory the command names: A grows, B is untouched.
+        let command = install_lines
+            .iter()
+            .find(|line| line.contains("config set"))
+            .expect("install prints the command");
+        profile_a
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                printed_command_value(command),
+            )
+            .expect("the printed value must apply through the real setter");
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+        assert_eq!(
+            profile_a.plugins.entry_egress(&instance_key).0,
+            vec![
+                "api.example.com".to_string(),
+                "api2.example.com".to_string()
+            ]
+        );
+        let b_after = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+        assert_eq!(b_after, b_before, "profile B must be byte-identical");
+        assert!(
+            b_after.contains("gitea.b.example.net"),
+            "premise: profile B's operator-only grant is on disk: {b_after}"
         );
     }
 }
