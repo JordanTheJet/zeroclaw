@@ -1,6 +1,6 @@
 use crate::cron::store::{
     RunCompletionAction, STATUS_NO_OWNER, completion_action_for, persist_manual_run_result,
-    persist_run_completion_state, persist_run_result,
+    persist_non_execution, persist_run_completion_state, persist_run_result,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
@@ -700,12 +700,12 @@ async fn process_due_jobs(
                 "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
                 id = job.id
             );
-            if let Err(e) = persist_run_completion_state(
+            if let Err(e) = persist_non_execution(
                 config,
                 &job,
                 Utc::now(),
                 STATUS_NO_OWNER,
-                Some(&reason),
+                &reason,
                 completion_action_for(&job),
             ) {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})), "Cron job: failed to record unresolved owner");
@@ -3299,7 +3299,62 @@ mod tests {
         // leaves the due set instead of respinning every poll, needs a genuinely
         // overdue row and is covered by
         // `store::tests::skip_missed_run_records_the_skip_on_a_recurring_job`,
-        // which shares the same `persist_run_completion_state` path.
+        // which shares the same `persist_non_execution` path.
+    }
+
+    #[tokio::test]
+    async fn a_no_owner_refusal_stays_in_run_history_after_a_later_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let before = cron::get_job(&config, &job.id).unwrap();
+
+        let restored = config.agents.clone();
+        config.agents.remove(TEST_AGENT);
+        assert!(resolve_owning_agent(&config, &before).is_none());
+
+        process_due_jobs(
+            &config,
+            vec![before.clone()],
+            &unique_component("no-owner-history"),
+            &None,
+        )
+        .await;
+
+        let history = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(history.len(), 1, "the refusal must reach run history");
+        assert_eq!(history[0].status, STATUS_NO_OWNER);
+
+        // Give the job its owner back and let it run for real. `cron_jobs`
+        // carries only the latest status, so this overwrites the refusal there.
+        // History is the only place an operator can still find it, and it is
+        // what `list_runs` - and so the `cron_runs` tool and
+        // `GET /api/cron/:id/runs` - reads.
+        config.agents = restored;
+        let owned = cron::get_job(&config, &job.id).unwrap();
+        assert!(resolve_owning_agent(&config, &owned).is_some());
+
+        process_due_jobs(
+            &config,
+            vec![owned],
+            &unique_component("no-owner-history-run"),
+            &None,
+        )
+        .await;
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_ne!(
+            after.last_status.as_deref(),
+            Some(STATUS_NO_OWNER),
+            "the later run is expected to overwrite the job's latest status"
+        );
+
+        let history = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert!(
+            history.iter().any(|run| run.status == STATUS_NO_OWNER),
+            "the refusal must still be discoverable after a later run, got {:?}",
+            history.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
