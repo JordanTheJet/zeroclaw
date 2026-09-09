@@ -64,6 +64,11 @@ pub enum ElicitationMode {
 ///
 /// Only the session-scoped variant is modeled — Phase 1 has no
 /// caller for request-scoped elicitation (auth/config phase).
+///
+/// The struct stays public and constructible by struct literal. [`Self::new`]
+/// exists alongside that so a caller who does not use ZeroClaw's optional
+/// `tool_call_id` correlation extension need not name it, and so a future
+/// optional field is not a source break for such callers.
 #[derive(Debug, Clone, Serialize)]
 pub struct ElicitationRequest {
     #[serde(rename = "sessionId")]
@@ -77,6 +82,54 @@ pub struct ElicitationRequest {
     pub message: String,
     #[serde(rename = "requestedSchema")]
     pub requested_schema: Value,
+}
+
+impl ElicitationRequest {
+    /// Build a request carrying only the fields ACP itself defines.
+    ///
+    /// `tool_call_id` — ZeroClaw's correlation extension, not part of ACP — is
+    /// left unset, which keeps it off the wire entirely
+    /// (`skip_serializing_if`). Add it with [`Self::with_tool_call_id`], which
+    /// is what an in-tree channel adapter does:
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use zeroclaw_api::elicitation::{ElicitationMode, ElicitationRequest};
+    ///
+    /// let request = ElicitationRequest::new(
+    ///     "sess_1",
+    ///     ElicitationMode::Form,
+    ///     "Pick one",
+    ///     json!({ "type": "object" }),
+    /// )
+    /// .with_tool_call_id(Some("call-1".to_string()));
+    /// assert_eq!(request.tool_call_id.as_deref(), Some("call-1"));
+    /// ```
+    pub fn new(
+        session_id: impl Into<String>,
+        mode: ElicitationMode,
+        message: impl Into<String>,
+        requested_schema: Value,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            tool_call_id: None,
+            mode,
+            message: message.into(),
+            requested_schema,
+        }
+    }
+
+    /// Attach (or clear) the ZeroClaw `toolCallId` correlation extension.
+    ///
+    /// Takes an `Option` so a call site can pass [`scoped_tool_call_id`]
+    /// straight through: outside the common tool dispatcher there is no ID to
+    /// correlate on, and `None` simply omits the field from the payload.
+    #[must_use]
+    pub fn with_tool_call_id(mut self, tool_call_id: Option<String>) -> Self {
+        self.tool_call_id = tool_call_id;
+        self
+    }
 }
 
 /// Return the canonical ID scoped around the currently executing tool call.
@@ -333,6 +386,40 @@ mod tests {
         assert_eq!(v["mode"], "form");
         assert_eq!(v["message"], "Pick one");
         assert!(v["requestedSchema"].is_object());
+    }
+
+    /// The constructor is the field-additive surface: it must produce exactly
+    /// the ACP-defined payload, with ZeroClaw's `toolCallId` extension off the
+    /// wire until a caller opts in.
+    #[test]
+    fn constructor_omits_the_tool_call_id_until_it_is_set() {
+        let req = ElicitationRequest::new(
+            "sess_1",
+            ElicitationMode::Form,
+            "Pick one",
+            json!({ "type": "object" }),
+        );
+        assert_eq!(req.tool_call_id, None);
+
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["sessionId"], "sess_1");
+        assert_eq!(v["mode"], "form");
+        assert_eq!(v["message"], "Pick one");
+        assert!(v["requestedSchema"].is_object());
+        assert!(
+            v.get("toolCallId").is_none(),
+            "an unset correlation ID must not reach the wire: {v}"
+        );
+
+        let with_id = req.with_tool_call_id(Some("call-1".to_string()));
+        let v = serde_json::to_value(&with_id).unwrap();
+        assert_eq!(v["toolCallId"], "call-1");
+
+        // Explicitly clearing it takes the field back off the wire, so a
+        // caller can pass `scoped_tool_call_id()` through unconditionally.
+        let cleared = with_id.with_tool_call_id(None);
+        let v = serde_json::to_value(&cleared).unwrap();
+        assert!(v.get("toolCallId").is_none());
     }
 
     #[test]

@@ -219,13 +219,13 @@ impl RpcApprovalChannel {
         choices: &[String],
         timeout: Duration,
     ) -> anyhow::Result<Option<String>> {
-        let req = ElicitationRequest {
-            session_id: self.session_id.clone(),
-            tool_call_id: scoped_tool_call_id(),
-            mode: ElicitationMode::Form,
-            message: question.to_string(),
-            requested_schema: single_select_schema(choices),
-        };
+        let req = ElicitationRequest::new(
+            self.session_id.clone(),
+            ElicitationMode::Form,
+            question,
+            single_select_schema(choices),
+        )
+        .with_tool_call_id(scoped_tool_call_id());
         debug_assert!(
             matches!(req.mode, ElicitationMode::Form),
             "Phase 1 must not emit URL-mode elicitation"
@@ -260,13 +260,13 @@ impl RpcApprovalChannel {
         max_items: usize,
         timeout: Duration,
     ) -> anyhow::Result<Option<Vec<String>>> {
-        let req = ElicitationRequest {
-            session_id: self.session_id.clone(),
-            tool_call_id: scoped_tool_call_id(),
-            mode: ElicitationMode::Form,
-            message: question.to_string(),
-            requested_schema: multi_select_schema(choices, min_items, max_items),
-        };
+        let req = ElicitationRequest::new(
+            self.session_id.clone(),
+            ElicitationMode::Form,
+            question,
+            multi_select_schema(choices, min_items, max_items),
+        )
+        .with_tool_call_id(scoped_tool_call_id());
         let params = serde_json::to_value(&req)?;
         let call = self.rpc.request("elicitation/create", params);
         let response_value = match tokio::time::timeout(timeout, call).await {
