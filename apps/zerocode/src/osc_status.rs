@@ -34,14 +34,22 @@
 //! being ASCII, which is the other reason state is carried there rather than
 //! inferred from the glyph.
 //!
-//! Title restoration is best-effort. XTPUSHTITLE has no capability response:
-//! a terminal may accept the bytes, ignore the title stack, and still honor
-//! OSC 2. Zerocode therefore never treats `Write::is_ok()` as proof of support.
-//! It records a restore obligation before the first overwrite, pairs every
-//! graceful teardown with a neutral title followed by XTPOPTITLE, and lets only
-//! one teardown path atomically claim the neutralize and pop obligations. A
-//! failed operation re-arms only its own obligation, so a failed neutral write
-//! can be retried without popping the saved title twice. A stack-capable
+//! Cleanup is best-effort. XTPUSHTITLE has no capability response: a terminal
+//! may accept the bytes, ignore the title stack, and still honor OSC 2.
+//! Zerocode therefore never treats `Write::is_ok()` as proof of support. It
+//! records each obligation before the write that creates it, and lets only one
+//! teardown path atomically claim them all. A failed operation re-arms only its
+//! own obligation, so a failed neutral write can be retried without popping the
+//! saved title twice.
+//!
+//! There are three such obligations, one per thing the terminal is left
+//! holding: a neutral title, the saved-title pop, and a cleared progress
+//! indicator. Progress is tracked separately from the title because the two
+//! channels fail independently — a terminal can accept OSC 2 and reject
+//! OSC 9;4 — and a release that restored the title while its progress clear
+//! failed would otherwise leave a busy or warning indicator lit for the life of
+//! that terminal, with nothing left to retry it. Teardown emits them in one
+//! order: clear progress, neutralize the title, then pop. A stack-capable
 //! terminal restores its saved title; a stack-less terminal keeps the neutral
 //! fallback instead of a stale working or blocked title.
 
@@ -63,7 +71,12 @@ const MAX_TITLE_CHARS: usize = 120;
 /// ordering between threads.
 const CLEANUP_NEUTRALIZE: u8 = 1 << 0;
 const CLEANUP_POP: u8 = 1 << 1;
-const CLEANUP_ALL: u8 = CLEANUP_NEUTRALIZE | CLEANUP_POP;
+/// The two title obligations a first overwrite creates together. Progress is
+/// deliberately excluded: an OSC 2 write says nothing about the OSC 9;4
+/// indicator, which arms its own bit at its own write.
+const CLEANUP_TITLE_ALL: u8 = CLEANUP_NEUTRALIZE | CLEANUP_POP;
+/// A live OSC 9;4 indicator that teardown still owes the terminal a clear for.
+const CLEANUP_PROGRESS: u8 = 1 << 2;
 
 /// Status glyph for a turn state. Leading character of the title.
 fn glyph(status: &TurnStatus) -> char {
@@ -199,7 +212,7 @@ impl StatusReporter {
             // A successful write cannot prove title-stack support, and a
             // failed write may be partial. Record cleanup ownership before
             // sending either sequence, then always pair it with a later pop.
-            let previous_cleanup = cleanup_needed.fetch_or(CLEANUP_ALL, Ordering::AcqRel);
+            let previous_cleanup = cleanup_needed.fetch_or(CLEANUP_TITLE_ALL, Ordering::AcqRel);
             if previous_cleanup & CLEANUP_POP == 0 {
                 let _ = push_title(out);
             }
@@ -217,8 +230,21 @@ impl StatusReporter {
         }
 
         let progress = progress_for(status);
-        if self.last_progress != Some(progress) && write_progress(out, progress).is_ok() {
-            self.last_progress = Some(progress);
+        if self.last_progress != Some(progress) {
+            let clears_the_indicator = progress == PROGRESS_CLEARED;
+            if !clears_the_indicator {
+                // Same discipline as the title bits: a failed or partial write
+                // may still have lit the indicator, so own the clear before the
+                // bytes leave rather than after they are acknowledged.
+                cleanup_needed.fetch_or(CLEANUP_PROGRESS, Ordering::AcqRel);
+            }
+            if write_progress(out, progress).is_ok() {
+                self.last_progress = Some(progress);
+                if clears_the_indicator {
+                    // Nothing is lit any more, so teardown owes no clear.
+                    cleanup_needed.fetch_and(!CLEANUP_PROGRESS, Ordering::AcqRel);
+                }
+            }
         }
 
         if release_epoch.load(Ordering::Acquire) != expected_release_epoch {
@@ -237,8 +263,7 @@ impl StatusReporter {
     }
 
     fn release_to(&mut self, out: &mut impl Write, cleanup_needed: &AtomicU8) {
-        let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-        release_title_obligations(out, cleanup_needed, false);
+        release_obligations(out, cleanup_needed, false);
         self.invalidate();
     }
 
@@ -255,8 +280,7 @@ impl StatusReporter {
         cleanup_needed: &AtomicU8,
         title_write_attempted: bool,
     ) {
-        let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-        release_title_obligations(out, cleanup_needed, title_write_attempted);
+        release_obligations(out, cleanup_needed, title_write_attempted);
         self.invalidate();
     }
 }
@@ -349,24 +373,27 @@ fn release_reporter_to(
 }
 
 fn emergency_release_to(out: &mut impl Write, cleanup_needed: &AtomicU8) {
-    let _ = write_progress(out, progress_for_state(LifecycleActivity::Finished.state()));
-    release_title_obligations(out, cleanup_needed, false);
+    release_obligations(out, cleanup_needed, false);
 }
 
-/// Claim all currently pending title work in one atomic operation, then re-arm
-/// only the operation whose write was unsuccessful. `force_neutralize` covers
-/// a title write that landed after a concurrent panic cleanup already claimed
-/// the saved-title pop.
-fn release_title_obligations(
-    out: &mut impl Write,
-    cleanup_needed: &AtomicU8,
-    force_neutralize: bool,
-) {
+/// Claim all currently pending cleanup work in one atomic operation, then
+/// re-arm only the operations whose writes were unsuccessful. `force_neutralize`
+/// covers a title write that landed after a concurrent panic cleanup already
+/// claimed the saved-title pop.
+///
+/// The progress clear is attempted unconditionally — it is one idempotent
+/// sequence and a release is the last chance to send it — but only a *claimed*
+/// clear is re-armed on failure, so a terminal that was never made busy does
+/// not acquire an obligation it cannot discharge.
+fn release_obligations(out: &mut impl Write, cleanup_needed: &AtomicU8, force_neutralize: bool) {
     let claimed = cleanup_needed.swap(0, Ordering::AcqRel);
     let should_neutralize = force_neutralize || claimed & CLEANUP_NEUTRALIZE != 0;
     let should_pop = claimed & CLEANUP_POP != 0;
     let mut retry = 0;
 
+    if write_progress(out, progress_for_state(LifecycleActivity::Finished.state())).is_err() {
+        retry |= claimed & CLEANUP_PROGRESS;
+    }
     if should_neutralize && write_title(out, "zerocode").is_err() {
         retry |= CLEANUP_NEUTRALIZE;
     }
@@ -968,12 +995,132 @@ mod tests {
         );
     }
 
+    /// Leading bytes of an OSC 9;4 sequence, used by the sinks below to fail
+    /// the progress channel while leaving the title channel working.
+    const PROGRESS_PREFIX: &[u8] = b"\x1b]9;4;";
+
+    /// The obligation is discharged by any successful clear, not only by a
+    /// release. Without this, an idle turn would leave a phantom obligation
+    /// that a later failed release re-arms for an indicator already off.
+    #[test]
+    fn a_successful_idle_sync_discharges_the_progress_obligation() {
+        let mut r = reporter();
+        let mut out = Vec::new();
+        r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
+        assert_eq!(r.cleanup_bits() & CLEANUP_PROGRESS, CLEANUP_PROGRESS);
+
+        r.sync_to(&mut out, Some(&TurnStatus::Idle), Some("herder"));
+        assert_eq!(
+            r.cleanup_bits(),
+            CLEANUP_TITLE_ALL,
+            "the indicator is off, but the title is still ours to restore"
+        );
+    }
+
+    /// Title cleanup succeeding says nothing about the progress indicator. A
+    /// terminal that rejected the clear is still showing a busy indicator, so
+    /// the obligation must survive the release that cleared the title.
+    #[test]
+    fn failed_progress_clear_is_retried_by_the_next_release() {
+        #[derive(Default)]
+        struct RejectProgress {
+            bytes: Vec<u8>,
+        }
+
+        impl Write for RejectProgress {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.starts_with(PROGRESS_PREFIX) {
+                    return Err(std::io::Error::other("progress rejected"));
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        let mut out = RejectProgress::default();
+        r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
+        assert_eq!(
+            r.cleanup_bits() & CLEANUP_PROGRESS,
+            CLEANUP_PROGRESS,
+            "a busy indicator must be owed a clear even when its write failed"
+        );
+
+        r.release_to(&mut out);
+        assert_eq!(
+            r.cleanup_bits(),
+            CLEANUP_PROGRESS,
+            "the title is restored, but the rejected progress clear stays owed"
+        );
+        assert!(out.bytes.ends_with(b"\x1b[23;0t"));
+
+        let mut retry = Vec::new();
+        r.release_to(&mut retry);
+        assert_eq!(retry, b"\x1b]9;4;0;0\x07");
+        assert_eq!(r.cleanup_bits(), 0);
+    }
+
+    /// A short `write` followed by an error leaves an unknown amount of the
+    /// payload on the wire, which is exactly the case where the terminal may
+    /// still be showing the old indicator. Treat it as a failed clear.
+    #[test]
+    fn partial_progress_clear_is_retried_by_the_next_release() {
+        #[derive(Default)]
+        struct PartialProgress {
+            bytes: Vec<u8>,
+            fail_next: bool,
+        }
+
+        impl Write for PartialProgress {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.fail_next {
+                    self.fail_next = false;
+                    return Err(std::io::Error::other("progress truncated"));
+                }
+                if buf.starts_with(PROGRESS_PREFIX) {
+                    let written = PROGRESS_PREFIX.len().min(buf.len());
+                    self.bytes.extend_from_slice(&buf[..written]);
+                    self.fail_next = true;
+                    return Ok(written);
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut r = reporter();
+        let mut out = PartialProgress::default();
+        r.sync_to(&mut out, Some(&TurnStatus::Working), Some("herder"));
+        assert_eq!(r.cleanup_bits() & CLEANUP_PROGRESS, CLEANUP_PROGRESS);
+
+        r.release_to(&mut out);
+        assert_eq!(
+            r.cleanup_bits(),
+            CLEANUP_PROGRESS,
+            "a truncated clear must stay owed after a successful title cleanup"
+        );
+        assert!(out.bytes.ends_with(b"\x1b[23;0t"));
+
+        let mut retry = Vec::new();
+        r.release_to(&mut retry);
+        assert_eq!(retry, b"\x1b]9;4;0;0\x07");
+        assert_eq!(r.cleanup_bits(), 0);
+    }
+
     /// Panic cleanup must not wait on the same reporter lock whose critical
     /// section panicked. The fallback is a direct clear + pop pair.
     #[test]
     fn reentrant_release_uses_nonblocking_emergency_cleanup() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
-        let cleanup_needed = AtomicU8::new(CLEANUP_ALL);
+        let cleanup_needed = AtomicU8::new(CLEANUP_TITLE_ALL);
         let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
@@ -990,7 +1137,7 @@ mod tests {
     #[test]
     fn emergency_then_normal_release_pops_exactly_once() {
         let reporter = Mutex::new(Some(StatusReporter::default()));
-        let cleanup_needed = AtomicU8::new(CLEANUP_ALL);
+        let cleanup_needed = AtomicU8::new(CLEANUP_TITLE_ALL);
         let release_epoch = AtomicUsize::new(0);
         let mut out = Vec::new();
         with_reporter_mutex(&reporter, |_| {
