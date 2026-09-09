@@ -811,14 +811,36 @@ pub fn reschedule_after_run_with_status(
 /// which made a job skipped on every restart indistinguishable from one
 /// running normally.
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
-    persist_run_completion_state(
+    persist_non_execution(
         config,
         job,
         now,
         STATUS_SKIPPED,
-        Some(SKIPPED_ON_STARTUP),
+        SKIPPED_ON_STARTUP,
         completion_action_for(job),
     )
+}
+
+/// Record an occurrence that was never executed.
+///
+/// `cron_jobs` carries only the latest status, so updating it alone leaves the
+/// occurrence invisible the moment a later run overwrites those fields. Run
+/// history is the only durable record, and it is what `list_runs` - and so the
+/// `cron_runs` tool and `GET /api/cron/:id/runs` - reads. Non-execution
+/// therefore has to land in `cron_runs` too, in the same transaction and under
+/// the same retention bound as an executed run.
+///
+/// The occurrence is zero-length and starts when it ends: nothing ran, so
+/// there is no interval to report.
+pub(crate) fn persist_non_execution(
+    config: &Config,
+    job: &CronJob,
+    at: DateTime<Utc>,
+    status: &str,
+    reason: &str,
+    action: RunCompletionAction,
+) -> Result<()> {
+    persist_run_result(config, job, at, at, at, status, Some(reason), 0, action)
 }
 
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
@@ -2171,6 +2193,55 @@ mod tests {
         assert!(after.last_run.is_some(), "the skip must be dated");
         assert!(after.next_run > overdue.next_run, "and still advance");
         assert!(after.enabled, "a recurring job stays enabled");
+    }
+
+    #[test]
+    fn a_skipped_occurrence_survives_a_later_run_in_history() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let overdue = get_job(&config, &job.id).unwrap();
+
+        skip_missed_run(&config, &overdue, Utc::now()).unwrap();
+
+        let history = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(history.len(), 1, "the skip must reach run history");
+        assert_eq!(history[0].status, STATUS_SKIPPED);
+
+        // `cron_jobs` holds only the latest status, so a later run overwrites
+        // it. History is the only place the earlier skip can still be found,
+        // and it is what `list_runs` - and so the `cron_runs` tool and
+        // `GET /api/cron/:id/runs` - reads.
+        let ran_at = Utc::now();
+        let skipped = get_job(&config, &job.id).unwrap();
+        persist_run_result(
+            &config,
+            &skipped,
+            ran_at,
+            ran_at,
+            ran_at,
+            "ok",
+            Some("ran"),
+            1,
+            completion_action_for(&skipped),
+        )
+        .unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert_ne!(
+            after.last_status.as_deref(),
+            Some(STATUS_SKIPPED),
+            "the later run is expected to overwrite the job's latest status"
+        );
+
+        let history = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(history.len(), 2, "both occurrences stay in history");
+        assert!(
+            history.iter().any(|run| run.status == STATUS_SKIPPED),
+            "the skip must still be discoverable after a later run, got {:?}",
+            history.iter().map(|r| &r.status).collect::<Vec<_>>()
+        );
     }
 
     #[test]
