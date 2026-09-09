@@ -404,6 +404,7 @@ zc-chat-status-awaiting-approval = 等待批准
 zc-chat-status-awaiting-input = 等待回答
 zc-chat-status-cancelling = 正在取消
 zc-chat-elicitation-dropped = 代理的一个提问在显示前被丢弃（客户端处理不及时）。代理的问题可能仍在等待；请重试。
+zc-chat-auto-reply-undelivered = A protocol reply to the agent ({ $id }) could not be delivered; the agent may still be waiting on it.
 zc-chat-session-restarted = 已启动新会话。
 zc-chat-session-restart-error = 无法启动新会话：{ $error }
 zc-chat-thinking-visible = 思考输出：可见

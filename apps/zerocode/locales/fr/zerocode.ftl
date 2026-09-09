@@ -404,6 +404,7 @@ zc-chat-status-awaiting-approval = en attente d’approbation
 zc-chat-status-awaiting-input = en attente d’une réponse
 zc-chat-status-cancelling = annulation
 zc-chat-elicitation-dropped = Une question de l'agent a été abandonnée avant de pouvoir être affichée (le client a pris du retard). La question de l'agent est peut-être toujours en attente ; réessayez.
+zc-chat-auto-reply-undelivered = A protocol reply to the agent ({ $id }) could not be delivered; the agent may still be waiting on it.
 zc-chat-session-restarted = Nouvelle session démarrée.
 zc-chat-session-restart-error = Échec du démarrage d'une nouvelle session : { $error }
 zc-chat-thinking-visible = Sortie de réflexion : visible

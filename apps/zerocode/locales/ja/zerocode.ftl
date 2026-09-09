@@ -404,6 +404,7 @@ zc-chat-status-awaiting-approval = 承認待ち
 zc-chat-status-awaiting-input = 回答待ち
 zc-chat-status-cancelling = キャンセル中
 zc-chat-elicitation-dropped = エージェントからの質問が表示される前に破棄されました（クライアントの処理が追いつきませんでした）。エージェントの質問がまだ待機している可能性があります。もう一度お試しください。
+zc-chat-auto-reply-undelivered = A protocol reply to the agent ({ $id }) could not be delivered; the agent may still be waiting on it.
 zc-chat-session-restarted = 新しいセッションを開始しました。
 zc-chat-session-restart-error = 新しいセッションを開始できませんでした: { $error }
 zc-chat-thinking-visible = 思考出力: 表示

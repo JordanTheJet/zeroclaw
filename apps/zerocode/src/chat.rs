@@ -48,7 +48,17 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+/// Per-attempt bound on one automatic protocol reply. A full writer queue is
+/// backpressure, not failure, so a lapsed attempt is retried rather than dropped.
 const AUTOMATIC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause between automatic-reply attempts while the writer stays saturated.
+const AUTOMATIC_RESPONSE_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Total budget for one automatic reply. Past it the daemon's own request
+/// timeout is the better outcome, so stop retrying and tell the operator.
+const AUTOMATIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(60);
+/// `RpcOutbound::respond`'s closed-transport message, surfaced through
+/// `RpcClient::respond_to_inbound_request`. Retrying past it can never succeed.
+const WRITER_CLOSED_ERROR: &str = "writer task is closed";
 
 fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
     if let Some(cleanup) = cleanup {
@@ -129,6 +139,12 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Automatic protocol replies that exhausted their delivery budget. The
+    /// request id is already claimed by the time one is spawned, so a silent
+    /// drop leaves the daemon blocked with nothing visible in the pane; this
+    /// routes the failure back to `poll` for an info notice.
+    auto_reply_failure_tx: mpsc::Sender<AutoReplyFailure>,
+    auto_reply_failure_rx: mpsc::Receiver<AutoReplyFailure>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
@@ -248,6 +264,23 @@ struct GitStatusUpdate {
     session_id: String,
     branch: Option<String>,
     hash: Option<String>,
+}
+
+/// One automatic protocol reply that never reached the daemon, routed back to
+/// the pane over `auto_reply_failure_tx` so the stalled request is visible.
+struct AutoReplyFailure {
+    /// The inbound JSON-RPC request id, rendered for display.
+    request_id: String,
+}
+
+/// How one automatic protocol reply ended. Only [`Self::DeadlineExhausted`]
+/// is operator-visible: a closed transport already surfaces as a disconnect.
+enum AutomaticResponseOutcome {
+    Delivered,
+    /// The transport is gone; no retry can land and none should be attempted.
+    TransportClosed,
+    /// Still undelivered when [`AUTOMATIC_RESPONSE_DEADLINE`] elapsed.
+    DeadlineExhausted,
 }
 
 /// Result of a background model-catalog fetch, routed back so the Loading
@@ -414,6 +447,7 @@ impl Chat {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         let (prompt_completion_tx, prompt_completion_rx) = mpsc::channel(4);
+        let (auto_reply_failure_tx, auto_reply_failure_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -426,6 +460,8 @@ impl Chat {
             model_fetch_rx,
             prompt_completion_tx,
             prompt_completion_rx,
+            auto_reply_failure_tx,
+            auto_reply_failure_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -1152,6 +1188,7 @@ impl Chat {
                     }
                     Self::spawn_inbound_response(
                         &self.rpc,
+                        &self.auto_reply_failure_tx,
                         id,
                         Err(crate::jsonrpc::JsonRpcError {
                             code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
@@ -1177,7 +1214,7 @@ impl Chat {
             ElicitationRouting::Installed | ElicitationRouting::Claimed => {}
             ElicitationRouting::Unparseable(id) => {
                 if self.inbound_request_claims.claim(&id) {
-                    Self::answer_cancel(&self.rpc, id);
+                    Self::answer_cancel(&self.rpc, &self.auto_reply_failure_tx, id);
                 }
             }
             ElicitationRouting::Defer(req) => {
@@ -1210,13 +1247,13 @@ impl Chat {
                 ElicitationRouting::Installed | ElicitationRouting::Claimed => {}
                 ElicitationRouting::Unparseable(id) => {
                     if self.inbound_request_claims.claim(&id) {
-                        Self::answer_cancel(&self.rpc, id);
+                        Self::answer_cancel(&self.rpc, &self.auto_reply_failure_tx, id);
                     }
                 }
                 ElicitationRouting::Defer(req) => {
                     if expired {
                         if self.inbound_request_claims.claim(&req.id) {
-                            Self::answer_cancel(&self.rpc, req.id);
+                            Self::answer_cancel(&self.rpc, &self.auto_reply_failure_tx, req.id);
                         }
                     } else {
                         self.deferred_elicitations.push(DeferredInboundRequest {
@@ -1232,26 +1269,83 @@ impl Chat {
     /// Answer an inbound request with `{"action":"cancel"}`, which the daemon's
     /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
     /// calling tool takes its non-channel fallback path.
-    fn answer_cancel(rpc: &Arc<RpcClient>, id: serde_json::Value) {
-        Self::spawn_inbound_response(rpc, id, Ok(serde_json::json!({ "action": "cancel" })));
+    fn answer_cancel(
+        rpc: &Arc<RpcClient>,
+        failures: &mpsc::Sender<AutoReplyFailure>,
+        id: serde_json::Value,
+    ) {
+        Self::spawn_inbound_response(
+            rpc,
+            failures,
+            id,
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
     }
 
-    /// Automatic protocol replies have no modal the operator can retry. Keep
-    /// them queued through transient writer backpressure, but bound the task so
-    /// a dead transport cannot accumulate waiters indefinitely.
+    /// Automatic protocol replies have no modal the operator can retry, and
+    /// their request id is already claimed, so a dropped reply is invisible on
+    /// both sides. Keep retrying through writer backpressure, stop at once when
+    /// the transport is gone, and surface the reply that never made it.
     fn spawn_inbound_response(
         rpc: &Arc<RpcClient>,
+        failures: &mpsc::Sender<AutoReplyFailure>,
         id: serde_json::Value,
         result: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
     ) {
         let rpc = Arc::clone(rpc);
+        let failures = failures.clone();
+        let request_id = id
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| id.to_string());
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(
+            match Self::deliver_automatic_response(&rpc, id, result).await {
+                AutomaticResponseOutcome::Delivered | AutomaticResponseOutcome::TransportClosed => {
+                }
+                AutomaticResponseOutcome::DeadlineExhausted => {
+                    let _ = failures.send(AutoReplyFailure { request_id }).await;
+                }
+            }
+        });
+    }
+
+    /// Attempt one automatic reply until it lands, the transport closes, or the
+    /// delivery budget runs out. Each attempt is bounded by
+    /// [`AUTOMATIC_RESPONSE_TIMEOUT`]; a lapsed attempt means the bounded writer
+    /// is still saturated, which is transient, so back off and try again.
+    async fn deliver_automatic_response(
+        rpc: &RpcClient,
+        id: serde_json::Value,
+        result: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
+    ) -> AutomaticResponseOutcome {
+        let deadline = tokio::time::Instant::now() + AUTOMATIC_RESPONSE_DEADLINE;
+        loop {
+            let attempt = tokio::time::timeout(
                 AUTOMATIC_RESPONSE_TIMEOUT,
-                rpc.respond_to_inbound_request(id, result),
+                rpc.respond_to_inbound_request(id.clone(), result.clone()),
             )
             .await;
-        });
+            match attempt {
+                Ok(Ok(())) => return AutomaticResponseOutcome::Delivered,
+                Ok(Err(error)) => {
+                    if error.to_string().contains(WRITER_CLOSED_ERROR) {
+                        return AutomaticResponseOutcome::TransportClosed;
+                    }
+                }
+                Err(_elapsed) => {
+                    if matches!(
+                        rpc.connection_state(),
+                        crate::client::ConnectionState::Disconnected { .. }
+                    ) {
+                        return AutomaticResponseOutcome::TransportClosed;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return AutomaticResponseOutcome::DeadlineExhausted;
+            }
+            tokio::time::sleep(AUTOMATIC_RESPONSE_RETRY_DELAY).await;
+        }
     }
 
     /// Send an answer to a structured agent question without losing the modal
@@ -1361,7 +1455,7 @@ impl Chat {
         );
         if cancelling {
             if self.inbound_request_claims.claim(&req.id) {
-                Self::answer_cancel(&self.rpc, req.id);
+                Self::answer_cancel(&self.rpc, &self.auto_reply_failure_tx, req.id);
             }
             return ElicitationRouting::Claimed;
         }
@@ -1383,7 +1477,7 @@ impl Chat {
             )
         });
         if tool_already_completed {
-            Self::answer_cancel(&self.rpc, req.id);
+            Self::answer_cancel(&self.rpc, &self.auto_reply_failure_tx, req.id);
             return ElicitationRouting::Claimed;
         }
 
@@ -1670,6 +1764,20 @@ impl Chat {
         }
     }
 
+    /// Surface automatic replies that never reached the daemon. Nothing local
+    /// is blocked — the claim already answered this pane — but the daemon is
+    /// waiting on its own timeout, so name the request that stalled.
+    fn drain_auto_reply_failures(&mut self) {
+        while let Ok(failure) = self.auto_reply_failure_rx.try_recv() {
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-auto-reply-undelivered",
+                    &[("id", &failure.request_id)],
+                ));
+            }
+        }
+    }
+
     /// Spawn a background `session/git_branch` poll when the cache is stale.
     /// Gated by `git_branch_inflight` so we never have more than one fetch
     /// outstanding per Chat — the daemon walks the filesystem each call and
@@ -1729,6 +1837,7 @@ impl Chat {
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
+        self.drain_auto_reply_failures();
     }
 
     /// Refresh metadata used only by this pane's visible chrome.
@@ -6122,6 +6231,13 @@ pub struct ChatState {
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Index into `entries` at which the current turn's records begin.
+    /// The transcript is retained across turns and tool-call ids are not
+    /// session-global, so staleness checks (`tool_call_completed`) must read
+    /// only this turn's slice — otherwise an id completed in an earlier turn
+    /// cancels a live request that legitimately reuses it. `entries` is
+    /// append-only between `reset_for_session` clears, so the index stays valid.
+    turn_entries_start: usize,
     /// Monotonic local turn identity. Prompt responses use it to avoid
     /// settling a newer queued turn after the prior terminal notification.
     turn_generation: u64,
@@ -6279,6 +6395,7 @@ impl ChatState {
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_entries_start: 0,
             turn_generation: 0,
             turn_had_streaming_text: false,
             turn_had_tool_calls: false,
@@ -7296,8 +7413,13 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
+    /// Whether `tool_call_id` already produced a result **in the current
+    /// turn**. Earlier turns are excluded on purpose: their ids may be reused
+    /// by a later turn, and treating such a reuse as stale would cancel a
+    /// legitimate request.
     fn tool_call_completed(&self, tool_call_id: &str) -> bool {
-        self.entries.iter().rev().any(|entry| {
+        let start = self.turn_entries_start.min(self.entries.len());
+        self.entries[start..].iter().rev().any(|entry| {
             matches!(
                 entry,
                 ChatEntry::Tool {
@@ -7660,6 +7782,9 @@ impl ChatState {
         {
             self.first_message = Some(t.clone());
         }
+        // Anchor the turn before its first entry lands, so this turn's
+        // staleness checks never read a prior turn's tool results.
+        self.turn_entries_start = self.entries.len();
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
@@ -8182,6 +8307,9 @@ impl ChatState {
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
         }
+        // Everything restored belongs to a completed turn; the next
+        // `push_user_message` opens the first turn this pane owns.
+        self.turn_entries_start = self.entries.len();
         self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
@@ -8203,6 +8331,7 @@ impl ChatState {
         self.input_bar.reset();
         let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
+        self.turn_entries_start = 0;
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.cached_lines.clear();
@@ -15362,6 +15491,53 @@ mod tests {
         ));
     }
 
+    /// Tool-call ids are not session-global and the transcript is retained
+    /// across turns, so a completed id from an earlier turn must never cancel
+    /// the elicitation of a live tool call that reuses it.
+    #[tokio::test]
+    async fn reused_tool_call_id_from_an_earlier_turn_still_installs_the_modal() {
+        let (mut chat, mut rx) = test_chat();
+        let mut active = state();
+
+        // Turn 1: `tool-e1` runs to completion.
+        active.push_user_message(Some("first ask".to_string()), Vec::new());
+        active.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tool-e1".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({"question": "  Pick one  "}),
+        });
+        active.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tool-e1".to_string(),
+            raw_output: "answered".to_string(),
+        });
+
+        // Turn 2: the same id is issued again and is still running.
+        active.push_user_message(Some("second ask".to_string()), Vec::new());
+        active.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tool-e1".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({"question": "  Pick one  "}),
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.route_inbound_elicitation(inbound_single_elicitation("e1", "sess-1"));
+
+        match &chat.phase {
+            ChatPhase::Active(s) => assert!(
+                s.pending_elicitation().is_some(),
+                "a current-turn elicitation must install even when an earlier turn used the id"
+            ),
+            _ => panic!("expected Active phase"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a live elicitation must not be auto-cancelled by a prior turn's tool result"
+        );
+    }
+
     #[tokio::test]
     async fn successful_elicitation_answer_releases_blocked_state() {
         let (client, mut rx) = test_client();
@@ -15436,13 +15612,107 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(1);
         tx.try_send("occupied".to_string()).unwrap();
         let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let (failures, _failure_rx) = mpsc::channel::<AutoReplyFailure>(4);
 
-        Chat::answer_cancel(&client, serde_json::json!("auto-cancel"));
+        Chat::answer_cancel(&client, &failures, serde_json::json!("auto-cancel"));
         assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
 
         let response = next_rpc_request(&mut rx, "automatic response should retry capacity").await;
         assert_eq!(response["id"], serde_json::json!("auto-cancel"));
         assert_eq!(response["result"]["action"], "cancel");
+    }
+
+    /// The request id is already claimed when the automatic reply is spawned,
+    /// so giving up after one attempt would silently drop the daemon's answer.
+    /// Sustained writer backpressure must be retried, not swallowed.
+    #[tokio::test(start_paused = true)]
+    async fn automatic_response_outlives_sustained_writer_backpressure() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("occupied".to_string()).unwrap();
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let (failures, mut failure_rx) = mpsc::channel::<AutoReplyFailure>(4);
+
+        Chat::answer_cancel(&client, &failures, serde_json::json!("auto-cancel"));
+        // Let the first attempt arm its timeout before the clock jumps.
+        tokio::task::yield_now().await;
+
+        // Hold the queue full past one attempt's timeout and several retries.
+        tokio::time::advance(AUTOMATIC_RESPONSE_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(AUTOMATIC_RESPONSE_RETRY_DELAY + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            failure_rx.try_recv().is_err(),
+            "backpressure well inside the delivery budget must not be reported as a failure"
+        );
+
+        // Capacity frees late; the reply must still land.
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        let response =
+            next_rpc_request(&mut rx, "automatic response must survive backpressure").await;
+        assert_eq!(response["id"], serde_json::json!("auto-cancel"));
+        assert_eq!(response["result"]["action"], "cancel");
+    }
+
+    /// The retry loop must not outlive the transport it writes to: a closed
+    /// writer can never accept the reply, so the task ends immediately rather
+    /// than burning the whole delivery budget.
+    #[tokio::test]
+    async fn automatic_response_stops_promptly_when_the_transport_is_closed() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        tx.try_send("occupied".to_string()).unwrap();
+        drop(rx);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            Chat::deliver_automatic_response(
+                &client,
+                serde_json::json!("closed-transport"),
+                Ok(serde_json::json!({ "action": "cancel" })),
+            ),
+        )
+        .await
+        .expect("a closed transport must end the automatic reply well inside one attempt");
+
+        assert!(matches!(outcome, AutomaticResponseOutcome::TransportClosed));
+    }
+
+    /// An automatic reply that never lands is invisible on both sides — the
+    /// claim tombstone suppresses a duplicate and the daemon just waits. Once
+    /// the budget is spent, the pane must name the request that stalled.
+    #[tokio::test(start_paused = true)]
+    async fn undelivered_automatic_reply_surfaces_a_pane_notice() {
+        // `_rx` stays alive so the writer is full rather than closed.
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        tx.try_send("occupied".to_string()).unwrap();
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        let rpc = Arc::clone(&chat.rpc);
+        let failures = chat.auto_reply_failure_tx.clone();
+        Chat::answer_cancel(&rpc, &failures, serde_json::json!("stuck-1"));
+
+        tokio::time::sleep(AUTOMATIC_RESPONSE_DEADLINE + AUTOMATIC_RESPONSE_TIMEOUT).await;
+        chat.poll();
+
+        match &chat.phase {
+            ChatPhase::Active(s) => {
+                let info = s
+                    .info_message
+                    .as_ref()
+                    .expect("an undelivered automatic reply must reach the operator");
+                assert!(
+                    info.text.contains("stuck-1"),
+                    "the notice must name the stalled request, got {:?}",
+                    info.text
+                );
+            }
+            _ => panic!("expected Active phase"),
+        }
     }
 
     #[tokio::test]
