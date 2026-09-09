@@ -691,6 +691,50 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
     "../../web/dist",
 )];
 
+/// A repository-relative path written the way `ESCAPE_EXCEPTIONS` spells it.
+///
+/// The exception list is a source literal, so it uses `/`. `Path::display` and
+/// `to_string_lossy` use the platform separator, so on Windows the same file
+/// renders as `crates\zeroclaw-gateway\src\static_files.rs` and no entry can
+/// ever match by string equality. The lookup then reports the one include the
+/// list exists to allow, failing this test on Windows for every branch.
+fn repo_relative_slug(path: &Path) -> String {
+    path.strip_prefix(repo_root())
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Every `ESCAPE_EXCEPTIONS` entry must match the file it names, on every
+/// platform.
+///
+/// The list is keyed by a `/`-separated source literal. Building the same path
+/// with `Path::join` yields the platform separator, so a lookup that compares
+/// raw strings matches on Unix and silently never matches on Windows - which
+/// turns the one deliberately allowed include into a violation and fails the
+/// contract test on every Windows run.
+#[test]
+fn escape_exceptions_match_their_files_on_every_platform() {
+    for (relative, _) in ESCAPE_EXCEPTIONS {
+        let native = relative
+            .split('/')
+            .fold(repo_root().to_path_buf(), |path, segment| {
+                path.join(segment)
+            });
+        assert!(
+            native.is_file(),
+            "exception names a file that does not exist: {relative}"
+        );
+        assert_eq!(
+            repo_relative_slug(&native),
+            *relative,
+            "the exception lookup must find this file on this platform"
+        );
+    }
+}
+
 #[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
@@ -733,11 +777,7 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                         .to_path_buf()
                 };
                 let resolved = normalize(&base, &include.path);
-                let rel = source_path
-                    .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
+                let rel = repo_relative_slug(&source_path);
                 let excepted = ESCAPE_EXCEPTIONS
                     .iter()
                     .any(|(f, p)| *f == rel && *p == include.path);
