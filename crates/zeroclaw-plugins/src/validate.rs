@@ -1,4 +1,4 @@
-//! Install-time load verification.
+//! Load verification: does this component instantiate against this host?
 //!
 //! A plugin built against a drifted or wrong WIT ABI (for example an old
 //! `configure(config: string)` where the host expects a no-arg `configure()`,
@@ -10,6 +10,11 @@
 //! [`verify_component_loads`] closes that gap by running the *same* type-check
 //! the daemon runs at startup, at install time, so the failure reaches the
 //! operator at the CLI with its full diagnostic instead of vanishing into a log.
+//!
+//! It is the single implementation of that check. `plugin install` runs it as a
+//! gate; `plugin info` and `plugin list --verify` run it as a report, for
+//! plugins that were installed before the gate existed, installed through
+//! `--no-verify`, or outlived a host upgrade.
 
 use crate::PluginManifest;
 use anyhow::Result;
