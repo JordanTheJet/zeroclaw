@@ -2815,7 +2815,7 @@ async fn verify_plugin_loads_or_bail(
                 ta(
                     "cli-plugin-install-verify-skipped",
                     &[("name", manifest.name.as_str()), ("error", detail.as_str())],
-                    &format!(
+                    format!(
                         "warning: '{}' does not load against this host and will be skipped at startup: {detail}",
                         manifest.name
                     ),
@@ -2828,7 +2828,7 @@ async fn verify_plugin_loads_or_bail(
             bail!(ta(
                 "cli-plugin-install-verify-failed",
                 &[("name", manifest.name.as_str()), ("error", detail.as_str())],
-                &format!(
+                format!(
                     "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
                     manifest.name
                 ),
