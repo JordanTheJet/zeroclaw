@@ -1205,22 +1205,9 @@ impl TranscriptionManager {
 
     /// The provider `transcribe` will dispatch to, or empty when unbound.
     /// Test-only: lets channel tests assert the binding without a network
-    /// call.
-    #[cfg(all(
-        test,
-        any(
-            feature = "channel-telegram",
-            feature = "channel-discord",
-            feature = "channel-slack",
-            feature = "channel-mattermost",
-            feature = "whatsapp-web",
-            feature = "channel-lark",
-            feature = "channel-line",
-            feature = "channel-qq",
-            feature = "channel-matrix",
-            feature = "voice-wake",
-        )
-    ))]
+    /// call. Gated on the two channels whose tests assert it, so no feature
+    /// shape compiles an unused method.
+    #[cfg(all(test, any(feature = "channel-slack", feature = "whatsapp-web")))]
     pub(crate) fn bound_provider(&self) -> &str {
         &self.agent_transcription_provider
     }
