@@ -2933,7 +2933,7 @@ fn plugin_list_lines(
             PluginLoadStatus::Loads => ta(
                 "cli-plugin-list-entry-loads",
                 &args,
-                &format!("{identity} [loads]"),
+                format!("{identity} [loads]"),
             ),
             PluginLoadStatus::Fails(error) => {
                 let cause = first_line(error);
@@ -2942,13 +2942,13 @@ fn plugin_list_lines(
                 ta(
                     "cli-plugin-list-entry-failed",
                     &args,
-                    &format!("{identity} [does not load: {cause}]"),
+                    format!("{identity} [does not load: {cause}]"),
                 )
             }
             PluginLoadStatus::NoComponent => ta(
                 "cli-plugin-list-entry-no-component",
                 &args,
-                &format!("{identity} [no component to load]"),
+                format!("{identity} [no component to load]"),
             ),
         };
         lines.push(format!("  {row}"));
@@ -3010,7 +3010,7 @@ fn plugin_info_lines(
         PluginLoadStatus::Fails(error) => ta(
             "cli-plugin-info-load-failed",
             &[("error", error)],
-            &format!(
+            format!(
                 "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
             ),
         ),
@@ -8360,7 +8360,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             bail!(ta(
                                 "cli-plugin-info-load-failed-exit",
                                 &[("name", &info.name)],
-                                &format!("plugin '{}' does not load against this host", info.name),
+                                format!("plugin '{}' does not load against this host", info.name),
                             ));
                         }
                     }
