@@ -8364,14 +8364,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                             ));
                         }
                     }
-                    None => println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-not-found",
-                            &[("name", &name)],
-                            "Plugin not found"
-                        )
-                    ),
+                    // A name that is not installed is an error, not a report:
+                    // a script asking about a plugin must not read exit 0 as
+                    // "it is here and loads".
+                    None => bail!(ta(
+                        "cli-plugin-not-found",
+                        &[("name", &name)],
+                        "Plugin not found"
+                    )),
                 }
                 Ok(())
             }
