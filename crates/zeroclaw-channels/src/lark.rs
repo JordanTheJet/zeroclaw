@@ -1241,7 +1241,7 @@ impl LarkChannel {
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
     /// Compatibility and test path. The daemon routes every channel through
-    /// [`Self::with_transcription_manager`] with a manager built from live
+    /// `with_transcription_manager` with a manager built from live
     /// config and the owning agent's resolved provider; this path can only see
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
