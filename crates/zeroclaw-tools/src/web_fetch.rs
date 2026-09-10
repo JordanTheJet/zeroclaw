@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -939,12 +939,20 @@ fn hard_wrap_long_lines(text: &str) -> Option<String> {
 /// the workspace — closing a check/act window that a post-write `canonicalize`
 /// could only detect after the bytes had already landed.
 ///
-/// The file itself is opened `create_new`, which refuses rather than follows
-/// whatever is already sitting at the destination. Because `file_name` is the
-/// full digest of `body`, a *regular* file already at that name holds exactly
-/// these bytes, so it is reused as-is; a symlink, directory, or special file is
-/// not ours to write and the spill is abandoned so the caller falls back to
-/// returning the response inline.
+/// The destination is published atomically. The bytes go to a uniquely named
+/// temp file opened `create_new` (which refuses rather than follows whatever is
+/// already sitting at that name), are synced, and are then renamed over
+/// `file_name` in one step. A file at the content-addressed name is therefore
+/// always whole: a concurrent identical fetch observes either no file or the
+/// complete file, and a crash mid-write leaves a stray temp, never a partial
+/// destination that a later fetch would reuse as complete.
+///
+/// Because `file_name` is the full digest of `body`, an existing regular file
+/// that holds exactly these bytes is reused as-is; the bytes are verified
+/// rather than trusted, so an incomplete or foreign file at that name is
+/// replaced by the rename instead. A symlink, directory, or special file at
+/// the destination is not ours to write and the spill is abandoned so the
+/// caller falls back to returning the response inline.
 fn write_spill_file(workspace_dir: &Path, file_name: &str, body: &str) -> anyhow::Result<()> {
     use cap_std::ambient_authority;
     use cap_std::fs::{Dir, OpenOptions};
@@ -970,26 +978,48 @@ fn write_spill_file(workspace_dir: &Path, file_name: &str, body: &str) -> anyhow
             .map_err(|e| anyhow::Error::msg(format!("failed to open spill directory: {e}")))?;
     }
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    match dir.open_with(file_name, &options) {
-        Ok(mut file) => file
-            .write_all(body.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|e| anyhow::Error::msg(format!("failed to write spill file: {e}"))),
-        Err(e) => {
-            if dir
-                .symlink_metadata(file_name)
-                .is_ok_and(|meta| meta.is_file())
+    match dir.symlink_metadata(file_name) {
+        Ok(meta) if meta.is_file() => {
+            // Content-addressed: this exact name means these exact bytes. Verify
+            // rather than trust it, so a partial or planted file at the name is
+            // replaced below instead of being handed back as complete.
+            if meta.len() == body.len() as u64
+                && dir
+                    .read(file_name)
+                    .is_ok_and(|existing| existing == body.as_bytes())
             {
-                // Content-addressed: this exact name means these exact bytes.
                 return Ok(());
             }
-            Err(anyhow::Error::msg(format!(
-                "refusing to write spill file: {e}"
-            )))
         }
+        Ok(_) => anyhow::bail!("refusing to write spill file: destination is not a regular file"),
+        Err(_) => {}
     }
+
+    // Unique per process and per call, so two concurrent identical fetches
+    // never share a temp file; whichever renames last installs the same bytes.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = format!(".{file_name}.tmp-{}-{seq}", std::process::id());
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = dir
+        .open_with(&tmp, &options)
+        .map_err(|e| anyhow::Error::msg(format!("failed to create spill temp file: {e}")))?;
+    let written = file
+        .write_all(body.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = dir.remove_file(&tmp);
+        anyhow::bail!("failed to write spill file: {e}");
+    }
+
+    if let Err(e) = dir.rename(&tmp, &dir, file_name) {
+        let _ = dir.remove_file(&tmp);
+        anyhow::bail!("failed to publish spill file: {e}");
+    }
+    Ok(())
 }
 
 /// File extension for a spilled body.
@@ -1021,9 +1051,9 @@ fn spill_extension(content_type: &str, body_mode: &str) -> &'static str {
 /// Two properties follow, and both are load-bearing. Deterministic: refetching
 /// unchanged content resolves to the same file instead of accumulating copies.
 /// Content-addressed over the *written* bytes, not the fetched ones: a file
-/// already present at this name holds exactly this body, which is what lets the
-/// no-follow `create_new` write in [`write_spill_file`] treat "already exists"
-/// as success rather than overwriting anything.
+/// already present at this name should hold exactly this body, which is what
+/// lets [`write_spill_file`] reuse it (after verifying the bytes) instead of
+/// publishing a second copy.
 fn spill_file_name(url: &str, body: &str, extension: &str) -> String {
     let host = extract_host(url)
         .map(|h| sanitize_path_component(&h))
@@ -4115,6 +4145,49 @@ mod tests {
             written.replace('\n', ""),
             body,
             "the reused file must still hold the full response"
+        );
+    }
+
+    /// The content-addressed name promises the complete body, so a partial
+    /// file left at that name — a crash mid-write, or a planted file — must be
+    /// replaced with the whole body rather than reused as if it were complete.
+    #[tokio::test]
+    async fn incomplete_file_at_the_destination_is_replaced_not_reused() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let tool = spill_test_tool(workspace.path(), 500_000);
+        let body = "n".repeat(60_000);
+
+        let first = fetch_body(&tool, &body, "text/plain").await;
+        let relative = saved_path(first.output.as_str()).to_string();
+        let destination = workspace.path().join(&relative);
+        let complete = std::fs::read(&destination).expect("spill file");
+        std::fs::write(&destination, &complete[..complete.len() / 2])
+            .expect("truncate the destination in place");
+
+        let second = fetch_body(&tool, &body, "text/plain").await;
+
+        assert!(second.success, "error={:?}", second.error);
+        assert_eq!(
+            saved_path(second.output.as_str()),
+            relative,
+            "identical content must resolve to the same file"
+        );
+        let republished = std::fs::read(&destination).expect("spill file");
+        assert_eq!(
+            republished, complete,
+            "a partial destination must be replaced with the complete body"
+        );
+
+        // Publication is temp-then-rename, and the temp never outlives the spill.
+        let mut spill_dir = workspace.path().to_path_buf();
+        for component in SPILL_DIR_COMPONENTS {
+            spill_dir.push(component);
+        }
+        let files = walk_spill_files(&spill_dir);
+        assert_eq!(
+            files.len(),
+            1,
+            "only the published file may remain, got {files:?}"
         );
     }
 
