@@ -143,6 +143,19 @@ impl ProviderRegistry {
     /// than silently shadowed.
     pub fn register(&mut self, provider: Arc<dyn AuthProvider>) -> anyhow::Result<()> {
         let name = provider.name().to_owned();
+        // An OIDC provider derives its authorization mapping from the `<alias>`
+        // in its `oidc.<alias>` name, so the registry enforces that canonical
+        // shape here rather than trusting each provider to honor the convention.
+        // Without this, an OIDC-method provider registered under a noncanonical
+        // name would slip past the alias-provenance boundary in
+        // `bind_provenance` and borrow an arbitrary issuer's profile mapping.
+        if provider.method() == AuthMethod::Oidc
+            && name.strip_prefix("oidc.").is_none_or(str::is_empty)
+        {
+            anyhow::bail!(
+                "OIDC auth provider must be registered under a canonical `oidc.<alias>` name, got {name:?}"
+            );
+        }
         if self.by_name.contains_key(&name) {
             anyhow::bail!("auth provider name {name:?} is already registered");
         }
@@ -253,12 +266,20 @@ fn bind_provenance(provider: &dyn AuthProvider, outcome: AuthOutcome) -> AuthOut
             | (AuthMethod::Oidc, IdentitySubject::Service { .. })
             | (AuthMethod::SharedOperator, IdentitySubject::SharedOperator)
     );
-    // An `oidc.<alias>` provider must return that same alias: the resolver
-    // selects the issuer/profile mapping from `provider_alias`, so a mismatch
-    // could borrow a different issuer's mapping.
-    let alias_ok = match provider.name().strip_prefix("oidc.") {
-        Some(expected) => identity.provider_alias.as_deref() == Some(expected),
-        None => true,
+    // An OIDC provider's alias carries authority: the resolver selects the
+    // issuer/profile mapping from `provider_alias`. Key this on the METHOD, not
+    // the name — an OIDC-method provider must carry a canonical `oidc.<alias>`
+    // name AND return that same alias, so it cannot dodge the check by
+    // registering under a noncanonical name (which `register` also refuses).
+    // Non-OIDC methods carry no alias authority, so nothing to bind there.
+    let alias_ok = if provider.method() == AuthMethod::Oidc {
+        matches!(
+            provider.name().strip_prefix("oidc."),
+            Some(expected)
+                if !expected.is_empty() && identity.provider_alias.as_deref() == Some(expected)
+        )
+    } else {
+        true
     };
     if method_ok && subject_ok && alias_ok {
         outcome
@@ -437,6 +458,84 @@ mod tests {
             .with_provider_alias("other"),
         )
         .await;
+    }
+
+    /// An OIDC-*method* provider registered under a NONCANONICAL name (one with
+    /// no `oidc.<alias>` prefix), returning a valid-looking OIDC identity with an
+    /// arbitrary alias. Proves both halves of the fix: the registry refuses it,
+    /// and `bind_provenance` denies it independently by keying on the method.
+    struct NoncanonicalOidc {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl AuthProvider for NoncanonicalOidc {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn method(&self) -> AuthMethod {
+            AuthMethod::Oidc
+        }
+        fn accepts(&self, credential: &Credential) -> bool {
+            matches!(credential, Credential::Bearer(_))
+        }
+        async fn verify(&self, _credential: &Credential) -> AuthOutcome {
+            AuthOutcome::Verified(
+                AuthenticatedIdentity::new(
+                    IdentitySubject::Oidc {
+                        issuer: "https://sso".into(),
+                        subject: "s".into(),
+                    },
+                    AuthMethod::Oidc,
+                )
+                .with_provider_alias("corp"),
+            )
+        }
+    }
+
+    #[test]
+    fn register_rejects_noncanonical_oidc_provider_name() {
+        let mut reg = ProviderRegistry::new();
+        // An OIDC-method provider under a noncanonical name is refused at the
+        // registry boundary — otherwise it would skip alias provenance and
+        // borrow an arbitrary issuer's authorization mapping.
+        let err = reg
+            .register(Arc::new(NoncanonicalOidc { name: "custom" }))
+            .unwrap_err();
+        assert!(err.to_string().contains("canonical"), "{err}");
+        // An empty alias is equally noncanonical.
+        assert!(
+            reg.register(Arc::new(NoncanonicalOidc { name: "oidc." }))
+                .is_err()
+        );
+        // The canonical `oidc.<alias>` form is accepted.
+        reg.register(Arc::new(NoncanonicalOidc { name: "oidc.corp" }))
+            .unwrap();
+    }
+
+    #[test]
+    fn bind_provenance_denies_a_noncanonical_oidc_provider() {
+        // Defense in depth: even if a noncanonical-named OIDC provider bypassed
+        // `register`, bind_provenance keys the alias check on the METHOD and
+        // denies it, so an OIDC method can never carry alias authority under a
+        // name that dodges the `oidc.` prefix.
+        let provider = NoncanonicalOidc { name: "custom" };
+        let outcome = AuthOutcome::Verified(
+            AuthenticatedIdentity::new(
+                IdentitySubject::Oidc {
+                    issuer: "https://sso".into(),
+                    subject: "s".into(),
+                },
+                AuthMethod::Oidc,
+            )
+            .with_provider_alias("corp"),
+        );
+        assert!(matches!(
+            bind_provenance(&provider, outcome),
+            AuthOutcome::Denied {
+                reason: DenyReason::Misconfigured
+            }
+        ));
     }
 
     fn bearer(token: &str) -> Credential {
