@@ -85,11 +85,51 @@ async fn write_claim_config(config: &mut Config, claimed: &Claimed) -> Result<()
     Box::pin(config.save_dirty()).await
 }
 
+/// Reject a `--control` URL that would carry the one-time claim token in the
+/// clear.
+///
+/// HTTPS is required for any real control plane. Plain `http://` is allowed only
+/// to a loopback host, so local development against a dev control plane (and the
+/// wiremock-backed tests below) still works while the token can never transit an
+/// untrusted network unencrypted. A value with no scheme is rejected here with
+/// an actionable message rather than surfacing later as an opaque transport
+/// error.
+fn ensure_control_is_secure(control: &str) -> Result<()> {
+    if control.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = control.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // Take the host, keeping a bracketed IPv6 literal whole and otherwise
+        // dropping an optional `:port`.
+        let host = if authority.starts_with('[') {
+            match authority.find(']') {
+                Some(close) => &authority[..=close],
+                None => authority,
+            }
+        } else {
+            authority.split(':').next().unwrap_or(authority)
+        };
+        if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "--control must use https:// — refusing to send the one-time claim token in \
+             cleartext to a non-loopback http:// address (`{control}`). Use the https URL \
+             from your ZeroRelay account."
+        );
+    }
+    anyhow::bail!(
+        "--control must be an absolute https:// URL (got `{control}`) — e.g. \
+         https://control.zerorelay.net"
+    );
+}
+
 /// Handle `zeroclaw relay claim <TOKEN> --control <URL> [--data-dir <PATH>]`.
 ///
-/// Fails closed: a bad token, an unreachable control plane, a non-success
-/// response, or an unwritable config each abort with an actionable message and
-/// never leave a partially written config.
+/// Fails closed: a bad token, a non-https control URL, an unreachable control
+/// plane, a non-success response, or an unwritable config each abort with an
+/// actionable message and never leave a partially written config.
 pub async fn handle_claim(
     config: &mut Config,
     claim_token: &str,
@@ -107,6 +147,9 @@ pub async fn handle_claim(
     if control.is_empty() {
         anyhow::bail!("--control <URL> is required (the ZeroRelay control-plane base URL)");
     }
+    // The claim token is a one-time bearer secret; refuse to send it over a
+    // channel that would carry it in the clear.
+    ensure_control_is_secure(control)?;
 
     let data_dir = data_dir.unwrap_or_else(|| config.data_dir.clone());
     let signing_key_pkcs8 = zeroclaw_runtime::relay::ensure_signing_key(&data_dir)
@@ -211,6 +254,30 @@ mod tests {
         assert!(claim_outcome(200, r#"{"node_id":"n-1"}"#).is_err());
         assert!(claim_outcome(200, r#"{"relay_addr":"r:1"}"#).is_err());
         assert!(claim_outcome(200, "not json").is_err());
+    }
+
+    #[test]
+    fn control_url_must_not_leak_the_token_in_cleartext() {
+        // https is always fine.
+        assert!(ensure_control_is_secure("https://control.zerorelay.net").is_ok());
+        assert!(ensure_control_is_secure("https://127.0.0.1:9800").is_ok());
+
+        // http is allowed only to a loopback host (local dev + the wiremock tests).
+        assert!(ensure_control_is_secure("http://127.0.0.1:9800").is_ok());
+        assert!(ensure_control_is_secure("http://localhost:9800").is_ok());
+        assert!(ensure_control_is_secure("http://[::1]:9800").is_ok());
+
+        // http to any real host is refused — that would send the one-time token
+        // over the wire in the clear.
+        let err = ensure_control_is_secure("http://control.zerorelay.net").unwrap_err();
+        assert!(err.to_string().contains("https"));
+        assert!(ensure_control_is_secure("http://198.51.100.7:9800").is_err());
+        // A loopback substring in the host must not fool the check.
+        assert!(ensure_control_is_secure("http://127.0.0.1.evil.example").is_err());
+
+        // A scheme-less value is rejected here, not later as an opaque error.
+        assert!(ensure_control_is_secure("control.zerorelay.net").is_err());
+        assert!(ensure_control_is_secure("ftp://control.zerorelay.net").is_err());
     }
 
     fn seed_config(dir: &std::path::Path) -> Config {
