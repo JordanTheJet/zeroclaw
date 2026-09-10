@@ -209,6 +209,25 @@ impl PrincipalResolver {
     /// and the generation does NOT advance, so established connections keep
     /// resolving against the last valid policy until the config is repaired.
     pub fn replace_from_config(&self, config: &Config) -> u64 {
+        // Fail closed on a semantically-invalid config. The reload gate upstream
+        // only rejects STRUCTURAL config degradation (a salvage marker), so a
+        // config that parses and survives salvage but fails auth-section
+        // validation — e.g. an OIDC issuer that can never match a token's `iss`,
+        // or a profile referencing a missing grant — must not become live
+        // policy. Keep the previous policy and hold the generation, exactly as
+        // for a duplicate-principal conflict, so live connections keep resolving
+        // against the last valid policy until the config is repaired. This does
+        // not trust the caller to have validated: installation is the boundary.
+        if let Err(e) = config.validate() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                "Refusing to install an authorization policy from a config that failed validation; keeping the previous policy. Repair the config and reload."
+            );
+            return self.generation();
+        }
         let policy = ResolverPolicy::from_config(config);
         if policy.roster_conflict {
             ::zeroclaw_log::record!(
@@ -698,6 +717,64 @@ mod tests {
         assert_eq!(
             after, before,
             "an invalid replacement must not install or advance the generation"
+        );
+    }
+
+    /// A known-valid auth config (mirrors `policy_compiles_from_config_sections`).
+    fn valid_auth_config() -> Config {
+        use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig};
+        let mut config = Config::default();
+        config.permission_profiles.insert(
+            "operator".to_string(),
+            PermissionProfileConfig {
+                allowed_tools: vec!["calculator".to_string()],
+                grants: HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".to_string(),
+            OidcConfig {
+                issuer: "https://sso.example.com".to_string(),
+                claim_path: "groups".to_string(),
+                profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn reload_installs_a_valid_config() {
+        let resolver = PrincipalResolver::new(policy());
+        let before = resolver.generation();
+        let good = valid_auth_config();
+        assert!(good.validate().is_ok(), "fixture must be valid");
+        let after = resolver.replace_from_config(&good);
+        assert_eq!(
+            after,
+            before + 1,
+            "a valid replacement installs and advances the generation"
+        );
+    }
+
+    #[test]
+    fn reload_refuses_a_semantically_invalid_config() {
+        let resolver = PrincipalResolver::new(policy());
+        let before = resolver.generation();
+        // Structurally fine, but the OIDC issuer carries a `#fragment` that can
+        // never match a token's `iss` (rejected by OidcConfig::validate). The
+        // structural reload gate would not catch this; the activation gate must.
+        let mut bad = valid_auth_config();
+        bad.oidc.get_mut("corp").unwrap().issuer = "https://sso.example.com#fragment".to_string();
+        assert!(
+            bad.validate().is_err(),
+            "fixture must be semantically invalid"
+        );
+        let after = resolver.replace_from_config(&bad);
+        assert_eq!(
+            after, before,
+            "a semantically-invalid replacement must not install or advance the generation"
         );
     }
 
