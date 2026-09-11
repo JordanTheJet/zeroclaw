@@ -832,6 +832,15 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
 ///
 /// The occurrence is zero-length and starts when it ends: nothing ran, so
 /// there is no interval to report.
+///
+/// The schedule change outranks the history row. `persist_run_result` writes
+/// both in one transaction, so a failed history write rolls the reschedule
+/// back too and leaves the job enabled and still overdue - and the startup
+/// caller logs and moves on, after which ordinary polling claims and runs the
+/// occurrence the operator configured the scheduler to skip. Storage damage
+/// confined to `cron_runs` is enough to reach that state while `cron_jobs`
+/// still works. So on failure, fall back to the state-only write this path
+/// used before history existed: lose the record, keep the skip.
 pub(crate) fn persist_non_execution(
     config: &Config,
     job: &CronJob,
@@ -840,7 +849,33 @@ pub(crate) fn persist_non_execution(
     reason: &str,
     action: RunCompletionAction,
 ) -> Result<()> {
-    persist_run_result(config, job, at, at, at, status, Some(reason), 0, action)
+    let Err(history_err) =
+        persist_run_result(config, job, at, at, at, status, Some(reason), 0, action)
+    else {
+        return Ok(());
+    };
+
+    persist_run_completion_state(config, job, at, status, Some(reason), action).map_err(
+        |state_err| {
+            state_err.context(format!(
+                "cron run history write also failed for job {id:?}: {history_err}",
+                id = job.id
+            ))
+        },
+    )?;
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "job_id": job.id,
+                "status": status,
+                "error": format!("{history_err}"),
+            })),
+        "Cron non-execution: history write failed; kept the skip without a history record",
+    );
+    Ok(())
 }
 
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
@@ -2193,6 +2228,112 @@ mod tests {
         assert!(after.last_run.is_some(), "the skip must be dated");
         assert!(after.next_run > overdue.next_run, "and still advance");
         assert!(after.enabled, "a recurring job stays enabled");
+    }
+
+    /// Make every `cron_runs` insert fail while leaving everything else usable.
+    ///
+    /// This models the failure the fallback exists for: damage confined to the
+    /// run table's data or index pages, where schema init, `cron_jobs` reads
+    /// and claim updates all still work.
+    ///
+    /// A trigger is the precise injection. Dropping the table does nothing,
+    /// because every connection runs `CREATE TABLE IF NOT EXISTS` on open and
+    /// puts it straight back. Replacing it with a differently shaped table is
+    /// too broad: schema init then fails building the `cron_runs` indexes, so
+    /// even the state-only fallback cannot open a connection, and the test
+    /// would be exercising a failure nobody claimed to handle.
+    fn break_run_history(config: &Config) {
+        with_initialized_connection(config, |conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER cron_runs_write_failure
+                 BEFORE INSERT ON cron_runs
+                 BEGIN SELECT RAISE(ABORT, 'injected cron_runs write failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Prove the injection bites before any test leans on it. A harness
+        // that silently repaired itself would make these regressions pass
+        // whatever the production code did.
+        let history_write = with_initialized_connection(config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+                 VALUES ('probe', '', '', '', NULL, 0)",
+                [],
+            )
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+        });
+        assert!(
+            history_write.is_err(),
+            "break_run_history must actually make cron_runs writes fail"
+        );
+
+        // And prove it left the job table alone, which is what the fallback
+        // needs in order to preserve the skip.
+        with_initialized_connection(config, |conn| {
+            conn.execute("UPDATE cron_jobs SET last_status = last_status", [])?;
+            Ok(())
+        })
+        .expect("cron_jobs must stay writable; the fallback depends on it");
+    }
+
+    #[test]
+    fn a_recurring_skip_survives_a_history_write_failure() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let overdue = get_job(&config, &job.id).unwrap();
+
+        break_run_history(&config);
+
+        // The skip must still take effect. If it does not, the row stays due,
+        // ordinary polling claims it, and the job runs despite
+        // catch_up_on_startup being off.
+        skip_missed_run(&config, &overdue, Utc::now()).unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(
+            after.next_run > overdue.next_run,
+            "the schedule must advance even when run history cannot be written"
+        );
+        assert!(after.enabled, "a recurring job stays enabled");
+        assert!(
+            !all_overdue_jobs(&config, Utc::now())
+                .unwrap()
+                .iter()
+                .any(|j| j.id == job.id),
+            "the job must leave the due set, or polling will execute the skipped occurrence"
+        );
+    }
+
+    #[test]
+    fn an_overdue_oneshot_is_still_disabled_when_history_cannot_be_written() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let run_at = Utc::now() - ChronoDuration::hours(2);
+        let schedule = Schedule::At { at: run_at };
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo once").unwrap();
+        let reloaded = get_job(&config, &job.id).unwrap();
+
+        break_run_history(&config);
+
+        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(
+            !after.enabled,
+            "a one-shot must still be disabled, or it fires the run it was meant to skip"
+        );
+        assert!(
+            !all_overdue_jobs(&config, Utc::now())
+                .unwrap()
+                .iter()
+                .any(|j| j.id == job.id),
+            "and it must not remain in the due set"
+        );
     }
 
     #[test]
