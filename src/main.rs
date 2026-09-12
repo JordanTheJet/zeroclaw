@@ -15438,7 +15438,7 @@ mod tests {
             .find(|line| line.contains("config set plugins.entries"))
             .expect("the migrate ceremony must still print a grant command");
         // The command double-quotes its value; take what is between the quotes.
-        let command_value = printed_command_value(grant_line);
+        let command_value = &printed_command_value(grant_line);
         assert!(
             command_value.contains("gitea.example.net"),
             "the printed command must carry the operator-only grant forward: {grant_line}"
@@ -15477,14 +15477,30 @@ mod tests {
     /// offending entry, so the value is read after the command, not from the
     /// first quote on the line.
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
-    fn printed_command_value(line: &str) -> &str {
+    fn printed_command_value(line: &str) -> String {
         let start = line
             .find("config set plugins.entries")
             .expect("the line must carry a config set command");
-        line[start..]
-            .split('"')
-            .nth(1)
-            .expect("the printed command must quote its value")
+        let quoted = &line[start..];
+        let open = quoted
+            .find('\'')
+            .expect("the printed command single-quotes its value");
+        // Undo `shell_single_quote`: the argument runs to the closing quote,
+        // and an embedded quote was written as `'\''`.
+        let mut value = String::new();
+        let mut rest = &quoted[open + 1..];
+        loop {
+            let close = rest.find('\'').expect("the quoted value must close");
+            value.push_str(&rest[..close]);
+            rest = &rest[close + 1..];
+            if let Some(after) = rest.strip_prefix("\\''") {
+                value.push('\'');
+                rest = after;
+            } else {
+                break;
+            }
+        }
+        value
     }
 
     /// The runtime's own acceptance check for a row, with the same inputs the
@@ -15604,7 +15620,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("config set plugins.entries"))
             .expect("a refused row must force a grant command, since the rename alone would put a refused allowlist in effect");
-        let command_value = printed_command_value(grant_line);
+        let command_value = &printed_command_value(grant_line);
         assert!(
             command_value.contains("api.com") && !command_value.contains("*.com"),
             "the command must carry the declaration and leave the rejected entry out: {grant_line}"
@@ -15669,7 +15685,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("config set plugins.entries"))
             .expect("a refused row must be offered a repair command");
-        let command_value = printed_command_value(grant_line);
+        let command_value = &printed_command_value(grant_line);
         config
             .set_prop(
                 &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
@@ -15856,7 +15872,7 @@ mod tests {
             .iter()
             .filter(|line| line.contains("config set plugins.entries"))
         {
-            let value = printed_command_value(line);
+            let value = &printed_command_value(line);
             assert!(
                 value.contains("api.com") && !value.contains("*.com"),
                 "every printed command must carry the declaration and leave the rejected \
@@ -16495,7 +16511,7 @@ hosts = ["api.example.com", "api2.example.com"]
         profile_a
             .set_prop(
                 &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
-                printed_command_value(command),
+                &printed_command_value(command),
             )
             .expect("the printed value must apply through the real setter");
         Box::pin(profile_a.save_dirty())

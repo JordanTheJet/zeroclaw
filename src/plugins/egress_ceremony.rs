@@ -37,10 +37,18 @@ pub fn egress_hosts_path(instance_key: &str) -> String {
 /// to it, so a command that is meant to *add* a destination has to carry the
 /// full resulting list. Callers building an "apply this addition" command must
 /// therefore pass the union (see [`EgressDeclarationDiff::union`]), not just the
-/// additions. The value is double-quoted because suffix patterns start with `*`
-/// and a bare `*.example.com` would be glob-expanded by the operator's shell.
+/// additions.
 ///
-/// The command addresses `config_dir` explicitly. `--config-dir` (and the
+/// The joined list is one single-quoted argument. The hosts come from a
+/// plugin's manifest, which is publisher-controlled text, and the operator
+/// pastes this command into their shell with their own authority: inside
+/// double quotes a shell still performs `$(...)`, backtick and `$var`
+/// substitution, so a declared `$(id).example.com` would run `id` before
+/// ZeroClaw saw the argument. Single quotes make every byte literal, including
+/// the `*` that starts a suffix pattern, and [`shell_single_quote`] escapes an
+/// embedded quote. The one thing the shell may do to this argument is nothing.
+///
+/// The directory carries the same treatment. `--config-dir` (and the
 /// `ZEROCLAW_CONFIG_DIR` it sets) is process-local, so a command copied out of
 /// `zeroclaw --config-dir /srv/a plugin list` and pasted into the operator's
 /// shell would otherwise load the ambient default configuration. The canonical
@@ -55,10 +63,10 @@ pub fn egress_set_command(
     hosts: &[String],
 ) -> String {
     format!(
-        "{} config set {} \"{}\"",
+        "{} config set {} {}",
         zeroclaw_invocation(config_dir),
         egress_hosts_path(instance_key),
-        hosts.join(",")
+        shell_single_quote(&hosts.join(","))
     )
 }
 
@@ -587,11 +595,63 @@ mod tests {
         assert_eq!(
             command,
             "zeroclaw --config-dir '/tmp/it'\\''s here/profile a' config set \
-             plugins.entries.zpi1_k.egress_hosts \"api.example.com\""
+             plugins.entries.zpi1_k.egress_hosts 'api.example.com'"
         );
         assert!(
             command.starts_with(&super::zeroclaw_invocation(awkward)),
             "the grant command must start with the selected-configuration invocation"
+        );
+    }
+
+    /// The printed command is pasted into the operator's shell, so the proof
+    /// has to be the shell's own argument parsing, not a substring check: a
+    /// POSIX `sh` tokenises the command with `zeroclaw` swapped for `printf`,
+    /// and every declared host, including ones that carry command-substitution
+    /// syntax, a glob and a quote, must arrive as one literal argument.
+    #[cfg(unix)]
+    #[test]
+    fn the_grant_value_survives_the_operator_shell_as_one_literal_argument() {
+        let hosts = [
+            "$(id).example.com",
+            "`id`.example.com",
+            "$HOME.example.com",
+            "*.cdn.example.com",
+            "it's.example.com",
+        ]
+        .map(String::from);
+        let dir = std::path::Path::new("/srv/it's here/profile a");
+        let command = super::egress_set_command(dir, "zpi1_k", &hosts);
+        let script = command
+            .strip_prefix("zeroclaw ")
+            .map(|rest| format!("printf '%s\\n' {rest}"))
+            .expect("the command starts with the binary name");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("HOME")
+            .output()
+            .expect("sh must be available");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let argv: Vec<String> = String::from_utf8(output.stdout)
+            .expect("utf-8 argv")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "--config-dir".to_string(),
+                dir.to_string_lossy().into_owned(),
+                "config".to_string(),
+                "set".to_string(),
+                super::egress_hosts_path("zpi1_k"),
+                hosts.join(","),
+            ],
+            "every byte of the host list must reach the argument untouched: {command}"
         );
     }
     use super::*;
@@ -687,7 +747,7 @@ mod tests {
         assert_eq!(
             cmd,
             format!(
-                "{} config set plugins.entries.{key}.egress_hosts \"api.example.com,*.cdn.example.com\"",
+                "{} config set plugins.entries.{key}.egress_hosts 'api.example.com,*.cdn.example.com'",
                 zeroclaw_invocation(dir())
             )
         );
@@ -696,8 +756,9 @@ mod tests {
             "the command must not address a package-name-keyed row: {cmd}"
         );
         assert!(
-            cmd.contains('"'),
-            "an unquoted '*.suffix' would be glob-expanded by the operator's shell"
+            cmd.ends_with("'api.example.com,*.cdn.example.com'"),
+            "the list must be one single-quoted argument, so the `*` of a suffix \
+             pattern is never glob-expanded by the operator's shell: {cmd}"
         );
     }
 

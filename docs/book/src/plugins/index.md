@@ -338,8 +338,9 @@ command copied out of `zeroclaw --config-dir /srv/a plugin list` would
 otherwise act on whichever configuration your shell resolves by default. The
 `zpi1_…` row key names the package, capability and binding but not the
 profile, so that command would replace a different profile's allowlist with a
-list computed from this one. The directory is shell-quoted; paste the command
-as printed.
+list computed from this one. The directory and the host list are each single-quoted as one literal
+argument, so nothing a manifest declares can be expanded or substituted by
+your shell; paste the command as printed.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
 for every installed plugin holding `http_client`, one line naming the
