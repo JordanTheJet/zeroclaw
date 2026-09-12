@@ -31,7 +31,7 @@ The host-side sibling already fails closed. The `http_request` tool refuses ever
 
 Pressure on this boundary grows with ADR-006, which makes runtime plugins the target for optional channels, because every messaging channel is an egress consumer. Today `wit/v0/inbound.wit` states plainly that a channel plugin runs with no network and no sockets, and the official plugin repository drafts socket and WebSocket interfaces for transports the host does not expose. Whichever transport arrives next needs an existing answer to "may this instance reach that address", not a third one.
 
-Part of this direction has shipped. [#9580](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) moved the built-in HTTP egress onto a shared network guard, and [#9137](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) added the plugin-side egress policy foundation. Three changes remain in review and are not part of the running system: [#9582](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) for enforcement at the `wasi:http` boundary, [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584) for the operator grant ceremony, and [#9126](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) for typed instance configuration. This record states the decision the merged foundation implements and the in-review changes complete, and it settles the network slice of RFC [#8398](https://github.com/zeroclaw-labs/zeroclaw/issues/8398): Q1 for network permissions, Q4 for user-extended destination grants.
+Part of this direction has shipped. [#9580](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) moved the built-in HTTP egress onto a shared network guard, [#9137](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) added the plugin-side egress policy foundation, [#9582](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) enforced the policy at the `wasi:http` boundary, and [#9126](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) added typed instance configuration. [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), the operator grant ceremony, remains in review. This record states the decision those slices implement and complete. RFC [#8398](https://github.com/zeroclaw-labs/zeroclaw/issues/8398) is closed as an omnibus/superseded RFC; this ADR records the focused network-egress decision that survived that split: Q1 for network permissions, Q4 for user-extended destination grants.
 
 The alternatives are to treat the manifest declaration itself as the grant, to keep one global allowlist for every installed plugin, or to give each transport its own destination policy. Manifest-as-grant preserves the #9395 self-grant path for unsigned packages, violates the default-closed doctrine, and makes the manifest a second source of truth for live authority. A global allowlist denies per-instance isolation, because any installed plugin could then reach every host any other plugin needs. Per-transport policies put three knobs on one question and invite drift, when the destination decision is transport-independent.
 
@@ -53,7 +53,7 @@ The host never follows redirects on a guest's behalf. A guest that chooses to ch
 
 A denial returns a masked error to the guest that names the policy rather than host internals, and emits a structured host-side log event attributing the attempt to the exact instance.
 
-This seam is the subject of #9582 and is in review. The store built on master still installs the default hooks.
+This seam shipped in #9582 for `wasi:http`; the remaining gates cover the declaration, intersection, ceremony, fixture coverage, and fleet rollout.
 
 ### Let the manifest declare and the operator's configuration grant
 
@@ -106,7 +106,7 @@ Per-instance connection budgets belong to the foundation rather than to each tra
 
 ### Bound untrusted manifest input at the same boundary
 
-A manifest is attacker-controlled input at the same trust boundary as an egress destination, so cheap manifest bytes must not buy expensive host work. The typed instance-configuration work in review (#9126) bounds pattern validation in manifest-supplied schemas accordingly: patterns compile on a linear-time engine under an explicit 256 KiB compiled-program limit and a 1 MiB DFA limit, and a pattern that exceeds either is rejected as an invalid manifest rather than compiled. Rejecting the package is the safe direction, because a plugin author who wants a pattern that expensive can write a smaller one, while a host that has already started compiling it cannot get its scheduler back. This is recorded here because it hardens the boundary this ADR owns, not because it sits on the egress path.
+A manifest is attacker-controlled input at the same trust boundary as an egress destination, so cheap manifest bytes must not buy expensive host work. The typed instance-configuration work shipped in #9126 bounds pattern validation in manifest-supplied schemas accordingly: patterns compile on a linear-time engine under an explicit 256 KiB compiled-program limit and a 1 MiB DFA limit, and a pattern that exceeds either is rejected as an invalid manifest rather than compiled. Rejecting the package is the safe direction, because a plugin author who wants a pattern that expensive can write a smaller one, while a host that has already started compiling it cannot get its scheduler back. This is recorded here because it hardens the boundary this ADR owns, not because it sits on the egress path.
 
 ### Acceptance gates
 
@@ -115,7 +115,7 @@ This ADR remains proposed until all of these conditions are met:
 - the shared guard primitives live in `zeroclaw-infra::net_guard` with both consumers on them, the per-store hooks and the pinned send path ship for plugin stores, the manifest `[egress]` declaration exists with parsing, validation, and signature coverage, the effective grant is the intersection of that declaration with the operator's entry, and install-time and binding-time seeding and the upgrade-diff ceremony work (G1);
 - required CI proves the boundary with a real component fixture: denied by default with no entry, allowed through a seeded entry, metadata and private-address refusal over a matching allowlist, and a component that chases a redirect from an allowed host toward a blocked class has its second request denied (G2);
 - the first channel plugin selected by [#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850) runs under a seeded entry for its API host (G3); and
-- the rollout for the existing fleet is complete: official registry `http_client` packages carry `[egress]` declarations in republished versions before host enforcement turns on, an upgrade-time diagnostic lists each installed instance's denied destinations with the exact seeding command, the release that enables enforcement names the break in its changelog, and #9395 closes (G4).
+- the rollout for the existing fleet is complete: official registry `http_client` packages carry `[egress]` declarations in republished versions before host enforcement turns on, an upgrade-time diagnostic lists each installed instance's denied destinations with the exact seeding command, and the release that enables enforcement names the break in its changelog, with #9395 already closed by the enforcement slice (G4).
 
 The shared guard, the plaintext operator fields, the per-request policy read, the strict destination grammar, the NAT64 boundary, and the connection budget are in place. The rest of G1, and G2 through G4, are not.
 
@@ -141,12 +141,12 @@ Negative consequences:
 
 - [Bug #9395: plugin `wasi:http` egress has no destination policy and no configuration knob](https://github.com/zeroclaw-labs/zeroclaw/issues/9395)
 - [Migration tracker #8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850)
-- [RFC #8398: plugin permission, config, and secrets model](https://github.com/zeroclaw-labs/zeroclaw/issues/8398)
+- [RFC #8398: plugin permission, config, and secrets model](https://github.com/zeroclaw-labs/zeroclaw/issues/8398) (closed/superseded context)
 - [PR #9580: harden built-in HTTP egress on the shared network guard](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) (merged)
 - [PR #9137: shared egress policy foundation](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) (merged)
-- [PR #9582: enforce a host-owned egress policy on plugin `wasi:http`](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) (in review)
+- [PR #9582: enforce a host-owned egress policy on plugin `wasi:http`](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) (merged)
 - [PR #9584: egress grant ceremony for plugin install and list](https://github.com/zeroclaw-labs/zeroclaw/pull/9584) (in review)
-- [PR #9126: typed instance configuration validation](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) (in review)
+- [PR #9126: typed instance configuration validation](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) (merged)
 - [ADR-006: Runtime channel plugins](./ADR-006-runtime-channel-plugins.md)
 - [ADR-009: WIT and wasmtime plugin execution](./ADR-009-wit-wasmtime-plugin-execution.md)
 - [ADR-012: Generation-scoped live config apply](./ADR-012-generation-scoped-live-config-apply.md)

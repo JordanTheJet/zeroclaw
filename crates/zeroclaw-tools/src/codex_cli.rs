@@ -8,13 +8,8 @@ use zeroclaw_config::schema::CodexCliConfig;
 
 use crate::coding_cli::{
     CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
-    add_safe_env,
+    add_coding_cli_env,
 };
-
-/// Environment variables safe to pass through to the `codex` subprocess.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
 
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
@@ -43,6 +38,26 @@ impl CodexCliTool {
             executor,
         }
     }
+}
+
+fn codex_exec_args<'a>(config: &'a CodexCliConfig, prompt: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["exec"];
+    let mut has_terminator = false;
+
+    for (_, arg) in config.effective_extra_args() {
+        has_terminator |= arg == "--";
+        args.push(arg);
+    }
+
+    // Keep the model-supplied prompt in the positional-argument lane. Without
+    // this boundary, a dangling value-taking extra arg could consume the
+    // prompt as its value instead of letting Codex parse it as the prompt.
+    if !has_terminator {
+        args.push("--");
+    }
+    args.push(prompt);
+
+    args
 }
 
 #[async_trait]
@@ -156,19 +171,9 @@ impl Tool for CodexCliTool {
 
         // Build CLI command: `codex exec [extra_args...] <prompt>`
         let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
-        cmd.arg("exec");
+        cmd.args(codex_exec_args(&self.config, prompt));
 
-        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
-        for arg in &self.config.extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
-
-        cmd.arg(prompt);
-
-        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
 
         match self.executor.output(cmd).await {
             Ok(output) => {
@@ -410,6 +415,48 @@ mod tests {
         assert!(
             config.extra_args.is_empty(),
             "extra_args should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_command_args_separate_prompt_from_dangling_value_flags() {
+        let prompt = "danger-full-access";
+
+        for flag in [
+            "--sandbox",
+            "--config",
+            "-c",
+            "--profile",
+            "--cd",
+            "-C",
+            "--add-dir",
+            "--enable",
+            "--disable",
+        ] {
+            let mut config = test_config();
+            config.extra_args = vec![flag.to_string()];
+
+            assert_eq!(
+                codex_exec_args(&config, prompt),
+                vec!["exec", flag, "--", prompt],
+                "{flag} must not consume the prompt as its value"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_cli_command_args_preserve_an_explicit_terminator() {
+        let mut config = test_config();
+        config.extra_args = vec!["  --skip-git-repo-check  ".to_string(), "--".to_string()];
+
+        assert_eq!(
+            codex_exec_args(&config, "--prompt-starting-with-a-dash"),
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--",
+                "--prompt-starting-with-a-dash"
+            ]
         );
     }
 
