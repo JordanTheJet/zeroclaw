@@ -1687,6 +1687,36 @@ impl RpcDispatcher {
         std::collections::HashMap::new()
     }
 
+    fn apply_principal_to_agent(&self, agent: &mut crate::agent::agent::Agent) {
+        agent.narrow_to_principal_tools(self.principal_tool_narrowing().as_deref());
+        if self.auth.as_ref().is_some_and(|auth| {
+            !auth.grants.admin
+                && !auth
+                    .grants
+                    .allowed_agents
+                    .iter()
+                    .any(|alias| alias == zeroclaw_api::grants::WILDCARD)
+        }) {
+            agent.disable_principal_unaware_nested_tools();
+        }
+    }
+
+    /// Queued prompts must not execute with the transport-time grants clone.
+    /// Reuse the connection's canonical resolver and expiry/revocation checks.
+    fn current_prompt_authority(&self) -> Result<Self, JsonRpcError> {
+        let mut current = self.spawn_handle();
+        if current.auth.is_some() {
+            current
+                .authorize(
+                    Method::SessionPrompt,
+                    zeroclaw_api::grants::Resource::Sessions,
+                    zeroclaw_api::grants::Verb::Execute,
+                )
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+        }
+        Ok(current)
+    }
+
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
@@ -12551,6 +12581,11 @@ mod tests {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools = vec!["calculator".into(), "file_read".into()];
         config.permission_profiles.insert(
             "narrow".into(),
             PermissionProfileConfig {
@@ -12602,10 +12637,390 @@ mod tests {
             .expect("session registered");
         let agent = agent_arc.lock().await;
         let tool_names = agent.tool_names();
-        assert!(
-            tool_names.iter().all(|t| *t == "calculator"),
-            "only the granted tool may survive assembly; got: {tool_names:?}"
+        assert_eq!(tool_names, vec!["calculator"]);
+        let permitted = agent
+            .dispatch_tool_for_test("calculator", json!({"function":"add", "values":[2,3]}))
+            .await;
+        assert!(permitted.success, "{}", permitted.output);
+        assert!(permitted.output.contains('5'));
+        let denied = agent
+            .dispatch_tool_for_test("file_read", json!({"path":"absent"}))
+            .await;
+        assert!(!denied.success);
+        assert!(denied.output.contains("Tool not available"));
+    }
+
+    fn principal_test_config(
+        tmp: &tempfile::TempDir,
+        allowed_tools: &[&str],
+        allowed_agents: &[&str],
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = make_acp_test_config(tmp);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools = vec![
+            "calculator".into(),
+            "file_read".into(),
+            "delegate".into(),
+            "spawn_subagent".into(),
+        ];
+        config.permission_profiles.insert(
+            "principal-test".into(),
+            PermissionProfileConfig {
+                allowed_agents: allowed_agents.iter().map(|s| (*s).into()).collect(),
+                allowed_tools: allowed_tools.iter().map(|s| (*s).into()).collect(),
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![
+                        zeroclaw_api::grants::Verb::Create,
+                        zeroclaw_api::grants::Verb::Execute,
+                    ],
+                )]),
+                ..Default::default()
+            },
         );
+        config.users.insert(
+            "principal-fixture".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["principal-test".into()],
+            },
+        );
+        config
+    }
+
+    async fn bind_test_principal(dispatcher: RpcDispatcher) -> RpcDispatcher {
+        let mut dispatcher = dispatcher.with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+        );
+        dispatcher.handle_initialize(&json!({})).await.unwrap();
+        dispatcher
+    }
+
+    fn refresh_test_principal(dispatcher: &RpcDispatcher, tools: &[&str], agents: &[&str]) {
+        let mut config = dispatcher.ctx.config.write();
+        let profile = config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap();
+        profile.allowed_tools = tools.iter().map(|s| (*s).into()).collect();
+        profile.allowed_agents = agents.iter().map(|s| (*s).into()).collect();
+        dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn principal_queued_prompt_after_resume_prunes_before_execution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = principal_test_config(&tmp, &["calculator"], &["*"]);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        let params = json!({"agent_alias":"test-agent", "session_id":"principal-resume"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        let original = sessions.get_agent("principal-resume").await.unwrap();
+        {
+            let mut agent = original.lock().await;
+            assert_eq!(agent.tool_names(), vec!["calculator"]);
+            assert!(
+                agent
+                    .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
+                    .await
+                    .success
+            );
+            agent.set_model_provider(Box::new(FailingProvider));
+        }
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent("principal-resume").await.unwrap()
+        ));
+        let queue_guard = sessions
+            .session_queue
+            .acquire("principal-resume")
+            .await
+            .unwrap();
+        let prompt_params = json!({"session_id":"principal-resume", "prompt":"exercise admission"});
+        let pending = dispatcher.handle_session_prompt(&prompt_params);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("prompt bypassed queue: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        refresh_test_principal(&dispatcher, &[], &["*"]);
+        drop(queue_guard);
+        // A local provider double fails after admission; no network is required.
+        let _result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap();
+        let agent = original.lock().await;
+        assert!(agent.tool_names().is_empty());
+        let denied = agent
+            .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
+            .await;
+        assert!(!denied.success);
+        assert!(denied.output.contains("Tool not available"));
+    }
+
+    #[tokio::test]
+    async fn principal_rehydration_uses_current_ceiling_and_rejects_removed_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = principal_test_config(&tmp, &["calculator", "file_read"], &["*"]);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        let sid = "principal-rehydrate";
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":sid, "chat_mode":"acp"}),
+            )
+            .await
+            .unwrap();
+        let before = sessions.get_agent(sid).await.unwrap();
+        assert!(before.lock().await.tool_names().contains(&"calculator"));
+        assert!(acp_store.load_session(sid).unwrap().is_some());
+        assert!(sessions.remove(sid).await);
+        refresh_test_principal(&dispatcher, &["file_read"], &["*"]);
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let rebuilt = current.rehydrate_reaped_session(sid).await.unwrap();
+        assert!(!Arc::ptr_eq(&before, &rebuilt));
+        assert_eq!(rebuilt.lock().await.tool_names(), vec!["file_read"]);
+        let denied = rebuilt
+            .lock()
+            .await
+            .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
+            .await;
+        assert!(!denied.success);
+        refresh_test_principal(&dispatcher, &["file_read"], &[]);
+        let denied = dispatcher
+            .handle_session_prompt(&json!({"session_id":sid,"prompt":"must not run"}))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, FORBIDDEN);
+        assert!(sessions.remove(sid).await);
+        let current = dispatcher.current_prompt_authority().unwrap();
+        assert!(current.rehydrate_reaped_session(sid).await.is_none());
+        assert!(sessions.get_agent(sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn principal_empty_wildcard_admin_and_risk_intersection() {
+        for (tools, admin, expected) in [
+            (vec![], false, vec![]),
+            (vec!["calculator", "shell"], false, vec!["calculator"]),
+            (vec!["*"], false, vec!["calculator", "file_read"]),
+            (vec![], true, vec!["calculator", "file_read"]),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = principal_test_config(&tmp, &tools, &["*"]);
+            config
+                .permission_profiles
+                .get_mut("principal-test")
+                .unwrap()
+                .admin = admin;
+            config
+                .risk_profiles
+                .get_mut("test-profile")
+                .unwrap()
+                .allowed_tools = vec!["calculator".into(), "file_read".into()];
+            let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+            let dispatcher = bind_test_principal(dispatcher).await;
+            dispatcher
+                .handle_session_new_for_test(
+                    &json!({"agent_alias":"test-agent","session_id":"principal-matrix"}),
+                )
+                .await
+                .unwrap();
+            let agent = sessions.get_agent("principal-matrix").await.unwrap();
+            let agent = agent.lock().await;
+            let mut names = agent.tool_names();
+            names.sort();
+            assert_eq!(names, expected);
+            assert_eq!(
+                agent
+                    .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
+                    .await
+                    .success,
+                !expected.is_empty()
+            );
+            assert!(
+                !agent
+                    .dispatch_tool_for_test("shell", json!({"command":"echo forbidden"}))
+                    .await
+                    .success
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn principal_delegation_bounded_independent_and_agent_only_fail_closed() {
+        use zeroclaw_config::schema::DelegateTargetConfig;
+        for independent in [false, true] {
+            for agent_only in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+                let target = config.agents["test-agent"].clone();
+                config.agents.insert("target-agent".into(), target);
+                config.agents.get_mut("test-agent").unwrap().delegates = vec![if independent {
+                    DelegateTargetConfig {
+                        agent: "target-agent".into(),
+                        mode: zeroclaw_config::schema::DelegateExecutionMode::Independent,
+                    }
+                } else {
+                    DelegateTargetConfig::bounded("target-agent")
+                }];
+                config
+                    .risk_profiles
+                    .get_mut("test-profile")
+                    .unwrap()
+                    .delegation_policy = toml::from_str("mode = 'allow'").unwrap();
+                let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+                let dispatcher = bind_test_principal(dispatcher).await;
+                dispatcher
+                    .handle_session_new_for_test(
+                        &json!({"agent_alias":"test-agent","session_id":"principal-delegate"}),
+                    )
+                    .await
+                    .unwrap();
+                let handle = sessions.get_agent("principal-delegate").await.unwrap();
+                assert!(
+                    handle.lock().await.tool_names().contains(&"delegate"),
+                    "positive control must actually have a delegate"
+                );
+                if agent_only {
+                    refresh_test_principal(&dispatcher, &["*"], &["test-agent"]);
+                } else {
+                    refresh_test_principal(
+                        &dispatcher,
+                        &["calculator", "delegate", "spawn_subagent"],
+                        &["*"],
+                    );
+                }
+                let current = dispatcher.current_prompt_authority().unwrap();
+                let mut agent = handle.lock().await;
+                current.apply_principal_to_agent(&mut agent);
+                assert!(
+                    agent.tool_names().contains(&"calculator"),
+                    "parent turn stays usable"
+                );
+                assert!(!agent.tool_names().contains(&"delegate"));
+                assert!(!agent.tool_names().contains(&"spawn_subagent"));
+                let denied = agent
+                    .dispatch_tool_for_test(
+                        "delegate",
+                        json!({"agent":"target-agent", "prompt":"must not run"}),
+                    )
+                    .await;
+                assert!(!denied.success);
+                assert!(denied.output.contains("Tool not available"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn principal_deferred_named_helper_always_and_revocation() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_config::schema::{RuntimeProfileConfig, ToolFilterGroup, ToolFilterGroupMode};
+        const TOOL: &str = "remote__domains.list";
+        for (helper, always) in [(false, false), (true, false), (false, true), (true, true)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let server = start_mock_mcp_http_server("domains.list").await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"tools/call"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc":"2.0", "id":3,
+                    "result":{"content":[{"type":"text","text":"principal-mcp-executed"}],"isError":false}
+                })))
+                .expect(if helper || always { 1 } else { 0 })
+                .mount(&server).await;
+            let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
+            let principal = principal_test_config(
+                &tmp,
+                if helper {
+                    &[TOOL, "tool_search"]
+                } else {
+                    &[TOOL]
+                },
+                &["*"],
+            );
+            config.users = principal.users;
+            config.permission_profiles = principal.permission_profiles;
+            if always {
+                config.agents.get_mut("test-agent").unwrap().runtime_profile =
+                    "principal-runtime".into();
+                config.runtime_profiles.insert(
+                    "principal-runtime".into(),
+                    RuntimeProfileConfig {
+                        tool_filter_groups: vec![ToolFilterGroup {
+                            mode: ToolFilterGroupMode::Always,
+                            tools: vec![TOOL.into()],
+                            keywords: vec![],
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+            let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+            let dispatcher = bind_test_principal(dispatcher).await;
+            dispatcher.handle_session_new_for_test(&json!({"agent_alias":"test-agent","session_id":"principal-mcp", "chat_mode":"chat"})).await.unwrap();
+            let handle = sessions.get_agent("principal-mcp").await.unwrap();
+            let mut agent = handle.lock().await;
+            assert_eq!(agent.tool_names().contains(&"tool_search"), helper);
+            let prompt = agent.system_prompt_for_test().unwrap();
+            assert_eq!(prompt.contains("## Deferred Tools"), helper && !always);
+            if helper && !always {
+                assert!(prompt.contains(TOOL));
+                assert!(!agent.dispatch_tool_for_test(TOOL, json!({})).await.success);
+                let selected = agent
+                    .dispatch_tool_for_test(
+                        "tool_search",
+                        json!({"query":format!("select:{TOOL}")}),
+                    )
+                    .await;
+                assert!(selected.success && selected.output.contains(TOOL));
+            }
+            let outcome = agent.dispatch_tool_for_test(TOOL, json!({})).await;
+            assert_eq!(outcome.success, helper || always, "{}", outcome.output);
+            if helper || always {
+                assert!(outcome.output.contains("principal-mcp-executed"));
+            }
+            refresh_test_principal(&dispatcher, &["tool_search"], &["*"]);
+            dispatcher
+                .current_prompt_authority()
+                .unwrap()
+                .apply_principal_to_agent(&mut agent);
+            assert!(
+                !agent
+                    .system_prompt_for_test()
+                    .unwrap()
+                    .contains("## Deferred Tools")
+            );
+            let revoked = agent.dispatch_tool_for_test(TOOL, json!({})).await;
+            assert!(!revoked.success);
+            assert!(revoked.output.contains("Tool not available"));
+            if helper {
+                let selected = agent
+                    .dispatch_tool_for_test(
+                        "tool_search",
+                        json!({"query":format!("select:{TOOL}")}),
+                    )
+                    .await;
+                assert!(!selected.output.contains("<function>{"));
+                assert!(!agent.dispatch_tool_for_test(TOOL, json!({})).await.success);
+            }
+            server.verify().await;
+        }
     }
 
     #[test]
