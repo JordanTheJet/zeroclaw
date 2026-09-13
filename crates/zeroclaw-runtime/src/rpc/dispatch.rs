@@ -4348,6 +4348,19 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
+        // The grants were re-resolved after admission, so apply that same
+        // selector to this session's static and already-activated deferred
+        // tools. It runs on the canonical handle, not the pre-reconciliation
+        // one, so a replaced incarnation cannot carry a stale ceiling, and it
+        // runs before any prompt-side effect. Direct unit handlers bind no
+        // connection and keep their fixture semantics.
+        if self.auth.is_some() {
+            agent
+                .lock()
+                .await
+                .narrow_to_principal_tools(self.principal_tool_narrowing().as_deref());
+        }
+
         // Mark the durable row running only after every preflight wait has
         // passed. The generation waits and the canonical Agent lookup above
         // can all still fail this prompt (SESSION_BUSY / SESSION_NOT_FOUND)
