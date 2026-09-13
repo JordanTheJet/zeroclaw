@@ -35,12 +35,13 @@ This matrix describes the current high-value surfaces, not every helper file pro
 2. Build workspace rustdoc.
 3. Materialize theme, keymap, hardware, feature-matrix, and plugin snippets.
 4. Run mdBook once for every locale in `locales.toml`, with preprocessors configured by `docs/book/book.toml`.
-5. Check links in the rendered primary locale.
-6. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
+5. Run mdBook once more for the primary locale with only the in-tree `llms` backend, writing `llms.txt` (a page index with one-line descriptions) and `llms-full.txt` (every page as one Markdown stream) beside that locale's HTML. The backend receives the same preprocessed book as the HTML renderer, so both files match the published pages; page links use the deployed `https://docs.zeroclaw.com/<tag>/<locale>/` prefix.
+6. Check links in the rendered primary locale.
+7. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
 
 The peer-group preprocessor expands its directives while mdBook processes each chapter. Other standard mdBook preprocessors handle links, Mermaid blocks, and gettext localization. Generated references therefore need to exist before chapter preprocessing, while directive expansion and translation happen during the locale build.
 
-The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. It does not call a translation provider or repair catalogs during deployment.
+The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. It also copies the stable version's `llms.txt` and `llms-full.txt` to the site root, so `https://docs.zeroclaw.com/llms.txt` always describes the current stable release while each `<tag>/en/` directory keeps its own pair. It does not call a translation provider or repair catalogs during deployment.
 
 ## Tracked and build-only outputs
 

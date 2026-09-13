@@ -94,6 +94,9 @@ enum Cmd {
     Hardware,
     /// Check internal links in the already-built book HTML
     Linkcheck,
+    /// mdBook renderer backend: write llms.txt + llms-full.txt for agents.
+    /// Invoked by `cargo mdbook build` via MDBOOK_OUTPUT; not run directly.
+    Llms,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,6 +117,7 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::feature_matrix::run(&root)?;
             cmd::mdbook::peer_groups::run()
         }
+        Cmd::Llms => cmd::mdbook::llms::run(),
         Cmd::Placeholders { arg, .. } => {
             if arg.as_deref() == Some("supports") {
                 cmd::mdbook::placeholders::supports();

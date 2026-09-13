@@ -353,6 +353,22 @@ jobs:
             $MDBOOK_XTASK gen-versions > versions.json
             $MDBOOK_XTASK retrofit-selector
             $MDBOOK_XTASK gen-root-index > index.html
+
+            # Root llms.txt / llms-full.txt mirror the stable version's English
+            # build (master when no pointer resolves) so agents have one fixed
+            # URL per file. Versioned copies stay at <tag>/en/llms*.txt.
+            LLMS_SRC="master"
+            if [ -s stable-version.txt ]; then
+              WANT="$(tr -d '[:space:]' < stable-version.txt)"
+              if [ -n "$WANT" ] && [ -d "$WANT/en" ]; then
+                LLMS_SRC="$WANT"
+              fi
+            fi
+            for LLMS_FILE in llms.txt llms-full.txt; do
+              if [ -f "$LLMS_SRC/en/$LLMS_FILE" ]; then
+                cp "$LLMS_SRC/en/$LLMS_FILE" "$LLMS_FILE"
+              fi
+            done
             # Canonical/hreflang/description/share tags on every page, plus
             # robots.txt and sitemap.xml at the root. Reads CNAME (written
             # above) for the site host and stable-version.txt for the copy
