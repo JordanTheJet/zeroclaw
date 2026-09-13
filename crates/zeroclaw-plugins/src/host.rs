@@ -309,14 +309,14 @@ impl PluginHost {
         Ok(installed_name)
     }
 
-    /// Resolve a source's manifest and absolute WASM path for a pre-install
-    /// load-check, without copying, signing, or registering anything.
+    /// Resolve a source's signature-admitted manifest and absolute WASM path
+    /// for a pre-install load-check, without copying or registering anything.
     ///
     /// Returns `Ok(None)` for a plugin that ships no WASM component (there is
     /// nothing to instantiate). The manifest is validated for shape and the
     /// WASM file's existence, matching what [`Self::install`] checks before it
-    /// commits, so the caller can instantiate the exact artifact install would
-    /// copy and refuse a plugin that cannot load against this host.
+    /// commits. Signature policy is checked before returning an executable
+    /// path, so callers cannot compile or instantiate an unadmitted component.
     pub fn source_component(
         &self,
         source: &str,
@@ -335,12 +335,13 @@ impl PluginHost {
             )));
         }
 
-        let (manifest, _manifest_toml) = self.load_manifest(&manifest_path)?;
+        let (manifest, manifest_toml) = self.load_manifest(&manifest_path)?;
         let source_dir = manifest_path
             .parent()
             .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
 
         validate_manifest_shape(&manifest, source_dir)?;
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
 
         match manifest.wasm_path.as_deref() {
             Some(rel) => {
@@ -1365,6 +1366,30 @@ capabilities = ["tool"]
             host.list_plugins().is_empty(),
             "strict mode must reject an unsigned plugin during discovery"
         );
+    }
+
+    #[test]
+    fn source_component_rejects_unsigned_plugin_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"unsigned-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = host
+            .source_component(source.path().to_str().unwrap())
+            .expect_err("strict policy must reject an unsigned source before load verification");
+        assert!(matches!(err, PluginError::UnsignedPlugin(_)));
     }
 
     #[test]
