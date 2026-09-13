@@ -342,6 +342,7 @@ impl PluginHost {
 
         validate_manifest_shape(&manifest, source_dir)?;
         self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        validate_manifest_config(&manifest)?;
 
         match manifest.wasm_path.as_deref() {
             Some(rel) => {
@@ -1390,6 +1391,25 @@ capabilities = ["tool"]
             .source_component(source.path().to_str().unwrap())
             .expect_err("strict policy must reject an unsigned source before load verification");
         assert!(matches!(err, PluginError::UnsignedPlugin(_)));
+    }
+
+    #[test]
+    fn source_component_rejects_invalid_config_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"invalid-config-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"config_read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let err = host
+            .source_component(source.path().to_str().unwrap())
+            .expect_err("invalid config must be rejected before load verification");
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
     }
 
     #[test]
