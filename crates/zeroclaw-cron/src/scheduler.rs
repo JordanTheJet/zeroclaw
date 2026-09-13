@@ -4278,6 +4278,88 @@ mod tests {
         assert_eq!(kept[0].source, "imperative");
     }
 
+    /// Charges one action from the policy it is handed, as a tool call would.
+    struct BudgetConsumingExecutor;
+
+    impl CronAgentExecutor for BudgetConsumingExecutor {
+        fn run_agent_job<'a>(
+            &'a self,
+            request: CronAgentRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CronAgentRun> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let charged = request.security.record_action();
+                CronAgentRun {
+                    success: charged,
+                    output: format!("charged={charged}"),
+                }
+            })
+        }
+    }
+
+    /// The work inside a run must spend the budget the scheduler admitted from.
+    ///
+    /// Admission and the agent's own tool actions are two halves of one hourly
+    /// allowance. While the seam carried policy *inputs*, the host rebuilt the
+    /// policy with `SecurityPolicy::for_agent`, whose constructor ends in
+    /// `PerSenderTracker::new()` - so the run charged a fresh budget and
+    /// `max_actions_per_hour` was enforced twice independently. Passing the
+    /// admitted policy across the seam keeps one tracker, because
+    /// `PerSenderTracker::clone` shares its buckets by `Arc`.
+    #[tokio::test]
+    async fn the_agent_run_spends_the_budget_the_scheduler_admitted_from() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // Two actions per hour: one admission plus one tool action is the lot.
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .max_actions_per_hour = 2;
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("do the thing".into());
+
+        let security = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        let (ok, output) = run_agent_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            &BudgetConsumingExecutor,
+        )
+        .await;
+        assert!(
+            ok,
+            "the first run is admitted and charges its action: {output}"
+        );
+
+        // Admission (1) + the run's own action (2) exhausts the allowance, so
+        // the next admission must be refused. If the run had charged a fresh
+        // tracker, this second admission would only be the budget's second
+        // action and would still be allowed.
+        let security = cron_security_policy(&config, TEST_AGENT).expect("policy builds");
+        let (ok, output) = run_agent_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            &BudgetConsumingExecutor,
+        )
+        .await;
+        assert!(
+            !ok,
+            "the run's own actions must count against the same hourly budget, got: {output}"
+        );
+        // Either refusal proves the point: both read the same tracker, and
+        // the pre-flight rate check simply sees the full bucket first.
+        assert!(
+            output.contains("action budget exhausted") || output.contains("rate limit exceeded"),
+            "expected a shared-budget refusal, got: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn cron_action_budget_persists_across_runs() {
         let tmp = TempDir::new().unwrap();
