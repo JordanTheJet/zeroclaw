@@ -150,7 +150,11 @@ impl PluginHost {
         let entries = std::fs::read_dir(&self.plugins_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // A package root is an admission boundary. Do not follow a
+            // directory symlink supplied at the discovery root: it would make
+            // an external package appear local before its manifest and payload
+            // confinement checks begin.
+            if entry.file_type()?.is_dir() {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
@@ -862,11 +866,34 @@ permissions = []
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         let plugins = host.list_plugins();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_a_symlinked_package_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        std::fs::write(
+            external.path().join("manifest.toml"),
+            "name = \"external\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(external.path().join("plugin.wasm"), b"\0asm").unwrap();
+
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        symlink(external.path(), plugins_dir.join("linked-package")).unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
     }
 
     #[test]
@@ -916,6 +943,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::from_plugins_dir(dir.path()).unwrap();
         let plugins = host.list_plugins();
@@ -945,6 +973,7 @@ capabilities = ["tool"]
         let nested = dir.path().join("plugins").join("p");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("manifest.toml"), manifest).unwrap();
+        std::fs::write(nested.join("p.wasm"), b"\0asm").unwrap();
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
         assert_eq!(host.list_plugins()[0].name, "p");
@@ -1105,6 +1134,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(tool_dir.join("tool.wasm"), b"\0asm").unwrap();
 
         // Channel plugin
         let chan_dir = plugins_base.join("my-channel");
@@ -1119,6 +1149,7 @@ capabilities = ["channel"]
 "#,
         )
         .unwrap();
+        std::fs::write(chan_dir.join("channel.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 2);
@@ -1143,6 +1174,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert!(host.get_plugin("lookup-test").is_some());
@@ -1164,6 +1196,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let mut host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
@@ -1318,6 +1351,7 @@ capabilities = ["tool"]
             "name = \"declares\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n\n[egress]\nhosts = [\"api.example.com\", \"*.cdn.example.com\"]\n",
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         let plugins = host.list_plugins();
@@ -1351,6 +1385,7 @@ capabilities = ["tool"]
             "name = \"legacy\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n",
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
@@ -1538,9 +1573,11 @@ capabilities = ["tool"]
         let plugin_dir = dir.path().join("signed-schema");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
-        let unsigned = r#"name = "signed-schema"
+        let unsigned = format!(
+            r#"name = "signed-schema"
 version = "0.1.0"
 wasm_path = "plugin.wasm"
+wasm_sha256 = "{}"
 capabilities = ["tool"]
 permissions = ["config_read"]
 
@@ -1553,9 +1590,11 @@ additionalProperties = false
 [config_schema.properties.retries]
 type = "integer"
 minimum = 1
-"#;
+"#,
+            signature::sha256_hex(b"\0asm")
+        );
         let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
-        let signed_value = signature::sign_manifest(unsigned, &private_key).unwrap();
+        let signed_value = signature::sign_manifest(&unsigned, &private_key).unwrap();
         let signed = unsigned.replacen(
             "wasm_path = \"plugin.wasm\"",
             &format!(
