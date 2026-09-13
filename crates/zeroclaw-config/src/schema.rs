@@ -12997,8 +12997,8 @@ pub struct OidcConfig {
     /// (fail closed).
     #[serde(default)]
     pub service_profile_map: HashMap<String, String>,
-    /// Require the token to attest MFA (`amr` containing `mfa`, `otp`, or
-    /// `hwk`) before authentication succeeds.
+    /// Require the token to attest MFA through the IdP aggregate `mfa`
+    /// marker or an accepted configured ACR before authentication succeeds.
     pub require_mfa: bool,
     /// Acceptable `acr` (authentication context class) values. Empty = no
     /// requirement; non-empty = the token's `acr` claim must be one of
@@ -13010,17 +13010,17 @@ pub struct OidcConfig {
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities that resolve to SERVICE principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id`/`azp` claim. Service principals are keyed by
+    /// verified `client_id` claim. Service principals are keyed by
     /// issuer + client identity and never inherit human-user assumptions.
-    /// A caller not listed here needs a human `sub` to authenticate.
+    /// Client-credentials-shaped tokens (`sub == client_id`) need an entry
+    /// here; resource-owner tokens with a distinct human `sub` remain human.
     pub service_clients: Vec<String>,
-    /// Require the RFC 9068 `typ: at+jwt` header on presented JWTs. Off
-    /// by default because not every IdP mints typed access tokens; ID
-    /// tokens are rejected regardless via their `nonce` marker.
+    /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
+    /// tokens remain valid only through configured introspection.
     pub require_at_jwt: bool,
     /// Maximum authentication lifetime (seconds) for offline-validated
     /// (JWKS) tokens. Offline validation cannot see revocation, so the
-    /// identity expires at the EARLIER of the token `exp` and now + this
+    /// identity expires at the EARLIER of the token `exp` and `iat` + this
     /// cap. Must be > 0.
     pub max_auth_lifetime_secs: u64,
     /// Revalidation interval (seconds) for introspection mode: the
@@ -13081,7 +13081,7 @@ impl Default for OidcConfig {
             required_acr: Vec::new(),
             allowed_authorized_parties: Vec::new(),
             service_clients: Vec::new(),
-            require_at_jwt: false,
+            require_at_jwt: true,
             max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
             revalidation_secs: default_oidc_revalidation_secs(),
         }
@@ -13193,6 +13193,12 @@ impl OidcConfig {
             anyhow::bail!(
                 "oidc.{alias}.max_auth_lifetime_secs must be > 0: offline-validated \
                  tokens need a bounded authentication lifetime"
+            );
+        }
+        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+            anyhow::bail!(
+                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
+                 RFC 9068 typed access tokens"
             );
         }
         Ok(())
@@ -26730,9 +26736,17 @@ zeroclaw-operators = "operator"
         assert_eq!(defaults.validation, OidcValidation::Jwks);
         assert_eq!(defaults.max_auth_lifetime_secs, 86_400);
         assert_eq!(defaults.revalidation_secs, 60);
-        assert!(!defaults.require_at_jwt);
+        assert!(defaults.require_at_jwt);
         assert!(defaults.required_acr.is_empty());
         assert!(defaults.service_clients.is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_bearer_profile_requires_typed_access_tokens() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_at_jwt"), "got: {err}");
     }
 
     #[::core::prelude::v1::test]
