@@ -13012,8 +13012,9 @@ pub struct OidcConfig {
     /// (`client_credentials` callers), matched against the token's
     /// verified `client_id` claim. Service principals are keyed by
     /// issuer + client identity and never inherit human-user assumptions.
-    /// Client-credentials-shaped tokens (`sub == client_id`) need an entry
-    /// here; resource-owner tokens with a distinct human `sub` remain human.
+    /// A configured client is always a service regardless of its
+    /// provider-specific `sub` shape; all other tokens need a distinct human
+    /// `sub` to resolve as an OIDC user.
     pub service_clients: Vec<String>,
     /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
     /// tokens remain valid only through configured introspection.
