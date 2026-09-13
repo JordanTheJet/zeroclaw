@@ -1120,6 +1120,9 @@ mod tests {
         });
 
         let hostname = "not-in-dns.invalid";
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        // This is a loopback-only transport test with a plaintext local server;
+        // TLS behavior is covered separately by the named-custom-CA test below.
         let mut connection_options = options(&format!("ws://{hostname}:{}/events", address.port()));
         connection_options.subprotocols = vec!["json.v1".to_string(), "binary.v1".to_string()];
         let prepared = prepare_connection(connection_options).unwrap();
