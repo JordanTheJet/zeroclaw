@@ -7,9 +7,9 @@
 //! `WARN` log, after which the plugin is silently skipped — so `plugin install`
 //! reports success for a plugin that will never load.
 //!
-//! [`verify_component_loads`] closes that gap by running the *same* type-check
-//! the daemon runs at startup, at install time, so the failure reaches the
-//! operator at the CLI with its full diagnostic instead of vanishing into a log.
+//! [`verify_component_loads`] closes that gap by running the same type-check
+//! and resolved limits the daemon uses at startup, so the failure reaches the
+//! operator at the CLI instead of vanishing into a log.
 //!
 //! It is the single implementation of that check. `plugin install` runs it as a
 //! gate; `plugin info` and `plugin list --verify` run it as a report, for
@@ -28,7 +28,11 @@ use std::path::Path;
 /// When the host is built without a WASM execution backend there is nothing to
 /// instantiate against, so this is a no-op that returns `Ok(())`.
 #[cfg(feature = "plugins-wasmtime")]
-pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest) -> Result<()> {
+pub async fn verify_component_loads(
+    wasm_path: &Path,
+    manifest: &PluginManifest,
+    limits: crate::component::PluginLimits,
+) -> Result<()> {
     use crate::PluginCapability;
     use crate::instance::PluginInstanceScope;
 
@@ -39,8 +43,6 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
     let _component = crate::component::load_component(wasm_path)?;
 
     let services = validation_services();
-    let limits = validation_limits();
-
     for capability in &manifest.capabilities {
         match capability {
             PluginCapability::Tool => {
@@ -75,26 +77,12 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
 
 /// No-backend build: nothing to instantiate against, so verification passes.
 #[cfg(not(feature = "plugins-wasmtime"))]
-pub async fn verify_component_loads(_wasm_path: &Path, _manifest: &PluginManifest) -> Result<()> {
+pub async fn verify_component_loads(
+    _wasm_path: &Path,
+    _manifest: &PluginManifest,
+    _limits: crate::component::PluginLimits,
+) -> Result<()> {
     Ok(())
-}
-
-/// Limits for a load-check. Instantiation runs the component's own
-/// initialization but no guest export, so a generous fuel and memory budget is
-/// ample; the timeout only bounds a pathological init. The instance and table
-/// ceilings mirror the runtime's own defaults so verification does not reject a
-/// component the daemon would happily instantiate — a WASI + component pair is
-/// already two core instances, so a tight `max_instances` would be a false
-/// failure, not a real ABI mismatch.
-#[cfg(feature = "plugins-wasmtime")]
-fn validation_limits() -> crate::component::PluginLimits {
-    crate::component::PluginLimits {
-        call_fuel: 1_000_000_000,
-        max_memory_bytes: 256 * 1024 * 1024,
-        max_table_elements: 100_000,
-        max_instances: 64,
-        call_timeout: std::time::Duration::from_secs(30),
-    }
 }
 
 /// A config resolver that is never consulted: verification stops at

@@ -3367,13 +3367,14 @@ enum PluginCommands {
 #[cfg(feature = "plugins-wasm")]
 async fn verify_plugin_loads_or_bail(
     host: &zeroclaw::plugins::host::PluginHost,
+    limits: zeroclaw::plugins::component::PluginLimits,
     source: &str,
     no_verify: bool,
 ) -> Result<()> {
     let Some((manifest, wasm)) = host.source_component(source)? else {
         return Ok(());
     };
-    match zeroclaw::plugins::validate::verify_component_loads(&wasm, &manifest).await {
+    match zeroclaw::plugins::validate::verify_component_loads(&wasm, &manifest, limits).await {
         Ok(()) => Ok(()),
         Err(error) if no_verify => {
             let detail = format!("{error:#}");
@@ -3439,6 +3440,7 @@ impl PluginLoadStatus {
 async fn installed_plugin_load_status(
     host: &zeroclaw::plugins::host::PluginHost,
     info: &zeroclaw::plugins::PluginInfo,
+    limits: zeroclaw::plugins::component::PluginLimits,
 ) -> Result<PluginLoadStatus> {
     let Some(wasm_path) = info.wasm_path.as_deref() else {
         return Ok(PluginLoadStatus::NoComponent);
@@ -3446,7 +3448,7 @@ async fn installed_plugin_load_status(
     let manifest = host
         .manifest(&info.name)
         .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    match zeroclaw::plugins::validate::verify_component_loads(wasm_path, manifest).await {
+    match zeroclaw::plugins::validate::verify_component_loads(wasm_path, manifest, limits).await {
         Ok(()) => Ok(PluginLoadStatus::Loads),
         Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
     }
@@ -8801,11 +8803,12 @@ Add pricing to the active provider profile or supply a catalog entry."
             PluginCommands::List { verify } => {
                 let host = plugin_host_with_configured_security(&config)?;
                 if verify {
+                    let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                     let mut entries = Vec::new();
                     for info in host.list_plugins() {
                         entries.push((
                             info.clone(),
-                            Some(installed_plugin_load_status(&host, &info).await?),
+                            Some(installed_plugin_load_status(&host, &info, limits).await?),
                         ));
                     }
                     for line in plugin_list_lines(&entries) {
@@ -8891,8 +8894,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     );
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 if plugin_registry::is_local_plugin_source(&source) {
-                    verify_plugin_loads_or_bail(&host, &source, no_verify).await?;
+                    verify_plugin_loads_or_bail(&host, limits, &source, no_verify).await?;
                     let name = host.install(&source)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
@@ -8921,7 +8925,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    verify_plugin_loads_or_bail(&host, &plugin_dir, no_verify).await?;
+                    verify_plugin_loads_or_bail(&host, limits, &plugin_dir, no_verify).await?;
                     let name = host.install(&plugin_dir)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
@@ -8950,13 +8954,14 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             PluginCommands::Info { name } => {
                 let host = plugin_host_with_configured_security(&config)?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 match host.get_plugin(&name) {
                     Some(info) => {
                         let config_entries = installed_plugin_config_entries(&host, &info.name)?;
                         // The load-check always runs here. "Why does my plugin
                         // not show up?" is the question this command is reached
                         // for, and discovery metadata cannot answer it.
-                        let status = installed_plugin_load_status(&host, &info).await?;
+                        let status = installed_plugin_load_status(&host, &info, limits).await?;
                         for line in plugin_info_lines(&info, &config_entries, &status) {
                             println!("{line}");
                         }
@@ -14417,6 +14422,12 @@ mod tests {
         /// honest under any locale the process happens to detect.
         const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
 
+        fn verifier_limits() -> zeroclaw::plugins::component::PluginLimits {
+            zeroclaw_runtime::plugin_runtime::plugin_limits(
+                &crate::config::schema::Config::default(),
+            )
+        }
+
         /// The fixture package's manifest, mirroring the one the plugins
         /// crate's end-to-end test installs.
         const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
@@ -14511,7 +14522,9 @@ type = "string"
                 .expect("the installed fixture is discovered");
             let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
 
-            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::Loads),
                 "the in-tree tool fixture must load against this host; got {status:?}"
@@ -14538,6 +14551,37 @@ type = "string"
         }
 
         #[tokio::test]
+        async fn load_verdict_uses_the_runtime_resolved_plugin_limits() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+
+            let mut constrained = crate::config::schema::Config::default();
+            constrained.plugins.limits.max_instances = 1;
+            let constrained_status = installed_plugin_load_status(
+                &host,
+                &info,
+                zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(constrained_status, PluginLoadStatus::Fails(_)),
+                "a limit below the component's required instances must not report loads: {constrained_status:?}"
+            );
+
+            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(default_status, PluginLoadStatus::Loads),
+                "the same component must load under the default runtime limits: {default_status:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn plugin_info_and_list_verify_expose_a_plugin_that_no_longer_loads() {
             let workspace = tempfile::tempdir().unwrap();
             let host = install_fixture(workspace.path());
@@ -14560,7 +14604,9 @@ type = "string"
                 "discovery still calls the package loaded, which is why the check is needed"
             );
 
-            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
             let PluginLoadStatus::Fails(cause) = &status else {
                 panic!("a non-component artifact must not report as loading; got {status:?}");
             };
@@ -14678,7 +14724,9 @@ type = "string"
                 .expect("the skill bundle is discovered");
             assert!(info.wasm_path.is_none(), "the fixture ships no component");
 
-            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::NoComponent),
                 "a component-less package is not applicable, not broken; got {status:?}"
