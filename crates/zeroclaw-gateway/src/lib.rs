@@ -824,6 +824,7 @@ pub async fn run_gateway(
 /// webhook registry. Standalone callers use [`run_gateway`], because no channel
 /// supervisor exists there to publish live routes.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
