@@ -528,13 +528,16 @@ pub async fn configured_plugin_channels_with_webhooks(
         // One host-owned egress authority for every channel in this plan. It is
         // shared, not per-channel: each store carries its own instance scope, and
         // the service resolves reach from canonical config against that scope's
-        // `config_entry_key()` at request time. Built from the same live view as
-        // the host services — before `live_config` is moved into them — so egress
-        // and config read one row, by construction.
+        // `config_entry_key()` at request time. The same live view is cloned
+        // into config reads and sender authorization, so each resolves the
+        // current canonical row independently rather than snapshotting it.
         let egress_service =
             crate::tools::plugin_egress_service(Arc::clone(&config), live_config.clone());
-        let host_services =
-            crate::tools::plugin_host_services(Arc::clone(&host), Arc::clone(&config), live_config);
+        let host_services = crate::tools::plugin_host_services(
+            Arc::clone(&host),
+            Arc::clone(&config),
+            live_config.clone(),
+        );
         let limits = plugin_limits(&config);
         let details = host.channel_plugin_details();
         let scopes: Vec<_> = plan.scopes(PluginCapability::Channel).collect();
