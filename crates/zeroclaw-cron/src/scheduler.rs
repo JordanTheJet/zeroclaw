@@ -7,9 +7,9 @@ use crate::store::{
     persist_run_result,
 };
 use crate::{
-    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
-    clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
-    sync_declarative_jobs,
+    CronAgentExecutor, CronAgentRequest, CronAgentRun, CronHealthReporter, CronJob, DeliveryConfig,
+    JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs,
+    next_run_for_schedule, release_job, skip_missed_run, sync_declarative_jobs,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -68,51 +68,6 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
-
-/// Process health reporter, supplied by the host.
-///
-/// Registered rather than threaded through every call site, matching how the
-/// delivery seam below already works. Unregistered defaults to a no-op, so an
-/// embedding that does not run a health registry simply reports nothing
-/// instead of failing.
-static HEALTH: std::sync::OnceLock<
-    std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>,
-> = std::sync::OnceLock::new();
-
-/// Register the health reporter. First registration wins.
-pub fn register_health_reporter(
-    reporter: std::sync::Arc<dyn zeroclaw_api::cron_traits::CronHealthReporter>,
-) {
-    let _ = HEALTH.set(reporter);
-}
-
-fn mark_ok(component: &str) {
-    if let Some(h) = HEALTH.get() {
-        h.mark_ok(component);
-    }
-}
-
-fn mark_error(component: &str, reason: &str) {
-    if let Some(h) = HEALTH.get() {
-        h.mark_error(component, reason);
-    }
-}
-
-/// Agent-job executor, supplied by the host.
-///
-/// Cron decides when a job runs and whether policy permits it; the runtime
-/// runs the agent. Without a registered executor an agent job fails with a
-/// clear message rather than silently reporting success.
-static AGENT_EXECUTOR: std::sync::OnceLock<
-    std::sync::Arc<dyn zeroclaw_api::cron_traits::CronAgentExecutor>,
-> = std::sync::OnceLock::new();
-
-/// Register the agent executor. First registration wins.
-pub fn register_agent_executor(
-    executor: std::sync::Arc<dyn zeroclaw_api::cron_traits::CronAgentExecutor>,
-) {
-    let _ = AGENT_EXECUTOR.set(executor);
-}
 
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
@@ -436,6 +391,7 @@ pub async fn run_manual_job(
     job: &CronJob,
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> ManualCronRunResult {
     run_manual_job_inner(
         config,
@@ -445,6 +401,7 @@ pub async fn run_manual_job(
         None,
         false,
         ManualClaim::Acquire,
+        agent_executor,
     )
     .await
 }
@@ -456,6 +413,7 @@ pub async fn run_manual_job_with_runtime(
     event_tx: &EventBroadcast,
     runtime: &dyn RuntimeAdapter,
     approved: bool,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> ManualCronRunResult {
     run_manual_job_inner(
         config,
@@ -465,6 +423,7 @@ pub async fn run_manual_job_with_runtime(
         Some(runtime),
         approved,
         ManualClaim::HeldByCaller,
+        agent_executor,
     )
     .await
 }
@@ -477,6 +436,7 @@ async fn run_manual_job_inner(
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
     claim: ManualClaim,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
 
@@ -543,7 +503,7 @@ async fn run_manual_job_inner(
         lock_token,
     });
 
-    let run = execute_job_now_with_runtime(config, job, runtime, approved).await;
+    let run = execute_job_now_with_runtime(config, job, runtime, approved, agent_executor).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, run, context).await;
@@ -596,12 +556,14 @@ pub async fn run(
     config: Config,
     event_tx: EventBroadcast,
     cancel: CancellationToken,
+    agent_executor: Arc<dyn CronAgentExecutor>,
+    health_reporter: Arc<dyn CronHealthReporter>,
 ) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    mark_ok(SCHEDULER_COMPONENT);
+    health_reporter.mark_ok(SCHEDULER_COMPONENT);
 
     // ── Declarative job sync: reconcile config-defined jobs with the DB.
     let mut jobs_with_builtin = config.cron.clone();
@@ -684,7 +646,13 @@ pub async fn run(
     }
 
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx).await;
+        catch_up_overdue_jobs(
+            &config,
+            &event_tx,
+            Arc::clone(&agent_executor),
+            Arc::clone(&health_reporter),
+        )
+        .await;
     } else {
         ::zeroclaw_log::record!(
             INFO,
@@ -698,12 +666,12 @@ pub async fn run(
         tokio::select! {
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
-                mark_ok(SCHEDULER_COMPONENT);
+                health_reporter.mark_ok(SCHEDULER_COMPONENT);
 
                 let jobs = match due_jobs(&config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
-                        mark_error(SCHEDULER_COMPONENT, &e.to_string());
+                        health_reporter.mark_error(SCHEDULER_COMPONENT, &e.to_string());
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -720,10 +688,18 @@ pub async fn run(
                 // gate is being resolved from.
                 let jobs = withhold_declarative_when_unreconciled(jobs, declarative_sync_failed);
                 let jobs = claim_due_jobs(&config, jobs);
-                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                process_due_jobs(
+                    &config,
+                    jobs,
+                    SCHEDULER_COMPONENT,
+                    &event_tx,
+                    Arc::clone(&agent_executor),
+                    Arc::clone(&health_reporter),
+                )
+                .await;
             }
             _ = cancel.cancelled() => {
-                mark_ok(SCHEDULER_COMPONENT);
+                health_reporter.mark_ok(SCHEDULER_COMPONENT);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -789,7 +765,12 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Result<&'a str
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
+async fn catch_up_overdue_jobs(
+    config: &Config,
+    event_tx: &EventBroadcast,
+    agent_executor: Arc<dyn CronAgentExecutor>,
+    health_reporter: Arc<dyn CronHealthReporter>,
+) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
@@ -822,7 +803,15 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 
     let jobs = claim_due_jobs(config, jobs);
-    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    process_due_jobs(
+        config,
+        jobs,
+        SCHEDULER_COMPONENT,
+        event_tx,
+        agent_executor,
+        health_reporter,
+    )
+    .await;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -902,6 +891,7 @@ async fn execute_job_now_with_runtime(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> CronRunOutcome {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
@@ -940,6 +930,7 @@ async fn execute_job_now_with_runtime(
         job,
         runtime,
         approved,
+        agent_executor,
     ))
     .instrument(span)
     .await
@@ -961,6 +952,22 @@ fn cron_agent_excluded_tools(job: &CronJob) -> Vec<String> {
         .collect()
 }
 
+fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+    let mut policy = base.clone();
+    let additions = cron_agent_excluded_tools(job);
+    if additions.is_empty() {
+        return policy;
+    }
+
+    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
+    for tool in additions {
+        if !excluded.contains(&tool) {
+            excluded.push(tool);
+        }
+    }
+    policy
+}
+
 fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
     match target {
         SessionTarget::Main => std::path::PathBuf::from("main"),
@@ -975,6 +982,7 @@ async fn execute_job_with_retry(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> CronRunOutcome {
     // A gate is declared in config only, so it is resolved from config rather
     // than from the cron row; agent jobs can carry one just as shell jobs can.
@@ -1056,7 +1064,16 @@ async fn execute_job_with_retry(
                 };
                 run_job_command_with_runtime(config, runtime, security, job, approved).await
             }
-            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
+            JobType::Agent => {
+                Box::pin(run_agent_job(
+                    config,
+                    security,
+                    agent_alias,
+                    job,
+                    agent_executor,
+                ))
+                .await
+            }
         };
         last_output = output;
 
@@ -1139,9 +1156,11 @@ async fn process_due_jobs(
     jobs: Vec<CronJob>,
     component: &str,
     event_tx: &EventBroadcast,
+    agent_executor: Arc<dyn CronAgentExecutor>,
+    health_reporter: Arc<dyn CronHealthReporter>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
-    mark_ok(component);
+    health_reporter.mark_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
@@ -1164,6 +1183,8 @@ async fn process_due_jobs(
         };
         let config = config.clone();
         let component = component.to_owned();
+        let agent_executor = Arc::clone(&agent_executor);
+        let health_reporter = Arc::clone(&health_reporter);
         Some(async move {
             Box::pin(execute_and_persist_job(
                 &config,
@@ -1171,6 +1192,8 @@ async fn process_due_jobs(
                 &agent_alias,
                 &job,
                 &component,
+                agent_executor.as_ref(),
+                health_reporter.as_ref(),
             ))
             .await
         })
@@ -1213,8 +1236,10 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
+    agent_executor: &dyn CronAgentExecutor,
+    health_reporter: &dyn CronHealthReporter,
 ) -> ScheduledRunReport {
-    mark_ok(component);
+    health_reporter.mark_ok(component);
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
@@ -1226,6 +1251,7 @@ async fn execute_and_persist_job(
         job,
         None,
         false,
+        agent_executor,
     ))
     .instrument(span)
     .await;
@@ -1266,6 +1292,7 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    agent_executor: &dyn CronAgentExecutor,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -1293,9 +1320,6 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    let mut cron_config = config.clone();
-    cron_config.memory.auto_save = false;
-
     // Assign a unique run ID for tracing. Isolated jobs also use it in the
     // session path so failed-run memory purge stays scoped per execution.
     // Main-target jobs reuse the stable `main` session path documented in
@@ -1306,35 +1330,20 @@ async fn run_agent_job(
     // Everything above is cron's own business: policy admission, the action
     // budget, the prompt envelope, and which session path the run belongs to.
     // Executing the agent is not, so it goes across the seam.
-    //
-    // The request carries policy *inputs* rather than a built `SecurityPolicy`.
-    // `zeroclaw-api` is the leaf trait crate and cannot see `zeroclaw-config`
-    // types, and inverting that would be a dependency cycle. The host rebuilds
-    // the effective policy from the alias and these narrowing lists.
-    let request = zeroclaw_api::cron_traits::CronAgentRequest {
+    let request = CronAgentRequest {
+        config: config.clone(),
+        security: Arc::new(cron_agent_run_policy(security, job)),
         job_id: job.id.clone(),
         agent_alias: agent_alias.to_string(),
         prompt: prefixed_prompt,
         model: model_override,
         session_path,
         allowed_tools: job.allowed_tools.clone(),
-        workspace_dir: security.workspace_dir.clone(),
-        excluded_tools: cron_agent_excluded_tools(job),
         uses_memory: job.uses_memory,
     };
 
-    let Some(executor) = AGENT_EXECUTOR.get() else {
-        // Fail loudly rather than report a success nobody performed.
-        return (
-            false,
-            "agent job failed: no cron agent executor registered \
-             (register_agent_executor was not called by the host)"
-                .to_string(),
-        );
-    };
-
-    let run = executor.run_agent_job(request).await;
-    (run.success, run.output)
+    let CronAgentRun { success, output } = agent_executor.run_agent_job(request).await;
+    (success, output)
 }
 
 async fn persist_job_result(
@@ -1721,24 +1730,14 @@ mod tests {
     // call sites; without it `cron::` resolves to the schedule-parsing crate.
     use crate as cron;
 
-    /// Records what the scheduler reports, standing in for the host registry.
-    ///
-    /// Registration is first-wins and the whole test binary shares one
-    /// process, so this is installed once and read by every health test.
+    /// Records what the scheduler reports for one test invocation.
     #[derive(Default)]
     struct RecordingHealth {
         ok: parking_lot::Mutex<Vec<String>>,
         errors: parking_lot::Mutex<Vec<String>>,
     }
 
-    static RECORDING_HEALTH: std::sync::LazyLock<std::sync::Arc<RecordingHealth>> =
-        std::sync::LazyLock::new(|| {
-            let reporter = std::sync::Arc::new(RecordingHealth::default());
-            register_health_reporter(reporter.clone());
-            reporter
-        });
-
-    impl zeroclaw_api::cron_traits::CronHealthReporter for RecordingHealth {
+    impl CronHealthReporter for RecordingHealth {
         fn mark_ok(&self, component: &str) {
             self.ok.lock().push(component.to_string());
         }
@@ -1747,12 +1746,33 @@ mod tests {
         }
     }
 
-    fn recorded_health_ok() -> Vec<String> {
-        RECORDING_HEALTH.ok.lock().clone()
+    struct SuccessfulExecutor;
+
+    impl CronAgentExecutor for SuccessfulExecutor {
+        fn run_agent_job<'a>(
+            &'a self,
+            _request: CronAgentRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CronAgentRun> + Send + 'a>>
+        {
+            Box::pin(async {
+                CronAgentRun {
+                    success: true,
+                    output: "done".to_string(),
+                }
+            })
+        }
     }
 
-    fn recorded_health_errors() -> Vec<String> {
-        RECORDING_HEALTH.errors.lock().clone()
+    fn test_agent_executor() -> &'static dyn CronAgentExecutor {
+        &SuccessfulExecutor
+    }
+
+    fn test_agent_executor_arc() -> Arc<dyn CronAgentExecutor> {
+        Arc::new(SuccessfulExecutor)
+    }
+
+    fn test_health_reporter() -> Arc<dyn CronHealthReporter> {
+        Arc::new(crate::NoopCronHealth)
     }
     use crate::DeliveryConfig;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -2240,7 +2260,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
         let event_tx = Some(tx);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &event_tx).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &event_tx,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(result.success);
         assert_eq!(result.status, "ok");
@@ -2583,6 +2610,7 @@ mod tests {
             &job,
             None,
             false,
+            test_agent_executor(),
         ))
         .await;
         let (success, output) = (outcome.is_success(), outcome.into_output());
@@ -2608,6 +2636,7 @@ mod tests {
             &job,
             None,
             false,
+            test_agent_executor(),
         ))
         .await;
         let (success, output) = (outcome.is_success(), outcome.into_output());
@@ -2623,16 +2652,22 @@ mod tests {
     /// success.
     #[tokio::test]
     async fn agent_job_failure_from_the_executor_is_reported_as_failure() {
-        std::sync::LazyLock::force(&RECORDING_EXECUTOR);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some(format!("Say hello {EXECUTOR_FAILURE_SENTINEL}"));
         let security = test_security(&config);
+        let executor = RecordingExecutor::default();
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            &executor,
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("agent job failed:"), "unexpected: {output}");
     }
@@ -2641,31 +2676,27 @@ mod tests {
     const EXECUTOR_FAILURE_SENTINEL: &str = "__cron_stub_should_fail__";
 
     /// Records what cron hands across the executor seam.
+    #[derive(Default)]
     struct RecordingExecutor {
-        seen: std::sync::Arc<parking_lot::Mutex<Vec<zeroclaw_api::cron_traits::CronAgentRequest>>>,
+        seen: parking_lot::Mutex<Vec<CronAgentRequest>>,
     }
 
-    impl zeroclaw_api::cron_traits::CronAgentExecutor for RecordingExecutor {
+    impl CronAgentExecutor for RecordingExecutor {
         fn run_agent_job<'a>(
             &'a self,
-            request: zeroclaw_api::cron_traits::CronAgentRequest,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = zeroclaw_api::cron_traits::CronAgentRun>
-                    + Send
-                    + 'a,
-            >,
-        > {
+            request: CronAgentRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CronAgentRun> + Send + 'a>>
+        {
             let fail = request.prompt.contains(EXECUTOR_FAILURE_SENTINEL);
             self.seen.lock().push(request);
             Box::pin(async move {
                 if fail {
-                    zeroclaw_api::cron_traits::CronAgentRun {
+                    CronAgentRun {
                         success: false,
                         output: "agent job failed: stub executor was asked to fail".to_string(),
                     }
                 } else {
-                    zeroclaw_api::cron_traits::CronAgentRun {
+                    CronAgentRun {
                         success: true,
                         output: "done".to_string(),
                     }
@@ -2674,27 +2705,15 @@ mod tests {
         }
     }
 
-    static RECORDING_EXECUTOR: std::sync::LazyLock<
-        std::sync::Arc<parking_lot::Mutex<Vec<zeroclaw_api::cron_traits::CronAgentRequest>>>,
-    > = std::sync::LazyLock::new(|| {
-        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        register_agent_executor(std::sync::Arc::new(RecordingExecutor {
-            seen: seen.clone(),
-        }));
-        seen
-    });
-
     /// The scheduler's workspace must survive the crate boundary.
     ///
-    /// Ported from the pre-extraction test added by the scheduler-workspace
-    /// fix. That test asserted end to end that shell output came from the
-    /// scheduler's workspace; agent execution now lives behind the executor
-    /// seam, so this asserts the half cron still owns: that the resolved
-    /// workspace is what cron hands over, on the retry path and under
-    /// concurrency. The end-to-end half belongs with the host executor.
+    /// This asserts the half cron owns: the effective policy crosses the seam
+    /// on the retry path and under concurrency without being projected into a
+    /// second field bag. The runtime-side test drives that policy through the
+    /// real agent loop and shell tool.
     #[tokio::test]
-    async fn cron_hands_the_scheduler_workspace_across_the_executor_seam() {
-        let seen = std::sync::LazyLock::force(&RECORDING_EXECUTOR).clone();
+    async fn cron_hands_the_effective_policy_across_the_executor_seam() {
+        let executor = RecordingExecutor::default();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
 
@@ -2711,35 +2730,37 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Print the current workspace directory".into());
-        job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
-        let before = seen.lock().len();
-
         let outcome = Box::pin(execute_job_with_retry(
-            &config, &security, TEST_AGENT, &job, None, false,
+            &config, &security, TEST_AGENT, &job, None, false, &executor,
         ))
         .await;
         assert!(outcome.is_success(), "{}", outcome.clone().into_output());
 
         let (a, b, c) = tokio::join!(
-            run_agent_job(&config, &security, TEST_AGENT, &job),
-            run_agent_job(&config, &security, TEST_AGENT, &job),
-            run_agent_job(&config, &security, TEST_AGENT, &job),
+            run_agent_job(&config, &security, TEST_AGENT, &job, &executor),
+            run_agent_job(&config, &security, TEST_AGENT, &job, &executor),
+            run_agent_job(&config, &security, TEST_AGENT, &job, &executor),
         );
         for result in [a, b, c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
         }
 
-        let requests = seen.lock();
-        let ours = &requests[before..];
-        assert_eq!(ours.len(), 4, "one request per run, retries included");
-        for request in ours {
+        let requests = executor.seen.lock();
+        assert_eq!(requests.len(), 4, "one request per run, retries included");
+        for request in requests.iter() {
             assert_eq!(
-                request.workspace_dir, scheduler_workspace,
+                request.security.workspace_dir, scheduler_workspace,
                 "the scheduler workspace must not be replaced by the agent default"
             );
             assert_eq!(request.agent_alias, TEST_AGENT);
+            for tool in CRON_AGENT_DEFAULT_EXCLUDED_TOOLS {
+                assert!(
+                    request.security.is_tool_excluded(tool),
+                    "{tool} must remain excluded across the executor seam"
+                );
+            }
         }
     }
 
@@ -2757,8 +2778,14 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            test_agent_executor(),
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -2778,8 +2805,14 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            test_agent_executor(),
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -2787,38 +2820,52 @@ mod tests {
 
     #[tokio::test]
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
-        // Force reporter registration before anything can report.
-        std::sync::LazyLock::force(&RECORDING_HEALTH);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let component = unique_component("idle-health");
+        let health = Arc::new(RecordingHealth::default());
 
         // An idle poll still has to report liveness, otherwise a silent
         // scheduler is indistinguishable from one with nothing to do.
-        process_due_jobs(&config, vec![], &component, &None).await;
+        process_due_jobs(
+            &config,
+            vec![],
+            &component,
+            &None,
+            test_agent_executor_arc(),
+            health.clone(),
+        )
+        .await;
 
         assert!(
-            recorded_health_ok().iter().any(|c| c == &component),
+            health.ok.lock().iter().any(|c| c == &component),
             "an idle poll must still mark the component healthy"
         );
     }
 
     #[tokio::test]
     async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
-        // Force reporter registration before anything can report.
-        std::sync::LazyLock::force(&RECORDING_HEALTH);
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let component = unique_component("failure-health");
         let job = test_job("definitely_not_a_real_command_xyz");
+        let health = Arc::new(RecordingHealth::default());
 
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &None,
+            test_agent_executor_arc(),
+            health.clone(),
+        )
+        .await;
 
         // A failing job is a job problem, not a scheduler problem. The
         // scheduler completed its poll, so it stays healthy.
-        assert!(recorded_health_ok().iter().any(|c| c == &component));
+        assert!(health.ok.lock().iter().any(|c| c == &component));
         assert!(
-            !recorded_health_errors().iter().any(|c| c == &component),
+            !health.errors.lock().iter().any(|c| c == &component),
             "a failed job must not mark the scheduler itself unhealthy"
         );
     }
@@ -3679,7 +3726,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -3705,7 +3760,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -3761,7 +3824,15 @@ mod tests {
             ..job.clone()
         };
 
-        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![orphan],
+            &unique_component("orphan"),
+            &None,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
 
         assert!(
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
@@ -3777,7 +3848,15 @@ mod tests {
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &None,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3792,7 +3871,15 @@ mod tests {
         // process_due_jobs must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(
+            &config,
+            vec![job],
+            &component,
+            &event_tx,
+            test_agent_executor_arc(),
+            test_health_reporter(),
+        )
+        .await;
         // If we got here without panic, the test passes.
     }
 
@@ -3862,7 +3949,14 @@ mod tests {
         allow_gate_test_commands(&mut config);
         let job = declarative_gated_job(&mut config, "gate-proceed", "exit 0", 30);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(
             result.success,
@@ -3884,7 +3978,14 @@ mod tests {
         allow_gate_test_commands(&mut config);
         let job = declarative_gated_job(&mut config, "gate-skip", "exit 10", 30);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         // A clean skip is not a failure.
         assert!(
@@ -3914,7 +4015,14 @@ mod tests {
         allow_gate_test_commands(&mut config);
         let job = declarative_gated_job(&mut config, "gate-fail", "exit 3", 30);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(!result.success, "a failing gate is a failed run");
         assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
@@ -3938,7 +4046,14 @@ mod tests {
         allow_gate_test_commands(&mut config);
         let job = declarative_gated_job(&mut config, "gate-timeout", "sleep 30", 1);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(!result.success, "a timed-out gate is a failed run");
         assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
@@ -3967,7 +4082,14 @@ mod tests {
             30,
         );
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(!result.success);
         assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
@@ -4001,7 +4123,8 @@ mod tests {
         job.id = "shared-id".into();
         job.source = "imperative".into();
 
-        let outcome = execute_job_now_with_runtime(&config, &job, None, false).await;
+        let outcome =
+            execute_job_now_with_runtime(&config, &job, None, false, test_agent_executor()).await;
 
         assert!(outcome.ran_body(), "imperative job should not be gated");
         assert!(outcome.is_success());
@@ -4238,7 +4361,14 @@ mod tests {
             .push("moved-job".to_string());
 
         // The row still carries the old owner; only live config moved.
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         // Under the old owner `exit` is allowed and the gate would pass. Under
         // the new owner it is not, so a correct resolver refuses the hook.
@@ -4307,7 +4437,14 @@ mod tests {
         assert!(reason.contains(TEST_AGENT) && reason.contains("rival-owner"));
 
         // And the run refuses rather than executing under a coin-flip policy.
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
         assert!(!result.success);
         assert!(
             !body_ran(&result),
@@ -4388,7 +4525,14 @@ mod tests {
         // Stand in for a due scheduled run that already claimed the row.
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
 
         assert!(!result.success);
         assert_eq!(result.status, STATUS_ALREADY_IN_FLIGHT);
@@ -4417,7 +4561,14 @@ mod tests {
         allow_gate_test_commands(&mut config);
         let job = declarative_gated_job(&mut config, "release-job", "exit 0", 30);
 
-        let first = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let first = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
         assert_eq!(first.status, "ok");
 
         assert!(
@@ -4434,7 +4585,14 @@ mod tests {
         // The gate skips, so the run returns early — the guard still releases.
         let job = declarative_gated_job(&mut config, "skip-release", "exit 10", 30);
 
-        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
         assert_eq!(result.status, STATUS_SKIPPED_PRECONDITION);
 
         assert!(
@@ -4484,11 +4642,24 @@ mod tests {
         let job = cron::get_job(&config, "race-job").expect("synced job should be readable");
 
         let (first, second) = tokio::join!(
-            run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None),
+            run_manual_job(
+                &config,
+                &job,
+                CronDeliveryContext::RpcManual,
+                &None,
+                test_agent_executor()
+            ),
             async {
                 // Let the first trigger take the claim before the second asks.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &None).await
+                run_manual_job(
+                    &config,
+                    &job,
+                    CronDeliveryContext::GatewayManual,
+                    &None,
+                    test_agent_executor(),
+                )
+                .await
             }
         );
 
@@ -4520,8 +4691,14 @@ mod tests {
         let job = declarative_gated_job(&mut config, "skip-broadcast", "exit 10", 30);
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
 
-        let result =
-            run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &Some(tx)).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::GatewayManual,
+            &Some(tx),
+            test_agent_executor(),
+        )
+        .await;
         assert_eq!(result.status, STATUS_SKIPPED_PRECONDITION);
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -4544,8 +4721,14 @@ mod tests {
         let job = declarative_gated_job(&mut config, "fail-broadcast", "exit 3", 30);
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
 
-        let result =
-            run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &Some(tx)).await;
+        let result = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::GatewayManual,
+            &Some(tx),
+            test_agent_executor(),
+        )
+        .await;
         assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())

@@ -661,7 +661,7 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron_host::run_manual_job(
         &config,
         &job,
         zeroclaw_cron::scheduler::CronDeliveryContext::GatewayManual,

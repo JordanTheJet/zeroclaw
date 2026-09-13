@@ -82,8 +82,8 @@ For background-work changes, answer these before reviewer sign-off:
 
 ## Source pointers
 
-- Cron scheduler and persistence: `crates/zeroclaw-runtime/src/cron/scheduler.rs`, `crates/zeroclaw-runtime/src/cron/store.rs`
-- Cron precondition gate: `crates/zeroclaw-runtime/src/cron/precondition.rs`
+- Cron scheduler and persistence: `crates/zeroclaw-cron/src/scheduler.rs`, `crates/zeroclaw-cron/src/store.rs`
+- Cron precondition gate: `crates/zeroclaw-cron/src/precondition.rs`
 - SOP engine and run stores: `crates/zeroclaw-runtime/src/sop/engine.rs`, `crates/zeroclaw-runtime/src/sop/store/`
 - Delegation and subagent behavior: [Delegation & SubAgents](../agents/delegation.md), `crates/zeroclaw-runtime/src/tools/delegate.rs`, `crates/zeroclaw-runtime/src/tools/spawn_subagent.rs`, `crates/zeroclaw-runtime/src/subagent/mod.rs`
 - Durable task control plane and recovery: `crates/zeroclaw-runtime/src/control_plane/`

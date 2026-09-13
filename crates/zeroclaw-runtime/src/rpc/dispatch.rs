@@ -4277,7 +4277,7 @@ impl RpcDispatcher {
         let job = zeroclaw_cron::get_job(&config, &req.id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         let event_tx = self.ctx.event_tx.clone();
-        let result = zeroclaw_cron::scheduler::run_manual_job(
+        let result = crate::cron_host::run_manual_job(
             &config,
             &job,
             zeroclaw_cron::scheduler::CronDeliveryContext::RpcManual,

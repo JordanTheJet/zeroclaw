@@ -3,6 +3,7 @@ use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
+mod host;
 pub mod i18n;
 mod precondition;
 mod schedule;
@@ -12,6 +13,10 @@ mod types;
 #[cfg(feature = "plugins-wasm")]
 pub mod outbox;
 pub mod scheduler;
+
+pub use host::{
+    CronAgentExecutor, CronAgentRequest, CronAgentRun, CronHealthReporter, NoopCronHealth,
+};
 
 #[allow(unused_imports)]
 pub use schedule::{

@@ -228,7 +228,7 @@ impl Tool for CronRunTool {
             self.agent_alias.clone(),
             lock_token,
         );
-        let result = cron::scheduler::run_manual_job_with_runtime(
+        let result = crate::cron_host::run_manual_job_with_runtime(
             &self.config,
             &job,
             cron::scheduler::CronDeliveryContext::ToolManual,

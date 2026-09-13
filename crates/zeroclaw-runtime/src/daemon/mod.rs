@@ -985,12 +985,6 @@ pub async fn run(
     if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
-        // Cron runs agent jobs and reports health through seams it cannot
-        // implement itself, so the host has to supply them before the
-        // scheduler starts. Registration is first-wins; a supervisor restart
-        // re-enters this path and correctly does nothing.
-        crate::cron_host::register_cron_host(scheduler_cfg.clone());
-
         let scheduler_cancel = channels_cancel.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -1001,7 +995,9 @@ pub async fn run(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
-                async move { Box::pin(zeroclaw_cron::scheduler::run(cfg, Some(tx), cancel)).await }
+                async move {
+                    Box::pin(crate::cron_host::run_scheduler(cfg, Some(tx), cancel)).await
+                }
             },
         ));
     } else {
