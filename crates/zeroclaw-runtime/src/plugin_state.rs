@@ -128,6 +128,7 @@ impl PluginStateStore {
             self.open_value(scope, key, &locator, &ciphertext)
         })
         .transpose()
+        .map(Option::flatten)
     }
 
     fn put_sync(
@@ -158,7 +159,7 @@ impl PluginStateStore {
             )
             .optional()
             .map_err(|_| PluginStateError::Unavailable)?;
-        let current_revision = existing
+        let existing_envelope = existing
             .as_ref()
             .map(|(stored_owner, ciphertext)| {
                 if stored_owner.as_slice() != owner {
@@ -166,18 +167,22 @@ impl PluginStateStore {
                 }
                 self.open_envelope(scope, key, &locator, ciphertext)
             })
-            .transpose()?
-            .map(|envelope| envelope.revision);
+            .transpose()?;
+        let current_revision = existing_envelope
+            .as_ref()
+            .and_then(|envelope| (!envelope.deleted).then_some(envelope.revision));
         if current_revision != expected_revision {
             return Err(PluginStateError::Conflict);
         }
 
         enforce_quotas(&transaction, self, scope, &owner, &locator, value.len())?;
-        let revision = current_revision
+        let revision = existing_envelope
+            .as_ref()
+            .map(|envelope| envelope.revision)
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(PluginStateError::Unavailable)?;
-        let ciphertext = self.seal(scope, key, revision, value)?;
+        let ciphertext = self.seal(scope, key, revision, value, false)?;
         let package_tag = self.package_tag(scope.id().package())?;
         let value_bytes =
             i64::try_from(value.len()).map_err(|_| PluginStateError::QuotaExceeded)?;
@@ -247,7 +252,34 @@ impl PluginStateStore {
         // backup or a rotated key; without it a single bad row is permanent.
         match self.open_envelope(scope, key, &locator, &ciphertext) {
             Ok(envelope) => {
+                if envelope.deleted {
+                    return Err(PluginStateError::NotFound);
+                }
                 if envelope.revision != expected_revision {
+                    return Err(PluginStateError::Conflict);
+                }
+                let tombstone_revision = envelope
+                    .revision
+                    .checked_add(1)
+                    .ok_or(PluginStateError::Unavailable)?;
+                // Keep an authenticated tombstone so a later create can advance
+                // beyond this key's last live revision. The guest still observes
+                // an absent key, but stale CAS tokens can never name a new value.
+                let tombstone = self.seal(scope, key, tombstone_revision, &[], true)?;
+                let package_tag = self.package_tag(scope.id().package())?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE plugin_state SET package_tag = ?1, value_bytes = NULL, ciphertext = ?2 \
+                         WHERE owner = ?3 AND locator = ?4",
+                        params![
+                            package_tag.as_slice(),
+                            tombstone.as_str(),
+                            owner.as_slice(),
+                            locator.as_slice(),
+                        ],
+                    )
+                    .map_err(|_| PluginStateError::Unavailable)?;
+                if updated != 1 {
                     return Err(PluginStateError::Conflict);
                 }
             }
@@ -259,16 +291,16 @@ impl PluginStateStore {
                     "removing an unreadable plugin state row; it could not be \
                      authenticated with the current install key"
                 );
+                let deleted = transaction
+                    .execute(
+                        "DELETE FROM plugin_state WHERE owner = ?1 AND locator = ?2",
+                        params![owner.as_slice(), locator.as_slice()],
+                    )
+                    .map_err(|_| PluginStateError::Unavailable)?;
+                if deleted != 1 {
+                    return Err(PluginStateError::Conflict);
+                }
             }
-        }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM plugin_state WHERE owner = ?1 AND locator = ?2",
-                params![owner.as_slice(), locator.as_slice()],
-            )
-            .map_err(|_| PluginStateError::Unavailable)?;
-        if deleted != 1 {
-            return Err(PluginStateError::Conflict);
         }
         transaction
             .commit()
@@ -281,6 +313,7 @@ impl PluginStateStore {
         key: &PluginStateKey,
         revision: u64,
         value: &[u8],
+        deleted: bool,
     ) -> Result<String, PluginStateError> {
         let envelope = StateEnvelope {
             format: ENVELOPE_VERSION,
@@ -290,6 +323,7 @@ impl PluginStateStore {
             key: key.as_str().to_string(),
             revision,
             value: base64::engine::general_purpose::STANDARD.encode(value),
+            deleted,
         };
         let plaintext = Zeroizing::new(
             serde_json::to_string(&envelope).map_err(|_| PluginStateError::Unavailable)?,
@@ -329,15 +363,18 @@ impl PluginStateStore {
         key: &PluginStateKey,
         locator: &[u8; 32],
         ciphertext: &str,
-    ) -> Result<PluginStateValue, PluginStateError> {
+    ) -> Result<Option<PluginStateValue>, PluginStateError> {
         let envelope = self.open_envelope(scope, key, locator, ciphertext)?;
+        if envelope.deleted {
+            return Ok(None);
+        }
         let value = base64::engine::general_purpose::STANDARD
             .decode(&envelope.value)
             .map_err(|_| PluginStateError::Unavailable)?;
         if value.len() > self.quotas.max_value_bytes {
             return Err(PluginStateError::Unavailable);
         }
-        Ok(PluginStateValue::new(envelope.revision, value))
+        Ok(Some(PluginStateValue::new(envelope.revision, value)))
     }
 
     fn owner_locator(&self, scope: &PluginInstanceScope) -> Result<[u8; 32], PluginStateError> {
@@ -603,6 +640,8 @@ struct StateEnvelope {
     key: String,
     revision: u64,
     value: String,
+    #[serde(default)]
+    deleted: bool,
 }
 
 impl Drop for StateEnvelope {
@@ -752,9 +791,9 @@ fn enforce_quotas(
         .checked_add(new_value_bytes)
         .ok_or(PluginStateError::QuotaExceeded)?;
 
-    // Generation-1 rows carry no recorded length. Only those are opened, so the
-    // decrypting path costs nothing once a store has been written by this
-    // generation.
+    // Generation-1 rows and deletion tombstones carry no recorded length. Only
+    // those are opened, so the decrypting path costs nothing once a store has
+    // been written by this generation and contains no deleted keys.
     let mut legacy = transaction
         .prepare(
             "SELECT locator, ciphertext FROM plugin_state \
@@ -772,12 +811,14 @@ fn enforce_quotas(
         let ciphertext: String = row.get(1).map_err(|_| PluginStateError::Unavailable)?;
         let envelope = open_owned_envelope(store, scope, owner, &locator, &ciphertext)?;
         let value_bytes = decoded_value_len(&envelope.value)?;
-        total = total
-            .checked_add(value_bytes)
-            .ok_or(PluginStateError::QuotaExceeded)?;
-        entries = entries
-            .checked_add(1)
-            .ok_or(PluginStateError::QuotaExceeded)?;
+        if !envelope.deleted {
+            total = total
+                .checked_add(value_bytes)
+                .ok_or(PluginStateError::QuotaExceeded)?;
+            entries = entries
+                .checked_add(1)
+                .ok_or(PluginStateError::QuotaExceeded)?;
+        }
     }
     if entries > store.quotas.max_entries || total > store.quotas.max_total_value_bytes {
         return Err(PluginStateError::QuotaExceeded);
@@ -994,9 +1035,40 @@ mod tests {
         );
         assert_eq!(store.delete(&scope, &key, 2).await, Ok(()));
         assert!(store.get(&scope, &key).await.unwrap().is_none());
+        assert_eq!(store.put(&scope, &key, b"recreated", None).await, Ok(4));
+        assert_eq!(
+            store.put(&scope, &key, b"stale update", Some(2)).await,
+            Err(PluginStateError::Conflict)
+        );
         assert_eq!(
             store.delete(&scope, &key, 2).await,
+            Err(PluginStateError::Conflict)
+        );
+        assert_eq!(store.delete(&scope, &key, 4).await, Ok(()));
+        assert_eq!(
+            store.delete(&scope, &key, 4).await,
             Err(PluginStateError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_recreate_do_not_reuse_cas_revisions() {
+        let root = TempDir::new().unwrap();
+        let store = store(&root);
+        let scope = scope("recreated-cas");
+        let key = key("cursor");
+
+        assert_eq!(store.put(&scope, &key, b"old", None).await, Ok(1));
+        assert_eq!(store.delete(&scope, &key, 1).await, Ok(()));
+        assert!(store.get(&scope, &key).await.unwrap().is_none());
+        assert_eq!(store.put(&scope, &key, b"new", None).await, Ok(3));
+        assert_eq!(
+            store.put(&scope, &key, b"stale update", Some(1)).await,
+            Err(PluginStateError::Conflict)
+        );
+        assert_eq!(
+            store.delete(&scope, &key, 1).await,
+            Err(PluginStateError::Conflict)
         );
     }
 
