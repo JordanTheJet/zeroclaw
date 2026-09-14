@@ -10156,7 +10156,11 @@ mod tests {
             Some(reload_tx),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        let mut dispatcher =
+            RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        // Quickstart is a gated method, so a real caller always arrives with a
+        // bound principal; the post-admission authority recheck expects one.
+        dispatcher.set_authenticated_for_test();
 
         let submission = BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
