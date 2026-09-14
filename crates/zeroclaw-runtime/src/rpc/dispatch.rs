@@ -1155,6 +1155,44 @@ impl RpcDispatcher {
         self.auth.as_ref().is_some_and(|auth| auth.grants.admin)
     }
 
+    /// The forwarded shell environment this connection may keep.
+    ///
+    /// A client may send its process environment in `initialize` so the
+    /// subprocesses the daemon spawns for that client's sessions see the
+    /// user's real `PATH`, credential sockets and helper settings. The shell
+    /// tool applies it verbatim on top of its safe environment, so it also
+    /// chooses what runs as the daemon account. It is therefore retained only
+    /// for an operator-level principal on a local transport, which is the
+    /// local IDE flow it exists for. A remote client's environment describes
+    /// another host, and a scoped principal shaping the daemon's subprocess
+    /// environment would step around its risk profile's command allowlist.
+    fn retained_tui_env(
+        &self,
+        auth: &crate::rpc::auth::ConnectionAuth,
+        env: std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        if env.is_empty() {
+            return env;
+        }
+        let local = self.transport_kind == crate::rpc::transport::TransportKind::Local;
+        if local && auth.grants.admin {
+            return env;
+        }
+        let transport = self.transport_kind;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "transport": format!("{transport:?}"),
+                    "principal_id": auth.principal.id.as_str(),
+                    "dropped_vars": env.len(),
+                })
+            ),
+            "forwarded client environment is not retained for this connection"
+        );
+        std::collections::HashMap::new()
+    }
+
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
@@ -1765,6 +1803,7 @@ impl RpcDispatcher {
             self.ctx.tui_registry.generate_unique_tui_id()
         };
 
+        let env = self.retained_tui_env(&connection_auth, req.env);
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
         let tui_epoch = self
             .ctx
@@ -1778,7 +1817,7 @@ impl RpcDispatcher {
                     .map_or("unknown", |(proto, _)| proto)
                     .to_string(),
                 peer_label: self.peer_label.clone(),
-                env: req.env,
+                env,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -7953,6 +7992,89 @@ mod tests {
         assert!(
             !env.contains("NEW_SOCK"),
             "a superseded registration must not read its successor's environment:\n{env}"
+        );
+    }
+
+    // ── Forwarded environment is retained only where it is trusted ────
+    //
+    // `initialize` may carry the client's process environment. The shell
+    // tool applies it verbatim, PATH included, so the daemon keeps it only
+    // for an operator-level principal on a local transport.
+
+    fn registered_env(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &RpcDispatcher,
+    ) -> std::collections::HashMap<String, String> {
+        let (id, epoch) = dispatcher
+            .tui_registration()
+            .expect("initialize registered the connection");
+        ctx.tui_registry
+            .env_for_registration(id, epoch)
+            .expect("the registration is live")
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_drops_the_forwarded_environment() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let ctx = enforcement_ctx(config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({
+                "auth_token": "zc_tok",
+                "env": {"PATH": "/tmp/evil", "SENTINEL_SOCK": "/tmp/remote.sock"},
+            }))
+            .await
+            .expect("paired token authenticates over wss");
+
+        assert!(
+            registered_env(&ctx, &dispatcher).is_empty(),
+            "a remote client's environment describes another host and must not \
+             reach the daemon's subprocesses"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_local_initialize_drops_the_forwarded_environment() {
+        let ctx = enforcement_ctx(roster_config(4242));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        dispatcher
+            .handle_initialize(&json!({"env": {"PATH": "/tmp/evil"}}))
+            .await
+            .expect("roster uid authenticates");
+
+        assert!(
+            registered_env(&ctx, &dispatcher).is_empty(),
+            "a scoped principal must not choose the daemon's subprocess environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_operator_initialize_keeps_the_forwarded_environment() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        dispatcher
+            .handle_initialize(&json!({"env": {"SSH_AUTH_SOCK": "/tmp/agent.sock"}}))
+            .await
+            .expect("the local operator initializes");
+
+        assert_eq!(
+            registered_env(&ctx, &dispatcher)
+                .get("SSH_AUTH_SOCK")
+                .map(String::as_str),
+            Some("/tmp/agent.sock"),
+            "the local IDE flow still forwards the operator's environment"
         );
     }
 
