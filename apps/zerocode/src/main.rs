@@ -44,6 +44,7 @@ mod mouse;
 mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
+mod secure_file;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]
