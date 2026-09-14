@@ -13281,8 +13281,8 @@ pub struct OidcConfig {
     /// requirement; non-empty = the token's `acr` claim must be one of
     /// these values or authentication fails closed.
     pub required_acr: Vec<String>,
-    /// Allowed `azp` (authorized party) values, meaning the client the
-    /// token was issued TO. Empty = no restriction; non-empty = the token must carry
+    /// Allowed `azp` (authorized party) values, meaning the client the token
+    /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
