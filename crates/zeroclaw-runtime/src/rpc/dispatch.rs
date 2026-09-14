@@ -916,6 +916,105 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// Re-establish the caller's authority to write `path` after the config
+    /// write lock has been granted.
+    ///
+    /// Every mutation handler tests its grants before it queues for the lock,
+    /// and the wait is unbounded: another connection can revoke or narrow the
+    /// waiting principal's profile, the credential can expire, the
+    /// revalidation deadline can pass, or the native pairing can be dropped
+    /// while the writer is parked. This repeats those checks against the
+    /// policy generation that is in force now.
+    ///
+    /// The generation observed here is the one the commit runs under.
+    /// `refresh_from_config` is reached only from `save_and_swap_config`,
+    /// which asserts this same lock is held, so no accepted policy can be
+    /// installed between this check and the commit. `config/reload` signals
+    /// the supervisor instead of refreshing in process, so it opens no window
+    /// either.
+    ///
+    /// This re-resolves rather than comparing against the grants stamped on
+    /// the connection, so a policy change that WIDENS the principal's
+    /// authority while it waits is honoured rather than refused. It is
+    /// non-mutating: the handlers take `&self`, and leaving the stamped
+    /// binding alone keeps `authorize` the single place that re-stamps it.
+    ///
+    /// `path` is the concrete config path the handler is about to write, or
+    /// `None` on a surface that has no path selector to repeat (Quickstart
+    /// applies a whole submission); the liveness, generation and coarse-grant
+    /// checks still run there.
+    fn recheck_config_write_authority(
+        &self,
+        method: Method,
+        path: Option<&str>,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(expires_at) = auth.principal.expires_at
+            && expires_at <= now
+        {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+            )));
+        }
+        if let Some(revalidate_by) = auth.principal.revalidate_by
+            && revalidate_by <= now
+        {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+            )));
+        }
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !self.ctx.auth.pairing().token_hash_is_paired(hash)
+        {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            )));
+        }
+        let resolved = self
+            .ctx
+            .auth
+            .revalidate_and_resolve(auth)
+            .map_err(|reason| refuse(AuthDenied::from_deny_reason(reason)))?;
+        if resolved.generation != self.ctx.auth.generation() {
+            // The accepted state moved between the resolution and this read.
+            // Fail closed rather than commit under a policy nobody observed.
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+            )));
+        }
+        if let MethodAuthz::Requires(resource, verb) = method.authz()
+            && !resolved.grants.permits(resource, verb)
+        {
+            return Err(refuse(AuthDenied::forbidden(format!(
+                "Principal is not granted {resource}:{verb} (required by {})",
+                method.wire_name()
+            ))));
+        }
+        if let Some(path) = path
+            && !resolved.grants.may_write_config(path)
+        {
+            return Err(refuse(AuthDenied::forbidden(format!(
+                "Principal is not granted config write access to {path:?}"
+            ))));
+        }
+        Ok(())
+    }
+
     /// Fine-grained agent selector for the cron surface. Composes with the
     /// coarse `Cron` grant the gate already enforced: both are required.
     ///
@@ -1072,6 +1171,13 @@ impl RpcDispatcher {
     #[cfg(test)]
     pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
         self.tui_id = tui_id;
+    }
+
+    #[cfg(test)]
+    pub fn expire_credential_for_test(&mut self) {
+        if let Some(auth) = self.auth.as_mut() {
+            auth.principal.expires_at = Some(0);
+        }
     }
 
     #[cfg(test)]
@@ -4172,6 +4278,11 @@ impl RpcDispatcher {
         self.selector_config_write(Method::ConfigSet, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigSet,
+            Some(&req.prop),
+            &config_write_guard,
+        )?;
         // Clone the live config and perform every mutation — alias creation,
         // field lookup, value coercion, masked-secret validation, and the
         // persistent write — on the working copy. Any early error simply
@@ -4552,6 +4663,11 @@ impl RpcDispatcher {
         self.selector_config_write(Method::ConfigDelete, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigDelete,
+            Some(&req.prop),
+            &config_write_guard,
+        )?;
         let mut working = self.ctx.config.read().clone();
         working
             .set_prop_persistent(&req.prop, "")
@@ -4595,11 +4711,14 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
-        self.selector_config_write(
-            Method::ConfigMapKeyCreate,
-            &format!("{}.{}", req.path, req.key),
-        )?;
+        let key_path = format!("{}.{}", req.path, req.key);
+        self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyCreate,
+            Some(&key_path),
+            &config_write_guard,
+        )?;
         let mut working = self.ctx.config.read().clone();
         let created = {
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -4629,11 +4748,14 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
-        self.selector_config_write(
-            Method::ConfigMapKeyDelete,
-            &format!("{}.{}", req.path, req.key),
-        )?;
+        let key_path = format!("{}.{}", req.path, req.key);
+        self.selector_config_write(Method::ConfigMapKeyDelete, &key_path)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyDelete,
+            Some(&key_path),
+            &config_write_guard,
+        )?;
         let mut working = self.ctx.config.read().clone();
         let deleted = {
             let deleted = working
@@ -4683,6 +4805,18 @@ impl RpcDispatcher {
             // alias-rename path so it can be released at that handler's
             // commit point, before its slow post-commit side effects.
             let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            // Both endpoints are rechecked here, before the alias branch is
+            // delegated into, so the alias-rename path inherits the recheck.
+            for key_path in [
+                format!("{}.{}", req.path, req.from),
+                format!("{}.{}", req.path, req.to),
+            ] {
+                self.recheck_config_write_authority(
+                    Method::ConfigMapKeyRename,
+                    Some(&key_path),
+                    &config_write_guard,
+                )?;
+            }
             if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
                 return self
                     .handle_config_alias_rename(req, kind, config_write_guard)
@@ -6046,6 +6180,10 @@ impl RpcDispatcher {
         // clone-apply-save-swap below, so the install on success can't race
         // a concurrent config write (see `ctx.config_write_lock`).
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        // Quickstart writes the authorization sections themselves, so it is
+        // held to the same post-admission authority check as the config
+        // mutation handlers.
+        self.recheck_config_write_authority(Method::QuickstartApply, None, &config_write_guard)?;
         // Clone out of the lock to satisfy `&mut Config`. On success
         // install the mutated snapshot, mirroring the gateway's
         // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
@@ -15423,6 +15561,326 @@ mod tests {
             on_disk.contains("blocked-value"),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
+    }
+
+    // ── Config authority is rechecked after write-lock admission ─────
+    //
+    // The path selector runs before the handler queues for the config write
+    // lock, and that wait is unbounded. A second connection can narrow or
+    // revoke the waiting principal's authority while it is parked.
+
+    fn config_write_roster_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        write_paths: &[&str],
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let mut config = make_two_provider_test_config(tmp);
+        config.permission_profiles.insert(
+            "config-writer".into(),
+            PermissionProfileConfig {
+                config_write_paths: write_paths.iter().map(|p| (*p).to_string()).collect(),
+                grants: HashMap::from([(
+                    Resource::Config,
+                    vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["config-writer".into()],
+            },
+        );
+        config
+    }
+
+    /// Park `rpc_call` on the config write lock, apply `mutate` to the
+    /// accepted authorization state while it waits, then release the lock and
+    /// return the call's result.
+    async fn rpc_result_after_midwait_policy_change<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        mutate: impl FnOnce(&Arc<RpcContext>),
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "the handler must park on the config write lock"
+            );
+        }
+        mutate(&ctx);
+        drop(guard);
+        task.await.expect("the parked RPC task must not panic")
+    }
+
+    /// Republish the accepted policy with alice's config write access gone.
+    fn revoke_alice_config_writes(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("config-writer")
+            .expect("the fixture profile exists")
+            .config_write_paths
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Run one config-mutation scenario on a thread with a larger stack.
+    ///
+    /// The debug profile's config-handler frames do not fit the default test
+    /// thread stack; that is a build characteristic of these handlers, not a
+    /// property of the recheck under test. The release binary and the daemon's
+    /// own worker threads are unaffected.
+    fn run_on_a_large_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let handle = std::thread::Builder::new()
+            .name("config-authority-recheck".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the test runtime builds")
+                    .block_on(body());
+            })
+            .expect("the test thread spawns");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn config_set_revoked_while_queued_on_the_write_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "revoked-value"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            let after = std::fs::read_to_string(&config_path).unwrap_or_default();
+            assert_eq!(before, after, "the refused write must not reach disk");
+        });
+    }
+
+    #[test]
+    fn config_delete_revoked_while_queued_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let mut config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config
+                .set_prop_persistent("providers.models.anthropic.default.model", "seeded")
+                .expect("seed a value to delete");
+            config.save_dirty().await.expect("seed the config file");
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({"prop": "providers.models.anthropic.default.model"});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_delete(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused delete must not reach disk"
+            );
+        });
+    }
+
+    #[test]
+    fn config_map_key_create_delete_and_rename_recheck_after_admission() {
+        run_on_a_large_stack(|| async move {
+            for (method, params) in [
+                (
+                    "create",
+                    json!({"path": "providers.models.openai", "key": "fresh"}),
+                ),
+                (
+                    "delete",
+                    json!({"path": "providers.models.openai", "key": "default"}),
+                ),
+                (
+                    "rename",
+                    json!({"path": "providers.models.openai", "from": "default", "to": "renamed"}),
+                ),
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+                let call = async move {
+                    match method {
+                        "create" => alice.handle_config_map_key_create(&params).await,
+                        "delete" => alice.handle_config_map_key_delete(&params).await,
+                        _ => alice.handle_config_map_key_rename(&params).await,
+                    }
+                };
+                let result = rpc_result_after_midwait_policy_change(
+                    Arc::clone(&ctx),
+                    call,
+                    revoke_alice_config_writes,
+                )
+                .await;
+
+                let err = result.expect_err("a revoked writer must not commit");
+                assert_eq!(err.code, FORBIDDEN, "map-key {method}: {err:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap_or_default(),
+                    before,
+                    "map-key {method}: the refused write must not reach disk"
+                );
+                assert!(
+                    ctx.config
+                        .read()
+                        .providers
+                        .models
+                        .openai
+                        .get("default")
+                        .is_some(),
+                    "map-key {method}: the live config must be untouched"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn config_set_with_an_expired_credential_after_a_long_wait_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (mut alice, _rx) = roster_peer(&ctx, 4242).await;
+            alice.expire_credential_for_test();
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "expired-value"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |_| {},
+            )
+            .await;
+
+            let err = result.expect_err("an expired credential must not commit");
+            assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused write must not reach disk"
+            );
+        });
+    }
+
+    #[test]
+    fn config_set_still_succeeds_when_authority_is_unchanged() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "unchanged-authority"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |_| {},
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "the recheck must not refuse a live writer: {result:?}"
+            );
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("unchanged-authority"), "{on_disk}");
+        });
+    }
+
+    #[test]
+    fn config_set_survives_an_unrelated_policy_republication_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            // The accepted policy is republished for an unrelated reason while
+            // alice waits, so her stamped generation goes stale. Her authority is
+            // unchanged, and a recheck that re-resolves rather than comparing
+            // against the stamped grants must let the write through.
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "still-authorized"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |ctx| {
+                    let mut republished = ctx.config.read().clone();
+                    republished.permission_profiles.insert(
+                        "unrelated-reader".into(),
+                        zeroclaw_config::schema::PermissionProfileConfig::default(),
+                    );
+                    ctx.auth
+                        .refresh_from_config(&republished)
+                        .expect("the republished policy compiles");
+                },
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "an unrelated republication must not refuse a still-authorized writer: {result:?}"
+            );
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("still-authorized"), "{on_disk}");
+        });
     }
 
     #[tokio::test]
