@@ -206,6 +206,10 @@ rpc_type! {
         pub cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_id: Option<String>,
+        /// Accepted for wire compatibility and ignored. The session's shell
+        /// environment is resolved from the calling connection's own TUI
+        /// registration, so naming another connection's id here has no
+        /// effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

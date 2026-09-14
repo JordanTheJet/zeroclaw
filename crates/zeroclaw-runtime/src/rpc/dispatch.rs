@@ -1075,6 +1075,19 @@ impl RpcDispatcher {
     }
 
     #[cfg(test)]
+    pub fn set_tui_registration_for_test(
+        &mut self,
+        registration: Option<(String, super::tui_identity::TuiEpoch)>,
+    ) {
+        let (id, epoch) = match registration {
+            Some((id, epoch)) => (Some(id), Some(epoch)),
+            None => (None, None),
+        };
+        self.tui_id = id;
+        self.tui_epoch = epoch;
+    }
+
+    #[cfg(test)]
     pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
         Arc::clone(&self.rpc)
     }
@@ -2276,10 +2289,13 @@ impl RpcDispatcher {
         }
 
         let cwd_path = Some(std::path::Path::new(&cwd));
-        let tui_env = req
-            .tui_id
-            .as_deref()
-            .and_then(|id| self.ctx.tui_registry.get_env(id));
+        // The environment comes from THIS connection's own registration, never
+        // from a request field. The captured environment carries the user's
+        // real shell, credential sockets included, so a caller must not be
+        // able to name someone else's TUI and inherit it.
+        let tui_env = self
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
         let chat_mode = req
             .chat_mode
             .clone()
@@ -2787,9 +2803,8 @@ impl RpcDispatcher {
 
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
-            .tui_id
-            .as_deref()
-            .and_then(|id| self.ctx.tui_registry.get_env(id));
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -7595,6 +7610,200 @@ mod tests {
         );
     }
 
+    // ── The session environment comes from the connection, not the wire ──
+    //
+    // A TUI registration carries the user's real shell environment, including
+    // credential sockets. `session/new` must resolve it from the calling
+    // connection's own registration.
+
+    #[cfg(unix)]
+    fn shell_env_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut config = make_acp_test_config(tmp);
+        let profile = config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default();
+        profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+        profile.allowed_commands = vec!["env".into()];
+        config
+    }
+
+    /// Register a TUI on `dispatcher`'s connection with one sentinel variable,
+    /// the way `initialize` does for a real client.
+    #[cfg(unix)]
+    fn register_tui_env(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &mut RpcDispatcher,
+        tui_id: &str,
+        var: &str,
+        value: &str,
+    ) {
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: tui_id.to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: tui_id.to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+            });
+        dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
+    }
+
+    /// The environment a session's shell tool actually runs with.
+    #[cfg(unix)]
+    async fn session_shell_env(ctx: &Arc<RpcContext>, session_id: &str) -> String {
+        let agent = ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("the session was created");
+        let guard = agent.lock().await;
+        let result = guard
+            .execute_tool_for_test("shell", json!({"command": "env"}))
+            .await
+            .expect("the shell tool is registered")
+            .expect("the environment print command succeeds");
+        result.output.into_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, _victim_rx) = tokio::sync::mpsc::channel(64);
+        let mut victim = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:victim".into());
+        victim.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut victim,
+            "tui_victim01",
+            "SENTINEL_SOCK",
+            "/tmp/victim.sock",
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut attacker = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:attacker".into());
+        attacker.set_authenticated_for_test();
+        register_tui_env(&ctx, &mut attacker, "tui_attack01", "ATTACKER_VAR", "mine");
+
+        let response = rpc(
+            &mut attacker,
+            &mut rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": "s-foreign-tui",
+                "tui_id": "tui_victim01",
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-foreign-tui"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-foreign-tui").await;
+        assert!(
+            !env.contains("SENTINEL_SOCK"),
+            "naming another connection's TUI must not import its environment:\n{env}"
+        );
+        assert!(
+            env.contains("ATTACKER_VAR=mine"),
+            "the connection's own registration is still used:\n{env}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_uses_only_the_connections_own_registration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:client".into());
+        client.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_own00001",
+            "OWN_SOCK",
+            "/tmp/own.sock",
+        );
+
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-own-tui"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-own-tui"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-own-tui").await;
+        assert!(
+            env.contains("OWN_SOCK=/tmp/own.sock"),
+            "the connection's own captured environment must still reach the session:\n{env}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_registration_cannot_read_its_successors_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut displaced = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:displaced".into());
+        displaced.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut displaced,
+            "tui_reconn01",
+            "OLD_SOCK",
+            "/tmp/old.sock",
+        );
+
+        // The client reconnects and re-registers the SAME id under a new
+        // epoch. The displaced connection is still draining.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
+        let mut reconnected = RpcDispatcher::new(Arc::clone(&ctx), tx2, "unix:reconnect".into());
+        reconnected.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut reconnected,
+            "tui_reconn01",
+            "NEW_SOCK",
+            "/tmp/new.sock",
+        );
+
+        let response = rpc(
+            &mut displaced,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-superseded"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-superseded"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-superseded").await;
+        assert!(
+            !env.contains("NEW_SOCK"),
+            "a superseded registration must not read its successor's environment:\n{env}"
+        );
+    }
+
     #[test]
     fn authz_classification_spot_checks() {
         use zeroclaw_api::grants::{Resource, Verb};
@@ -10512,7 +10721,9 @@ mod tests {
             "the reconnect must survive the displaced connection's cleanup"
         );
         assert!(
-            ctx.tui_registry.get_env(&id).is_some(),
+            ctx.tui_registry
+                .env_for_registration(&id, epoch_second)
+                .is_some(),
             "the live TUI must still resolve its captured environment"
         );
 
