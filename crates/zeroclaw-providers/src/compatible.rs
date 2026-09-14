@@ -2205,15 +2205,12 @@ impl OpenAiCompatibleModelProvider {
     /// request is sent to, rather than `base_url`: an `api_path` is appended to
     /// the base, so the base alone need not name the destination host.
     ///
-    /// Returns `None` when the operator has already pinned the header through
-    /// `extra_headers`: those are baked into the client's default headers, so
-    /// adding a second value here would put the header on the wire twice.
+    /// Returns `None` when the operator has already pinned a valid header value
+    /// through `extra_headers`: those are baked into the client's default
+    /// headers, so adding a second value here would put the header on the wire
+    /// twice. A pinned value the client builder skips as invalid does not count.
     fn opencode_session_value(&self) -> Option<String> {
-        if self
-            .extra_headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
-        {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
             return None;
         }
         crate::opencode_session::session_token(&self.chat_completions_url())
@@ -5993,6 +5990,28 @@ mod tests {
         assert!(
             provider.opencode_session_value().is_none(),
             "an operator-pinned header must win over the derived value"
+        );
+    }
+
+    #[test]
+    fn malformed_pinned_session_header_falls_back_to_the_derived_token() {
+        // The client builder skips a header value it cannot encode, so treating
+        // it as a pin would leave the request with no affinity header at all.
+        let headers = std::collections::HashMap::from([(
+            "x-opencode-session".to_string(),
+            "bad\nvalue".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            built_session_header(&provider).is_some(),
+            "an invalid pinned value must not suppress the derived token"
         );
     }
 

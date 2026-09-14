@@ -93,6 +93,21 @@ pub fn is_opencode_target(base_url: &str) -> bool {
     })
 }
 
+/// True when `extra_headers` pins an `x-opencode-session` value that will
+/// actually reach the wire.
+///
+/// The provider client builders skip an `extra_headers` entry whose value is not
+/// a valid HTTP header value, logging a warning. Such an entry must not count as
+/// a pin: suppressing the derived token for it would leave the request with no
+/// affinity header at all.
+#[must_use]
+pub fn operator_pinned_session(extra_headers: &std::collections::HashMap<String, String>) -> bool {
+    extra_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER)
+            && reqwest::header::HeaderValue::from_str(value).is_ok()
+    })
+}
+
 /// Domain-separated, truncated SHA-256 of one affinity scope.
 fn digest_scope(scope: &str) -> String {
     let mut hasher = Sha256::new();
@@ -311,6 +326,31 @@ mod tests {
             process_token(),
             "a spawned read falls back to the process token"
         );
+    }
+
+    #[test]
+    fn only_a_valid_pinned_value_counts_as_an_operator_pin() {
+        let pin = |name: &str, value: &str| {
+            std::collections::HashMap::from([(name.to_string(), value.to_string())])
+        };
+        assert!(operator_pinned_session(&pin(
+            "x-opencode-session",
+            "fixed-scope"
+        )));
+        assert!(operator_pinned_session(&pin(
+            "X-Opencode-Session",
+            "fixed-scope"
+        )));
+        // The client builders drop a value that is not a valid header value, so
+        // it must not suppress the derived token.
+        assert!(!operator_pinned_session(&pin(
+            "x-opencode-session",
+            "bad\nvalue"
+        )));
+        assert!(!operator_pinned_session(&pin(
+            "x-other-header",
+            "fixed-scope"
+        )));
     }
 
     #[test]

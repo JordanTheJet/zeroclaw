@@ -1164,15 +1164,12 @@ impl OpenAiResponsesModelProvider {
     ///
     /// `responses_url` is the full endpoint rather than a base URL; the target
     /// test parses its host, so it matches either shape. Returns `None` when
-    /// the operator already pinned the header through `extra_headers`, which
-    /// `build_default_headers` puts on every request — a second value here
-    /// would send the header twice.
+    /// the operator already pinned a valid header value through
+    /// `extra_headers`, which `build_default_headers` puts on every request; a
+    /// second value here would send the header twice. A pinned value
+    /// `build_default_headers` skips as invalid does not count.
     fn opencode_session_value(&self) -> Option<String> {
-        if self
-            .extra_headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
-        {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
             return None;
         }
         crate::opencode_session::session_token(&self.responses_url)
@@ -1744,6 +1741,32 @@ mod tests {
                 "{api_url}: header selection must match the request host {host}"
             );
         }
+    }
+
+    #[test]
+    fn opencode_session_pin_counts_only_when_the_value_is_valid() {
+        let provider_with = |value: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url("https://opencode.ai/zen/v1")
+                .credential(Some("test-key"))
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-opencode-session".to_string(),
+                    value.to_string(),
+                )]))
+                .build()
+        };
+        assert!(
+            provider_with("pinned-by-operator")
+                .opencode_session_value()
+                .is_none(),
+            "a valid operator pin must win over the derived value"
+        );
+        assert!(
+            provider_with("bad\nvalue")
+                .opencode_session_value()
+                .is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
     }
 
     #[test]
