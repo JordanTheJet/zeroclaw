@@ -23,7 +23,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use parking_lot::RwLock;
@@ -140,7 +140,12 @@ impl AuthDenied {
 /// The daemon's inbound-auth layer: providers, resolver, and live local
 /// bindings. One instance per daemon generation, shared by every
 /// connection.
-struct AcceptedAuthState {
+///
+/// Published as one unit by [`RpcInboundAuth::refresh_from_config`] and
+/// [`RpcInboundAuth::publish_accepted`]; its fields stay private so a
+/// consumer can only observe the snapshot through the accessors that keep
+/// registry, resolver, roster and flags consistent.
+pub struct AcceptedAuthState {
     registry: ProviderRegistry,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
@@ -273,6 +278,15 @@ impl AcceptedAuthState {
 pub struct RpcInboundAuth {
     state: RwLock<Arc<AcceptedAuthState>>,
     pairing: Arc<PairingGuard>,
+    /// The persistence revision the accepted state was built from.
+    ///
+    /// The generation counts policy installations; this counts accepted
+    /// persistences of the configuration those installations came from. A
+    /// consumer that has just persisted revision N can wait for the accepted
+    /// state to reach N rather than guessing from the generation, and a
+    /// publication carrying an older revision is refused, so a slow writer
+    /// cannot reinstall superseded policy.
+    accepted_revision: AtomicU64,
 }
 
 impl RpcInboundAuth {
@@ -293,6 +307,7 @@ impl RpcInboundAuth {
         Ok(Self {
             state: RwLock::new(Arc::new(state)),
             pairing,
+            accepted_revision: AtomicU64::new(0),
         })
     }
 
@@ -352,6 +367,48 @@ impl RpcInboundAuth {
         let next = AcceptedAuthState::from_config(config, Arc::clone(&self.pairing), generation)?;
         *slot = Arc::new(next);
         Ok(generation)
+    }
+
+    /// The revision of the configuration the accepted state was built from.
+    pub fn accepted_revision(&self) -> u64 {
+        self.accepted_revision.load(Ordering::Acquire)
+    }
+
+    /// Publish an accepted policy built from a configuration that has been
+    /// persisted as `revision`.
+    ///
+    /// Takes the same write lock over the accepted state that
+    /// [`Self::refresh_from_config`] takes, so the state and the revision it
+    /// carries are installed together. A `revision` that is not newer than
+    /// the accepted one is refused as a no-op and the current generation is
+    /// returned, which is what keeps a writer that was slow to publish from
+    /// reinstalling superseded policy over a newer one.
+    ///
+    /// Returns the generation in force after the call.
+    pub fn publish_accepted(&self, config: &Config, revision: u64) -> anyhow::Result<u64> {
+        let mut slot = self.state.write();
+        if revision <= self.accepted_revision.load(Ordering::Acquire) {
+            return Ok(slot.resolver.generation());
+        }
+        let generation = slot.resolver.generation().saturating_add(1);
+        let next = AcceptedAuthState::from_config(config, Arc::clone(&self.pairing), generation)?;
+        *slot = Arc::new(next);
+        self.accepted_revision.store(revision, Ordering::Release);
+        Ok(generation)
+    }
+
+    /// The accepted state, but only once it has caught up to `revision`.
+    ///
+    /// Fail-closed: a consumer that needs to act on a policy it just
+    /// persisted gets a denial rather than the previous state when the
+    /// publication has not landed yet.
+    pub fn accepted_at_least(&self, revision: u64) -> Result<Arc<AcceptedAuthState>, DenyReason> {
+        let state = self.state();
+        if self.accepted_revision.load(Ordering::Acquire) >= revision {
+            Ok(state)
+        } else {
+            Err(DenyReason::Misconfigured)
+        }
     }
 
     /// Prove that an auth snapshot can be compiled before a caller persists
@@ -730,6 +787,46 @@ mod tests {
         assert!(
             RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(true, &[]))).is_ok(),
             "pairing-capable WSS config is startable; handshakes deny until paired"
+        );
+    }
+
+    #[test]
+    fn publish_accepted_refuses_an_older_revision() {
+        let config = config_with_roster(4242);
+        let auth = RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(false, &[])))
+            .expect("the fixture policy compiles");
+        assert_eq!(auth.accepted_revision(), 0);
+
+        let first = auth
+            .publish_accepted(&config, 1)
+            .expect("the first publication installs");
+        assert_eq!(auth.accepted_revision(), 1);
+        assert_eq!(auth.generation(), first);
+
+        // A writer that persisted revision 1 and published late must not
+        // reinstall its policy over revision 2.
+        let mut newer = config.clone();
+        newer
+            .permission_profiles
+            .insert("reader".into(), PermissionProfileConfig::default());
+        let second = auth
+            .publish_accepted(&newer, 2)
+            .expect("the newer publication installs");
+        assert_eq!(auth.accepted_revision(), 2);
+
+        let stale = auth
+            .publish_accepted(&config, 1)
+            .expect("a stale publication is a no-op, not an error");
+        assert_eq!(stale, second, "the generation must not move");
+        assert_eq!(auth.accepted_revision(), 2, "the revision must not move");
+
+        assert!(
+            auth.accepted_at_least(2).is_ok(),
+            "the accepted state has reached revision 2"
+        );
+        assert!(
+            auth.accepted_at_least(3).is_err(),
+            "a revision that has not been published yet fails closed"
         );
     }
 }
