@@ -300,7 +300,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
 /// place is what makes that property structural rather than coincidental.
 #[must_use]
 pub fn job_not_found(job_id: &str) -> anyhow::Error {
-    anyhow::anyhow!("Cron job '{job_id}' not found")
+    anyhow::Error::msg(format!("Cron job '{job_id}' not found"))
 }
 
 /// Read a job only when `agent_alias` is its current owner. The ownership

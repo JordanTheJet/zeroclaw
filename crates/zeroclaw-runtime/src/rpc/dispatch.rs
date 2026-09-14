@@ -15789,8 +15789,7 @@ mod tests {
                         .providers
                         .models
                         .openai
-                        .get("default")
-                        .is_some(),
+                        .contains_key("default"),
                     "map-key {method}: the live config must be untouched"
                 );
             }
