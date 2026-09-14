@@ -1337,7 +1337,13 @@ impl RpcDispatcher {
         // so a new generation reaches established connections at their
         // next privileged operation — no reconnect or restart.
         let refreshed = self.ctx.config.read().clone();
-        if let Err(error) = self.ctx.auth.refresh_from_config(&refreshed) {
+        // One accepted persistence, one revision. Both the save and this
+        // publication happen under `config_write_lock`, so the revision is
+        // monotonic and the accepted state a consumer observes at revision N
+        // is the policy compiled from the configuration that was persisted as
+        // N.
+        let revision = self.ctx.auth.accepted_revision().saturating_add(1);
+        if let Err(error) = self.ctx.auth.publish_accepted(&refreshed, revision) {
             // The auth sections were validated before the save, so this is
             // defensive: the resolver keeps the previous policy and
             // generation in effect rather than installing anything invalid.
