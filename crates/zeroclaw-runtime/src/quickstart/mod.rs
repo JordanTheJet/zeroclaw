@@ -237,6 +237,23 @@ pub async fn apply_with_surface(
     config: &mut Config,
     surface: Surface,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_checked(submission, config, surface, &|_| Ok(())).await
+}
+
+/// Apply a submission, with `staged_check` given the fully staged
+/// configuration immediately before the first persistent write.
+///
+/// `config.validate_auth()` runs here already, but the daemon's save boundary
+/// applies a strictly stronger test: the accepted authorization policy must
+/// also compile. Without that test running BEFORE the first write, a rejected
+/// policy can reach disk and the caller is then told nothing was saved. The
+/// two production callers pass the resolver's own compile check.
+pub async fn apply_with_surface_checked(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    staged_check: &(dyn Fn(&Config) -> Result<(), String> + Sync),
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
 
@@ -309,6 +326,16 @@ pub async fn apply_with_surface(
             format!("authorization config rejected before persistence: {err}"),
             "cli-quickstart-error-auth-validation",
             &[("err", &err.to_string())],
+        )]
+    })?;
+    staged_check(config).map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err)],
         )]
     })?;
     ::zeroclaw_log::record!(
@@ -2935,6 +2962,65 @@ mod tests {
     fn reload(dir: &tempfile::TempDir) -> Config {
         let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         toml::from_str(&raw).expect("on-disk config must round-trip")
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_rejects_an_invalid_auth_policy_before_any_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        let errors = super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Err("authorization policy does not compile".to_string()),
+        )
+        .await
+        .expect_err("a rejected staged policy must refuse the apply");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("rejected before persistence")),
+            "{errors:?}"
+        );
+
+        let after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected policy must not reach disk before the caller is told nothing was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_still_persists_a_valid_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Ok(()),
+        )
+        .await
+        .expect("an accepted staged policy still applies");
+
+        let reloaded = reload(&dir);
+        assert!(
+            reloaded.agents.contains_key("bot"),
+            "the agent must persist"
+        );
     }
 
     #[tokio::test]
