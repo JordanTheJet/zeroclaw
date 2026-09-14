@@ -227,6 +227,16 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// The error a lookup for an absent job produces.
+///
+/// Ownership refusals reuse it, so a job owned by someone else is
+/// indistinguishable from one that does not exist. Keeping the wording in one
+/// place is what makes that property structural rather than coincidental.
+#[must_use]
+pub fn job_not_found(job_id: &str) -> anyhow::Error {
+    anyhow::anyhow!("Cron job '{job_id}' not found")
+}
+
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
@@ -246,11 +256,11 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
         if let Some(row) = rows.next()? {
             map_cron_job_row(row).map_err(Into::into)
         } else {
-            anyhow::bail!("Cron job '{job_id}' not found")
+            Err(job_not_found(job_id))
         }
     })?
     else {
-        anyhow::bail!("Cron job '{job_id}' not found")
+        return Err(job_not_found(job_id));
     };
     Ok(job)
 }
@@ -264,7 +274,7 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
     if job.agent_alias == agent_alias {
         Ok(job)
     } else {
-        anyhow::bail!("Cron job '{job_id}' not found")
+        Err(job_not_found(job_id))
     }
 }
 
