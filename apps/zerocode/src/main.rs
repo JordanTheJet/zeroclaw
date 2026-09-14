@@ -43,6 +43,7 @@ mod logs;
 mod mouse;
 mod quickstart_pane;
 mod relay_proto;
+mod secure_file;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]

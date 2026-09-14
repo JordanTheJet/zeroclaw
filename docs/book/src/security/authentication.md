@@ -108,6 +108,13 @@ Migration for existing remote zerocode users:
    or via the `ZEROCLAW_AUTH_TOKEN` environment variable, which overrides
    the config value and keeps the credential out of the file.
 
+   The environment variable is the recommended path. When the token is
+   kept in the config file instead, zerocode writes that file owner-only
+   (`0600`, in a `0700` config directory) and repairs the modes of a file
+   that predates this, on platforms with Unix permission bits. On
+   platforms without them the directory ACL is the only guard, so treat
+   the file as a secret there.
+
 An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
 
 ## Credential lifecycle

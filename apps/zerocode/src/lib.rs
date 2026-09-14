@@ -11,6 +11,7 @@ mod client_crypto;
 mod color_depth;
 mod display_width;
 mod relay_proto;
+mod secure_file;
 
 #[cfg(test)]
 mod test_support;
