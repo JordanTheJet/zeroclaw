@@ -853,6 +853,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deny_all_refuses_the_daemon_uid_so_only_the_on_disk_repair_remains() {
+        // The Recovery section of docs/book/src/security/authentication.md
+        // splits the two lockout states on exactly this behaviour: a policy
+        // that compiles keeps the daemon's own uid on the trusted local path,
+        // and a deny-all accepted state does not, so nothing reachable over
+        // RPC repairs it.
+        let mut dangling = base_config();
+        dangling.security.trust_daemon_uid = true;
+        dangling.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["not-configured".into()],
+            },
+        );
+        let daemon_uid = PeercredAuthProvider::current_process_uid();
+        let auth = auth_for(&dangling, &["zc_tok"]);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: daemon_uid },
+            None,
+            None,
+        )
+        .await
+        .expect_err("a deny-all state refuses the daemon's own uid as well");
+
+        // The same roster on a policy that compiles keeps that route open, so
+        // the refusal above is the deny-all state and not the roster entry.
+        let mut repaired = dangling;
+        repaired
+            .permission_profiles
+            .insert("not-configured".into(), PermissionProfileConfig::default());
+        let auth = auth_for(&repaired, &["zc_tok"]);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: daemon_uid },
+            None,
+            None,
+        )
+        .await
+        .expect("a compiling policy keeps the daemon uid on the trusted local path");
+    }
+
     #[test]
     fn publish_accepted_refuses_an_older_revision() {
         let config = config_with_roster(4242);
