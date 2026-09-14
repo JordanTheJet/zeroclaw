@@ -828,8 +828,12 @@ impl OpenAiCompatibleModelProvider {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
+        // An OpenCode client needs its own redirect policy, which the shared
+        // cached client below does not carry.
+        let endpoint = self.chat_completions_url();
+        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
 
-        if has_user_agent || has_extra_headers || has_tls_cert {
+        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -863,6 +867,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -895,6 +900,7 @@ impl OpenAiCompatibleModelProvider {
     /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
     /// of hanging forever. Streaming paths must use this client instead of http_client().
     fn streaming_http_client(&self) -> Client {
+        let endpoint = self.chat_completions_url();
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
@@ -933,6 +939,7 @@ impl OpenAiCompatibleModelProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(STREAM_IDLE_TIMEOUT)
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -955,6 +962,7 @@ impl OpenAiCompatibleModelProvider {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(STREAM_IDLE_TIMEOUT);
+        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -6013,6 +6021,23 @@ mod tests {
             built_session_header(&provider).is_some(),
             "an invalid pinned value must not suppress the derived token"
         );
+    }
+
+    #[test]
+    fn opencode_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest strips only credential headers on a cross-host redirect, so
+        // every client an OpenCode provider builds must stop there instead.
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+
+        let opencode = opencode_provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_http_client()));
+
+        let other = opencode_provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_http_client()));
     }
 
     #[test]

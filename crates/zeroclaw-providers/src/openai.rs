@@ -1195,6 +1195,7 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1210,6 +1211,7 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1767,6 +1769,27 @@ mod tests {
                 .is_some(),
             "an invalid pinned value must not suppress the derived token"
         );
+    }
+
+    #[test]
+    fn opencode_responses_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default, so this checks both clients the Responses provider builds.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+        let provider = |api_url: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build()
+        };
+
+        let opencode = provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_client()));
+
+        let other = provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_client()));
     }
 
     #[test]

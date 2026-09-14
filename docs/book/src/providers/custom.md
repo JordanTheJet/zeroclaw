@@ -115,7 +115,7 @@ model = "big-pickle"
 x-opencode-session = "my-fixed-scope"
 ```
 
-Hosts other than `opencode.ai` and its subdomains never receive the header.
+Hosts other than `opencode.ai` and its subdomains never receive the header. To keep it that way, OpenCode requests follow a redirect only within the same host: a redirect to a different host is not followed, and the request fails with that redirect status.
 
 ## Validation
 
