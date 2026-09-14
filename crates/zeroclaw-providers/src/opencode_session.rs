@@ -8,9 +8,11 @@
 //! model (`deepseek-v4-flash`) rejects header-less requests outright with
 //! HTTP 400 `Model is unavailable`.
 //!
-//! Every OpenCode request — both wires, streaming and non-streaming — resolves
-//! its value through [`session_token`] so the header cannot drift per code
-//! path.
+//! Every OpenCode inference request, on both wires and on both streaming and
+//! non-streaming paths, resolves its value through [`session_token`] so the
+//! header cannot drift per code path. Model-catalog and warmup requests
+//! (`GET /models`) do not carry it: they are not a conversation turn, so there
+//! is no backend to pin.
 //!
 //! # Value derivation
 //!
@@ -103,12 +105,12 @@ fn digest_scope(scope: &str) -> String {
     hex::encode(&hasher.finalize()[..TOKEN_BYTES])
 }
 
-/// Affinity token for requests made outside any conversation scope.
+/// Affinity token for inference requests made outside any conversation scope.
 ///
-/// Warmup probes and other calls that never enter the agent loop still have to
-/// carry a header, or the Go models that reject header-less requests would fail
-/// on exactly those paths. One process-stable random token keeps them pinned
-/// together without inventing a conversation identity for them.
+/// Model calls that never enter the agent loop still have to carry a header, or
+/// the Go models that reject header-less requests would fail on exactly those
+/// paths. One process-stable random token keeps them pinned together without
+/// inventing a conversation identity for them.
 fn process_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
     TOKEN.get_or_init(|| digest_scope(&uuid::Uuid::new_v4().to_string()))
@@ -213,7 +215,7 @@ mod tests {
     #[test]
     fn opencode_target_always_yields_a_token() {
         // Outside any conversation scope the process token still applies, so
-        // warmup-style calls are never header-less.
+        // inference calls made outside the agent loop are never header-less.
         let token = session_token("https://opencode.ai/zen/go/v1")
             .expect("OpenCode target must always carry an affinity token");
         assert_eq!(token.len(), TOKEN_BYTES * 2);
