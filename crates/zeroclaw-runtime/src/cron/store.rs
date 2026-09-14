@@ -327,7 +327,7 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
 /// place is what makes that property structural rather than coincidental.
 #[must_use]
 pub fn job_not_found(job_id: &str) -> anyhow::Error {
-    anyhow::anyhow!("Cron job '{job_id}' not found")
+    anyhow::Error::msg(format!("Cron job '{job_id}' not found"))
 }
 
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
