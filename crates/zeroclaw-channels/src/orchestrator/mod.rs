@@ -8640,6 +8640,63 @@ struct InboundAdmission {
     task_sequence: Arc<AtomicU64>,
 }
 
+/// The shared SOP-gate stage, ahead of every other admission decision.
+///
+/// Gate answers (button-click markers / `approve <ref>` text replies) resolve a
+/// PARKED run and must never start one, so they are consumed BEFORE agent
+/// ownership lookup. A configured approval route may be intentionally unowned
+/// by an agent; it can present gate prompts but must never receive ordinary
+/// agent traffic. All live contexts share the global channel registry and
+/// prompt config, so any one of them answers for the whole daemon.
+///
+/// Both ingress sources call this: the native channel receiver and the typed
+/// plugin event queue, whose messages no longer reach the native receiver at
+/// all. An operator who presents a gate on a `plugin.<binding>` route must be
+/// able to answer it from that same binding.
+///
+/// Returns `true` when the message was consumed as a gate answer.
+async fn consume_channel_sop_gate(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(gate_ctx) = router
+        .single_ctx
+        .as_ref()
+        .cloned()
+        .or_else(|| router.by_agent.values().next().cloned())
+    else {
+        return false;
+    };
+    let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, msg).cloned();
+    let gate_channel_route_keys = gate_channel
+        .as_ref()
+        .map(|target| {
+            let mut keys: Vec<String> = gate_ctx
+                .channels_by_name
+                .iter()
+                .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
+                .map(|(key, _channel)| key.clone())
+                .collect();
+            let inbound_key = channel_key_for_message(msg);
+            if !keys.iter().any(|key| key == &inbound_key) {
+                keys.push(inbound_key);
+            }
+            keys.sort();
+            keys.dedup();
+            keys
+        })
+        .unwrap_or_else(|| vec![channel_key_for_message(msg)]);
+    let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+    dispatch_channel_sop_gate(
+        router,
+        msg,
+        gate_ctx.prompt_config.as_ref(),
+        &gate_prompt_channels,
+        &gate_channel_route_keys,
+    )
+    .await
+}
+
 /// Shared control stage every admitted inbound message passes through before a
 /// turn starts: the `/stop` fast path, the per-sender debounce window, and
 /// worker admission under the in-flight semaphore.
@@ -9081,13 +9138,22 @@ async fn run_message_dispatch_loop_inner(
                         continue;
                     }
                 };
+                let message = event.into_message();
+                // The gate stage runs here for the same reason it runs before
+                // ownership lookup on the native receiver, and it runs AFTER
+                // the route check above so a guest cannot answer another
+                // binding's approval route: the route check is what proves the
+                // message carries its own admitted `plugin.<binding>` identity.
+                if consume_channel_sop_gate(&router, &message).await {
+                    acknowledgement.send(Ok(()));
+                    continue;
+                }
                 if targets.sop
                     && let Err(error) = validate_resolved_plugin_sop(&router)
                 {
                     acknowledgement.send(Err(error));
                     continue;
                 }
-                let message = event.into_message();
                 let Some(context) = targets.agent else {
                     dispatch_resolved_plugin_sop(&router, &message).await;
                     acknowledgement.send(Ok(()));
@@ -9106,49 +9172,8 @@ async fn run_message_dispatch_loop_inner(
             }
         };
 
-        // Gate answers (button-click markers / `approve <ref>` text replies)
-        // resolve a PARKED run and must never start one, so they are consumed
-        // BEFORE agent ownership lookup. A configured approval route may be
-        // intentionally unowned by an agent; it can present gate prompts but
-        // must never receive ordinary agent traffic. All live contexts share
-        // this global channel registry and prompt config.
-        let gate_ctx = router
-            .single_ctx
-            .as_ref()
-            .cloned()
-            .or_else(|| router.by_agent.values().next().cloned());
-        if let Some(gate_ctx) = gate_ctx {
-            let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
-            let gate_channel_route_keys = gate_channel
-                .as_ref()
-                .map(|target| {
-                    let mut keys: Vec<String> = gate_ctx
-                        .channels_by_name
-                        .iter()
-                        .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
-                        .map(|(key, _channel)| key.clone())
-                        .collect();
-                    let inbound_key = channel_key_for_message(&msg);
-                    if !keys.iter().any(|key| key == &inbound_key) {
-                        keys.push(inbound_key);
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    keys
-                })
-                .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
-            let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
-            if dispatch_channel_sop_gate(
-                &router,
-                &msg,
-                gate_ctx.prompt_config.as_ref(),
-                &gate_prompt_channels,
-                &gate_channel_route_keys,
-            )
-            .await
-            {
-                continue;
-            }
+        if consume_channel_sop_gate(&router, &msg).await {
+            continue;
         }
 
         let Some(ctx) = router.resolve(&msg) else {
@@ -16408,10 +16433,24 @@ temperature = 0.3
         tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         tokio::task::JoinHandle<()>,
     ) {
+        plugin_ingress_harness_with_sop(ctx, None)
+    }
+
+    /// The same harness with a live SOP engine, for the gate stage.
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_ingress_harness_with_sop(
+        ctx: Arc<ChannelRuntimeContext>,
+        sop_engine: Option<Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    ) -> (
+        PluginEventRouter,
+        zeroclaw_plugins::endpoint::PluginChannelEndpoint,
+        tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let router = AgentRouter::multi(
             HashMap::from([("operator".to_string(), ctx)]),
             HashMap::new(),
-            None,
+            sop_engine,
             None,
         );
         let (dispatcher, plugin_rx) = crate::plugin_event_dispatch::bounded_plugin_event_dispatch();
@@ -16727,6 +16766,79 @@ temperature = 0.3
         assert!(
             combined.contains("first half") && combined.contains("second half"),
             "the combined turn must carry both events: {combined}"
+        );
+
+        drop(native_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), dispatch_loop).await;
+    }
+
+    /// An operator can present a SOP approval gate on a `plugin.<binding>`
+    /// route, so the answer must reach the shared gate stage and resolve the
+    /// parked run instead of starting a turn. Plugin inbound no longer reaches
+    /// the native receiver, so this only holds because the plugin arm runs the
+    /// gate stage itself.
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn plugin_originated_gate_reply_answers_the_parked_run_without_starting_a_turn() {
+        let mut engine = zeroclaw_runtime::sop::SopEngine::new(channel_gate_config_with_routes(
+            Some("plugin.operations:room"),
+            None,
+        ));
+        engine.set_sops_for_test(vec![channel_gate_sop(Some("prod"))]);
+        let action = engine
+            .start_run("channel-gate", manual_sop_event())
+            .expect("the fixture SOP starts");
+        let zeroclaw_runtime::sop::types::SopRunAction::WaitApproval { run_id, .. } = action else {
+            panic!("expected the fixture SOP to park on approval, got {action:?}");
+        };
+        let engine = Arc::new(Mutex::new(engine));
+
+        let provider = Arc::new(HistoryCaptureModelProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            vision: false,
+        });
+        let channel: Arc<dyn Channel> = Arc::new(PluginRecordingChannel::default());
+        let base = (*router_test_ctx()).clone();
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::from([("plugin.operations".to_string(), channel)])),
+            model_provider: provider.clone(),
+            agent_alias: Arc::new("operator".to_string()),
+            ..base
+        });
+        let (event_router, endpoint, native_tx, dispatch_loop) =
+            plugin_ingress_harness_with_sop(ctx, Some(Arc::clone(&engine)));
+
+        event_router
+            .submit(
+                &endpoint,
+                plugin_event_message(&format!("approve {run_id}")),
+            )
+            .await
+            .expect("the gate answer is admitted");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !matches!(
+                    active_run_status(&engine, &run_id),
+                    Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a plugin-originated gate answer must resolve the parked run");
+
+        // Give a turn that should never start time to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            provider
+                .calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "a gate answer must resolve the run, never start an agent turn"
         );
 
         drop(native_tx);
