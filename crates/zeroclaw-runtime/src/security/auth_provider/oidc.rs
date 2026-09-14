@@ -128,6 +128,8 @@ struct Claims {
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
     acr: Option<String>,
     #[serde(default)]
     amr: Option<Vec<String>>,
@@ -223,6 +225,7 @@ fn select_verification_keys(set: JwkSet) -> anyhow::Result<HashMap<String, Jwk>>
         anyhow::bail!("issuer JWKS exceeds the configured key count limit");
     }
     let mut next = HashMap::new();
+    let mut seen_kids = std::collections::HashSet::new();
     for key in set.keys {
         let kid = key
             .kid
@@ -230,7 +233,10 @@ fn select_verification_keys(set: JwkSet) -> anyhow::Result<HashMap<String, Jwk>>
             .filter(|kid| !kid.trim().is_empty())
             .ok_or_else(|| anyhow::Error::msg("issuer JWKS contains a missing or empty kid"))?
             .to_owned();
-        if next.contains_key(&kid) {
+        // Reject duplicate ids before filtering eligibility. Otherwise an
+        // attacker can make the result depend on key order by placing an
+        // ineligible copy before or after a verification key.
+        if !seen_kids.insert(kid.clone()) {
             anyhow::bail!("issuer JWKS contains a duplicate kid");
         }
         if is_verification_key(&key) {
@@ -479,7 +485,7 @@ impl OidcAuthProvider {
             .http
             .post(&endpoint)
             .basic_auth(self.config.effective_client_id(), Some(secret))
-            .form(&[("token", token)])
+            .form(&[("token", token), ("token_type_hint", "access_token")])
             .send()
             .await;
         let body = match response {
@@ -497,6 +503,16 @@ impl OidcAuthProvider {
             return deny(DenyReason::BadCredential);
         };
         if claims.active != Some(true) {
+            return deny(DenyReason::BadCredential);
+        }
+        // RFC 7662's active flag alone does not bind the result to the API
+        // bearer purpose or to this daemon. Require both from the authority.
+        if !claims
+            .token_type
+            .as_deref()
+            .is_some_and(|token_type| token_type.eq_ignore_ascii_case("Bearer"))
+            || !audience_matches(claims.aud.as_ref(), &self.config.audience)
+        {
             return deny(DenyReason::BadCredential);
         }
         self.claims_to_identity(&claims, raw, VerifiedVia::Introspection)
@@ -567,31 +583,29 @@ impl OidcAuthProvider {
             return deny(DenyReason::MfaRequired);
         }
 
-        // RFC 9068 client_id is common to resource-owner and client-credentials
-        // tokens. A human sub remains human; only an allowlisted
-        // client-credentials shape (sub == client_id) is a service. A missing
-        // subject is ambiguous and is denied even for an allowlisted client.
-        let client_identity = claims.client_id.as_deref();
+        // A verified client_id is the stable actor discriminator. Providers
+        // vary in their service-token `sub` shape, so an allowlisted client is
+        // always a service; a non-allowlisted client must have a distinct
+        // human subject and can never impersonate an equal service-shaped sub.
+        let client_identity = claims
+            .client_id
+            .as_deref()
+            .filter(|client_id| !client_id.trim().is_empty());
         let human_subject = claims.sub.as_deref().filter(|sub| !sub.trim().is_empty());
         let subject = match (client_identity, human_subject) {
-            (Some(client_id), Some(subject)) if subject != client_id => IdentitySubject::Oidc {
-                issuer: self.config.issuer.clone(),
-                subject: subject.to_owned(),
-            },
-            (Some(client_id), Some(subject))
-                if subject == client_id
-                    && self
-                        .config
-                        .service_clients
-                        .iter()
-                        .any(|allowed| allowed == client_id) =>
+            (Some(client_id), _)
+                if self
+                    .config
+                    .service_clients
+                    .iter()
+                    .any(|allowed| allowed == client_id) =>
             {
                 IdentitySubject::Service {
                     issuer: self.config.issuer.clone(),
                     client_id: client_id.to_owned(),
                 }
             }
-            (None, Some(subject)) => IdentitySubject::Oidc {
+            (Some(client_id), Some(subject)) if subject != client_id => IdentitySubject::Oidc {
                 issuer: self.config.issuer.clone(),
                 subject: subject.to_owned(),
             },
@@ -610,14 +624,14 @@ impl OidcAuthProvider {
                 let Some(iat) = claims.iat else {
                     return deny(DenyReason::BadCredential);
                 };
-                if !claims
+                if claims
                     .jti
                     .as_deref()
-                    .is_some_and(|jti| !jti.trim().is_empty())
-                    || !claims
+                    .is_none_or(|jti| jti.trim().is_empty())
+                    || claims
                         .client_id
                         .as_deref()
-                        .is_some_and(|client_id| !client_id.trim().is_empty())
+                        .is_none_or(|client_id| client_id.trim().is_empty())
                 {
                     return deny(DenyReason::BadCredential);
                 }
@@ -884,6 +898,7 @@ mod tests {
                 "introspection" => {
                     let mut claims = idp.good_claims();
                     claims["active"] = serde_json::json!(true);
+                    claims["token_type"] = serde_json::json!("Bearer");
                     claims
                 }
                 _ => panic!("unknown test surface"),
@@ -1026,7 +1041,10 @@ mod tests {
                             base64::engine::general_purpose::STANDARD.encode("zeroclaw:s3cret")
                         )
                     );
-                    assert_eq!(request.body, b"token=opaque-token");
+                    assert_eq!(
+                        request.body,
+                        b"token=opaque-token&token_type_hint=access_token"
+                    );
                 }
                 assert!(
                     sink.received_requests().await.unwrap().is_empty(),
@@ -1164,8 +1182,9 @@ mod tests {
             let response = Mock::given(method("POST"))
                 .and(path("/introspect"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "active": true, "iss": idp.issuer, "sub": "subject-1", "aud": "zeroclaw",
-                    "client_id": "zerocode-cli", "amr": ["otp"], "acr": acr,
+                    "active": true, "token_type": "Bearer", "iss": idp.issuer,
+                    "sub": "subject-1", "aud": "zeroclaw", "client_id": "zerocode-cli",
+                    "amr": ["otp"], "acr": acr,
                 })))
                 .expect(1)
                 .mount_as_scoped(&idp.server)
@@ -1484,7 +1503,7 @@ mod tests {
 
         let mut claims = idp.good_claims();
         claims["client_id"] = serde_json::json!("reporting-batch");
-        claims["sub"] = serde_json::json!("reporting-batch");
+        claims["sub"] = serde_json::json!("provider-service-subject");
         let out = provider.verify(&bearer(idp.mint(claims))).await;
         let identity = out.identity().expect("verified");
         assert_eq!(
@@ -1511,11 +1530,21 @@ mod tests {
         claims["client_id"] = serde_json::json!("reporting-batch");
         claims.as_object_mut().unwrap().remove("sub");
         assert!(
+            matches!(
+                provider.verify(&bearer(idp.mint(claims))).await.identity().map(|identity| &identity.subject),
+                Some(IdentitySubject::Service { client_id, .. }) if client_id == "reporting-batch"
+            ),
+            "configured services do not rely on a provider-specific subject shape"
+        );
+
+        let mut claims = idp.good_claims();
+        claims.as_object_mut().unwrap().remove("client_id");
+        assert!(
             !provider
                 .verify(&bearer(idp.mint(claims)))
                 .await
                 .is_allowed(),
-            "an allowlisted service JWT still needs a nonblank subject"
+            "a token without a stable client discriminator is denied"
         );
     }
 
@@ -1644,6 +1673,17 @@ mod tests {
             })
             .is_err()
         );
+        let mut ineligible = key(Some("same"));
+        ineligible.key_use = Some("enc".into());
+        for keys in [
+            vec![ineligible.clone(), key(Some("same"))],
+            vec![key(Some("same")), ineligible],
+        ] {
+            assert!(
+                select_verification_keys(JwkSet { keys }).is_err(),
+                "duplicate ids must be rejected regardless of eligibility or order"
+            );
+        }
         assert!(
             select_verification_keys(JwkSet {
                 keys: vec![key(Some(""))],
@@ -1700,10 +1740,12 @@ mod tests {
             .and(path("/introspect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "active": true,
+                "token_type": "Bearer",
                 "iss": idp.issuer,
                 "sub": "bob",
                 "aud": "zeroclaw",
                 "exp": now_unix() + 600,
+                "client_id": "zerocode-cli",
                 "realm_access": {"roles": ["ops"]},
             })))
             .mount(&idp.server)
@@ -1726,6 +1768,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn introspection_binds_active_tokens_to_bearer_purpose_and_audience() {
+        for (token_type, audience, allowed) in [
+            (Some("Bearer"), "zeroclaw", true),
+            (Some("MAC"), "zeroclaw", false),
+            (None, "zeroclaw", false),
+            (Some("Bearer"), "other-resource", false),
+        ] {
+            let idp = start_idp().await;
+            let mut response = serde_json::json!({
+                "active": true,
+                "iss": idp.issuer,
+                "sub": "bob",
+                "aud": audience,
+                "client_id": "zerocode-cli",
+            });
+            if let Some(token_type) = token_type {
+                response["token_type"] = serde_json::json!(token_type);
+            }
+            Mock::given(method("POST"))
+                .and(path("/introspect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&idp.server)
+                .await;
+            let provider = idp.provider(OidcValidation::Introspection);
+            assert_eq!(
+                provider.verify(&bearer("opaque-token")).await.is_allowed(),
+                allowed,
+                "token_type={token_type:?}, audience={audience}"
+            );
+            let request = idp
+                .server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|request| request.url.path() == "/introspect")
+                .expect("introspection request");
+            assert_eq!(
+                request.body,
+                b"token=opaque-token&token_type_hint=access_token"
+            );
+            idp.server.verify().await;
+        }
+    }
+
+    #[tokio::test]
     async fn introspection_inactive_token_is_denied() {
         let idp = start_idp().await;
         Mock::given(method("POST"))
@@ -1745,8 +1834,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/introspect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "active": true, "iss": idp.issuer, "sub": "bob", "aud": "zeroclaw",
-                "amr": ["otp"], "client_id": "zerocode-cli"
+                "active": true, "token_type": "Bearer", "iss": idp.issuer,
+                "sub": "bob", "aud": "zeroclaw", "amr": ["otp"],
+                "client_id": "zerocode-cli"
             })))
             .mount(&idp.server)
             .await;
@@ -1759,8 +1849,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/introspect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "active": true, "iss": idp.issuer, "sub": "bob", "aud": "zeroclaw",
-                "amr": ["mfa"]
+                "active": true, "token_type": "Bearer", "iss": idp.issuer,
+                "sub": "bob", "aud": "zeroclaw", "amr": ["mfa"],
+                "client_id": "zerocode-cli"
             })))
             .mount(&idp.server)
             .await;
@@ -1867,13 +1958,16 @@ mod tests {
                     issuer: idp.issuer.clone(),
                     claim_path: "realm_access.roles".into(),
                     profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
-                    service_profile_map: HashMap::new(),
+                    service_profile_map: HashMap::from([(
+                        "reporting-batch".to_string(),
+                        "operator".to_string(),
+                    )]),
                 },
             )]),
             roster: HashMap::new(),
             roster_conflict: false,
         };
-        let resolver = PrincipalResolver::new(policy);
+        let resolver = PrincipalResolver::new(policy.clone());
         let resolved = resolver.resolve(&identity).expect("resolves");
         assert_eq!(resolved.principal.actor, ActorKind::Human);
         assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
@@ -1882,5 +1976,35 @@ mod tests {
             resolved.principal.id.as_str().starts_with("oidc:"),
             "issuer-keyed canonical principal"
         );
+
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.service_clients = vec!["reporting-batch".into()];
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = idp.good_claims();
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        claims["sub"] = serde_json::json!("provider-specific-service-subject");
+        let service_identity = provider
+            .verify(&bearer(idp.mint(claims)))
+            .await
+            .identity()
+            .expect("configured service verifies")
+            .clone();
+        let service = resolver
+            .resolve(&service_identity)
+            .expect("configured service resolves through service map");
+        assert_eq!(service.principal.actor, ActorKind::Service);
+        assert!(service.grants.permits(Resource::Sessions, Verb::Read));
+
+        let mut human_only_policy = policy;
+        human_only_policy
+            .oidc
+            .get_mut("test")
+            .expect("test mapping")
+            .service_profile_map
+            .clear();
+        assert!(matches!(
+            PrincipalResolver::new(human_only_policy).resolve(&service_identity),
+            Err(DenyReason::NotEntitled)
+        ));
     }
 }
