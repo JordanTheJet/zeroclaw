@@ -54,6 +54,25 @@ Any **other** uid must be mapped by an explicit `[users.<name>].uid`
 entry. An unmapped uid (root included) is denied; there is no fallback to
 shared-operator access.
 
+#### Recovery
+
+There is no remote recovery path. A remote authentication bypass is never
+offered, so every route back from a locked-out or deny-all state runs over
+the local Unix socket, as the account that runs the daemon:
+
+1. Connect locally as the daemon's own uid. With
+   `security.trust_daemon_uid = true` (the default) that account stays the
+   trusted shared operator whatever the roster or the accepted policy says.
+2. Repair the offending section, for example
+   `zeroclaw config set users.alice.uid 1001`, or edit `config.toml`
+   directly when the entry cannot be authored one field at a time.
+3. Reload the daemon so the repaired sections are compiled and published.
+
+If `security.trust_daemon_uid` is set to `false`, that local route is gone
+too, and the only remaining repair is to edit `config.toml` as its owner
+and restart the daemon. Turn the setting off only where that is
+acceptable.
+
 ### The users roster
 
 {{#config-fields users}}
@@ -88,11 +107,22 @@ the session-assembly change lands.
 ## Breaking change: remote WSS requires authentication
 
 From this change on, a remote WSS connection must present `auth_token` in
-`initialize`. There is no unauthenticated remote fallback, and a daemon
-whose `[wss]` listener is enabled with no possible credential path (no
+`initialize`. There is no unauthenticated remote fallback.
+
+A `[wss]` listener enabled with no possible credential path (no
 `[oidc.<alias>]`, no paired tokens, and `gateway.require_pairing = false`)
-refuses to load its configuration rather than accept unauthenticated
-clients.
+is rejected by config validation, so no supported surface can save one.
+A configuration already on disk in that shape still boots: the daemon
+starts and the listener denies every remote handshake. It does not refuse
+to load, because an operator has to be able to boot a daemon in order to
+repair it.
+
+Invalid `[oidc.<alias>]`, `[users]`, or `[permission_profiles]` sections
+are the separate case. There the authorization policy itself does not
+compile, so the daemon installs a deny-all accepted state and logs that
+it is doing so until the sections are repaired and reloaded. Every
+privileged operation is refused under that state, on remote and local
+connections alike, except the local repair path below.
 
 Migration for existing remote zerocode users:
 
