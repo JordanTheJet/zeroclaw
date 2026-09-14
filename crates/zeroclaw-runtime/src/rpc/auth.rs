@@ -544,6 +544,10 @@ mod tests {
         Config::default()
     }
 
+    fn shared_operator_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::shared_operator(AuthMethod::SharedOperator)
+    }
+
     fn config_with_roster(uid: u32) -> Config {
         let mut config = base_config();
         config.permission_profiles.insert(
@@ -804,6 +808,48 @@ mod tests {
         assert!(
             RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(true, &[]))).is_ok(),
             "pairing-capable WSS config is startable; handshakes deny until paired"
+        );
+    }
+
+    #[test]
+    fn deny_all_state_is_installed_only_for_invalid_auth_sections() {
+        // A wss listener with no credential path is rejected by config
+        // validation, so no supported surface can save it; if one is already
+        // on disk the daemon still boots with an ordinary policy and the
+        // listener denies every remote handshake. It is NOT a deny-all state.
+        let mut unusable_listener = base_config();
+        unusable_listener.wss.enabled = true;
+        unusable_listener.gateway.require_pairing = false;
+        assert!(
+            unusable_listener.validate().is_err(),
+            "config validation must reject a credential-path-less wss listener"
+        );
+        let auth = RpcInboundAuth::from_config(
+            &unusable_listener,
+            Arc::new(PairingGuard::new(false, &[])),
+        )
+        .expect("the daemon still boots so an operator can repair it");
+        assert!(
+            auth.resolve(&shared_operator_identity()).is_ok(),
+            "the local shared operator keeps the repair path"
+        );
+
+        // An authorization section that does not compile is the deny-all
+        // case: the roster references a profile that is not configured.
+        let mut dangling = base_config();
+        dangling.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["not-configured".into()],
+            },
+        );
+        let auth = RpcInboundAuth::from_config(&dangling, Arc::new(PairingGuard::new(false, &[])))
+            .expect("an invalid policy installs deny-all rather than refusing to load");
+        assert!(
+            auth.resolve(&shared_operator_identity()).is_err(),
+            "a deny-all state refuses even the shared operator's ordinary grants"
         );
     }
 
