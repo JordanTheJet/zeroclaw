@@ -272,6 +272,23 @@ impl AcceptedAuthState {
     }
 }
 
+/// Prove that an authorization policy compiles, without a live auth layer in
+/// hand.
+///
+/// [`RpcInboundAuth::validate_refresh_from_config`] is the same test for a
+/// caller that owns the live layer. Surfaces that stage a configuration
+/// without one (the gateway's Quickstart) use this so they can refuse an
+/// invalid policy before their first persistent write rather than after it.
+/// Pairing state does not affect whether the policy compiles.
+pub fn validate_accepted_auth_config(config: &Config) -> anyhow::Result<()> {
+    let pairing = Arc::new(PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+    ));
+    let _ = AcceptedAuthState::from_config(config, pairing, 1)?;
+    Ok(())
+}
+
 /// The daemon's inbound-auth layer. The accepted state is a single snapshot:
 /// registry, resolver/generation, uid roster, and local trust posture are
 /// rebuilt and published together or not at all.

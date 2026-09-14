@@ -6256,10 +6256,18 @@ impl RpcDispatcher {
         // the clone, so `save_and_swap_config` performs no second disk
         // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface(
+        // The staged policy is compiled BEFORE Quickstart's first write, so a
+        // rejected one cannot reach disk and then be reported as not saved.
+        let result = crate::quickstart::apply_with_surface_checked(
             req.submission,
             &mut working,
             crate::quickstart::Surface::Tui,
+            &|staged| {
+                self.ctx
+                    .auth
+                    .validate_refresh_from_config(staged)
+                    .map_err(|e| e.to_string())
+            },
         )
         .await;
         let body = match result {
