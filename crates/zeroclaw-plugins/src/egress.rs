@@ -2,30 +2,42 @@
 //!
 //! Transport adapters submit an [`EgressRequest`], then dial only the pinned
 //! addresses returned by [`AuthorizedEgress`]. Policy is resolved at each
-//! request, while live-connection accounting is shared across every transport
-//! and store belonging to the same logical plugin instance.
+//! request, while live-connection accounting is shared process-wide by every
+//! transport, store, service, and tool registry that represents the same
+//! logical plugin instance.
 //!
 //! Linkers expose only the imports selected by an admitted instance's effective
 //! grants. This service repeats that grant check at the operation boundary, then
-//! applies the common destination, confidentiality, TLS-profile, and capacity
-//! policy. The duplicate check is intentional defense in depth: an adapter
-//! cannot accidentally turn a linked-but-ungranted import into network access.
+//! applies the common destination, address-class, and capacity policy. The
+//! duplicate check is intentional defense in depth: an adapter cannot
+//! accidentally turn a linked-but-ungranted import into network access.
+//!
+//! # What this module does not own
+//!
+//! Address classification, the egress pattern grammar, NAT64 translation, and
+//! the post-resolution SSRF verdict all live in `zeroclaw_infra::net_guard`,
+//! which is also what the built-in tools use. Nothing here re-implements them:
+//! a plugin and a built-in tool must not be able to disagree about whether a
+//! destination is reachable.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use zeroclaw_api::plugin_egress::{OutboundHostPattern, is_valid_tls_profile_name};
-use zeroclaw_api::plugin_key::SecretPropertyRef;
 use zeroclaw_infra::net_guard::{
-    NetworkGuardError, PrivateNetworkAccess, ResolvedDestination, normalize_host,
+    Nat64Prefix, NetworkGuardError, PrivateNetworkAccess, ResolvedDestination, egress_host_matches,
+    egress_pattern_contains, normalize_egress_patterns, normalize_host, parse_nat64_prefixes,
 };
 
 use crate::PluginPermission;
 use crate::instance::{PluginInstanceId, PluginInstanceScope};
 
 /// Protocol family and confidentiality mode requested by a plugin adapter.
+///
+/// The distinction the host cares about is which effective grant a transport
+/// needs and whether it can still become encrypted; the wire protocol itself is
+/// the adapter's business.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressTransport {
     /// HTTP; `encrypted = true` represents HTTPS.
@@ -48,23 +60,6 @@ impl EgressTransport {
             Self::Tcp | Self::Tls | Self::StartTls => PluginPermission::SocketClient,
         }
     }
-
-    fn permanently_plaintext(self) -> bool {
-        matches!(
-            self,
-            Self::Http { encrypted: false } | Self::WebSocket { encrypted: false } | Self::Tcp
-        )
-    }
-
-    fn uses_tls(self) -> bool {
-        matches!(
-            self,
-            Self::Http { encrypted: true }
-                | Self::WebSocket { encrypted: true }
-                | Self::Tls
-                | Self::StartTls
-        )
-    }
 }
 
 impl fmt::Display for EgressTransport {
@@ -81,214 +76,94 @@ impl fmt::Display for EgressTransport {
     }
 }
 
-/// Validated operator-facing name of a TLS profile.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TlsProfileName(String);
-
-impl TlsProfileName {
-    /// Parse a lowercase profile slug.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EgressError::InvalidTlsProfileName`] for an invalid slug.
-    pub fn new(name: impl Into<String>) -> Result<Self, EgressError> {
-        let name = name.into();
-        if !is_valid_tls_profile_name(&name) {
-            return Err(EgressError::InvalidTlsProfileName(name));
-        }
-        Ok(Self(name))
-    }
-
-    /// Canonical profile slug.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Secret references for one TLS client certificate and its private key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TlsClientIdentity {
-    certificate: SecretPropertyRef,
-    private_key: SecretPropertyRef,
-}
-
-impl TlsClientIdentity {
-    /// Pair a certificate-chain property with its private-key property.
-    #[must_use]
-    pub fn new(certificate: SecretPropertyRef, private_key: SecretPropertyRef) -> Self {
-        Self {
-            certificate,
-            private_key,
-        }
-    }
-
-    /// PEM certificate-chain secret reference.
-    #[must_use]
-    pub fn certificate(&self) -> &SecretPropertyRef {
-        &self.certificate
-    }
-
-    /// PEM private-key secret reference.
-    #[must_use]
-    pub fn private_key(&self) -> &SecretPropertyRef {
-        &self.private_key
-    }
-}
-
-/// Named TLS trust and optional mTLS identity policy.
-///
-/// The profile contains references only; it never owns resolved PEM bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TlsProfile {
-    name: TlsProfileName,
-    hosts: Vec<OutboundHostPattern>,
-    system_roots: bool,
-    custom_ca: Option<SecretPropertyRef>,
-    client_identity: Option<TlsClientIdentity>,
-}
-
-impl TlsProfile {
-    /// Create a named TLS profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EgressError`] if no destination is bound, a host pattern is
-    /// invalid, or neither system roots nor a custom CA supplies trust anchors.
-    pub fn new(
-        name: TlsProfileName,
-        hosts: impl IntoIterator<Item = String>,
-        system_roots: bool,
-        custom_ca: Option<SecretPropertyRef>,
-        client_identity: Option<TlsClientIdentity>,
-    ) -> Result<Self, EgressError> {
-        let hosts = hosts
-            .into_iter()
-            .map(|pattern| {
-                OutboundHostPattern::parse(&pattern).ok_or(EgressError::InvalidHostPattern(pattern))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if hosts.is_empty() {
-            return Err(EgressError::TlsProfileWithoutHosts(
-                name.as_str().to_string(),
-            ));
-        }
-        if !system_roots && custom_ca.is_none() {
-            return Err(EgressError::InvalidTlsProfile {
-                profile: name.as_str().to_string(),
-                reason: "at least one of system roots or a custom CA is required".to_string(),
-            });
-        }
-        Ok(Self {
-            name,
-            hosts,
-            system_roots,
-            custom_ca,
-            client_identity,
-        })
-    }
-
-    /// Profile name selected by an egress request.
-    #[must_use]
-    pub fn name(&self) -> &TlsProfileName {
-        &self.name
-    }
-
-    /// Whether platform/system trust roots should be loaded.
-    #[must_use]
-    pub fn uses_system_roots(&self) -> bool {
-        self.system_roots
-    }
-
-    /// Optional instance-secret property containing PEM CA certificates.
-    #[must_use]
-    pub fn custom_ca(&self) -> Option<&SecretPropertyRef> {
-        self.custom_ca.as_ref()
-    }
-
-    /// Optional instance-secret properties forming an mTLS identity.
-    #[must_use]
-    pub fn client_identity(&self) -> Option<&TlsClientIdentity> {
-        self.client_identity.as_ref()
-    }
-
-    fn allows_host(&self, host: &str) -> bool {
-        self.hosts
-            .iter()
-            .any(|pattern| pattern.matches_normalized(host))
-    }
-}
-
 /// One materialized view of canonical operator egress policy.
 ///
 /// Construct this inside an [`EgressPolicyResolver`] call. Long-lived stores
-/// retain the resolver, not this view, so reloads apply to the next dial.
+/// retain the resolver, not this view, so an operator's edit applies to the
+/// next dial rather than to the next restart.
+///
+/// The two host lists are exactly the operator's
+/// `plugins.entries[].egress_hosts` and `egress_allow_private`. There is no
+/// second config surface: a destination is reachable because the operator
+/// granted it, and no manifest, permission, or default adds to that.
 #[derive(Clone, Debug)]
 pub struct EgressPolicy {
-    private_network_hosts: Vec<OutboundHostPattern>,
-    plaintext_hosts: Vec<OutboundHostPattern>,
-    tls_profiles: HashMap<TlsProfileName, TlsProfile>,
+    hosts: Vec<String>,
+    allow_private: Vec<String>,
+    nat64_prefixes: Vec<Nat64Prefix>,
     max_connections_per_instance: usize,
 }
 
 impl EgressPolicy {
     /// Build and validate one resolved policy view.
     ///
-    /// Host patterns accept exact hosts, `*.example.com`, or the explicit `*`
-    /// wildcard. Public encrypted egress is permitted by default; these lists
-    /// authorize only otherwise-denied private-network and permanent-plaintext
-    /// exceptions.
+    /// `hosts` and `allow_private` use the strict egress grammar
+    /// (`zeroclaw_infra::net_guard::normalize_egress_pattern`): exact hosts or
+    /// `*.suffix` patterns, with no allow-all form. An empty `hosts` list is
+    /// the default and means no reach at all.
+    ///
+    /// `nat64_prefixes` is the deployment's `security.nat64_prefixes`, parsed
+    /// here so a malformed list fails the policy closed rather than silently
+    /// disabling network-specific classification. This mirrors how the built-in
+    /// tools parse the same list at construction.
     ///
     /// # Errors
     ///
-    /// Returns [`EgressError`] for invalid patterns, duplicate TLS profile
-    /// names, or a zero connection ceiling.
+    /// Returns [`EgressError`] for an invalid host pattern, a private carveout
+    /// that is broader than every host grant, an invalid NAT64 prefix, or a
+    /// zero connection ceiling.
     pub fn new(
-        private_network_hosts: impl IntoIterator<Item = String>,
-        plaintext_hosts: impl IntoIterator<Item = String>,
-        tls_profiles: impl IntoIterator<Item = TlsProfile>,
+        hosts: &[String],
+        allow_private: &[String],
+        nat64_prefixes: &[String],
         max_connections_per_instance: usize,
     ) -> Result<Self, EgressError> {
         if max_connections_per_instance == 0 {
             return Err(EgressError::InvalidConnectionLimit);
         }
-        let private_network_hosts = private_network_hosts
-            .into_iter()
-            .map(|pattern| {
-                OutboundHostPattern::parse(&pattern).ok_or(EgressError::InvalidHostPattern(pattern))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let plaintext_hosts = plaintext_hosts
-            .into_iter()
-            .map(|pattern| {
-                OutboundHostPattern::parse(&pattern).ok_or(EgressError::InvalidHostPattern(pattern))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut profiles = HashMap::new();
-        for profile in tls_profiles {
-            let name = profile.name().clone();
-            if profiles.insert(name.clone(), profile).is_some() {
-                return Err(EgressError::DuplicateTlsProfile(name.as_str().to_string()));
-            }
+        let hosts = normalize_egress_patterns(hosts, "plugins.entries.egress_hosts")
+            .map_err(|error| EgressError::InvalidHostPattern(error.to_string()))?;
+        let allow_private =
+            normalize_egress_patterns(allow_private, "plugins.entries.egress_allow_private")
+                .map_err(|error| EgressError::InvalidHostPattern(error.to_string()))?;
+        if let Some(private) = allow_private.iter().find(|private| {
+            !hosts
+                .iter()
+                .any(|grant| egress_pattern_contains(grant, private))
+        }) {
+            return Err(EgressError::InvalidHostPattern(format!(
+                "plugins.entries.egress_allow_private entry {private:?} is not granted by plugins.entries.egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one"
+            )));
         }
+        let nat64_prefixes = parse_nat64_prefixes(nat64_prefixes, "security.nat64_prefixes")
+            .map_err(|error| EgressError::InvalidNat64Prefix(error.to_string()))?;
         Ok(Self {
-            private_network_hosts,
-            plaintext_hosts,
-            tls_profiles: profiles,
+            hosts,
+            allow_private,
+            nat64_prefixes,
             max_connections_per_instance,
         })
     }
 
-    fn private_network_allowed(&self, host: &str) -> bool {
-        self.private_network_hosts
-            .iter()
-            .any(|pattern| pattern.matches_normalized(host))
+    /// A policy that grants nothing. The state an unconfigured instance is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError::InvalidConnectionLimit`] for a zero ceiling.
+    pub fn deny_all(max_connections_per_instance: usize) -> Result<Self, EgressError> {
+        Self::new(&[], &[], &[], max_connections_per_instance)
     }
 
-    fn plaintext_allowed(&self, host: &str) -> bool {
-        self.plaintext_hosts
-            .iter()
-            .any(|pattern| pattern.matches_normalized(host))
+    fn grants(&self, host: &str) -> bool {
+        egress_host_matches(host, &self.hosts)
+    }
+
+    fn private_access(&self, host: &str) -> PrivateNetworkAccess {
+        if egress_host_matches(host, &self.allow_private) {
+            PrivateNetworkAccess::Allow
+        } else {
+            PrivateNetworkAccess::Deny
+        }
     }
 }
 
@@ -296,9 +171,19 @@ type ResolveEgress =
     dyn Fn(&PluginInstanceScope) -> Result<EgressPolicy, EgressError> + Send + Sync;
 
 /// Live point-of-use resolver for canonical operator egress policy.
+///
+/// Deliberately a closure rather than a resolved value: a long-lived store must
+/// never snapshot policy, so the lists are re-read on every request.
 #[derive(Clone)]
 pub struct EgressPolicyResolver {
     resolve: Arc<ResolveEgress>,
+}
+
+impl fmt::Debug for EgressPolicyResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EgressPolicyResolver")
+            .finish_non_exhaustive()
+    }
 }
 
 impl EgressPolicyResolver {
@@ -327,7 +212,6 @@ pub struct EgressRequest {
     transport: EgressTransport,
     host: String,
     port: u16,
-    tls_profile: Option<TlsProfileName>,
 }
 
 impl EgressRequest {
@@ -335,29 +219,22 @@ impl EgressRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`EgressError`] for a malformed host/port/profile or for
-    /// selecting a TLS profile on a permanently plaintext transport.
+    /// Returns [`EgressError`] for a malformed host or a zero port.
     pub fn new(
         scope: PluginInstanceScope,
         transport: EgressTransport,
         host: &str,
         port: u16,
-        tls_profile: Option<&str>,
     ) -> Result<Self, EgressError> {
         let host = normalize_host(host)?;
         if port == 0 {
             return Err(EgressError::Network(NetworkGuardError::InvalidPort));
-        }
-        let tls_profile = tls_profile.map(TlsProfileName::new).transpose()?;
-        if tls_profile.is_some() && !transport.uses_tls() {
-            return Err(EgressError::TlsProfileOnPlaintext(transport));
         }
         Ok(Self {
             scope,
             transport,
             host,
             port,
-            tls_profile,
         })
     }
 
@@ -384,82 +261,140 @@ impl EgressRequest {
     pub fn port(&self) -> u16 {
         self.port
     }
+}
 
-    /// Optional named TLS profile; `None` means system roots without mTLS.
-    #[must_use]
-    pub fn tls_profile(&self) -> Option<&TlsProfileName> {
-        self.tls_profile.as_ref()
+/// Live connection accounting for every plugin instance in this process.
+///
+/// # Why this state is process-global
+///
+/// A live connection is *runtime* state: the socket this instance holds open
+/// right now either exists or it does not, and there is exactly one truth about
+/// that per process. This is deliberately not the same kind of fact as an
+/// admission or policy decision, which is derived from canonical config every
+/// time it is asked and therefore must never acquire a global counter. Nothing
+/// about the operator's policy is cached here — only how many slots are
+/// currently held. The ceiling those counts are compared against is still read
+/// live from the resolver on every acquire, so lowering it applies to the next
+/// connection.
+///
+/// # Why per-service counting was wrong
+///
+/// `EgressHostService` used to own its counts, so a clone shared them but an
+/// independently built service did not. Production builds a *fresh* service per
+/// `all_tools_with_runtime` call, and the same canonical instance is registered
+/// by several independent paths — the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool. Each registry therefore handed the same
+/// instance a full budget, and N registries multiplied the operator's ceiling by
+/// N. Keying on the canonical [`PluginInstanceId`] puts every one of those
+/// registries on the same count.
+#[derive(Clone, Default)]
+struct ConnectionRegistry {
+    by_instance: Arc<Mutex<HashMap<PluginInstanceId, Arc<InstanceConnections>>>>,
+}
+
+impl ConnectionRegistry {
+    /// The one registry every service built by [`EgressHostService::new`] uses.
+    fn shared() -> Self {
+        static SHARED: OnceLock<ConnectionRegistry> = OnceLock::new();
+        SHARED.get_or_init(ConnectionRegistry::default).clone()
+    }
+
+    /// This instance's counter, created on first use.
+    ///
+    /// The map holds a strong reference for the life of the process, and that
+    /// is the point rather than an oversight. A `Weak` map would be tidier but
+    /// unsound here: no counter outlives the request that acquired against it,
+    /// so every entry would drop between connections and quietly reset the
+    /// ceiling to zero — a leak of budget rather than of memory. Growth is
+    /// bounded by the number of distinct instance identities the host admits,
+    /// which is the operator's installed plugin set; a guest cannot mint one.
+    fn counter(&self, instance: &PluginInstanceId) -> Arc<InstanceConnections> {
+        Arc::clone(self.lock().entry(instance.clone()).or_default())
+    }
+
+    fn acquire(
+        &self,
+        instance: &PluginInstanceId,
+        limit: usize,
+    ) -> Result<ConnectionLease, EgressError> {
+        self.counter(instance).acquire(instance, limit)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<PluginInstanceId, Arc<InstanceConnections>>> {
+        self.by_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    fn live(&self, instance: &PluginInstanceId) -> usize {
+        self.lock()
+            .get(instance)
+            .map_or(0, |connections| *connections.lock())
     }
 }
 
+/// One instance's live connection count, shared by every service that
+/// represents that instance.
 #[derive(Default)]
-struct ConnectionCounts {
-    by_instance: Mutex<HashMap<PluginInstanceId, usize>>,
+struct InstanceConnections {
+    live: Mutex<usize>,
 }
 
-impl ConnectionCounts {
+impl InstanceConnections {
     fn acquire(
         self: &Arc<Self>,
         instance: &PluginInstanceId,
         limit: usize,
     ) -> Result<ConnectionLease, EgressError> {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = counts.entry(instance.clone()).or_default();
-        if *count >= limit {
+        let mut live = self.lock();
+        if *live >= limit {
             return Err(EgressError::ConnectionLimitReached {
-                instance: instance.config_entry_key().unwrap_or_else(|_| {
-                    format!(
-                        "{}:{:?}:{}",
-                        instance.package(),
-                        instance.capability(),
-                        instance.binding()
-                    )
-                }),
+                instance: instance_label(instance),
                 limit,
             });
         }
-        *count += 1;
+        *live += 1;
         Ok(ConnectionLease {
-            counts: Arc::clone(self),
-            instance: instance.clone(),
+            connections: Arc::clone(self),
         })
     }
 
-    fn release(&self, instance: &PluginInstanceId) {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let remove = counts.get_mut(instance).is_some_and(|count| {
-            *count = count.saturating_sub(1);
-            *count == 0
-        });
-        if remove {
-            counts.remove(instance);
-        }
+    fn release(&self) {
+        let mut live = self.lock();
+        *live = live.saturating_sub(1);
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.live.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+fn instance_label(instance: &PluginInstanceId) -> String {
+    format!(
+        "{}:{:?}:{}",
+        instance.package(),
+        instance.capability(),
+        instance.binding()
+    )
 }
 
 // Dropping the authorized token returns capacity to the shared budget.
 struct ConnectionLease {
-    counts: Arc<ConnectionCounts>,
-    instance: PluginInstanceId,
+    connections: Arc<InstanceConnections>,
 }
 
 impl fmt::Debug for ConnectionLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionLease")
-            .field("instance", &self.instance)
-            .finish_non_exhaustive()
+        f.debug_struct("ConnectionLease").finish_non_exhaustive()
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        self.counts.release(&self.instance);
+        self.connections.release();
     }
 }
 
@@ -473,7 +408,6 @@ impl Drop for ConnectionLease {
 pub struct AuthorizedEgress {
     request: EgressRequest,
     destination: ResolvedDestination,
-    tls_profile: Option<TlsProfile>,
     _lease: ConnectionLease,
 }
 
@@ -484,45 +418,128 @@ impl AuthorizedEgress {
         &self.request
     }
 
-    /// Exact validated destination. Adapters must not resolve its host again.
+    /// Exact validated destination. Adapters must not resolve its host again;
+    /// use [`ResolvedDestination::host`] for SNI and certificate verification
+    /// and [`ResolvedDestination::addresses`] for the connect.
     #[must_use]
     pub fn destination(&self) -> &ResolvedDestination {
         &self.destination
     }
-
-    /// Selected named profile, or `None` for the implicit system-roots profile.
-    #[must_use]
-    pub fn tls_profile(&self) -> Option<&TlsProfile> {
-        self.tls_profile.as_ref()
-    }
 }
 
+/// Test-only stand-in for `tokio::net::lookup_host`.
+///
+/// A deterministic closure from a requested host and port to an address set,
+/// used only to model a resolver whose answer changes between calls (DNS
+/// rebinding) without depending on real DNS or resolver ordering. Production
+/// has no equivalent and never installs one.
+#[cfg(test)]
+type TestAddressResolver = Arc<dyn Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync>;
+
 /// Shared service injected into plugin stores and cloned across transports.
+///
+/// Policy is per service, because a service is built around one resolver.
+/// Connection accounting is not: it comes from the process-wide
+/// connection registry, so two services built independently for the same
+/// canonical instance spend one budget rather than one each.
 #[derive(Clone)]
 pub struct EgressHostService {
     resolver: EgressPolicyResolver,
-    counts: Arc<ConnectionCounts>,
+    connections: ConnectionRegistry,
+    /// Test-only DNS override. `None` in every production build (the field
+    /// does not exist there at all), so the resolve path stays the shipped
+    /// `lookup_host` call.
+    #[cfg(test)]
+    resolver_override: Option<TestAddressResolver>,
+}
+
+impl fmt::Debug for EgressHostService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EgressHostService").finish_non_exhaustive()
+    }
 }
 
 impl EgressHostService {
     /// Construct one service around a live canonical policy resolver.
+    ///
+    /// The connection budget it enforces is the process-wide one for each
+    /// instance it sees, so an operator's ceiling holds no matter how many tool
+    /// registries end up representing the same instance.
     #[must_use]
     pub fn new(resolver: EgressPolicyResolver) -> Self {
         Self {
             resolver,
-            counts: Arc::new(ConnectionCounts::default()),
+            connections: ConnectionRegistry::shared(),
+            #[cfg(test)]
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose connection accounting is private to it.
+    ///
+    /// Test-only. Tests share one process with the real registry, so a test
+    /// holding a lease would otherwise be able to exhaust another test's
+    /// ceiling. Tests that are *about* the sharing use
+    /// [`EgressHostService::new`] with an instance identity unique to that
+    /// test, which is the only way to observe the shared registry without
+    /// depending on what else is running.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_private_connection_accounting(resolver: EgressPolicyResolver) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose DNS resolution is replaced by a deterministic closure.
+    ///
+    /// Test-only. The override stands in for `tokio::net::lookup_host`, so a
+    /// test can pin one answer and then observe that a *different* later answer
+    /// is never dialed — the DNS-rebinding / TOCTOU property, made deterministic
+    /// and free of any dependence on resolver ordering. Accounting is private to
+    /// the caller for the same reason [`Self::with_private_connection_accounting`]
+    /// is. Production has no equivalent constructor and never sets the override.
+    ///
+    /// The gate matches the *caller's*: the only caller is in [`crate::wasi_http`]'s
+    /// tests, and that module exists only under `plugins-wasmtime`. A wider gate
+    /// makes this dead code on the default feature surface, which the `default
+    /// features, all targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    #[must_use]
+    pub(crate) fn with_test_resolver(
+        resolver: EgressPolicyResolver,
+        addresses: impl Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: Some(Arc::new(addresses)),
         }
     }
 
     /// Resolve DNS, apply current policy, pin the checked addresses, and reserve
     /// one shared connection slot for the request's logical instance.
     ///
+    /// This is the single resolution: the addresses in the returned
+    /// [`AuthorizedEgress`] are the only ones that may be dialed.
+    ///
     /// # Errors
     ///
-    /// Returns [`EgressError`] when policy resolution, DNS, address validation,
-    /// TLS-profile selection, or connection-budget acquisition fails.
+    /// Returns [`EgressError`] when the grant check, DNS, address validation,
+    /// or connection-budget acquisition fails.
     pub async fn authorize(&self, request: EgressRequest) -> Result<AuthorizedEgress, EgressError> {
-        let (policy, tls_profile) = self.resolve_policy(&request)?;
+        let policy = self.resolve_policy(&request)?;
+        // Test-only DNS override. Production never installs one, so under
+        // `not(test)` this block compiles to nothing and the resolution below is
+        // exactly the shipped `lookup_host` path. Under test it lets a case pin
+        // the first answer and prove a later, different answer is never dialed.
+        #[cfg(test)]
+        if let Some(resolver) = &self.resolver_override {
+            let addresses = resolver(request.host(), request.port());
+            return self.authorize_with_policy(request, addresses, &policy);
+        }
         let addresses = tokio::net::lookup_host((request.host(), request.port()))
             .await
             .map_err(|error| EgressError::DnsFailed {
@@ -531,7 +548,7 @@ impl EgressHostService {
                 reason: error.to_string(),
             })?
             .collect::<Vec<_>>();
-        self.authorize_with_policy(request, addresses, policy, tls_profile)
+        self.authorize_with_policy(request, addresses, &policy)
     }
 
     /// Apply current policy to an address set supplied by a resolver.
@@ -548,14 +565,28 @@ impl EgressHostService {
         request: EgressRequest,
         addresses: impl IntoIterator<Item = SocketAddr>,
     ) -> Result<AuthorizedEgress, EgressError> {
-        let (policy, tls_profile) = self.resolve_policy(&request)?;
-        self.authorize_with_policy(request, addresses, policy, tls_profile)
+        let policy = self.resolve_policy(&request)?;
+        self.authorize_with_policy(request, addresses, &policy)
     }
 
-    fn resolve_policy(
-        &self,
-        request: &EgressRequest,
-    ) -> Result<(EgressPolicy, Option<TlsProfile>), EgressError> {
+    /// Live connection count held for one instance.
+    ///
+    /// Test-only: the budget is observable in production solely through
+    /// [`EgressError::ConnectionLimitReached`], and adapters must not be able to
+    /// read or reset it. Tests that prove a failed dial returns its slot need to
+    /// see the count itself, not just that a later acquire happened to succeed.
+    ///
+    /// The gate matches the *caller's*, not just `test`: the only caller is in
+    /// [`crate::wasi_http`]'s tests, and that module exists only under
+    /// `plugins-wasmtime`. A wider gate makes this dead code on the default
+    /// feature surface, which is exactly what the `default features, all
+    /// targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
+        self.connections.live(instance)
+    }
+
+    fn resolve_policy(&self, request: &EgressRequest) -> Result<EgressPolicy, EgressError> {
         let permission = request.transport.required_permission();
         if !request.scope.grants().allows(permission) {
             return Err(EgressError::PermissionDenied {
@@ -564,52 +595,37 @@ impl EgressHostService {
             });
         }
         let policy = self.resolver.resolve(&request.scope)?;
-        if request.transport.permanently_plaintext() && !policy.plaintext_allowed(&request.host) {
-            return Err(EgressError::PlaintextDenied {
-                transport: request.transport,
+        if !policy.grants(&request.host) {
+            return Err(EgressError::DestinationNotGranted {
+                instance: instance_label(request.instance_id()),
                 host: request.host.clone(),
             });
         }
-        let tls_profile = if let Some(name) = request.tls_profile.as_ref() {
-            let profile = policy
-                .tls_profiles
-                .get(name)
-                .cloned()
-                .ok_or_else(|| EgressError::UnknownTlsProfile(name.as_str().to_string()))?;
-            if !profile.allows_host(&request.host) {
-                return Err(EgressError::TlsProfileHostDenied {
-                    profile: name.as_str().to_string(),
-                    host: request.host.clone(),
-                });
-            }
-            Some(profile)
-        } else {
-            None
-        };
-        Ok((policy, tls_profile))
+        Ok(policy)
     }
 
     fn authorize_with_policy(
         &self,
         request: EgressRequest,
         addresses: impl IntoIterator<Item = SocketAddr>,
-        policy: EgressPolicy,
-        tls_profile: Option<TlsProfile>,
+        policy: &EgressPolicy,
     ) -> Result<AuthorizedEgress, EgressError> {
-        let private_access = if policy.private_network_allowed(&request.host) {
-            PrivateNetworkAccess::Allow
-        } else {
-            PrivateNetworkAccess::Deny
-        };
-        let destination =
-            ResolvedDestination::new(&request.host, request.port, addresses, private_access)?;
+        let destination = ResolvedDestination::new(
+            &request.host,
+            request.port,
+            addresses,
+            policy.private_access(&request.host),
+            &policy.nat64_prefixes,
+        )?;
+        // The ceiling comes from the policy this request just resolved, never
+        // from a value cached alongside the count: an operator who lowers
+        // `max_connections_per_instance` binds the next connection.
         let lease = self
-            .counts
+            .connections
             .acquire(request.instance_id(), policy.max_connections_per_instance)?;
         Ok(AuthorizedEgress {
             request,
             destination,
-            tls_profile,
             _lease: lease,
         })
     }
@@ -629,6 +645,11 @@ pub enum StartTlsPhase {
 }
 
 /// Host-owned STARTTLS transition guard for one connection.
+///
+/// The downgrade this closes is the classic one: a negotiation that fails to
+/// upgrade, and an adapter that carries on in the clear because the connection
+/// is technically still usable. Once an upgrade begins, plaintext I/O is over
+/// whether or not the handshake succeeds.
 #[derive(Debug)]
 pub struct StartTlsState {
     phase: StartTlsPhase,
@@ -717,27 +738,16 @@ impl StartTlsState {
 /// Failure at the shared plugin egress boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
-    /// Host/address policy rejection.
+    /// Host/address policy rejection from the shared network guard.
     #[error("network destination rejected: {0}")]
     Network(#[from] NetworkGuardError),
-    /// Invalid exception pattern in canonical config.
-    #[error("invalid plugin egress host pattern: {0:?}")]
+    /// Invalid pattern in the canonical operator allowlist.
+    #[error("invalid plugin egress host pattern: {0}")]
     InvalidHostPattern(String),
-    /// Invalid top-level secret property reference.
-    #[error("invalid TLS secret property reference: {0:?}")]
-    InvalidSecretReference(String),
-    /// Invalid TLS profile slug.
-    #[error("invalid TLS profile name: {0:?}")]
-    InvalidTlsProfileName(String),
-    /// Incoherent TLS profile definition.
-    #[error("invalid TLS profile {profile:?}: {reason}")]
-    InvalidTlsProfile { profile: String, reason: String },
-    /// Duplicate name in the canonical TLS profile table.
-    #[error("duplicate TLS profile name: {0:?}")]
-    DuplicateTlsProfile(String),
-    /// A TLS profile has no destination binding.
-    #[error("TLS profile {0:?} must authorize at least one host pattern")]
-    TlsProfileWithoutHosts(String),
+    /// Invalid `security.nat64_prefixes` entry. Fails the policy closed rather
+    /// than quietly narrowing the validation boundary.
+    #[error("invalid NAT64 prefix configuration: {0}")]
+    InvalidNat64Prefix(String),
     /// A policy returned an unsafe zero connection ceiling.
     #[error("plugin max connections per instance must be greater than zero")]
     InvalidConnectionLimit,
@@ -747,21 +757,9 @@ pub enum EgressError {
         transport: EgressTransport,
         permission: PluginPermission,
     },
-    /// A permanently plaintext transport lacks an exact operator exception.
-    #[error("plaintext {transport} egress to {host:?} is not authorized")]
-    PlaintextDenied {
-        transport: EgressTransport,
-        host: String,
-    },
-    /// A plaintext transport attempted to select TLS metadata.
-    #[error("TLS profile cannot be selected for plaintext {0} egress")]
-    TlsProfileOnPlaintext(EgressTransport),
-    /// Requested named TLS profile does not exist.
-    #[error("unknown plugin TLS profile: {0:?}")]
-    UnknownTlsProfile(String),
-    /// Requested named TLS profile is not authorized for this destination.
-    #[error("plugin TLS profile {profile:?} is not authorized for host {host:?}")]
-    TlsProfileHostDenied { profile: String, host: String },
+    /// The destination is not in this instance's operator-granted allowlist.
+    #[error("plugin instance {instance} is not granted egress to {host:?}")]
+    DestinationNotGranted { instance: String, host: String },
     /// DNS resolution failed before policy could pin an address set.
     #[error("DNS resolution for {host}:{port} failed: {reason}")]
     DnsFailed {
@@ -785,13 +783,14 @@ pub enum EgressError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::{PluginCapability, PluginManifest, PluginPermission};
 
     use super::*;
 
-    fn scope_with_grants(
+    fn scope_in_package(
+        package: &str,
         binding: &str,
         grants: impl IntoIterator<Item = PluginPermission>,
     ) -> PluginInstanceScope {
@@ -801,169 +800,357 @@ mod tests {
             PluginPermission::SocketClient,
         ];
         let manifest = PluginManifest {
-            name: "egress-fixture".to_string(),
+            name: package.to_string(),
             version: "0.0.0-test".to_string(),
             description: None,
             author: None,
             wasm_path: None,
-            wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
             permissions,
             config_schema: None,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, grants)
             .unwrap()
     }
 
+    fn scope_with_grants(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        scope_in_package("egress-fixture", binding, grants)
+    }
+
+    fn all_grants() -> [PluginPermission; 3] {
+        [
+            PluginPermission::HttpClient,
+            PluginPermission::WebSocketClient,
+            PluginPermission::SocketClient,
+        ]
+    }
+
     fn scope(binding: &str) -> PluginInstanceScope {
-        scope_with_grants(
-            binding,
-            [
-                PluginPermission::HttpClient,
-                PluginPermission::WebSocketClient,
-                PluginPermission::SocketClient,
-            ],
-        )
+        scope_with_grants(binding, all_grants())
     }
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), port)
     }
 
+    fn owned(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    fn policy(hosts: &[&str], allow_private: &[&str], limit: usize) -> EgressPolicy {
+        EgressPolicy::new(&owned(hosts), &owned(allow_private), &[], limit).unwrap()
+    }
+
+    /// A service with accounting private to the test that built it.
+    ///
+    /// Everything below except the sharing regressions is about policy, and
+    /// policy is per service. Isolating the counts keeps concurrently running
+    /// tests from spending each other's ceilings through the process registry.
     fn service(policy: EgressPolicy) -> EgressHostService {
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+            move |_| Ok(policy.clone()),
+        ))
+    }
+
+    /// A service built exactly the way production builds one: bound to the
+    /// process-wide connection registry.
+    fn shared_service(policy: EgressPolicy) -> EgressHostService {
         EgressHostService::new(EgressPolicyResolver::new(move |_| Ok(policy.clone())))
     }
 
-    fn policy(private_hosts: &[&str], plaintext_hosts: &[&str], limit: usize) -> EgressPolicy {
-        EgressPolicy::new(
-            private_hosts.iter().map(|host| (*host).to_string()),
-            plaintext_hosts.iter().map(|host| (*host).to_string()),
-            [],
-            limit,
-        )
-        .unwrap()
+    fn request(binding: &str, transport: EgressTransport, host: &str, port: u16) -> EgressRequest {
+        EgressRequest::new(scope(binding), transport, host, port).unwrap()
     }
 
     #[test]
-    fn encrypted_public_egress_is_default_and_plaintext_is_exception_only() {
-        let service = service(policy(&[], &[], 2));
-        let secure = EgressRequest::new(
-            scope("main"),
+    fn an_ungranted_destination_is_denied_even_when_the_transport_is_granted() {
+        let service = service(policy(&["api.example.com"], &[], 2));
+        let granted = request(
+            "main",
             EgressTransport::Http { encrypted: true },
             "api.example.com",
             443,
-            None,
-        )
-        .unwrap();
+        );
         assert!(
             service
-                .authorize_addresses(secure, [addr("1.1.1.1", 443)])
+                .authorize_addresses(granted, [addr("1.1.1.1", 443)])
                 .is_ok()
         );
 
-        let plaintext = EgressRequest::new(
-            scope("main"),
-            EgressTransport::Tcp,
-            "irc.example.com",
-            6667,
-            None,
-        )
-        .unwrap();
+        let ungranted = request(
+            "main",
+            EgressTransport::Http { encrypted: true },
+            "other.example.com",
+            443,
+        );
         assert!(matches!(
-            service.authorize_addresses(plaintext, [addr("1.1.1.1", 6667)]),
-            Err(EgressError::PlaintextDenied { .. })
+            service.authorize_addresses(ungranted, [addr("1.1.1.1", 443)]),
+            Err(EgressError::DestinationNotGranted { .. })
         ));
     }
 
     #[test]
+    fn an_empty_allowlist_reaches_nothing() {
+        let service = service(EgressPolicy::deny_all(8).unwrap());
+        let anywhere = request(
+            "main",
+            EgressTransport::Http { encrypted: true },
+            "api.example.com",
+            443,
+        );
+        assert!(matches!(
+            service.authorize_addresses(anywhere, [addr("1.1.1.1", 443)]),
+            Err(EgressError::DestinationNotGranted { .. })
+        ));
+    }
+
+    /// The grant is per destination, and the strict grammar's apex/subdomain
+    /// asymmetry has to survive the trip through the request path.
+    #[test]
+    fn a_suffix_grant_does_not_authorize_its_apex() {
+        let service = service(policy(&["*.cdn.example.com"], &[], 2));
+        let subdomain = request(
+            "main",
+            EgressTransport::Http { encrypted: true },
+            "assets.cdn.example.com",
+            443,
+        );
+        assert!(
+            service
+                .authorize_addresses(subdomain, [addr("1.1.1.1", 443)])
+                .is_ok()
+        );
+
+        let apex = request(
+            "main",
+            EgressTransport::Http { encrypted: true },
+            "cdn.example.com",
+            443,
+        );
+        assert!(
+            matches!(
+                service.authorize_addresses(apex, [addr("1.1.1.1", 443)]),
+                Err(EgressError::DestinationNotGranted { .. })
+            ),
+            "a subdomain wildcard must not authorize its apex"
+        );
+    }
+
+    #[test]
     fn every_transport_is_rejected_without_its_effective_grant() {
-        let service = service(policy(&[], &["plain.example.com"], 8));
+        let service = service(policy(&["secure.example.com"], &[], 8));
         let cases = [
             (
                 EgressTransport::Http { encrypted: true },
-                "secure.example.com",
-                443,
                 PluginPermission::WebSocketClient,
                 PluginPermission::HttpClient,
             ),
             (
                 EgressTransport::WebSocket { encrypted: true },
-                "secure.example.com",
-                443,
                 PluginPermission::HttpClient,
                 PluginPermission::WebSocketClient,
             ),
             (
                 EgressTransport::Tls,
-                "secure.example.com",
-                443,
+                PluginPermission::HttpClient,
+                PluginPermission::SocketClient,
+            ),
+            (
+                EgressTransport::StartTls,
+                PluginPermission::HttpClient,
+                PluginPermission::SocketClient,
+            ),
+            (
+                EgressTransport::Tcp,
                 PluginPermission::HttpClient,
                 PluginPermission::SocketClient,
             ),
         ];
 
-        for (transport, host, port, wrong_grant, expected) in cases {
+        for (transport, wrong_grant, expected) in cases {
             let request = EgressRequest::new(
                 scope_with_grants("main", [wrong_grant]),
                 transport,
-                host,
-                port,
-                None,
+                "secure.example.com",
+                443,
             )
             .unwrap();
-            assert!(matches!(
-                service.authorize_addresses(request, [addr("1.1.1.1", port)]),
-                Err(EgressError::PermissionDenied { permission, .. }) if permission == expected
-            ));
+            assert!(
+                matches!(
+                    service.authorize_addresses(request, [addr("1.1.1.1", 443)]),
+                    Err(EgressError::PermissionDenied { permission, .. }) if permission == expected
+                ),
+                "{transport} must require {expected:?}"
+            );
         }
     }
 
+    /// The private carveout relaxes an address class for a granted host. It
+    /// never reaches metadata, and it never covers a host that was not granted.
     #[test]
-    fn private_exception_is_host_scoped_and_metadata_remains_blocked() {
-        let service = service(policy(&["*.internal.example"], &[], 2));
-        let allowed = EgressRequest::new(
-            scope("main"),
-            EgressTransport::Tls,
-            "mail.internal.example",
-            993,
-            None,
-        )
-        .unwrap();
+    fn private_carveout_is_host_scoped_and_metadata_remains_blocked() {
+        let service = service(policy(
+            &["*.internal.example", "metadata.internal.example"],
+            &["*.internal.example", "metadata.internal.example"],
+            4,
+        ));
+
+        let allowed = request("main", EgressTransport::Tls, "mail.internal.example", 993);
         assert!(
             service
                 .authorize_addresses(allowed, [addr("10.0.0.5", 993)])
                 .is_ok()
         );
 
-        let metadata = EgressRequest::new(
-            scope("main"),
+        let metadata = request(
+            "main",
             EgressTransport::Tls,
             "metadata.internal.example",
             443,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(
-            service.authorize_addresses(metadata, [addr("169.254.169.254", 443)]),
-            Err(EgressError::Network(NetworkGuardError::CloudMetadata(_)))
-        ));
-
-        let wildcard_apex = EgressRequest::new(
-            scope("main"),
-            EgressTransport::Tls,
-            "internal.example",
-            443,
-            None,
-        )
-        .unwrap();
-        assert!(
-            service
-                .authorize_addresses(wildcard_apex, [addr("10.0.0.6", 443)])
-                .is_err(),
-            "a subdomain wildcard must not authorize its apex"
         );
+        let error = service
+            .authorize_addresses(metadata, [addr("169.254.169.254", 443)])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(NetworkGuardError::CloudMetadata { .. })
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_granted_host_without_the_carveout_cannot_resolve_private() {
+        let service = service(policy(&["gitea.example.com"], &[], 2));
+        let request = request("main", EgressTransport::Tls, "gitea.example.com", 443);
+        let error = service
+            .authorize_addresses(request, [addr("10.0.0.5", 443)])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(NetworkGuardError::PrivateNetworkDenied { .. })
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The single-resolution contract: one mixed answer set is refused outright
+    /// rather than letting resolver order pick the trust zone.
+    #[test]
+    fn a_mixed_public_private_answer_set_is_refused() {
+        let service = service(policy(&["rebind.example.com"], &["rebind.example.com"], 2));
+        let request = request("main", EgressTransport::Tls, "rebind.example.com", 443);
+        let error = service
+            .authorize_addresses(request, [addr("1.1.1.1", 443), addr("10.0.0.5", 443)])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(NetworkGuardError::MixedAddressClasses)
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The pin. The authorized token must carry the exact addresses that were
+    /// validated, for a host that does not resolve at all — so an adapter (or a
+    /// regression) that reached for a second resolution could not proceed.
+    #[test]
+    fn the_authorized_destination_is_the_validated_address_set() {
+        let service = service(policy(&["pinned.invalid"], &[], 2));
+        let request = request("main", EgressTransport::Tls, "pinned.invalid", 443);
+        let authorized = service
+            .authorize_addresses(request, [addr("1.1.1.1", 443), addr("8.8.8.8", 443)])
+            .unwrap();
+        assert_eq!(authorized.destination().host(), "pinned.invalid");
+        assert_eq!(authorized.destination().port(), 443);
+        assert_eq!(
+            authorized.destination().addresses(),
+            [addr("1.1.1.1", 443), addr("8.8.8.8", 443)],
+            "the token must pin the validated answer set, not a fresh resolution"
+        );
+    }
+
+    /// A NAT64 translator declared in `security.nat64_prefixes` makes an
+    /// apparently-global IPv6 answer reach a private or metadata destination.
+    /// The foundation must classify through it exactly as the tool layer does.
+    #[test]
+    fn configured_nat64_translation_is_classified_on_the_foundation_path() {
+        let nat64 = owned(&["2001:67c:2b0:db32:0:1::/96"]);
+        let build = |allow_private: &[&str]| {
+            EgressPolicy::new(
+                &owned(&["translated.example.com"]),
+                &owned(allow_private),
+                &nat64,
+                4,
+            )
+            .unwrap()
+        };
+
+        // -> 10.0.0.5, which is private once the translator is declared.
+        let private_via_nat64 = addr("2001:67c:2b0:db32:0:1:a00:5", 443);
+        let error = service(build(&[]))
+            .authorize_addresses(
+                request("main", EgressTransport::Tls, "translated.example.com", 443),
+                [private_via_nat64],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(NetworkGuardError::PrivateNetworkDenied { .. })
+            ),
+            "unexpected error: {error}"
+        );
+
+        // -> 169.254.169.254, which the carveout must not re-open.
+        let metadata_via_nat64 = addr("2001:67c:2b0:db32:0:1:a9fe:a9fe", 443);
+        let error = service(build(&["translated.example.com"]))
+            .authorize_addresses(
+                request("main", EgressTransport::Tls, "translated.example.com", 443),
+                [metadata_via_nat64],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(NetworkGuardError::CloudMetadata { .. })
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A malformed prefix list must fail the policy closed rather than silently
+    /// disabling network-specific classification.
+    #[test]
+    fn a_malformed_nat64_prefix_list_fails_the_policy_closed() {
+        let error = EgressPolicy::new(
+            &owned(&["api.example.com"]),
+            &[],
+            &owned(&["2001:db8::/97"]),
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, EgressError::InvalidNat64Prefix(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_private_carveout_cannot_widen_an_exact_host_grant() {
+        let error = EgressPolicy::new(&owned(&["example.com"]), &owned(&["*.example.com"]), &[], 4)
+            .unwrap_err();
+        assert!(matches!(error, EgressError::InvalidHostPattern(_)));
+        assert!(error.to_string().contains("not granted by"));
     }
 
     #[test]
@@ -971,22 +1158,15 @@ mod tests {
         let allow_private = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&allow_private);
         let service = EgressHostService::new(EgressPolicyResolver::new(move |_| {
-            let hosts = flag
-                .load(Ordering::SeqCst)
-                .then(|| "internal.example".to_string())
-                .into_iter();
-            EgressPolicy::new(hosts, [], [], 2)
+            let hosts = owned(&["internal.example"]);
+            let private = if flag.load(Ordering::SeqCst) {
+                owned(&["internal.example"])
+            } else {
+                Vec::new()
+            };
+            EgressPolicy::new(&hosts, &private, &[], 2)
         }));
-        let request = || {
-            EgressRequest::new(
-                scope("main"),
-                EgressTransport::Tls,
-                "internal.example",
-                443,
-                None,
-            )
-            .unwrap()
-        };
+        let request = || request("main", EgressTransport::Tls, "internal.example", 443);
         assert!(
             service
                 .authorize_addresses(request(), [addr("10.0.0.2", 443)])
@@ -1002,52 +1182,124 @@ mod tests {
 
     #[test]
     fn one_budget_is_shared_by_instance_across_transports_and_store_clones() {
-        let service = service(policy(&[], &["irc.example.com"], 1));
+        let service = service(policy(&["mail.example.com", "irc.example.com"], &[], 1));
         let clone = service.clone();
-        let first = EgressRequest::new(
-            scope("shared"),
-            EgressTransport::Tls,
-            "mail.example.com",
-            993,
-            None,
-        )
-        .unwrap();
         let first = service
-            .authorize_addresses(first, [addr("1.1.1.1", 993)])
+            .authorize_addresses(
+                request("shared", EgressTransport::Tls, "mail.example.com", 993),
+                [addr("1.1.1.1", 993)],
+            )
             .unwrap();
-        let second = EgressRequest::new(
-            scope("shared"),
-            EgressTransport::Tcp,
-            "irc.example.com",
-            6667,
-            None,
-        )
-        .unwrap();
+        let second = || request("shared", EgressTransport::Tcp, "irc.example.com", 6667);
         assert!(matches!(
-            clone.authorize_addresses(second.clone(), [addr("1.1.1.1", 6667)]),
+            clone.authorize_addresses(second(), [addr("1.1.1.1", 6667)]),
             Err(EgressError::ConnectionLimitReached { limit: 1, .. })
         ));
         drop(first);
         assert!(
             clone
-                .authorize_addresses(second, [addr("1.1.1.1", 6667)])
+                .authorize_addresses(second(), [addr("1.1.1.1", 6667)])
                 .is_ok()
         );
     }
 
+    /// The sharing regression.
+    ///
+    /// Production never clones one service around the process. It builds a
+    /// fresh [`EgressHostService`] per `all_tools_with_runtime` call, and the
+    /// agent loop, the gateway, the channels orchestrator, and the delegate
+    /// tool each register the same canonical instance through a registry of
+    /// their own. When the count lived in the service, every one of those
+    /// registries handed that instance a full budget. These two services share
+    /// nothing but the instance identity.
     #[test]
-    fn budgets_are_isolated_by_canonical_instance_id() {
-        let service = service(policy(&[], &[], 1));
-        let authorize = |binding| {
+    fn one_budget_is_shared_by_services_built_independently_for_one_instance() {
+        // Packages unique to this test. The registry is process-wide, so the
+        // instance identity is what keeps the assertions deterministic under a
+        // parallel test runner.
+        const INSTANCE: &str = "egress-shared-ceiling-fixture";
+        const OTHER: &str = "egress-other-ceiling-fixture";
+
+        let granted = policy(&["api.example.com"], &[], 1);
+        let first_registry = shared_service(granted.clone());
+        let second_registry = shared_service(granted);
+
+        let authorize = |service: &EgressHostService, package: &str| {
             let request = EgressRequest::new(
-                scope(binding),
+                scope_in_package(package, "main", all_grants()),
                 EgressTransport::Tls,
                 "api.example.com",
                 443,
-                None,
             )
             .unwrap();
             service.authorize_addresses(request, [addr("1.1.1.1", 443)])
+        };
+
+        let held = authorize(&first_registry, INSTANCE).unwrap();
+        assert!(
+            matches!(
+                authorize(&second_registry, INSTANCE),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a second registry must not grant the same instance a second budget"
+        );
+        assert!(
+            authorize(&second_registry, OTHER).is_ok(),
+            "the ceiling is shared per instance, not seized process-wide"
+        );
+
+        drop(held);
+        assert!(
+            authorize(&second_registry, INSTANCE).is_ok(),
+            "a slot released in one registry must come back in every registry"
+        );
+    }
+
+    /// The count is shared; the ceiling it is compared against is not cached
+    /// with it. An operator who lowers `max_connections_per_instance` binds the
+    /// next connection rather than the next restart.
+    #[test]
+    fn the_connection_ceiling_is_re_read_from_policy_on_every_acquire() {
+        let ceiling = Arc::new(AtomicUsize::new(2));
+        let configured = Arc::clone(&ceiling);
+        let service = EgressHostService::with_private_connection_accounting(
+            EgressPolicyResolver::new(move |_| {
+                EgressPolicy::new(
+                    &owned(&["api.example.com"]),
+                    &[],
+                    &[],
+                    configured.load(Ordering::SeqCst),
+                )
+            }),
+        );
+        let authorize = || {
+            service.authorize_addresses(
+                request("main", EgressTransport::Tls, "api.example.com", 443),
+                [addr("1.1.1.1", 443)],
+            )
+        };
+
+        let held = authorize().unwrap();
+        ceiling.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(
+                authorize(),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a lowered ceiling must bind the next acquire"
+        );
+        drop(held);
+        assert!(authorize().is_ok());
+    }
+
+    #[test]
+    fn budgets_are_isolated_by_canonical_instance_id() {
+        let service = service(policy(&["api.example.com"], &[], 1));
+        let authorize = |binding| {
+            service.authorize_addresses(
+                request(binding, EgressTransport::Tls, "api.example.com", 443),
+                [addr("1.1.1.1", 443)],
+            )
         };
         let main = authorize("main").unwrap();
         let backup = authorize("backup").unwrap();
@@ -1055,49 +1307,24 @@ mod tests {
     }
 
     #[test]
-    fn tls_profiles_hold_only_same_instance_secret_property_references() {
-        let profile = TlsProfile::new(
-            TlsProfileName::new("corporate-mtls").unwrap(),
-            ["api.example.com".to_string()],
-            true,
-            Some(SecretPropertyRef::parse("corporate_ca_pem").unwrap()),
-            Some(TlsClientIdentity::new(
-                SecretPropertyRef::parse("client_cert_pem").unwrap(),
-                SecretPropertyRef::parse("client_key_pem").unwrap(),
-            )),
-        )
-        .unwrap();
-        let policy = EgressPolicy::new([], [], [profile], 2).unwrap();
-        let service = service(policy);
-        let request = EgressRequest::new(
-            scope("main"),
-            EgressTransport::Tls,
-            "api.example.com",
-            443,
-            Some("corporate-mtls"),
-        )
-        .unwrap();
-        let authorized = service
-            .authorize_addresses(request, [addr("1.1.1.1", 443)])
-            .unwrap();
-        let selected = authorized.tls_profile().unwrap();
-        assert_eq!(selected.custom_ca().unwrap().as_str(), "corporate_ca_pem");
-        assert_eq!(
-            selected.client_identity().unwrap().private_key().as_str(),
-            "client_key_pem"
-        );
-
-        let wrong_host = EgressRequest::new(
-            scope("main"),
-            EgressTransport::Tls,
-            "attacker.example",
-            443,
-            Some("corporate-mtls"),
-        )
-        .unwrap();
+    fn a_zero_connection_ceiling_is_refused_at_policy_construction() {
         assert!(matches!(
-            service.authorize_addresses(wrong_host, [addr("1.1.1.1", 443)]),
-            Err(EgressError::TlsProfileHostDenied { .. })
+            EgressPolicy::deny_all(0),
+            Err(EgressError::InvalidConnectionLimit)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_request_host_or_port_is_refused_before_policy_runs() {
+        for host in ["https://api.example.com", "api.example.com:8443", ""] {
+            assert!(
+                EgressRequest::new(scope("main"), EgressTransport::Tls, host, 443).is_err(),
+                "{host:?} must not become a request host"
+            );
+        }
+        assert!(matches!(
+            EgressRequest::new(scope("main"), EgressTransport::Tls, "api.example.com", 0),
+            Err(EgressError::Network(NetworkGuardError::InvalidPort))
         ));
     }
 
@@ -1111,17 +1338,58 @@ mod tests {
         state.fail_upgrade().unwrap();
         assert_eq!(state.phase(), StartTlsPhase::Failed);
         assert!(state.begin_upgrade().is_err());
+        assert!(!state.plaintext_negotiation_allowed());
         assert!(!state.application_io_allowed());
     }
 
     #[test]
     fn starttls_allows_application_io_only_after_success() {
         let mut state = StartTlsState::new();
+        assert!(!state.application_io_allowed());
         state.begin_upgrade().unwrap();
+        assert!(!state.application_io_allowed());
         state.complete_upgrade().unwrap();
         assert_eq!(state.phase(), StartTlsPhase::Secured);
         assert!(state.application_io_allowed());
         assert!(!state.plaintext_negotiation_allowed());
         assert!(state.fail_upgrade().is_err());
+    }
+
+    /// The async entry point performs the one resolution itself. `localhost`
+    /// resolves without a network round trip, so this stays deterministic.
+    #[tokio::test]
+    async fn authorize_resolves_once_and_pins_what_it_resolved() {
+        let service = service(policy(&["localhost"], &["localhost"], 2));
+        let authorized = service
+            .authorize(request("main", EgressTransport::Tls, "localhost", 443))
+            .await
+            .unwrap();
+        assert_eq!(authorized.destination().host(), "localhost");
+        assert!(
+            !authorized.destination().addresses().is_empty(),
+            "the pin must carry the addresses the service resolved"
+        );
+        assert!(
+            authorized
+                .destination()
+                .addresses()
+                .iter()
+                .all(|address| address.ip().is_loopback() && address.port() == 443),
+            "got: {:?}",
+            authorized.destination().addresses()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_checks_the_grant_before_it_resolves_anything() {
+        let service = service(EgressPolicy::deny_all(2).unwrap());
+        let error = service
+            .authorize(request("main", EgressTransport::Tls, "localhost", 443))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, EgressError::DestinationNotGranted { .. }),
+            "unexpected error: {error}"
+        );
     }
 }

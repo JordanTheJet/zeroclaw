@@ -438,12 +438,12 @@ capabilities = ["tool"]
             description: None,
             author: None,
             wasm_path: None,
-            wasm_sha256: None,
             capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
             permissions: Vec::new(),
             config_schema: None,
             signature: None,
             publisher_key: None,
+            egress: zeroclaw::plugins::PluginEgressDeclaration::default(),
         };
 
         assert!(verify_manifest_matches_registry(&entry, &manifest).is_err());

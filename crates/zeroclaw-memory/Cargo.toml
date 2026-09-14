@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Memory backends, embeddings, consolidation, and retrieval for ZeroClaw."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
@@ -27,7 +29,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 
 [features]
-memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
+memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres", "tokio/rt"]
 
 [dev-dependencies]
 filetime = "0.2"

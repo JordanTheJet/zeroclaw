@@ -4,6 +4,11 @@
 //! host-resolved route, one host-stamped envelope, and one acknowledgement.
 //! Canonical configuration and ownership stay outside this module and are
 //! resolved before the request is enqueued.
+//!
+//! The acknowledgement means the shared dispatcher ADMITTED the event: the
+//! route was still live, its agent owner was still active, and the message
+//! entered the same control stage every native inbound message passes through.
+//! It is not a delivery or completion receipt for the resulting turn.
 
 use std::sync::Arc;
 
@@ -120,12 +125,12 @@ mod tests {
             description: None,
             author: None,
             wasm_path: None,
-            wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
             permissions: Vec::new(),
             config_schema: None,
             signature: None,
             publisher_key: None,
+            egress: zeroclaw_plugins::PluginEgressDeclaration::default(),
         };
         let scope =
             PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, "main", [])

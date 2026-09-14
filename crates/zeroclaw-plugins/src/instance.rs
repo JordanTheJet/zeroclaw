@@ -246,6 +246,12 @@ impl PluginInstanceScope {
 
 /// Validate the package-name grammar once for both manifest admission and
 /// runtime instance construction.
+///
+/// The grammar itself lives in `zeroclaw_api::plugin`, which configuration
+/// validation already calls. Delegating here rather than restating the rule
+/// keeps the config side and the manifest side on one spelling: a declaration
+/// that passes config validation cannot fail to match an admitted package
+/// because the two definitions drifted.
 pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
     zeroclaw_api::plugin::validate_plugin_package_name(name).map_err(|error| error.to_string())
 }
@@ -277,12 +283,12 @@ fn test_manifest(
         description: None,
         author: None,
         wasm_path: Some("plugin.wasm".to_string()),
-        wasm_sha256: None,
         capabilities: vec![capability],
         permissions,
         config_schema: None,
         signature: None,
         publisher_key: None,
+        egress: crate::PluginEgressDeclaration::default(),
     }
 }
 

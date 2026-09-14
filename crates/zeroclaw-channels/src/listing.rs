@@ -193,6 +193,9 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),
     },
+    // Plugin channels have no `channel-*` feature of their own: whether they
+    // can run is decided by the runtime crate's WASM plugin support, so this
+    // row defers to that single source rather than restating the condition.
     ChannelCompileSpec {
         schema_name: Some("Plugin"),
         type_keys: &["plugin"],
@@ -204,6 +207,14 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-acp-server"),
     },
 ];
+
+#[cfg(test)]
+pub(crate) fn channel_compile_specs_for_tests()
+-> impl Iterator<Item = (Option<&'static str>, &'static [&'static str], bool)> {
+    CHANNEL_COMPILE_SPECS
+        .iter()
+        .map(|spec| (spec.schema_name, spec.type_keys, spec.compiled))
+}
 
 fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
     CHANNEL_COMPILE_SPECS
@@ -361,7 +372,9 @@ mod tests {
         assert_eq!(names.contains("Slack"), !cfg!(feature = "channel-slack"));
         assert_eq!(
             names.contains("Plugin"),
-            !zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED
+            !zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+            "a configured plugin channel must be reported when this build \
+             cannot execute WASM plugins"
         );
     }
 

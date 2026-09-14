@@ -164,6 +164,57 @@ api_key = "sk-cc-v2-test"
 }
 
 #[test]
+fn openai_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai-chat]
+api_key = "sk-oc-v2-test"
+uri = "http://127.0.0.1:8002/v1"
+model = "coder"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    let entry = model_providers
+        .get("openai")
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("openai-chat folded under providers.models.openai.default");
+    assert_eq!(
+        entry.get("uri").and_then(toml::Value::as_str),
+        Some("http://127.0.0.1:8002/v1")
+    );
+    assert!(
+        !model_providers.contains_key("openai-chat"),
+        "standalone openai-chat provider must not appear in V3"
+    );
+}
+
+#[test]
+fn openai_underscore_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai_chat]
+api_key = "sk-ocu-v2-test"
+uri = "http://127.0.0.1:8006/v1"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    assert!(
+        model_providers
+            .get("openai")
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("default"))
+            .is_some(),
+        "openai_chat folded under providers.models.openai.default"
+    );
+}
+
+#[test]
 fn v1_model_routes_preserved_at_providers_level() {
     let cfg = v3_config();
     assert!(
@@ -2075,6 +2126,59 @@ fn generate_every_version_migrates_and_validates() {
         });
         cfg.validate()
             .unwrap_or_else(|e| panic!("generate({target}) output fails Config::validate: {e:#}"));
+    }
+}
+
+#[test]
+fn retired_node_transport_is_removed_when_v1_or_v2_migrates_to_current() {
+    let cases = [
+        (
+            "v1",
+            r#"[node_transport]
+shared_secret = "v1-retired-secret"
+"#,
+        ),
+        (
+            "v2",
+            r#"schema_version = 2
+
+[node_transport]
+shared_secret = "v2-retired-secret"
+"#,
+        ),
+    ];
+
+    for (name, raw) in cases {
+        let migrated = migrate_file(raw)
+            .unwrap_or_else(|error| panic!("{name} migration failed: {error:#}"))
+            .unwrap_or_else(|| panic!("{name} input should require migration"));
+        let root = migrated
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("{name} migrated TOML failed to parse: {error}"));
+        assert!(
+            !root.contains_key("node_transport"),
+            "{name} migration must remove the retired section: {migrated}"
+        );
+        assert!(
+            !migrated.contains("retired-secret"),
+            "{name} migration must not preserve the retired secret: {migrated}"
+        );
+    }
+}
+
+#[test]
+fn retired_node_transport_is_historical_v1_only_in_generated_config() {
+    for target in 1..=CURRENT_SCHEMA_VERSION {
+        let raw = generate(target, &GenerateOptions::default())
+            .unwrap_or_else(|error| panic!("generate({target}) failed: {error:#}"));
+        let root = raw
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("generate({target}) did not parse: {error}"));
+        assert_eq!(
+            root.contains_key("node_transport"),
+            target == 1,
+            "only historical V1 generation may retain node_transport"
+        );
     }
 }
 

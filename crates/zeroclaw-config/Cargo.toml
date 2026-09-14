@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Configuration schema, secrets, and related types for ZeroClaw."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
+# `plugins.entries[].egress_hosts` validates against the one shared egress
+# grammar in `zeroclaw_infra::net_guard`. Reimplementing the grammar here would
+# give a security-relevant rule two definitions that can drift apart.
+zeroclaw-infra.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "derive"] }
 # OnboardUi needs dyn-compat; native AFIT isn't dyn-safe. Already built for api/channels/runtime.
@@ -19,8 +25,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 directories = "6.0"
 hex = "0.4"
 hostname = "0.4.2"
-hmac.workspace = true
-zeroize.workspace = true
 parking_lot = "0.12"
 postgres = { version = "0.19", default-features = false, features = ["with-chrono-0_4"], optional = true }
 rand = "0.10"
@@ -46,6 +50,12 @@ url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
@@ -54,6 +64,9 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 # schema-export and clap are the only defaults. All channel schema types
 # compile unconditionally; channel feature flags live in zeroclaw-channels only.
 default = ["schema-export", "clap"]
-schema-export = ["dep:schemars"]
+schema-export = ["dep:schemars", "zeroclaw-api/schema-export"]
 clap = ["dep:clap"]
 memory-postgres = ["dep:postgres"]
+# Test-only fault-injection hooks (post-replace sync failure). Enabled by
+# downstream dev-dependencies only; never by a production dependency.
+test-helpers = []

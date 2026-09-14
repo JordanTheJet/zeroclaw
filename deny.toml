@@ -51,6 +51,9 @@ unused-allowed-license = "allow"
 # remove skips as dependency bumps resolve them.
 multiple-versions = "deny"
 wildcards = "deny"
+deny = [
+    { crate = "lru:<0.18.2", wrappers = ["nostr-database", "nostr-relay-pool"], reason = "RUSTSEC-2026-0253; temporary Nostr cache exception tracked in #9602" },
+]
 
 # Pre-existing duplicate-version crates as of 2026-07-01.
 # Each skip entry removes one specific duplicate version from the
@@ -82,6 +85,11 @@ version = "=2.5.3"
 [[bans.skip]]
 name = "foldhash"
 version = "=0.1.5"
+
+[[bans.skip]]
+name = "lru"
+version = "=0.16.4"
+reason = "temporary Nostr 0.44 duplicate tracked in #9602"
 
 [[bans.skip]]
 name = "getrandom"
@@ -138,6 +146,11 @@ version = "=0.27.2"
 [[bans.skip]]
 name = "strum_macros"
 version = "=0.27.2"
+
+[[bans.skip]]
+name = "syn"
+version = "=2.0.117"
+reason = "whatsapp-rust 0.7 requires async-trait >=0.1.91 (syn 3); existing proc macros still require syn 2"
 
 [[bans.skip]]
 name = "thiserror"

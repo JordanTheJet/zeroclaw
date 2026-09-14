@@ -38,21 +38,21 @@ one.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
    containing a `manifest.toml`.
-3. **Validate shape.** Each manifest must declare at least one capability, its
-   package directory must match its canonical name, and a non-skill plugin must
-   name a confined relative `wasm_path`. Traversal and symlink paths are
-   rejected. A malformed manifest is skipped with a warning, never loaded.
+3. **Validate shape.** Each manifest must declare at least one capability, and a
+   non-skill plugin must name a `wasm_path` that exists. A malformed manifest is
+   skipped with a warning, never loaded.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
-5. **Admit executable bytes.** The host opens the confined component once,
-   verifies any declared `wasm_sha256`, and retains those exact bytes. In
-   `strict` mode the signed manifest must declare this digest. Adapters compile
-   the admitted buffer rather than reopening its path.
-6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
+5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. Tool dispatch resolves names first-match, so a
    plugin tool that collides with a built-in name is never selected; give plugin
-   tools unique names.
+   tools unique names. Tool and skill plugins are *auto-discovered*, so this
+   enumeration happens only when `[plugins] auto_discover = true` (default
+   `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
+   plugin tools or skills load, though channels you declare under
+   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
+   `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -71,11 +71,11 @@ signature is enforced through `[plugins.security] signature_mode`:
 
 In `strict` mode the manifest's `publisher_key` must appear in
 `[plugins.security] trusted_publisher_keys`, and the signature must verify
-against the canonical manifest bytes. Executable plugins must also declare a
-signed `wasm_sha256` matching the exact admitted bytes. A plugin that fails any
-of these checks is dropped at discovery and never becomes a tool. The default
-is `disabled` so a fresh local checkout works without key management, but a
-host that loads plugins from anywhere you do not control should run `strict`.
+against the canonical manifest bytes. A plugin that is unsigned, signed by an
+untrusted key, or whose signature does not verify is dropped at discovery and
+never becomes a tool. The default is `disabled` so a fresh local checkout works
+without key management, but a host that loads plugins from anywhere you do not
+control should run `strict`.
 
 This policy is enforced uniformly: the same check that the host applies when you
 list plugins is the check the agent runtime applies when it builds the tool set,
@@ -110,6 +110,10 @@ config surface (zerocode, the gateway, or the CLI):
 # Master switch. Nothing loads while this is false.
 zeroclaw config set plugins.enabled true
 
+# Load auto-discovered tool and skill plugins at runtime (default: false).
+# Without this, `enabled = true` activates only explicitly-declared channels.
+zeroclaw config set plugins.auto_discover true
+
 # Where plugins are discovered (default: ~/.zeroclaw/plugins).
 zeroclaw config set plugins.plugins_dir ~/.zeroclaw/plugins
 
@@ -121,8 +125,11 @@ zeroclaw config set plugins.security.trusted_publisher_keys '["a1b2c3d4e5f6..."]
 ```
 
 A host meant to load third-party plugins should set `enabled = true`,
-`signature_mode = "strict"`, and list only the publisher keys you trust. A host
-that runs only plugins you build yourself can leave `signature_mode` at its
+`signature_mode = "strict"`, and list only the publisher keys you trust. To load
+auto-discovered tool and skill plugins as well, also set `auto_discover = true`;
+it is `false` by default, so `enabled = true` alone activates only the channels
+you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
+host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
 
 ## What a plugin still cannot do

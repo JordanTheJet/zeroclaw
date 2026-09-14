@@ -47,10 +47,15 @@ cargo mdbook check                       # validate .po format (run before a tra
 
 | Tool | Install |
 |---|---|
-| [`mdbook`](https://rust-lang.github.io/mdBook/) | `cargo install mdbook --locked` |
+| [`mdbook`](https://rust-lang.github.io/mdBook/) | `cargo install mdbook --version 0.5.4 --locked` |
+| [`mdbook-mermaid`](https://github.com/badboy/mdbook-mermaid) | `cargo install mdbook-mermaid --version 0.17.1` |
 | [`mdbook-i18n-helpers`](https://github.com/google/mdbook-i18n-helpers) | `cargo install mdbook-i18n-helpers --locked` |
 | `cargo` | <https://rustup.rs> |
 | `gettext` (msgfmt, msgmerge) | `apt install gettext` / `brew install gettext` |
+
+The `mdbook-mermaid` version is pinned, but its published lockfile still
+selects the mdBook 0.5.0 preprocessor. Leave off `--locked` for that tool so
+Cargo resolves the compatible 0.5.x preprocessor used by mdBook 0.5.4.
 
 ## What gets built where
 
@@ -59,6 +64,6 @@ cargo mdbook check                       # validate .po format (run before a tra
 | `docs/book/src/**/*.md` (hand-written) | `docs/book/book/<locale>/` | `mdbook build` |
 | `docs/book/src/reference/cli.md` | (same path; **gitignored**) | `cargo mdbook refs` |
 | `docs/book/src/reference/config.md` | (same path; **gitignored**) | `cargo mdbook refs` |
-| `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace` |
+| `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` |
 
 The two `reference/*.md` files are generated from the actual `clap` derives and JSON schema in the code, never edit them by hand. Edit the `///` doc comments on the relevant Rust types instead.

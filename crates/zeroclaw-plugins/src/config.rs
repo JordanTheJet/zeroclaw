@@ -13,9 +13,6 @@ use std::sync::Arc;
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use serde_json::Map;
 use serde_json::Value;
-use zeroclaw_api::plugin_key::SecretPropertyRef;
-#[cfg(any(feature = "plugins-wasmtime", test))]
-use zeroize::Zeroizing;
 
 use crate::error::PluginError;
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -24,7 +21,51 @@ use crate::{PluginCapability, PluginManifest, PluginPermission};
 
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
+/// Keep admission-time validator compilation bounded for wide object schemas.
+const MAX_SCHEMA_PROPERTIES: usize = 256;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// Ceiling on one compiled `pattern` program, in bytes.
+///
+/// A bounded repetition expands into program proportional to its bound, and
+/// that expansion is paid at *compile* time. Since `resolve_plugin_config_from`
+/// recompiles the schema on every resolution, an expensive pattern is not a
+/// one-off admission cost, it is a per-call cost on the host thread. The
+/// engine's own default ceiling is 10 MiB, which is high enough that a
+/// max-size schema packed with `^[\s\S]{0,8000}$` properties takes tens of
+/// seconds to compile - each and every time it resolves.
+///
+/// 256 KiB was chosen against measurement: it admits the structural patterns
+/// operator config actually uses (slugs, UUIDs, emails, URLs, bounded
+/// free text up to a few hundred characters) while refusing the
+/// large-repetition forms in about a millisecond. Length bounds belong in
+/// `maxLength`, which costs nothing to check, not in a repetition count.
+const MAX_PATTERN_SIZE_BYTES: usize = 256 * 1024;
+
+/// Ceiling on the lazy-DFA transition cache one compiled pattern may hold.
+///
+/// Unlike [`MAX_PATTERN_SIZE_BYTES`] this is a cache capacity, not a
+/// correctness bound - exceeding it costs cache churn, never a wrong answer -
+/// so it only caps steady-state memory per admitted plugin.
+const MAX_PATTERN_DFA_BYTES: usize = 1024 * 1024;
+
+/// Root keywords that admit properties by pattern or constraint instead of by
+/// name.
+///
+/// The dialect is deliberately *enumerable*: `resolve_plugin_config_from`
+/// materializes an operator value only when the root `properties` map names its
+/// key. A schema whose keys are admitted solely by one of these keywords
+/// therefore passes admission and validation while every one of those keys is
+/// unreachable - the plugin author sees an accepted contract the host never
+/// honours. Reject at admission and name the keyword instead.
+///
+/// `additionalProperties` is absent by design: the root check below already
+/// pins it to exactly `false`, which rejects the schema-object form too.
+const DYNAMIC_KEY_KEYWORDS: [&str; 3] = [
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+];
 
 /// A typed, validated per-use view of one plugin's canonical config section.
 ///
@@ -34,7 +75,7 @@ const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
     public_json: Value,
-    secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
+    secrets: HashMap<String, String>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -42,7 +83,7 @@ impl ResolvedPluginConfig {
     fn new(
         scope: &PluginInstanceScope,
         public_json: Value,
-        secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
+        secrets: HashMap<String, String>,
     ) -> Self {
         Self {
             scope: scope.clone(),
@@ -60,15 +101,7 @@ impl ResolvedPluginConfig {
     /// Borrow one schema-designated secret for an immediate host-mediated use.
     #[must_use]
     pub(crate) fn secret(&self, name: &str) -> Option<&str> {
-        SecretPropertyRef::parse(name)
-            .ok()
-            .and_then(|reference| self.secret_ref(&reference))
-    }
-
-    /// Borrow one secret through the canonical portable reference type.
-    #[must_use]
-    pub(crate) fn secret_ref(&self, reference: &SecretPropertyRef) -> Option<&str> {
-        self.secrets.get(reference).map(|secret| secret.as_str())
+        self.secrets.get(name).map(String::as_str)
     }
 
     /// Reject pairing this materialized view with another admission decision.
@@ -129,6 +162,45 @@ pub fn validate_manifest_config(manifest: &PluginManifest) -> Result<(), PluginE
     compile_manifest_config(manifest).map(drop)
 }
 
+/// The single set of compiler options every manifest schema is built with.
+///
+/// A `config_schema` is untrusted input: it ships inside the plugin package,
+/// the default install mode does not require a signature, and
+/// `resolve_plugin_config_from` recompiles and revalidates it on *every*
+/// resolution. All of that regex work runs on the host thread, outside the
+/// guest's fuel budget, so whatever a `pattern` costs, the host pays it
+/// repeatedly.
+///
+/// Two bounds apply, and they cover different halves of the cost:
+///
+/// - [`MAX_PATTERN_SIZE_BYTES`] bounds *compile* time, which measurement shows
+///   is the dominant term. It is the reason a schema cannot make resolution
+///   take tens of seconds.
+/// - The `regex` engine bounds *match* time. It is linear in the length of the
+///   value for every pattern it accepts, so no operator value can trigger
+///   super-linear matching. The default `fancy-regex` engine caps backtracking
+///   rather than forbidding it, which leaves a real but much smaller
+///   per-match amplification.
+///
+/// The narrower dialect is the deliberate trade. `regex` rejects
+/// backreferences and look-around, which `fancy-regex` accepts, so a manifest
+/// using them now fails to compile. That is fail-closed: the rejection travels
+/// the existing `InvalidManifest` path in `compile_manifest_config`, so
+/// admission refuses the package rather than admitting a validator whose cost
+/// the host cannot predict. Both limits are documented alongside the other
+/// schema limits in `docs/book/src/plugins/migrating-to-typed-config.md`.
+///
+/// Every validator built from a manifest schema must come from here; building
+/// one with `jsonschema::draft202012::new` would restore the default engine
+/// and the default 10 MiB program ceiling.
+fn manifest_schema_options<'a>() -> jsonschema::ValidationOptions<'a> {
+    jsonschema::draft202012::options().with_pattern_options(
+        jsonschema::PatternOptions::regex()
+            .size_limit(MAX_PATTERN_SIZE_BYTES)
+            .dfa_size_limit(MAX_PATTERN_DFA_BYTES),
+    )
+}
+
 fn compile_manifest_config(
     manifest: &PluginManifest,
 ) -> Result<Option<jsonschema::Validator>, PluginError> {
@@ -186,6 +258,17 @@ fn compile_manifest_config(
             manifest.name
         )));
     }
+    if let Some(keyword) = DYNAMIC_KEY_KEYWORDS
+        .into_iter()
+        .find(|keyword| schema.get(*keyword).is_some())
+    {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema must not declare '{keyword}' at the root; config values \
+             are materialized only for keys named in the properties map, so keys admitted by \
+             '{keyword}' would never reach the plugin",
+            manifest.name
+        )));
+    }
     if schema
         .get("$schema")
         .and_then(Value::as_str)
@@ -197,14 +280,6 @@ fn compile_manifest_config(
         )));
     }
 
-    let validator = jsonschema::draft202012::new(schema).map_err(|error| {
-        invalid_manifest(format!(
-            "plugin '{}' config_schema cannot be compiled: {}",
-            manifest.name,
-            error.masked()
-        ))
-    })?;
-
     let properties = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -214,6 +289,22 @@ fn compile_manifest_config(
                 manifest.name
             ))
         })?;
+    if properties.len() > MAX_SCHEMA_PROPERTIES {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema declares {} root properties, exceeding the maximum of {MAX_SCHEMA_PROPERTIES}",
+            manifest.name,
+            properties.len()
+        )));
+    }
+
+    let validator = manifest_schema_options().build(schema).map_err(|error| {
+        invalid_manifest(format!(
+            "plugin '{}' config_schema cannot be compiled: {}",
+            manifest.name,
+            error.masked()
+        ))
+    })?;
+
     for (name, property) in properties {
         let kind = property_type(schema, property).map_err(|message| {
             invalid_manifest(format!(
@@ -224,12 +315,6 @@ fn compile_manifest_config(
         if is_secret_property(property) && !matches!(kind, PropertyKind::String) {
             return Err(invalid_manifest(format!(
                 "plugin '{}' config_schema property '{name}' marks x-secret but does not resolve to type string",
-                manifest.name
-            )));
-        }
-        if is_secret_property(property) && SecretPropertyRef::parse(name.clone()).is_err() {
-            return Err(invalid_manifest(format!(
-                "plugin '{}' config_schema secret property '{name}' is not a portable top-level property reference",
                 manifest.name
             )));
         }
@@ -355,13 +440,7 @@ pub fn resolve_plugin_config_from(
                     manifest.name
                 )));
             };
-            let reference = SecretPropertyRef::parse(name).map_err(|_| {
-                PluginError::InvalidConfig(format!(
-                    "plugin '{}' resolved secret property is not portable",
-                    manifest.name
-                ))
-            })?;
-            secrets.insert(reference, Zeroizing::new(secret));
+            secrets.insert(name, secret);
         } else {
             public.insert(name, value);
         }
@@ -629,7 +708,6 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
-            wasm_sha256: None,
             capabilities: vec![PluginCapability::Tool],
             permissions: requests_config
                 .then_some(PluginPermission::ConfigRead)
@@ -638,6 +716,7 @@ mod tests {
             config_schema: schema,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 
@@ -675,6 +754,222 @@ mod tests {
             ));
         }
         assert!(validate_manifest_config(&manifest(Some(schema), true)).is_ok());
+    }
+
+    /// A schema whose keys exist only under a dynamic-key keyword is an
+    /// accepted-contract trap: admission and validation both pass, but
+    /// resolution walks the root `properties` map, so none of those keys is
+    /// ever materialized for the guest. Admission must refuse it and say which
+    /// keyword is at fault.
+    #[test]
+    fn root_dynamic_key_keywords_are_rejected_at_admission() {
+        for (keyword, value) in [
+            ("patternProperties", json!({"^x-": {"type": "string"}})),
+            ("propertyNames", json!({"pattern": "^x-"})),
+            ("unevaluatedProperties", json!(false)),
+        ] {
+            let mut schema = object_schema(json!({"label": {"type": "string"}}));
+            schema[keyword] = value;
+
+            let error = validate_manifest_config(&manifest(Some(schema), true))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a root '{keyword}' schema must be refused at admission; admitting it \
+                         hands the author a contract whose keys can never be resolved"
+                    )
+                });
+            assert!(
+                matches!(error, PluginError::InvalidManifest(_)),
+                "a dynamic-key schema is a manifest defect, not a config defect: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(keyword),
+                "the admission error must name the offending keyword so the author can find \
+                 it; got {error}"
+            );
+        }
+    }
+
+    /// The refusal is about the manifest alone, so it must not quote the
+    /// operator's section - these errors surface in install output and logs.
+    #[test]
+    fn dynamic_key_rejection_does_not_leak_operator_values() {
+        let mut schema = object_schema(json!({"label": {"type": "string"}}));
+        schema["patternProperties"] = json!({"^secret-": {"type": "string"}});
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let configured = configured(&[("label", "s3cr3t-operator-value")]);
+
+        let (display, debug) =
+            error_text(resolve_plugin_config(&manifest, &scope, Some(&configured)));
+        for rendered in [&display, &debug] {
+            assert!(
+                !rendered.contains("s3cr3t-operator-value"),
+                "the admission error must not quote operator values; got {rendered}"
+            );
+        }
+        assert!(
+            display.contains("patternProperties"),
+            "the resolve-time refusal must still name the keyword; got {display}"
+        );
+    }
+
+    /// The neighbouring keywords keep working: the rejection is scoped to the
+    /// root, matching how the size, depth, type, and `additionalProperties`
+    /// checks are scoped, and does not reach into nested property schemas.
+    #[test]
+    fn nested_dynamic_key_keywords_are_left_alone() {
+        let schema = object_schema(json!({
+            "options": {
+                "type": "object",
+                "patternProperties": {"^x-": {"type": "string"}}
+            }
+        }));
+        validate_manifest_config(&manifest(Some(schema), true)).expect(
+            "the enumerable-key rule constrains the root object; a nested property's own \
+             schema keeps the full dialect",
+        );
+    }
+
+    /// A `pattern` is author-controlled and the value matched against it is
+    /// operator-controlled, so a nested-quantifier form is the classic
+    /// super-linear-matching shape. Admission and resolution together must
+    /// stay far below any interactive budget on a value that does not match.
+    ///
+    /// This is a floor, not proof of the engine choice: with the current
+    /// lockfile `(a+)+$` carries no fancy construct, so `fancy-regex` hands it
+    /// to the same linear engine and it is fast either way. The assertion
+    /// earns its place by catching a future dependency or option change that
+    /// puts a backtracking matcher back on this path.
+    #[test]
+    fn nested_quantifier_patterns_resolve_in_bounded_time() {
+        let schema = object_schema(json!({
+            "token": {"type": "string", "pattern": "(a+)+$"}
+        }));
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        // Ends in a non-`a`, so the quantifier can never reach `$` and a
+        // backtracking matcher explores every partition of the run.
+        let hostile = format!("{}b", "a".repeat(128));
+        let configured = configured(&[("token", hostile.as_str())]);
+
+        let started = std::time::Instant::now();
+        validate_manifest_config(&manifest).expect("a nested quantifier is a legal pattern");
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&configured));
+        let elapsed = started.elapsed();
+
+        assert!(
+            resolved.is_err(),
+            "the value does not match the pattern, so resolution must refuse it"
+        );
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "admission plus resolution took {elapsed:?}; a linear matcher needs microseconds, \
+             so anything near this bound means the host is backtracking on operator input"
+        );
+    }
+
+    /// Backreferences and look-around are exactly the constructs a linear
+    /// matcher cannot support, and exactly the ones that make backtracking
+    /// super-linear. Refusing them at admission is the fail-closed half of the
+    /// bound: the host would rather not run the plugin than run a matcher
+    /// whose cost it cannot predict.
+    #[test]
+    fn patterns_outside_the_linear_dialect_are_refused_at_admission() {
+        for pattern in [r"(a+)+\1$", "(?=(a+)+$)x", r"(\w+)\s\1"] {
+            let schema = object_schema(json!({
+                "token": {"type": "string", "pattern": pattern}
+            }));
+            let manifest = manifest(Some(schema), true);
+            let error = validate_manifest_config(&manifest)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "pattern {pattern:?} needs a backtracking matcher; admitting it would \
+                         hand the host an unpredictable per-resolution cost"
+                    )
+                });
+            assert!(
+                matches!(error, PluginError::InvalidManifest(_)),
+                "an uncompilable pattern is a manifest defect, not a config defect: {error:?}"
+            );
+
+            let scope = scope(&manifest, true);
+            let configured = configured(&[("token", "aa aa")]);
+            assert!(
+                matches!(
+                    resolve_plugin_config(&manifest, &scope, Some(&configured)),
+                    Err(PluginError::InvalidManifest(_))
+                ),
+                "resolution recompiles the schema, so it must refuse {pattern:?} too"
+            );
+        }
+    }
+
+    /// The program a pattern expands into is paid on every resolution, so a
+    /// large repetition bound is a per-call cost rather than a one-off. The
+    /// engine's own 10 MiB ceiling admits repetitions that take tens of
+    /// seconds to compile; this bound refuses them in about a millisecond.
+    #[test]
+    fn patterns_that_exceed_the_program_size_limit_are_refused_at_admission() {
+        let schema = object_schema(json!({
+            "token": {"type": "string", "pattern": r"^[\s\S]{0,8000}$"}
+        }));
+        let manifest = manifest(Some(schema), true);
+
+        let started = std::time::Instant::now();
+        let error = validate_manifest_config(&manifest)
+            .expect_err("a repetition this large must not be admitted");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, PluginError::InvalidManifest(_)),
+            "an over-large pattern is a manifest defect, not a config defect: {error:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the refusal itself took {elapsed:?}; a limit that is only reached after the \
+             expensive compile does not bound anything"
+        );
+    }
+
+    /// The bound above narrows the dialect, so pin the shapes operator config
+    /// actually uses. A limit that also refuses these would have traded a
+    /// bounded cost for a broken contract.
+    #[test]
+    fn structural_patterns_operators_use_are_still_admitted() {
+        for (pattern, value) in [
+            (r"^[a-z0-9-]{1,64}$", "my-plugin-instance"),
+            (
+                r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
+                "operator@example.com",
+            ),
+            (
+                r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            ),
+            (
+                r"^https://[a-zA-Z0-9.-]+(/[^\s]*)?$",
+                "https://example.com/hook",
+            ),
+            (r"^[\s\S]{0,200}$", "a short free-text note"),
+        ] {
+            let schema = object_schema(json!({
+                "token": {"type": "string", "pattern": pattern}
+            }));
+            let manifest = manifest(Some(schema), true);
+            validate_manifest_config(&manifest).unwrap_or_else(|error| {
+                panic!("pattern {pattern:?} is ordinary operator config, but was refused: {error}")
+            });
+
+            let scope = scope(&manifest, true);
+            let configured = configured(&[("token", value)]);
+            resolve_plugin_config(&manifest, &scope, Some(&configured)).unwrap_or_else(|error| {
+                panic!("value {value:?} matches {pattern:?}, but resolution refused it: {error}")
+            });
+        }
     }
 
     #[test]
@@ -776,25 +1071,6 @@ x-secret = true
             }),
         ];
         for schema in invalid_schemas {
-            assert!(matches!(
-                validate_manifest_config(&manifest(Some(schema), true)),
-                Err(PluginError::InvalidManifest(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn secret_property_references_use_the_shared_portable_key_grammar() {
-        for name in [
-            "plugin://other/key",
-            "../key",
-            "key:value",
-            "other\\key",
-            "café",
-        ] {
-            let schema = object_schema(json!({
-                (name): {"type": "string", "x-secret": true}
-            }));
             assert!(matches!(
                 validate_manifest_config(&manifest(Some(schema), true)),
                 Err(PluginError::InvalidManifest(_))
@@ -1101,6 +1377,37 @@ x-secret = true
         let mut too_deep = object_schema(json!({}));
         too_deep["annotation"] = nested;
         assert!(validate_manifest_config(&manifest(Some(too_deep), true)).is_err());
+    }
+
+    #[test]
+    fn root_property_count_limit_is_enforced_at_admission() {
+        let at_limit = (0..MAX_SCHEMA_PROPERTIES)
+            .map(|index| (format!("key_{index}"), json!({"type": "string"})))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(
+            validate_manifest_config(&manifest(
+                Some(object_schema(Value::Object(at_limit))),
+                true
+            ))
+            .is_ok()
+        );
+
+        let over_limit = (0..=MAX_SCHEMA_PROPERTIES)
+            .map(|index| {
+                (
+                    format!("key_{index}"),
+                    json!({"type": "string", "pattern": "(?=x)"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let error = validate_manifest_config(&manifest(
+            Some(object_schema(Value::Object(over_limit))),
+            true,
+        ))
+        .expect_err("schema over the root property cap must fail closed");
+        assert!(matches!(error, PluginError::InvalidManifest(_)));
+        assert!(error.to_string().contains("root properties"));
+        assert!(error.to_string().contains("maximum of 256"));
     }
 
     #[test]

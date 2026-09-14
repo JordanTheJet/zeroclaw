@@ -1,22 +1,39 @@
 //! Regression coverage for `zeroclaw config patch --json` output.
+//!
+//! The CLI/HTTP parity test needs the in-process gateway router, whose
+//! `AppState` and deps only exist under the `gateway` feature. Those items are
+//! gated so the CLI-only tests still compile and run with the feature off.
 
+#[cfg(feature = "gateway")]
 use axum::{Router, routing::patch};
+#[cfg(feature = "gateway")]
 use parking_lot::RwLock;
+#[cfg(feature = "gateway")]
 use std::collections::HashMap;
 use std::process::{Command, Output, Stdio};
+#[cfg(feature = "gateway")]
 use std::sync::Arc;
+#[cfg(feature = "gateway")]
 use std::time::Duration;
+#[cfg(feature = "gateway")]
 use tower::ServiceExt;
+#[cfg(feature = "gateway")]
 use zeroclaw::gateway::{self, AppState};
+#[cfg(feature = "gateway")]
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_config::schema::Config;
+#[cfg(feature = "gateway")]
 use zeroclaw_memory::NoneMemory;
+#[cfg(feature = "gateway")]
 use zeroclaw_providers::ModelProvider;
+#[cfg(feature = "gateway")]
 use zeroclaw_runtime::security::PairingGuard;
 
+#[cfg(feature = "gateway")]
 #[derive(Default)]
 struct MockModelProvider;
 
+#[cfg(feature = "gateway")]
 #[async_trait::async_trait]
 impl ModelProvider for MockModelProvider {
     async fn chat_with_system(
@@ -30,6 +47,7 @@ impl ModelProvider for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 impl Attributable for MockModelProvider {
     fn role(&self) -> zeroclaw_api::attribution::Role {
         zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
@@ -42,6 +60,7 @@ impl Attributable for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 fn test_state(config: Config) -> AppState {
     let memory: Arc<dyn zeroclaw_memory::Memory> =
         Arc::new(NoneMemory::new("config-patch-cli-test"));
@@ -60,7 +79,6 @@ fn test_state(config: Config) -> AppState {
             ),
         ),
         auto_save: false,
-        webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(false, &[])),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100)),
@@ -206,6 +224,7 @@ fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serd
     serde_json::from_str(&stdout).expect("stdout should be JSON success envelope")
 }
 
+#[cfg(feature = "gateway")]
 async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let config = Config {
         config_path: config_dir.join("config.toml"),
@@ -254,6 +273,7 @@ fn config_patch_json_success_emits_envelope_and_persists_change() {
     assert_eq!(parsed.gateway.host, "127.0.0.2");
 }
 
+#[cfg(feature = "gateway")]
 #[tokio::test]
 async fn config_patch_json_failed_op_matches_http_error_envelope() {
     let patch_doc = br#"[{"op":"replace","path":"/not/a/path","value":"x"}]"#;
@@ -723,6 +743,83 @@ fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
+/// Run one non-interactive property write in a fresh CLI process.
+fn run_cli_set(config_dir: &std::path::Path, path: &str, value: &str) {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "set", "--no-interactive", path, value])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config set");
+    assert!(
+        output.status.success(),
+        "config set {path} should succeed in a new process: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn required_field_sections_can_be_completed_across_cli_processes() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "gateway.tls",
+            &[
+                ("gateway.tls.cert_path", "/tmp/zeroclaw-test-cert.pem"),
+                ("gateway.tls.key_path", "/tmp/zeroclaw-test-key.pem"),
+            ],
+        ),
+        (
+            "transcription.local_whisper",
+            &[(
+                "transcription.local_whisper.url",
+                "http://127.0.0.1:8080/v1/transcribe",
+            )],
+        ),
+        (
+            "tunnel.openvpn",
+            &[("tunnel.openvpn.config_file", "/tmp/zeroclaw-test.ovpn")],
+        ),
+    ];
+
+    for (section, writes) in cases {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let initialized = run_cli_init(config_dir.path(), section);
+        assert!(
+            initialized["initialized"]
+                .as_array()
+                .expect("initialized should be an array")
+                .iter()
+                .any(|value| value == section),
+            "explicit init must include `{section}`: {initialized}",
+        );
+
+        // Each helper invocation launches a new process. Intermediate files may
+        // still be incomplete, so every later write must repair from the
+        // original TOML instead of relying on the resilient in-memory section.
+        for (path, value) in *writes {
+            run_cli_set(config_dir.path(), path, value);
+        }
+
+        let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+            .expect("read completed config");
+        let strict: Config = toml::from_str(&saved).unwrap_or_else(|error| {
+            panic!("completed `{section}` must strictly reload: {error}\n{saved}")
+        });
+        for (path, value) in *writes {
+            assert_eq!(
+                strict
+                    .get_prop(path)
+                    .expect("completed property should exist"),
+                *value,
+                "completed `{section}` property `{path}` must survive strict reload",
+            );
+        }
+    }
 }
 
 #[test]

@@ -12,6 +12,13 @@ pub struct InvalidPluginPackageName {
 /// Validate the package-name grammar shared by manifests, configuration, and
 /// runtime instance construction.
 ///
+/// One grammar keeps `[channels.plugin.<alias>].package` and the installed
+/// manifest's `name` on the same spelling, so a declaration that passes config
+/// validation cannot fail to match an admitted package for a reason the
+/// operator never sees. The grammar is deliberately narrow: no uppercase, no
+/// path separators, and no whitespace or control characters, so a package name
+/// can be embedded in a log field or a derived key without quoting.
+///
 /// # Errors
 ///
 /// Returns [`InvalidPluginPackageName`] when `name` is empty, longer than 128
@@ -41,7 +48,7 @@ mod tests {
 
     #[test]
     fn package_name_grammar_accepts_canonical_slugs() {
-        for name in ["a", "chat", "acme.chat", "chat-v2", "chat_bridge"] {
+        for name in ["a", "chat", "acme.chat", "chat-v2", "chat_bridge", "s3"] {
             assert!(validate_plugin_package_name(name).is_ok(), "{name}");
         }
     }
@@ -53,12 +60,20 @@ mod tests {
             "Chat",
             ".chat",
             "chat.",
+            "chat-",
+            "-chat",
             "chat/plugin",
+            "../escape",
             "chat plugin",
             "chat\nplugin",
             &"a".repeat(129),
         ] {
             assert!(validate_plugin_package_name(name).is_err(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn package_name_grammar_accepts_the_longest_supported_name() {
+        assert!(validate_plugin_package_name(&"a".repeat(128)).is_ok());
     }
 }

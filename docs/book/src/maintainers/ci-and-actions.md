@@ -10,18 +10,25 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
+- **history-guard**: fetches full history and checks the commit under test
+  against `origin/master`; pull requests use the explicit
+  `github.event.pull_request.head.sha`, while trusted pushes and merge-queue
+  runs use `github.sha`. The guard and its fixture test reject an empty
+  `git merge-base`, preventing a grafted second root from collapsing
+  `git blame` after merge
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), and the comment hygiene gate
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
+- **check**: three warnings-fatal passes over the workspace (excluding `zeroclaw-desktop`): all features; no default features; and default features with `--all-targets`, which is the only leg that compiles test targets on the default feature surface
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards
+- **windows-test-scope / windows-test**: advisory PR measurement on `windows-latest`; the selector classifies the PR as baseline `skip`, `scoped`, or `full` plus `needs_plugin_host`, and the Windows job runs pinned-toolchain `cargo nextest` only when appropriate
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
 
-`fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` directly or transitively and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
+`fmt` runs first as the cheap serial gate. Every required job declares `needs: [fmt]` directly or transitively and fans out after formatting passes; `CI Required Gate` aggregates the required results only. The advisory Windows jobs are deliberately absent from that gate and cannot block a PR. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
 
@@ -31,7 +38,25 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - a release target is outside the PR matrix and only covered by release/manual workflows;
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
 
-When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
+When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. That pass runs `cargo check` without `--all-targets`, so it never compiles test targets: a helper gated on plain `test` whose only callers sit behind a feature is caught by the default-features/all-targets leg instead. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
+
+### Advisory PR Windows Measurement (`ci.yml`)
+
+The first Windows PR rollout is measurement-only and is not a required check. On `pull_request`, `windows-test-scope` compares the base SHA to `HEAD`, generates Cargo workspace metadata from the checkout on the Linux selector runner, and writes baseline `mode`, JSON `packages`, concise `reason`, and the orthogonal `needs_plugin_host` boolean to job outputs and the step summary. The advisory selector and Windows jobs are skipped for `push` and `merge_group`; the nightly full-platform workflow remains the post-merge backstop without adding a second full Windows run to every merge.
+
+`skip` means no changed path affects Rust compilation or tests covered by the current workspace suite. `scoped` maps Rust source, test, benchmark, example, and package-local manifest paths to package roots from Cargo metadata, closes that set over workspace reverse dependents, maps root `src/` and `tests/` to the root package, deduplicates package names, and excludes `zeroclaw-desktop` like the existing workspace suite. `full` is selected for workspace manifests or dependency resolution, `.cargo`, the Rust toolchain, CI or test infrastructure, the selector or workflow, unknown paths, ambiguous metadata, and other changes that cannot be mapped safely. Every `Cargo.lock` change selects `full` because workspace-wide dependency resolution can affect packages beyond the directly changed manifests. Direct changes to the root, gateway, or provider packages, plus changes to plugin, runtime, plugin config, WIT, root plugin activation, plugin backend filter, dependency, selector, selector-contract, or `ci.yml` paths, set `needs_plugin_host=true`. The controlling-file cases make workflow revisions exercise the plugin-host path they own. Malformed or unavailable changed-path input selects baseline `full` and true. Missing or malformed Cargo metadata also selects baseline `full` with `needs_plugin_host=true` because the dependency closure cannot be established safely.
+
+For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop`. When `needs_plugin_host=true`, it installs `wasm32-wasip2` and appends the feature-enabled `zeroclaw-plugins` component targets (`channel_plugin_e2e`, `tool_plugin_timeout_e2e`, `reference_plugin`, `reference_plugin_e2e`, and `tool_plugin_e2e`), plugin library tests, runtime live-config and admission regressions, gateway library tests, focused root CLI plugin-registry tests, and root `plugin_channel_runtime_e2e`. Every appended invocation runs even when an earlier one fails, and the summary preserves each phase status plus the failure inventory. The job reports separate baseline, plugin-host, and total durations. Ordinary `scoped` and `full` selections do not pay the plugin-host compilation cost. Pull requests restore the `platform-test` cache seeded by trusted nightly or manual runs on `master` and never write cache entries. A skipped Windows job is intentional and visible beside the selector result.
+
+### Scheduled Platform Tests (`platform-tests.yml`)
+
+Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting check. This nightly full-workspace run is the backstop for the advisory PR measurement and inventories failures with `--no-fail-fast`. The matrix runs for:
+
+- pull requests that change `platform-tests.yml` itself;
+- manual dispatches; and
+- the nightly 03:17 UTC schedule.
+
+The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch this full matrix automatically because `ci.yml` now measures the affected Windows scope; maintainers can manually dispatch it against a branch when full platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -70,15 +95,21 @@ The `checkver` and `autoupdate` blocks are already load-bearing for the planned 
 
 Auto-applies path and scope labels based on changed files. It runs on PR open, reopen, and every pushed update to the PR branch. Because `sync-labels: true` is enabled, labels defined in `.github/labeler.yml` are recalculated from the current PR file set.
 
-This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
+This workflow does not apply `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels. If a PR is missing a path/scope label, check whether the paths in `.github/labeler.yml` cover the changes.
 
 Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
+
+### PR Size Labeler (`pr-size-labeler.yml`)
+
+Applies exactly one canonical `size:*` label from PR file metadata. It runs on PR open, reopen, and every pushed update to the PR branch. The classifier counts additions plus deletions after excluding docs-like files and `Cargo.lock`, then applies the threshold table from [Labels](./labels.md#size-labels).
+
+This workflow runs in `pull_request_target` so it can write labels on fork PRs, but it fetches the classifier script from the trusted workflow/default-branch revision. It does not check out, build, import, source, or execute pull-request code. It does not apply `risk:*`, `type:*`, contributor-tier, status, resolution, stale, pickup, or ProjectV2 fields.
 
 ### Project Dashboard Planner (`project-dashboard-plan.yml`)
 
 Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.
 
-This workflow does not run automatically on issue events, write ProjectV2 fields, edit issues, add labels, post comments, or recalculate PR `risk:*`, `size:*`, or `type:*` labels. Live ProjectV2 mutation or automatic issue-event planning needs a separately approved field mapping, trigger policy, and project-scoped credential.
+This workflow does not run automatically on issue events, write ProjectV2 fields, edit issues, add labels, post comments, or recalculate PR `risk:*` or `type:*` labels. Live ProjectV2 mutation or automatic issue-event planning needs a separately approved field mapping, trigger policy, and project-scoped credential.
 
 ### Validate PR title (`pr-title.yml`)
 
@@ -90,7 +121,7 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`.
+Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`. Separate Alpine and Debian `linux/amd64` lanes enable `plugins-wasm-runtime-only` so their builder contexts continuously prove that the repository WIT contract is available to plugin-enabled source builds.
 
 The all-features `Containerfile` source image builds for `linux/amd64` when that file or the Docker workflow changes. It uses an isolated cache scope and is neither loaded nor pushed. The Alpine amd64 lane runs both binaries, starts the built image through the merged Compose configuration, and checks the gateway health and dashboard surfaces. The Alpine arm64 lane is compile- and image-assembly coverage only. Compose-only changes use a reduced Alpine amd64 matrix so they still exercise the runtime contract without rebuilding unrelated images. All jobs have read-only repository permissions and no registry write permission.
 
@@ -130,9 +161,15 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
+Every dispatch also runs a small release-tool smoke matrix independently of the builds. Set `release_tools_only` when only this evidence is needed; the web and release-build jobs are then skipped. On trusted GitHub-hosted Linux x86_64, the smoke installs the pinned `cross` archive, confirms both `cross` and `cross-util`, and records `cross --version`. On trusted GitHub-hosted Windows x86_64, it uses the same Rust version and Bash-to-Cargo path shape as the stable release workflow, then records both `cargo-tauri.exe --version` and `cargo tauri --version`. Each leg records the exact tested commit and runner architecture in the public job summary. The smoke uses read-only repository permissions and has no publishing job, environment, secret, or artifact upload.
+
+MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
+
+Required Linux Clippy, advisory cross-platform Clippy, and targeted Windows Clippy call `scripts/ci/run_clippy.sh`. That runner owns the supported command shapes, Cargo exit-status propagation, and the shared duration, cache, compile-count, and download-count diagnostics. The workflow files continue to own triggers, runners, toolchains, caches, timeouts, and required-gate membership.
 
 ### Release Stable (`release-stable-manual.yml`)
 
@@ -145,6 +182,13 @@ Cosign remains limited to GHCR image signing.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
+Release-only build tools do not compile from source on every run. The workflow
+installs pinned upstream `cross` and Tauri CLI release binaries through
+`scripts/ci/install_release_tool.sh`; that script verifies a repository-owned
+SHA-256 for each runner-specific archive before placing the binary in Cargo's
+bin directory. Updating either tool requires updating its version, asset name,
+and checksum together, then running `scripts/ci/install_release_tool.test.sh`.
+
 ### Package Publishers
 
 Each fires on `workflow_dispatch` with a version input. They are also invoked from the release workflow after a successful publish.
@@ -152,6 +196,7 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | Workflow | What it does |
 |---|---|
 | `pub-aur.yml` | Updates the Arch User Repository `PKGBUILD` and pushes to the AUR |
+| `pub-crates.yml` | Packages and verifies the coordinated workspace release, then publishes it to crates.io in dependency order behind the `crates-io` environment gate |
 | `pub-scoop.yml` | Updates the Scoop manifest for Windows |
 
 Homebrew Core's
@@ -165,13 +210,22 @@ authoritative automation.
 | Secret | Used by |
 |---|---|
 | `AUR_SSH_KEY` | `pub-aur.yml` |
+| `CARGO_REGISTRY_TOKEN` | Repository secret explicitly passed to `pub-crates.yml` and referenced only by its protected publish job; v0.8.5 needs `publish-new` for `zerorelay`, `zeroclaw-relay-proto`, and `zeroclaw-tls`, while later coordinated updates need `publish-update` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
 | `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`, `release-stable-manual.yml`, `scoop-bucket-canary.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
-Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. The release pipeline does not publish to crates.io, so no `CARGO_REGISTRY_TOKEN` is required.
+Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. Store `CARGO_REGISTRY_TOKEN` as a repository secret and map only that named secret into the reusable publisher. The called workflow references it only in the irreversible publish step, whose job requires approval through the `crates-io` environment; the tokenless preflight neither references nor exports it. The preflight packages the same immutable release commit before an approver can start the publish job.
+
+Most crates in the coordinated release set already exist and are eligible for
+crates.io trusted publishing. The v0.8.5 release additionally creates
+`zerorelay`, `zeroclaw-relay-proto`, and `zeroclaw-tls`, so its bootstrap token
+must include `publish-new`. The environment token remains the bootstrap path
+until every crate has a trusted-publisher entry for this workflow. After those
+entries are configured, migrate the job so GitHub exchanges OIDC identity for
+a short-lived token instead of retaining `CARGO_REGISTRY_TOKEN`.
 
 The organization currently disables deploy keys on the Scoop bucket, and the
 automatic `GITHUB_TOKEN` cannot write another repository. Keep
@@ -230,13 +284,13 @@ transfers, coordinate the package rename or merge in one reviewed change.
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) do not. These behaviors are worth knowing when triaging cache-related flakes:
+Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust-cache` composite, which selects the cache backend from the same `CI_USE_BLACKSMITH` toggle that selects the runner: `useblacksmith/rust-cache` (Blacksmith NVMe sticky disk) when the job runs on a Blacksmith runner, and `Swatinem/rust-cache` otherwise. Any non-`true` toggle value (including unset, and every fork PR) falls back to `Swatinem/rust-cache` on GitHub-hosted runners, so caching is never lost when Blacksmith is off. Both action references live in the composite regardless of the toggle, so both must stay in the allowlist. The macOS and Windows build legs stay on `Swatinem/rust-cache`, and the `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) use no Rust cache. These behaviors are worth knowing when triaging cache-related flakes:
 
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
-- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the `test` job pulls the `cargo-nextest` binary from `get.nexte.st`. Neither is cached, so both add a fixed install cost to every run. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
+- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job and both scheduled `platform-tests.yml` legs pull the appropriate `cargo-nextest` binary from `get.nexte.st`. The advisory PR Windows job instead downloads its pinned nextest release archive and verifies a hardcoded SHA-256 before extraction because it runs on a much larger set of untrusted PRs. Neither tool is cached, so each install adds a fixed cost to its job. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
 
 ## When the gate goes red
 
@@ -259,22 +313,23 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 |---|---|---|
 | `actions/checkout` (`v6.0.2`) | Most workflows | Repository checkout |
 | `actions/cache` (`v4.2.3`, `v5.0.5`) | `docker-image-pr.yml`, `tweet-release.yml` | Generic dependency and Trivy database caching |
-| `actions/setup-node` (`v7.0.0`) | `ci-sbom.yml`, `ci.yml`, `cross-platform-build-manual.yml`, `daily-npm-audit.yml`, `release-stable-manual.yml` | Node toolchain for npm SBOM generation, web tests/audit, and web/desktop builds |
+| `actions/setup-node` (`v7.0.0`) | `ci-sbom.yml`, `ci.yml`, `cross-platform-build-manual.yml`, `daily-npm-audit.yml`, `pub-crates.yml`, `release-stable-manual.yml` | Node toolchain for npm SBOM generation, web tests/audit, and web/desktop builds |
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
-| `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
-| `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |
+| `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
+| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
+| `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected only when `CI_USE_BLACKSMITH=true` |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
 | `docker/build-push-action` (`v6.18.0`, `v7.1.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Multi-platform image build and push |
 | `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless GHCR container-image signing |
 | `anchore/sbom-action` (`v0.24.0`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Report-only container vulnerability scanning |
-| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml` | Upload Trivy SARIF reports to the Security tab |
-| `github/codeql-action/init` (`v3`) | `ci-code-analysis.yml` | Initialize CodeQL Rust analysis |
-| `github/codeql-action/analyze` (`v3`) | `ci-code-analysis.yml` | Upload CodeQL SARIF to the Security tab |
+| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml`, `ci-code-analysis.yml` | Upload Trivy and Semgrep SARIF reports to the Security tab |
+| `github/codeql-action/init` (`v4.37.8`) | `codeql.yml` | Initialize CodeQL analysis (Rust and JS/TS) |
+| `github/codeql-action/analyze` (`v4.37.8`) | `codeql.yml` | Upload CodeQL SARIF to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -284,6 +339,7 @@ Equivalent allowlist patterns (kept narrow on purpose):
 actions/*
 dtolnay/rust-toolchain@*
 Swatinem/rust-cache@*
+useblacksmith/rust-cache@*
 docker/*
 sigstore/cosign-installer@*
 anchore/sbom-action@*
@@ -297,7 +353,7 @@ Export the current effective policy:
 
 <div class="os-tabs-src">
 
-#### sh
+### sh
 
 ```sh
 gh api repos/zeroclaw-labs/zeroclaw/actions/permissions

@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -10,13 +12,11 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
+use crate::egress::EgressHostService;
 use crate::error::PluginError;
-use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
-use crate::services::{
-    ConfigLookupError, PluginHostServices, PluginStateError, PluginStateKey, PluginStateValue,
-    SecretLookupError,
-};
+use crate::services::{ConfigLookupError, PluginHostServices, SecretLookupError};
+use crate::wasi_http::PluginEgressHooks;
 use crate::{PluginCapability, PluginPermission};
 
 /// Hard safety ceiling for ZeroClaw-owned WIT imports in one service frame.
@@ -80,6 +80,8 @@ pub struct PluginLimits {
     pub max_memory_bytes: usize,
     pub max_table_elements: usize,
     pub max_instances: usize,
+    /// Wall-clock ceiling for one guest export, including awaited host work.
+    pub call_timeout: Duration,
 }
 
 #[cfg(test)]
@@ -89,6 +91,7 @@ pub(crate) fn test_limits(call_fuel: u64) -> PluginLimits {
         max_memory_bytes: 1024 * 1024,
         max_table_elements: 100,
         max_instances: 10,
+        call_timeout: Duration::from_secs(30),
     }
 }
 
@@ -103,6 +106,7 @@ pub(crate) struct PluginStoreSpec {
     limits: PluginLimits,
     inbound: InboundQueue,
     http: bool,
+    egress: Option<EgressHostService>,
 }
 
 impl PluginStoreSpec {
@@ -119,6 +123,7 @@ impl PluginStoreSpec {
             limits,
             inbound: InboundQueue::default(),
             http: false,
+            egress: None,
         }
     }
 
@@ -127,9 +132,28 @@ impl PluginStoreSpec {
     /// Adapters opt into the surface explicitly. This prevents adding a grant
     /// to a scope from silently widening an adapter that has not implemented
     /// and tested the corresponding component boundary.
+    ///
+    /// This grants the *surface*, never the *reach*. Without a service from
+    /// [`Self::with_egress_policy`] the store still links `wasi:http` and still
+    /// answers `http_enabled()`, but every request the guest issues is denied
+    /// Keeping the linker attached rather than dropping it is what
+    /// keeps store construction and the store/linker coherence check stable
+    /// while the answer to "may this instance reach the network" moves to the
+    /// host-owned egress boundary.
     #[must_use]
     pub(crate) fn with_granted_http(mut self) -> Self {
         self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the host-owned egress authority for this instance.
+    ///
+    /// `None` (the default) means deny-by-default: no destination is reachable.
+    /// The service is shared, not per-store — cloning it into several stores is
+    /// what makes one connection budget span every store of one instance.
+    #[must_use]
+    pub(crate) fn with_egress_policy(mut self, egress: Option<EgressHostService>) -> Self {
+        self.egress = egress;
         self
     }
 
@@ -145,7 +169,7 @@ pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
             world: "tool-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -153,7 +177,7 @@ pub mod bindings {
     pub mod channel {
         wasmtime::component::bindgen!({
             world: "channel-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -161,7 +185,7 @@ pub mod bindings {
     pub mod memory {
         wasmtime::component::bindgen!({
             world: "memory-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -175,10 +199,20 @@ pub struct PluginState {
     host_calls_remaining: u64,
     wasi: WasiCtx,
     table: ResourceTable,
-    http: Option<WasiHttpCtx>,
+    http: Option<HttpSurface>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
+    call_timeout: Duration,
+}
+
+/// The outbound-HTTP half of a store: wasmtime's per-store context paired with
+/// ZeroClaw's policy hooks. They are one field because `WasiHttpCtxView` needs
+/// both, and because a context without hooks would be the unmediated `wasi:http`
+/// the host-owned egress boundary exists to remove.
+struct HttpSurface {
+    ctx: WasiHttpCtx,
+    hooks: PluginEgressHooks,
 }
 
 /// The host-dispatched service frame that is currently active.
@@ -216,6 +250,9 @@ impl CallConfig {
     }
 }
 
+/// Warm component state held between export calls.
+pub(crate) type WarmPluginState<Bindings> = Option<(Store<PluginState>, Bindings)>;
+
 impl PluginState {
     /// Build store state from one typed, host-issued specification.
     /// `HttpClient` is the only grant that can widen the host surface here, and
@@ -224,7 +261,10 @@ impl PluginState {
     /// linked. Other grants are consumed by adapters or host services where
     /// implemented and do not widen ambient WASI.
     pub(crate) fn new(spec: PluginStoreSpec) -> Self {
-        let http = spec.http.then(WasiHttpCtx::new);
+        let http = spec.http.then(|| HttpSurface {
+            ctx: WasiHttpCtx::new(),
+            hooks: PluginEgressHooks::new(spec.scope.clone(), spec.egress.clone()),
+        });
         Self {
             scope: spec.scope,
             services: spec.services,
@@ -240,6 +280,7 @@ impl PluginState {
                 .instances(spec.limits.max_instances)
                 .build(),
             fuel_per_call: spec.limits.call_fuel,
+            call_timeout: spec.limits.call_timeout,
         }
     }
 
@@ -299,8 +340,8 @@ impl PluginState {
         true
     }
 
-    /// Whether the active frame may use this instance's scoped host services.
-    fn instance_services_enabled(&self) -> bool {
+    /// Whether the active frame may resolve this instance's secret properties.
+    fn secret_service_enabled(&self) -> bool {
         matches!(
             (self.call_config.phase(), self.scope.id().capability()),
             (Some(PluginCallPhase::ToolExecute), PluginCapability::Tool)
@@ -336,7 +377,7 @@ impl PluginState {
         if !self.charge_host_call() {
             return Err(SecretLookupError::Unavailable);
         }
-        if !self.instance_services_enabled() {
+        if !self.secret_service_enabled() {
             return Err(SecretLookupError::Unavailable);
         }
         if !self.scope.grants().allows(PluginPermission::ConfigRead) {
@@ -347,60 +388,6 @@ impl PluginState {
             .ok_or(SecretLookupError::NotFound)
     }
 
-    /// Read durable state under the immutable store-owned instance scope.
-    pub(crate) async fn state_get(
-        &mut self,
-        key: String,
-    ) -> Result<Option<PluginStateValue>, PluginStateError> {
-        if !self.charge_host_call() || !self.instance_services_enabled() {
-            return Err(PluginStateError::Unavailable);
-        }
-        if !self.scope.grants().allows(PluginPermission::StateRead) {
-            return Err(PluginStateError::AccessDenied);
-        }
-        let key = PluginStateKey::parse(key)?;
-        let state = self.services.state().clone();
-        let scope = self.scope.clone();
-        state.get(&scope, &key).await
-    }
-
-    /// Commit durable state with compare-and-swap semantics.
-    pub(crate) async fn state_put(
-        &mut self,
-        key: String,
-        value: Vec<u8>,
-        expected_revision: Option<u64>,
-    ) -> Result<u64, PluginStateError> {
-        if !self.charge_host_call() || !self.instance_services_enabled() {
-            return Err(PluginStateError::Unavailable);
-        }
-        if !self.scope.grants().allows(PluginPermission::StateWrite) {
-            return Err(PluginStateError::AccessDenied);
-        }
-        let key = PluginStateKey::parse(key)?;
-        let state = self.services.state().clone();
-        let scope = self.scope.clone();
-        state.put(&scope, &key, &value, expected_revision).await
-    }
-
-    /// Delete durable state with compare-and-swap semantics.
-    pub(crate) async fn state_delete(
-        &mut self,
-        key: String,
-        expected_revision: u64,
-    ) -> Result<(), PluginStateError> {
-        if !self.charge_host_call() || !self.instance_services_enabled() {
-            return Err(PluginStateError::Unavailable);
-        }
-        if !self.scope.grants().allows(PluginPermission::StateWrite) {
-            return Err(PluginStateError::AccessDenied);
-        }
-        let key = PluginStateKey::parse(key)?;
-        let state = self.services.state().clone();
-        let scope = self.scope.clone();
-        state.delete(&scope, &key, expected_revision).await
-    }
-
     /// Whether this state was built with outbound HTTP attached.
     pub(crate) fn http_enabled(&self) -> bool {
         self.http.is_some()
@@ -409,6 +396,11 @@ impl PluginState {
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
     pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
+    }
+
+    /// Host-owned wall-clock ceiling for one guest export call.
+    pub(crate) fn call_timeout(&self) -> Duration {
+        self.call_timeout
     }
 }
 
@@ -422,15 +414,19 @@ impl WasiView for PluginState {
 }
 
 impl WasiHttpView for PluginState {
+    /// Hand `wasi:http` ZeroClaw's policy hooks instead of
+    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// request the guest asks for; these submit it to the host-owned egress
+    /// boundary first and own the connect (see [`crate::wasi_http`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {
-        let ctx = self
+        let surface = self
             .http
             .as_mut()
             .expect("wasi:http called on a plugin without the HttpClient permission");
         WasiHttpCtxView {
-            ctx,
+            ctx: &mut surface.ctx,
             table: &mut self.table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: &mut surface.hooks,
         }
     }
 }
@@ -481,6 +477,14 @@ pub(crate) fn new_store(spec: PluginStoreSpec) -> Store<PluginState> {
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
     set_call_fuel(&mut store, call_fuel);
+    // Tokio deadlines can only be observed while the Wasmtime future yields.
+    // All host imports are async; this additionally prevents uninterrupted
+    // guest computation from starving the deadline until its full fuel budget
+    // is exhausted. Invariant: `engine()` unconditionally enables fuel and the
+    // interval literal is non-zero, which are the only documented error cases.
+    store
+        .fuel_async_yield_interval(Some(100_000))
+        .expect("plugin engine enables fuel and async yield interval is non-zero");
     store
 }
 
@@ -539,6 +543,21 @@ pub fn wt<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T> {
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e}")))
 }
 
+/// Error returned when a guest export exceeds its host-owned wall-clock bound.
+pub(crate) fn call_timeout_error(deadline: Duration) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "plugin call exceeded wall-clock deadline of {} ms",
+        deadline.as_millis()
+    ))
+}
+
+/// Error returned after an interrupted warm instance has been discarded.
+pub(crate) fn unavailable_instance_error() -> anyhow::Error {
+    anyhow::Error::msg(
+        "plugin instance is unavailable: a previous call was interrupted before completion",
+    )
+}
+
 /// Hint appended to instantiation failures, pointing plugin authors at the
 /// most common cause: a vendored `wit/v0` copy that has drifted from the
 /// host's current WIT. Phrased conditionally ("if this is a WIT ... mismatch")
@@ -558,36 +577,61 @@ pub fn wt_instantiate<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T>
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e:#} (hint: {WIT_DRIFT_HINT})")))
 }
 
-/// Compile or deserialize the exact component bytes admitted by the host.
-pub fn load_component(component: &AdmittedComponent) -> Result<Component> {
-    wt(load_inner(component), "failed to load WASM component")
+/// Compile a component from a WASM file. With a JIT backend present a `.wasm`
+/// component is compiled on load; in runtime-only builds the file is a
+/// precompiled `.cwasm` deserialized directly.
+pub fn load_component(wasm_path: &Path) -> Result<Component> {
+    wt(load_inner(wasm_path), "failed to load WASM component")
 }
 
 #[cfg(feature = "plugins-wasm-cranelift")]
-fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
-    Component::new(engine(), component.bytes())
+fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
+    Component::from_file(engine(), wasm_path)
 }
 
 #[cfg(not(feature = "plugins-wasm-cranelift"))]
-fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
-    // SAFETY: the bytes are a wasmtime-produced `.cwasm` for this engine; a
+fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
+    // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
-    unsafe { Component::deserialize(engine(), component.bytes()) }
+    unsafe { Component::deserialize_file(engine(), wasm_path) }
 }
 
-/// Run an async call against a warm mutex-protected `(Store, bindings)` pair,
-/// holding the store lock for the duration of the single component call.
+/// Run one warm guest export inside its host-service frame, bounded by the
+/// wall-clock deadline.
+///
+/// The `(Store, bindings)` pair is moved out of the shared slot before
+/// awaiting. If the deadline fires, or if the caller cancels and drops this
+/// future, the in-flight Wasmtime future is dropped and unwound and the
+/// interrupted store is discarded (the slot is left empty) rather than resumed.
+/// The `ActivePluginCall` frame refuels the store and exposes the phase's
+/// config/secrets for the call, then clears that transient view on drop.
 macro_rules! call_plugin_frame {
     ($self:expr, $constructor:ident, $body:expr) => {{
         let mut guard = $self.state.lock().await;
-        let (ref mut store, ref mut bindings) = *guard;
-        let mut active_call = crate::component::ActivePluginCall::$constructor(store);
-        let f = $body;
-        let result = f(active_call.store_mut(), bindings).await;
-        drop(active_call);
-        result
+        match guard.take() {
+            None => Err(crate::component::unavailable_instance_error()),
+            Some((mut store, mut bindings)) => {
+                let deadline = store.data().call_timeout();
+                let mut active_call = crate::component::ActivePluginCall::$constructor(&mut store);
+                let f = $body;
+                match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings))
+                    .await
+                {
+                    Ok(result) => {
+                        drop(active_call);
+                        *guard = Some((store, bindings));
+                        result
+                    }
+                    Err(_) => {
+                        drop(active_call);
+                        Err(crate::component::call_timeout_error(deadline))
+                    }
+                }
+            }
+        }
     }};
 }
+pub(crate) use call_plugin_frame;
 
 macro_rules! call_plugin {
     ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $body) }};
@@ -597,24 +641,65 @@ pub(crate) use call_plugin;
 macro_rules! call_tool_execute {
     ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, tool_execute, $body) }};
 }
-pub(crate) use call_plugin_frame;
 pub(crate) use call_tool_execute;
 
+/// Warm channel calls reinstantiate from host-owned inputs when the previous
+/// call was interrupted and discarded, then run under the same
+/// discard-on-interruption rule as other warm instances, inside the
+/// channel-service frame.
 macro_rules! call_channel {
-    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, channel_service, $body) }};
+    ($self:expr, $body:expr) => {{
+        'plugin_call: {
+            let mut guard = $self.state.lock().await;
+            if guard.is_none() {
+                match $self.reinstantiate().await {
+                    Ok(pair) => *guard = Some(pair),
+                    Err(error) => break 'plugin_call Err(error),
+                }
+            }
+            let Some((mut store, mut bindings)) = guard.take() else {
+                break 'plugin_call Err(crate::component::unavailable_instance_error());
+            };
+            let deadline = store.data().call_timeout();
+            let mut active_call = crate::component::ActivePluginCall::channel_service(&mut store);
+            let f = $body;
+            match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await
+            {
+                Ok(result) => {
+                    drop(active_call);
+                    *guard = Some((store, bindings));
+                    break 'plugin_call result;
+                }
+                Err(_) => {
+                    drop(active_call);
+                    break 'plugin_call Err(crate::component::call_timeout_error(deadline));
+                }
+            }
+        }
+    }};
 }
 pub(crate) use call_channel;
 
-/// Run one direct store call inside the same transient service frame used by
-/// warm adapter calls. The RAII guard drops the transient resolved-config view
-/// on success, error, trap, panic unwinding, or future cancellation.
+/// Run one direct owned-store call inside its host-service frame, bounded by
+/// the wall-clock deadline. Used during instantiation and metadata probing,
+/// where there is no warm slot to poison: a timed-out or cancelled call drops
+/// its local store. The RAII frame guard drops the transient resolved-config
+/// view on success, error, trap, panic unwinding, or future cancellation.
 macro_rules! call_store_frame {
     ($store:ident, $constructor:ident, $body:expr) => {{
+        let deadline = $store.data().call_timeout();
         let mut active_call = crate::component::ActivePluginCall::$constructor(&mut $store);
         let f = $body;
-        let result = f(active_call.store_mut()).await;
-        drop(active_call);
-        result
+        match ::tokio::time::timeout(deadline, f(active_call.store_mut())).await {
+            Ok(result) => {
+                drop(active_call);
+                result
+            }
+            Err(_) => {
+                drop(active_call);
+                Err(crate::component::call_timeout_error(deadline))
+            }
+        }
     }};
 }
 pub(crate) use call_store_frame;
@@ -660,7 +745,6 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
-            wasm_sha256: None,
             capabilities: vec![capability],
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
@@ -675,6 +759,7 @@ mod tests {
             })),
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 
@@ -704,7 +789,7 @@ mod tests {
         manifest: PluginManifest,
         values: HashMap<String, String>,
     ) -> PluginHostServices {
-        crate::services::test_services(PluginConfigResolver::new(move |scope| {
+        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
             resolve_plugin_config(&manifest, scope, Some(&values))
         }))
     }
@@ -719,7 +804,7 @@ mod tests {
             let denied = secret_scope(&manifest, capability, "main", false);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("denied lookup must not invoke config resolution")
             }));
@@ -748,7 +833,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Channel, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             panic!("disabled secret frame must not invoke config resolution")
         }));
@@ -774,7 +859,7 @@ mod tests {
             let scope = secret_scope(&manifest, capability, "main", true);
             let calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls = Arc::clone(&calls);
-            let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+            let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
                 resolver_calls.fetch_add(1, Ordering::SeqCst);
                 panic!("a mismatched call phase must not resolve secrets")
             }));
@@ -816,7 +901,7 @@ mod tests {
         let requested = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let issued = secret_scope(&manifest, PluginCapability::Tool, "backup", true);
         let resolver_manifest = Arc::clone(&manifest);
-        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
             let values = configured("one", "backup-token");
             resolve_plugin_config(&resolver_manifest, &issued, Some(&values))
         }));
@@ -840,7 +925,7 @@ mod tests {
         let resolver_manifest = Arc::clone(&manifest);
         let resolver_values = Arc::clone(&values);
         let resolver_calls = Arc::clone(&calls);
-        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             let values = resolver_values
                 .read()
@@ -876,7 +961,7 @@ mod tests {
         let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver_calls = Arc::clone(&calls);
-        let services = crate::services::test_services(PluginConfigResolver::new(move |_| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |_| {
             resolver_calls.fetch_add(1, Ordering::SeqCst);
             Err(PluginError::InvalidConfig("resolver detail".to_string()))
         }));
@@ -1193,6 +1278,14 @@ mod tests {
             500,
             "refuel must reset a drained warm store to the configured per-call budget"
         );
+    }
+
+    #[test]
+    fn store_enables_periodic_async_fuel_yields() {
+        let mut store = new_store(spec([], 500));
+        store
+            .fuel_async_yield_interval(Some(100_000))
+            .expect("plugin stores support async fuel yields");
     }
 
     #[test]

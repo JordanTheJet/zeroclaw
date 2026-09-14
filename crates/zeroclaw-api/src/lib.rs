@@ -4,6 +4,7 @@ pub mod agent;
 pub mod attribution;
 pub mod channel;
 pub mod elicitation;
+pub mod grants;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
@@ -15,7 +16,6 @@ pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
 pub mod plugin;
-pub mod plugin_egress;
 pub mod plugin_key;
 pub mod principal;
 pub mod runtime_status;
@@ -24,6 +24,7 @@ pub mod schema;
 pub mod session_keys;
 pub mod tool;
 pub mod vad;
+pub mod webhook;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.

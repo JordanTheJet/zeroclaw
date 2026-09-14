@@ -41,9 +41,10 @@ matches at once:
    exactly the set of host imports its world declares plus whatever its
    manifest permissions add, and nothing else.
 2. **Metered execution.** The engine is built with fuel metering enabled, and
-   every call gets a fresh fuel budget. A plugin that loops forever traps; it
+   every call gets a fresh fuel budget plus a wall-clock deadline that includes
+   awaited host work. A plugin that loops forever or waits forever fails; it
    cannot hang the agent. Memory, table, and instance ceilings are enforced by
-   a store limiter. All four bounds come from operator config
+   a store limiter. All five bounds come from operator config
    (`plugins.limits.*`) and are validated non-zero, and a store cannot be
    constructed without them, so no load path can produce an unsandboxed
    plugin.
@@ -84,11 +85,9 @@ The manifest declares two orthogonal things:
   channel adapters receive their own schema-materialized, validated public
   config and can
   resolve schema-designated secrets in authorized service calls) and
-  `http_client`, `state_read`, and `state_write` have behavioral effect. The
-  HTTP permission is the necessary grant for adapters that implement outbound
-  `wasi:http`: tool and channel enable that surface, while memory intentionally
-  does not yet. The state permissions gate encrypted durable state owned by the
-  exact package, capability, and binding.
+  `http_client` have behavioral effect. The HTTP permission is the necessary
+  grant for adapters that implement outbound `wasi:http`: tool and channel
+  enable that surface, while memory intentionally does not yet.
   `config_read` must be paired with the manifest's `config_schema`; either one
   without the other is rejected. The filesystem and memory-access permissions
   are accepted by the schema but not yet backed by host functions, so declaring
@@ -104,8 +103,8 @@ version) plus its primary interface:
 
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
-| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` and durable `state` |
-| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, durable `state`, and host-fed `inbound` |
+| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` |
+| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, and host-fed `inbound` |
 | `memory-plugin` | `memory`: store, recall, get, forget, plus {{#include ../_snippets/plugin-memory-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call |
 
 The channel and memory worlds use **capability flags**: a bitmask the host
@@ -132,9 +131,12 @@ a precompiled `.cwasm`. Each plugin instantiation gets:
   (`ensure_http_coherent`).
 
 Tool calls are stateless by construction: `WasmTool::execute` builds a fresh
-store, runs the call, and drops it. Channels and memory backends hold one warm
-store for the plugin's lifetime; the host refuels it before every call so a
-long-lived plugin gets a full budget per call rather than draining over time.
+store, runs the call, and drops it. Channels and memory backends are stateful
+by nature, so they hold one warm store for the plugin's lifetime; the host
+refuels it before every call so a long-lived plugin gets a full budget per
+call rather than draining over time. A deadline interruption discards the warm
+store instead of resuming partially unwound guest state. Channels recreate the
+instance on the next call; memory stays unavailable until its owner rebuilds it.
 During an authorized channel call, `config.get` and `secrets.get` materialize at
 most one revision of that admitted instance's canonical config. The host drops
 the view when the call ends. A compliant channel plugin **must** resolve both at
@@ -156,9 +158,9 @@ not yet reachable from a running daemon:
 
 | Capability | Host adapter | Runtime wiring |
 |------------|--------------|----------------|
-| `tool` | `WasmTool` | Package-scoped instances are admitted when `plugins.auto_discover = true` and appear in the agent's tool set |
-| `skill` | markdown loader | Package-scoped instances are admitted when `plugins.auto_discover = true`; skills load namespaced as `plugin:<plugin>/<skill>` |
-| `channel` | `WasmChannel`, complete and unit-covered | Explicit, enabled, agent-owned bindings are constructed and supervised; push/webhook traffic still needs a host-owned ingress producer |
+| `tool` | `WasmTool` | Registered end to end; discovered tool plugins appear in the agent's tool set |
+| `skill` | markdown loader | Registered end to end; skills load namespaced as `plugin:<plugin>/<skill>` |
+| `channel` | `WasmChannel`, complete and unit-covered | Alias-owned construction and runtime config resolution landed ([#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146)); the per-vendor host listener that drains each transport into the channel's `inbound` queue is a follow-up |
 | `memory` | `WasmMemory`, implements the full `Memory` trait | The runtime does not yet construct it as a configurable backend |
 | `observer` | none | `PluginCapability::Observer` is reserved; no WIT world or adapter exists yet |
 
@@ -177,43 +179,56 @@ defaults, which reads back as `plugins.enabled = false` with no warning
 # turn the system on
 zeroclaw config set plugins.enabled true
 
+# load auto-discovered tool and skill plugins at runtime (default: false)
+zeroclaw config set plugins.auto_discover true
+
 # where plugins are discovered (default: ~/.zeroclaw/plugins)
 zeroclaw config set plugins.plugins_dir /srv/zeroclaw/plugins
-
-# admit package-scoped tool and skill plugins on startup
-zeroclaw config set plugins.auto_discover true
 
 # signature policy: disabled | permissive | strict
 zeroclaw config set plugins.security.signature_mode strict
 
 # per-call sandbox limits
 zeroclaw config set plugins.limits.call_fuel 1000000000
+zeroclaw config set plugins.limits.call_timeout_ms 30000
 zeroclaw config set plugins.limits.max_memory_mb 256
 ```
+
+`plugins.limits.max_connections_per_instance` (default 16) caps how many
+outbound connections one logical plugin instance may hold open at once. The
+ceiling is per instance, not per call: a response holds its connection until
+the guest has drained the body or dropped the response, so a tool that keeps
+sixteen responses alive inside one invocation cannot open a seventeenth
+connection. Sequential requests that drain or drop each response as they go
+never approach the limit. When the ceiling binds, the guest sees
+`wasi:http`'s own `connection-limit-reached` error, not an egress denial: the
+destination was granted, and the host is reporting a resource it counted.
+
+`plugins.enabled = true` turns the plugin host on, but auto-discovered tool and
+skill capabilities load only when `plugins.auto_discover = true` as well. That
+flag is `false` by default (fail-closed), so `enabled = true` on its own gives
+you the channels you declare under `[channels.plugin.<alias>]` and no plugin
+tools or skills: a tool or skill package can list and `info` cleanly yet
+contribute nothing at runtime. Explicit channel bindings are operator-named
+rather than auto-discovered, so they do not need `auto_discover`; the flag gates
+only auto-discovered tools and skills.
 
 Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
 identity. Installation prints and seeds the keys for the package's default
-tool binding; `zeroclaw plugin info <package>` prints that key again. Alias-owned
-channel instances declare package selection separately from values:
-
-```toml
-[channels.plugin.operations]
-package = "my-platform"
-enabled = true
-
-[agents.operator]
-channels = ["plugin.operations"]
-```
-
-The host derives the channel instance key from `my-platform`, the `channel`
-capability, and `operations`; the declaration never copies credentials or
-other plugin values. This explicit channel binding is eligible even when
-`plugins.auto_discover = false`; it must be enabled and owned by an enabled
-agent. Full-identity keys let different packages and capability
+tool binding; `zeroclaw plugin info <package>` prints that tool key again. Those
+automatic surfaces are tool-only. Alias-owned channel construction derives the
+key from its actual configured alias rather than inventing a package-name
+binding. That runtime path landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146): a daemon now
+constructs an explicitly declared `[channels.plugin.<alias>]` instance and
+resolves its typed config from that alias. Automatic `plugin info` key display
+and install-time seeding for channel instances remain manual until the grant
+ceremony in [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584).
+Full-identity keys let different packages and capability
 worlds safely reuse aliases such as `main` without sharing credentials. The
-canonical operator values are a secret-marked string map and remain encrypted
-at rest (`enc2:…`). A plugin that requests `config_read`
+canonical operator values are a secret-marked string map and
+remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
 declares the map's single type contract in `config_schema`: a closed Draft
 2020-12 object whose
 top-level properties explicitly use `string`, `boolean`, `integer`, `number`,
@@ -232,15 +247,6 @@ channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
 
-Tool and channel components can request `state_read` and/or `state_write` for
-the `state` import. The host, not the guest, supplies the admitted package,
-capability, and binding namespace. Portable logical keys address authenticated
-byte values within that exact instance. Reads return a revision; create,
-replace, and delete operations use exact compare-and-swap revisions. Durable
-rows live as `enc2:` ciphertext behind keyed blind indexes in
-`data/plugin-state.db`, using the install `.secret_key`. Fixed quotas and any
-key, storage, or integrity failure fail closed.
-
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
 schema matching the current values, update tool/channel guests to deserialize
@@ -254,6 +260,9 @@ config plus credential rotation within the same logical binding is visible as
 one revision on the next operation. Static identity and capability exports are
 read once at load; changing the bot/account identity or other static metadata
 requires channel lifecycle reconstruction.
+[Migrating to typed config](./migrating-to-typed-config.md) is the step-by-step
+recipe, including the release decision to ship this enforcement without a
+compatibility shim.
 
 This is a strict pre-1.0 key format: legacy entries named only after a package
 or binding are not consulted. For an existing tool package, run `zeroclaw
@@ -274,6 +283,10 @@ The sandbox bounds what a loaded plugin can do; the signature policy bounds
 what loads at all. Both are operator decisions, and they compose:
 
 - `plugins.enabled` false (the default): no plugin code runs, ever.
+- `plugins.auto_discover` false (the default): auto-discovered tool and skill
+  capabilities do not load. `plugins.enabled = true` alone activates only the
+  channels you declare under `[channels.plugin.<alias>]`; tools and skills load
+  only when `auto_discover = true` as well.
 - Signature `strict`: only components whose manifest carries a valid Ed25519
   signature from a key in your trusted set load.
 - Loaded plugin: bounded by fuel, memory ceilings, no-preopen WASI, and the
@@ -284,3 +297,19 @@ chooses to call: a tool with the `http_client` grant and the tool adapter's HTTP
 surface can send whatever the model passes it to wherever its code decides.
 Signature policy exists because "which code do I load" is the decision that
 matters most; make it deliberately.
+
+### Certificate trust for plugin HTTPS
+
+A plugin request over HTTPS verifies against the bundled webpki root program
+plus the roots this machine already trusts. An endpoint whose certificate chains
+to a locally installed CA, such as an enterprise MDM root or a private PKI,
+therefore works for plugins exactly as it already works for provider requests.
+Verification itself is unchanged: chain building and hostname matching stay in
+force, and the egress policy still decides which destinations a guest may reach.
+
+Those roots are read once per process. Rewriting the certificate file at the same
+path, or changing the operating system store, does not reach a running daemon;
+restart it before expecting plugin HTTPS to see the change. The same applies to
+an unlucky first read: a machine whose store was briefly unreadable serves
+bundled-only trust until the process restarts, and the
+`plugin_egress_trust_anchors` log line is what says which of the two happened.

@@ -4,10 +4,13 @@
 //! the admitted package host. It never stores operator config, authorization,
 //! or guest metadata, and building it never executes guest code.
 
+#[cfg(feature = "plugins-wasm")]
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::webhook::PluginWebhookRegistryLease;
 use zeroclaw_config::schema::Config;
 
 /// Whether this build can execute WASM plugins.
@@ -31,6 +34,14 @@ struct ActivationCandidate {
     scope: PluginInstanceScope,
 }
 
+#[cfg(feature = "plugins-wasm")]
+struct BuiltChannelCandidate {
+    package: String,
+    alias: String,
+    config_read: bool,
+    channel: zeroclaw_plugins::wasm_channel::WasmChannel,
+}
+
 /// One deterministic, guest-free admission decision across logical plugin
 /// tool, channel, and skill instances.
 #[cfg(feature = "plugins-wasm")]
@@ -46,6 +57,27 @@ impl PluginActivationPlan {
     /// and take priority over package-scoped tool and skill auto-discovery.
     /// The single configured ceiling is applied only after all candidates have
     /// been placed in stable package/capability/binding order.
+    ///
+    /// The enumeration order is the contract every loader depends on, so it is
+    /// stated once here rather than re-derived per capability:
+    ///
+    /// 1. Explicit `[channels.plugin.<alias>]` declarations, then
+    /// 2. auto-discovered tool and skill package bindings,
+    ///
+    /// each group ordered by package name, then capability, then binding. The
+    /// ceiling truncates that one sequence, so an operator-configured channel
+    /// can never be displaced by a package that merely happens to be installed.
+    ///
+    /// Nothing here touches component bytes: candidates are derived from the
+    /// manifests the package host already admitted, so a package with an
+    /// unloadable component still plans identically. That property is what lets
+    /// the ceiling be applied before any guest runs.
+    ///
+    /// The decision is a pure function of `config` and `host`: it holds no
+    /// counter and consumes no budget. Every physical registry reconstruction
+    /// (per agent, per CLI run, per delegate, per SOP execution) re-derives the
+    /// identical admitted set from the same snapshot instead of spending slots
+    /// cumulatively.
     pub(crate) fn build(config: &Config, host: &PluginHost) -> Result<Self, PluginError> {
         if !config.plugins.enabled {
             return Ok(Self {
@@ -125,23 +157,48 @@ impl PluginActivationPlan {
         })
     }
 
+    fn find(
+        &self,
+        package: &str,
+        capability: PluginCapability,
+        binding: &str,
+    ) -> Option<&PluginInstanceScope> {
+        self.admitted.iter().find(|scope| {
+            let id = scope.id();
+            id.package() == package && id.capability() == capability && id.binding() == binding
+        })
+    }
+
+    /// Whether this plan admitted one exact logical instance.
+    ///
+    /// The skill loader reads a directory per package rather than a component,
+    /// so it walks host details and asks this question instead of re-deriving
+    /// the admission rule for itself.
+    pub(crate) fn admits(
+        &self,
+        package: &str,
+        capability: PluginCapability,
+        binding: &str,
+    ) -> bool {
+        self.find(package, capability, binding).is_some()
+    }
+
     /// Return the exact host-issued scope admitted for one logical instance.
-    pub(crate) fn scope(
+    ///
+    /// Production construction iterates [`Self::scopes`] by capability; this
+    /// point lookup exists so tests can assert on a single admission decision.
+    #[cfg(test)]
+    fn scope(
         &self,
         package: &str,
         capability: PluginCapability,
         binding: &str,
     ) -> Option<PluginInstanceScope> {
-        self.admitted
-            .iter()
-            .find(|scope| {
-                let id = scope.id();
-                id.package() == package && id.capability() == capability && id.binding() == binding
-            })
-            .cloned()
+        self.find(package, capability, binding).cloned()
     }
 
-    fn scopes(
+    /// Admitted scopes of one capability, in the plan's enumeration order.
+    pub(crate) fn scopes(
         &self,
         capability: PluginCapability,
     ) -> impl Iterator<Item = PluginInstanceScope> + '_ {
@@ -152,6 +209,9 @@ impl PluginActivationPlan {
     }
 }
 
+/// An explicit channel binding activates only when some enabled agent actually
+/// routes to it. Without an owner the listener would run with nothing to
+/// deliver to, so an orphaned declaration is inert rather than half-live.
 #[cfg(feature = "plugins-wasm")]
 fn has_enabled_owner(config: &Config, binding: &str) -> bool {
     let channel_ref = format!("plugin.{binding}");
@@ -198,53 +258,253 @@ pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::Plu
             .saturating_mul(1024 * 1024),
         max_table_elements: config.plugins.limits.max_table_elements,
         max_instances: config.plugins.limits.max_instances,
+        call_timeout: std::time::Duration::from_millis(config.plugins.limits.call_timeout_ms),
     }
 }
 
-/// Construct every admitted channel plugin from the exact component bytes the
-/// package host verified. The returned channels carry their canonical alias in
-/// their host-issued `PluginChannelEndpoint`. Production callers must inject
-/// the typed host event router; a plugin listener never submits through the
-/// native channel sender.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
+    config
+        .channel_external_peers("plugin", alias)
+        .iter()
+        .any(|allowed| allowed == "*" || allowed == sender)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn channel_sender_authorizer(
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+    alias: String,
+) -> zeroclaw_plugins::wasm_channel::SenderAuthorizer {
+    match live_config {
+        Some(live_config) => {
+            Arc::new(move |sender| plugin_sender_allowed(&live_config.read(), &alias, sender))
+        }
+        None => Arc::new(move |sender| plugin_sender_allowed(&config, &alias, sender)),
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn valid_webhook_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn bounded_plugin_log_value(value: impl AsRef<str>, max_chars: usize) -> String {
+    let value = value.as_ref();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut bounded: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    bounded.push('…');
+    bounded
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn finalize_plugin_webhooks(
+    candidates: Vec<BuiltChannelCandidate>,
+    registry: Option<&PluginWebhookRegistryLease>,
+) -> Vec<Arc<dyn Channel>> {
+    let Some(registry) = registry else {
+        return candidates
+            .into_iter()
+            .map(|candidate| Arc::new(candidate.channel) as Arc<dyn Channel>)
+            .collect();
+    };
+
+    // Resolve every guest declaration before mutating the shared route map.
+    // Invalid or duplicate claims reject their entire channel instance so an
+    // advertised webhook channel can never run in a silently unreachable mode.
+    let mut paths = Vec::with_capacity(candidates.len());
+    let mut rejected = HashSet::new();
+    let mut claimants: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.channel.has_webhook_ingress() {
+            paths.push(None);
+            continue;
+        }
+        if !candidate.config_read {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "error_key": "plugin_webhook_config_read_required",
+                    })),
+                "Webhook channel plugin requires config_read; rejecting channel instance"
+            );
+            rejected.insert(index);
+            paths.push(None);
+            continue;
+        }
+
+        match candidate.channel.webhook_path().await {
+            Ok(Some(path)) if valid_webhook_path(&path) => {
+                claimants.entry(path.clone()).or_default().push(index);
+                paths.push(Some(path));
+            }
+            Ok(Some(path)) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "path": bounded_plugin_log_value(path, 128),
+                            "error_key": "plugin_webhook_path_invalid",
+                        })),
+                    "Webhook channel plugin declared an invalid route; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "error_key": "plugin_webhook_path_missing",
+                        })),
+                    "Webhook channel plugin advertised ingress without a route; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "error": bounded_plugin_log_value(format!("{error:#}"), 2_048),
+                            "error_key": "plugin_webhook_path_unavailable",
+                        })),
+                    "Webhook channel plugin route could not be resolved; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+        }
+    }
+
+    let ambiguous: HashSet<usize> = claimants
+        .values()
+        .filter(|indices| indices.len() > 1)
+        .flat_map(|indices| indices.iter().copied())
+        .collect();
+    let mut routes = HashMap::new();
+    let mut channels = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if rejected.contains(&index) {
+            continue;
+        }
+        if ambiguous.contains(&index) {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "path": paths[index],
+                        "error_key": "plugin_webhook_path_ambiguous",
+                    })),
+                "Multiple channel-plugin instances claimed one webhook route; rejecting every claimant"
+            );
+            continue;
+        }
+
+        if let Some(path) = paths[index].as_ref() {
+            let (sink, receiver) = tokio::sync::mpsc::channel(64);
+            candidate.channel.set_webhook_receiver(receiver);
+            routes.insert(path.clone(), sink);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "path": path,
+                    })),
+                "Registered channel-plugin webhook route"
+            );
+        }
+        channels.push(Arc::new(candidate.channel) as Arc<dyn Channel>);
+    }
+
+    if registry.replace(routes) {
+        channels
+    } else {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "plugin_webhook_generation_stale",
+                })),
+            "A newer channel supervisor owns plugin webhook routes; rejecting stale plugin channels"
+        );
+        Vec::new()
+    }
+}
+
+/// Construct every admitted channel plugin from the package the host verified.
+///
+/// The returned channels carry their canonical alias in their host-issued
+/// `PluginChannelEndpoint`, so the caller can register them under the ordinary
+/// `plugin.<alias>` composite key without re-deriving identity from config.
+///
+/// A package that fails to construct is logged and skipped: one broken plugin
+/// must not stop the daemon from starting its remaining channels.
+///
+/// No typed event router is installed on this path, so inbound traffic would
+/// reach the plain channel sender. That is what the health check wants: it
+/// constructs the same channels the daemon would and never runs their
+/// listeners.
 pub async fn configured_plugin_channels(
     config: Arc<Config>,
     live_config: Option<Arc<RwLock<Config>>>,
-    #[cfg(feature = "plugins-wasm")] event_router: zeroclaw_plugins::event::PluginEventRouter,
 ) -> Vec<Arc<dyn Channel>> {
-    configured_plugin_channels_inner(
+    Box::pin(configured_plugin_channels_with_webhooks(
         config,
         live_config,
-        #[cfg(feature = "plugins-wasm")]
-        Some(event_router),
-    )
-    .await
-}
-
-/// Construct channel plugins for health checks and tests that do not dispatch
-/// inbound traffic. Any guest message emitted in this mode fails closed.
-pub async fn configured_plugin_channels_without_event_dispatch(
-    config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
-) -> Vec<Arc<dyn Channel>> {
-    configured_plugin_channels_inner(
-        config,
-        live_config,
+        None,
         #[cfg(feature = "plugins-wasm")]
         None,
-    )
+    ))
     .await
 }
 
-async fn configured_plugin_channels_inner(
+/// Construct configured channel plugins and publish their validated webhook
+/// claims into one daemon-generation registry.
+///
+/// `event_router` is the host-owned typed boundary the daemon injects. Every
+/// constructed channel submits its inbound events through it, so the host
+/// resolves the live route and authorization for each event before it reaches
+/// the shared dispatcher.
+pub async fn configured_plugin_channels_with_webhooks(
     config: Arc<Config>,
     live_config: Option<Arc<RwLock<Config>>>,
+    webhook_registry: Option<&PluginWebhookRegistryLease>,
     #[cfg(feature = "plugins-wasm")] event_router: Option<
-        zeroclaw_plugins::event::PluginEventRouter,
+        &zeroclaw_plugins::event::PluginEventRouter,
     >,
 ) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
     {
-        let _ = (config, live_config);
+        let _ = (config, live_config, webhook_registry);
         Vec::new()
     }
 
@@ -280,17 +540,20 @@ async fn configured_plugin_channels_inner(
                 return Vec::new();
             }
         };
-        let services =
-            crate::tools::plugin_host_services(Arc::clone(&host), Arc::clone(&config), live_config);
+        let host_services = crate::tools::plugin_host_services(
+            Arc::clone(&host),
+            Arc::clone(&config),
+            live_config.clone(),
+        );
         let limits = plugin_limits(&config);
         let details = host.channel_plugin_details();
         let scopes: Vec<_> = plan.scopes(PluginCapability::Channel).collect();
         let admitted_count = scopes.len();
-        let mut channels: Vec<Arc<dyn Channel>> = Vec::with_capacity(admitted_count);
+        let mut candidates = Vec::with_capacity(admitted_count);
 
         for scope in scopes {
             let package = scope.id().package().to_string();
-            let Some((_, component)) = details
+            let Some((manifest, wasm_path)) = details
                 .iter()
                 .copied()
                 .find(|(manifest, _)| manifest.name == package)
@@ -318,19 +581,31 @@ async fn configured_plugin_channels_inner(
                     }
                 };
             let alias = endpoint.alias().to_string();
-            let constructed = if let Some(router) = event_router.clone() {
-                zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
-                    endpoint, component, &services, limits, router,
-                )
-                .await
-            } else {
-                zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm_without_event_dispatch(
-                    endpoint, component, &services, limits,
-                )
-                .await
-            };
-            match constructed {
-                Ok(channel) => channels.push(Arc::new(channel)),
+            let authorizer =
+                channel_sender_authorizer(Arc::clone(&config), live_config.clone(), alias.clone());
+            match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
+                endpoint,
+                wasm_path,
+                &host_services,
+                limits,
+            )
+            .await
+            {
+                Ok(channel) => {
+                    let channel = channel.with_sender_authorizer(authorizer);
+                    let channel = match event_router {
+                        Some(router) => channel.with_event_router(router.clone()),
+                        None => channel,
+                    };
+                    candidates.push(BuiltChannelCandidate {
+                        package: package.clone(),
+                        alias,
+                        config_read: manifest
+                            .permissions
+                            .contains(&zeroclaw_plugins::PluginPermission::ConfigRead),
+                        channel,
+                    });
+                }
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -352,12 +627,12 @@ async fn configured_plugin_channels_inner(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load).with_attrs(
                 ::serde_json::json!({
                     "admitted": admitted_count,
-                    "constructed": channels.len(),
+                    "constructed": candidates.len(),
                 })
             ),
             "Registered WASM channel plugins"
         );
-        channels
+        finalize_plugin_webhooks(candidates, webhook_registry).await
     }
 }
 
@@ -371,6 +646,64 @@ mod tests {
     use zeroclaw_config::schema::{AliasedAgentConfig, PluginChannelConfig};
 
     use super::*;
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn webhook_paths_use_the_bounded_single_segment_grammar() {
+        for path in ["a", "Fixture_01", "a-b", &"x".repeat(64)] {
+            assert!(valid_webhook_path(path), "expected valid path: {path:?}");
+        }
+        for path in [
+            "".to_string(),
+            "x".repeat(65),
+            "has.dot".to_string(),
+            "has/slash".to_string(),
+            "has space".to_string(),
+            "control\n".to_string(),
+            "unicode-λ".to_string(),
+        ] {
+            assert!(
+                !valid_webhook_path(&path),
+                "expected invalid path: {path:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn channel_sender_policy_resolves_plugin_peer_groups_live() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let live = Arc::new(RwLock::new(Config::default()));
+        let authorizer = channel_sender_authorizer(
+            Arc::new(Config::default()),
+            Some(Arc::clone(&live)),
+            "operations".to_string(),
+        );
+        assert!(!authorizer("alice"), "empty peer groups deny by default");
+
+        live.write().peer_groups.insert(
+            "operators".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("plugin.operations"),
+                external_peers: vec![PeerUsername::new("alice")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        assert!(authorizer("alice"));
+        assert!(!authorizer("Alice"), "plugin sender identity is exact");
+
+        live.write()
+            .peer_groups
+            .get_mut("operators")
+            .expect("operator peer group")
+            .external_peers = vec![PeerUsername::new("*")];
+        assert!(
+            authorizer("anyone"),
+            "wildcard uses native channel semantics"
+        );
+    }
 
     fn write_executable_plugin(root: &Path, name: &str, capabilities: &[&str]) {
         let plugin_dir = root.join(name);
@@ -484,6 +817,30 @@ mod tests {
         );
     }
 
+    /// Every package in the fixture carries an unloadable component, so a plan
+    /// that reached guest code could not be built at all. Planning the full
+    /// candidate set proves admission is decided from manifests alone.
+    #[test]
+    fn building_a_plan_never_touches_component_bytes() {
+        let (plugins, config, host) = fixture();
+        for package in ["alpha", "zeta"] {
+            let bytes = std::fs::read(plugins.path().join(package).join("plugin.wasm")).unwrap();
+            assert_eq!(
+                bytes, b"not a component",
+                "the fixture must stay unloadable for this proof to mean anything"
+            );
+        }
+
+        let plan = PluginActivationPlan::build(&config, &host)
+            .expect("planning must succeed without loading any component");
+
+        assert_eq!(
+            identities(&plan).len(),
+            5,
+            "two channels, two tools, and one skill are all planned from manifests"
+        );
+    }
+
     #[test]
     fn explicit_channel_does_not_require_auto_discovery() {
         let (_plugins, mut config, host) = fixture();
@@ -518,6 +875,72 @@ mod tests {
     }
 
     #[test]
+    fn explicit_channel_rejects_a_disabled_declaration() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.auto_discover = false;
+        config.channels.plugin.get_mut("ops").unwrap().enabled = false;
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.scope("alpha", PluginCapability::Channel, "ops")
+                .is_none(),
+            "a disabled declaration must not be admitted"
+        );
+        assert!(
+            plan.scope("alpha", PluginCapability::Channel, "backup")
+                .is_some(),
+            "disabling one alias must not disturb its sibling"
+        );
+    }
+
+    #[test]
+    fn explicit_channel_rejects_an_uninstalled_or_non_channel_package() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.auto_discover = false;
+        config.channels.plugin.insert(
+            "missing".to_string(),
+            PluginChannelConfig {
+                package: "not-installed".to_string(),
+                enabled: true,
+            },
+        );
+        // `zeta` is installed but declares only the tool capability.
+        config.channels.plugin.insert(
+            "toolonly".to_string(),
+            PluginChannelConfig {
+                package: "zeta".to_string(),
+                enabled: true,
+            },
+        );
+        let agent = config.agents.get_mut("operator").unwrap();
+        agent.channels.push(ChannelRef::new("plugin.missing"));
+        agent.channels.push(ChannelRef::new("plugin.toolonly"));
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.scope("not-installed", PluginCapability::Channel, "missing")
+                .is_none()
+        );
+        assert!(
+            plan.scope("zeta", PluginCapability::Channel, "toolonly")
+                .is_none(),
+            "a package without the channel capability must not back a channel binding"
+        );
+    }
+
+    #[test]
+    fn disabled_plugin_system_admits_nothing() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.enabled = false;
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(identities(&plan).is_empty());
+    }
+
+    #[test]
     fn explicit_channel_keeps_the_exact_host_alias_and_plugin_family() {
         let (_plugins, config, host) = fixture();
         let plan = PluginActivationPlan::build(&config, &host).unwrap();
@@ -534,5 +957,17 @@ mod tests {
                 .is_none(),
             "a configured alias must never fall back to the package binding"
         );
+    }
+
+    /// The loader must survive a package whose component cannot be loaded:
+    /// every fixture package is unloadable, so construction fails for all of
+    /// them and the daemon still gets a well-formed (empty) channel list.
+    #[tokio::test]
+    async fn an_unloadable_component_is_skipped_rather_than_fatal() {
+        let (_plugins, config, _host) = fixture();
+
+        let channels = configured_plugin_channels(Arc::new(config), None).await;
+
+        assert!(channels.is_empty());
     }
 }

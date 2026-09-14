@@ -4,37 +4,52 @@
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
-    ApprovalRequest as WitApprovalRequest, ApprovalResponse as WitApprovalResponse,
-    ChannelCapabilities, InboundMessage as WitInboundMessage,
-    MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
+    ApprovalPosition as WitApprovalPosition, ApprovalRequest as WitApprovalRequest,
+    ApprovalResponse as WitApprovalResponse, ChannelCapabilities,
+    InboundMessage as WitInboundMessage, MediaAttachment as WitMediaAttachment,
+    SendMessage as WitSendMessage, WebhookRejection as WitWebhookRejection,
+    WebhookRequest as WitWebhookRequest, WebhookResponse as WitWebhookResponse,
 };
 use crate::component::{
-    PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
-    load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_channel_store, call_store,
+    engine, load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
 use crate::event::{PluginEventError, PluginEventRouter};
-use crate::host::AdmittedComponent;
 use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use wasmtime::Store;
+use wasmtime::component::Component;
 use wasmtime::component::Linker;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::webhook::{
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookIdempotency, WebhookOutcome, WebhookReject,
+    WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
+};
+
+/// Live host policy for a normalized channel-plugin sender.
+pub type SenderAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
     endpoint: PluginChannelEndpoint,
+    /// Typed host boundary every inbound bridge submits through when the
+    /// runtime installs one. Absent for health checks and construction tests,
+    /// which keep the plain sender.
     event_router: Option<PluginEventRouter>,
     capabilities: ChannelCapabilities,
-    state: Mutex<(Store<PluginState>, ChannelPlugin)>,
+    state: Mutex<WarmPluginState<ChannelPlugin>>,
+    factory: ChannelInstanceFactory,
     inbound: InboundQueue,
     // Static component metadata, fixed for one admitted logical binding.
     // Changing the external account or these capabilities requires rebuilding
@@ -43,6 +58,33 @@ pub struct WasmChannel {
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
     poll_healthy: AtomicBool,
+    /// Applied at the final host boundary for polling and webhook delivery.
+    sender_authorizer: SenderAuthorizer,
+    /// Drain end of the bounded gateway-to-plugin queue. Set once by runtime
+    /// route publication and taken by the supervised listener.
+    webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
+}
+
+#[derive(Clone)]
+struct ChannelInstanceFactory {
+    component: Arc<Component>,
+    /// Required host-service bundle carrying the live config resolver. A
+    /// rebuilt instance re-runs the no-arg `configure()` and re-resolves
+    /// config and secrets through these services at each point of use, so an
+    /// interrupted instance is reconstructed against the same canonical config
+    /// source rather than a captured plaintext snapshot. The reinstantiation
+    /// metadata check still guards against the external account or capabilities
+    /// drifting under a rebuilt instance.
+    services: PluginHostServices,
+    limits: crate::component::PluginLimits,
+}
+
+struct ChannelInstance {
+    state: (Store<PluginState>, ChannelPlugin),
+    capabilities: ChannelCapabilities,
+    self_handle: Option<String>,
+    self_addressed_mention: Option<String>,
+    multi_message_delay_ms: u64,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -54,6 +96,10 @@ fn poll_health_ok(flag: &AtomicBool) -> bool {
 
 fn mark_poll_healthy(flag: &AtomicBool, healthy: bool) {
     flag.store(healthy, Ordering::Relaxed);
+}
+
+fn deny_all_senders() -> SenderAuthorizer {
+    Arc::new(|_| false)
 }
 
 impl Attributable for WasmChannel {
@@ -84,130 +130,100 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
+/// Build the sandboxed store backing a channel plugin.
+///
+/// Channel outbound HTTP is intentionally UNAVAILABLE on this host build: the
+/// store is constructed WITHOUT [`PluginStoreSpec::with_granted_http`], so even
+/// a channel whose manifest grants `HttpClient` receives no `wasi:http` surface.
+/// [`PluginState::http_enabled`] is therefore false, [`build_linker`] never
+/// wires `wasi:http`, and the guest cannot reach the network at all — genuinely
+/// unavailable, not "deny-all".
+///
+/// The reason this is fail-closed rather than governed: enabling `wasi:http`
+/// here would attach `wasmtime_wasi_http::p2::default_hooks()` — UNRESTRICTED
+/// egress with no destination allowlist, no metadata/loopback denial, no DNS
+/// pinning, and no connection budget. That is a fresh instance of the egress
+/// SSRF hole (issue 9395), which making channel construction a production
+/// caller must not introduce. Egress-governed channel HTTP is a follow-up that
+/// threads the `EgressHostService` through channel construction on top of the
+/// `PluginEgressHooks` work (issue 9582); until that lands, the channel surface
+/// stays off.
+fn new_channel_store(
+    scope: crate::instance::PluginInstanceScope,
+    services: PluginHostServices,
+    limits: crate::component::PluginLimits,
+    inbound: InboundQueue,
+) -> Store<PluginState> {
+    crate::component::new_store(PluginStoreSpec::new(scope, services, limits).with_inbound(inbound))
+}
+
 impl WasmChannel {
-    /// Construct a production channel whose inbound events must enter the
-    /// host-owned typed event router.
+    /// Build one admitted channel component.
+    ///
+    /// Inbound sender policy starts deny-all. A production owner must install
+    /// its live host policy with [`Self::with_sender_authorizer`] before calling
+    /// [`Channel::listen`].
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
-        component: &AdmittedComponent,
-        services: &PluginHostServices,
-        limits: crate::component::PluginLimits,
-        event_router: PluginEventRouter,
-    ) -> Result<Self> {
-        Self::from_wasm_with_router(endpoint, component, services, limits, Some(event_router)).await
-    }
-
-    /// Construct a channel only for health checks and tests that never dispatch
-    /// inbound traffic. If the guest does emit a message, the listen loop fails
-    /// closed instead of bypassing the typed host router.
-    pub async fn from_wasm_without_event_dispatch(
-        endpoint: PluginChannelEndpoint,
-        component: &AdmittedComponent,
+        wasm_path: &Path,
         services: &PluginHostServices,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        Self::from_wasm_with_router(endpoint, component, services, limits, None).await
-    }
-
-    async fn from_wasm_with_router(
-        endpoint: PluginChannelEndpoint,
-        component: &AdmittedComponent,
-        services: &PluginHostServices,
-        limits: crate::component::PluginLimits,
-        event_router: Option<PluginEventRouter>,
-    ) -> Result<Self> {
+        // Resolve and validate the operator config before any guest code is
+        // loaded, so an invalid section rejects registration rather than
+        // reaching a running instance. Config then stays host-owned and is
+        // served live through point-of-use imports; the factory replays the
+        // no-arg `configure()` against these same services when it rebuilds an
+        // interrupted instance, so a rebuilt instance re-resolves config
+        // rather than replaying a captured plaintext snapshot.
         services.resolve_config(endpoint.scope())?;
-        let component = load_component(component)?;
         let inbound = InboundQueue::default();
-        let mut store = crate::component::new_store(
-            PluginStoreSpec::new(endpoint.scope().clone(), services.clone(), limits)
-                .with_granted_http()
-                .with_inbound(inbound.clone()),
-        );
-        let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
-        crate::component::ensure_http_coherent(&store, http)?;
-        let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
-            wt_instantiate(
-                ChannelPlugin::instantiate_async(store, &component, &linker).await,
-                "failed to instantiate channel plugin",
-            )
-        });
-        let bindings = bindings?;
-
-        let channel = bindings.zeroclaw_plugin_channel();
-
-        // Let the plugin initialize before static discovery. Config stays
-        // host-owned and is available through point-of-use imports in this
-        // channel-service frame.
-        let configure_result: Result<()> =
-            call_channel_store!(store, async |store: &mut Store<PluginState>| {
-                wt(
-                    channel.call_configure(store).await,
-                    "channel.configure trapped",
-                )?
-                .map_err(anyhow::Error::msg)
-            });
-        configure_result?;
-
-        let static_exports: Result<_> = call_store!(store, async |store: &mut Store<
-            PluginState,
-        >| {
-            let capabilities = wt(
-                channel.call_get_channel_capabilities(&mut *store).await,
-                "channel.get-channel-capabilities failed",
-            )?;
-            let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
-                wt(
-                    channel.call_self_handle(&mut *store).await,
-                    "channel.self-handle failed",
-                )?
-            } else {
-                None
-            };
-            let cached_self_addressed_mention =
-                if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
-                    wt(
-                        channel.call_self_addressed_mention(&mut *store).await,
-                        "channel.self-addressed-mention failed",
-                    )?
-                } else {
-                    None
-                };
-            let cached_multi_message_delay_ms =
-                if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
-                    wt(
-                        channel.call_multi_message_delay_ms(store).await,
-                        "channel.multi-message-delay-ms failed",
-                    )?
-                } else {
-                    800
-                };
-            Ok((
-                capabilities,
-                cached_self_handle,
-                cached_self_addressed_mention,
-                cached_multi_message_delay_ms,
-            ))
-        });
-        let (
-            capabilities,
-            cached_self_handle,
-            cached_self_addressed_mention,
-            cached_multi_message_delay_ms,
-        ) = static_exports?;
+        let factory = ChannelInstanceFactory {
+            component: Arc::new(load_component(wasm_path)?),
+            services: services.clone(),
+            limits,
+        };
+        let instance = factory.instantiate(&endpoint, inbound.clone()).await?;
 
         Ok(Self {
             endpoint,
-            event_router,
-            capabilities,
-            state: Mutex::new((store, bindings)),
+            event_router: None,
+            capabilities: instance.capabilities,
+            state: Mutex::new(Some(instance.state)),
+            factory,
             inbound,
-            cached_self_handle,
-            cached_self_addressed_mention,
-            cached_multi_message_delay_ms,
+            cached_self_handle: instance.self_handle,
+            cached_self_addressed_mention: instance.self_addressed_mention,
+            cached_multi_message_delay_ms: instance.multi_message_delay_ms,
             poll_healthy: AtomicBool::new(true),
+            sender_authorizer: deny_all_senders(),
+            webhook_rx: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Rebuild an interrupted warm instance from the host-owned component,
+    /// scope, generation-scoped config snapshot, and limits, reattaching the
+    /// queued inbound backlog. A message the interrupted call had already
+    /// dequeued through `inbound-poll` is not requeued: inbound delivery to
+    /// the guest is at-most-once across an interruption, and only the
+    /// still-queued backlog survives reconstruction.
+    /// This does not lock `state`, so the shared call boundary may invoke it
+    /// while holding the slot lock.
+    async fn reinstantiate(&self) -> Result<(Store<PluginState>, ChannelPlugin)> {
+        let instance = self
+            .factory
+            .instantiate(&self.endpoint, self.inbound.clone())
+            .await?;
+        if instance.capabilities != self.capabilities
+            || instance.self_handle != self.cached_self_handle
+            || instance.self_addressed_mention != self.cached_self_addressed_mention
+            || instance.multi_message_delay_ms != self.cached_multi_message_delay_ms
+        {
+            anyhow::bail!(
+                "channel plugin metadata changed while recreating an interrupted instance"
+            );
+        }
+        Ok(instance.state)
     }
 
     /// Handle to this channel's inbound queue. A host-run listener clones it and
@@ -215,6 +231,186 @@ impl WasmChannel {
     /// drains them through its imported `inbound` interface.
     pub fn inbound(&self) -> InboundQueue {
         self.inbound.clone()
+    }
+
+    /// Install the live host sender policy used by every inbound bridge.
+    /// Empty or omitted policy is never interpreted as allow-all.
+    #[must_use]
+    pub fn with_sender_authorizer(mut self, authorizer: SenderAuthorizer) -> Self {
+        self.sender_authorizer = authorizer;
+        self
+    }
+
+    /// Install the host-owned typed event router. Every inbound bridge then
+    /// submits through it instead of the plain channel sender, so the host
+    /// resolves the live route and authorization for each event before it
+    /// reaches the shared dispatcher.
+    #[must_use]
+    pub fn with_event_router(mut self, router: PluginEventRouter) -> Self {
+        self.event_router = Some(router);
+        self
+    }
+
+    /// Whether this component advertises host-fed webhook ingress.
+    #[must_use]
+    pub fn has_webhook_ingress(&self) -> bool {
+        self.capabilities
+            .contains(ChannelCapabilities::WEBHOOK_INGRESS)
+    }
+
+    /// Resolve the guest-declared route before the runtime publishes any sink.
+    pub async fn webhook_path(&self) -> Result<Option<String>> {
+        if !self.has_webhook_ingress() {
+            return Ok(None);
+        }
+        call_channel!(
+            self,
+            async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                wt(
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_webhook_path(store)
+                        .await,
+                    "channel.webhook-path failed",
+                )
+            }
+        )
+    }
+
+    /// Attach the bounded gateway sink before this channel enters `listen`.
+    pub fn set_webhook_receiver(&self, receiver: mpsc::Receiver<RawWebhook>) {
+        *self
+            .webhook_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receiver);
+    }
+}
+
+impl ChannelInstanceFactory {
+    async fn instantiate(
+        &self,
+        endpoint: &PluginChannelEndpoint,
+        inbound: InboundQueue,
+    ) -> Result<ChannelInstance> {
+        // Channel outbound HTTP is intentionally withheld: routing through
+        // `new_channel_store` builds the store WITHOUT `with_granted_http`, so
+        // even a channel whose manifest grants `HttpClient` receives no
+        // `wasi:http` surface. Granting it would attach the ungoverned
+        // `default_hooks()` egress (a fresh instance of the SSRF hole, issue
+        // 9395); `new_channel_store` carries the full rationale and the issue
+        // 9582 egress-governed follow-up. Config and secrets still reach the
+        // guest through the live host services threaded into the store here.
+        let mut store = new_channel_store(
+            endpoint.scope().clone(),
+            self.services.clone(),
+            self.limits,
+            inbound,
+        );
+        let http = store.data().http_enabled();
+        let linker = build_linker(http)?;
+        crate::component::ensure_http_coherent(&store, http)?;
+        let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt_instantiate(
+                ChannelPlugin::instantiate_async(store, self.component.as_ref(), &linker).await,
+                "failed to instantiate channel plugin",
+            )
+        })?;
+
+        // Let the plugin initialize before static discovery. Config stays
+        // host-owned and is served live through the point-of-use imports in
+        // this channel-service frame, so the plugin resolves config and secrets
+        // itself rather than receiving them as a `configure` argument.
+        call_channel_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_configure(store)
+                    .await,
+                "channel.configure trapped",
+            )?
+            .map_err(anyhow::Error::msg)
+        })?;
+
+        let capabilities = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_get_channel_capabilities(store)
+                    .await,
+                "channel.get-channel-capabilities failed",
+            )
+        })?;
+
+        let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
+            call_store!(store, async |store: &mut Store<PluginState>| {
+                wt(
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_self_handle(store)
+                        .await,
+                    "channel.self-handle failed",
+                )
+            })?
+        } else {
+            None
+        };
+        let cached_self_addressed_mention =
+            if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
+                call_store!(store, async |store: &mut Store<PluginState>| {
+                    wt(
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_self_addressed_mention(store)
+                            .await,
+                        "channel.self-addressed-mention failed",
+                    )
+                })?
+            } else {
+                None
+            };
+        let cached_multi_message_delay_ms =
+            if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
+                call_store!(store, async |store: &mut Store<PluginState>| {
+                    wt(
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_multi_message_delay_ms(store)
+                            .await,
+                        "channel.multi-message-delay-ms failed",
+                    )
+                })?
+            } else {
+                800
+            };
+
+        Ok(ChannelInstance {
+            state: (store, bindings),
+            capabilities,
+            self_handle: cached_self_handle,
+            self_addressed_mention: cached_self_addressed_mention,
+            multi_message_delay_ms: cached_multi_message_delay_ms,
+        })
+    }
+
+    /// Run webhook authentication and parsing in a disposable configured
+    /// instance. Cancelling this future drops only this store; it cannot poison
+    /// the warm poll/send instance.
+    async fn parse_webhook(
+        &self,
+        endpoint: &PluginChannelEndpoint,
+        request: &WitWebhookRequest,
+    ) -> Result<Result<WitWebhookResponse, WitWebhookRejection>> {
+        let instance = self.instantiate(endpoint, InboundQueue::default()).await?;
+        let (mut store, bindings) = instance.state;
+        call_channel_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_parse_webhook(store, request)
+                    .await,
+                "channel.parse-webhook trapped",
+            )
+        })
     }
 }
 
@@ -231,6 +427,11 @@ fn from_wit_media(a: WitMediaAttachment) -> MediaAttachment {
         file_name: a.file_name,
         data: a.data,
         mime_type: a.mime_type,
+        // The plugin ABI carries bytes, not the host's text rendering, so a
+        // plugin-supplied attachment is unreferenced by definition. Widening
+        // the WIT record would be a breaking ABI change for no gain: a plugin
+        // channel has no marker for the pipeline to join against.
+        marker: None,
     }
 }
 
@@ -245,10 +446,62 @@ fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     }
 }
 
+/// Upper bound on a guest-asserted identity string, in bytes. Every platform
+/// identity this boundary has to carry (handle, email address, opaque user id,
+/// thread key) fits well inside it; anything longer is a payload, not an
+/// identity.
+const MAX_GUEST_IDENTITY_BYTES: usize = 512;
+
+/// Canonicalize a guest-asserted sender before it is compared against the
+/// operator's peer allowlist or used as a cancellation key component.
+///
+/// Returns `None` for a value the host refuses to carry at all: empty or
+/// whitespace-only, containing any control character, or longer than
+/// [`MAX_GUEST_IDENTITY_BYTES`]. A rejected value is denied even when the
+/// operator's allowlist is a wildcard, because it cannot be matched, logged or
+/// keyed on safely.
+fn host_normalized_sender(raw: &str) -> Option<String> {
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_GUEST_IDENTITY_BYTES {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Namespace a guest-asserted interruption scope by the admitted binding.
+///
+/// The scope participates in the host's cancellation key, so an un-namespaced
+/// guest value lets one package address a scope that belongs to another
+/// binding. Prefixing the admitted binding keeps the legitimate use (a guest
+/// isolating its own threads) while confining the value to its own namespace.
+/// A scope that does not survive canonicalization is dropped entirely, which
+/// falls the cancellation key back to the host-stamped reply target.
+fn host_namespaced_interruption_scope(
+    raw: Option<String>,
+    endpoint: &PluginChannelEndpoint,
+) -> Option<String> {
+    let raw = raw?;
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_GUEST_IDENTITY_BYTES {
+        return None;
+    }
+    Some(format!("{}:{trimmed}", endpoint.instance_id().binding()))
+}
+
 fn from_wit_inbound(msg: WitInboundMessage, endpoint: &PluginChannelEndpoint) -> ChannelMessage {
     ChannelMessage {
         id: msg.id,
-        sender: msg.sender,
+        // Guest-asserted platform identity. The host cannot authenticate it,
+        // so it is canonicalized here and authorized against the operator's
+        // peer allowlist before delivery; a value that canonicalizes to
+        // nothing stays empty and is denied at that gate.
+        sender: host_normalized_sender(&msg.sender).unwrap_or_default(),
         reply_target: msg.reply_target,
         content: msg.content,
         // Routing identity is issued by the host. Guest-supplied channel and
@@ -257,11 +510,293 @@ fn from_wit_inbound(msg: WitInboundMessage, endpoint: &PluginChannelEndpoint) ->
         channel_alias: Some(endpoint.alias().to_string()),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
-        interruption_scope_id: msg.interruption_scope_id,
+        interruption_scope_id: host_namespaced_interruption_scope(
+            msg.interruption_scope_id,
+            endpoint,
+        ),
         attachments: msg.attachments.into_iter().map(from_wit_media).collect(),
         subject: msg.subject,
         ..Default::default()
     }
+}
+
+fn sender_is_authorized(
+    authorizer: &SenderAuthorizer,
+    endpoint: &PluginChannelEndpoint,
+    message: &ChannelMessage,
+    ingress: &str,
+) -> bool {
+    // Canonicalization is part of the gate, not a courtesy applied earlier:
+    // a sender the host cannot canonicalize is denied outright, including
+    // under an allow-everything operator policy.
+    if let Some(sender) = host_normalized_sender(&message.sender)
+        && authorizer(&sender)
+    {
+        return true;
+    }
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "plugin": endpoint.instance_id().package(),
+                "channel_alias": endpoint.alias(),
+                "ingress": ingress,
+                "error_key": "plugin_channel_sender_denied",
+            })),
+        "Ignoring channel-plugin inbound from an unauthorized sender"
+    );
+    false
+}
+
+struct OwnedWebhookReservation {
+    idempotency: WebhookIdempotency,
+    token: Option<WebhookReservationToken>,
+}
+
+impl OwnedWebhookReservation {
+    fn new(idempotency: WebhookIdempotency, token: WebhookReservationToken) -> Self {
+        Self {
+            idempotency,
+            token: Some(token),
+        }
+    }
+
+    fn commit(mut self) -> bool {
+        let Some(token) = self.token.take() else {
+            return false;
+        };
+        self.idempotency.commit(&token)
+    }
+}
+
+impl Drop for OwnedWebhookReservation {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.idempotency.rollback(&token);
+        }
+    }
+}
+
+enum DeliveryReservation {
+    Untracked,
+    Owner(OwnedWebhookReservation),
+    Duplicate,
+}
+
+const WEBHOOK_DIAGNOSTIC_MAX_CHARS: usize = 2_048;
+
+fn bounded_webhook_detail(detail: impl AsRef<str>) -> String {
+    let detail = detail.as_ref();
+    if detail.chars().count() <= WEBHOOK_DIAGNOSTIC_MAX_CHARS {
+        return detail.to_string();
+    }
+    let mut bounded: String = detail
+        .chars()
+        .take(WEBHOOK_DIAGNOSTIC_MAX_CHARS.saturating_sub(1))
+        .collect();
+    bounded.push('…');
+    bounded
+}
+
+fn log_webhook_rejection(endpoint: &PluginChannelEndpoint, rejection: &WebhookReject) {
+    let (error_key, detail) = match rejection {
+        WebhookReject::Unauthorized(detail) => {
+            ("plugin_webhook_unauthorized", Some(detail.as_str()))
+        }
+        WebhookReject::BadRequest(detail) => ("plugin_webhook_invalid", Some(detail.as_str())),
+        WebhookReject::Unavailable(detail) => ("plugin_webhook_unavailable", Some(detail.as_str())),
+        WebhookReject::InvalidResponse => ("plugin_webhook_invalid_response", None),
+        WebhookReject::Timeout => ("plugin_webhook_timeout", None),
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "plugin": endpoint.instance_id().package(),
+                "channel_alias": endpoint.alias(),
+                "error": detail,
+                "error_key": error_key,
+            })),
+        "Channel-plugin webhook request rejected"
+    );
+}
+
+async fn reserve_webhook_delivery(
+    idempotency: Option<&WebhookIdempotency>,
+    message_id: &str,
+    cancellation: &zeroclaw_api::webhook::WebhookCancellation,
+) -> Result<DeliveryReservation, WebhookReject> {
+    let Some(idempotency) = idempotency else {
+        return Ok(DeliveryReservation::Untracked);
+    };
+    if message_id.is_empty() {
+        return Ok(DeliveryReservation::Untracked);
+    }
+
+    loop {
+        match idempotency.begin(message_id) {
+            WebhookReservation::Owner(token) => {
+                return Ok(DeliveryReservation::Owner(OwnedWebhookReservation::new(
+                    idempotency.clone(),
+                    token,
+                )));
+            }
+            WebhookReservation::Committed => return Ok(DeliveryReservation::Duplicate),
+            WebhookReservation::Unavailable => {
+                return Err(WebhookReject::Unavailable(
+                    "plugin webhook idempotency store is saturated".to_string(),
+                ));
+            }
+            WebhookReservation::InFlight(mut waiter) => {
+                let status = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(WebhookReject::Timeout),
+                    status = waiter.wait() => status,
+                };
+                match status {
+                    WebhookReservationStatus::Committed => {
+                        return Ok(DeliveryReservation::Duplicate);
+                    }
+                    WebhookReservationStatus::RolledBack => continue,
+                    WebhookReservationStatus::InFlight => {
+                        return Err(WebhookReject::Unavailable(
+                            "plugin webhook idempotency waiter remained in flight".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Hand one authorized inbound message to the host.
+///
+/// With a typed router installed the message enters the host boundary that
+/// resolves its live route and authorization; without one it goes to the plain
+/// channel sender, which is the health-check and construction-test path. Both
+/// ingress bridges go through here so neither can bypass the typed boundary.
+async fn submit_inbound(
+    router: Option<&PluginEventRouter>,
+    endpoint: &PluginChannelEndpoint,
+    tx: &mpsc::Sender<ChannelMessage>,
+    message: ChannelMessage,
+) -> Result<(), InboundSubmitError> {
+    let Some(router) = router else {
+        return tx
+            .send(message)
+            .await
+            .map_err(|_| InboundSubmitError::ReceiverClosed);
+    };
+    router
+        .submit(endpoint, message)
+        .await
+        .map_err(InboundSubmitError::Rejected)
+}
+
+enum InboundSubmitError {
+    /// The plain channel sender's receiving half is gone.
+    ReceiverClosed,
+    /// The typed host boundary refused or could not route the event.
+    Rejected(PluginEventError),
+}
+
+fn log_inbound_rejection(
+    endpoint: &PluginChannelEndpoint,
+    ingress: &str,
+    error: &PluginEventError,
+) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "plugin": endpoint.instance_id().package(),
+                "channel": endpoint.channel_type(),
+                "channel_alias": endpoint.alias(),
+                "ingress": ingress,
+                "error": bounded_webhook_detail(error.to_string()),
+                "error_key": "plugin_channel_event_rejected",
+            })),
+        "Channel-plugin event rejected by host routing"
+    );
+}
+
+async fn deliver_webhook_messages(
+    messages: Vec<WitInboundMessage>,
+    tx: &mpsc::Sender<ChannelMessage>,
+    router: Option<&PluginEventRouter>,
+    authorizer: &SenderAuthorizer,
+    endpoint: &PluginChannelEndpoint,
+    cancellation: &zeroclaw_api::webhook::WebhookCancellation,
+    idempotency: Option<&WebhookIdempotency>,
+) -> Result<(), WebhookReject> {
+    for message in messages {
+        let message = from_wit_inbound(message, endpoint);
+        if !sender_is_authorized(authorizer, endpoint, &message, "webhook") {
+            continue;
+        }
+
+        let reservation =
+            reserve_webhook_delivery(idempotency, message.id.trim(), cancellation).await?;
+        if matches!(reservation, DeliveryReservation::Duplicate) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": endpoint.instance_id().package(),
+                        "channel_alias": endpoint.alias(),
+                        "error_key": "plugin_webhook_duplicate",
+                    })),
+                "Duplicate plugin webhook message ignored"
+            );
+            continue;
+        }
+
+        let sent = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(WebhookReject::Timeout),
+            result = submit_inbound(router, endpoint, tx, message) => result,
+        };
+        // Either failure rolls the idempotency reservation back through
+        // `OwnedWebhookReservation`'s drop, so a vendor retry can own the
+        // delivery instead of being deduplicated against a message that never
+        // reached the runtime.
+        match sent {
+            Ok(()) => {}
+            Err(InboundSubmitError::ReceiverClosed) => {
+                return Err(WebhookReject::Unavailable(
+                    "channel inbound receiver closed".to_string(),
+                ));
+            }
+            Err(InboundSubmitError::Rejected(error)) => {
+                log_inbound_rejection(endpoint, "webhook", &error);
+                return Err(WebhookReject::Unavailable(bounded_webhook_detail(
+                    error.to_string(),
+                )));
+            }
+        }
+
+        if let DeliveryReservation::Owner(owner) = reservation
+            && !owner.commit()
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": endpoint.instance_id().package(),
+                        "channel_alias": endpoint.alias(),
+                        "error_key": "plugin_webhook_reservation_lost",
+                    })),
+                "Plugin webhook delivery completed after its idempotency ownership was lost"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
@@ -269,6 +804,10 @@ fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
         tool_name: req.tool_name.clone(),
         arguments_summary: req.arguments_summary.clone(),
         raw_arguments: req.raw_arguments.as_ref().map(|v| v.to_string()),
+        position: req.position.map(|p| WitApprovalPosition {
+            index: p.index,
+            total: p.total,
+        }),
     }
 }
 
@@ -307,77 +846,172 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-        const MAX_BACKOFF: Duration = Duration::from_millis(500);
-        let mut backoff = INITIAL_BACKOFF;
-        // Keep the poll loop inside the Channel::listen future. The
-        // orchestrator owns cancellation and restart supervision; detaching a
-        // second task here would make every apparent exit leak another loop.
-        loop {
-            let polled = call_channel!(
-                self,
-                async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_poll_message(store)
+        let webhook_receiver = self
+            .webhook_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+
+        // Keep both bridges inside Channel::listen. The orchestrator owns
+        // cancellation and restart supervision; detached tasks would outlive
+        // the channel generation that published their route.
+        let poll_loop = async {
+            const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+            const MAX_BACKOFF: Duration = Duration::from_millis(500);
+            let mut backoff = INITIAL_BACKOFF;
+            loop {
+                let polled: Result<Option<WitInboundMessage>> = call_channel!(
+                    self,
+                    async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                        wt(
+                            bindings
+                                .zeroclaw_plugin_channel()
+                                .call_poll_message(store)
+                                .await,
+                            "channel.poll-message trapped",
+                        )
+                    }
+                );
+                match polled {
+                    Ok(Some(wit_msg)) => {
+                        mark_poll_healthy(&self.poll_healthy, true);
+                        backoff = INITIAL_BACKOFF;
+                        let message = from_wit_inbound(wit_msg, &self.endpoint);
+                        if !sender_is_authorized(
+                            &self.sender_authorizer,
+                            &self.endpoint,
+                            &message,
+                            "poll",
+                        ) {
+                            continue;
+                        }
+                        match submit_inbound(
+                            self.event_router.as_ref(),
+                            &self.endpoint,
+                            &tx,
+                            message,
+                        )
                         .await
-                }
-            );
-            match polled {
-                Ok(Some(wit_msg)) => {
-                    mark_poll_healthy(&self.poll_healthy, true);
-                    backoff = INITIAL_BACKOFF;
-                    let message = from_wit_inbound(wit_msg, &self.endpoint);
-                    let Some(router) = self.event_router.as_ref() else {
-                        return Err(anyhow::Error::msg(
-                            "channel plugin emitted inbound traffic while event dispatch was disabled",
-                        ));
-                    };
-                    if let Err(error) = router.submit(&self.endpoint, message).await {
+                        {
+                            Ok(()) => {}
+                            Err(InboundSubmitError::ReceiverClosed) => return Ok(()),
+                            Err(InboundSubmitError::Rejected(error)) => {
+                                log_inbound_rejection(&self.endpoint, "poll", &error);
+                                // A routing refusal is a per-event decision and
+                                // the bridge stays up. A dispatcher that cannot
+                                // accept anything is a supervision concern, so
+                                // the listener surfaces it and is restarted.
+                                if matches!(error, PluginEventError::DispatchFailed(_)) {
+                                    return Err(anyhow::Error::new(error));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(None) => mark_poll_healthy(&self.poll_healthy, true),
+                    Err(error) => {
+                        mark_poll_healthy(&self.poll_healthy, false);
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Reject
+                                ::zeroclaw_log::Action::Inbound
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "channel": self.endpoint.channel_type(),
                                 "channel_alias": self.endpoint.alias(),
-                                "error": error.to_string(),
+                                "error": bounded_webhook_detail(format!("{error:#}")),
                             })),
-                            "channel plugin event rejected by host routing"
+                            "Channel plugin poll-message trapped; backing off"
                         );
-                        if matches!(error, PluginEventError::DispatchFailed(_)) {
-                            return Err(anyhow::Error::new(error));
+                    }
+                }
+
+                tokio::select! {
+                    () = tx.closed() => return Ok(()),
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        };
+        tokio::pin!(poll_loop);
+
+        let Some(mut webhook_receiver) = webhook_receiver else {
+            return poll_loop.await;
+        };
+        let webhook_factory = self.factory.clone();
+        let webhook_endpoint = self.endpoint.clone();
+        let webhook_authorizer = Arc::clone(&self.sender_authorizer);
+        let webhook_router = self.event_router.clone();
+        let webhook_tx = tx.clone();
+        let webhook_loop = async move {
+            while let Some(RawWebhook {
+                method,
+                query,
+                headers,
+                body,
+                cancellation,
+                idempotency,
+                reply,
+            }) = webhook_receiver.recv().await
+            {
+                let request = WitWebhookRequest {
+                    method,
+                    query,
+                    headers,
+                    body,
+                };
+                let parsed = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => None,
+                    result = webhook_factory.parse_webhook(&webhook_endpoint, &request) => {
+                        Some(result)
+                    }
+                };
+                let outcome = match parsed {
+                    Some(Ok(Ok(WitWebhookResponse::Messages(messages)))) => {
+                        deliver_webhook_messages(
+                            messages,
+                            &webhook_tx,
+                            webhook_router.as_ref(),
+                            &webhook_authorizer,
+                            &webhook_endpoint,
+                            &cancellation,
+                            idempotency.as_ref(),
+                        )
+                        .await
+                        .map(|()| WebhookOutcome::Ack)
+                    }
+                    Some(Ok(Ok(WitWebhookResponse::Reply(body)))) => {
+                        if body.len() > MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+                            Err(WebhookReject::InvalidResponse)
+                        } else {
+                            Ok(WebhookOutcome::Body(body))
                         }
                     }
-                    continue;
+                    Some(Ok(Err(WitWebhookRejection::Unauthorized(detail)))) => {
+                        Err(WebhookReject::Unauthorized(bounded_webhook_detail(detail)))
+                    }
+                    Some(Ok(Err(WitWebhookRejection::BadRequest(detail)))) => {
+                        Err(WebhookReject::BadRequest(bounded_webhook_detail(detail)))
+                    }
+                    Some(Err(error)) => Err(WebhookReject::Unavailable(bounded_webhook_detail(
+                        format!("{error:#}"),
+                    ))),
+                    None => Err(WebhookReject::Timeout),
+                };
+                if let Err(rejection) = &outcome {
+                    log_webhook_rejection(&webhook_endpoint, rejection);
                 }
-                Ok(None) => {
-                    mark_poll_healthy(&self.poll_healthy, true);
-                }
-                Err(e) => {
-                    mark_poll_healthy(&self.poll_healthy, false);
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "channel": self.endpoint.channel_type(),
-                                "channel_alias": self.endpoint.alias(),
-                                "error": format!("{e:#}"),
-                            })),
-                        "channel plugin poll-message trapped; backing off"
-                    );
-                }
+                let _ = reply.send(outcome);
             }
+        };
+        tokio::pin!(webhook_loop);
 
-            tokio::select! {
-                () = tx.closed() => return Ok(()),
-                () = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+        tokio::select! {
+            result = &mut poll_loop => result,
+            () = &mut webhook_loop => poll_loop.await,
         }
     }
 
@@ -817,6 +1451,7 @@ mod tests {
             file_name: "photo.jpg".into(),
             data: vec![0xFF, 0xD8, 0xFF],
             mime_type: Some("image/jpeg".into()),
+            marker: None,
         };
         let back = from_wit_media(to_wit_media(&ma));
         assert_eq!(back.file_name, "photo.jpg");
@@ -829,6 +1464,20 @@ mod tests {
         let caps = ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SEND_DRAFT;
         assert!(caps.contains(ChannelCapabilities::HEALTH_CHECK));
         assert!(!caps.contains(ChannelCapabilities::PIN_MESSAGE));
+    }
+
+    #[test]
+    fn webhook_diagnostics_are_utf8_safe_and_bounded() {
+        let detail = "λ".repeat(WEBHOOK_DIAGNOSTIC_MAX_CHARS + 50);
+        let bounded = bounded_webhook_detail(detail);
+
+        assert_eq!(bounded.chars().count(), WEBHOOK_DIAGNOSTIC_MAX_CHARS);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn direct_channel_construction_has_no_implicit_webhook_sender_grant() {
+        assert!(!deny_all_senders()("any-sender"));
     }
 
     #[test]
@@ -846,19 +1495,54 @@ mod tests {
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
     }
 
+    #[test]
+    fn channel_http_surface_is_unavailable_even_when_granted() {
+        // Regression for the channel-activation egress hole. Making
+        // `WasmChannel::from_wasm` a production caller must NOT grant channels a
+        // usable outbound-HTTP surface on this host build: enabling `wasi:http`
+        // would attach the ungoverned `default_hooks()` egress (a fresh instance
+        // of the egress SSRF hole, issue 9395). The store is the security
+        // boundary, so a channel whose manifest GRANTS `HttpClient` must still
+        // carry no `wasi:http` context — the surface is unavailable, not
+        // "deny-all".
+        let granted_scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [crate::PluginPermission::HttpClient],
+        );
+        assert!(
+            granted_scope
+                .grants()
+                .allows(crate::PluginPermission::HttpClient),
+            "precondition: the channel scope must actually grant HttpClient"
+        );
+
+        let store = new_channel_store(
+            granted_scope,
+            crate::services::test_host_services(),
+            crate::component::test_limits(0),
+            InboundQueue::default(),
+        );
+
+        assert!(
+            !store.data().http_enabled(),
+            "a channel that grants HttpClient must NOT receive an outbound-HTTP \
+             surface: ungoverned default_hooks() egress is the SSRF hole"
+        );
+    }
+
     #[tokio::test]
     async fn channel_validates_config_before_loading_guest_code() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
-        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))
         }));
-        let component = AdmittedComponent::test_component(b"not-a-component");
-        let result = WasmChannel::from_wasm_without_event_dispatch(
+        let result = WasmChannel::from_wasm(
             endpoint,
-            &component,
+            Path::new("/path/that/must/not/exist.wasm"),
             &services,
             crate::component::test_limits(0),
         )
@@ -904,6 +1588,91 @@ mod tests {
             assert!(message.internal_sop_event.is_none());
             assert!(!message.passive_context);
             assert!(!message.explicitly_addressed);
+        }
+    }
+
+    fn guest_inbound(sender: &str, interruption_scope_id: Option<&str>) -> WitInboundMessage {
+        WitInboundMessage {
+            id: "evt-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: "room".to_string(),
+            content: "hello".to_string(),
+            channel: "guest-selected-type".to_string(),
+            channel_alias: None,
+            timestamp: 42,
+            thread_ts: None,
+            interruption_scope_id: interruption_scope_id.map(str::to_string),
+            attachments: Vec::new(),
+            subject: None,
+        }
+    }
+
+    #[test]
+    fn host_rejects_a_guest_sender_that_is_empty_or_control_bearing() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
+        // An operator wildcard is the weakest possible policy; canonicalization
+        // still has to hold, or `""` and `"a\u{0}b"` reach the cancellation key
+        // and the audit log as authorized identities.
+        let wildcard: SenderAuthorizer = Arc::new(|_| true);
+
+        for raw in ["", "   ", "\t", "a\u{0}b", "a\nb", "alice\u{7}"] {
+            let message = from_wit_inbound(guest_inbound(raw, None), &endpoint);
+            assert!(
+                !sender_is_authorized(&wildcard, &endpoint, &message, "poll"),
+                "an uncanonicalizable sender must be denied under a wildcard policy: {raw:?}"
+            );
+        }
+
+        let too_long = "a".repeat(MAX_GUEST_IDENTITY_BYTES + 1);
+        let message = from_wit_inbound(guest_inbound(&too_long, None), &endpoint);
+        assert!(
+            !sender_is_authorized(&wildcard, &endpoint, &message, "poll"),
+            "an over-long sender must be denied under a wildcard policy"
+        );
+
+        // Padding is canonicalized away before the compare, so an exact
+        // operator allowlist entry still matches.
+        let exact: SenderAuthorizer = Arc::new(|sender| sender == "alice");
+        let message = from_wit_inbound(guest_inbound("  alice  ", None), &endpoint);
+        assert_eq!(message.sender, "alice");
+        assert!(sender_is_authorized(&exact, &endpoint, &message, "poll"));
+    }
+
+    #[test]
+    fn guest_interruption_scope_is_namespaced_by_the_admitted_binding() {
+        let ops = PluginChannelEndpoint::new(
+            crate::instance::test_scope(PluginCapability::Channel, "ops", []),
+            "plugin",
+        )
+        .unwrap();
+        let backup = PluginChannelEndpoint::new(
+            crate::instance::test_scope(PluginCapability::Channel, "backup", []),
+            "plugin",
+        )
+        .unwrap();
+
+        let forged = from_wit_inbound(guest_inbound("alice", Some("shared-thread")), &ops);
+        let victim = from_wit_inbound(guest_inbound("alice", Some("shared-thread")), &backup);
+        assert_eq!(
+            forged.interruption_scope_id.as_deref(),
+            Some("ops:shared-thread")
+        );
+        assert_ne!(forged.interruption_scope_id, victim.interruption_scope_id);
+
+        // A guest cannot re-forge the namespace either: its own value is
+        // prefixed, never parsed.
+        let spoofed = from_wit_inbound(guest_inbound("alice", Some("backup:thread")), &ops);
+        assert_eq!(
+            spoofed.interruption_scope_id.as_deref(),
+            Some("ops:backup:thread")
+        );
+
+        // A scope the host cannot carry falls back to the host-stamped reply
+        // target rather than entering the key as-is.
+        for raw in ["", "  ", "a\u{0}b"] {
+            let dropped = from_wit_inbound(guest_inbound("alice", Some(raw)), &ops);
+            assert!(dropped.interruption_scope_id.is_none(), "scope {raw:?}");
         }
     }
 
