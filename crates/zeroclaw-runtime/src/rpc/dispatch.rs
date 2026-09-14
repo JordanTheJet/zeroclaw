@@ -986,6 +986,69 @@ impl RpcDispatcher {
         Err(denied)
     }
 
+    /// Confine a caller-selected session workspace to roots the agent is
+    /// authorized to reach.
+    ///
+    /// `session/new` lets the caller name a `cwd`, and the agent builder then
+    /// makes that path the session's workspace root, so selecting an entitled
+    /// agent must not also select an arbitrary directory on the daemon host.
+    /// Operator-level principals keep today's behaviour, which is what the
+    /// local TUI, ACP and editor flows use; every other principal is held to
+    /// the agent's own risk-profile policy, whose `allowed_roots` is the
+    /// operator's escape hatch for a project directory outside the workspace.
+    ///
+    /// The check runs against the resolved path, so a symlink out of the
+    /// workspace is refused, and a path that cannot be resolved at all is
+    /// refused rather than assumed benign.
+    fn confine_session_cwd(
+        &self,
+        method: Method,
+        config: &Config,
+        alias: &str,
+        cwd: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        if auth.grants.admin {
+            return Ok(());
+        }
+        let refuse = |detail: String| {
+            let denied = rpc_err(FORBIDDEN, detail);
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            denied
+        };
+        let policy =
+            zeroclaw_config::policy::SecurityPolicy::for_agent(config, alias).map_err(|e| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to resolve agent policy: {e}"),
+                )
+            })?;
+        let requested = std::path::Path::new(cwd);
+        let resolved = requested.canonicalize().map_err(|_| {
+            refuse(format!(
+                "Session workspace {cwd:?} cannot be resolved; a scoped principal may only \
+                 select an existing directory inside agent {alias:?}'s workspace or one of \
+                 its risk profile's allowed_roots"
+            ))
+        })?;
+        if policy.is_resolved_path_allowed(&resolved) {
+            return Ok(());
+        }
+        Err(refuse(format!(
+            "Session workspace {cwd:?} is outside agent {alias:?}'s workspace {:?}; add the \
+             directory to the agent's risk profile allowed_roots to authorize it",
+            policy.workspace_dir
+        )))
+    }
+
     /// Whether this connection holds operator-level (admin) grants. An
     /// unauthenticated dispatcher (the direct unit-test handlers, which never
     /// reach a gated method through `process_line`) is not admin.
@@ -2204,6 +2267,13 @@ impl RpcDispatcher {
                     .to_string_lossy()
                     .to_string()
             });
+
+        // A caller-selected cwd replaces the agent's workspace jail further
+        // down, so it is authorized here. A resumed ACP session's persisted
+        // workspace and the agent's own default are host-owned and skip it.
+        if req.cwd.is_some() {
+            self.confine_session_cwd(Method::SessionNew, &config, &req.agent_alias, &cwd)?;
+        }
 
         let cwd_path = Some(std::path::Path::new(&cwd));
         let tui_env = req
@@ -7367,6 +7437,162 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["id"], json!(legacy.id), "{response}");
+    }
+
+    // ── A caller-selected session workspace is confined ──────────────
+    //
+    // `session/new` lets the caller name a `cwd`, which becomes the agent's
+    // workspace root. A scoped principal must not reach outside the agent's
+    // own workspace with it.
+
+    fn session_cwd_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        extra_allowed_root: Option<std::path::PathBuf>,
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let mut config = make_acp_test_config(tmp);
+        config.config_path = tmp.path().join("config.toml");
+        let agent_workspace = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(&agent_workspace).expect("the agent workspace is creatable");
+        let agent = config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists");
+        agent.workspace.path = Some(agent_workspace);
+        if let Some(root) = extra_allowed_root {
+            config
+                .risk_profiles
+                .entry("test-profile".into())
+                .or_default()
+                .allowed_roots
+                .push(root.to_string_lossy().to_string());
+        }
+        config.permission_profiles.insert(
+            "session-scoped".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["test-agent".into()],
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                grants: HashMap::from([(Resource::Sessions, vec![Verb::Create, Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["session-scoped".into()],
+            },
+        );
+        config
+    }
+
+    async fn session_new_with_cwd(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> Value {
+        rpc(
+            dispatcher,
+            rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": session_id,
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_select_a_cwd_outside_the_agent_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-outside", outside.path()).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            ctx.sessions.get_agent("s-outside").await.is_none(),
+            "a refused session/new must not leave a session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_may_select_a_cwd_inside_the_agent_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let inside = config.agent_workspace_dir("test-agent").join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-inside", &inside).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-inside"),
+            "{response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_principal_cwd_confinement_follows_symlinks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let link = config.agent_workspace_dir("test-agent").join("escape");
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-link", &link).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "a symlink out of the workspace is still out of the workspace: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_may_select_a_configured_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, Some(canonical.clone())));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-root", &canonical).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-root"),
+            "allowed_roots is the operator's escape hatch: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_and_shared_operator_keep_arbitrary_session_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let anywhere = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response =
+            session_new_with_cwd(&mut operator, &mut rx, "s-operator", anywhere.path()).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-operator"),
+            "the local operator's editor flows are untouched: {response}"
+        );
     }
 
     #[test]
