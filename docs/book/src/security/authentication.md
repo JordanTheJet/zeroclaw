@@ -54,6 +54,13 @@ Any **other** uid must be mapped by an explicit `[users.<name>].uid`
 entry. An unmapped uid (root included) is denied; there is no fallback to
 shared-operator access.
 
+A client may forward its shell environment in `initialize` so the
+daemon's subprocesses see its `PATH` and credential sockets (see
+[Environment variable pass-through](../zerocode/environment.md)). That
+snapshot is kept only for the trusted shared operator on a local
+connection. A roster principal, and every remote connection, gets the
+daemon's own environment instead.
+
 #### Recovery
 
 There is no remote recovery path. A remote authentication bypass is never
