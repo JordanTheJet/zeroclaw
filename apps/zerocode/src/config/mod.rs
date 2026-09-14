@@ -210,6 +210,7 @@ impl std::fmt::Debug for WssSection {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("auth_token_file", &self.auth_token_file)
             .field("auth_provider", &self.auth_provider)
             .field("tls", &self.tls)
             .field("relay_url", &self.relay_url)
@@ -229,6 +230,12 @@ pub(crate) struct WssSection {
     /// config file entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Path to a file holding the bearer, as an alternative to writing it
+    /// into this file. The file must be readable by its owner only; a
+    /// group- or world-readable one is refused rather than used. Takes
+    /// precedence over `auth_token` and yields to `ZEROCLAW_AUTH_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_file: Option<String>,
     /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
     /// to the daemon's `native` pairing provider when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
