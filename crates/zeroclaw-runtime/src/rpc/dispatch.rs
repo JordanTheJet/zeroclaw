@@ -6759,6 +6759,243 @@ mod tests {
         );
     }
 
+    // ── Auth republication through the real config mutation RPCs ─────
+    //
+    // Every mutation below goes through `process_line`: the real gate
+    // (`authorize`), the real handler, and the one validated
+    // save-and-swap boundary. Nothing calls `refresh_from_config`
+    // directly; the effect is observed on an ESTABLISHED connection's next
+    // privileged operation and on a FRESH handshake.
+
+    fn roster_config_in(tmp: &tempfile::TempDir, uid: u32) -> zeroclaw_config::schema::Config {
+        let mut config = roster_config(uid);
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config
+    }
+
+    fn local_peer(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, format!("unix:uid={uid}"))
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid },
+            );
+        (dispatcher, rx)
+    }
+
+    /// A connection bound as the daemon's own uid through the real
+    /// handshake: the trusted local operator that edits policy.
+    async fn local_operator(
+        ctx: &Arc<RpcContext>,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (mut dispatcher, rx) = local_peer(
+            ctx,
+            crate::security::auth_provider::PeercredAuthProvider::current_process_uid(),
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("the daemon's own uid is the trusted local operator");
+        (dispatcher, rx)
+    }
+
+    async fn roster_peer(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (mut dispatcher, rx) = local_peer(ctx, uid);
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        (dispatcher, rx)
+    }
+
+    /// Drive one request through `process_line` and return its response
+    /// frame (notifications interleaved on the same writer are skipped).
+    async fn rpc(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        dispatcher.process_line(&line).await;
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    fn can_list_sessions(
+        dispatcher: &mut RpcDispatcher,
+    ) -> Result<(), crate::rpc::auth::AuthDenied> {
+        dispatcher.authorize(
+            Method::SessionList,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Read,
+        )
+    }
+
+    #[tokio::test]
+    async fn map_key_delete_of_a_user_ends_its_binding_for_established_and_fresh_connections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        can_list_sessions(&mut alice).expect("alice starts granted");
+
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-delete",
+            json!({"path": "users", "key": "alice"}),
+        )
+        .await;
+        assert_eq!(response["result"]["deleted"], json!(true), "{response}");
+
+        let denied = can_list_sessions(&mut alice)
+            .expect_err("the deleted user's established binding ends at her next operation");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        let (mut fresh, _rx) = local_peer(&ctx, 4242);
+        let err = fresh
+            .handle_initialize(&json!({}))
+            .await
+            .expect_err("the old uid no longer binds");
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(!ctx.config.read().users.contains_key("alice"));
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!on_disk.contains("[users.alice]"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn map_key_delete_that_dangles_a_reference_is_rejected_with_nothing_persisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let generation = ctx.auth.generation();
+
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-delete",
+            json!({"path": "permission_profiles", "key": "reader"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            ctx.config.read().permission_profiles.contains_key("reader"),
+            "the live config is untouched"
+        );
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing reached disk"
+        );
+        assert_eq!(ctx.auth.generation(), generation, "no policy was published");
+        can_list_sessions(&mut alice).expect("alice keeps her grants");
+    }
+
+    #[tokio::test]
+    async fn map_key_create_of_an_incomplete_user_is_rejected_with_nothing_persisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let generation = ctx.auth.generation();
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        // A `[users.<name>]` entry with no uid and no profile can never
+        // authenticate; the validated boundary refuses it before disk.
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-create",
+            json!({"path": "users", "key": "bob"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(!ctx.config.read().users.contains_key("bob"));
+        assert!(!tmp.path().join("config.toml").exists());
+        assert_eq!(ctx.auth.generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn config_delete_of_a_uid_is_rejected_and_map_key_rename_republishes_the_roster() {
+        // config/delete users.alice.uid would leave an entry that can never
+        // authenticate: refused, alice keeps her binding.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+            let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+            let (mut operator, mut rx) = local_operator(&ctx).await;
+            let response = rpc(
+                &mut operator,
+                &mut rx,
+                1,
+                "config/delete",
+                json!({"prop": "users.alice.uid"}),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{response}"
+            );
+            assert_eq!(ctx.config.read().users["alice"].uid, Some(4242));
+            can_list_sessions(&mut alice).expect("alice keeps her binding");
+        }
+        // map-key-rename users.alice -> users.carol (the non-cascading
+        // path): the effective principal id changes, so alice's established
+        // binding ends and the uid now binds carol.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+            let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+            let (mut operator, mut rx) = local_operator(&ctx).await;
+            let response = rpc(
+                &mut operator,
+                &mut rx,
+                1,
+                "config/map-key-rename",
+                json!({"path": "users", "from": "alice", "to": "carol"}),
+            )
+            .await;
+            assert_eq!(response["result"]["renamed"], json!(true), "{response}");
+            let denied = can_list_sessions(&mut alice).expect_err("renamed principal");
+            assert_eq!(denied.code, AUTH_REQUIRED);
+            let (mut fresh, _rx) = local_peer(&ctx, 4242);
+            let bound = fresh
+                .handle_initialize(&json!({}))
+                .await
+                .expect("the uid binds the renamed entry");
+            assert_eq!(bound["principal_id"], json!("user:carol"));
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(on_disk.contains("[users.carol]"), "{on_disk}");
+            assert!(!on_disk.contains("[users.alice]"), "{on_disk}");
+        }
+    }
+
     #[test]
     fn authz_classification_spot_checks() {
         use zeroclaw_api::grants::{Resource, Verb};
