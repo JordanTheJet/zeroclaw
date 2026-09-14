@@ -928,6 +928,83 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// Fine-grained agent selector for the cron surface. Composes with the
+    /// coarse `Cron` grant the gate already enforced: both are required.
+    ///
+    /// This deliberately omits `selector_session_agent`'s constrained-tools
+    /// refusal. That refusal exists because an agent session runs the model's
+    /// whole tool loop with no per-tool principal awareness yet; a cron row
+    /// carries an owner and a command, and its execution path is gated
+    /// separately, so the tool selector is not the boundary here.
+    fn selector_cron_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if auth.grants.may_use_agent(alias) {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!("Principal is not entitled to agent {alias:?}"),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Resolve a cron job and confirm the caller is entitled to its owning
+    /// agent.
+    ///
+    /// A job owned by another agent reports the same `INVALID_PARAMS`
+    /// "Cron job not found" a genuinely missing id reports, so the guard does
+    /// not become an existence oracle. That matches
+    /// [`crate::cron::store::get_job_for_agent`]'s documented contract. Rows
+    /// written before the owner column exists carry an empty alias, and
+    /// `may_use_agent("")` is false for every non-admin principal, so those
+    /// legacy rows stay reachable only from operator-level grants.
+    fn authorize_cron_job(
+        &self,
+        method: Method,
+        config: &Config,
+        id: &str,
+    ) -> Result<crate::cron::CronJob, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let job = crate::cron::get_job(config, id)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        if auth.grants.may_use_agent(&job.agent_alias) {
+            return Ok(job);
+        }
+        let denied = rpc_err(
+            INVALID_PARAMS,
+            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: format!(
+                    "Principal is not entitled to agent {:?}, which owns cron job {id:?}",
+                    job.agent_alias
+                ),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Whether this connection holds operator-level (admin) grants. An
+    /// unauthenticated dispatcher (the direct unit-test handlers, which never
+    /// reach a gated method through `process_line`) is not admin.
+    fn has_admin_grants(&self) -> bool {
+        self.auth.as_ref().is_some_and(|auth| auth.grants.admin)
+    }
+
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
@@ -3872,21 +3949,27 @@ impl RpcDispatcher {
 
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let jobs = crate::cron::list_jobs(&config)
+        let mut jobs = crate::cron::list_jobs(&config)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron list failed: {e}")))?;
+        // One query, then drop what this principal is not entitled to see.
+        // An operator-level principal keeps the whole list; a scoped one sees
+        // only its own agents' rows, and legacy ownerless rows are nobody's.
+        if let Some(auth) = self.auth.as_ref() {
+            jobs.retain(|job| auth.grants.may_use_agent(&job.agent_alias));
+        }
         to_result(CronListResult { jobs })
     }
 
     async fn handle_cron_get(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = crate::cron::get_job(&config, &req.id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronGet, &config, &req.id)?;
         to_result(job)
     }
 
     async fn handle_cron_add(&self, params: &Value) -> RpcResult {
         let req: CronAddParams = parse_params(params)?;
+        self.selector_cron_agent(Method::CronAdd, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let schedule = Schedule::Cron {
             expr: req.schedule,
@@ -3907,6 +3990,7 @@ impl RpcDispatcher {
 
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
+        self.selector_cron_agent(Method::CronPatch, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
@@ -3922,16 +4006,32 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        let job = crate::cron::update_job(&config, &req.id, patch)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        // The ownership test rides in the `UPDATE` itself for a scoped
+        // principal, so an agent rename landing between the check and the
+        // write cannot open a window. An operator-level principal patches
+        // any row, including the ownerless legacy ones.
+        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let job = if self.has_admin_grants() {
+            crate::cron::update_job(&config, &req.id, patch)
+        } else {
+            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
         to_result(job)
     }
 
     async fn handle_cron_delete(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        crate::cron::remove_job(&config, &req.id)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronDelete, &config, &req.id)?;
+        // As with the patch path, a scoped principal's delete carries the
+        // owner into the statement so a concurrent rename cannot widen it.
+        if self.has_admin_grants() {
+            crate::cron::remove_job(&config, &req.id)
+        } else {
+            crate::cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
         to_result(CronDeleteResult {
             id: req.id,
             deleted: true,
@@ -3941,6 +4041,7 @@ impl RpcDispatcher {
     async fn handle_cron_runs(&self, params: &Value) -> RpcResult {
         let req: CronRunsParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
+        self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
         let limit = req.limit.unwrap_or(20) as usize;
         let runs = crate::cron::list_runs(&config, &req.id, limit)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
@@ -3950,8 +4051,7 @@ impl RpcDispatcher {
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = crate::cron::get_job(&config, &req.id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job(
             &config,
@@ -3973,6 +4073,10 @@ impl RpcDispatcher {
 
     async fn handle_cron_settings(&self, params: &Value) -> RpcResult {
         let config = self.ctx.config.read().clone();
+        // Scheduler settings are global, not per-agent, so no agent selector
+        // applies here. When the write branch below is implemented it must
+        // gate on an operator-level grant rather than an agent selector.
+        //
         // If a "patch" field is present, this is a write; otherwise read.
         if params.get("patch").is_some() {
             not_yet_implemented(Method::CronSettings)
@@ -7307,6 +7411,275 @@ mod tests {
             assert!(on_disk.contains("[users.carol]"), "{on_disk}");
             assert!(!on_disk.contains("[users.alice]"), "{on_disk}");
         }
+    }
+
+    // ── Cron RPC operations are scoped to the principal's agents ─────
+    //
+    // Two agents, one non-admin roster principal entitled to `alpha` only,
+    // and a `beta`-owned job. Every case drives the real wire method through
+    // `process_line`.
+
+    fn cron_roster_config_in(tmp: &tempfile::TempDir, uid: u32) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, PermissionProfileConfig, RiskProfileConfig, UserConfig,
+        };
+
+        let mut config = roster_config_in(tmp, uid);
+        std::fs::create_dir_all(&config.data_dir).expect("the data dir is creatable");
+        config.risk_profiles.insert(
+            "cron-profile".into(),
+            RiskProfileConfig {
+                allowed_commands: vec!["echo".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for alias in ["alpha", "beta"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    risk_profile: "cron-profile".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "cron-alpha".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                grants: HashMap::from([(
+                    Resource::Cron,
+                    vec![
+                        Verb::Create,
+                        Verb::Read,
+                        Verb::Update,
+                        Verb::Delete,
+                        Verb::Execute,
+                    ],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["cron-alpha".into()],
+            },
+        );
+        config
+    }
+
+    /// Seed a prompt job owned by `alias`. Prompt jobs need no shell policy,
+    /// which keeps the fixture about ownership rather than command approval.
+    fn seed_cron_job(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        name: &str,
+    ) -> crate::cron::CronJob {
+        crate::cron::add_agent_job(
+            config,
+            alias,
+            Some(name.to_string()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("the fixture job is created")
+    }
+
+    #[tokio::test]
+    async fn cron_list_hides_jobs_owned_by_other_agents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let alpha = seed_cron_job(&config, "alpha", "alpha-job");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config);
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "cron/list", json!({})).await;
+        let ids: Vec<&str> = response["result"]["jobs"]
+            .as_array()
+            .expect("a jobs array")
+            .iter()
+            .filter_map(|job| job["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![alpha.id.as_str()], "{response}");
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(&mut operator, &mut op_rx, 1, "cron/list", json!({})).await;
+        let mut ids: Vec<&str> = response["result"]["jobs"]
+            .as_array()
+            .expect("a jobs array")
+            .iter()
+            .filter_map(|job| job["id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        let mut expected = vec![alpha.id.as_str(), beta.id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "the operator still sees every job");
+    }
+
+    #[tokio::test]
+    async fn cron_get_runs_and_trigger_refuse_a_foreign_job_as_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        seed_cron_job(&config, "alpha", "alpha-job");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let absent = "00000000-0000-4000-8000-000000000000";
+        for (id, method, params) in [
+            (1u64, "cron/get", json!({"id": beta.id})),
+            (2, "cron/runs", json!({"id": beta.id})),
+            (3, "cron/trigger", json!({"id": beta.id})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"].as_str(),
+                Some(format!("Cron job not found: Cron job '{}' not found", beta.id).as_str()),
+                "{method}: a foreign job must not be an existence oracle"
+            );
+        }
+        // The same three methods on an id that genuinely does not exist
+        // produce the identical message shape.
+        for (id, method) in [(4u64, "cron/get"), (5, "cron/runs"), (6, "cron/trigger")] {
+            let response = rpc(&mut alice, &mut rx, id, method, json!({"id": absent})).await;
+            assert_eq!(
+                response["error"]["message"].as_str(),
+                Some(format!("Cron job not found: Cron job '{absent}' not found").as_str()),
+                "{method}: {response}"
+            );
+        }
+        // Nothing ran: the foreign job has no recorded status.
+        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        assert!(reread.last_status.is_none(), "the foreign job must not run");
+    }
+
+    #[tokio::test]
+    async fn cron_add_requires_the_agent_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "beta", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "a refused cron/add must not create a job"
+        );
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["agent_alias"],
+            json!("alpha"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_patch_and_delete_cannot_reach_a_foreign_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": beta.id, "agent": "alpha", "name": "hijacked"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/delete",
+            json!({"id": beta.id}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+
+        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        assert_eq!(reread.name.as_deref(), Some("beta-job"));
+        assert_eq!(reread.prompt.as_deref(), beta.prompt.as_deref());
+    }
+
+    #[tokio::test]
+    async fn cron_admin_still_reaches_ownerless_legacy_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let legacy = seed_cron_job(&config, "legacy", "legacy-job");
+        // Rows written before the owner column exists carry an empty alias.
+        crate::cron::rename_jobs_by_agent(&config, "legacy", "")
+            .expect("the fixture row is re-owned");
+        let ctx = enforcement_ctx(config);
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "cron/get", json!({"id": legacy.id})).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "an ownerless row is not reachable from an agent selector: {response}"
+        );
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut op_rx,
+            1,
+            "cron/get",
+            json!({"id": legacy.id}),
+        )
+        .await;
+        assert_eq!(response["result"]["id"], json!(legacy.id), "{response}");
     }
 
     #[test]
