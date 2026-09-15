@@ -332,6 +332,10 @@ pub(crate) const APP_JS: &str = r##"(function () {
   }
 
   const state = { nodeId: '', pairingCode: '', caChainPem: '' };
+  // True while an /enroll POST is in flight. Once submission starts the daemon
+  // may already have consumed the one-time pairing code, so Stop must not be
+  // able to claim "nothing was sent".
+  let submitting = false;
 
   $('begin').addEventListener('click', async () => {
     setError('');
@@ -363,6 +367,10 @@ pub(crate) const APP_JS: &str = r##"(function () {
   });
 
   $('abort').addEventListener('click', () => {
+    // The button is disabled while submitting; this flag is the robust backstop.
+    // Once the exchange is in flight the pairing code may already be spent, so
+    // "nothing was sent" would be a lie - refuse to act on Stop then.
+    if (submitting) return;
     state.nodeId = '';
     state.pairingCode = '';
     state.caChainPem = '';
@@ -374,7 +382,12 @@ pub(crate) const APP_JS: &str = r##"(function () {
 
   $('confirm').addEventListener('click', async () => {
     setError('');
+    submitting = true;
     $('confirm').disabled = true;
+    // Disable Stop for the duration: a late success still writes the cert after
+    // the daemon has consumed the code, so Stop must not race it with a false
+    // "nothing was sent".
+    $('abort').disabled = true;
     setStatus('Generating a key in this browser...');
     try {
       const material = await createEnrollmentMaterial('zeroclaw-browser');
@@ -406,9 +419,14 @@ pub(crate) const APP_JS: &str = r##"(function () {
       // The pairing code is one-time and now spent; drop our copy.
       state.pairingCode = '';
     } catch (error) {
+      // The exchange did not complete: let the operator retry, or now stop
+      // honestly (nothing was issued).
       setError(String(error.message || error));
       setStatus('');
       $('confirm').disabled = false;
+      $('abort').disabled = false;
+    } finally {
+      submitting = false;
     }
   });
 })();
@@ -628,4 +646,150 @@ process.stdout.write(JSON.stringify({{ fingerprint, sas }}));
             "the instructions must state certificate verification is on"
         );
     }
+
+    /// Run the FULL page driver (`APP_JS`) under node behind a minimal DOM +
+    /// fetch shim and a caller-supplied driver, returning the driver's JSON.
+    ///
+    /// Returns `None` when node is unavailable so the suite still runs; callers
+    /// assert loudly on the value when it is present.
+    fn run_page_app(driver: &str) -> Option<serde_json::Value> {
+        // No packages: enough of a DOM for the page's handlers, and a swappable
+        // fetch. Element stubs are cached by id, so `__el(id)` inside the driver
+        // is the same object the page mutated.
+        const DOM_SHIM: &str = r#"
+const __els = new Map();
+function __el(id) {
+  if (!__els.has(id)) {
+    __els.set(id, {
+      id, value: '', textContent: '', disabled: false, hidden: false, _click: null,
+      addEventListener(type, fn) { if (type === 'click') this._click = fn; },
+    });
+  }
+  return __els.get(id);
+}
+globalThis.document = { getElementById: __el };
+let __fetch = async () => { throw new Error('no fetch configured'); };
+globalThis.fetch = (...a) => __fetch(a[0], a[1]);
+function __click(id) { return __el(id)._click(); }
+const __nextTick = () => new Promise((r) => setImmediate(r));
+"#;
+        let dir = tempfile::tempdir().ok()?;
+        let script = dir.path().join("page-app.mjs");
+        std::fs::write(&script, format!("{DOM_SHIM}\n{APP_JS}\n{driver}\n")).ok()?;
+        let output = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .ok()?;
+        assert!(
+            output.status.success(),
+            "the page app failed under node: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).ok()
+    }
+
+    /// FIX 4: once the /enroll POST is in flight the daemon may already have
+    /// consumed the one-time pairing code, so a late-clicked Stop must NOT print
+    /// "nothing was sent" when issuance actually completes.
+    ///
+    /// The driver reaches the SAS step, confirms with an /enroll response held
+    /// open, clicks Stop mid-flight, then lets the enrollment succeed.
+    #[test]
+    fn stop_after_submit_does_not_falsely_claim_nothing_was_sent() {
+        let (ca_pem, _key) = zeroclaw_tls::testing::gen_ca();
+        let ca_json = serde_json::to_string(&ca_pem).expect("ca as a JS string literal");
+        // `replace` rather than `format!` so the driver's own `{}`/`${}` need no
+        // brace escaping.
+        let driver = DRIVER_STOP_RACE.replace("__CA_PEM_JSON__", &ca_json);
+
+        let Some(result) = run_page_app(&driver) else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+
+        // The core assertion: a real issuance must not be shadowed by a false
+        // "nothing was sent" from a mid-flight Stop.
+        let error_text = result["errorText"].as_str().unwrap_or_default();
+        assert!(
+            !error_text.to_ascii_lowercase().contains("nothing was sent"),
+            "Stop falsely claimed nothing was sent after a real issuance: {error_text:?}"
+        );
+        // Issuance completed honestly and is shown as Enrolled.
+        assert_eq!(result["statusText"].as_str(), Some("Enrolled."));
+        assert_eq!(result["stepDoneHidden"].as_bool(), Some(false));
+        assert_eq!(result["stepSasHidden"].as_bool(), Some(true));
+        assert_eq!(result["deviceShown"].as_str(), Some("device-xyz"));
+        assert!(
+            result["certShown"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("BEGIN CERTIFICATE"),
+            "the issued certificate must be shown"
+        );
+        // Stop was disabled while the enrollment was in flight (the primary
+        // defence; the handler's flag guard is the backstop the driver exercised
+        // by clicking anyway).
+        assert_eq!(
+            result["abortDisabledWhileInFlight"].as_bool(),
+            Some(true),
+            "Stop must be disabled while an enrollment is in flight"
+        );
+        // Crosscheck FIX 2: the confirmed CA was handed to the page.
+        assert_eq!(result["caShown"].as_str(), Some(ca_pem.as_str()));
+    }
+
+    const DRIVER_STOP_RACE: &str = r#"
+const caPem = __CA_PEM_JSON__;
+__el('node-id').value = 'node-1';
+__el('pairing-code').value = '482913';
+
+// Step 1: /enroll/ca resolves immediately, advancing the page to the SAS step.
+__fetch = async (path) => {
+  if (path === '/enroll/ca') {
+    return { ok: true, status: 200, json: async () => ({ ca_chain_pem: caPem }) };
+  }
+  throw new Error('unexpected preflight fetch: ' + path);
+};
+await __click('begin');
+if (__el('step-sas').hidden) throw new Error('did not reach the SAS step');
+
+// Step 2: confirm, with /enroll held open until we release it.
+let enrollRequested = false;
+let release;
+const held = new Promise((res) => { release = res; });
+__fetch = async (path) => {
+  if (path === '/enroll') { enrollRequested = true; return held; }
+  throw new Error('unexpected enroll fetch: ' + path);
+};
+const confirmDone = __click('confirm');
+
+// Wait until the enrollment POST is actually in flight.
+for (let i = 0; i < 10000 && !enrollRequested; i += 1) await __nextTick();
+if (!enrollRequested) throw new Error('the enrollment POST never started');
+
+// The operator clicks Stop mid-flight. Invoked directly (bypassing the disabled
+// attribute) to prove the in-flight guard itself, not merely the disabled button.
+const abortDisabledWhileInFlight = __el('abort').disabled;
+__click('abort');
+
+// The enrollment then completes successfully - the code was already spent.
+release({ ok: true, status: 200, json: async () => ({
+  device_id: 'device-xyz',
+  not_after: 1893456000,
+  cert_pem: '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n',
+  relay_profile: { relay_url: 'relay.test:9000', node_id: 'node-1' },
+}) });
+await confirmDone;
+
+process.stdout.write(JSON.stringify({
+  abortDisabledWhileInFlight,
+  errorText: __el('error').textContent,
+  statusText: __el('status').textContent,
+  stepDoneHidden: __el('step-done').hidden,
+  stepSasHidden: __el('step-sas').hidden,
+  deviceShown: __el('device-id').textContent,
+  certShown: __el('cert-pem').textContent,
+  caShown: __el('ca-pem').textContent,
+}));
+"#;
 }
