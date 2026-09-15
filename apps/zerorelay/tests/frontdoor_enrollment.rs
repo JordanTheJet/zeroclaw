@@ -118,7 +118,11 @@ async fn start_daemon_enrollment() -> Daemon {
     let ledger = Arc::new(
         zeroclaw_runtime::security::cert_ledger::CertLedger::open_in_memory(None).unwrap(),
     );
-    let pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(true, &[]));
+    let pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        true,
+        &[],
+        zeroclaw_config::pairing::PairingCodePolicy::default(),
+    ));
     let pairing_code = pairing.pairing_code().expect("a pairing code");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,6 +134,7 @@ async fn start_daemon_enrollment() -> Daemon {
         ca_key_pem: zeroize::Zeroizing::new(ca_key_pem),
         ledger: ledger.clone(),
         pairing,
+        pairing_code_policy: Arc::new(zeroclaw_config::pairing::PairingCodePolicy::default),
         static_client_pins_configured: false,
         allow_unpaired_until: None,
         relay_profile: zeroclaw_runtime::enroll::RelayProfile {
