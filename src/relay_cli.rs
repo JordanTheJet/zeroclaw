@@ -72,10 +72,23 @@ fn claim_outcome(status: u16, body: &str) -> Result<Claimed> {
 /// survive. The write is atomic, so a failure leaves the prior config intact.
 async fn write_claim_config(config: &mut Config, claimed: &Claimed) -> Result<()> {
     let known: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+    // Derive the outer-TLS SNI / `wss://` host from the freshly claimed relay
+    // address the same way the daemon does — the host portion of `host:port`
+    // (see `handle_run`'s `relay_host` derivation). Persisting it OVERWRITES any
+    // stale operator-set `[relay].relay_host`: the daemon prefers a non-empty
+    // `relay_host` over deriving from `relay.url`, so leaving an old value in
+    // place would make it dial the newly claimed relay under the OLD certificate
+    // name — a mismatch the "will register" success message would misreport.
+    let relay_host = claimed
+        .relay_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(claimed.relay_addr.as_str());
     let updates = [
         ("relay.enabled", "true"),
         ("relay.url", claimed.relay_addr.as_str()),
         ("relay.node-id", claimed.node_id.as_str()),
+        ("relay.relay-host", relay_host),
     ];
     for (path, value) in updates {
         let resolved = zeroclaw_config::helpers::resolve_field_path(&known, path);
@@ -430,6 +443,90 @@ mod tests {
             data_dir: dir.to_path_buf(),
             ..Default::default()
         }
+    }
+
+    /// Seed a config whose `[relay]` already pins a `relay_host` for a *different*
+    /// relay than the one about to be claimed, plus a comment and an unrelated
+    /// section that must survive the claim write.
+    fn seed_config_with_stale_relay_host(dir: &std::path::Path) -> Config {
+        let config_path = dir.join("config.toml");
+        let schema_version = Config::default().schema_version;
+        let seed = format!(
+            "schema_version = {schema_version}\n\n\
+             # Gateway listener — unrelated section, must survive untouched.\n\
+             [gateway]\n\
+             host = \"127.0.0.1\"\n\
+             port = 8080\n\n\
+             [relay]\n\
+             # keep-this-comment: operator note about the relay\n\
+             relay_host = \"old.example\"\n\
+             tofu = false\n"
+        );
+        std::fs::write(&config_path, seed).unwrap();
+        Config {
+            config_path,
+            data_dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn write_claim_config_overwrites_stale_relay_host_for_consistency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config_with_stale_relay_host(tmp.path());
+
+        write_claim_config(
+            &mut config,
+            &Claimed {
+                relay_addr: "new.example:8443".to_string(),
+                node_id: "node-xyz".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let written = std::fs::read_to_string(&config.config_path).unwrap();
+
+        // The stale host is gone: it would otherwise be preferred over the new
+        // url for TLS SNI + the wss URI, dialing the new relay under the old name.
+        assert!(
+            !written.contains("old.example"),
+            "stale relay_host must not survive the claim:\n{written}"
+        );
+
+        // The persisted profile is internally consistent: relay_host is either
+        // cleared (daemon derives from url) or equals the new url's host.
+        let reloaded: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reloaded.relay.url, "new.example:8443");
+        let derived_host = reloaded
+            .relay
+            .url
+            .rsplit_once(':')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_else(|| reloaded.relay.url.clone());
+        assert!(
+            reloaded.relay.relay_host.is_empty() || reloaded.relay.relay_host == derived_host,
+            "relay_host `{}` is inconsistent with url host `{derived_host}`",
+            reloaded.relay.relay_host
+        );
+
+        // Comments and the unrelated section still survive byte-for-byte.
+        assert!(
+            written.contains("# Gateway listener — unrelated section, must survive untouched."),
+            "unrelated-section comment lost:\n{written}"
+        );
+        assert!(
+            written.contains("[gateway]\nhost = \"127.0.0.1\"\nport = 8080"),
+            "unrelated section body changed:\n{written}"
+        );
+        assert!(
+            written.contains("# keep-this-comment: operator note about the relay"),
+            "in-section comment lost:\n{written}"
+        );
+        assert!(
+            written.contains("tofu = false"),
+            "sibling field lost:\n{written}"
+        );
     }
 
     #[tokio::test]
