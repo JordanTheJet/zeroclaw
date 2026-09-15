@@ -17,12 +17,19 @@
 //!
 //! Because nothing here is authenticated, every route is bounded *before*
 //! it can cause outbound work, by three independent limits held in
-//! [`OidcEnrollmentState`]: the gateway auth limiter refuses clients that
-//! are already locked out, a per-client sliding-window budget caps relay
+//! [`OidcEnrollmentState`]: an attempt limiter refuses clients that are
+//! already locked out, a per-client sliding-window budget caps relay
 //! requests per minute, and a process-wide semaphore caps how many IdP
 //! round trips can be in flight at once. Every response from these routes
 //! is `Cache-Control: no-store`: each one carries, or is one step from, a
 //! device code or an access token.
+//!
+//! The attempt limiter is this surface's own, not the gateway-wide
+//! `auth_limiter` that `POST /pair` and webhook auth share. Those two
+//! count only failures, so billing enrollment traffic to the same counter
+//! would let a browser sign-in loop lock a client out of pairing, and a
+//! wrong pairing code shorten the enrollment budget. Both limiters are
+//! built from the same thresholds and share the loopback exemption.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -45,6 +52,12 @@ use crate::{AppState, SlidingWindowRateLimiter};
 
 const FLOW_TTL: Duration = Duration::from_secs(600);
 const FLOW_CAP: usize = 32;
+
+/// Refusal when the pending-flow store is full. Raised twice: once before
+/// the IdP round trip that starts a flow, and once on the insert that
+/// follows it, so a burst that passes the first check still cannot push
+/// the store past its cap.
+const FLOW_STORE_FULL: &str = "too many in-flight sign-ins; retry shortly";
 
 /// Relay requests one client may spend per minute across the enrollment
 /// surface. RFC 8628 puts the default minimum polling interval at five
@@ -96,11 +109,22 @@ impl Default for OidcFlowStore {
 }
 
 impl OidcFlowStore {
+    /// Whether a flow started now would have somewhere to land, counting
+    /// only entries still inside the TTL. Checked *before* the IdP round
+    /// trip so a full store refuses without spending an outbound request;
+    /// [`Self::insert`] repeats the check for the flows that start between
+    /// this answer and their own insert.
+    fn has_capacity(&self) -> bool {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        flows.len() < FLOW_CAP
+    }
+
     fn insert(&self, pending: PendingPkce) -> Result<(), &'static str> {
         let mut flows = self.flows.lock();
         flows.retain(|_, p| p.created.elapsed() < self.ttl);
         if flows.len() >= FLOW_CAP {
-            return Err("too many in-flight sign-ins; retry shortly");
+            return Err(FLOW_STORE_FULL);
         }
         flows.insert(pending.flow.state.clone(), pending);
         Ok(())
@@ -114,10 +138,14 @@ impl OidcFlowStore {
 }
 
 /// Everything the enrollment routes need beyond [`AppState`]: the pending
-/// browser flows plus the two limits that bound what an unauthenticated
+/// browser flows plus the three limits that bound what an unauthenticated
 /// caller can make this gateway do.
 pub(crate) struct OidcEnrollmentState {
     flows: OidcFlowStore,
+    /// This surface's own attempt counter, deliberately separate from
+    /// `AppState::auth_limiter`: a lockout earned here must not reach
+    /// pairing or webhook auth, nor theirs reach enrollment.
+    attempts: crate::auth_rate_limit::AuthRateLimiter,
     poll_budget: SlidingWindowRateLimiter,
     pub(crate) outbound: Semaphore,
 }
@@ -126,6 +154,7 @@ impl Default for OidcEnrollmentState {
     fn default() -> Self {
         Self {
             flows: OidcFlowStore::default(),
+            attempts: crate::auth_rate_limit::AuthRateLimiter::new(),
             poll_budget: SlidingWindowRateLimiter::new(
                 POLL_BUDGET_PER_MINUTE,
                 POLL_BUDGET_WINDOW,
@@ -193,12 +222,19 @@ fn too_many_requests(message: &str, retry_after_secs: u64) -> Response {
     response
 }
 
-/// Brute-force gate: refuse a client the auth limiter has locked out.
-/// `record` distinguishes the flow-starting requests (counted on arrival)
-/// from polls, which are counted only once the IdP's answer shows the
-/// caller is polling too fast or feeding the relay invalid device codes.
-fn auth_gate(state: &AppState, key: &str, record: bool) -> Result<(), Box<Response>> {
-    if let Err(e) = state.auth_limiter.check_rate_limit(key) {
+/// Brute-force gate: refuse a client this surface's limiter has locked
+/// out. `record` distinguishes the flow-starting requests (counted on
+/// arrival, because each one commits the gateway to an IdP round trip)
+/// from the routes counted by outcome: a poll is counted once the IdP's
+/// answer shows the caller is polling too fast or feeding the relay
+/// invalid device codes, and a callback once it turns out not to have
+/// finished a sign-in.
+fn auth_gate(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+    record: bool,
+) -> Result<(), Box<Response>> {
+    if let Err(e) = enrollment_state.attempts.check_rate_limit(key) {
         return Err(Box::new(too_many_requests(
             &format!(
                 "Too many enrollment attempts. Try again in {}s.",
@@ -208,7 +244,7 @@ fn auth_gate(state: &AppState, key: &str, record: bool) -> Result<(), Box<Respon
         )));
     }
     if record {
-        state.auth_limiter.record_attempt(key);
+        enrollment_state.attempts.record_attempt(key);
     }
     Ok(())
 }
@@ -286,7 +322,7 @@ async fn handle_providers(
     headers: HeaderMap,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&state, &key, false) {
+    if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
     }
     if let Err(denied) = budget_gate(&relay, &key) {
@@ -314,7 +350,7 @@ async fn handle_device_start(
     headers: HeaderMap,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&state, &key, true) {
+    if let Err(denied) = auth_gate(&relay, &key, true) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
@@ -339,7 +375,10 @@ async fn handle_device_start(
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// No `Debug`: the one field is a device code, one successful poll away
+/// from an access token. Anything that needs to name this body writes a
+/// redacting impl rather than deriving one.
+#[derive(Deserialize)]
 struct DevicePollBody {
     device_code: String,
 }
@@ -353,7 +392,7 @@ async fn handle_device_poll(
     Json(body): Json<DevicePollBody>,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&state, &key, false) {
+    if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
     }
     if let Err(denied) = budget_gate(&relay, &key) {
@@ -374,7 +413,7 @@ async fn handle_device_poll(
             // The IdP says this caller is polling faster than the grant
             // allows. Count it: a caller that ignores back-off walks into
             // the same lockout a password guesser does.
-            state.auth_limiter.record_attempt(&key);
+            relay.attempts.record_attempt(&key);
             Json(serde_json::json!({ "status": "slow_down" })).into_response()
         }
         // Only what the enrolling client needs to authenticate: the access
@@ -391,12 +430,18 @@ async fn handle_device_poll(
             },
         }))
         .into_response(),
-        Err(e) => {
-            // An invalid or expired device code: what a caller relaying
-            // guesses produces, so it counts as an attempt too.
-            state.auth_limiter.record_attempt(&key);
-            error_json(StatusCode::BAD_GATEWAY, &format!("{e}"))
+        Ok(DevicePollOutcome::Denied(reason)) => {
+            // The IdP rejected the device code outright: what a caller
+            // relaying guesses produces, so it counts as an attempt too.
+            relay.attempts.record_attempt(&key);
+            error_json(
+                StatusCode::BAD_GATEWAY,
+                &format!("device grant failed: {reason}"),
+            )
         }
+        // A transport or parse failure on the way to the IdP says nothing
+        // about the caller, so it is not billed to them.
+        Err(e) => error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
     }
 }
 
@@ -413,7 +458,18 @@ fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Res
     let scheme = match forwarded_proto {
         Some(proto) => proto.to_string(),
         None => {
-            let tls_on = state.config.read().gateway.tls.is_some();
+            // A `[gateway.tls]` block that is present but not enabled is
+            // the schema default, and the server it configures listens in
+            // plain HTTP. Read `enabled`, exactly as the listener setup
+            // and the HSTS decision do: a `https://` redirect URI against
+            // an HTTP listener is one the browser can never come back to.
+            let tls_on = state
+                .config
+                .read()
+                .gateway
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.enabled);
             if tls_on {
                 "https".into()
             } else {
@@ -439,7 +495,7 @@ async fn handle_pkce_login(
     headers: HeaderMap,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&state, &key, true) {
+    if let Err(denied) = auth_gate(&relay, &key, true) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
@@ -450,6 +506,12 @@ async fn handle_pkce_login(
         Ok(uri) => uri,
         Err(response) => return *response,
     };
+    // Refuse a full store before the discovery round trip, not after it:
+    // otherwise every login past the cap still costs the gateway an
+    // outbound request to the IdP to produce a flow with nowhere to go.
+    if !relay.flows.has_capacity() {
+        return too_many_requests(FLOW_STORE_FULL, CAPACITY_RETRY_AFTER_SECS);
+    }
     let flow = {
         let Some(_permit) = outbound_permit(&relay) else {
             return relay_busy();
@@ -470,7 +532,10 @@ async fn handle_pkce_login(
     Redirect::temporary(&authorize_url).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+/// No `Debug`: `code` is an authorization code, redeemable for an access
+/// token until it is spent. Anything that needs to name this query writes
+/// a redacting impl rather than deriving one.
+#[derive(Deserialize)]
 struct CallbackQuery {
     #[serde(default)]
     state: Option<String>,
@@ -484,6 +549,20 @@ struct CallbackQuery {
     /// flow was started for before the response is acted on either way.
     #[serde(default)]
     iss: Option<String>,
+}
+
+/// A callback that did not finish a sign-in: no live flow for the state,
+/// a mix-up, an IdP refusal, a code that would not exchange. Each one is
+/// billed to the caller before the fixed page goes out — sprayed `state`
+/// values and replayed codes are exactly what this route has to bound —
+/// while the callback that completes an enrollment costs nothing.
+fn unproductive_callback(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+    status: StatusCode,
+) -> Response {
+    enrollment_state.attempts.record_attempt(key);
+    failure_page(status)
 }
 
 /// Fixed failure page: never echoes request content. Details go to the
@@ -549,13 +628,17 @@ async fn handle_pkce_callback(
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&state, &key, true) {
+    // Counted by outcome, not on arrival: the callback that finishes a
+    // browser sign-in is the successful end of a flow this gateway itself
+    // started, and charging it would halve how many sign-ins a shared
+    // address gets. Every other way out of this handler records below.
+    if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
     }
     // State gates everything: without a live matching flow there is
     // nothing to fail, let alone finish.
     let Some(pending) = query.state.as_deref().and_then(|s| relay.flows.consume(s)) else {
-        return failure_page(StatusCode::BAD_REQUEST);
+        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     };
     // RFC 9207: a response that names another issuer is a mix-up, and is
     // not acted on either way — neither its code nor its error verdict.
@@ -570,7 +653,7 @@ async fn handle_pkce_callback(
                 })),
             "oidc browser sign-in response names a different issuer"
         );
-        return failure_page(StatusCode::BAD_REQUEST);
+        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     }
     if let Some(error) = query.error {
         ::zeroclaw_log::record!(
@@ -584,17 +667,18 @@ async fn handle_pkce_callback(
                 })),
             "oidc browser sign-in denied by the identity provider"
         );
-        return failure_page(StatusCode::BAD_REQUEST);
+        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     }
     let Some(code) = query.code else {
-        return failure_page(StatusCode::BAD_REQUEST);
+        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     };
     let enrollment = match enrollment_for(&state, &pending.alias) {
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
-        Err(_) => return failure_page(StatusCode::BAD_REQUEST),
+        Err(_) => return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST),
     };
     let Some(_permit) = outbound_permit(&relay) else {
+        relay.attempts.record_attempt(&key);
         return relay_busy_page();
     };
     match enrollment.pkce_exchange(&pending.flow, &code).await {
@@ -614,7 +698,7 @@ async fn handle_pkce_callback(
                     })),
                 "oidc browser sign-in code exchange failed"
             );
-            failure_page(StatusCode::BAD_GATEWAY)
+            unproductive_callback(&relay, &key, StatusCode::BAD_GATEWAY)
         }
     }
 }
@@ -628,7 +712,7 @@ mod tests {
     use tower::ServiceExt as _;
     use wiremock::matchers::{body_string_contains, method as http_method, path as http_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use zeroclaw_config::schema::{Config, OidcConfig, OidcValidation};
+    use zeroclaw_config::schema::{Config, GatewayTlsConfig, OidcConfig, OidcValidation};
 
     use crate::auth_rate_limit::MAX_ATTEMPTS;
 
@@ -679,6 +763,17 @@ mod tests {
     /// A remote caller, which every per-client limit applies to.
     fn remote() -> SocketAddr {
         SocketAddr::from(([203, 0, 113, 7], 40000))
+    }
+
+    /// The key every limiter bills [`remote`] under: the peer IP, no port.
+    fn remote_key() -> String {
+        remote().ip().to_string()
+    }
+
+    /// How many requests the IdP mock has seen in total — the count that
+    /// says whether a refusal happened before or after any outbound call.
+    async fn total_requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
     }
 
     fn build_request(
@@ -910,6 +1005,94 @@ mod tests {
         );
     }
 
+    /// The `redirect_uri` the login redirect sent the browser off with,
+    /// still percent-encoded as the authorize URL carries it.
+    async fn login_redirect_uri(
+        config: Config,
+        trust_forwarded_headers: bool,
+        extra_headers: &[(&str, &str)],
+    ) -> String {
+        let mut state = crate::api::tests::test_state(config);
+        state.trust_forwarded_headers = trust_forwarded_headers;
+        let router = routes().with_state(state);
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            extra_headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        header_value(&response, "location")
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("redirect_uri="))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_login_redirect_uri_scheme_follows_the_effective_tls_setting() {
+        let server = idp().await;
+        let base = config_with_alias(&server.uri(), "corp");
+        let tls_block = |enabled: bool| {
+            Some(GatewayTlsConfig {
+                enabled,
+                cert_path: "/etc/zeroclaw/cert.pem".into(),
+                key_path: "/etc/zeroclaw/key.pem".into(),
+                client_auth: None,
+            })
+        };
+        let http_uri = query_escape("http://gw.local/oidc/callback");
+        let https_uri = query_escape("https://gw.local/oidc/callback");
+
+        // No `[gateway.tls]` block at all: a plain HTTP listener.
+        assert_eq!(
+            login_redirect_uri(base.clone(), false, &[]).await,
+            http_uri,
+            "no TLS configured"
+        );
+
+        // Present but disabled — the schema default for the block, and
+        // still a plain HTTP listener. An `https://` redirect URI here is
+        // one the browser could never come back to.
+        let mut disabled = base.clone();
+        disabled.gateway.tls = tls_block(false);
+        assert_eq!(
+            login_redirect_uri(disabled, false, &[]).await,
+            http_uri,
+            "[gateway.tls] present with enabled = false"
+        );
+
+        // Enabled: the listener really is HTTPS.
+        let mut enabled = base.clone();
+        enabled.gateway.tls = tls_block(true);
+        assert_eq!(
+            login_redirect_uri(enabled, false, &[]).await,
+            https_uri,
+            "[gateway.tls] present with enabled = true"
+        );
+
+        // A TLS-terminating proxy the deployment trusts outranks both:
+        // the browser's origin is the proxy's, not this listener's.
+        let forwarded = [("x-forwarded-proto", "https")];
+        assert_eq!(
+            login_redirect_uri(base.clone(), true, &forwarded).await,
+            https_uri,
+            "trusted X-Forwarded-Proto"
+        );
+
+        // The same header from a hop the deployment does not trust says
+        // nothing, and cannot talk the gateway into a foreign scheme.
+        assert_eq!(
+            login_redirect_uri(base, false, &forwarded).await,
+            http_uri,
+            "untrusted X-Forwarded-Proto is ignored"
+        );
+    }
+
     #[tokio::test]
     async fn callback_without_a_live_flow_is_refused() {
         let router = router_for(Config::default());
@@ -936,24 +1119,41 @@ mod tests {
 
     /// Start a browser flow and return the `state` the gateway issued.
     async fn start_login(router: &Router) -> String {
-        let response = send(router, "GET", "/oidc/login/corp", "gw.local", None).await;
+        start_login_as(router, loopback()).await
+    }
+
+    /// The same, from a chosen peer, for the tests that care which client
+    /// the flow is billed to.
+    async fn start_login_as(router: &Router, peer: SocketAddr) -> String {
+        let response = send_as(
+            router,
+            peer,
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap()
-            .to_string();
-        state_from_location(&location)
+        state_from_location(&header_value(&response, "location"))
     }
 
     #[tokio::test]
     async fn pkce_callback_exchanges_once_and_only_once() {
         let server = idp().await;
+        // The exchange must present the redirect URI stored when the flow
+        // started, byte for byte: RFC 6749 section 4.1.3 makes the IdP
+        // compare it against the one the authorize request carried, and a
+        // mock that does not see it answers 404 instead of a token.
         Mock::given(http_method("POST"))
             .and(http_path("/token"))
             .and(body_string_contains("grant_type=authorization_code"))
             .and(body_string_contains("code_verifier="))
+            .and(body_string_contains(format!(
+                "redirect_uri={}",
+                query_escape("http://gw.local/oidc/callback")
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-browser",
                 "expires_in": 3600,
@@ -1079,7 +1279,11 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+        // The limiter `POST /pair` and webhook auth share, kept to check
+        // that this surface's lockout does not spill onto them.
+        let shared_auth = Arc::clone(&state.auth_limiter);
+        let router = routes().with_state(state);
 
         for attempt in 0..MAX_ATTEMPTS {
             let response = send_as(
@@ -1113,6 +1317,20 @@ mod tests {
             requests_to(&server, "/token").await,
             outbound,
             "the locked-out caller caused no further outbound work"
+        );
+        assert!(
+            !shared_auth.is_locked_out(&remote_key()),
+            "an enrollment lockout must not reach /pair or webhook auth for \
+             the same client address"
+        );
+        // What `POST /pair` and webhook auth actually ask on arrival. The
+        // shared limiter holds no record of this client, so its next
+        // pairing attempt is served rather than refused for polls it never
+        // made — and `is_locked_out` alone would not notice, since only a
+        // check registers the lockout a recorded attempt earns.
+        assert!(
+            shared_auth.check_rate_limit(&remote_key()).is_ok(),
+            "pairing from the same address is still allowed"
         );
     }
 
@@ -1158,6 +1376,128 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!header_value(&response, "retry-after").is_empty());
         assert_eq!(requests_to(&server, "/token").await, outbound);
+    }
+
+    #[tokio::test]
+    async fn completed_browser_sign_ins_are_not_billed_as_attempts() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Five sign-ins in a row from one remote address — a shared office
+        // egress, or one user retrying. Each is a login (one attempt) plus
+        // the callback that finishes it (none): a completed enrollment is
+        // not a failed authentication and must not spend the budget.
+        for round in 0..5 {
+            let flow_state = start_login_as(&router, remote()).await;
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "sign-in {round}");
+            assert!(body_text(response).await.contains("\"at-browser\""));
+        }
+        assert!(!relay.attempts.is_locked_out(&remote_key()));
+
+        // Ten recorded attempts is already the lockout; five is not, so
+        // the next login is still served.
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "only the five logins were recorded, not the five callbacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn callbacks_without_a_live_flow_run_the_caller_into_the_lockout() {
+        let router = router_for(Config::default());
+
+        // A caller spraying `state` values at the callback is guessing at
+        // flows it did not start: each dead callback is an attempt.
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/callback?code=x&state=never-issued",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "callback {attempt}"
+            );
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/callback?code=x&state=never-issued",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relay_failure_reaching_the_idp_is_not_billed_to_the_caller() {
+        // An alias pointed at a closed loopback port: every poll fails in
+        // transport, before the IdP has said anything about the device
+        // code. That is the deployment's problem, not the caller's, so it
+        // must not walk a blameless client into a five-minute lockout.
+        let router = router_for(config_with_alias("http://127.0.0.1:1", "corp"));
+
+        // One more than the lockout threshold, and well inside the poll
+        // budget, so a 429 here could only come from a recorded attempt.
+        for attempt in 0..=MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "poll {attempt} is a relay failure, not an attempt"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1623,7 +1963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pending_flow_store_is_capped() {
+    async fn the_pending_flow_store_is_capped_before_the_idp_is_contacted() {
         let server = idp().await;
         let router = router_for(config_with_alias(&server.uri(), "corp"));
         for attempt in 0..FLOW_CAP {
@@ -1634,6 +1974,8 @@ mod tests {
                 "login {attempt}"
             );
         }
+        let outbound = total_requests(&server).await;
+
         let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!header_value(&response, "retry-after").is_empty());
@@ -1644,6 +1986,12 @@ mod tests {
                 .unwrap_or_default()
                 .contains("too many in-flight"),
             "{json}"
+        );
+        assert_eq!(
+            total_requests(&server).await,
+            outbound,
+            "a full store refuses without spending a discovery round trip \
+             on a flow that would have nowhere to land"
         );
     }
 
