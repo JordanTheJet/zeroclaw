@@ -61,7 +61,19 @@ env:
 # and is not an exposure.
 
 jobs:
-  # ── Fast serial gate: fail formatting errors before burning compute ───────
+  # ── Format and compile-runner selection ───────────────────────────────────
+  # Ordering note: `fmt` does not serialise the run. Only the jobs that read
+  # its `runner` / `use_blacksmith` outputs declare `needs: [fmt]`; every other
+  # job starts immediately, and `CI Required Gate` needs `fmt` directly, so a
+  # formatting error still blocks merge.
+  #
+  # TRADE-OFF, deliberate: a PR with a formatting error no longer skips the
+  # GitHub-hosted jobs, such as security, Landlock, web, docs, nix, relay
+  # smoke, and targeted Windows Clippy; they run and spend runner minutes
+  # before the gate reports red. In exchange, a slow `fmt` queue wait no longer holds
+  # every one of those jobs at zero during a GitHub-hosted runner shortage.
+  # The Blacksmith compile jobs still wait on `fmt` because their runner
+  # label comes from its outputs.
 
   fmt:
     name: Format
@@ -100,7 +112,6 @@ jobs:
 
   history-guard:
     name: Common Ancestor
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -116,7 +127,6 @@ jobs:
 
   repo-structure:
     name: Repository Structure
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -180,8 +190,7 @@ jobs:
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
-    # Its compile-heavy dependents still declare `fmt` directly, so nothing
-    # expensive starts before formatting passes.
+    # See the ordering note above `fmt` for which dependents still wait on it.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -220,7 +229,7 @@ jobs:
 
   relay-container-smoke:
     name: Relay Container Fresh-Volume Smoke
-    needs: [fmt, relay-container-smoke-changes]
+    needs: [relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -239,7 +248,7 @@ jobs:
         shell: bash
         run: ZERORELAY_SMOKE_IMAGE=zerorelay:smoke bash scripts/ci/smoke_relay_fresh_volume.sh
 
-  # ── Post-format required quality gate ─────────────────────────────────────
+  # ── Required quality gate ─────────────────────────────────────────────────
 
   lint:
     name: Lint
@@ -293,8 +302,7 @@ jobs:
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
-    # Its compile-heavy dependents still declare `fmt` directly, so nothing
-    # expensive starts before formatting passes.
+    # See the ordering note above `fmt` for which dependents still wait on it.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -333,7 +341,7 @@ jobs:
 
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
-    needs: [fmt, windows-clippy-tools-changes]
+    needs: [windows-clippy-tools-changes]
     if: needs.windows-clippy-tools-changes.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -363,7 +371,7 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
-  # ── Post-format build + check fan-out ─────────────────────────────────────
+  # ── Build + check fan-out ─────────────────────────────────────────────────
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
@@ -702,7 +710,7 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
-  # ── Post-format tests ─────────────────────────────────────────────────────
+  # ── Tests ─────────────────────────────────────────────────────────────────
 
   test:
     name: Test
@@ -783,7 +791,6 @@ jobs:
 
   windows-test-scope:
     name: Advisory Windows test selection
-    needs: [fmt]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1129,8 +1136,7 @@ jobs:
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
-    # Its compile-heavy dependents still declare `fmt` directly, so nothing
-    # expensive starts before formatting passes.
+    # See the ordering note above `fmt` for which dependents still wait on it.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -1202,7 +1208,6 @@ jobs:
 
   test-landlock:
     name: Test (Landlock)
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1227,11 +1232,10 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # ── Post-format security checks ───────────────────────────────────────────
+  # ── Security checks ───────────────────────────────────────────────────────
 
   security:
     name: Security
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1290,8 +1294,7 @@ jobs:
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
-    # Its compile-heavy dependents still declare `fmt` directly, so nothing
-    # expensive starts before formatting passes.
+    # See the ordering note above `fmt` for which dependents still wait on it.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -1348,7 +1351,7 @@ jobs:
 
   nix-eval:
     name: Nix Module Eval
-    needs: [fmt, path-changes]
+    needs: [path-changes]
     if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1363,7 +1366,7 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [fmt, path-changes]
+    needs: [path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1405,7 +1408,7 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [fmt, path-changes]
+    needs: [path-changes]
     if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1431,7 +1434,6 @@ jobs:
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1492,7 +1494,7 @@ jobs:
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [fmt, path-changes]
+    needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
