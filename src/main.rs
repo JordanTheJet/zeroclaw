@@ -3665,11 +3665,6 @@ Examples:
         /// Control-plane base URL, e.g. https://control.zerorelay.net.
         #[arg(long)]
         control: String,
-
-        /// Data dir holding the relay registration key. Defaults to the
-        /// daemon's configured data dir.
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
     },
 }
 
@@ -7249,18 +7244,8 @@ Add pricing to the active provider profile or supply a catalog entry."
 
         #[cfg(feature = "agent-runtime")]
         Commands::Relay { relay_command } => match relay_command {
-            RelayCommands::Claim {
-                token,
-                control,
-                data_dir,
-            } => {
-                Box::pin(relay_cli::handle_claim(
-                    &mut config,
-                    &token,
-                    &control,
-                    data_dir,
-                ))
-                .await
+            RelayCommands::Claim { token, control } => {
+                Box::pin(relay_cli::handle_claim(&mut config, &token, &control)).await
             }
         },
 

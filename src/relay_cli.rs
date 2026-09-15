@@ -6,7 +6,6 @@
 //! now-allowlisted relay on its next start. The byte-exact claim proof is built by
 //! `zeroclaw_runtime::relay_claim`, next to the registration key it must agree with.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -169,17 +168,19 @@ fn ensure_control_is_secure(control: &str) -> Result<String> {
     }
 }
 
-/// Handle `zeroclaw relay claim <TOKEN> --control <URL> [--data-dir <PATH>]`.
+/// Handle `zeroclaw relay claim <TOKEN> --control <URL>`.
 ///
 /// Fails closed: a bad token, a non-https control URL, an unreachable control
 /// plane, a non-success response, or an unwritable config each abort with an
 /// actionable message and never leave a partially written config.
-pub async fn handle_claim(
-    config: &mut Config,
-    claim_token: &str,
-    control: &str,
-    data_dir: Option<PathBuf>,
-) -> Result<()> {
+///
+/// The claim proof is always signed with the registration key under
+/// `config.data_dir` — the exact key the daemon loads and registers with on its
+/// next start. There is deliberately no independent data-dir override: proving a
+/// key under a different directory would allowlist a fingerprint the daemon then
+/// never presents. (`config.data_dir` still honors `ZEROCLAW_DATA_DIR` /
+/// `--config-dir`, which move the CLI and the daemon together.)
+pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str) -> Result<()> {
     let token = claim_token.trim();
     if token.is_empty() {
         anyhow::bail!(
@@ -196,7 +197,10 @@ pub async fn handle_claim(
     // it names. `control` is the validated destination.
     let control = ensure_control_is_secure(control)?;
 
-    let data_dir = data_dir.unwrap_or_else(|| config.data_dir.clone());
+    // Sign with the key the daemon will register with: the one under
+    // `config.data_dir`. Using any other directory would prove a fingerprint the
+    // daemon never presents at registration.
+    let data_dir = config.data_dir.clone();
     let signing_key_pkcs8 = zeroclaw_runtime::relay::ensure_signing_key(&data_dir)
         .context("loading the daemon relay registration key")?;
     let proof = zeroclaw_runtime::relay_claim::build_claim_proof(&signing_key_pkcs8, token)?;
@@ -401,7 +405,7 @@ mod tests {
         let mut config = seed_config(tmp.path());
         let before = std::fs::read_to_string(&config.config_path).unwrap();
 
-        let err = handle_claim(&mut config, "tok-secret", &control.uri(), None)
+        let err = handle_claim(&mut config, "tok-secret", &control.uri())
             .await
             .unwrap_err();
         // The redirect surfaced as a non-success status instead of being followed.
@@ -603,7 +607,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        handle_claim(&mut config, "tok-live", &server.uri(), None)
+        handle_claim(&mut config, "tok-live", &server.uri())
             .await
             .unwrap();
 
@@ -657,7 +661,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = handle_claim(&mut config, "tok-bad", &server.uri(), None)
+        let err = handle_claim(&mut config, "tok-bad", &server.uri())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"), "err: {err}");
@@ -665,6 +669,72 @@ mod tests {
         // The config file is byte-identical: no half-write on rejection.
         let after = std::fs::read_to_string(&config.config_path).unwrap();
         assert_eq!(before, after, "a rejected claim must not touch the config");
+    }
+
+    #[tokio::test]
+    async fn claim_proves_the_key_the_daemon_registers_with_from_config_data_dir() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The daemon loads its registration key from `config.data_dir`. Give the
+        // config its OWN data dir, distinct from any other directory, so the
+        // equality below is a real constraint on which key is proven.
+        let cfg_data = tempfile::TempDir::new().unwrap();
+        let config_home = tempfile::TempDir::new().unwrap();
+        let config_path = config_home.path().join("config.toml");
+        std::fs::write(&config_path, "schema_version = 3\n").unwrap();
+        let mut config = Config {
+            config_path,
+            data_dir: cfg_data.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": "node-id-eq",
+                "relay_addr": "relay.eq:8443",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        handle_claim(&mut config, "tok-eq", &server.uri())
+            .await
+            .unwrap();
+
+        // The fingerprint the claim PROVED (what the control plane allowlisted).
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let proven_fpr = sent["fingerprint"].as_str().unwrap().to_string();
+
+        // The fingerprint the daemon will REGISTER with: it loads the signing key
+        // from `config.data_dir` on start. `ensure_signing_key` is idempotent, so
+        // this reads back the very key the claim signed with. The fingerprint is
+        // sha256(pubkey) and independent of the token, so any token serves here.
+        let daemon_key = zeroclaw_runtime::relay::ensure_signing_key(&config.data_dir).unwrap();
+        let daemon_fpr = zeroclaw_runtime::relay_claim::build_claim_proof(&daemon_key, "any")
+            .unwrap()
+            .fingerprint;
+        assert_eq!(
+            proven_fpr, daemon_fpr,
+            "the claim must prove the exact key the daemon registers with (config.data_dir)"
+        );
+
+        // And the equality is dir-specific: a key under a DIFFERENT data dir — the
+        // fingerprint the removed `--data-dir` override could have proved — yields
+        // a different fingerprint, so this assertion is not vacuous.
+        let other = tempfile::TempDir::new().unwrap();
+        let other_key = zeroclaw_runtime::relay::ensure_signing_key(other.path()).unwrap();
+        let other_fpr = zeroclaw_runtime::relay_claim::build_claim_proof(&other_key, "any")
+            .unwrap()
+            .fingerprint;
+        assert_ne!(
+            proven_fpr, other_fpr,
+            "a different data dir must yield a different fingerprint"
+        );
     }
 
     // Minimal base64 STANDARD decode for the test assertion above; base64 is a
