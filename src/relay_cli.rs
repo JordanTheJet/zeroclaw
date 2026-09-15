@@ -11,6 +11,18 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use zeroclaw_config::schema::Config;
 
+/// Cap on the control plane's response body. A `/v1/claim` result is a tiny JSON
+/// object; anything larger is refused rather than buffered, so a hostile or
+/// malfunctioning endpoint cannot make the CLI read an unbounded body into memory.
+const MAX_CLAIM_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Upper bound on the claimed relay address (`host:port`). Generous for any real
+/// hostname, tight enough that a runaway value cannot bloat the written config.
+const MAX_RELAY_ADDR_LEN: usize = 255;
+
+/// Upper bound on the claimed node-id (an opaque ~32-hex capability in practice).
+const MAX_NODE_ID_LEN: usize = 128;
+
 /// A successful `/v1/claim` result: the relay to register against and the node-id
 /// bound to this daemon. Field names mirror the control plane's response body.
 #[derive(Debug)]
@@ -34,9 +46,66 @@ fn claim_request_body(
     })
 }
 
+/// Validate the claimed relay address the same way the relay path constrains a
+/// configured `relay.url`: it is a `host:port` dial target whose host portion
+/// becomes the outer-TLS SNI and the `wss://` authority. Reject control
+/// characters and whitespace (they would corrupt the persisted TOML value and
+/// the derived URI), an over-long value, and anything that is not `host:port`
+/// with a non-empty host and a `1..=65535` port. The daemon further rejects a
+/// host that is not a valid TLS server name at connect time; this surfaces the
+/// obvious failures early so no unusable config is written.
+fn validate_relay_addr(addr: &str) -> Result<()> {
+    if addr.len() > MAX_RELAY_ADDR_LEN {
+        anyhow::bail!(
+            "the control plane returned an over-long `relay_addr` ({} bytes); no config was written",
+            addr.len()
+        );
+    }
+    if addr.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!(
+            "the control plane returned a `relay_addr` with whitespace or control characters; \
+             no config was written"
+        );
+    }
+    let (host, port) = addr.rsplit_once(':').context(
+        "the control plane returned a `relay_addr` that is not `host:port`; no config was written",
+    )?;
+    if host.is_empty() {
+        anyhow::bail!(
+            "the control plane returned a `relay_addr` with an empty host; no config was written"
+        );
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok(()),
+        _ => anyhow::bail!(
+            "the control plane returned a `relay_addr` whose port is not 1..=65535; no config was written"
+        ),
+    }
+}
+
+/// Validate the claimed node-id. It is an opaque capability the daemon registers
+/// verbatim, so the constraints are minimal but real: bounded length, and no
+/// control characters or whitespace that would corrupt the persisted config.
+fn validate_node_id(node_id: &str) -> Result<()> {
+    if node_id.len() > MAX_NODE_ID_LEN {
+        anyhow::bail!(
+            "the control plane returned an over-long `node_id` ({} bytes); no config was written",
+            node_id.len()
+        );
+    }
+    if node_id.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!(
+            "the control plane returned a `node_id` with whitespace or control characters; \
+             no config was written"
+        );
+    }
+    Ok(())
+}
+
 /// Interpret the control plane's response. A non-success status surfaces the
 /// server's error and returns `Err`, so the caller writes no config. A success
-/// status must carry `relay_addr` and `node_id`; anything else is an error.
+/// status must carry `relay_addr` and `node_id`, and both must pass the same
+/// constraints the relay path enforces; anything else is an error.
 fn claim_outcome(status: u16, body: &str) -> Result<Claimed> {
     if !(200..300).contains(&status) {
         anyhow::bail!(
@@ -59,6 +128,8 @@ fn claim_outcome(status: u16, body: &str) -> Result<Claimed> {
         .filter(|s| !s.is_empty())
         .context("the control plane response is missing `node_id`; no config was written")?
         .to_string();
+    validate_relay_addr(&relay_addr)?;
+    validate_node_id(&node_id)?;
     Ok(Claimed {
         relay_addr,
         node_id,
@@ -229,7 +300,23 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
             format!("could not reach the ZeroRelay control plane at {url}; check --control and your network")
         })?;
     let status = response.status().as_u16();
-    let text = response.text().await.unwrap_or_default();
+    // Read the body under a hard cap so a hostile or malfunctioning control plane
+    // cannot make the CLI buffer an unbounded response into memory. A real claim
+    // result is a tiny JSON object; an oversized body is refused, not truncated
+    // into a misparse.
+    let (text, overflowed) =
+        match zeroclaw_tools::helpers::read_response_text(response, Some(MAX_CLAIM_RESPONSE_BYTES))
+            .await
+        {
+            Ok(read) => read,
+            Err(_) => (String::new(), false),
+        };
+    if overflowed {
+        anyhow::bail!(
+            "the ZeroRelay control plane returned an oversized response (> {MAX_CLAIM_RESPONSE_BYTES} bytes); \
+             no config was written"
+        );
+    }
     let claimed = claim_outcome(status, &text)?;
 
     Box::pin(write_claim_config(config, &claimed))
@@ -311,6 +398,35 @@ mod tests {
         assert!(claim_outcome(200, r#"{"node_id":"n-1"}"#).is_err());
         assert!(claim_outcome(200, r#"{"relay_addr":"r:1"}"#).is_err());
         assert!(claim_outcome(200, "not json").is_err());
+    }
+
+    #[test]
+    fn claim_outcome_rejects_malformed_relay_addr() {
+        // No port.
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"hostonly"}"#).is_err());
+        // Empty host.
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":":8443"}"#).is_err());
+        // Port out of range / zero.
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"h:99999"}"#).is_err());
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"h:0"}"#).is_err());
+        // Whitespace / control characters would corrupt the persisted value.
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"ho st:8443"}"#).is_err());
+        assert!(claim_outcome(200, "{\"node_id\":\"n\",\"relay_addr\":\"h:8443\\n\"}").is_err());
+        // A valid host:port — including a bracketed IPv6 literal — is accepted.
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"relay.example:8443"}"#).is_ok());
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"[2001:db8::1]:8443"}"#).is_ok());
+    }
+
+    #[test]
+    fn claim_outcome_rejects_malformed_node_id() {
+        // Control character in the node-id.
+        assert!(claim_outcome(200, "{\"node_id\":\"n\\u0000\",\"relay_addr\":\"h:1\"}").is_err());
+        // Whitespace in the node-id.
+        assert!(claim_outcome(200, r#"{"node_id":"n id","relay_addr":"h:1"}"#).is_err());
+        // Over-long node-id.
+        let huge = "n".repeat(MAX_NODE_ID_LEN + 1);
+        let body = format!(r#"{{"node_id":"{huge}","relay_addr":"h:1"}}"#);
+        assert!(claim_outcome(200, &body).is_err());
     }
 
     #[test]
@@ -669,6 +785,45 @@ mod tests {
         // The config file is byte-identical: no half-write on rejection.
         let after = std::fs::read_to_string(&config.config_path).unwrap();
         assert_eq!(before, after, "a rejected claim must not touch the config");
+    }
+
+    #[tokio::test]
+    async fn handle_claim_rejects_oversized_response_body_without_writing_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config(tmp.path());
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        // A well-formed success body padded past the cap: the fields are valid, so
+        // only the size guard can reject it.
+        let pad = "a".repeat(MAX_CLAIM_RESPONSE_BYTES + 4096);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": "node-ok",
+                "relay_addr": "relay.ok:8443",
+                "pad": pad,
+            })))
+            .mount(&server)
+            .await;
+
+        let err = handle_claim(&mut config, "tok-big", &server.uri())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("oversized"),
+            "an oversized body must be refused; err: {err}"
+        );
+
+        // No config was written despite the 200 status.
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an oversized response must not touch the config"
+        );
     }
 
     #[tokio::test]
