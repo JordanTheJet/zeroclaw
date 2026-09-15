@@ -196,10 +196,10 @@ fn is_loopback_host(host: &str) -> bool {
 /// opaque transport error.
 fn ensure_control_is_secure(control: &str) -> Result<String> {
     let url = reqwest::Url::parse(control).map_err(|_| {
-        anyhow::anyhow!(
+        anyhow::Error::msg(format!(
             "--control must be an absolute https:// URL (got `{control}`) — e.g. \
              https://control.zerorelay.net"
-        )
+        ))
     })?;
 
     // A `user[:pass]@host` authority makes reqwest connect to `host`, not to the
@@ -305,12 +305,9 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
     // result is a tiny JSON object; an oversized body is refused, not truncated
     // into a misparse.
     let (text, overflowed) =
-        match zeroclaw_tools::helpers::read_response_text(response, Some(MAX_CLAIM_RESPONSE_BYTES))
+        zeroclaw_tools::helpers::read_response_text(response, Some(MAX_CLAIM_RESPONSE_BYTES))
             .await
-        {
-            Ok(read) => read,
-            Err(_) => (String::new(), false),
-        };
+            .unwrap_or_default();
     if overflowed {
         anyhow::bail!(
             "the ZeroRelay control plane returned an oversized response (> {MAX_CLAIM_RESPONSE_BYTES} bytes); \
