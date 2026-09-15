@@ -22,8 +22,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::OidcConfig;
 
+use super::oidc::read_response_limited;
+
 #[derive(Debug, Clone, Deserialize)]
 struct EnrollmentDiscovery {
+    /// The identifier the document asserts for itself. Optional here only so
+    /// that its absence is refused with a specific error rather than a serde
+    /// field error; [`Enrollment::discovery`] requires it.
+    #[serde(default)]
+    issuer: Option<String>,
     #[serde(default)]
     device_authorization_endpoint: Option<String>,
     token_endpoint: String,
@@ -33,7 +40,7 @@ struct EnrollmentDiscovery {
     code_challenge_methods_supported: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceGrantStart {
     pub device_code: String,
     pub user_code: String,
@@ -43,6 +50,23 @@ pub struct DeviceGrantStart {
     pub expires_in: u64,
     #[serde(default = "default_poll_interval")]
     pub interval: u64,
+}
+
+/// `device_code` is the bearer credential of an in-flight device grant —
+/// whoever holds it can redeem the user's approval — so it is redacted here.
+/// Everything else is shown to the user by the enrolling client anyway and
+/// stays visible, which is what makes a trace of this struct worth having.
+impl std::fmt::Debug for DeviceGrantStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceGrantStart")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 fn default_poll_interval() -> u64 {
@@ -86,6 +110,11 @@ pub enum DevicePollOutcome {
     Pending,
     /// The IdP asked to slow down; add five seconds to the interval.
     SlowDown,
+    /// The IdP rejected the grant outright (`access_denied`,
+    /// `expired_token`, an unknown device code, and the like): the OAuth
+    /// error with its description. Distinct from a transport or parse
+    /// failure, which is an `Err` and says nothing about the device code.
+    Denied(String),
     /// The token was granted.
     Token(Box<EnrolledToken>),
 }
@@ -103,25 +132,52 @@ impl Enrollment {
         Ok(Self { config, http })
     }
 
-    async fn discovery(&self) -> Result<EnrollmentDiscovery> {
+    /// Fetch and verify the issuer's metadata document.
+    ///
+    /// RFC 8414 section 3.3 (and OIDC Discovery 4.3): the `issuer` the
+    /// document asserts must be byte-identical to the identifier the client
+    /// started from. A document that names another identifier is not this
+    /// issuer's metadata, whatever URL served it, so none of its endpoints may
+    /// be used. The check runs here — before any endpoint leaves this function
+    /// — so every flow built on it (device start, device poll,
+    /// `client_credentials`, PKCE start) is covered by construction and no
+    /// substituted document can point an enrollment at another provider.
+    ///
+    /// Returns the document together with that verified issuer identifier.
+    /// The body is read through the bounded reader shared with the verifier
+    /// sibling: an IdP document is untrusted input and is capped rather than
+    /// buffered to whatever length the peer likes.
+    async fn discovery(&self) -> Result<(EnrollmentDiscovery, String)> {
         let url = format!(
             "{}/.well-known/openid-configuration",
             self.config.issuer.trim_end_matches('/')
         );
-        self.http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+        let body = read_response_limited(self.http.get(&url).send().await?.error_for_status()?)
             .await
-            .context("issuer discovery document is not valid JSON")
+            .context("issuer discovery document could not be read")?;
+        let discovery: EnrollmentDiscovery =
+            serde_json::from_slice(&body).context("issuer discovery document is not valid JSON")?;
+        let Some(issuer) = discovery.issuer.clone() else {
+            bail!(
+                "the discovery document for {} has no issuer; refusing to use its endpoints",
+                self.config.issuer
+            );
+        };
+        if issuer != self.config.issuer {
+            bail!(
+                "the discovery document asserts issuer {issuer} but this alias is configured \
+                 for {}; the configured issuer must match the document's identifier exactly, \
+                 including any trailing slash",
+                self.config.issuer
+            );
+        }
+        Ok((discovery, issuer))
     }
 
     /// Start the Device Authorization Grant: returns the user code and
     /// verification URI to show the human, plus the polling parameters.
     pub async fn device_grant_start(&self) -> Result<DeviceGrantStart> {
-        let discovery = self.discovery().await?;
+        let (discovery, _issuer) = self.discovery().await?;
         let Some(endpoint) = discovery.device_authorization_endpoint else {
             bail!(
                 "issuer {} does not advertise a device_authorization_endpoint; \
@@ -139,15 +195,15 @@ impl Enrollment {
             .send()
             .await?
             .error_for_status()?;
-        response
-            .json()
+        let body = read_response_limited(response)
             .await
-            .context("device authorization response is not valid JSON")
+            .context("device authorization response could not be read")?;
+        serde_json::from_slice(&body).context("device authorization response is not valid JSON")
     }
 
     /// One poll of the token endpoint for an in-flight device grant.
     pub async fn device_grant_poll(&self, device_code: &str) -> Result<DevicePollOutcome> {
-        let discovery = self.discovery().await?;
+        let (discovery, _issuer) = self.discovery().await?;
         let mut form = vec![
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ("device_code", device_code),
@@ -162,26 +218,26 @@ impl Enrollment {
             .form(&form)
             .send()
             .await?;
-        if response.status().is_success() {
-            let token: EnrolledToken = response
-                .json()
-                .await
-                .context("token response is not valid JSON")?;
+        let success = response.status().is_success();
+        let body = read_response_limited(response)
+            .await
+            .context("token response could not be read")?;
+        if success {
+            let token: EnrolledToken =
+                serde_json::from_slice(&body).context("token response is not valid JSON")?;
             return Ok(DevicePollOutcome::Token(Box::new(token)));
         }
-        let err: OAuthError = response
-            .json()
-            .await
-            .context("OAuth error response is not valid JSON")?;
+        let err: OAuthError =
+            serde_json::from_slice(&body).context("OAuth error response is not valid JSON")?;
         match err.error.as_str() {
             "authorization_pending" => Ok(DevicePollOutcome::Pending),
             "slow_down" => Ok(DevicePollOutcome::SlowDown),
-            other => bail!(
-                "device grant failed: {other}{}",
+            other => Ok(DevicePollOutcome::Denied(format!(
+                "{other}{}",
                 err.error_description
                     .map(|d| format!(" ({d})"))
                     .unwrap_or_default()
-            ),
+            ))),
         }
     }
 
@@ -191,7 +247,7 @@ impl Enrollment {
         let Some(secret) = self.config.client_secret.as_deref() else {
             bail!("client_credentials enrollment requires oidc client_secret");
         };
-        let discovery = self.discovery().await?;
+        let (discovery, _issuer) = self.discovery().await?;
         let response = self
             .http
             .post(&discovery.token_endpoint)
@@ -199,16 +255,14 @@ impl Enrollment {
             .form(&[("grant_type", "client_credentials"), ("scope", "openid")])
             .send()
             .await?;
-        if response.status().is_success() {
-            return response
-                .json()
-                .await
-                .context("token response is not valid JSON");
-        }
         let status = response.status();
-        let err: OAuthError = response
-            .json()
+        let body = read_response_limited(response)
             .await
+            .context("token response could not be read")?;
+        if status.is_success() {
+            return serde_json::from_slice(&body).context("token response is not valid JSON");
+        }
+        let err: OAuthError = serde_json::from_slice(&body)
             .with_context(|| format!("token endpoint returned HTTP {status}"))?;
         bail!(
             "client_credentials enrollment failed: {}{}",
@@ -232,11 +286,15 @@ pub struct PkceFlow {
     pub(crate) verifier: String,
     pub(crate) redirect_uri: String,
     pub(crate) token_endpoint: String,
-    /// The issuer and client this flow was started for. The code exchange
-    /// posts credentials to `token_endpoint` (pinned at start); binding the
-    /// initiating issuer/client lets the exchange refuse to run if the alias
-    /// was repointed to a different provider while the flow was pending, so a
-    /// live A->B swap can never send B's client secret to A's endpoint.
+    /// The issuer and client this flow was started for. `issuer` is the
+    /// identifier the discovery document asserted, verified at start to be
+    /// exactly the configured one (the two are byte-equal once that check
+    /// passes), so it names the provider whose `token_endpoint` is pinned
+    /// above rather than merely what the config said. The code exchange posts
+    /// credentials to that endpoint; binding the initiating issuer/client lets
+    /// the exchange refuse to run if the alias was repointed to a different
+    /// provider while the flow was pending, so a live A->B swap can never send
+    /// B's client secret to A's endpoint.
     pub(crate) issuer: String,
     pub(crate) client_id: String,
 }
@@ -304,7 +362,8 @@ fn now_unix() -> u64 {
 /// Validate the id_token bundled with a code exchange against this flow
 /// (OIDC Core 3.1.3.7): the token must be a three-segment JWT whose claims
 /// name this flow's issuer, include this client in `aud` (with any `azp`
-/// equal to the client), have not expired, and echo this flow's `nonce`.
+/// equal to the client, and an `azp` REQUIRED when `aud` names more than one
+/// party), have not expired, and echo this flow's `nonce`.
 /// The signature is not checked separately: the token arrived over the
 /// TLS-verified token endpoint in a direct exchange, the case 3.1.3.7 step
 /// 6 exempts. The id_token is discarded afterwards; it is never presented
@@ -337,12 +396,18 @@ fn validate_id_token(id_token: &str, flow: &PkceFlow, now: u64) -> Result<()> {
         None => bail!("id_token carries no issuer claim; aborting enrollment"),
     }
 
-    let audience_includes_client = match claims.get("aud") {
-        Some(serde_json::Value::String(aud)) => aud == &flow.client_id,
-        Some(serde_json::Value::Array(list)) => list
-            .iter()
-            .any(|aud| aud.as_str() == Some(flow.client_id.as_str())),
-        _ => false,
+    // OIDC Core 3.1.3.7 step 3: `aud` must name this client. Step 4: when it
+    // names more than one party, `azp` is REQUIRED and must be this client —
+    // a token minted for an audience shared with other relying parties is
+    // only ours if it says so.
+    let (audience_includes_client, multiple_audiences) = match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => (aud == &flow.client_id, false),
+        Some(serde_json::Value::Array(list)) => (
+            list.iter()
+                .any(|aud| aud.as_str() == Some(flow.client_id.as_str())),
+            list.len() > 1,
+        ),
+        _ => (false, false),
     };
     if !audience_includes_client {
         bail!(
@@ -350,18 +415,31 @@ fn validate_id_token(id_token: &str, flow: &PkceFlow, now: u64) -> Result<()> {
             flow.client_id
         );
     }
-    if let Some(azp) = claims.get("azp")
-        && azp.as_str() != Some(flow.client_id.as_str())
-    {
-        bail!(
+    match claims.get("azp") {
+        Some(azp) if azp.as_str() != Some(flow.client_id.as_str()) => bail!(
             "id_token authorized party is not client {}; aborting enrollment",
             flow.client_id
-        );
+        ),
+        None if multiple_audiences => bail!(
+            "id_token names several audiences but carries no authorized party (azp) for \
+             client {}; aborting enrollment",
+            flow.client_id
+        ),
+        _ => {}
     }
 
-    let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) else {
+    // RFC 7519 NumericDate is a JSON number, not necessarily an integer: a
+    // fractional `exp` is legal, and is floored to whole seconds here. A
+    // non-numeric or negative value is not a NumericDate and is refused.
+    let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_f64) else {
         bail!("id_token carries no numeric exp claim; aborting enrollment");
     };
+    if !exp.is_finite() || exp < 0.0 {
+        bail!("id_token exp claim is not a valid NumericDate; aborting enrollment");
+    }
+    // Finite and non-negative, and a float-to-integer cast saturates rather
+    // than wrapping, so a far-future exp stays far-future.
+    let exp = exp.floor() as u64;
     if exp.saturating_add(ID_TOKEN_CLOCK_LEEWAY_SECS) <= now {
         bail!("id_token has expired; aborting enrollment");
     }
@@ -382,7 +460,7 @@ impl Enrollment {
     /// (RFC 8414 defaults the advertisement to `plain` when the field is
     /// absent): there is no downgrade path.
     pub async fn pkce_start(&self, redirect_uri: &str) -> Result<PkceFlow> {
-        let discovery = self.discovery().await?;
+        let (discovery, issuer) = self.discovery().await?;
         let Some(authorize_endpoint) = discovery.authorization_endpoint else {
             bail!(
                 "issuer {} does not advertise an authorization_endpoint; \
@@ -427,7 +505,7 @@ impl Enrollment {
             verifier,
             redirect_uri: redirect_uri.to_string(),
             token_endpoint: discovery.token_endpoint,
-            issuer: self.config.issuer.clone(),
+            issuer,
             client_id: self.config.effective_client_id().to_string(),
         })
     }
@@ -475,11 +553,12 @@ impl Enrollment {
             .form(&form)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let err: OAuthError = response
-                .json()
-                .await
+        let status = response.status();
+        let body = read_response_limited(response)
+            .await
+            .context("token response could not be read")?;
+        if !status.is_success() {
+            let err: OAuthError = serde_json::from_slice(&body)
                 .with_context(|| format!("token endpoint returned HTTP {status}"))?;
             bail!(
                 "authorization code exchange failed: {}{}",
@@ -489,10 +568,8 @@ impl Enrollment {
                     .unwrap_or_default()
             );
         }
-        let raw: serde_json::Map<String, serde_json::Value> = response
-            .json()
-            .await
-            .context("token response is not valid JSON")?;
+        let raw: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&body).context("token response is not valid JSON")?;
         match raw.get("id_token") {
             None => {}
             Some(serde_json::Value::String(id_token)) => {
@@ -680,6 +757,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
                 "device_authorization_endpoint": format!("{issuer}/device"),
                 "token_endpoint": format!("{issuer}/token"),
             })))
@@ -706,6 +784,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "code_challenge_methods_supported": ["S256"],
@@ -756,6 +835,111 @@ mod tests {
         assert!(err.to_string().contains("changed provider"), "{err}");
     }
 
+    /// RFC 8414 section 3.3: the identifier the discovery document asserts must
+    /// be exactly the configured one — a trailing slash makes it a different
+    /// issuer. The refusal has to land before any endpoint out of that document
+    /// is used, for every flow, or a substituted document steers the whole
+    /// enrollment; the `expect(0)` mocks are what pin that.
+    #[tokio::test]
+    async fn discovery_refuses_a_document_whose_issuer_differs() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": format!("{issuer}/"),
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        for endpoint in ["/device", "/token"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "never-minted",
+                })))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let enrollment = Enrollment::new(config(&issuer, Some("s3cret"))).unwrap();
+        let errors = [
+            enrollment.device_grant_start().await.unwrap_err(),
+            enrollment.device_grant_poll("dev-x").await.unwrap_err(),
+            enrollment.client_credentials().await.unwrap_err(),
+            enrollment
+                .pkce_start("http://127.0.0.1:1/cb")
+                .await
+                .unwrap_err(),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("asserts issuer {issuer}/")), "{msg}");
+            assert!(msg.contains(&format!("configured for {issuer}")), "{msg}");
+            assert!(msg.contains("trailing slash"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_refuses_a_document_without_an_issuer() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "token_endpoint": format!("{issuer}/token"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new(config(&issuer, None)).unwrap();
+        let err = enrollment.device_grant_start().await.unwrap_err();
+        assert!(err.to_string().contains("no issuer"), "{err}");
+    }
+
+    /// An IdP document is untrusted input of unbounded length. The shared
+    /// bounded reader refuses an oversized body before it is parsed, so no
+    /// endpoint out of it is ever reached.
+    #[tokio::test]
+    async fn discovery_refuses_an_oversized_document() {
+        use super::super::oidc::MAX_OIDC_RESPONSE_BYTES;
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let mut document = serde_json::json!({
+            "issuer": issuer,
+            "device_authorization_endpoint": format!("{issuer}/device"),
+            "token_endpoint": format!("{issuer}/token"),
+        });
+        document["padding"] = serde_json::json!("x".repeat(MAX_OIDC_RESPONSE_BYTES));
+        let body = document.to_string();
+        assert!(
+            body.len() > MAX_OIDC_RESPONSE_BYTES,
+            "the fixture must exceed the cap"
+        );
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new(config(&issuer, None)).unwrap();
+        let err = enrollment.device_grant_start().await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("size limit"), "{chain}");
+    }
+
     #[tokio::test]
     async fn device_grant_start_returns_user_code() {
         let server = idp_with_device_endpoint().await;
@@ -784,6 +968,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
                 "token_endpoint": format!("{issuer}/token"),
             })))
             .mount(&server)
@@ -840,9 +1025,13 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = Enrollment::new(config(&server.uri(), None)).unwrap();
-        let err = enrollment.device_grant_poll("dev-x").await.unwrap_err();
-        assert!(err.to_string().contains("access_denied"));
-        assert!(err.to_string().contains("user rejected"));
+        match enrollment.device_grant_poll("dev-x").await.unwrap() {
+            DevicePollOutcome::Denied(reason) => {
+                assert!(reason.contains("access_denied"), "{reason}");
+                assert!(reason.contains("user rejected"), "{reason}");
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -882,10 +1071,32 @@ mod tests {
         assert!(!dbg.contains("raw-refresh"));
         assert!(dbg.contains("<redacted>"));
     }
+
+    /// The device code is the bearer credential of an in-flight grant, so it
+    /// must never reach a log through a `{:?}`; the rest of the start response
+    /// is shown to the user anyway and stays legible.
+    #[test]
+    fn device_grant_start_debug_redacts_secrets() {
+        let start = DeviceGrantStart {
+            device_code: "raw-device-code".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://sso.example.com/activate".into(),
+            verification_uri_complete: Some("https://sso.example.com/activate?c=ABCD".into()),
+            expires_in: 600,
+            interval: 5,
+        };
+        let dbg = format!("{start:?}");
+        assert!(!dbg.contains("raw-device-code"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(dbg.contains("ABCD-EFGH"), "{dbg}");
+        assert!(dbg.contains("sso.example.com/activate"), "{dbg}");
+        assert!(dbg.contains("600"), "{dbg}");
+    }
     async fn idp_with_pkce(methods: Option<serde_json::Value>) -> MockServer {
         let server = MockServer::start().await;
         let issuer = server.uri();
         let mut discovery = serde_json::json!({
+            "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
         });
@@ -987,6 +1198,16 @@ mod tests {
         claims["aud"] = serde_json::json!(["other-app", flow.client_id]);
         claims["azp"] = serde_json::json!(flow.client_id);
         validate_id_token(&id_token_with(claims), &flow, now_unix()).unwrap();
+        // A single-entry audience array names one party, so OIDC Core 3.1.3.7
+        // step 4 asks for no azp; neither does a string audience (above).
+        let mut claims = valid_claims(&flow);
+        claims["aud"] = serde_json::json!([flow.client_id]);
+        validate_id_token(&id_token_with(claims), &flow, now_unix()).unwrap();
+        // RFC 7519 NumericDate may carry a fraction of a second; it is
+        // floored to whole seconds rather than refused.
+        let mut claims = valid_claims(&flow);
+        claims["exp"] = serde_json::json!(now_unix() as f64 + 600.5);
+        validate_id_token(&id_token_with(claims), &flow, now_unix()).unwrap();
         // Expiry is checked with a little clock leeway.
         let mut claims = valid_claims(&flow);
         claims["exp"] = serde_json::json!(now_unix() - ID_TOKEN_CLOCK_LEEWAY_SECS + 5);
@@ -1019,12 +1240,29 @@ mod tests {
         c["aud"] = serde_json::json!(["other-app", flow.client_id]);
         c["azp"] = serde_json::json!("other-app");
         cases.push(("authorized party", c));
+        // More than one audience without an azp: OIDC Core 3.1.3.7 step 4
+        // makes azp REQUIRED there, so the token is not demonstrably ours.
+        let mut c = valid_claims(&flow);
+        c["aud"] = serde_json::json!(["other-app", flow.client_id]);
+        cases.push(("authorized party", c));
         let mut c = valid_claims(&flow);
         c["exp"] = serde_json::json!(now_unix() - ID_TOKEN_CLOCK_LEEWAY_SECS - 10);
         cases.push(("expired", c));
         let mut c = valid_claims(&flow);
         c.as_object_mut().unwrap().remove("exp");
         cases.push(("exp", c));
+        // A NumericDate is a number: a string is not one, and neither is a
+        // negative instant. A fractional one is floored, so an ancient
+        // fraction is expired rather than accepted.
+        let mut c = valid_claims(&flow);
+        c["exp"] = serde_json::json!("1700000000");
+        cases.push(("no numeric exp", c));
+        let mut c = valid_claims(&flow);
+        c["exp"] = serde_json::json!(-1.0);
+        cases.push(("not a valid NumericDate", c));
+        let mut c = valid_claims(&flow);
+        c["exp"] = serde_json::json!(1.5);
+        cases.push(("expired", c));
         let mut c = valid_claims(&flow);
         c["nonce"] = serde_json::json!("some-other-flows-nonce");
         cases.push(("nonce", c));

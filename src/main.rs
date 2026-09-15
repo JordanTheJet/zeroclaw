@@ -9832,6 +9832,62 @@ fn open_url_in_system_browser(url: &str) -> bool {
     }
 }
 
+/// Longest device-code lifetime this client will wait for approval. RFC 8628
+/// puts no ceiling on `expires_in`, so an issuer advertising hours would
+/// otherwise park the enrollment loop for that long; an hour is far above any
+/// real device code and still refuses the pathological values that make
+/// `Instant + Duration` meaningless.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_CODE_LIFETIME_SECS: u64 = 3600;
+
+/// Longest advertised poll interval this client will honor, for the same
+/// reason: RFC 8628 puts no ceiling on `interval` either, and one measured in
+/// hours turns the flow into an indefinite sleep.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_POLL_INTERVAL_SECS: u64 = 300;
+
+/// RFC 8628 section 3.5 default interval, used here as the floor: polling
+/// faster than this earns `slow_down` at best and a rate limit at worst, so a
+/// smaller (or absent, or zero) advertised value is raised to it.
+#[cfg(feature = "agent-runtime")]
+const MIN_DEVICE_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Bound the timings the identity provider can put this client on.
+///
+/// RFC 8628 lets a server advertise any `expires_in` and `interval`, and the
+/// client is otherwise obliged to follow both; without a ceiling a remote
+/// value can leave the CLI sleeping between polls, or waiting for approval,
+/// for as long as the remote side likes. Mirrors zerocode's gateway-side
+/// bounds so both surfaces refuse the same responses.
+#[cfg(feature = "agent-runtime")]
+fn device_grant_bounds(expires_in: u64, interval: u64) -> Result<()> {
+    if expires_in == 0 {
+        bail!("the identity provider advertised an already-expired device code (expires_in = 0)");
+    }
+    if expires_in > MAX_DEVICE_CODE_LIFETIME_SECS {
+        bail!(
+            "the identity provider advertised a device code lifetime of {expires_in}s, above \
+             the {MAX_DEVICE_CODE_LIFETIME_SECS}s this client will wait for approval"
+        );
+    }
+    if interval > MAX_DEVICE_POLL_INTERVAL_SECS {
+        bail!(
+            "the identity provider advertised a poll interval of {interval}s, above the \
+             {MAX_DEVICE_POLL_INTERVAL_SECS}s this client will wait between polls"
+        );
+    }
+    Ok(())
+}
+
+/// How long to wait before the next poll: the advertised interval raised to
+/// [`MIN_DEVICE_POLL_INTERVAL_SECS`] and then clipped to what is left of the
+/// device code's lifetime, so a sleep never outlives the code it is waiting
+/// on and the loop always gets back to the deadline check.
+#[cfg(feature = "agent-runtime")]
+fn device_poll_wait(interval_secs: u64, remaining: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(interval_secs.max(MIN_DEVICE_POLL_INTERVAL_SECS)).min(remaining)
+}
+
 #[cfg(feature = "agent-runtime")]
 async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
     use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
@@ -9902,6 +9958,10 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
         }
         OidcFlow::Device => {
             let start = enrollment.device_grant_start().await?;
+            // Before the user is sent anywhere: a code that is already dead,
+            // or timings that would park this loop for as long as the issuer
+            // likes, are refused rather than acted on.
+            device_grant_bounds(start.expires_in, start.interval)?;
             let uri = start
                 .verification_uri_complete
                 .clone()
@@ -9925,20 +9985,38 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
                     ),
                 )
             );
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
-            let mut interval = start.interval.max(1);
+            let expired = || {
+                t(
+                    "cli-oidc-device-expired",
+                    "The device code expired before approval; run the command again.",
+                )
+            };
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(start.expires_in))
+                .ok_or_else(|| {
+                    anyhow::Error::msg(
+                        "the advertised device code lifetime does not fit this platform's clock",
+                    )
+                })?;
+            // Seeded at the floor so an RFC 8628 `slow_down` backs off from a
+            // legal interval rather than from an advertised zero.
+            let mut interval = start.interval.max(MIN_DEVICE_POLL_INTERVAL_SECS);
             loop {
-                if std::time::Instant::now() >= deadline {
-                    bail!(t(
-                        "cli-oidc-device-expired",
-                        "The device code expired before approval; run the command again.",
-                    ));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!(expired());
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                tokio::time::sleep(device_poll_wait(interval, remaining)).await;
+                // A wait clipped to the remaining lifetime lands exactly on the
+                // deadline, so re-check here rather than only at the top of the
+                // loop: the code is dead by now and the request must not go out.
+                if std::time::Instant::now() >= deadline {
+                    bail!(expired());
+                }
                 match enrollment.device_grant_poll(&start.device_code).await? {
                     DevicePollOutcome::Pending => {}
-                    DevicePollOutcome::SlowDown => interval += 5,
+                    DevicePollOutcome::SlowDown => interval = interval.saturating_add(5),
+                    DevicePollOutcome::Denied(reason) => bail!("device grant failed: {reason}"),
                     DevicePollOutcome::Token(token) => break *token,
                 }
             }
@@ -10961,6 +11039,54 @@ mod tests {
             "quiet",
             "spawn_detached must give the child no standard streams"
         );
+    }
+
+    /// RFC 8628 lets an identity provider advertise any `expires_in` and
+    /// `interval`, and a client that follows both blindly can be parked for as
+    /// long as the remote side likes — or handed a lifetime that makes the
+    /// deadline arithmetic meaningless.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_grant_bounds_refuse_hostile_timings() {
+        device_grant_bounds(600, 5).unwrap();
+        device_grant_bounds(MAX_DEVICE_CODE_LIFETIME_SECS, MAX_DEVICE_POLL_INTERVAL_SECS).unwrap();
+
+        let err = device_grant_bounds(0, 5).unwrap_err().to_string();
+        assert!(err.contains("expires_in = 0"), "{err}");
+        for lifetime in [MAX_DEVICE_CODE_LIFETIME_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(lifetime, 5).unwrap_err().to_string();
+            assert!(err.contains("will wait for approval"), "{err}");
+        }
+        for interval in [MAX_DEVICE_POLL_INTERVAL_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(600, interval).unwrap_err().to_string();
+            assert!(err.contains("between polls"), "{err}");
+        }
+    }
+
+    /// Every wait is floored at the RFC 8628 default and clipped to what is
+    /// left of the code's lifetime: an issuer advertising `expires_in = 1,
+    /// interval = 60` must not put this client to sleep for a minute past the
+    /// moment the code it is waiting on died.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_poll_wait_floors_and_clips_the_interval() {
+        use std::time::Duration;
+
+        let lifetime = Duration::from_mins(10);
+        for advertised in [0, 1, 4, MIN_DEVICE_POLL_INTERVAL_SECS] {
+            assert_eq!(
+                device_poll_wait(advertised, lifetime),
+                Duration::from_secs(MIN_DEVICE_POLL_INTERVAL_SECS),
+                "an advertised {advertised}s must be raised to the floor"
+            );
+        }
+        assert_eq!(device_poll_wait(97, lifetime), Duration::from_secs(97));
+        assert_eq!(
+            device_poll_wait(60, Duration::from_secs(1)),
+            Duration::from_secs(1),
+            "no wait may outlive the device code"
+        );
+        assert_eq!(device_poll_wait(60, Duration::ZERO), Duration::ZERO);
     }
 
     #[cfg(feature = "agent-runtime")]
