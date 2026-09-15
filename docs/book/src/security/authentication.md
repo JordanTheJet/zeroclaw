@@ -97,6 +97,24 @@ commands compose with command substitution. Nothing is stored: present
 the token as `auth_token` in the RPC handshake (or via the environment
 variable) before it expires, then re-enroll.
 
+`--browser` opens the system browser for you on macOS and Linux, and on
+every platform it also prints the sign-in URL so you can open it by
+hand in a browser on the same machine (the callback lands on a loopback
+port of the host running the CLI). The browser opener runs detached
+from the CLI's standard streams, so whatever a launcher writes on its
+own stdout cannot contaminate the result: stdout still carries only the
+token.
+
+Both callback adapters, the CLI's loopback listener and the gateway
+callback, enforce the RFC 9207 issuer check. A response whose `iss`
+parameter does not match the issuer that started the flow is refused
+before its `code` or its `error` is acted on. A response that carries no
+`iss` at all is accepted, since the parameter is optional and not every
+issuer sends it. When the code exchange returns an `id_token` next to
+the access token, that `id_token` is validated in full (issuer,
+audience, expiry, and the nonce bound to this flow) and then discarded.
+Only the access token is ever presented to the daemon.
+
 Clients that hold no IdP credentials (the web dashboard, zerocode)
 enroll through the gateway instead, which proxies the same flows with
 the configured entry's client credentials: `GET /api/oidc/providers`
@@ -109,6 +127,41 @@ copy fallback. These routes are unauthenticated by necessity
 they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
+
+The rate limiting works in layers. Requests that start a flow
+(`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
+`GET /oidc/callback`) count against the gateway's brute-force auth
+limiter, the same one that governs a bad pairing token. Provider
+listings and device polls carry a per-client budget of 20 requests per
+minute, which leaves headroom over RFC 8628's five-second minimum
+polling interval (12 polls per minute) without letting a client spin.
+Polls the identity provider answers with `slow_down`, and polls that
+fail hard, also count as auth attempts, so a client relaying garbage
+device codes walks into the existing lockout instead of polling
+forever. At most 16 outbound relays to the identity provider are in
+flight at once across all clients, which bounds what the gateway will do
+to the IdP on everyone's behalf. Loopback clients are exempt from the
+per-client budgets, as they are from every other gateway auth limit, so
+a reverse proxy sitting on the same host must enable
+`trust_forwarded_headers` for the per-client limits to apply to the real
+callers behind it. Every enrollment response carries
+`Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
+`no-referrer` policy, because device codes and access tokens travel in
+those bodies.
+
+zerocode enrolls over the same API from its own config.
+`[connection.wss] enroll_url` names the gateway's HTTP origin, and an
+optional path prefix is allowed. It must be `https://` unless it points
+at a loopback address (`127.0.0.1`, `::1`, or `localhost`), because the
+device code and then the access token travel over it, and redirects are
+not followed, so a plaintext hop cannot be introduced after the fact.
+The enrollment connection uses the same `[connection.wss.tls]` trust
+material as the WSS leg: the configured CA, `skip_verify`, and the
+mutual-TLS client certificate. zerocode clips every polling wait to the
+device code's remaining lifetime and never polls after it expires, and
+it refuses an advertised lifetime above one hour or a polling interval
+above five minutes rather than sleeping on a hostile answer. The token
+it receives is held in memory for that session only.
 
 ## Permission profiles
 

@@ -188,3 +188,29 @@ handle); the `redirect_uri` used at exchange is the one stored at flow start,
 derived from the configured redirect base when set and otherwise from the
 request origin, and a wrong one simply fails at the IdP, which only accepts
 registered redirect URIs.
+
+### Implementation notes
+
+Rate limiting is layered rather than a single bucket. Flow-starting requests
+(`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
+`GET /oidc/callback`) count against the gateway's existing brute-force auth
+limiter, while provider listings and device polls get a per-client budget of
+20 requests per minute, which sits comfortably above RFC 8628's five-second
+minimum polling interval (12 polls per minute) but still stops a client from
+spinning. Polls the IdP answers with `slow_down`, and polls that fail hard,
+are booked as auth attempts too, so a client relaying garbage device codes
+reaches the existing lockout instead of polling indefinitely. A global
+semaphore caps outbound IdP relays at 16 in flight across all clients, which
+bounds what the gateway will do to the IdP on everyone's behalf regardless of
+how many callers show up. Loopback clients are exempt from the per-client
+budgets, consistent with every other gateway auth limit, which means a
+same-host reverse proxy has to enable `trust_forwarded_headers` before the
+per-client limits can see the real caller. Every enrollment response is sent
+with `Cache-Control: no-store` and `Pragma: no-cache` alongside the gateway's
+`no-referrer` policy, because device codes and access tokens travel in those
+bodies and must not land in a proxy or browser cache. The RFC 9207 `iss`
+check (mismatch refused before the `code` or `error` is acted on, absent
+`iss` accepted) and full `id_token` claim validation (issuer, audience,
+expiry, nonce, then discard) live in the shared enrollment client, not in
+either adapter, so the CLI loopback listener and the gateway callback get
+identical behavior and neither can drift.
