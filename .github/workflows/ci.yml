@@ -373,11 +373,45 @@ jobs:
 
   # ── Build + check fan-out ─────────────────────────────────────────────────
 
+  windows-check-changes:
+    name: Detect Windows check changes
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # See the ordering note above `fmt` for which dependents still wait on it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Verify Windows check change filter
+        run: bash scripts/ci/windows_check_change_filter.test.sh
+      - name: Detect Windows check changes
+        id: changed
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # push and merge_group carry no base SHA, so they always check Windows.
+          if [ -z "$BASE_SHA" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          run="$(git diff --no-renames --name-only "$BASE_SHA" HEAD | bash scripts/ci/windows_check_change_filter.sh)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
-    needs: [fmt]
+    needs: [fmt, windows-check-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      # Pull requests check the Windows target only when windows-check-changes
+      # selects it. An unselected Windows leg still takes a runner but skips
+      # every step: keeping it in this matrix keeps the job-scoped rust-cache
+      # key that master seeds for pull requests.
+      LEG_SELECTED: ${{ matrix.target != 'x86_64-pc-windows-msvc' || needs.windows-check-changes.outputs.run == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -395,12 +429,19 @@ jobs:
             cmd: check
             label: Check
     steps:
+      - name: Skip unselected Windows check
+        if: env.LEG_SELECTED != 'true'
+        shell: bash
+        run: echo "::notice title=Windows check skipped::No Windows-relevant paths changed; push and merge_group runs always check this target."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: env.LEG_SELECTED == 'true'
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        if: env.LEG_SELECTED == 'true'
         with:
           toolchain: 1.98.0
           targets: ${{ matrix.target }}
       - uses: ./.github/actions/rust-cache
+        if: env.LEG_SELECTED == 'true'
         id: rust-cache
         with:
           use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
@@ -410,9 +451,11 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/ci/apt_install.sh mold libasound2-dev
       - name: Ensure web/dist placeholder exists
+        if: env.LEG_SELECTED == 'true'
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: ${{ matrix.label }}
+        if: env.LEG_SELECTED == 'true'
         shell: bash
         run: |
           set +e
@@ -450,7 +493,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       - name: Check voice-wake
-        if: runner.os != 'Linux'
+        if: env.LEG_SELECTED == 'true' && runner.os != 'Linux'
         shell: bash
         run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }}
       - name: Test voice-wake
@@ -461,7 +504,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       - name: Test Windows task-owner recovery
-        if: runner.os == 'Windows'
+        if: env.LEG_SELECTED == 'true' && runner.os == 'Windows'
         shell: bash
         run: >-
            cargo test --profile ci --locked -p zeroclaw-runtime --lib
@@ -1532,7 +1575,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-check-changes, build, check, check-plugin-backends, msrv, check-32bit, bench, test, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
