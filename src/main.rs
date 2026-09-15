@@ -4282,8 +4282,9 @@ enum OidcCommands {
     Login {
         /// Alias of the [oidc.<alias>] config entry to enroll against
         alias: String,
-        /// Sign in with the system browser via Authorization Code + PKCE
-        /// (RFC 8252 loopback) instead of the device grant
+        /// Sign in with the system browser via Authorization Code + PKCE (RFC 8252
+        /// loopback) instead of the device grant; the browser is opened automatically
+        /// on macOS and Linux, and the sign-in URL is always printed for manual opening
         #[arg(long)]
         browser: bool,
     },
@@ -9797,6 +9798,40 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
     Ok(())
 }
 
+/// Spawn `program` with `args` detached from this process's standard streams.
+///
+/// `oidc login` prints the access token on stdout and callers capture that
+/// stdout, so a helper process must stay out of it: a detached child can
+/// neither write into the stdout that carries the token nor hold that pipe
+/// open after the command finishes. Fire and forget — the child is never
+/// waited on.
+#[cfg(feature = "agent-runtime")]
+fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Launch the system browser at `url`, reporting whether an opener started.
+///
+/// Platforms other than macOS and Linux have no opener here and rely on the
+/// sign-in URL the caller prints for manual opening.
+#[cfg(feature = "agent-runtime")]
+fn open_url_in_system_browser(url: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        spawn_detached("open", &[url]).is_ok()
+    } else if cfg!(target_os = "linux") {
+        spawn_detached("xdg-open", &[url]).is_ok()
+    } else {
+        false
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
     use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
@@ -9850,18 +9885,9 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
                     ),
                 )
             );
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg(&pkce.authorize_url)
-                    .spawn();
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&pkce.authorize_url)
-                    .spawn();
-            }
+            // The URL was printed above, so failing to launch an opener (or
+            // having none on this platform) only means opening it by hand.
+            let _ = open_url_in_system_browser(&pkce.authorize_url);
             eprintln!(
                 "{}",
                 t(
@@ -10890,6 +10916,52 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    /// `oidc login` prints the access token on stdout and shells capture it, so
+    /// the browser opener must not inherit the CLI's standard streams. The probe
+    /// child records whether its stdout and stderr are the null device, then
+    /// writes noise and exits nonzero: neither may disturb the spawn.
+    #[cfg(all(unix, feature = "agent-runtime"))]
+    #[test]
+    fn browser_opener_children_get_no_standard_streams() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let marker = std::env::temp_dir().join(format!(
+            "zeroclaw-spawn-detached-{}-{nanos}.marker",
+            std::process::id()
+        ));
+        let marker_path = marker.to_string_lossy().into_owned();
+        let script = "if [ /dev/stdout -ef /dev/null ] && [ /dev/stderr -ef /dev/null ]; then \
+                      echo quiet > \"$0\"; else echo leak > \"$0\"; fi; echo NOISE; exit 3";
+
+        let spawned = spawn_detached("sh", &["-c", script, &marker_path]);
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_file(&marker);
+                panic!("spawning a noisy opener must succeed; got: {err}");
+            }
+        };
+        // Reap the probe so it does not linger as a zombie; its nonzero exit is
+        // expected and must not have failed the spawn above.
+        let status = child.wait();
+        let observed = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_file(&marker);
+
+        let status = status.unwrap_or_else(|err| panic!("waiting on the probe failed: {err}"));
+        assert!(
+            !status.success(),
+            "probe must report its nonzero exit; got: {status}"
+        );
+        let observed = observed
+            .unwrap_or_else(|err| panic!("probe must have written {marker_path}; got: {err}"));
+        assert_eq!(
+            observed.trim(),
+            "quiet",
+            "spawn_detached must give the child no standard streams"
+        );
+    }
 
     #[cfg(feature = "agent-runtime")]
     struct SelectorTestTerminal {
