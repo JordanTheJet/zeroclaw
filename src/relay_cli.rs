@@ -85,44 +85,75 @@ async fn write_claim_config(config: &mut Config, claimed: &Claimed) -> Result<()
     Box::pin(config.save_dirty()).await
 }
 
-/// Reject a `--control` URL that would carry the one-time claim token in the
-/// clear.
+/// True for the exact loopback hosts a cleartext `http://` claim may target.
 ///
-/// HTTPS is required for any real control plane. Plain `http://` is allowed only
-/// to a loopback host, so local development against a dev control plane (and the
-/// wiremock-backed tests below) still works while the token can never transit an
-/// untrusted network unencrypted. A value with no scheme is rejected here with
-/// an actionable message rather than surfacing later as an opaque transport
-/// error.
-fn ensure_control_is_secure(control: &str) -> Result<()> {
-    if control.starts_with("https://") {
-        return Ok(());
-    }
-    if let Some(rest) = control.strip_prefix("http://") {
-        let authority = rest.split('/').next().unwrap_or(rest);
-        // Take the host, keeping a bracketed IPv6 literal whole and otherwise
-        // dropping an optional `:port`.
-        let host = if authority.starts_with('[') {
-            match authority.find(']') {
-                Some(close) => &authority[..=close],
-                None => authority,
-            }
-        } else {
-            authority.split(':').next().unwrap_or(authority)
-        };
-        if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
-            return Ok(());
-        }
+/// `reqwest::Url::host_str` serializes an IPv6 literal bracketed (`[::1]`); accept
+/// both that and the bare `::1`, plus the dotted-quad and `localhost`. Anything
+/// else — including a loopback *substring* like `127.0.0.1.evil.example` — is not
+/// loopback and must not receive the token in the clear.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// Reject a `--control` URL that would carry the one-time claim token in the
+/// clear or to an origin other than the one it appears to name; return the
+/// validated destination on success.
+///
+/// The authority is parsed with a real URL parser (not string splitting) so that
+/// a userinfo-wrapped authority cannot masquerade as loopback: reqwest connects
+/// to the *host* of `user[:pass]@host`, not to the loopback-looking userinfo, so
+/// `http://127.0.0.1:80@evil.example:9800` would otherwise send the bearer token
+/// to `evil.example` in cleartext. Any username or password is therefore
+/// rejected outright. HTTPS is required for any real control plane; plain
+/// `http://` is allowed only when the parsed host is exactly a loopback host, so
+/// local development against a dev control plane (and the wiremock-backed tests
+/// below) still works. A query or fragment is rejected because the value must be
+/// a bare base URL that `/v1/claim` is appended to. A value with no scheme is
+/// rejected here with an actionable message rather than surfacing later as an
+/// opaque transport error.
+fn ensure_control_is_secure(control: &str) -> Result<String> {
+    let url = reqwest::Url::parse(control).map_err(|_| {
+        anyhow::anyhow!(
+            "--control must be an absolute https:// URL (got `{control}`) — e.g. \
+             https://control.zerorelay.net"
+        )
+    })?;
+
+    // A `user[:pass]@host` authority makes reqwest connect to `host`, not to the
+    // userinfo, so the token would go to `host` — refuse any userinfo outright.
+    if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!(
-            "--control must use https:// — refusing to send the one-time claim token in \
-             cleartext to a non-loopback http:// address (`{control}`). Use the https URL \
-             from your ZeroRelay account."
+            "--control must not embed a username or password (`{control}`): a \
+             `user@host` URL sends the one-time claim token to `host`, not to the \
+             address the userinfo appears to name. Use the plain https URL from \
+             your ZeroRelay account."
         );
     }
-    anyhow::bail!(
-        "--control must be an absolute https:// URL (got `{control}`) — e.g. \
-         https://control.zerorelay.net"
-    );
+
+    // The value is a base URL that `/v1/claim` is appended to; a query or
+    // fragment on it is meaningless and would corrupt the request target.
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("--control must be a bare base URL with no query or fragment (`{control}`)");
+    }
+
+    match url.scheme() {
+        "https" => Ok(control.to_string()),
+        "http" => {
+            if is_loopback_host(url.host_str().unwrap_or_default()) {
+                Ok(control.to_string())
+            } else {
+                anyhow::bail!(
+                    "--control must use https:// — refusing to send the one-time claim token in \
+                     cleartext to a non-loopback http:// address (`{control}`). Use the https URL \
+                     from your ZeroRelay account."
+                )
+            }
+        }
+        other => anyhow::bail!(
+            "--control must be an absolute https:// URL (got scheme `{other}` in `{control}`) — \
+             e.g. https://control.zerorelay.net"
+        ),
+    }
 }
 
 /// Handle `zeroclaw relay claim <TOKEN> --control <URL> [--data-dir <PATH>]`.
@@ -148,8 +179,9 @@ pub async fn handle_claim(
         anyhow::bail!("--control <URL> is required (the ZeroRelay control-plane base URL)");
     }
     // The claim token is a one-time bearer secret; refuse to send it over a
-    // channel that would carry it in the clear.
-    ensure_control_is_secure(control)?;
+    // channel that would carry it in the clear or to an origin other than the one
+    // it names. `control` is the validated destination.
+    let control = ensure_control_is_secure(control)?;
 
     let data_dir = data_dir.unwrap_or_else(|| config.data_dir.clone());
     let signing_key_pkcs8 = zeroclaw_runtime::relay::ensure_signing_key(&data_dir)
@@ -158,9 +190,17 @@ pub async fn handle_claim(
     let body = claim_request_body(&proof, token);
 
     let url = format!("{control}/v1/claim");
+    // The one-time claim token rides in this request body. Refuse to follow a
+    // redirect (a 307/308 would replay the POST body to whatever origin the
+    // `Location` names) and refuse to route through an operator proxy
+    // (`HTTP(S)_PROXY`/`ALL_PROXY`) — either would leak the token off the
+    // validated destination. Mirrors the sensitive-client pattern in
+    // `zeroclaw_runtime::tools::skill_http`.
     let client = reqwest::Client::builder()
         .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .context("building the claim HTTP client")?;
     let response = client
@@ -264,6 +304,7 @@ mod tests {
 
         // http is allowed only to a loopback host (local dev + the wiremock tests).
         assert!(ensure_control_is_secure("http://127.0.0.1:9800").is_ok());
+        assert!(ensure_control_is_secure("http://127.0.0.1").is_ok());
         assert!(ensure_control_is_secure("http://localhost:9800").is_ok());
         assert!(ensure_control_is_secure("http://[::1]:9800").is_ok());
 
@@ -278,6 +319,95 @@ mod tests {
         // A scheme-less value is rejected here, not later as an opaque error.
         assert!(ensure_control_is_secure("control.zerorelay.net").is_err());
         assert!(ensure_control_is_secure("ftp://control.zerorelay.net").is_err());
+    }
+
+    #[test]
+    fn control_url_rejects_userinfo_wrapped_external_hosts() {
+        // The bug: reqwest connects to the *host* of `user[:pass]@host`, so a
+        // loopback-looking userinfo would ship the token to the real external
+        // host in the clear. Every userinfo form must be rejected.
+        //
+        // `127.0.0.1:80` is parsed as user=127.0.0.1 / pass=80; the host is
+        // evil.example — the token would leak there.
+        assert!(ensure_control_is_secure("http://127.0.0.1:80@evil.example:9800").is_err());
+        // Bracketed-IPv6-looking userinfo, same trick.
+        assert!(ensure_control_is_secure("http://[::1]@evil.example:9800").is_err());
+        // Bare username, no password.
+        assert!(ensure_control_is_secure("http://localhost@evil.example:9800").is_err());
+        // Userinfo is rejected even when the host itself IS loopback and even on
+        // https — a control URL never legitimately carries credentials.
+        assert!(ensure_control_is_secure("http://user@127.0.0.1:9800").is_err());
+        assert!(ensure_control_is_secure("https://user:pass@control.zerorelay.net").is_err());
+
+        // A query or fragment is not a valid base URL and is refused.
+        assert!(ensure_control_is_secure("https://control.zerorelay.net?x=1").is_err());
+        assert!(ensure_control_is_secure("https://control.zerorelay.net#frag").is_err());
+
+        // The happy paths return the validated destination unchanged.
+        assert_eq!(
+            ensure_control_is_secure("https://control.zerorelay.net").unwrap(),
+            "https://control.zerorelay.net"
+        );
+        assert_eq!(
+            ensure_control_is_secure("http://127.0.0.1:9800").unwrap(),
+            "http://127.0.0.1:9800"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_client_refuses_cross_origin_redirect_and_never_leaks_the_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The second origin stands in for a redirect target the attacker controls.
+        // If the client followed the redirect it would replay the POST (with the
+        // claim token) here; it must receive nothing.
+        let attacker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": "leaked",
+                "relay_addr": "attacker:1",
+            })))
+            .mount(&attacker)
+            .await;
+
+        // The control plane the operator pointed at answers with a redirect to
+        // the attacker origin.
+        let control = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/v1/claim", attacker.uri())),
+            )
+            .mount(&control)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config(tmp.path());
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let err = handle_claim(&mut config, "tok-secret", &control.uri(), None)
+            .await
+            .unwrap_err();
+        // The redirect surfaced as a non-success status instead of being followed.
+        assert!(err.to_string().contains("307"), "err: {err}");
+
+        // The attacker origin never saw the claim request — the token did not leak.
+        let leaked = attacker.received_requests().await.unwrap();
+        assert!(
+            leaked.is_empty(),
+            "the claim client must not follow a redirect to another origin (leaked {} request(s))",
+            leaked.len()
+        );
+
+        // And a non-success claim wrote no config.
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused redirect must not touch the config"
+        );
     }
 
     fn seed_config(dir: &std::path::Path) -> Config {
