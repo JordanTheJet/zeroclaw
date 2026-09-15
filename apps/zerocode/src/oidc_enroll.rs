@@ -189,7 +189,10 @@ impl GatewayEnrollment {
     /// The gateway enforces a per-client poll budget and answers HTTP 429 with
     /// a `Retry-After` once it is exceeded. That is the transport spelling of
     /// the same obligation, so it maps to `slow_down` and a legitimate client
-    /// backs off instead of failing the enrollment outright.
+    /// backs off instead of failing the enrollment outright, waiting out the
+    /// `Retry-After` the gateway named rather than the RFC's five seconds: a
+    /// lockout can hold the client off for minutes, and polling through it
+    /// only keeps the lockout alive.
     pub async fn device_poll(&self, alias: &str, device_code: &str) -> Result<DevicePoll> {
         let response = self
             .http
@@ -199,7 +202,9 @@ impl GatewayEnrollment {
             .await
             .context("cannot reach the gateway enrollment API")?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Ok(DevicePoll::SlowDown);
+            return Ok(DevicePoll::SlowDown {
+                retry_after: retry_after_secs(response.headers()),
+            });
         }
         if !response.status().is_success() {
             return Err(Self::gateway_error(response).await);
@@ -214,10 +219,27 @@ impl GatewayEnrollment {
                 None => bail!("gateway reported a grant without a token"),
             },
             "pending" => Ok(DevicePoll::Pending),
-            "slow_down" => Ok(DevicePoll::SlowDown),
+            // An IdP-originated `slow_down` names no delay of its own, so the
+            // RFC's five-second increment is all there is to go on.
+            "slow_down" => Ok(DevicePoll::SlowDown { retry_after: None }),
             other => bail!("unexpected poll status from the gateway: {other}"),
         }
     }
+}
+
+/// The `Retry-After` delay in whole seconds, if the header names one.
+///
+/// RFC 9110 also allows an HTTP-date, which the gateway never sends; a date,
+/// a malformed value, or a missing header all yield `None` and leave the
+/// caller on the RFC 8628 back-off it would have used anyway.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// One device-grant poll outcome. RFC 8628 §3.5 treats `slow_down` and
@@ -226,7 +248,12 @@ impl GatewayEnrollment {
 pub(crate) enum DevicePoll {
     Granted(String),
     Pending,
-    SlowDown,
+    /// `retry_after` is the gateway's `Retry-After` in seconds when the
+    /// throttling came from the gateway's own budget or lockout, and `None`
+    /// when the IdP asked for the slow-down and named no delay.
+    SlowDown {
+        retry_after: Option<u64>,
+    },
 }
 
 /// The granted variant carries the access token itself, so formatting it would
@@ -237,7 +264,9 @@ impl std::fmt::Debug for DevicePoll {
         match self {
             Self::Granted(_) => f.write_str("Granted(<redacted>)"),
             Self::Pending => f.write_str("Pending"),
-            Self::SlowDown => f.write_str("SlowDown"),
+            // The back-off delay is a timing hint, not a secret, and it is
+            // what makes a throttled trace readable.
+            Self::SlowDown { retry_after } => write!(f, "SlowDown({retry_after:?})"),
         }
     }
 }
@@ -247,9 +276,17 @@ impl std::fmt::Debug for DevicePoll {
 /// while `pending` keeps the current wait. The result is never capped
 /// below the floor, so an IdP advertising 60s is honored and a throttled
 /// client backs off instead of polling early until the code expires.
+///
+/// A gateway `Retry-After` is the longer obligation of the two whenever it
+/// exceeds the RFC increment: it names when the budget or the lockout
+/// actually frees a slot, so anything sooner is a poll that can only be
+/// refused. The wait is still never shorter than the RFC increment, so a
+/// small or zero `Retry-After` cannot talk this client into polling faster.
 fn next_poll_interval(current: u64, minimum: u64, outcome: &DevicePoll) -> u64 {
     let next = match outcome {
-        DevicePoll::SlowDown => current.saturating_add(5),
+        DevicePoll::SlowDown { retry_after } => current
+            .saturating_add(5)
+            .max(retry_after.unwrap_or_default()),
         DevicePoll::Pending | DevicePoll::Granted(_) => current,
     };
     next.max(minimum)
@@ -297,7 +334,10 @@ async fn poll_until_granted(
 ) -> Result<String> {
     validate_device_start(start)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(start.expires_in);
-    let minimum = start.interval.max(1);
+    // RFC 8628's default interval is the floor, not one second: an advertised
+    // `0` or `1` would otherwise put this client on a once-a-second poll, well
+    // past the gateway's per-client budget and straight into its lockout.
+    let minimum = start.interval.max(default_poll_interval());
     let mut interval = minimum;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -418,10 +458,11 @@ mod tests {
             DevicePoll::Pending
         );
         // slow_down must survive as its own outcome: folding it into
-        // pending would lose the RFC 8628 §3.5 back-off obligation.
+        // pending would lose the RFC 8628 §3.5 back-off obligation. It comes
+        // from the IdP and names no delay, so only the RFC increment applies.
         assert_eq!(
             gateway.device_poll("corp", "throttled").await.unwrap(),
-            DevicePoll::SlowDown
+            DevicePoll::SlowDown { retry_after: None }
         );
         assert_eq!(
             gateway.device_poll("corp", "done").await.unwrap(),
@@ -431,38 +472,81 @@ mod tests {
 
     /// The gateway's per-client poll budget answers 429 rather than a JSON
     /// `slow_down`, and a client that failed on it would abandon an
-    /// enrollment the user is about to approve.
+    /// enrollment the user is about to approve. The `Retry-After` it sends
+    /// names when a slot frees, so it has to survive the mapping.
     #[tokio::test]
     async fn http_429_is_treated_as_slow_down() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/oidc/corp/device/poll"))
+            .and(body_string_contains("budget"))
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("Retry-After", "10")
+                    .set_body_json(serde_json::json!({
+                        "error": "poll budget exceeded",
+                        "retry_after": 10,
+                    })),
+            )
+            .mount(&server)
+            .await;
+        // A `Retry-After` that is not a plain count of seconds (RFC 9110 also
+        // allows an HTTP-date) leaves the client on the RFC 8628 back-off
+        // rather than on a delay it guessed at.
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/device/poll"))
+            .and(body_string_contains("dated"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT")
                     .set_body_json(serde_json::json!({ "error": "poll budget exceeded" })),
             )
             .mount(&server)
             .await;
         let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
         assert_eq!(
-            gateway.device_poll("corp", "dev-1").await.unwrap(),
-            DevicePoll::SlowDown
+            gateway.device_poll("corp", "budget").await.unwrap(),
+            DevicePoll::SlowDown {
+                retry_after: Some(10)
+            }
+        );
+        assert_eq!(
+            gateway.device_poll("corp", "dated").await.unwrap(),
+            DevicePoll::SlowDown { retry_after: None }
         );
     }
 
     #[test]
     fn poll_interval_follows_rfc_8628() {
+        let slow_down = DevicePoll::SlowDown { retry_after: None };
         // slow_down adds five seconds (5 -> 10), never one.
-        assert_eq!(next_poll_interval(5, 5, &DevicePoll::SlowDown), 10);
+        assert_eq!(next_poll_interval(5, 5, &slow_down), 10);
         // Repeated throttling keeps backing off and is not capped at 30.
-        assert_eq!(next_poll_interval(30, 5, &DevicePoll::SlowDown), 35);
+        assert_eq!(next_poll_interval(30, 5, &slow_down), 35);
         // pending keeps the current wait rather than growing it.
         assert_eq!(next_poll_interval(10, 5, &DevicePoll::Pending), 10);
         // An advertised interval above 30 is honored, never shrunk.
         assert_eq!(next_poll_interval(60, 60, &DevicePoll::Pending), 60);
         // The advertised minimum is a floor the interval never drops below.
         assert_eq!(next_poll_interval(1, 5, &DevicePoll::Pending), 5);
+    }
+
+    /// A gateway `Retry-After` outranks the RFC increment when it is longer,
+    /// and can never shorten the wait below it.
+    #[test]
+    fn retry_after_outranks_the_rfc_increment_when_longer() {
+        let retry_after = |secs: u64| DevicePoll::SlowDown {
+            retry_after: Some(secs),
+        };
+        // A lockout's 300s is honored in full, not shaved to 10s.
+        assert_eq!(next_poll_interval(5, 5, &retry_after(300)), 300);
+        // The longer of the two obligations wins: 30 + 5 beats a 12s hint.
+        assert_eq!(next_poll_interval(30, 5, &retry_after(12)), 35);
+        // A zero or tiny `Retry-After` cannot make this client poll sooner.
+        assert_eq!(next_poll_interval(5, 5, &retry_after(0)), 10);
+        assert_eq!(next_poll_interval(5, 5, &retry_after(1)), 10);
+        // The advertised floor still applies to the result.
+        assert_eq!(next_poll_interval(5, 60, &retry_after(20)), 60);
     }
 
     #[tokio::test]
@@ -604,7 +688,7 @@ mod tests {
             let n = calls.get();
             calls.set(n + 1);
             Ok(if n == 0 {
-                DevicePoll::SlowDown
+                DevicePoll::SlowDown { retry_after: None }
             } else {
                 DevicePoll::Granted("tok".into())
             })
@@ -616,6 +700,86 @@ mod tests {
         assert_eq!(began.elapsed(), Duration::from_secs(15));
     }
 
+    /// A 429 carrying `Retry-After: 300` (the gateway's lockout ceiling) has
+    /// to hold the next poll for the full five minutes: polling sooner is a
+    /// request the gateway can only refuse, and each refusal keeps the
+    /// lockout alive.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_sets_the_next_wait() {
+        let start = device_start_fixture(600, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let token = poll_until_granted(&start, async |_code: &str| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(if n == 0 {
+                DevicePoll::SlowDown {
+                    retry_after: Some(300),
+                }
+            } else {
+                DevicePoll::Granted("tok".into())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(calls.get(), 2);
+        // 5s to the throttled poll, then the gateway's own 300s.
+        assert_eq!(began.elapsed(), Duration::from_secs(305));
+    }
+
+    /// The `Retry-After` wait is still clipped to the device code's remaining
+    /// lifetime: a lockout longer than the code outlives it, and the driver
+    /// fails at the deadline rather than sleeping past it.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_clipped_to_the_remaining_lifetime() {
+        let start = device_start_fixture(100, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let err = poll_until_granted(&start, async |_code: &str| {
+            calls.set(calls.get() + 1);
+            Ok(DevicePoll::SlowDown {
+                retry_after: Some(300),
+            })
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expired before approval"), "{err}");
+        assert_eq!(calls.get(), 1, "expected exactly one in-lifetime poll");
+        assert_eq!(began.elapsed(), Duration::from_secs(100));
+    }
+
+    /// RFC 8628's default interval is the floor: an advertised `0` or `1`
+    /// must not put this client on a once-a-second poll, which the gateway's
+    /// 20-per-minute budget would refuse outright.
+    #[tokio::test(start_paused = true)]
+    async fn an_advertised_interval_below_the_default_is_floored() {
+        for advertised in [0, 1] {
+            let start = device_start_fixture(600, advertised);
+            let calls = std::cell::Cell::new(0u32);
+            let began = tokio::time::Instant::now();
+            let token = poll_until_granted(&start, async |_code: &str| {
+                let n = calls.get();
+                calls.set(n + 1);
+                Ok(if n == 0 {
+                    DevicePoll::Pending
+                } else {
+                    DevicePoll::Granted("tok".into())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(token, "tok");
+            assert_eq!(calls.get(), 2);
+            assert_eq!(
+                began.elapsed(),
+                Duration::from_secs(10),
+                "interval {advertised} should be floored at the RFC 8628 default"
+            );
+        }
+    }
+
     // ── Secret redaction ─────────────────────────────────────────
 
     #[test]
@@ -623,6 +787,21 @@ mod tests {
         let granted = format!("{:?}", DevicePoll::Granted("sentinel-token".into()));
         assert!(!granted.contains("sentinel-token"), "{granted}");
         assert!(granted.contains("Granted"), "{granted}");
+
+        // The back-off delay is a timing hint rather than a secret, so it
+        // stays legible: a throttled enrollment is diagnosed from it.
+        let throttled = format!(
+            "{:?}",
+            DevicePoll::SlowDown {
+                retry_after: Some(300)
+            }
+        );
+        assert!(throttled.contains("SlowDown"), "{throttled}");
+        assert!(throttled.contains("300"), "{throttled}");
+        assert!(
+            format!("{:?}", DevicePoll::SlowDown { retry_after: None }).contains("SlowDown"),
+            "the variant name is what makes a trace readable"
+        );
 
         let start = DeviceStart {
             device_code: "sentinel-device".into(),

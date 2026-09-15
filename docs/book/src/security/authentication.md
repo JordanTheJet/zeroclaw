@@ -113,7 +113,14 @@ before its `code` or its `error` is acted on. A response that carries no
 issuer sends it. When the code exchange returns an `id_token` next to
 the access token, that `id_token` is validated in full (issuer,
 audience, expiry, and the nonce bound to this flow) and then discarded.
-Only the access token is ever presented to the daemon.
+Only the access token is ever presented to the daemon. The enrollment
+client applies the same suspicion to discovery itself: it refuses a
+`.well-known/openid-configuration` document whose `issuer` is not an
+exact match for the configured issuer, trailing slash included, before
+it uses any endpoint named in it (the RFC 8414 check), and it caps the
+size of the documents it reads, so a hostile or broken issuer cannot
+redirect the flow to endpoints of its choosing or answer with an
+unbounded body.
 
 Clients that hold no IdP credentials (the web dashboard, zerocode)
 enroll through the gateway instead, which proxies the same flows with
@@ -122,7 +129,12 @@ lists aliases, `POST /api/oidc/{alias}/device/start` and
 `/device/poll` drive the device grant, and `GET /oidc/login/{alias}`
 runs the browser flow, whose one-time callback page hands the token to
 the opening window via `postMessage` (same-origin only) with a manual
-copy fallback. These routes are unauthenticated by necessity
+copy fallback. The gateway also sends
+`Cross-Origin-Opener-Policy: same-origin`, which severs `window.opener`
+once the popup has navigated through the identity provider, so in
+current browsers the manual copy on that page is the handoff that works
+today and the `postMessage` contract is in place for the dashboard
+follow-up. These routes are unauthenticated by necessity
 (enrollment precedes authentication), rate limited, and grant nothing:
 they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
@@ -130,19 +142,33 @@ rationale and failure-mode table:
 
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
-`GET /oidc/callback`) count against the gateway's brute-force auth
-limiter, the same one that governs a bad pairing token. Provider
-listings and device polls carry a per-client budget of 20 requests per
-minute, which leaves headroom over RFC 8628's five-second minimum
-polling interval (12 polls per minute) without letting a client spin.
-Polls the identity provider answers with `slow_down`, and polls that
-fail hard, also count as auth attempts, so a client relaying garbage
-device codes walks into the existing lockout instead of polling
-forever. At most 16 outbound relays to the identity provider are in
-flight at once across all clients, which bounds what the gateway will do
-to the IdP on everyone's behalf. Loopback clients are exempt from the
-per-client budgets, as they are from every other gateway auth limit, so
-a reverse proxy sitting on the same host must enable
+`GET /oidc/callback`) count against an enrollment-specific instance of
+the gateway's brute-force limiter: the same thresholds and the same
+lockout that govern a bad pairing token, kept on their own ledger, so
+an address locked out of enrollment can still pair or present a webhook
+signature, and a lockout earned on either of those never blocks
+enrollment. A callback counts as an attempt only when it is
+unproductive: no live flow state for the `state` it carries, an issuer
+that does not match, an error handed back by the identity provider, or
+a code exchange that fails. A callback that completes a sign-in costs
+nothing, so a crowd of people signing in at once cannot lock their
+shared address out. Provider listings and device polls carry a
+per-client budget of 20 requests per minute, which leaves headroom over
+RFC 8628's five-second minimum polling interval (12 polls per minute)
+without letting a client spin. A poll counts as an attempt when the
+identity provider answers `slow_down` or rejects the device code
+outright, so a client relaying garbage device codes walks into the
+existing lockout instead of polling forever; a transport failure on the
+gateway's own leg to the identity provider says nothing about the
+caller and is not billed to it. A client over its budget, or locked
+out, gets HTTP 429 with a `Retry-After` naming the delay in seconds,
+and zerocode waits that delay out before its next poll rather than
+adding the RFC's five seconds, and never polls faster than once every
+five seconds in any case. At most 16 outbound relays to the identity
+provider are in flight at once across all clients, which bounds what the
+gateway will do to the IdP on everyone's behalf. Loopback clients are
+exempt from the per-client budgets, as they are from every other gateway
+auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real
 callers behind it. Every enrollment response carries
 `Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
@@ -160,8 +186,11 @@ material as the WSS leg: the configured CA, `skip_verify`, and the
 mutual-TLS client certificate. zerocode clips every polling wait to the
 device code's remaining lifetime and never polls after it expires, and
 it refuses an advertised lifetime above one hour or a polling interval
-above five minutes rather than sleeping on a hostile answer. The token
-it receives is held in memory for that session only.
+above five minutes rather than sleeping on a hostile answer. An
+advertised interval of `0` or `1` is floored at RFC 8628's five-second
+default, so a gateway answer cannot put zerocode on a once-a-second
+poll the per-client budget would only refuse. The token it receives is
+held in memory for that session only.
 
 ## Permission profiles
 

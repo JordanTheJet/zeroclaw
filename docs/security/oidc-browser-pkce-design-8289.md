@@ -180,26 +180,37 @@ Client-to-surface mapping:
   token as `auth_token`. Device grant is the right UX for a terminal; no
   loopback listener or browser is assumed on the zerocode host.
 
-Security posture of the API: every route is rate limited through the existing
-gateway auth limiter; the PKCE flow store follows the `PairingStore` precedent
-(in-memory, keyed by `state`, single-use consume-on-arrival, short TTL, capped
-size); the device proxy is stateless (the IdP's `device_code` is the flow
-handle); the `redirect_uri` used at exchange is the one stored at flow start,
-derived from the configured redirect base when set and otherwise from the
-request origin, and a wrong one simply fails at the IdP, which only accepts
-registered redirect URIs.
+Security posture of the API: every route is rate limited through the gateway's
+brute-force limiter, in an instance reserved for enrollment; the PKCE flow
+store follows the `PairingStore` precedent (in-memory, keyed by `state`,
+single-use consume-on-arrival, short TTL, capped size); the device proxy is
+stateless (the IdP's `device_code` is the flow handle); the `redirect_uri` used
+at exchange is the one stored at flow start, always derived from the request
+`Host` (there is no configured redirect base; a forwarded proto is honored only
+under `trust_forwarded_headers`), and a wrong one simply fails at the IdP,
+which only accepts registered redirect URIs.
 
 ### Implementation notes
 
 Rate limiting is layered rather than a single bucket. Flow-starting requests
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
-`GET /oidc/callback`) count against the gateway's existing brute-force auth
-limiter, while provider listings and device polls get a per-client budget of
-20 requests per minute, which sits comfortably above RFC 8628's five-second
-minimum polling interval (12 polls per minute) but still stops a client from
-spinning. Polls the IdP answers with `slow_down`, and polls that fail hard,
-are booked as auth attempts too, so a client relaying garbage device codes
-reaches the existing lockout instead of polling indefinitely. A global
+`GET /oidc/callback`) count against an enrollment-specific instance of the
+gateway's brute-force limiter, same thresholds and same lockout as the pairing
+and webhook surfaces but on its own ledger, so an enrollment lockout never
+denies pairing or webhook authentication for that address and neither of those
+can deny enrollment. Accounting is unproductive-only: a callback is booked as
+an attempt when it finds no live flow state, names a mismatched issuer, carries
+an IdP error, or fails its code exchange, while a callback that completes a
+sign-in is booked as nothing at all. Provider listings and device polls get a
+per-client budget of 20 requests per minute, which sits comfortably above RFC
+8628's five-second minimum polling interval (12 polls per minute) but still
+stops a client from spinning. A poll is booked as an attempt when the IdP
+answers `slow_down` or rejects the device code, so a client relaying garbage
+device codes reaches the lockout instead of polling indefinitely, while a
+transport failure on the gateway's own leg to the IdP is the gateway's problem
+and is not billed to the caller. The 429 those limits produce carries a
+`Retry-After` in seconds (up to the 300s lockout), which zerocode waits out in
+full instead of adding the RFC's five seconds. A global
 semaphore caps outbound IdP relays at 16 in flight across all clients, which
 bounds what the gateway will do to the IdP on everyone's behalf regardless of
 how many callers show up. Loopback clients are exempt from the per-client
@@ -213,4 +224,15 @@ check (mismatch refused before the `code` or `error` is acted on, absent
 `iss` accepted) and full `id_token` claim validation (issuer, audience,
 expiry, nonce, then discard) live in the shared enrollment client, not in
 either adapter, so the CLI loopback listener and the gateway callback get
-identical behavior and neither can drift.
+identical behavior and neither can drift. Discovery gets the RFC 8414 check
+in the same place: a `.well-known/openid-configuration` whose `issuer` is not
+an exact match for the configured issuer, trailing slash included, is refused
+before any endpoint it names is used, and the documents the client reads are
+size capped.
+
+One caveat on decision 4's handoff. The gateway's
+`Cross-Origin-Opener-Policy: same-origin` header severs `window.opener` once
+the popup has navigated through the IdP, so the `postMessage` leg does not
+reach an opener in current browsers: the manual copy on the callback page is
+the handoff that works today, and the `postMessage` contract stays in place
+for the dashboard follow-up that will own the sign-in surface.
