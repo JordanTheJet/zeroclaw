@@ -336,6 +336,11 @@ pub(crate) const APP_JS: &str = r##"(function () {
   // may already have consumed the one-time pairing code, so Stop must not be
   // able to claim "nothing was sent".
   let submitting = false;
+  // True once an /enroll POST has been sent at all, even if it then failed. The
+  // one-time pairing code and CSR are already out (and on a response-CA mismatch
+  // the daemon has issued a cert), so a later Stop must not claim "nothing was
+  // sent" - it stays true across a failed attempt.
+  let submitted = false;
 
   $('begin').addEventListener('click', async () => {
     setError('');
@@ -377,7 +382,14 @@ pub(crate) const APP_JS: &str = r##"(function () {
     $('step-sas').hidden = true;
     $('step-details').hidden = false;
     setStatus('');
-    setError('Enrollment stopped. Nothing was sent and no certificate was trusted.');
+    if (submitted) {
+      // A prior /enroll attempt already sent the code and CSR (and may have made
+      // the agent issue a cert), even though it did not complete here. Do not
+      // claim nothing was sent - that code is likely spent.
+      setError('Enrollment stopped. A pairing code and request were already sent, so that code may be spent - generate a new pairing code on the agent to try again.');
+    } else {
+      setError('Enrollment stopped. Nothing was sent and no certificate was trusted.');
+    }
   });
 
   $('confirm').addEventListener('click', async () => {
@@ -392,6 +404,10 @@ pub(crate) const APP_JS: &str = r##"(function () {
     try {
       const material = await createEnrollmentMaterial('zeroclaw-browser');
       setStatus('Enrolling through the relay...');
+      // From here the code and CSR leave the browser; even a failure past this
+      // point means the pairing code may be spent. Record it so a later Stop is
+      // honest.
+      submitted = true;
       const issued = await postJson('/enroll', {
         node_id: state.nodeId,
         pairing_code: state.pairingCode,
@@ -419,8 +435,9 @@ pub(crate) const APP_JS: &str = r##"(function () {
       // The pairing code is one-time and now spent; drop our copy.
       state.pairingCode = '';
     } catch (error) {
-      // The exchange did not complete: let the operator retry, or now stop
-      // honestly (nothing was issued).
+      // The exchange did not complete here, but the code and CSR were already
+      // sent (see `submitted`): let the operator retry, or Stop - which now
+      // reports honestly that the code may be spent rather than "nothing sent".
       setError(String(error.message || error));
       setStatus('');
       $('confirm').disabled = false;
@@ -790,6 +807,69 @@ process.stdout.write(JSON.stringify({
   deviceShown: __el('device-id').textContent,
   certShown: __el('cert-pem').textContent,
   caShown: __el('ca-pem').textContent,
+}));
+"#;
+
+    /// A submission that failed (e.g. the agent rejected a response-CA mismatch)
+    /// still sent the one-time code and CSR. Once the catch path re-enables Stop,
+    /// a Stop click must not claim "nothing was sent" - it must warn the code may
+    /// be spent and point at a fresh pairing code.
+    #[test]
+    fn stop_after_failed_submit_reports_the_code_may_be_spent() {
+        let (ca_pem, _key) = zeroclaw_tls::testing::gen_ca();
+        let ca_json = serde_json::to_string(&ca_pem).expect("ca as a JS string literal");
+        let driver = DRIVER_STOP_AFTER_FAILURE.replace("__CA_PEM_JSON__", &ca_json);
+
+        let Some(result) = run_page_app(&driver) else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+
+        let error_text = result["errorText"].as_str().unwrap_or_default();
+        let lower = error_text.to_ascii_lowercase();
+        assert!(
+            !lower.contains("nothing was sent"),
+            "Stop falsely claimed nothing was sent after a failed submission: {error_text:?}"
+        );
+        assert!(
+            lower.contains("new pairing code"),
+            "Stop after a failed submission should point at a new pairing code: {error_text:?}"
+        );
+        // The failed attempt re-enabled Stop so the operator could click it.
+        assert_eq!(result["abortDisabledAfterFailure"].as_bool(), Some(false));
+    }
+
+    const DRIVER_STOP_AFTER_FAILURE: &str = r#"
+const caPem = __CA_PEM_JSON__;
+__el('node-id').value = 'node-1';
+__el('pairing-code').value = '482913';
+
+// Step 1: /enroll/ca resolves, advancing the page to the SAS step.
+__fetch = async (path) => {
+  if (path === '/enroll/ca') {
+    return { ok: true, status: 200, json: async () => ({ ca_chain_pem: caPem }) };
+  }
+  throw new Error('unexpected preflight fetch: ' + path);
+};
+await __click('begin');
+if (__el('step-sas').hidden) throw new Error('did not reach the SAS step');
+
+// Step 2: confirm, but /enroll fails - the code and CSR still went out.
+__fetch = async (path) => {
+  if (path === '/enroll') {
+    return { ok: false, status: 400, json: async () => ({ error: 'response CA did not match' }) };
+  }
+  throw new Error('unexpected enroll fetch: ' + path);
+};
+await __click('confirm');
+
+// The failed attempt re-enables Stop; the operator clicks it.
+const abortDisabledAfterFailure = __el('abort').disabled;
+__click('abort');
+
+process.stdout.write(JSON.stringify({
+  abortDisabledAfterFailure,
+  errorText: __el('error').textContent,
 }));
 "#;
 }
