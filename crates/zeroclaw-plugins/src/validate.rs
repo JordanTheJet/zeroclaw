@@ -76,12 +76,13 @@ pub async fn verify_component_loads(
 }
 
 /// No-backend build: nothing to instantiate against, so verification passes.
+///
+/// There are no limits to take here: `PluginLimits` lives in the backend-only
+/// `component` module, and every caller that has a materialized limit set is
+/// itself compiled with a backend, so this shape is reached only by builds that
+/// cannot hand one over.
 #[cfg(not(feature = "plugins-wasmtime"))]
-pub async fn verify_component_loads(
-    _wasm_path: &Path,
-    _manifest: &PluginManifest,
-    _limits: crate::component::PluginLimits,
-) -> Result<()> {
+pub async fn verify_component_loads(_wasm_path: &Path, _manifest: &PluginManifest) -> Result<()> {
     Ok(())
 }
 
