@@ -226,6 +226,7 @@ mod tests {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
         assert!(map.contains_key("zc-pane-chat"));
+        assert!(map.contains_key("zc-sidebar-title"));
         let mismatch = format_ftl_message(
             EN_FTL,
             "en",
@@ -343,6 +344,15 @@ mod tests {
             assert!(controls.contains('↑'));
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
+
+            let picker_error = format_ftl_message(
+                source,
+                locale,
+                "zc-sidebar-picker-error",
+                &[("error", "socket closed")],
+            )
+            .unwrap_or_else(|| panic!("sidebar picker error must format for {locale}"));
+            assert!(picker_error.contains("socket closed"));
         }
     }
 
@@ -365,6 +375,79 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("spawned-daemon failure must format for {locale}"));
             assert!(failure.contains("test failure"));
+        }
+    }
+
+    #[test]
+    fn spawned_daemon_readiness_messages_format_in_every_builtin_catalogue() {
+        // The daemon-wait notice and its timeout guidance ship in the English
+        // catalogue, which is the source of truth; the shipped non-English
+        // catalogues are filled by the documented `cargo fluent fill` pass and
+        // may not define them yet. `t_args` resolves the English source in that
+        // case, so a non-English locale must still render an interpolated
+        // message rather than the raw `{key}` brace form.
+        const PATH: &str = "/tmp/zeroclaw-long-socket-path/daemon.sock";
+        let args = [("path", PATH), ("seconds", "30")];
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        // Moving these two messages into the catalogue must not reword them.
+        // These are the exact strings `await_spawned_daemon_ready` printed
+        // before the change, with the same path and duration interpolation.
+        assert_eq!(
+            format_ftl_message(EN_FTL, "en", "zc-daemon-wait-notice", &args).unwrap(),
+            format!("zerocode: waiting for daemon at {PATH} (up to 30s)…")
+        );
+        assert_eq!(
+            format_ftl_message(EN_FTL, "en", "zc-error-daemon-not-ready-timeout", &args).unwrap(),
+            format!(
+                "daemon did not become ready within 30s (socket: {PATH}); if the socket path is \
+                 long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir"
+            )
+        );
+
+        for (locale, source) in catalogues {
+            for key in ["zc-daemon-wait-notice", "zc-error-daemon-not-ready-timeout"] {
+                // Mirrors the lookup order `t_args` performs: the active
+                // locale's catalogue first, then the English fallback.
+                let rendered = format_ftl_message(source, locale, key, &args)
+                    .or_else(|| format_ftl_message(EN_FTL, "en", key, &args))
+                    .unwrap_or_else(|| panic!("`{key}` must render for {locale}"));
+
+                assert!(
+                    rendered.contains(PATH),
+                    "`{key}` for {locale} dropped the socket path: {rendered}"
+                );
+                assert!(
+                    rendered.contains("30"),
+                    "`{key}` for {locale} dropped the readiness budget: {rendered}"
+                );
+                assert!(
+                    !rendered.contains(&format!("{{{key}}}")),
+                    "`{key}` for {locale} fell back to the raw brace form"
+                );
+            }
+
+            // The timeout guidance has to stay actionable after formatting.
+            let timeout =
+                format_ftl_message(source, locale, "zc-error-daemon-not-ready-timeout", &args)
+                    .or_else(|| {
+                        format_ftl_message(EN_FTL, "en", "zc-error-daemon-not-ready-timeout", &args)
+                    })
+                    .expect("timeout guidance must render");
+            assert!(
+                timeout.contains("ZEROCLAW_SOCKET"),
+                "`{locale}` lost the ZEROCLAW_SOCKET guidance: {timeout}"
+            );
+            assert!(
+                timeout.contains("--config-dir"),
+                "`{locale}` lost the --config-dir guidance: {timeout}"
+            );
         }
     }
 

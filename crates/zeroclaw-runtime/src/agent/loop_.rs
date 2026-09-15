@@ -688,7 +688,7 @@ pub(crate) fn build_system_prompt_for_turn(
             native_tool_specs_present,
             skills_prompt_mode,
             compact_context,
-            max_system_prompt_chars,
+            0,
             inject_memory,
             show_tool_calls,
             shell_profile,
@@ -708,7 +708,10 @@ pub(crate) fn build_system_prompt_for_turn(
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
 
-    Ok(system_prompt)
+    Ok(crate::agent::system_prompt::finalize_system_prompt(
+        system_prompt,
+        max_system_prompt_chars,
+    ))
 }
 
 pub fn make_query_summary(raw: &str) -> Option<String> {
@@ -3289,7 +3292,7 @@ pub async fn process_message(
                 native_tool_specs_present,
                 eff_prompt_injection_mode,
                 eff_compact_context,
-                eff_max_system_prompt_chars,
+                0,
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
@@ -3342,6 +3345,10 @@ pub async fn process_message(
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
+        system_prompt = crate::agent::system_prompt::finalize_system_prompt(
+            system_prompt,
+            eff_max_system_prompt_chars,
+        );
 
         let effective_msg_ref = effective_message.as_str();
         let runtime_capability_names: Vec<&str> = effective_tool_names.iter().copied().collect();
@@ -4195,6 +4202,9 @@ mod tests {
         assert!(outcome.error_reason.is_none());
     }
 
+    // Success path only. The failure arms of `execute_one_tool` do scrub the
+    // model-visible `output` (they fold in a tool's detailed error body); see
+    // the failure-output tests in `agent::tool_execution::tests`.
     #[tokio::test]
     async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
         struct CapturingResults {
@@ -4592,6 +4602,79 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "RecordingModelProvider"
+        }
+    }
+
+    struct MutatingImageProvider {
+        calls: Arc<AtomicUsize>,
+        image_path: std::path::PathBuf,
+        original_data_uri: String,
+        replacement_bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MutatingImageProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in image-cache tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(&self.original_data_uri)),
+                "every iteration must reuse the first prepared image bytes"
+            );
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if call == 0 {
+                std::fs::write(&self.image_path, &self.replacement_bytes)?;
+                r#"<tool_call>
+{"name":"probe","arguments":{"value":"ok"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MutatingImageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MutatingImageProvider"
         }
     }
 
@@ -5275,6 +5358,73 @@ mod tests {
         }
     }
 
+    /// The operator-denial result has to carry its own meaning, because the
+    /// model will otherwise supply one. Handed the bare three-word form, it
+    /// reported the decline correctly on one run and offered three invented
+    /// causes on the next, none of them what happened.
+    ///
+    /// Three separate obligations, asserted separately so a regression names
+    /// which one broke: the call did not run, the operator is named as the
+    /// one who declined, and the model is told not to guess at a reason.
+    #[tokio::test]
+    async fn operator_deny_states_the_outcome_and_forbids_inventing_a_cause() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+
+        assert!(
+            content.contains("the call did not run"),
+            "the result must say the tool did not execute: {content}"
+        );
+        assert!(
+            content.contains("operator was asked to approve") && content.contains("declined"),
+            "the result must attribute the decision to the operator: {content}"
+        );
+        assert!(
+            content.contains("do not speculate about why"),
+            "the result must forbid inventing a cause: {content}"
+        );
+    }
+
+    /// A denial the model is invited to retry is a denial that does not hold.
+    /// The gate is the only place that knows the operator has already answered,
+    /// so the instruction against retrying belongs in its result rather than in
+    /// the system prompt, which cannot see this turn.
+    #[tokio::test]
+    async fn operator_deny_tells_the_model_not_to_retry_the_call() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+        assert!(
+            content.contains("Do not retry this call"),
+            "the result must tell the model not to retry: {content}"
+        );
+    }
+
+    /// The result is read by the MODEL, so it must not hand it the vocabulary
+    /// for lobbying its way past the gate. `auto_approve` bypasses operator
+    /// approval for one tool and `level = "full"` removes the gate for every
+    /// tool and drops workspace confinement; naming either invites the model to
+    /// argue for expanding its own privileges. The operator gets that advice
+    /// through the WARN record and the UI, where the decision is theirs.
+    #[tokio::test]
+    async fn no_denial_result_names_a_setting_that_would_permit_the_call() {
+        for source in [
+            ::zeroclaw_api::channel::ApprovalSource::Operator,
+            ::zeroclaw_api::channel::ApprovalSource::TimedOut,
+            ::zeroclaw_api::channel::ApprovalSource::Unreachable,
+            ::zeroclaw_api::channel::ApprovalSource::Unavailable,
+        ] {
+            let content = tool_results_for_denying_channel(source).await;
+            for forbidden in ["auto_approve", "level = \"full\"", "risk profile"] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{source:?} denial names `{forbidden}` to the model: {content}"
+                );
+            }
+        }
+    }
+
     struct CredentialOutputTool;
 
     #[async_trait]
@@ -5663,6 +5813,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_reuses_fallback_image_cache_across_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let uploads = temp.path().join("uploads");
+        std::fs::create_dir(&uploads).unwrap();
+        let image_path = uploads.join("cached.png");
+        let original_bytes = [
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        ];
+        let replacement_bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
+        ];
+        std::fs::write(&image_path, original_bytes).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = MutatingImageProvider {
+            calls: Arc::clone(&calls),
+            image_path: image_path.clone(),
+            original_data_uri: format!("data:image/png;base64,{}", STANDARD.encode(original_bytes)),
+            replacement_bytes,
+        };
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("probe", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![ChatMessage::user(format!(
+            "inspect [IMAGE:{}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("fallback cache should survive every tool-loop iteration");
+
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_degrades_carried_over_image_on_non_vision_provider() {
         let model_provider = RecordingModelProvider::new();
         let recorded_requests = Arc::clone(&model_provider.requests);
@@ -5750,7 +5988,7 @@ mod tests {
             "carried-over image marker must be stripped, got: {sent_blob}"
         );
         assert!(
-            sent_blob.contains("[media attachment]"),
+            sent_blob.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
             "stripped marker should become the text placeholder, got: {sent_blob}"
         );
     }
@@ -13790,6 +14028,42 @@ Let me check the result."#;
     }
 
     #[test]
+    fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().expect("tempdir");
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            &format!("## Deferred\n\n{}", "界".repeat(300)),
+            &[],
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &[],
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            512,
+            true,
+            false,
+            Some("THINKING_PREFIX"),
+            None,
+        )
+        .expect("turn prompt");
+
+        assert_eq!(prompt.chars().count(), 512);
+        assert!(prompt.starts_with("THINKING_PREFIX"));
+        assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("System prompt truncated"));
+    }
+
+    #[test]
     fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use zeroclaw_config::schema::{
@@ -15211,6 +15485,7 @@ Let me check the result."#;
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15314,6 +15589,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15324,6 +15600,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15675,6 +15952,7 @@ Let me check the result."#;
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15902,6 +16180,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15973,6 +16252,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16094,6 +16374,7 @@ Let me check the result."#;
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -16163,6 +16444,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),

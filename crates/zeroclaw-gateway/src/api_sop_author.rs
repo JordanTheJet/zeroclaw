@@ -1247,6 +1247,7 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &[member_token.to_string(), other_token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ));
         (tmp, state, run_id)
     }
@@ -1347,6 +1348,7 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &[first_member.to_string(), second_member.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ));
 
         let resp = handle_sop_decide(
@@ -1417,7 +1419,11 @@ mod tests {
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         let mut state = crate::api::test_state(config);
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let resp = handle_sop_decide(
             State(state.clone()),
@@ -1495,7 +1501,11 @@ mod tests {
 
         let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         (state, run_id)
     }
 
@@ -1624,7 +1634,11 @@ mod tests {
     #[tokio::test]
     async fn authoring_cancel_fails_closed_remotely_when_pairing_is_disabled() {
         let (mut state, run_id) = authoring_state_with_running_run("unused");
-        state.pairing = Arc::new(PairingGuard::new(false, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let remote = handle_sop_cancel(
             State(state.clone()),
@@ -1660,7 +1674,11 @@ mod tests {
     #[tokio::test]
     async fn authoring_cancel_rejects_remote_client_behind_trusted_loopback_proxy() {
         let (mut state, run_id) = authoring_state_with_running_run("unused");
-        state.pairing = Arc::new(PairingGuard::new(false, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         state.trust_forwarded_headers = true;
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.17"));
@@ -1720,7 +1738,11 @@ mod tests {
 
         let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let resp = handle_sop_cancel(
             State(state.clone()),
