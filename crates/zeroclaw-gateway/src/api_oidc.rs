@@ -14,6 +14,15 @@
 //!   to `window.opener` via `postMessage` (gateway origin only) with a
 //!   manual copy fallback. No cookies, no session: clients keep
 //!   authenticating per request with the route-layer headers.
+//!
+//! Because nothing here is authenticated, every route is bounded *before*
+//! it can cause outbound work, by three independent limits held in
+//! [`OidcEnrollmentState`]: the gateway auth limiter refuses clients that
+//! are already locked out, a per-client sliding-window budget caps relay
+//! requests per minute, and a process-wide semaphore caps how many IdP
+//! round trips can be in flight at once. Every response from these routes
+//! is `Cache-Control: no-store`: each one carries, or is one step from, a
+//! device code or an access token.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,18 +31,47 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Extension, Json, Router,
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
-use crate::AppState;
+use crate::{AppState, SlidingWindowRateLimiter};
 
 const FLOW_TTL: Duration = Duration::from_secs(600);
 const FLOW_CAP: usize = 32;
+
+/// Relay requests one client may spend per minute across the enrollment
+/// surface. RFC 8628 puts the default minimum polling interval at five
+/// seconds, so a device-flow client that honours it spends twelve polls a
+/// minute; twenty leaves headroom for interval jitter and for the provider
+/// listing the same client fetches alongside its polls.
+pub(crate) const POLL_BUDGET_PER_MINUTE: u32 = 20;
+
+/// Window the budget above is measured over.
+const POLL_BUDGET_WINDOW: Duration = Duration::from_secs(60);
+
+/// Distinct client keys the budget tracks before it starts evicting the
+/// least recently seen one. Bounds the map a spray of source addresses (or
+/// of forwarded headers, where those are trusted) can grow.
+const POLL_BUDGET_MAX_KEYS: usize = 4096;
+
+/// Enrollment requests to an identity provider allowed in flight at once,
+/// across all clients. This is the bound that still applies where the
+/// per-client budget does not: a loopback caller, or a reverse proxy that
+/// collapses every client onto one address because forwarded headers are
+/// not trusted. Exceeding it refuses the request instead of queueing it.
+pub(crate) const OUTBOUND_RELAY_CAP: usize = 16;
+
+/// `Retry-After` for the two capacity refusals (outbound cap reached,
+/// pending-flow store full). Both clear as soon as an in-flight enrollment
+/// finishes, so the hint is short.
+const CAPACITY_RETRY_AFTER_SECS: u64 = 5;
 
 struct PendingPkce {
     alias: String,
@@ -43,15 +81,24 @@ struct PendingPkce {
 
 /// In-flight PKCE flows keyed by `state`, following the pairing-store
 /// posture: in-memory, single-use consume-on-arrival, short TTL, capped.
-#[derive(Default)]
-pub struct OidcFlowStore {
+struct OidcFlowStore {
     flows: parking_lot::Mutex<HashMap<String, PendingPkce>>,
+    ttl: Duration,
+}
+
+impl Default for OidcFlowStore {
+    fn default() -> Self {
+        Self {
+            flows: parking_lot::Mutex::new(HashMap::new()),
+            ttl: FLOW_TTL,
+        }
+    }
 }
 
 impl OidcFlowStore {
     fn insert(&self, pending: PendingPkce) -> Result<(), &'static str> {
         let mut flows = self.flows.lock();
-        flows.retain(|_, p| p.created.elapsed() < FLOW_TTL);
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
         if flows.len() >= FLOW_CAP {
             return Err("too many in-flight sign-ins; retry shortly");
         }
@@ -61,51 +108,151 @@ impl OidcFlowStore {
 
     fn consume(&self, state_key: &str) -> Option<PendingPkce> {
         let mut flows = self.flows.lock();
-        flows.retain(|_, p| p.created.elapsed() < FLOW_TTL);
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
         flows.remove(state_key)
     }
 }
 
+/// Everything the enrollment routes need beyond [`AppState`]: the pending
+/// browser flows plus the two limits that bound what an unauthenticated
+/// caller can make this gateway do.
+pub(crate) struct OidcEnrollmentState {
+    flows: OidcFlowStore,
+    poll_budget: SlidingWindowRateLimiter,
+    pub(crate) outbound: Semaphore,
+}
+
+impl Default for OidcEnrollmentState {
+    fn default() -> Self {
+        Self {
+            flows: OidcFlowStore::default(),
+            poll_budget: SlidingWindowRateLimiter::new(
+                POLL_BUDGET_PER_MINUTE,
+                POLL_BUDGET_WINDOW,
+                POLL_BUDGET_MAX_KEYS,
+            ),
+            outbound: Semaphore::new(OUTBOUND_RELAY_CAP),
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
+    routes_with(Arc::new(OidcEnrollmentState::default()))
+}
+
+/// Same routes over a caller-supplied state, so a test can hold the budget
+/// and semaphore handles the routes are enforcing.
+pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<AppState> {
     Router::new()
         .route("/api/oidc/providers", get(handle_providers))
         .route("/api/oidc/{alias}/device/start", post(handle_device_start))
         .route("/api/oidc/{alias}/device/poll", post(handle_device_poll))
         .route("/oidc/login/{alias}", get(handle_pkce_login))
         .route("/oidc/callback", get(handle_pkce_callback))
-        .layer(Extension(Arc::new(OidcFlowStore::default())))
+        .layer(axum::middleware::from_fn(no_store))
+        .layer(Extension(enrollment_state))
 }
 
-/// Rate limiting for the enrollment surface. `record` distinguishes
-/// flow-starting requests (counted) from polls (checked but not counted,
-/// or a legitimate device flow would exhaust its own budget; the IdP
-/// throttles polling itself via `slow_down`).
-fn rate_limit(
-    state: &AppState,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-    record: bool,
-) -> Result<(), Box<Response>> {
-    let key = crate::client_key_from_request(Some(peer), headers, state.trust_forwarded_headers);
-    if let Err(e) = state.auth_limiter.check_rate_limit(&key) {
-        return Err(Box::new(
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "Too many enrollment attempts. Try again in {}s.",
-                        e.retry_after_secs
-                    ),
-                    "retry_after": e.retry_after_secs,
-                })),
-            )
-                .into_response(),
-        ));
+/// Keep enrollment responses out of caches, back/forward restores and
+/// proxies: the callback page embeds an access token, the device start
+/// returns a device code, and a granted poll returns the token itself.
+/// Attached inside [`routes_with`] so the production router gets it by
+/// merging these routes, next to (not instead of) the gateway-wide
+/// security headers, which set `no-referrer` and COOP but no cache policy.
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+/// The client this request is billed to: the forwarded address only where
+/// the deployment trusts its proxy, the peer address otherwise. Same
+/// derivation as every other rate-limited gateway surface.
+fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
+    crate::client_key_from_request(Some(peer), headers, state.trust_forwarded_headers)
+}
+
+fn set_retry_after(response: &mut Response, secs: u64) {
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+}
+
+fn too_many_requests(message: &str, retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": message,
+            "retry_after": retry_after_secs,
+        })),
+    )
+        .into_response();
+    set_retry_after(&mut response, retry_after_secs);
+    response
+}
+
+/// Brute-force gate: refuse a client the auth limiter has locked out.
+/// `record` distinguishes the flow-starting requests (counted on arrival)
+/// from polls, which are counted only once the IdP's answer shows the
+/// caller is polling too fast or feeding the relay invalid device codes.
+fn auth_gate(state: &AppState, key: &str, record: bool) -> Result<(), Box<Response>> {
+    if let Err(e) = state.auth_limiter.check_rate_limit(key) {
+        return Err(Box::new(too_many_requests(
+            &format!(
+                "Too many enrollment attempts. Try again in {}s.",
+                e.retry_after_secs
+            ),
+            e.retry_after_secs,
+        )));
     }
     if record {
-        state.auth_limiter.record_attempt(&key);
+        state.auth_limiter.record_attempt(key);
     }
     Ok(())
+}
+
+/// Per-client request budget for the relay routes, consumed before any
+/// outbound work. Loopback is exempt on exactly the terms the auth limiter
+/// exempts it on, so a local dashboard and a local zerocode keep working
+/// while a remote caller stays bounded.
+fn budget_gate(enrollment_state: &OidcEnrollmentState, key: &str) -> Result<(), Box<Response>> {
+    if crate::auth_rate_limit::is_loopback_key(key) {
+        return Ok(());
+    }
+    enrollment_state
+        .poll_budget
+        .allow_or_retry_after(key)
+        .map_err(|retry_after_secs| {
+            Box::new(too_many_requests(
+                &format!("Too many enrollment requests. Try again in {retry_after_secs}s."),
+                retry_after_secs,
+            ))
+        })
+}
+
+/// Reserve one of the outbound slots. The permit is held for the whole IdP
+/// round trip, so the cap counts requests in flight rather than started.
+fn outbound_permit(enrollment_state: &OidcEnrollmentState) -> Option<SemaphorePermit<'_>> {
+    enrollment_state.outbound.try_acquire().ok()
+}
+
+/// Refusal when the outbound cap is reached: nothing is sent to the IdP.
+fn relay_busy() -> Response {
+    let mut response = error_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "enrollment relay is busy; retry shortly",
+    );
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
+}
+
+/// The same refusal for the browser callback, which answers in HTML.
+fn relay_busy_page() -> Response {
+    let mut response = failure_page(StatusCode::SERVICE_UNAVAILABLE);
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
 }
 
 fn error_json(status: StatusCode, message: &str) -> Response {
@@ -132,7 +279,19 @@ fn enrollment_for(state: &AppState, alias: &str) -> Result<Enrollment, Box<Respo
     })
 }
 
-async fn handle_providers(State(state): State<AppState>) -> Response {
+async fn handle_providers(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&state, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
     let mut aliases: Vec<String> = state.config.read().oidc.keys().cloned().collect();
     aliases.sort();
     let providers: Vec<serde_json::Value> = aliases
@@ -149,16 +308,21 @@ async fn handle_providers(State(state): State<AppState>) -> Response {
 
 async fn handle_device_start(
     State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(alias): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(denied) = rate_limit(&state, peer, &headers, true) {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&state, &key, true) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
         Ok(enrollment) => enrollment,
         Err(response) => return *response,
+    };
+    let Some(_permit) = outbound_permit(&relay) else {
+        return relay_busy();
     };
     match enrollment.device_grant_start().await {
         Ok(start) => Json(start).into_response(),
@@ -182,32 +346,57 @@ struct DevicePollBody {
 
 async fn handle_device_poll(
     State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(alias): Path<String>,
     headers: HeaderMap,
     Json(body): Json<DevicePollBody>,
 ) -> Response {
-    if let Err(denied) = rate_limit(&state, peer, &headers, false) {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&state, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
         Ok(enrollment) => enrollment,
         Err(response) => return *response,
     };
+    let Some(_permit) = outbound_permit(&relay) else {
+        return relay_busy();
+    };
     match enrollment.device_grant_poll(&body.device_code).await {
         Ok(DevicePollOutcome::Pending) => {
             Json(serde_json::json!({ "status": "pending" })).into_response()
         }
         Ok(DevicePollOutcome::SlowDown) => {
+            // The IdP says this caller is polling faster than the grant
+            // allows. Count it: a caller that ignores back-off walks into
+            // the same lockout a password guesser does.
+            state.auth_limiter.record_attempt(&key);
             Json(serde_json::json!({ "status": "slow_down" })).into_response()
         }
+        // Only what the enrolling client needs to authenticate: the access
+        // token and its lifetime. A refresh token the IdP may have issued
+        // is not relayed; renewal is out of scope here, and a long-lived
+        // credential nobody consumes has no business in a browser tab or a
+        // terminal.
         Ok(DevicePollOutcome::Token(token)) => Json(serde_json::json!({
             "status": "granted",
             "provider": format!("oidc.{alias}"),
-            "token": *token,
+            "token": {
+                "access_token": token.access_token,
+                "expires_in": token.expires_in,
+            },
         }))
         .into_response(),
-        Err(e) => error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        Err(e) => {
+            // An invalid or expired device code: what a caller relaying
+            // guesses produces, so it counts as an attempt too.
+            state.auth_limiter.record_attempt(&key);
+            error_json(StatusCode::BAD_GATEWAY, &format!("{e}"))
+        }
     }
 }
 
@@ -244,12 +433,13 @@ fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Res
 
 async fn handle_pkce_login(
     State(state): State<AppState>,
-    Extension(flows): Extension<Arc<OidcFlowStore>>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(alias): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(denied) = rate_limit(&state, peer, &headers, true) {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&state, &key, true) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
@@ -260,17 +450,22 @@ async fn handle_pkce_login(
         Ok(uri) => uri,
         Err(response) => return *response,
     };
-    let flow = match enrollment.pkce_start(&redirect_uri).await {
-        Ok(flow) => flow,
-        Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+    let flow = {
+        let Some(_permit) = outbound_permit(&relay) else {
+            return relay_busy();
+        };
+        match enrollment.pkce_start(&redirect_uri).await {
+            Ok(flow) => flow,
+            Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        }
     };
     let authorize_url = flow.authorize_url.clone();
-    if let Err(full) = flows.insert(PendingPkce {
+    if let Err(full) = relay.flows.insert(PendingPkce {
         alias,
         flow,
         created: Instant::now(),
     }) {
-        return error_json(StatusCode::TOO_MANY_REQUESTS, full);
+        return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
     }
     Redirect::temporary(&authorize_url).into_response()
 }
@@ -285,6 +480,10 @@ struct CallbackQuery {
     error: Option<String>,
     #[serde(default)]
     error_description: Option<String>,
+    /// RFC 9207 issuer identification. Checked against the issuer this
+    /// flow was started for before the response is acted on either way.
+    #[serde(default)]
+    iss: Option<String>,
 }
 
 /// Fixed failure page: never echoes request content. Details go to the
@@ -344,19 +543,35 @@ fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> 
 
 async fn handle_pkce_callback(
     State(state): State<AppState>,
-    Extension(flows): Extension<Arc<OidcFlowStore>>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    if let Err(denied) = rate_limit(&state, peer, &headers, true) {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&state, &key, true) {
         return *denied;
     }
     // State gates everything: without a live matching flow there is
     // nothing to fail, let alone finish.
-    let Some(pending) = query.state.as_deref().and_then(|s| flows.consume(s)) else {
+    let Some(pending) = query.state.as_deref().and_then(|s| relay.flows.consume(s)) else {
         return failure_page(StatusCode::BAD_REQUEST);
     };
+    // RFC 9207: a response that names another issuer is a mix-up, and is
+    // not acted on either way — neither its code nor its error verdict.
+    if let Err(e) = pending.flow.check_callback_issuer(query.iss.as_deref()) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "alias": pending.alias,
+                    "error": format!("{e}"),
+                })),
+            "oidc browser sign-in response names a different issuer"
+        );
+        return failure_page(StatusCode::BAD_REQUEST);
+    }
     if let Some(error) = query.error {
         ::zeroclaw_log::record!(
             WARN,
@@ -378,6 +593,9 @@ async fn handle_pkce_callback(
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
         Err(_) => return failure_page(StatusCode::BAD_REQUEST),
+    };
+    let Some(_permit) = outbound_permit(&relay) else {
+        return relay_busy_page();
     };
     match enrollment.pkce_exchange(&pending.flow, &code).await {
         Ok(token) => success_page(
@@ -411,6 +629,8 @@ mod tests {
     use wiremock::matchers::{body_string_contains, method as http_method, path as http_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_config::schema::{Config, OidcConfig, OidcValidation};
+
+    use crate::auth_rate_limit::MAX_ATTEMPTS;
 
     async fn idp() -> MockServer {
         let server = MockServer::start().await;
@@ -451,6 +671,45 @@ mod tests {
         routes().with_state(crate::api::tests::test_state(config))
     }
 
+    /// The default test peer: loopback, exempt from the per-client budget.
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 39999))
+    }
+
+    /// A remote caller, which every per-client limit applies to.
+    fn remote() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 40000))
+    }
+
+    fn build_request(
+        http_method: &str,
+        path: &str,
+        host: &str,
+        body: Option<serde_json::Value>,
+        peer: SocketAddr,
+        extra_headers: &[(&str, &str)],
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(http_method)
+            .uri(path)
+            .header("host", host);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let payload = body.map(|json| json.to_string());
+        if let Some(payload) = payload.as_deref() {
+            builder = builder
+                .header("content-type", "application/json")
+                .header("content-length", payload.len().to_string());
+        }
+        let mut request = match payload {
+            Some(payload) => builder.body(Body::from(payload)).unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
     async fn send(
         router: &Router,
         http_method: &str,
@@ -458,26 +717,73 @@ mod tests {
         host: &str,
         body: Option<serde_json::Value>,
     ) -> axum::response::Response {
-        let mut builder = HttpRequest::builder()
-            .method(http_method)
-            .uri(path)
-            .header("host", host);
-        if body.is_some() {
-            builder = builder.header("content-type", "application/json");
-        }
-        let mut request = match body {
-            Some(json) => builder.body(Body::from(json.to_string())).unwrap(),
-            None => builder.body(Body::empty()).unwrap(),
-        };
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 39999))));
+        let request = build_request(http_method, path, host, body, loopback(), &[]);
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn send_as(
+        router: &Router,
+        peer: SocketAddr,
+        http_method: &str,
+        path: &str,
+        host: &str,
+        body: Option<serde_json::Value>,
+        extra_headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let request = build_request(http_method, path, host, body, peer, extra_headers);
         router.clone().oneshot(request).await.unwrap()
     }
 
     async fn body_text(response: axum::response::Response) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_str(&body_text(response).await).unwrap()
+    }
+
+    /// How many requests the IdP saw on one path — the count that says
+    /// whether a refusal happened before or after the outbound call.
+    async fn requests_to(server: &MockServer, path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .count()
+    }
+
+    fn header_value(response: &axum::response::Response, name: &str) -> String {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn poll_body() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"device_code": "dev-relayed"}))
+    }
+
+    fn assert_no_store(label: &str, response: &axum::response::Response, status: StatusCode) {
+        assert_eq!(response.status(), status, "{label}");
+        assert_eq!(
+            header_value(response, "cache-control"),
+            "no-store",
+            "{label}"
+        );
+        assert_eq!(header_value(response, "pragma"), "no-cache", "{label}");
+    }
+
+    /// Percent-encode a URL so it survives as one query-parameter value.
+    fn query_escape(value: &str) -> String {
+        value
+            .replace('%', "%25")
+            .replace(':', "%3A")
+            .replace('/', "%2F")
     }
 
     #[tokio::test]
@@ -535,6 +841,7 @@ mod tests {
             .and(body_string_contains("device_code=dev-9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-device",
+                "refresh_token": "rt-never-relayed",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -576,6 +883,11 @@ mod tests {
         assert_eq!(poll["status"], "granted");
         assert_eq!(poll["provider"], "oidc.corp");
         assert_eq!(poll["token"]["access_token"], "at-device");
+        assert_eq!(poll["token"]["expires_in"], 3600);
+        assert!(
+            poll["token"].get("refresh_token").is_none(),
+            "the relay hands out only the access token and its lifetime: {poll}"
+        );
     }
 
     #[tokio::test]
@@ -622,6 +934,19 @@ mod tests {
             .to_string()
     }
 
+    /// Start a browser flow and return the `state` the gateway issued.
+    async fn start_login(router: &Router) -> String {
+        let response = send(router, "GET", "/oidc/login/corp", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        state_from_location(&location)
+    }
+
     #[tokio::test]
     async fn pkce_callback_exchanges_once_and_only_once() {
         let server = idp().await;
@@ -637,14 +962,7 @@ mod tests {
             .await;
         let router = router_for(config_with_alias(&server.uri(), "corp"));
 
-        let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap()
-            .to_string();
-        let flow_state = state_from_location(&location);
+        let flow_state = start_login(&router).await;
 
         let response = send(
             &router,
@@ -676,14 +994,7 @@ mod tests {
     async fn idp_error_on_callback_consumes_the_flow_and_shows_the_fixed_page() {
         let server = idp().await;
         let router = router_for(config_with_alias(&server.uri(), "corp"));
-        let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap()
-            .to_string();
-        let flow_state = state_from_location(&location);
+        let flow_state = start_login(&router).await;
         let response = send(
             &router,
             "GET",
@@ -701,5 +1012,668 @@ mod tests {
             !page.contains("access_denied") && !page.contains("nope"),
             "the failure page never echoes request content"
         );
+    }
+
+    #[tokio::test]
+    async fn device_polls_consume_a_bounded_per_client_budget() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending",
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        // A remote caller that never started a flow still pays for every
+        // poll it makes, because each one costs the gateway an IdP round
+        // trip carrying this deployment's client credentials.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_header = header_value(&response, "retry-after");
+        let retry_after = body_json(response).await["retry_after"].as_u64().unwrap();
+        assert!(
+            (1..=POLL_BUDGET_WINDOW.as_secs()).contains(&retry_after),
+            "retry_after names when the window frees a slot: {retry_after}"
+        );
+        assert_eq!(retry_header, retry_after.to_string());
+
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            POLL_BUDGET_PER_MINUTE as usize,
+            "the refused poll never reached the identity provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_slow_down_walks_the_caller_into_the_lockout() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "slow_down" })),
+            )
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+            assert_eq!(body_json(response).await["status"], "slow_down");
+        }
+        let outbound = requests_to(&server, "/token").await;
+        assert_eq!(outbound, MAX_ATTEMPTS as usize);
+
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            outbound,
+            "the locked-out caller caused no further outbound work"
+        );
+    }
+
+    #[tokio::test]
+    async fn relayed_garbage_device_codes_run_into_the_lockout() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "expired_token" })),
+            )
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let response = send_as(
+                &router,
+                remote(),
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "poll {attempt}");
+        }
+        let outbound = requests_to(&server, "/token").await;
+        assert_eq!(outbound, MAX_ATTEMPTS as usize);
+
+        let response = send_as(
+            &router,
+            remote(),
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+        assert_eq!(requests_to(&server, "/token").await, outbound);
+    }
+
+    #[tokio::test]
+    async fn the_provider_listing_is_budgeted_for_remote_callers_only() {
+        let router = router_for(config_with_alias("https://idp.example.com", "corp"));
+
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/api/oidc/providers",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "listing {attempt}");
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/api/oidc/providers",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Loopback keeps the exemption the auth limiter already grants it.
+        for _ in 0..(POLL_BUDGET_PER_MINUTE * 2) {
+            let response = send(&router, "GET", "/api/oidc/providers", "gw.local", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trusted_forwarded_address_is_the_budgeted_identity() {
+        let mut state = crate::api::tests::test_state(Config::default());
+        state.trust_forwarded_headers = true;
+        let router = routes().with_state(state);
+        let forwarded = [("x-forwarded-for", "198.51.100.4")];
+
+        // The peer is loopback, but the deployment trusts its proxy, so the
+        // budget follows the forwarded client, not the proxy.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                "/api/oidc/providers",
+                "gw.local",
+                None,
+                &forwarded,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "listing {attempt}");
+        }
+        let response = send_as(
+            &router,
+            loopback(),
+            "GET",
+            "/api/oidc/providers",
+            "gw.local",
+            None,
+            &forwarded,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The same loopback peer without the header is a local client.
+        for _ in 0..(POLL_BUDGET_PER_MINUTE + 1) {
+            let response = send(&router, "GET", "/api/oidc/providers", "gw.local", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_outbound_cap_refuses_relaying_before_contacting_the_idp() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-relayed",
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // A live flow, started while the relay still had capacity.
+        let flow_state = start_login(&router).await;
+
+        // Every outbound slot is taken; nothing may reach the IdP now.
+        let _permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(
+            requests_to(&server, "/token").await,
+            0,
+            "no code was exchanged while the relay was saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_enrollment_response_forbids_caching() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dev-9",
+                "user_code": "WXYZ-1234",
+                "verification_uri": "https://sso.example.com/activate",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-cacheable-never",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let flow_state = start_login(&router).await;
+
+        assert_no_store(
+            "providers",
+            &send(&router, "GET", "/api/oidc/providers", "gw.local", None).await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "unknown alias",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/nope/device/start",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+        assert_no_store(
+            "device start",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/corp/device/start",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "granted poll",
+            &send(
+                &router,
+                "POST",
+                "/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "callback success page",
+            &send(
+                &router,
+                "GET",
+                &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_no_store(
+            "callback failure page",
+            &send(
+                &router,
+                "GET",
+                "/oidc/callback?code=x&state=never-issued",
+                "gw.local",
+                None,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_callback_refuses_a_response_from_another_issuer() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let foreign = query_escape("https://different.example");
+
+        // A matching state carrying a foreign `iss` is a mix-up: refused
+        // before the code is exchanged.
+        let flow_state = start_login(&router).await;
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={foreign}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        // An IdP error from a foreign issuer is not a verdict on this flow
+        // either, and the state is spent regardless.
+        let flow_state = start_login(&router).await;
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?error=access_denied&state={flow_state}&iss={foreign}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the refused response consumed the state"
+        );
+        assert_eq!(requests_to(&server, "/token").await, 0);
+
+        // The issuer this flow was started for is accepted.
+        let flow_state = start_login(&router).await;
+        let matching = query_escape(&server.uri());
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={matching}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("\"at-browser\""));
+        assert_eq!(requests_to(&server, "/token").await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_production_assembly_keeps_every_boundary() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-browser",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let mut config = config_with_alias(&server.uri(), "corp");
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_paired".into()];
+        let mut state = AppState {
+            pairing: Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                config.gateway.require_pairing,
+                &config.gateway.paired_tokens,
+            )),
+            ..crate::api::tests::test_state(config.clone())
+        };
+        state.path_prefix = "/gw".to_string();
+        let inbound_auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &config,
+                Arc::clone(&state.pairing),
+                Arc::clone(&state.config),
+            )
+            .unwrap(),
+        );
+        // The real assembly: the authenticated config group and the
+        // deliberately unauthenticated enrollment group in one router,
+        // nested under the deployment's path prefix, under the gateway
+        // body cap and the gateway security headers.
+        let app = Router::new()
+            .nest(
+                "/gw",
+                Router::new()
+                    .merge(crate::config_admin_router(&inbound_auth))
+                    .merge(routes())
+                    .with_state(state)
+                    .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                        crate::MAX_BODY_SIZE,
+                    )),
+            )
+            .layer(axum::middleware::from_fn(crate::security_headers::apply));
+
+        // The config group's route layer still gates config, and does not
+        // reach across the merge to the enrollment routes, which have to
+        // answer before anyone can enroll a credential.
+        let response = send(&app, "GET", "/gw/api/config", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = send(&app, "GET", "/gw/api/oidc/providers", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The redirect_uri the browser is sent with carries the prefix the
+        // deployment is nested under.
+        let response = send(&app, "GET", "/gw/oidc/login/corp", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("%2Fgw%2Foidc%2Fcallback"),
+            "redirect_uri keeps the path prefix: {location}"
+        );
+        let flow_state = state_from_location(&location);
+
+        // The token-bearing page carries both the gateway security headers
+        // and this surface's cache policy.
+        let response = send(
+            &app,
+            "GET",
+            &format!("/gw/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(&response, "cross-origin-opener-policy"),
+            "same-origin"
+        );
+        assert_eq!(header_value(&response, "referrer-policy"), "no-referrer");
+        assert_eq!(header_value(&response, "x-frame-options"), "DENY");
+        assert_eq!(header_value(&response, "cache-control"), "no-store");
+        assert_eq!(header_value(&response, "pragma"), "no-cache");
+
+        // The gateway body cap applies to the enrollment routes too.
+        let oversized = "d".repeat(70 * 1024);
+        let response = send(
+            &app,
+            "POST",
+            "/gw/api/oidc/corp/device/poll",
+            "gw.local",
+            Some(serde_json::json!({ "device_code": oversized })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // And a remote identity is still budgeted through the whole stack.
+        for attempt in 0..POLL_BUDGET_PER_MINUTE {
+            let response = send_as(
+                &app,
+                remote(),
+                "POST",
+                "/gw/api/oidc/corp/device/poll",
+                "gw.local",
+                poll_body(),
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "poll {attempt}");
+        }
+        let response = send_as(
+            &app,
+            remote(),
+            "POST",
+            "/gw/api/oidc/corp/device/poll",
+            "gw.local",
+            poll_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_pending_flow_past_its_ttl_is_gone_when_the_callback_arrives() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-exchanged",
+            })))
+            .mount(&server)
+            .await;
+        // A store whose entries are stale the moment they land: the retain
+        // pass that guards insert and consume must drop the pending flow
+        // rather than let a late callback finish it.
+        let relay = Arc::new(OidcEnrollmentState {
+            flows: OidcFlowStore {
+                flows: parking_lot::Mutex::new(HashMap::new()),
+                ttl: Duration::ZERO,
+            },
+            ..OidcEnrollmentState::default()
+        });
+        let router = routes_with(relay).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        let flow_state = start_login(&router).await;
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_pending_flow_store_is_capped() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for attempt in 0..FLOW_CAP {
+            let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT,
+                "login {attempt}"
+            );
+        }
+        let response = send(&router, "GET", "/oidc/login/corp", "gw.local", None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!header_value(&response, "retry-after").is_empty());
+        let json = body_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too many in-flight"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_alias_mid_flow_fails_the_callback_closed() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-exchanged",
+            })))
+            .mount(&server)
+            .await;
+        let state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+        let config = state.config.clone();
+        let router = routes().with_state(state);
+
+        let flow_state = start_login(&router).await;
+        config.write().oidc.clear();
+
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Sign-in not completed"));
+        assert_eq!(requests_to(&server, "/token").await, 0);
     }
 }

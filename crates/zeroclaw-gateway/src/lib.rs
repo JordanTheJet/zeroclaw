@@ -242,7 +242,7 @@ fn hash_webhook_secret(value: &str) -> String {
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug)]
-struct SlidingWindowRateLimiter {
+pub(crate) struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
     max_keys: usize,
@@ -250,7 +250,7 @@ struct SlidingWindowRateLimiter {
 }
 
 impl SlidingWindowRateLimiter {
-    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
+    pub(crate) fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
             limit_per_window,
             window,
@@ -267,8 +267,16 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
+        self.allow_or_retry_after(key).is_ok()
+    }
+
+    /// Consume one request from `key`'s budget. On refusal, the error is the
+    /// whole seconds until the oldest request still inside the window ages
+    /// out (rounded up, never below 1), which is what a caller puts in
+    /// `Retry-After`.
+    pub(crate) fn allow_or_retry_after(&self, key: &str) -> Result<(), u64> {
         if self.limit_per_window == 0 {
-            return true;
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -303,11 +311,18 @@ impl SlidingWindowRateLimiter {
         entry.retain(|instant| *instant > cutoff);
 
         if entry.len() >= self.limit_per_window as usize {
-            return false;
+            // Timestamps are pushed in order, so the first one still inside
+            // the window is the one whose expiry frees the next slot.
+            let remaining = entry
+                .first()
+                .map(|oldest| self.window.saturating_sub(now.duration_since(*oldest)))
+                .unwrap_or(self.window);
+            let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(secs.max(1));
         }
 
         entry.push(now);
-        true
+        Ok(())
     }
 }
 
