@@ -141,12 +141,17 @@ where
         mut pending,
     } = session;
     loop {
-        let response = match route(&head, &mut stream, &mut pending, &inner).await {
+        let mut response = match route(&head, &mut stream, &mut pending, &inner).await {
             Ok(bytes) => bytes,
             // The request could not be read at all (oversized body, early EOF):
             // answer if we still can, then stop.
             Err(status) => status,
         };
+        // A HEAD response carries the headers a GET would - content-length still
+        // advertises the entity - but no body bytes.
+        if request_is_head(&head) {
+            response = head_only(response);
+        }
         if stream.write_all(&response).await.is_err() {
             break;
         }
@@ -306,6 +311,19 @@ fn request_line(head: &[u8]) -> Option<(&str, &str)> {
     Some((method, path.split_once('?').map_or(path, |(p, _)| p)))
 }
 
+fn request_is_head(head: &[u8]) -> bool {
+    request_line(head).is_some_and(|(method, _)| method.eq_ignore_ascii_case("HEAD"))
+}
+
+/// Keep the status line and headers, drop the body - a HEAD response sends the
+/// headers a GET would (content-length included) but none of the entity bytes.
+fn head_only(mut response: Vec<u8>) -> Vec<u8> {
+    if let Some(i) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        response.truncate(i + 4);
+    }
+    response
+}
+
 fn should_close_after_response(head: &[u8]) -> bool {
     let text = String::from_utf8_lossy(head);
     let mut lines = text.lines();
@@ -368,9 +386,32 @@ fn is_websocket_upgrade(head: &[u8]) -> bool {
         })
 }
 
+/// Security headers applied to EVERY frontdoor HTTP response.
+///
+/// The frontdoor page is a consent / short-auth-string surface, so it must not
+/// be framable (clickjacking of the confirm button) and must not be able to
+/// source code cross-origin.
+///
+/// SAFETY (CSP): the served page (`frontdoor_assets`) carries NO inline
+/// `<script>` - its only script is same-origin `/app.js`, covered by
+/// `default-src 'self'` - so `script-src` needs no `'unsafe-inline'` and none is
+/// granted (scripts inherit `default-src 'self'`). The page does carry one
+/// inline `<style>` block, so `style-src` allows `'unsafe-inline'`; inline
+/// styles cannot execute script and this is the minimal relaxation that lets the
+/// shipped page render. The page's `fetch()` calls are same-origin
+/// (`/enroll/ca`, `/enroll`), covered by `default-src`. The headers are inert on
+/// the JS/JSON/error responses and harmless there.
+const SECURITY_HEADERS: &str = concat!(
+    "content-security-policy: frame-ancestors 'none'; default-src 'self'; style-src 'self' 'unsafe-inline'\r\n",
+    "referrer-policy: no-referrer\r\n",
+    "cross-origin-opener-policy: same-origin\r\n",
+    "x-content-type-options: nosniff\r\n",
+    "x-frame-options: DENY\r\n",
+);
+
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     let mut response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: keep-alive\r\nkeep-alive: timeout=5\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\n{SECURITY_HEADERS}connection: keep-alive\r\nkeep-alive: timeout=5\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -554,5 +595,79 @@ mod tests {
         let head = b"POST /enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n\r\n";
         assert_eq!(content_length(head), Some(42));
         assert_eq!(content_length(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), None);
+    }
+
+    /// FIX 3: every frontdoor response carries the anti-clickjacking / consent
+    /// hardening headers. The page is a SAS / consent surface, so it must not be
+    /// framable and must not source code cross-origin.
+    #[test]
+    fn every_response_carries_the_security_headers() {
+        let response = http_response("200 OK", "text/html; charset=utf-8", "<html></html>");
+        let text = String::from_utf8(response).unwrap();
+        let head = text.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+        assert!(head.contains("content-security-policy:"), "no CSP: {head}");
+        assert!(
+            head.contains("frame-ancestors 'none'"),
+            "the page must refuse cross-origin framing: {head}"
+        );
+        assert!(
+            head.contains("default-src 'self'"),
+            "no default-src: {head}"
+        );
+        assert!(head.contains("x-frame-options: deny"), "no XFO: {head}");
+        assert!(
+            head.contains("x-content-type-options: nosniff"),
+            "no nosniff: {head}"
+        );
+        assert!(
+            head.contains("referrer-policy: no-referrer"),
+            "no referrer-policy: {head}"
+        );
+        assert!(
+            head.contains("cross-origin-opener-policy: same-origin"),
+            "no COOP: {head}"
+        );
+        // Scripts inherit `default-src 'self'`: no `script-src`, so no chance of
+        // an `'unsafe-inline'` script relaxation slipping in.
+        assert!(
+            !head.contains("script-src"),
+            "scripts must inherit default-src 'self': {head}"
+        );
+    }
+
+    /// Minor (adversarial pass): a HEAD response returns the headers a GET would
+    /// - content-length included - but no body.
+    #[test]
+    fn head_only_keeps_headers_and_drops_the_body() {
+        let full = http_response("200 OK", "text/html; charset=utf-8", "<html>hi</html>");
+        let stripped = head_only(full.clone());
+        let full_text = String::from_utf8(full).unwrap();
+        let stripped_text = String::from_utf8(stripped).unwrap();
+        let head_block = full_text.split("\r\n\r\n").next().unwrap();
+        assert!(
+            stripped_text.starts_with(head_block),
+            "the headers must be unchanged"
+        );
+        assert!(
+            stripped_text.ends_with("\r\n\r\n"),
+            "no body after the headers: {stripped_text:?}"
+        );
+        // "<html>hi</html>" is 15 bytes: the length a GET would still advertise.
+        assert!(
+            stripped_text
+                .to_ascii_lowercase()
+                .contains("content-length: 15"),
+            "HEAD keeps the entity content-length: {stripped_text:?}"
+        );
+        assert!(
+            !stripped_text.contains("<html>hi</html>"),
+            "the body must be gone"
+        );
+    }
+
+    #[test]
+    fn request_is_head_detects_the_method() {
+        assert!(request_is_head(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(!request_is_head(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
     }
 }

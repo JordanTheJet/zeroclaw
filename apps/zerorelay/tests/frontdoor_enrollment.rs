@@ -375,6 +375,30 @@ async fn frontdoor_request(
     path: &str,
     body: Option<&str>,
 ) -> (u16, String) {
+    let text = frontdoor_raw(relay_addr, method, path, body).await;
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
+    (status, body)
+}
+
+/// Like `frontdoor_request`, but returns the WHOLE raw response (status line,
+/// headers, and body), so header presence and HEAD-body behaviour can be
+/// asserted rather than discarded.
+async fn frontdoor_raw(
+    relay_addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> String {
     let tcp = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
     let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -401,19 +425,7 @@ async fn frontdoor_request(
             break;
         }
     }
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let status = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("")
-        .to_string();
-    (status, body)
+    String::from_utf8_lossy(&raw).to_string()
 }
 
 /// The headline path: the page's two POSTs produce a real certificate, issued by
@@ -807,4 +819,58 @@ async fn a_disabled_frontdoor_serves_nothing() {
     )
     .await;
     assert_eq!(status, 404, "the enrollment routes must not exist when off");
+}
+
+/// FIX 3: the served page is a consent / short-auth-string surface, so its
+/// responses carry anti-clickjacking and hardening headers. A cross-origin frame
+/// of the page is refused two ways (CSP `frame-ancestors 'none'` and XFO).
+#[tokio::test]
+async fn the_frontdoor_page_carries_anti_framing_and_hardening_headers() {
+    let relay = start_relay_with_frontdoor().await;
+    let raw = frontdoor_raw(relay, "GET", "/", None).await;
+    let head = raw
+        .split("\r\n\r\n")
+        .next()
+        .expect("a header block")
+        .to_ascii_lowercase();
+    assert!(
+        head.contains("content-security-policy:"),
+        "the page must set a CSP: {head}"
+    );
+    assert!(
+        head.contains("frame-ancestors 'none'"),
+        "a cross-origin frame of the consent page must be refused by CSP: {head}"
+    );
+    assert!(
+        head.contains("x-frame-options: deny"),
+        "and by X-Frame-Options: {head}"
+    );
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+    assert!(head.contains("referrer-policy: no-referrer"), "{head}");
+    assert!(
+        head.contains("cross-origin-opener-policy: same-origin"),
+        "{head}"
+    );
+}
+
+/// Minor (adversarial pass): a HEAD request gets the headers - content-length
+/// included - but no body.
+#[tokio::test]
+async fn a_head_request_returns_headers_without_a_body() {
+    let relay = start_relay_with_frontdoor().await;
+    let raw = frontdoor_raw(relay, "HEAD", "/", None).await;
+    let (head, body) = raw.split_once("\r\n\r\n").expect("a header terminator");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length:"),
+        "HEAD keeps the content-length header: {head}"
+    );
+    assert!(
+        body.is_empty(),
+        "HEAD must not return a body, got: {body:?}"
+    );
+    // The hardening headers apply to HEAD too.
+    assert!(
+        head.to_ascii_lowercase().contains("x-frame-options: deny"),
+        "{head}"
+    );
 }
