@@ -114,18 +114,27 @@ pub(crate) const INDEX_HTML: &str = r##"<!doctype html>
   <h3>Next step: open a session with a native client</h3>
   <p>
     The relay cannot carry a browser session in this release, so this page stops
-    here. Save the two files below and hand them to <code>zerocode</code>, which
-    will connect to your agent end-to-end encrypted - the relay forwards those
-    bytes without being able to read them.
+    here. Save the three files below into <code>zerocode</code>'s
+    <code>tls/</code> directory as <code>client.crt</code>,
+    <code>client.key</code> and <code>ca.crt</code>. <code>zerocode</code> then
+    connects to your agent end-to-end encrypted with certificate verification
+    on - the relay forwards those bytes without being able to read them.
+  </p>
+  <p>
+    <code>ca.crt</code> is the agent CA you just confirmed by short-auth-string.
+    <code>zerocode</code> pins it to verify your agent and refuses to connect
+    without it, so all three files are required.
   </p>
   <p>
     Keep the private key on this device. Anyone who holds it can act as this
     enrolled client.
   </p>
-  <h3>Client certificate</h3>
+  <h3>Client certificate (client.crt)</h3>
   <pre id="cert-pem"></pre>
-  <h3>Client private key</h3>
+  <h3>Client private key (client.key)</h3>
   <pre id="key-pem"></pre>
+  <h3>Agent CA (ca.crt)</h3>
+  <pre id="ca-pem"></pre>
 </section>
 
 <p class="status" id="status" role="status"></p>
@@ -384,6 +393,12 @@ pub(crate) const APP_JS: &str = r##"(function () {
       $('relay-url').textContent = profile.relay_url || '(none configured)';
       $('relay-node').textContent = profile.node_id || state.nodeId;
       $('cert-pem').textContent = issued.cert_pem || '';
+      // The agent CA the operator confirmed by SAS. A fresh zerocode REQUIRES it
+      // (tls.ca_cert_path) to connect with verification on, so the page must hand
+      // it over too. Injected via textContent, never HTML - preserve the XSS
+      // boundary. state.caChainPem is the confirmed CA; post_enroll has already
+      // verified the response CA matches it by fingerprint.
+      $('ca-pem').textContent = state.caChainPem;
       $('key-pem').textContent = material.keyPem;
       $('step-sas').hidden = true;
       $('step-done').hidden = false;
@@ -570,6 +585,47 @@ process.stdout.write(JSON.stringify({{ fingerprint, sas }}));
             result["sas"].as_str().unwrap(),
             zeroclaw_tls::enrollment_sas(pairing_code, &expected_fingerprint),
             "the page's SAS must match the daemon console value"
+        );
+    }
+
+    /// FIX 2: the handoff must offer the daemon CA (`ca.crt`) as a third file.
+    ///
+    /// A fresh `zerocode` REQUIRES the daemon CA (`tls.ca_cert_path`, see
+    /// `apps/zerocode/src/client.rs`) to connect with verification on - without
+    /// it, and without `skip_verify`, the client refuses to build a TLS config.
+    /// The page previously offered only the client cert and key ("two files");
+    /// it must also hand over the CA the operator confirmed by SAS, injected via
+    /// `textContent` so the XSS boundary is preserved.
+    #[test]
+    fn the_handoff_offers_the_daemon_ca_as_a_third_file() {
+        assert!(
+            INDEX_HTML.contains(r#"id="ca-pem""#),
+            "the page must display the daemon CA (ca.crt)"
+        );
+        assert!(
+            APP_JS.contains("$('ca-pem').textContent = state.caChainPem"),
+            "the CA must be injected from the confirmed CA via textContent (no HTML interpolation)"
+        );
+        assert!(
+            !INDEX_HTML.contains("two files"),
+            "the instructions must no longer say two files"
+        );
+        assert!(
+            INDEX_HTML.contains("three files"),
+            "the instructions must say three files"
+        );
+        for name in ["client.crt", "client.key", "ca.crt"] {
+            assert!(INDEX_HTML.contains(name), "the page must name `{name}`");
+        }
+        // Whitespace-normalized so a line wrap between the words does not hide it.
+        let normalized = INDEX_HTML
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        assert!(
+            normalized.contains("verification on"),
+            "the instructions must state certificate verification is on"
         );
     }
 }
