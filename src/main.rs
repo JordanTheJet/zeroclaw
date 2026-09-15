@@ -216,7 +216,7 @@ fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
 }
 
 /// Whether a sampled terminal size is usable for fitting the checklist.
-#[cfg(feature = "agent-runtime")]
+#[cfg(all(feature = "agent-runtime", test))]
 fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
     size.is_some()
 }
@@ -10094,7 +10094,6 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
-#[cfg(feature = "agent-runtime")]
 fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
     #[cfg(feature = "agent-runtime")]
     {
