@@ -67,8 +67,11 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
 
 /// Emit `llms.txt` and `llms-full.txt` beside the primary locale's HTML by
 /// running mdBook once more with only the in-tree `llms` backend. The
-/// preprocessor chain runs again so the text matches the rendered pages, and
-/// no HTML backend runs, so the output already in `dest` is untouched.
+/// preprocessors that support that renderer (gettext, peer-groups,
+/// placeholders) run again so the text matches the rendered pages; mermaid
+/// serves the HTML renderer only, so diagram source stays fenced. No HTML
+/// backend runs, so the output already in `dest` is untouched. `serve` does
+/// not call this, and an HTML watch rebuild of `dest` discards the pair.
 pub fn build_llms(root: &Path, tag: Option<&str>, locale: &str) -> anyhow::Result<()> {
     use crate::cmd::mdbook::llms;
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);

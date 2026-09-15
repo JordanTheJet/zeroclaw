@@ -7,18 +7,24 @@
 //! page prefixed by its canonical URL, so an agent can ingest the whole site
 //! in a single fetch.
 //!
-//! mdBook invokes this backend with the fully preprocessed book on stdin
-//! (after gettext, peer-groups, mermaid, and placeholders have run), so the
-//! output matches the rendered HTML rather than the raw authored sources.
-//! `build.rs` runs it as a second `mdbook build` with the `output` table
-//! replaced (`MDBOOK_OUTPUT`), which keeps the HTML backend out of that pass
-//! and avoids mdBook's multi-backend `<dest>/html/` layout.
+//! mdBook invokes this backend with the preprocessed book on stdin. Only the
+//! preprocessors that declare support for the `llms` renderer run: gettext,
+//! peer-groups, and placeholders. `mdbook-mermaid` supports the HTML renderer
+//! alone, so fenced ```mermaid blocks stay as diagram source here, and page
+//! bodies keep their authored `.md` links; nothing is rewritten to deployed
+//! HTML URLs. `build.rs` runs the backend as a second `mdbook build` with the
+//! `output` table replaced (`MDBOOK_OUTPUT`), which keeps the HTML backend
+//! out of that pass and avoids mdBook's multi-backend `<dest>/html/` layout.
+//!
+//! [`sync_root`] is the deploy-time counterpart: it mirrors the stable
+//! release's pair to the gh-pages root, or withdraws the root pair when that
+//! release was built without this backend.
 
 use anyhow::Context as _;
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Environment variable carrying the absolute URL prefix for every page link
 /// (for example `https://docs.zeroclaw.com/v0.8.5/en/`). Set by `build.rs`.
@@ -29,6 +35,12 @@ pub const DOCS_ORIGIN: &str = "https://docs.zeroclaw.com";
 
 pub const INDEX_FILE: &str = "llms.txt";
 pub const FULL_FILE: &str = "llms-full.txt";
+
+/// Locale whose pair the gh-pages root mirrors.
+pub const ROOT_LOCALE: &str = "en";
+
+/// Pointer file at the gh-pages root naming the stable release directory.
+const STABLE_POINTER_FILE: &str = "stable-version.txt";
 
 /// Longest description emitted per page in `llms.txt`.
 const DESCRIPTION_MAX_CHARS: usize = 200;
@@ -95,6 +107,73 @@ pub fn base_url_for(tag: &str, locale: &str) -> String {
     format!("{DOCS_ORIGIN}/{tag}/{locale}/")
 }
 
+/// Entry point for `cargo mdbook sync-root-llms`, run in the gh-pages clone
+/// root after `gen-root-index`: publish the stable release's `llms.txt` and
+/// `llms-full.txt` at the site root, or withdraw the root pair when that
+/// release has none.
+///
+/// The two files are one publication unit. The source is the stable pointer's
+/// target when `stable-version.txt` names a version dir present on gh-pages,
+/// otherwise `master`; that is the same resolution `gen-root-index` uses for
+/// `/`. Only a source carrying both files is mirrored. In every other state
+/// both root files are removed, so `/llms.txt` can never keep serving a
+/// release other than the one `/` redirects to. A release built before this
+/// backend existed therefore defers the root pair instead of inheriting a
+/// stale copy or a master build presented as stable.
+pub fn sync_root(root: &Path) -> anyhow::Result<()> {
+    let source = root_source(root);
+    let src_dir = root.join(&source).join(ROOT_LOCALE);
+    let files = [INDEX_FILE, FULL_FILE];
+    if files.iter().all(|file| src_dir.join(file).is_file()) {
+        for file in files {
+            let dest = root.join(file);
+            let staged = root.join(format!("{file}.tmp"));
+            std::fs::copy(src_dir.join(file), &staged)
+                .with_context(|| format!("copy {source}/{ROOT_LOCALE}/{file} to the root"))?;
+            std::fs::rename(&staged, &dest)
+                .with_context(|| format!("publish {file} at the root"))?;
+        }
+        println!(
+            "==> sync-root-llms: published {INDEX_FILE} and {FULL_FILE} from {source}/{ROOT_LOCALE}/"
+        );
+        return Ok(());
+    }
+    let mut removed = Vec::new();
+    for file in files {
+        let dest = root.join(file);
+        if dest.is_file() {
+            std::fs::remove_file(&dest).with_context(|| format!("remove stale root {file}"))?;
+            removed.push(file);
+        }
+    }
+    let removal = if removed.is_empty() {
+        String::new()
+    } else {
+        format!(" Removed stale root {}.", removed.join(" and "))
+    };
+    println!(
+        "::notice::sync-root-llms: {source}/{ROOT_LOCALE}/ has no {INDEX_FILE} + {FULL_FILE} pair \
+         (built before the llms backend existed), so the root pair is deferred.{removal} It \
+         publishes on the first deploy whose stable target carries both files."
+    );
+    Ok(())
+}
+
+/// Version dir whose English pair the root mirrors: the stable pointer's
+/// target when it names a version dir present under `root`, else `master`.
+/// Mirrors `gen-root-index`, so `/llms.txt` always describes the release `/`
+/// redirects to.
+fn root_source(root: &Path) -> String {
+    let pointer = std::fs::read_to_string(root.join(STABLE_POINTER_FILE))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|tag| !tag.is_empty());
+    match pointer {
+        Some(tag) if super::versions::is_version_dir(&tag) && root.join(&tag).is_dir() => tag,
+        _ => "master".to_string(),
+    }
+}
+
 struct Rendered {
     index: String,
     full: String,
@@ -155,7 +234,9 @@ fn render(ctx: &RenderContext, base_url: &str) -> anyhow::Result<Rendered> {
     let _ = writeln!(
         full,
         "Every page of the {title} site, in reading order. Each page starts with its \
-         canonical URL. Relative links inside a page resolve against that URL.\n"
+         canonical HTML URL. Page bodies are the authored Markdown: links inside a page \
+         keep their `.md` targets and are not rewritten to deployed URLs, and every page \
+         they point to is included in this file.\n"
     );
     for page in &pages {
         let _ = writeln!(full, "---\n\nSource: {}\n", page.url);
@@ -396,6 +477,14 @@ mod tests {
             "page bodies are verbatim markdown"
         );
         assert!(
+            full.contains("Install on [Linux](./linux.md)"),
+            "authored .md links are kept as written"
+        );
+        assert!(
+            full.contains("are not rewritten to deployed URLs"),
+            "the preamble must not promise working deployed links"
+        );
+        assert!(
             !full.contains("Source: https://docs.zeroclaw.com/master/en/\n"),
             "drafts emit nothing"
         );
@@ -440,6 +529,119 @@ mod tests {
         );
         assert_eq!(html_path(std::path::Path::new("a/b.md")), "a/b.html");
         assert_eq!(html_path(std::path::Path::new("raw.html")), "raw.html");
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn read(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    /// gh-pages fixture: `master/en/` carries a pair, `stable-version.txt`
+    /// names `stable`, whose `en/` dir holds `stable_files`.
+    fn site(stable: &str, stable_files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(STABLE_POINTER_FILE), &format!("{stable}\n"));
+        write(&root.join("master/en/index.html"), "<html>");
+        write(&root.join("master/en").join(INDEX_FILE), "master index");
+        write(&root.join("master/en").join(FULL_FILE), "master full");
+        write(&root.join(stable).join("en/index.html"), "<html>");
+        for file in stable_files {
+            write(
+                &root.join(stable).join("en").join(file),
+                &format!("{stable} {file}"),
+            );
+        }
+        dir
+    }
+
+    #[test]
+    fn sync_root_publishes_the_stable_pair_over_an_older_root_pair() {
+        let dir = site("v0.9.0", &[INDEX_FILE, FULL_FILE]);
+        let root = dir.path();
+        write(&root.join(INDEX_FILE), "v0.8.5 llms.txt");
+        write(&root.join(FULL_FILE), "v0.8.5 llms-full.txt");
+        sync_root(root).unwrap();
+        assert_eq!(
+            read(&root.join(INDEX_FILE)).as_deref(),
+            Some("v0.9.0 llms.txt")
+        );
+        assert_eq!(
+            read(&root.join(FULL_FILE)).as_deref(),
+            Some("v0.9.0 llms-full.txt")
+        );
+        assert!(!root.join(format!("{INDEX_FILE}.tmp")).exists());
+    }
+
+    #[test]
+    fn sync_root_withdraws_the_root_pair_when_the_stable_target_has_none() {
+        // The regression: a root pair from an earlier stable exists, then the
+        // pointer moves to a release built without the llms backend. The root
+        // must not keep serving the previous release.
+        let dir = site("v0.8.5", &[]);
+        let root = dir.path();
+        write(&root.join(INDEX_FILE), "v0.8.4 llms.txt");
+        write(&root.join(FULL_FILE), "v0.8.4 llms-full.txt");
+        sync_root(root).unwrap();
+        assert!(
+            !root.join(INDEX_FILE).exists(),
+            "stale root llms.txt removed"
+        );
+        assert!(
+            !root.join(FULL_FILE).exists(),
+            "stale root llms-full.txt removed"
+        );
+        assert_eq!(
+            read(&root.join("master/en").join(INDEX_FILE)).as_deref(),
+            Some("master index"),
+            "master's own pair is untouched and not promoted to the root"
+        );
+    }
+
+    #[test]
+    fn sync_root_treats_a_partial_pair_as_missing() {
+        let dir = site("v0.8.5", &[INDEX_FILE]);
+        let root = dir.path();
+        write(&root.join(FULL_FILE), "v0.8.4 llms-full.txt");
+        sync_root(root).unwrap();
+        assert!(
+            !root.join(INDEX_FILE).exists(),
+            "half a pair is not published"
+        );
+        assert!(
+            !root.join(FULL_FILE).exists(),
+            "the stale half is withdrawn"
+        );
+    }
+
+    #[test]
+    fn sync_root_follows_master_only_when_no_stable_pointer_resolves() {
+        // No pointer: `/` redirects to master, so the root pair mirrors master.
+        let dir = site("v0.8.5", &[INDEX_FILE, FULL_FILE]);
+        let root = dir.path();
+        std::fs::remove_file(root.join(STABLE_POINTER_FILE)).unwrap();
+        sync_root(root).unwrap();
+        assert_eq!(
+            read(&root.join(INDEX_FILE)).as_deref(),
+            Some("master index")
+        );
+
+        // Pointer names a version dir that is not on gh-pages: same fallback.
+        write(&root.join(STABLE_POINTER_FILE), "v0.9.1\n");
+        sync_root(root).unwrap();
+        assert_eq!(read(&root.join(FULL_FILE)).as_deref(), Some("master full"));
+
+        // Pointer names a present release: that release wins over master.
+        write(&root.join(STABLE_POINTER_FILE), "v0.8.5\n");
+        sync_root(root).unwrap();
+        assert_eq!(
+            read(&root.join(INDEX_FILE)).as_deref(),
+            Some("v0.8.5 llms.txt")
+        );
     }
 
     #[test]
