@@ -302,6 +302,7 @@ impl RpcInboundAuth {
         let pairing = Arc::new(PairingGuard::new(
             config.gateway.require_pairing,
             &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
         ));
         Arc::new(Self::from_config(config, pairing).expect("test auth config is valid"))
     }
@@ -492,8 +493,15 @@ mod tests {
 
     fn auth_for(config: &Config, tokens: &[&str]) -> RpcInboundAuth {
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
-        RpcInboundAuth::from_config(config, Arc::new(PairingGuard::new(true, &tokens)))
-            .expect("valid")
+        RpcInboundAuth::from_config(
+            config,
+            Arc::new(PairingGuard::new(
+                true,
+                &tokens,
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+        )
+        .expect("valid")
     }
 
     #[tokio::test]
@@ -728,7 +736,15 @@ mod tests {
         config.wss.enabled = true;
         config.gateway.require_pairing = true;
         assert!(
-            RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(true, &[]))).is_ok(),
+            RpcInboundAuth::from_config(
+                &config,
+                Arc::new(PairingGuard::new(
+                    true,
+                    &[],
+                    zeroclaw_config::pairing::PairingCodePolicy::default()
+                ))
+            )
+            .is_ok(),
             "pairing-capable WSS config is startable; handshakes deny until paired"
         );
     }

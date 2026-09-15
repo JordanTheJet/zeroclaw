@@ -242,6 +242,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(
                 config.gateway.require_pairing,
                 &config.gateway.paired_tokens,
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
             )),
             ..crate::api::tests::test_state(config.clone())
         };

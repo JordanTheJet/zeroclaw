@@ -77,7 +77,11 @@ mod tests {
 
     fn provider_with(tokens: &[&str]) -> NativeAuthProvider {
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
-        NativeAuthProvider::new(Arc::new(PairingGuard::new(true, &tokens)))
+        NativeAuthProvider::new(Arc::new(PairingGuard::new(
+            true,
+            &tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )))
     }
 
     #[tokio::test]
@@ -119,7 +123,11 @@ mod tests {
     async fn revocation_on_the_shared_guard_applies_live() {
         // The RFC's live-authority requirement: revoking a token on the
         // guard the gateway serves invalidates it here with no reload.
-        let guard = Arc::new(PairingGuard::new(true, &["zc_tok".to_string()]));
+        let guard = Arc::new(PairingGuard::new(
+            true,
+            &["zc_tok".to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let provider = NativeAuthProvider::new(Arc::clone(&guard));
         assert!(
             provider
@@ -139,7 +147,11 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_on_the_shared_guard_applies_live() {
-        let guard = Arc::new(PairingGuard::new(true, &[]));
+        let guard = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let provider = NativeAuthProvider::new(Arc::clone(&guard));
         assert!(
             !provider

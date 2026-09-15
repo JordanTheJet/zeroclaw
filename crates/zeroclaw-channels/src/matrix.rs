@@ -215,7 +215,7 @@ mod allowlist {
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
-    use zeroclaw_api::channel::ChannelApprovalResponse;
+    use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
 
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -229,6 +229,14 @@ mod approval {
     pub(super) fn generate_token_default() -> String {
         let mut rng = rand::rng();
         generate_token(&mut rng)
+    }
+
+    /// Build the outbound `SendMessage` for an approval prompt: the rendered
+    /// prompt text to the requesting recipient, with voice synthesis
+    /// suppressed. Kept as a small, pure helper so tests can assert its shape
+    /// (recipient, voice suppression) without standing up a live client.
+    pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
+        SendMessage::new(prompt, recipient).suppress_voice()
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -1715,15 +1723,17 @@ mod client {
             .as_deref()
             .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
-        let response = reqwest::Client::builder()
-            .timeout(WHOAMI_TIMEOUT)
-            .build()
-            .context("matrix: build whoami HTTP client")?
-            .get(url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("matrix: whoami request failed")?;
+        let response = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().timeout(WHOAMI_TIMEOUT),
+            "channel.matrix",
+        )
+        .build()
+        .context("matrix: build whoami HTTP client")?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("matrix: whoami request failed")?;
         let status = response.status();
 
         if !status.is_success() {
@@ -2917,21 +2927,7 @@ pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,
 ) -> anyhow::Result<crate::transcription::TranscriptionManager> {
-    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
-        config,
-        agent_provider.to_string(),
-    )?;
-    if !agent_provider.is_empty() {
-        return Ok(manager);
-    }
-    let sole_provider = match manager.available_providers().as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    };
-    Ok(match sole_provider {
-        Some(alias) => manager.with_agent_transcription_provider(alias),
-        None => manager,
-    })
+    crate::transcription::build_channel_transcription_manager(config, agent_provider)
 }
 
 /// Resolves transcription state from live config at message time. `None` means
@@ -3388,12 +3384,15 @@ mod outbound {
                 }
                 attempt.follow()
             });
-            reqwest::Client::builder()
-                .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(redirect_policy)
-                .user_agent("zeroclaw-matrix/1.0")
-                .build()
-                .expect("default reqwest client config never fails to build")
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder()
+                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .redirect(redirect_policy)
+                    .user_agent("zeroclaw-matrix/1.0"),
+                "channel.matrix",
+            )
+            .build()
+            .expect("default reqwest client config never fails to build")
         })
     }
 
@@ -5302,7 +5301,7 @@ impl Channel for MatrixChannel {
             },
         );
 
-        let send_msg = SendMessage::new(prompt, recipient);
+        let send_msg = approval::build_prompt_message(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
             self.pending_approvals.lock().await.remove(&token);
             return Err(e);
@@ -6662,7 +6661,7 @@ mod tests {
 
     mod approval {
         use super::super::approval::{
-            TOKEN_LEN, generate_token, generate_token_default, parse_reply,
+            TOKEN_LEN, build_prompt_message, generate_token, generate_token_default, parse_reply,
         };
         use rand::SeedableRng;
         use rand::rngs::StdRng;
@@ -6834,6 +6833,26 @@ mod tests {
         #[test]
         fn rejects_trailing_garbage() {
             assert!(parse_reply("ABCDEFGH approve please").is_none());
+        }
+
+        #[test]
+        fn approval_prompt_message_suppresses_voice() {
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &generate_token_default(),
+                "shell",
+                "ls -la",
+                None,
+            );
+
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+
+            assert_eq!(message.recipient, "!room:example.invalid");
+            assert_eq!(message.content, prompt);
+            assert!(
+                message.suppress_voice,
+                "the approval prompt must suppress voice synthesis"
+            );
+            assert!(!message.force_voice);
         }
 
         #[test]
