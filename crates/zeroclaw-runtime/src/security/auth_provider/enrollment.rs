@@ -256,6 +256,26 @@ impl std::fmt::Debug for PkceFlow {
     }
 }
 
+impl PkceFlow {
+    /// RFC 9207 mix-up defense shared by both callback adapters (the CLI
+    /// loopback listener and the gateway callback): when the authorization
+    /// response carries an `iss` parameter it must name exactly the issuer
+    /// this flow was started for, and the check runs before the response's
+    /// code or error is acted on. A response without `iss` is accepted for
+    /// providers that predate RFC 9207; that is the only leniency.
+    pub fn check_callback_issuer(&self, iss: Option<&str>) -> Result<()> {
+        match iss {
+            None => Ok(()),
+            Some(iss) if iss == self.issuer => Ok(()),
+            Some(iss) => bail!(
+                "the authorization response names issuer {iss} but this sign-in was \
+                 started with {}; refusing the response (possible mix-up attack)",
+                self.issuer
+            ),
+        }
+    }
+}
+
 fn random_urlsafe(bytes: usize) -> Result<String> {
     use ring::rand::SecureRandom as _;
     let rng = ring::rand::SystemRandom::new();
@@ -271,22 +291,83 @@ pub(crate) fn s256_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest.as_ref())
 }
 
-/// The id_token riding along with a code exchange proves the authorize
-/// round-trip: its nonce must be the one this flow sent. The id_token is
-/// discarded afterwards; it is never presented as a credential (the
-/// daemon rejects nonce-marked ID tokens outright).
-fn verify_id_token_nonce(id_token: &str, expected: &str) -> Result<()> {
-    let payload = id_token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| anyhow::Error::msg("id_token is not a JWT"))?;
+/// Clock skew tolerated when checking the id_token's `exp`.
+const ID_TOKEN_CLOCK_LEEWAY_SECS: u64 = 30;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Validate the id_token bundled with a code exchange against this flow
+/// (OIDC Core 3.1.3.7): the token must be a three-segment JWT whose claims
+/// name this flow's issuer, include this client in `aud` (with any `azp`
+/// equal to the client), have not expired, and echo this flow's `nonce`.
+/// The signature is not checked separately: the token arrived over the
+/// TLS-verified token endpoint in a direct exchange, the case 3.1.3.7 step
+/// 6 exempts. The id_token is discarded afterwards; it is never presented
+/// as a credential (the daemon rejects nonce-marked ID tokens outright).
+fn validate_id_token(id_token: &str, flow: &PkceFlow, now: u64) -> Result<()> {
+    let mut segments = id_token.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        bail!("id_token is not a three-segment JWT; refusing the token response");
+    };
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| anyhow::Error::msg("id_token payload is not base64url"))?;
     let claims: serde_json::Value =
         serde_json::from_slice(&bytes).context("id_token payload is not JSON")?;
+    let Some(claims) = claims.as_object() else {
+        bail!("id_token payload is not a JSON object");
+    };
+
+    match claims.get("iss").and_then(|v| v.as_str()) {
+        Some(iss) if iss == flow.issuer => {}
+        Some(iss) => bail!(
+            "id_token issuer {iss} does not match this flow's issuer {}; aborting enrollment",
+            flow.issuer
+        ),
+        None => bail!("id_token carries no issuer claim; aborting enrollment"),
+    }
+
+    let audience_includes_client = match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => aud == &flow.client_id,
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .any(|aud| aud.as_str() == Some(flow.client_id.as_str())),
+        _ => false,
+    };
+    if !audience_includes_client {
+        bail!(
+            "id_token audience does not include client {}; aborting enrollment",
+            flow.client_id
+        );
+    }
+    if let Some(azp) = claims.get("azp")
+        && azp.as_str() != Some(flow.client_id.as_str())
+    {
+        bail!(
+            "id_token authorized party is not client {}; aborting enrollment",
+            flow.client_id
+        );
+    }
+
+    let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) else {
+        bail!("id_token carries no numeric exp claim; aborting enrollment");
+    };
+    if exp.saturating_add(ID_TOKEN_CLOCK_LEEWAY_SECS) <= now {
+        bail!("id_token has expired; aborting enrollment");
+    }
+
     match claims.get("nonce").and_then(|v| v.as_str()) {
-        Some(nonce) if nonce == expected => Ok(()),
+        Some(nonce) if nonce == flow.nonce => Ok(()),
         _ => bail!(
             "id_token nonce does not match this flow (possible token substitution); \
              aborting enrollment"
@@ -352,8 +433,9 @@ impl Enrollment {
     }
 
     /// Exchange the authorization code from the callback. When the
-    /// response bundles an id_token, its nonce is verified against this
-    /// flow before anything is returned.
+    /// response bundles an id_token it is validated against this flow
+    /// (issuer, audience, expiry, nonce) before anything is returned; a
+    /// present but malformed id_token fails the exchange.
     pub async fn pkce_exchange(&self, flow: &PkceFlow, code: &str) -> Result<EnrolledToken> {
         // The exchange posts this client's credentials to the token endpoint
         // pinned when the flow started. If the alias was repointed to another
@@ -411,8 +493,12 @@ impl Enrollment {
             .json()
             .await
             .context("token response is not valid JSON")?;
-        if let Some(id_token) = raw.get("id_token").and_then(|v| v.as_str()) {
-            verify_id_token_nonce(id_token, &flow.nonce)?;
+        match raw.get("id_token") {
+            None => {}
+            Some(serde_json::Value::String(id_token)) => {
+                validate_id_token(id_token, flow, now_unix())?;
+            }
+            Some(_) => bail!("token response carries a non-string id_token; refusing it"),
         }
         let token: EnrolledToken = serde_json::from_value(serde_json::Value::Object(raw))
             .context("token response is missing required fields")?;
@@ -431,6 +517,7 @@ const FAILURE_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>Sign-i
 enum CallbackParse {
     Code(String),
     IdpError(String),
+    IssuerMismatch(String),
     Ignore,
 }
 
@@ -457,24 +544,25 @@ impl LoopbackListener {
         format!("http://127.0.0.1:{}/callback", self.port)
     }
 
-    /// Wait for the callback carrying `expected_state`. An IdP `error`
-    /// response for the matching state fails the flow; everything else
-    /// (wrong path, wrong state, unparsable) is answered and ignored,
-    /// bounded by `timeout`.
-    pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<String> {
-        match tokio::time::timeout(timeout, self.accept_loop(expected_state)).await {
+    /// Wait for the callback carrying `flow`'s state. An IdP `error`
+    /// response for the matching state fails the flow, as does a response
+    /// whose `iss` names another issuer (RFC 9207); everything else (wrong
+    /// path, wrong state, unparsable) is answered and ignored, bounded by
+    /// `timeout`.
+    pub async fn wait_for_code(self, flow: &PkceFlow, timeout: Duration) -> Result<String> {
+        match tokio::time::timeout(timeout, self.accept_loop(flow)).await {
             Ok(result) => result,
             Err(_) => bail!("timed out waiting for the browser sign-in to complete"),
         }
     }
 
-    async fn accept_loop(&self, expected_state: &str) -> Result<String> {
+    async fn accept_loop(&self, flow: &PkceFlow) -> Result<String> {
         loop {
             let (mut stream, _) = self.listener.accept().await?;
             let Ok(target) = Self::read_request_target(&mut stream).await else {
                 continue;
             };
-            match Self::parse_callback(&target, expected_state) {
+            match Self::parse_callback(&target, flow) {
                 CallbackParse::Code(code) => {
                     Self::respond(&mut stream, 200, SUCCESS_PAGE).await;
                     return Ok(code);
@@ -482,6 +570,10 @@ impl LoopbackListener {
                 CallbackParse::IdpError(err) => {
                     Self::respond(&mut stream, 200, FAILURE_PAGE).await;
                     bail!("the identity provider denied the sign-in: {err}");
+                }
+                CallbackParse::IssuerMismatch(err) => {
+                    Self::respond(&mut stream, 400, FAILURE_PAGE).await;
+                    bail!("{err}");
                 }
                 CallbackParse::Ignore => {
                     Self::respond(&mut stream, 404, FAILURE_PAGE).await;
@@ -514,7 +606,7 @@ impl LoopbackListener {
         Ok(parts.next().unwrap_or_default().to_string())
     }
 
-    fn parse_callback(target: &str, expected_state: &str) -> CallbackParse {
+    fn parse_callback(target: &str, flow: &PkceFlow) -> CallbackParse {
         let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
             return CallbackParse::Ignore;
         };
@@ -525,19 +617,26 @@ impl LoopbackListener {
         let mut code = None;
         let mut error = None;
         let mut error_description = None;
+        let mut iss = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "state" => state = Some(value.into_owned()),
                 "code" => code = Some(value.into_owned()),
                 "error" => error = Some(value.into_owned()),
                 "error_description" => error_description = Some(value.into_owned()),
+                "iss" => iss = Some(value.into_owned()),
                 _ => {}
             }
         }
         // State gates everything: an error without this flow's state is
         // some other request's business, not a verdict on this flow.
-        if state.as_deref() != Some(expected_state) {
+        if state.as_deref() != Some(flow.state.as_str()) {
             return CallbackParse::Ignore;
+        }
+        // The issuer check precedes both the error and the code: a mixed-up
+        // response is not acted on either way.
+        if let Err(e) = flow.check_callback_issuer(iss.as_deref()) {
+            return CallbackParse::IssuerMismatch(e.to_string());
         }
         if let Some(err) = error {
             let detail = error_description
@@ -553,7 +652,11 @@ impl LoopbackListener {
 
     async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
         use tokio::io::AsyncWriteExt as _;
-        let reason = if status == 200 { "OK" } else { "Not Found" };
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            _ => "Not Found",
+        };
         let response = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -843,16 +946,145 @@ mod tests {
         }
     }
 
-    fn fake_id_token(nonce: &str) -> String {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    fn flow_for(state: &str, issuer: &str) -> PkceFlow {
+        PkceFlow {
+            authorize_url: String::new(),
+            state: state.into(),
+            nonce: "flow-nonce".into(),
+            verifier: "v".into(),
+            redirect_uri: "http://127.0.0.1:1/callback".into(),
+            token_endpoint: format!("{issuer}/token"),
+            issuer: issuer.into(),
+            client_id: "zerocode-cli".into(),
+        }
+    }
+
+    /// A JWT-shaped id_token carrying `claims`. The signature segment is
+    /// arbitrary: the direct token-endpoint exchange relies on TLS rather
+    /// than a separate signature check (OIDC Core 3.1.3.7 step 6), so the
+    /// claim checks are what these tests pin.
+    fn id_token_with(claims: serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({ "nonce": nonce }).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
         format!("{header}.{payload}.sig")
     }
 
+    fn valid_claims(flow: &PkceFlow) -> serde_json::Value {
+        serde_json::json!({
+            "iss": flow.issuer,
+            "aud": flow.client_id,
+            "exp": now_unix() + 600,
+            "nonce": flow.nonce,
+        })
+    }
+
+    #[test]
+    fn id_token_validation_accepts_a_token_for_this_flow() {
+        let flow = flow_for("s", "https://idp.example.com");
+        validate_id_token(&id_token_with(valid_claims(&flow)), &flow, now_unix()).unwrap();
+        // An audience list naming this client is fine, with a matching azp.
+        let mut claims = valid_claims(&flow);
+        claims["aud"] = serde_json::json!(["other-app", flow.client_id]);
+        claims["azp"] = serde_json::json!(flow.client_id);
+        validate_id_token(&id_token_with(claims), &flow, now_unix()).unwrap();
+        // Expiry is checked with a little clock leeway.
+        let mut claims = valid_claims(&flow);
+        claims["exp"] = serde_json::json!(now_unix() - ID_TOKEN_CLOCK_LEEWAY_SECS + 5);
+        validate_id_token(&id_token_with(claims), &flow, now_unix()).unwrap();
+    }
+
+    #[test]
+    fn id_token_validation_rejects_every_claim_defect() {
+        let flow = flow_for("s", "https://idp.example.com");
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut c = valid_claims(&flow);
+        c.as_object_mut().unwrap().remove("iss");
+        cases.push(("no issuer", c));
+        let mut c = valid_claims(&flow);
+        c["iss"] = serde_json::json!("https://other-idp.example.com");
+        cases.push(("issuer", c));
+        let mut c = valid_claims(&flow);
+        c["iss"] = serde_json::json!("https://idp.example.com/");
+        cases.push(("issuer", c));
+        let mut c = valid_claims(&flow);
+        c["aud"] = serde_json::json!("someone-else");
+        cases.push(("audience", c));
+        let mut c = valid_claims(&flow);
+        c["aud"] = serde_json::json!(["someone-else", "another"]);
+        cases.push(("audience", c));
+        let mut c = valid_claims(&flow);
+        c.as_object_mut().unwrap().remove("aud");
+        cases.push(("audience", c));
+        let mut c = valid_claims(&flow);
+        c["aud"] = serde_json::json!(["other-app", flow.client_id]);
+        c["azp"] = serde_json::json!("other-app");
+        cases.push(("authorized party", c));
+        let mut c = valid_claims(&flow);
+        c["exp"] = serde_json::json!(now_unix() - ID_TOKEN_CLOCK_LEEWAY_SECS - 10);
+        cases.push(("expired", c));
+        let mut c = valid_claims(&flow);
+        c.as_object_mut().unwrap().remove("exp");
+        cases.push(("exp", c));
+        let mut c = valid_claims(&flow);
+        c["nonce"] = serde_json::json!("some-other-flows-nonce");
+        cases.push(("nonce", c));
+        let mut c = valid_claims(&flow);
+        c.as_object_mut().unwrap().remove("nonce");
+        cases.push(("nonce", c));
+
+        for (expected, claims) in cases {
+            let err =
+                validate_id_token(&id_token_with(claims.clone()), &flow, now_unix()).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "claims {claims} should fail on {expected}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn id_token_validation_rejects_malformed_tokens() {
+        let flow = flow_for("s", "https://idp.example.com");
+        let payload = URL_SAFE_NO_PAD.encode(valid_claims(&flow).to_string());
+        for (label, token) in [
+            ("two segments", format!("hdr.{payload}")),
+            ("four segments", format!("hdr.{payload}.sig.extra")),
+            ("not base64url", "hdr.!!!.sig".to_string()),
+            (
+                "not json",
+                format!("hdr.{}.sig", URL_SAFE_NO_PAD.encode("not json")),
+            ),
+            (
+                "not an object",
+                format!("hdr.{}.sig", URL_SAFE_NO_PAD.encode("[1,2]")),
+            ),
+        ] {
+            assert!(
+                validate_id_token(&token, &flow, now_unix()).is_err(),
+                "{label} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_issuer_check_follows_rfc_9207() {
+        let flow = flow_for("s", "https://idp.example.com");
+        flow.check_callback_issuer(None).unwrap();
+        flow.check_callback_issuer(Some("https://idp.example.com"))
+            .unwrap();
+        let err = flow
+            .check_callback_issuer(Some("https://different.example"))
+            .unwrap_err();
+        assert!(err.to_string().contains("mix-up"), "{err}");
+        // Exact comparison: a trailing slash is a different issuer string.
+        assert!(
+            flow.check_callback_issuer(Some("https://idp.example.com/"))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
-    async fn pkce_exchange_sends_the_verifier_and_checks_the_nonce() {
+    async fn pkce_exchange_sends_the_verifier_and_validates_the_id_token() {
         let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
         let enrollment = Enrollment::new(config(&server.uri(), None)).unwrap();
         let flow = enrollment
@@ -869,7 +1101,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-pkce",
                 "expires_in": 3600,
-                "id_token": fake_id_token(&flow.nonce),
+                "id_token": id_token_with(valid_claims(&flow)),
             })))
             .mount(&server)
             .await;
@@ -888,11 +1120,13 @@ mod tests {
             .pkce_start("http://127.0.0.1:7777/callback")
             .await
             .unwrap();
+        let mut claims = valid_claims(&flow);
+        claims["nonce"] = serde_json::json!("some-other-flows-nonce");
         Mock::given(method("POST"))
             .and(path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-substituted",
-                "id_token": fake_id_token("some-other-flows-nonce"),
+                "id_token": id_token_with(claims),
             })))
             .mount(&server)
             .await;
@@ -904,20 +1138,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pkce_exchange_rejects_id_tokens_for_another_issuer_or_audience() {
+        for (label, mutate) in [
+            (
+                "issuer",
+                serde_json::json!({"iss": "https://other-idp.example.com"}),
+            ),
+            ("audience", serde_json::json!({"aud": "someone-else"})),
+            ("expired", serde_json::json!({"exp": 1})),
+        ] {
+            let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+            let enrollment = Enrollment::new(config(&server.uri(), None)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap();
+            let mut claims = valid_claims(&flow);
+            for (k, v) in mutate.as_object().unwrap() {
+                claims[k] = v.clone();
+            }
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-never-returned",
+                    "id_token": id_token_with(claims),
+                })))
+                .mount(&server)
+                .await;
+            let err = enrollment
+                .pkce_exchange(&flow, "auth-code-1")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(label), "{label}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pkce_exchange_rejects_a_present_non_string_or_malformed_id_token() {
+        for (label, id_token) in [
+            ("non-string", serde_json::json!(42)),
+            ("object", serde_json::json!({"nonce": "x"})),
+            ("malformed", serde_json::json!("not.a.jwt.at.all")),
+        ] {
+            let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+            let enrollment = Enrollment::new(config(&server.uri(), None)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap();
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-never-returned",
+                    "id_token": id_token,
+                })))
+                .mount(&server)
+                .await;
+            let err = enrollment
+                .pkce_exchange(&flow, "auth-code-1")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("id_token"), "{label}: {err}");
+        }
+    }
+
+    #[tokio::test]
     async fn loopback_listener_ignores_wrong_state_and_returns_the_matching_code() {
         let listener = LoopbackListener::bind().await.unwrap();
         let base = listener.redirect_uri();
-        let wait = listener.wait_for_code("good-state", Duration::from_secs(5));
+        let flow = flow_for("good-state", "https://idp.example.com");
+        let wait = listener.wait_for_code(&flow, Duration::from_secs(5));
         let drive = async {
             // Wrong state: answered, ignored, the wait continues.
             let resp = reqwest::get(format!("{base}?code=evil&state=bad-state"))
                 .await
                 .unwrap();
             assert_eq!(resp.status().as_u16(), 404);
-            // Matching state: the code comes back and the listener is done.
-            let resp = reqwest::get(format!("{base}?code=real-code&state=good-state"))
-                .await
-                .unwrap();
+            // Matching state and a matching RFC 9207 issuer: the code comes
+            // back and the listener is done.
+            let resp = reqwest::get(format!(
+                "{base}?code=real-code&state=good-state&iss=https%3A%2F%2Fidp.example.com"
+            ))
+            .await
+            .unwrap();
             assert_eq!(resp.status().as_u16(), 200);
         };
         let (code, ()) = tokio::join!(wait, drive);
@@ -928,7 +1231,8 @@ mod tests {
     async fn loopback_listener_fails_the_flow_on_an_idp_error() {
         let listener = LoopbackListener::bind().await.unwrap();
         let base = listener.redirect_uri();
-        let wait = listener.wait_for_code("good-state", Duration::from_secs(5));
+        let flow = flow_for("good-state", "https://idp.example.com");
+        let wait = listener.wait_for_code(&flow, Duration::from_secs(5));
         let drive = async {
             reqwest::get(format!(
                 "{base}?error=access_denied&error_description=user+rejected&state=good-state"
@@ -940,5 +1244,33 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("access_denied"), "{err}");
         assert!(err.to_string().contains("user rejected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_refuses_a_callback_from_another_issuer() {
+        // A matching state with a foreign `iss` is a mix-up (RFC 9207): the
+        // flow fails before any code is returned, whether the response
+        // carries a code or an IdP error.
+        for query in [
+            "code=real-code&state=good-state&iss=https%3A%2F%2Fdifferent.example",
+            "error=access_denied&state=good-state&iss=https%3A%2F%2Fdifferent.example",
+        ] {
+            let listener = LoopbackListener::bind().await.unwrap();
+            let base = listener.redirect_uri();
+            let flow = flow_for("good-state", "https://idp.example.com");
+            let wait = listener.wait_for_code(&flow, Duration::from_secs(5));
+            let drive = async {
+                let resp = reqwest::get(format!("{base}?{query}")).await.unwrap();
+                assert_eq!(resp.status().as_u16(), 400);
+                let page = resp.text().await.unwrap();
+                assert!(
+                    !page.contains("different.example"),
+                    "no echo of the request"
+                );
+            };
+            let (result, ()) = tokio::join!(wait, drive);
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("mix-up"), "{err}");
+        }
     }
 }

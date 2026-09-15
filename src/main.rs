@@ -9896,7 +9896,7 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
                 )
             );
             let code = listener
-                .wait_for_code(&pkce.state, std::time::Duration::from_mins(5))
+                .wait_for_code(&pkce, std::time::Duration::from_mins(5))
                 .await?;
             enrollment.pkce_exchange(&pkce, &code).await?
         }
