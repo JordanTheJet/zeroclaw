@@ -3391,3 +3391,136 @@ mod graceful_close_tests {
         daemon_task.abort();
     }
 }
+
+/// Regression coverage for the frontdoor enrollment route's teardown.
+///
+/// A leg (`crate::enroll_proxy`) opens a route, uses it, and then drops the
+/// route's guard on EVERY exit - success and failure alike (a TLS failure, the
+/// 64 KiB byte cap, a 15s read or 30s leg timeout, a refused pin). That guard
+/// drop must reclaim the conn slot in the per-node `conns` map AND tell the
+/// daemon to release its half, right then. The map is shared with the WS data
+/// plane, so a slot the teardown forgets is a slot a legitimate relay client on
+/// that node cannot use until the daemon's own timeout eventually fires - a
+/// window an unauthenticated frontdoor caller who knows a node-id can drive.
+///
+/// Lives here, not in `enroll_route.rs`, because it registers a `DaemonHandle`
+/// (whose fields are private to this module) and reads the private `conns` map
+/// to assert reclamation - the only place that observation is possible.
+#[cfg(test)]
+mod enroll_route_reclaim_tests {
+    use super::*;
+    use crate::enroll_route::open_enroll_route;
+
+    /// Register a routable node directly and hand back its outbound channel and
+    /// conn map, so the test can play a daemon without a second handshake.
+    async fn register_stub_daemon(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (mpsc::Receiver<Message>, Arc<Mutex<ConnRoutes>>) {
+        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(64);
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
+        server.inner.daemons.lock().await.insert(
+            node_id.to_string(),
+            DaemonHandle {
+                fpr: "stub-fingerprint".into(),
+                epoch: 1,
+                to_daemon,
+                conns: conns.clone(),
+                metrics: Arc::new(NodeMetrics::default()),
+                // Generous so the per-node connect budget (A6) never refuses a
+                // leg in this test; reclamation, not rate-limiting, is the point.
+                connect_bucket: Arc::new(Mutex::new(TokenBucket::new(4096, 4096.0))),
+                supersede: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        (daemon_rx, conns)
+    }
+
+    /// Play the daemon: pair every `Open` by delivering `Opened` to the matching
+    /// route. Every other frame (the pump's up-front `Window`, the `Close` a
+    /// torn-down route emits) is drained and ignored, which is all pairing needs.
+    fn spawn_pairing_daemon(
+        mut daemon_rx: mpsc::Receiver<Message>,
+        conns: Arc<Mutex<ConnRoutes>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(msg) = daemon_rx.recv().await {
+                let Ok(text) = msg.into_text() else { continue };
+                if let Ok(Control::Open { conn_id, .. }) = Control::from_json(text.as_str()) {
+                    let events = conns
+                        .lock()
+                        .await
+                        .get(&conn_id)
+                        .map(|route| route.events.clone());
+                    if let Some(events) = events {
+                        let _ = events.send(ConnEvent::Opened).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Wait, bounded, for the conn map to drain to empty. The pump reclaims on
+    /// its own task once the guard signals it, so this yields until it has.
+    async fn wait_until_empty(conns: &Arc<Mutex<ConnRoutes>>) {
+        for _ in 0..2000 {
+            if conns.lock().await.is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the conn map never drained: {} slot(s) leaked after a torn-down leg",
+            conns.lock().await.len()
+        );
+    }
+
+    /// (a) Every torn-down leg reclaims its slot, and (b) a later legitimate
+    /// enrollment on the node still opens after more failed legs than the node's
+    /// whole connection budget.
+    #[tokio::test]
+    async fn a_dropped_enrollment_route_reclaims_its_conn_slot() {
+        const CAP: usize = 4;
+        let server = RelayServer::new(RelayConfig {
+            max_conns_per_node: CAP,
+            ..RelayConfig::default()
+        });
+        let (daemon_rx, conns) = register_stub_daemon(&server, "node").await;
+        let daemon = spawn_pairing_daemon(daemon_rx, conns.clone());
+
+        // Drive MORE post-pairing legs than the node's whole budget. If a torn
+        // -down leg leaked its slot, the map would fill at CAP and the next open
+        // would be refused `Busy`; reaching CAP + 2 opens proves each reclaimed.
+        for leg in 0..(CAP + 2) {
+            let route = open_enroll_route(&server.inner, "node")
+                .await
+                .unwrap_or_else(|e| panic!("leg {leg} must open (slot leak?): {e:?}"));
+            assert_eq!(
+                conns.lock().await.len(),
+                1,
+                "leg {leg}: exactly one live slot while the route is held"
+            );
+
+            // Keep the byte stream ALIVE and drop only the guard, so the guard
+            // drop is the SOLE thing that can reclaim the slot - this asserts the
+            // guard's teardown, not an incidental stream EOF.
+            let (stream, guard) = route.split();
+            drop(guard);
+            wait_until_empty(&conns).await;
+            assert!(
+                conns.lock().await.is_empty(),
+                "leg {leg}: the conn slot must be reclaimed when the guard drops"
+            );
+            drop(stream);
+        }
+
+        let route = open_enroll_route(&server.inner, "node")
+            .await
+            .expect("a later enrollment on the node must still open");
+        assert_eq!(conns.lock().await.len(), 1);
+        drop(route);
+        wait_until_empty(&conns).await;
+
+        daemon.abort();
+    }
+}

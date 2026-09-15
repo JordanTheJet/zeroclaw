@@ -68,18 +68,40 @@ impl OpenError {
     }
 }
 
-/// Aborts the pump when the route is dropped.
+/// Tears the pump down GRACEFULLY when the route is dropped.
 ///
 /// The pump holds the route's `LiveConnGuard` and its entry in the daemon's conn
 /// map, so "the caller is finished with this stream" and "the route is torn down"
-/// have to be the same event. Without the abort, an enrollment leg that returns
-/// early - a TLS failure, a byte cap, an expired budget - would leave the pump
-/// parked on `conn_rx` holding a live conn against `max_conns_per_node`.
-struct PumpGuard(tokio::task::JoinHandle<()>);
+/// have to be the same event. An enrollment leg that returns early - a TLS
+/// failure, a byte cap, an expired budget, a refused pin - would otherwise leave
+/// the pump parked on `conn_rx` holding a live conn against `max_conns_per_node`.
+///
+/// SAFETY / cancellation-safety: this used to `abort()` the pump task. But the
+/// pump's cleanup ([`release_conn`]: remove the conn from the map AND tell the
+/// daemon to `Close` its half) runs only AFTER the pump loop, so aborting the
+/// task cancelled it at its next await point and that cleanup never ran. The
+/// slot then leaked against `max_conns_per_node` - a budget SHARED with the WS
+/// data plane (`lib.rs`) - and the daemon was never told, until its own timeout
+/// eventually fired. An unauthenticated frontdoor caller who knows a node-id
+/// could drive that window to starve legitimate relay clients on the node.
+///
+/// Instead the guard drops (or sends on) a `shutdown` oneshot, which resolves
+/// the pump's `shutdown` select branch; the pump breaks and runs `release_conn`
+/// on its own task. The pump is deliberately detached, not aborted and not
+/// joined: its teardown is bounded (a map removal plus a `DAEMON_HANDOFF_BUDGET`
+/// -bounded send) and is left to run to completion. So the invariant holds on
+/// EVERY guard drop - success or failure: the slot is reclaimed and a `Close` is
+/// delivered, never left to the daemon's timeout.
+struct PumpGuard(Option<tokio::sync::oneshot::Sender<()>>);
 
 impl Drop for PumpGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        // Signal graceful teardown. If the pump already exited on its own (stream
+        // EOF, or daemon-side removal via `cancelled`), the receiver is gone and
+        // this send is a harmless no-op.
+        if let Some(shutdown) = self.0.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
@@ -188,13 +210,24 @@ pub(crate) async fn open_enroll_route(
     }
 
     let (proxy_io, relay_io) = tokio::io::duplex(ROUTE_BUFFER_BYTES);
-    let pump = tokio::spawn(pump_route(
-        conn_id, relay_io, conn_rx, to_daemon, conns, live, cancelled,
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Detach the pump: its teardown is driven by `cancelled` (daemon-side
+    // removal), stream EOF, or `shutdown` (the route's guard dropping) - never by
+    // an abort that would skip `release_conn`. See [`PumpGuard`].
+    tokio::spawn(pump_route(
+        conn_id,
+        relay_io,
+        conn_rx,
+        to_daemon,
+        conns,
+        live,
+        cancelled,
+        shutdown_rx,
     ));
 
     Ok(EnrollRoute {
         stream: proxy_io,
-        _pump: PumpGuard(pump),
+        _pump: PumpGuard(Some(shutdown_tx)),
     })
 }
 
@@ -215,6 +248,7 @@ async fn pump_route(
     conns: Arc<tokio::sync::Mutex<crate::ConnRoutes>>,
     _live: LiveConnGuard,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut send_window = ConnWindow::new(INITIAL_WINDOW);
     let mut recv_drained: u32 = 0;
@@ -244,6 +278,10 @@ async fn pump_route(
             // The route left the daemon's conn map (link death, supersede,
             // backpressure shedding): stop, even mid-write.
             _ = &mut cancelled => break,
+            // The route's guard was dropped above us (any leg exit, success or
+            // failure): stop and run the teardown below, so the slot is always
+            // reclaimed and the daemon told - never left to abort or timeout.
+            _ = &mut shutdown => break,
             // Window exhausted: stop reading the TLS side so backpressure
             // reaches it, instead of queueing past the daemon's grant.
             n = relay_io.read(&mut buf), if !send_window.is_blocked() => match n {
