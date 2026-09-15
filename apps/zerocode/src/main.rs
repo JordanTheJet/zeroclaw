@@ -972,7 +972,10 @@ async fn run() -> anyhow::Result<()> {
                         &[("provider", auth_provider.as_deref().unwrap_or(""))],
                     ));
                 };
-                let token = oidc_enroll::run_device_flow(enroll_url, skip_verify, alias, |start| {
+                // `tls` is borrowed here and moved into the WssRoute below: the
+                // enrollment leg runs on exactly the trust material the WSS
+                // connection is about to use.
+                let token = oidc_enroll::run_device_flow(enroll_url, &tls, alias, |start| {
                     let uri = start
                         .verification_uri_complete
                         .as_deref()
