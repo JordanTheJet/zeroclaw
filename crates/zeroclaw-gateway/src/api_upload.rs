@@ -22,6 +22,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::media::provider_loadable_image_mime_for;
+use zeroclaw_tools::embedded_resource::{
+    persist_content_addressed_with_limit, strip_windows_verbatim_prefix,
+};
 
 use super::AppState;
 use super::api::require_auth;
@@ -47,7 +50,7 @@ pub struct UploadQuery {
     pub filename: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UploadResponse {
     /// Absolute path of the saved file inside the agent workspace.
     pub path: String,
@@ -174,15 +177,17 @@ pub async fn handle_upload(
     // filesystem owner the RPC attachment and ACP/MCP blob paths use: the
     // on-disk name is the content hash (never the client filename), the write
     // is directory-handle-bound and no-follow, and identical bytes dedup to
-    // one file.
+    // one file. The writer's size gate is the same per-kind limit
+    // `classify_upload` just enforced (the live image allowance, up to
+    // 20 MiB, or the RPC document cap), so an image the route accepted is
+    // never shrunk to the fixed 10 MiB blob cap the RPC/ACP/MCP paths keep.
     let ext = std::path::Path::new(&file_name)
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
-        &workspace, &body, &ext,
-    )
-    .map_err(|e| {
+    let persist_limit = persist_limit_bytes(&kind, image_max_bytes);
+    let dest = persist_content_addressed_with_limit(&workspace, &body, &ext, persist_limit as u64)
+        .map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -197,12 +202,34 @@ pub async fn handle_upload(
         )
     })?;
 
-    let path = dest.display().to_string();
+    Ok(Json(upload_response(&kind, &file_name, &dest)))
+}
+
+/// The per-file cap the persistence layer enforces for an accepted upload:
+/// the same limit `classify_upload` applied for its kind, so the two gates
+/// cannot drift apart.
+pub fn persist_limit_bytes(kind: &UploadKind, image_max_bytes: usize) -> usize {
+    match kind {
+        UploadKind::Image => image_max_bytes,
+        UploadKind::Document => MAX_DOCUMENT_BYTES,
+    }
+}
+
+/// Build the response for a persisted upload. The stored path is normalized
+/// like the RPC attachment path: `canonicalize` on Windows yields a verbatim
+/// `\\?\` prefix the multimodal marker parser rejects, so it is stripped
+/// before the path is embedded in the marker or returned to the dashboard.
+pub fn upload_response(
+    kind: &UploadKind,
+    file_name: &str,
+    dest: &std::path::Path,
+) -> UploadResponse {
+    let path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
     let marker = match kind {
         UploadKind::Image => format!("[IMAGE:{path}]"),
         UploadKind::Document => format!("[Document: {file_name}] {path}"),
     };
-    Ok(Json(UploadResponse { path, marker }))
+    UploadResponse { path, marker }
 }
 
 /// `{code, message}` mirrors the structured error envelope the dashboard's
@@ -292,6 +319,106 @@ mod tests {
                 limit_bytes: MAX_DOCUMENT_BYTES
             })
         );
+    }
+
+    #[test]
+    fn persist_limit_follows_the_classified_kind() {
+        let image_max = 20 * 1024 * 1024;
+        assert_eq!(
+            persist_limit_bytes(&UploadKind::Image, image_max),
+            image_max
+        );
+        assert_eq!(
+            persist_limit_bytes(&UploadKind::Document, image_max),
+            MAX_DOCUMENT_BYTES
+        );
+    }
+
+    #[test]
+    fn upload_markers_strip_windows_verbatim_prefix() {
+        // Drive path: `\\?\C:\…` → `C:\…`, which the multimodal parser
+        // recognises as a Windows path.
+        let dest = std::path::Path::new(r"\\?\C:\ws\uploads\abc.png");
+        let resp = upload_response(&UploadKind::Image, "a.png", dest);
+        assert_eq!(resp.path, r"C:\ws\uploads\abc.png");
+        assert_eq!(resp.marker, r"[IMAGE:C:\ws\uploads\abc.png]");
+
+        // Verbatim UNC path unwraps to the plain `\\server\share\…` spelling
+        // the parser's UNC check accepts, as the RPC attachment path does.
+        let dest = std::path::Path::new(r"\\?\UNC\server\share\uploads\abc.pdf");
+        let resp = upload_response(&UploadKind::Document, "report.pdf", dest);
+        assert_eq!(resp.path, r"\\server\share\uploads\abc.pdf");
+        assert_eq!(
+            resp.marker,
+            r"[Document: report.pdf] \\server\share\uploads\abc.pdf"
+        );
+
+        // POSIX paths are untouched.
+        let dest = std::path::Path::new("/home/u/ws/uploads/abc.png");
+        let resp = upload_response(&UploadKind::Image, "a.png", dest);
+        assert_eq!(resp.marker, "[IMAGE:/home/u/ws/uploads/abc.png]");
+    }
+
+    /// Regression for the review blocker: with `multimodal.max_image_size_mb`
+    /// above the fixed 10 MiB blob cap, an image between the two must persist
+    /// through the hardened writer and answer 200 with an `[IMAGE:…]` marker,
+    /// not 500 `upload_io_error`.
+    #[tokio::test]
+    async fn image_between_blob_cap_and_configured_limit_is_persisted() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.multimodal.max_image_size_mb = 20;
+        config.agents.insert(
+            "vision".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(ws.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = crate::api::tests::test_state(config);
+
+        // 12 MiB PNG: valid magic, then padding. Above the 10 MiB blob cap,
+        // below the configured 20 MiB image allowance.
+        let mut png = PNG.to_vec();
+        png.resize(12 * 1024 * 1024, 0);
+        let body = Bytes::from(png);
+
+        let Json(resp) = handle_upload(
+            State(state.clone()),
+            Query(UploadQuery {
+                agent: Some("vision".into()),
+                filename: Some("big.png".into()),
+            }),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .unwrap_or_else(|(status, Json(body))| panic!("expected 200, got {status}: {body}"));
+
+        assert_eq!(resp.marker, format!("[IMAGE:{}]", resp.path));
+        let stored = std::path::Path::new(&resp.path);
+        assert!(stored.is_file(), "{}", resp.path);
+        assert_eq!(std::fs::metadata(stored).unwrap().len(), body.len() as u64);
+        assert!(stored.starts_with(std::fs::canonicalize(ws.path()).unwrap()));
+
+        // The same bytes as a document still hit the RPC per-file cap with a
+        // truthful 413, so the wider image allowance never widens documents.
+        let (status, Json(err)) = handle_upload(
+            State(state),
+            Query(UploadQuery {
+                agent: Some("vision".into()),
+                filename: Some("big.bin".into()),
+            }),
+            HeaderMap::new(),
+            Bytes::from(vec![b'x'; 12 * 1024 * 1024]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err["code"], "payload_too_large");
     }
 
     #[test]
