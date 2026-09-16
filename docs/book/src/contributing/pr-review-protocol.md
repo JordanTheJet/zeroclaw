@@ -131,14 +131,25 @@ Run all of these. The data informs every step that follows.
      --jq '{status,behind_by,ahead_by}'
    gh pr checks <number> --repo zeroclaw-labs/zeroclaw \
      --required --json name,state,bucket
+   HEAD_AFTER=$(gh pr view <number> --repo zeroclaw-labs/zeroclaw \
+     --json headRefOid --jq .headRefOid)
+   if [ "$HEAD_AFTER" != "$HEAD_SHA" ]; then
+     echo "head moved from $HEAD_SHA to $HEAD_AFTER during capture; repeat this step" >&2
+     exit 1
+   fi
    ```
 
    </div>
 
    This classification requires `gh >= 2.50.0`. Stop and upgrade
    an older client rather than silently dropping required-check data. Record
-   `headRefOid` as the revision being reviewed. Treat the check output and
-   `behind_by` comparison as current only for that head. `gh pr checks` exits
+   `headRefOid` as the revision being reviewed. `gh pr checks` is keyed by the
+   mutable PR number, not by a commit, so the trailing `headRefOid` re-read is
+   what binds the check output and the `behind_by` comparison to `HEAD_SHA`.
+   If the head moved during the capture, discard everything captured in this
+   step and repeat it from `PR_STATE`; never classify a comparison from one
+   head against checks from another. Treat the check output and `behind_by`
+   comparison as current only for the captured head. `gh pr checks` exits
    non-zero by design when required checks are pending (exit 8), failing, or
    absent. Treat that exit code as state to classify, not as a failed fetch,
    and inspect any JSON output it returned. Use this state for the CI freshness
@@ -230,6 +241,12 @@ Do not ignore another reviewer's visible `CHANGES_REQUESTED`. Before approving, 
 <!-- >>> generated:review-ci-freshness-policy by `cargo generate review-docs` - do not edit <<< -->
 ## CI freshness and base drift
 
+This section implements the CI-freshness and base-drift review policy accepted
+in proposal item 8 of [RFC #10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366)
+(accepted 2026-09-03). That RFC is the decision record for the warning
+classification and the approve-with-warning verdict row above; this generated
+text does not extend it.
+
 Classify CI freshness from the current GitHub state fetched above, not from an
 author's prose or a stale review artifact. Base drift alone is mergeability
 housekeeping, consistent with the [PR lanes](../maintainers/pr-workflow.md#pr-lanes),
@@ -267,11 +284,13 @@ Apply these rules in order:
 Pending CI is not evidence and must not be described as proof. This rule only
 says that a verified refresh-and-rerun state is not itself a code-review
 blocker. It does not make the PR merge-ready. The `squash-merge` skill's
-required-check and freshness-basis steps still apply before merge. Because
-`master` dismisses stale approvals when new commits are pushed, an approval on
-this path is dismissed when the author performs the requested refresh;
-re-approve the refreshed head after reviewing it and once the required gate
-reports.
+required-check and freshness-basis steps still apply before merge. An approval
+on this path covers only the `headRefOid` it reviewed. Do not rely on GitHub to
+dismiss it when the author pushes the requested refresh: native stale-approval
+dismissal depends on the live `master` ruleset or branch-protection setting and
+may be disabled, so an aggregate `APPROVED` state alone is not proof that the
+current head was reviewed. Re-review the refreshed head and re-approve it once
+the required gate reports.
 <!-- >>> end generated:review-ci-freshness-policy <<< -->
 
 ## Validation evidence gaps

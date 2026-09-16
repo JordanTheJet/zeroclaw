@@ -10,6 +10,8 @@ const COMMAND: &str = "cargo generate review-docs";
 struct ReviewCiPolicy {
     base_branch: &'static str,
     required_gate: &'static str,
+    decision_issue: u32,
+    decision_accepted_on: &'static str,
     minimum_gh_major: u16,
     minimum_gh_minor: u16,
     pending_exit_code: u8,
@@ -20,6 +22,8 @@ struct ReviewCiPolicy {
 const POLICY: ReviewCiPolicy = ReviewCiPolicy {
     base_branch: "master",
     required_gate: "CI Required Gate",
+    decision_issue: 10366,
+    decision_accepted_on: "2026-09-03",
     minimum_gh_major: 2,
     minimum_gh_minor: 50,
     pending_exit_code: 8,
@@ -30,6 +34,13 @@ const POLICY: ReviewCiPolicy = ReviewCiPolicy {
 impl ReviewCiPolicy {
     fn minimum_gh_version(self) -> String {
         format!("{}.{}.0", self.minimum_gh_major, self.minimum_gh_minor)
+    }
+
+    fn decision_link(self) -> String {
+        format!(
+            "[RFC #{issue}](https://github.com/zeroclaw-labs/zeroclaw/issues/{issue})",
+            issue = self.decision_issue
+        )
     }
 }
 
@@ -172,14 +183,25 @@ fn render_protocol_fetch(policy: &ReviewCiPolicy) -> String {
      --jq '{{status,behind_by,ahead_by}}'
    gh pr checks <number> --repo zeroclaw-labs/zeroclaw \
      --required --json name,state,bucket
+   HEAD_AFTER=$(gh pr view <number> --repo zeroclaw-labs/zeroclaw \
+     --json headRefOid --jq .headRefOid)
+   if [ "$HEAD_AFTER" != "$HEAD_SHA" ]; then
+     echo "head moved from $HEAD_SHA to $HEAD_AFTER during capture; repeat this step" >&2
+     exit 1
+   fi
    ```
 
    </div>
 
    This classification requires `gh >= {minimum_gh_version}`. Stop and upgrade
    an older client rather than silently dropping required-check data. Record
-   `headRefOid` as the revision being reviewed. Treat the check output and
-   `behind_by` comparison as current only for that head. `gh pr checks` exits
+   `headRefOid` as the revision being reviewed. `gh pr checks` is keyed by the
+   mutable PR number, not by a commit, so the trailing `headRefOid` re-read is
+   what binds the check output and the `behind_by` comparison to `HEAD_SHA`.
+   If the head moved during the capture, discard everything captured in this
+   step and repeat it from `PR_STATE`; never classify a comparison from one
+   head against checks from another. Treat the check output and `behind_by`
+   comparison as current only for the captured head. `gh pr checks` exits
    non-zero by design when required checks are pending (exit {pending_exit_code}), failing, or
    absent. Treat that exit code as state to classify, not as a failed fetch,
    and inspect any JSON output it returned. Use this state for the CI freshness
@@ -202,6 +224,12 @@ fn render_protocol_fetch(policy: &ReviewCiPolicy) -> String {
 fn render_protocol_policy(policy: &ReviewCiPolicy) -> String {
     format!(
         r#"## CI freshness and base drift
+
+This section implements the CI-freshness and base-drift review policy accepted
+in proposal item 8 of {decision_link}
+(accepted {decision_accepted_on}). That RFC is the decision record for the warning
+classification and the approve-with-warning verdict row above; this generated
+text does not extend it.
 
 Classify CI freshness from the current GitHub state fetched above, not from an
 author's prose or a stale review artifact. Base drift alone is mergeability
@@ -240,13 +268,17 @@ Apply these rules in order:
 Pending CI is not evidence and must not be described as proof. This rule only
 says that a verified refresh-and-rerun state is not itself a code-review
 blocker. It does not make the PR merge-ready. The `squash-merge` skill's
-required-check and freshness-basis steps still apply before merge. Because
-`{base_branch}` dismisses stale approvals when new commits are pushed, an approval on
-this path is dismissed when the author performs the requested refresh;
-re-approve the refreshed head after reviewing it and once the required gate
-reports."#,
+required-check and freshness-basis steps still apply before merge. An approval
+on this path covers only the `headRefOid` it reviewed. Do not rely on GitHub to
+dismiss it when the author pushes the requested refresh: native stale-approval
+dismissal depends on the live `{base_branch}` ruleset or branch-protection setting and
+may be disabled, so an aggregate `APPROVED` state alone is not proof that the
+current head was reviewed. Re-review the refreshed head and re-approve it once
+the required gate reports."#,
         base_branch = policy.base_branch,
         required_gate = policy.required_gate,
+        decision_link = policy.decision_link(),
+        decision_accepted_on = policy.decision_accepted_on,
         current_failure_buckets = buckets(policy.current_failure_buckets),
         evidence_gap_buckets = buckets(policy.evidence_gap_buckets),
     )
@@ -345,6 +377,9 @@ mod tests {
         assert!(rendered.contains(&buckets(POLICY.current_failure_buckets)));
         assert!(rendered.contains(&buckets(POLICY.evidence_gap_buckets)));
 
+        assert!(rendered.contains(&POLICY.decision_link()));
+        assert!(rendered.contains(POLICY.decision_accepted_on));
+
         let fetch = render_protocol_fetch(&POLICY);
         assert!(fetch.contains(&POLICY.minimum_gh_version()));
         assert!(fetch.contains(&POLICY.pending_exit_code.to_string()));
@@ -356,6 +391,25 @@ mod tests {
             "[ \"$GH_MINOR\" -lt {} ]",
             POLICY.minimum_gh_minor
         )));
+    }
+
+    #[test]
+    fn fetch_binds_required_checks_to_the_captured_head() {
+        let fetch = render_protocol_fetch(&POLICY);
+        let capture = fetch.find("HEAD_SHA=$(").expect("captures HEAD_SHA");
+        let checks = fetch.find("gh pr checks <number>").expect("fetches checks");
+        let reread = fetch.find("HEAD_AFTER=$(").expect("re-reads the head");
+        assert!(capture < checks && checks < reread);
+        assert!(fetch.contains(r#"if [ "$HEAD_AFTER" != "$HEAD_SHA" ]; then"#));
+        assert!(fetch.contains("repeat this step"));
+    }
+
+    #[test]
+    fn policy_does_not_assert_native_stale_approval_dismissal() {
+        let rendered = render_protocol_policy(&POLICY);
+        assert!(!rendered.contains("dismisses stale approvals"));
+        assert!(rendered.contains("may be disabled"));
+        assert!(rendered.contains("Re-review the refreshed head"));
     }
 
     #[test]
