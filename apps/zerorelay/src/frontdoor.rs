@@ -141,12 +141,25 @@ where
         mut pending,
     } = session;
     loop {
-        let mut response = match route(&head, &mut stream, &mut pending, &inner).await {
-            Ok(bytes) => bytes,
-            // The request could not be read at all (oversized body, early EOF):
-            // answer if we still can, then stop.
-            Err(status) => status,
+        let (mut response, request_failed) = match route(&head, &mut stream, &mut pending, &inner)
+            .await
+        {
+            Ok(bytes) => (bytes, false),
+            // An error response may leave the request body unconsumed (an oversized
+            // or truncated body, or a body on a route that never reads one), so the
+            // stream is no longer at a request boundary. Answer if we still can,
+            // then CLOSE - never keep-alive into unsynchronized bytes and parse
+            // them as the next request head.
+            Err(status) => (status, true),
         };
+        // Keep-alive only after a clean, fully-consumed request; a failed request
+        // or an explicit close ends the connection. Tell the client so, rather
+        // than leaving the shared builder's `keep-alive` on a response we then
+        // close underneath.
+        let close = request_failed || should_close_after_response(&head);
+        if close {
+            response = mark_connection_close(response);
+        }
         // A HEAD response carries the headers a GET would - content-length still
         // advertises the entity - but no body bytes.
         if request_is_head(&head) {
@@ -155,7 +168,7 @@ where
         if stream.write_all(&response).await.is_err() {
             break;
         }
-        if should_close_after_response(&head) {
+        if close {
             break;
         }
         match timeout(
@@ -339,6 +352,20 @@ fn should_close_after_response(head: &[u8]) -> bool {
         connection_keep_alive |= lower.contains("keep-alive");
     }
     connection_close || (request.ends_with(" HTTP/1.0") && !connection_keep_alive)
+}
+
+/// Rewrite a response's keep-alive header to `Connection: close`. Called when the
+/// relay will close the connection after this response - an error may have left
+/// the request body unconsumed, so the stream is no longer at a request boundary
+/// and MUST NOT be reused. The shared builder always writes keep-alive; this
+/// flips it so the client is told what the relay is about to do.
+fn mark_connection_close(mut response: Vec<u8>) -> Vec<u8> {
+    const KEEP: &[u8] = b"connection: keep-alive\r\nkeep-alive: timeout=5\r\n";
+    const CLOSE: &[u8] = b"connection: close\r\n";
+    if let Some(pos) = response.windows(KEEP.len()).position(|w| w == KEEP) {
+        response.splice(pos..pos + KEEP.len(), CLOSE.iter().copied());
+    }
+    response
 }
 
 async fn read_http_head<S>(stream: &mut S, pending: &mut Vec<u8>) -> Result<Vec<u8>>
@@ -525,6 +552,62 @@ mod tests {
     fn websocket_upgrade_is_detected() {
         let head = b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_websocket_upgrade(head));
+    }
+
+    /// An error response must close the connection rather than keep-alive into an
+    /// unconsumed request body. A POST that declares an oversized body, with a
+    /// second request pipelined behind it, would otherwise have its leftover
+    /// bytes parsed as that second request - a client-confusing HTTP desync.
+    /// Regression for the `read_body` keep-alive bug.
+    #[tokio::test]
+    async fn an_error_response_closes_instead_of_desyncing_the_next_request() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // A keep-alive POST whose declared body exceeds the cap (read_body rejects
+        // it before reading any body), then a full pipelined GET the desync would
+        // answer with 200 if the connection stayed open.
+        let oversize = MAX_FRONTDOOR_REQUEST_BYTES + 1;
+        let first =
+            format!("POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: {oversize}\r\n\r\n");
+        let smuggled = "GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n";
+        client.write_all(first.as_bytes()).await.unwrap();
+        client.write_all(smuggled.as_bytes()).await.unwrap();
+
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let lower = text.to_ascii_lowercase();
+
+        assert!(text.starts_with("HTTP/1.1 400"), "expected 400: {text}");
+        assert!(
+            text.contains("request body too large"),
+            "expected the size error: {text}"
+        );
+        // The connection was closed, and the response advertised it.
+        assert!(lower.contains("connection: close"), "must advertise close: {text}");
+        assert!(!lower.contains("keep-alive"), "must not keep-alive: {text}");
+        // The smuggled request must not have been served.
+        assert!(
+            !lower.contains("application/javascript"),
+            "desync: the pipelined /app.js was served: {text}"
+        );
+        assert_eq!(
+            text.matches("HTTP/1.1").count(),
+            1,
+            "exactly one response must be written: {text}"
+        );
     }
 
     /// With the frontdoor off the relay plane is WebSocket-only: a plain HTTP hit
