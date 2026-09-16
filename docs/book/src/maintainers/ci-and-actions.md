@@ -323,7 +323,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
-| `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected by the `fmt` job's `use_blacksmith` output (a checked-in constant) |
+| `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected by the `use-blacksmith: 'true'` input each Blacksmith compile job passes to the composite (a checked-in constant) |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
 | `docker/build-push-action` (`v6.18.0`, `v7.1.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Multi-platform image build and push |
