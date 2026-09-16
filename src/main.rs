@@ -3000,7 +3000,7 @@ fn model_path_provider_type(path: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
     let mut parts = tail.split('.');
@@ -3011,7 +3011,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 
 /// Split `section_arg` into the map key under `section_path` with NOTHING after
 /// it, the `config init <section>.<alias>` shape.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
     let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
     (!tail.is_empty() && !tail.contains('.')).then_some(tail)
@@ -3021,7 +3021,7 @@ fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Opti
 /// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
 /// are values from another domain (model id, voice, tool name) and may
 /// themselves contain dots, so a dot split would yield a bogus alias.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn alias_target_for_path<'a>(
     path: &'a str,
     split: impl Fn(&str, &'a str) -> Option<&'a str>,
@@ -3040,7 +3040,7 @@ fn alias_target_for_path<'a>(
 /// exists, the section is resource-keyed or a natural-key list, or the argument
 /// is a plain nested prefix that `init_defaults` already handles). A reserved
 /// alias is an error, not a silent no-op.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
     let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
@@ -3073,7 +3073,7 @@ fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
@@ -10511,7 +10511,7 @@ async fn run_gateway_if_enabled(
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -10520,12 +10520,12 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_browser_host(host: &str) -> &str {
     match host {
         "0.0.0.0" => "127.0.0.1",
@@ -10534,7 +10534,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -10578,7 +10578,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -10587,7 +10587,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -10605,7 +10605,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -12232,6 +12232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "lmstudio".into(),
@@ -12247,6 +12248,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "anthropic".into(),
@@ -12262,6 +12264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "ollama".into(),
