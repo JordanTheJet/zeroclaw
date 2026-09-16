@@ -561,6 +561,7 @@ pub async fn run(
     let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
     ));
 
     if let Some(gateway_start) = registry.take_gateway_start() {

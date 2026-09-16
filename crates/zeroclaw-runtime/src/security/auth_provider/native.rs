@@ -74,10 +74,15 @@ impl AuthProvider for NativeAuthProvider {
 mod tests {
     use super::*;
     use zeroclaw_api::principal::{IdentitySubject, PrincipalId};
+    use zeroclaw_config::pairing::PairingCodePolicy;
 
     fn provider_with(tokens: &[&str]) -> NativeAuthProvider {
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
-        NativeAuthProvider::new(Arc::new(PairingGuard::new(true, &tokens)))
+        NativeAuthProvider::new(Arc::new(PairingGuard::new(
+            true,
+            &tokens,
+            PairingCodePolicy::default(),
+        )))
     }
 
     #[tokio::test]
@@ -139,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_on_the_shared_guard_applies_live() {
-        let guard = Arc::new(PairingGuard::new(true, &[]));
+        let guard = Arc::new(PairingGuard::new(true, &[], PairingCodePolicy::default()));
         let provider = NativeAuthProvider::new(Arc::clone(&guard));
         assert!(
             !provider

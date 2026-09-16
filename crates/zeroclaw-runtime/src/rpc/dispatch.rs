@@ -427,6 +427,7 @@ impl Method {
             | M::SopsGet
             | M::SopsGraph
             | M::SopsRuns
+            | M::SopsRunDetail
             | M::SopsRunOverlay
             | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
