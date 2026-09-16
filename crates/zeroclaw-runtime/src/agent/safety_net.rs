@@ -2162,7 +2162,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
     );
 
     let provider = ScriptedProvider::new(vec![text_response("never reached")]);
-    let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
     let mut history = vec![ChatMessage::user("hi")];
     let (dtx, _drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
