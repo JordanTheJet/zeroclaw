@@ -100,7 +100,7 @@ impl Default for ResearchBounds {
 /// `zeroclaw-runtime`, which this crate cannot depend on (runtime depends on
 /// tool implementations). Registration therefore injects the real
 /// implementation as a trait object, exactly as it injects the scoped tool
-/// handles. Every nested provider call goes through [`metered_chat`], so there
+/// handles. Every nested provider call goes through `metered_chat`, so there
 /// is no path to the model that skips this seam.
 pub trait SubAgentMeter: Send + Sync {
     /// Enforce the shared tool-loop spend budget *before* a model call.

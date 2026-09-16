@@ -2024,7 +2024,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When a question needs current, real-time, or external information \
                (prices, news, weather, web pages, lookups, etc.), use your tools — \
-               e.g. web_search_tool and web_fetch — to obtain it before answering; \
+               e.g. web_research and web_fetch — to obtain it before answering; \
                never guess or answer from memory alone when a tool can verify it.\n\
              - Present the final answer to the latest user message directly from the \
                tool results, without narrating delayed/internal tool-execution bookkeeping.",
@@ -7862,7 +7862,6 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
     (&["model_switch"], &["action", "model_provider", "model"]),
     (&["proxy_config"], &["action", "scope"]),
     (&["http_request"], &["method"]),
-    (&["web_search_tool"], &["query"]),
     (&["image_info"], &["path"]),
     (&["canvas"], &["action"]),
     (&["backup"], &[]),
@@ -7886,6 +7885,7 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
 // same presentation policy, but the default registry used by the drift test
 // intentionally does not construct them.
 const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (&["web_research"], &["question"]),
     (
         &["delegate"],
         &["action", "agent", "background", "timeout_ms"],
@@ -43759,7 +43759,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram block must instruct the model to use its tools"
         );
         assert!(
-            block.contains("web_search_tool") && block.contains("web_fetch"),
+            block.contains("web_research") && block.contains("web_fetch"),
             "telegram block must name the real-time tools so the model knows to reach for them"
         );
         assert!(

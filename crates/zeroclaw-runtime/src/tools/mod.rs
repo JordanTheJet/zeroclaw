@@ -3438,27 +3438,31 @@ permissions = ["http_client"]
         );
     }
 
-    /// `web_search_tool` must be registered behind `RateLimitedTool` like
-    /// every other outbound-network tool. It was the lone exception, which let
-    /// an agent loop issue unbounded searches — and unbounded scrapes against
-    /// the default DuckDuckGo path.
+    /// Regression: the raw search tool stays wrapped in
+    /// `RateLimitedTool`, so an agent loop cannot issue unbounded searches
+    /// against the configured provider.
     ///
-    /// The probe uses an exhausted action budget plus the SearXNG provider
-    /// with no instance URL configured, so the two outcomes are distinguishable
-    /// without any network call:
-    ///   * wrapped   → `Ok(success: false)` carrying the rate-limit error,
-    ///                 because the wrapper short-circuits before the inner tool
-    ///   * unwrapped → `Err("SearXNG instance URL not configured…")` from the
-    ///                 inner tool's own config resolution
+    /// The tool left the standard registry when `web_research` took over the
+    /// surface, so the only place it is still directly reachable is the
+    /// `allowed_tools` resurrection path. That is where the limiter has to
+    /// hold: inside `web_research` the same wrapped handle is what the
+    /// sub-agent gets.
     #[tokio::test]
-    async fn web_search_tool_is_registered_behind_the_rate_limiter() {
+    async fn resurrected_web_search_tool_is_still_behind_the_rate_limiter() {
         let tmp = TempDir::new().unwrap();
 
         // A zero-action budget is rate-limited from the very first call.
         let security = Arc::new(SecurityPolicy {
             max_actions_per_hour: 0,
+            allowed_tools: Some(vec!["web_search_tool".into()]),
             ..SecurityPolicy::default()
         });
+
+        let mut cfg = web_search_config(&tmp);
+        // Resolves locally and fails without touching the network.
+        cfg.web_search.search_provider = "searxng".to_string();
+        cfg.web_search.searxng_instance_url = None;
+        std::fs::write(&cfg.config_path, "[web_search]\n").unwrap();
 
         let mem_cfg = MemoryConfig {
             backend: "markdown".into(),
@@ -3467,29 +3471,19 @@ permissions = ["http_client"]
         let mem: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
-        let browser = BrowserConfig {
-            enabled: false,
-            ..BrowserConfig::default()
-        };
-        let http = zeroclaw_config::schema::HttpRequestConfig::default();
-
-        let mut cfg = test_config(&tmp);
-        cfg.web_search.enabled = true;
-        // Resolves locally and fails without touching the network.
-        cfg.web_search.search_provider = "searxng".to_string();
-        cfg.web_search.searxng_instance_url = None;
-        std::fs::write(&cfg.config_path, "[web_search]\n").unwrap();
-
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
             mem,
             None,
             None,
-            &browser,
-            &http,
+            &BrowserConfig {
+                enabled: false,
+                ..BrowserConfig::default()
+            },
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
             &zeroclaw_config::schema::WebFetchConfig::default(),
             tmp.path(),
             &HashMap::new(),
@@ -3505,7 +3499,7 @@ permissions = ["http_client"]
         let web_search = tools
             .iter()
             .find(|t| t.name() == "web_search_tool")
-            .expect("web_search_tool must be registered when enabled");
+            .expect("allow-listing web_search_tool must resurrect it");
 
         let result = web_search
             .execute(serde_json::json!({"query": "test"}))
@@ -3519,7 +3513,7 @@ permissions = ["http_client"]
         let error = result.error.unwrap_or_default();
         assert!(
             error.contains("Rate limit exceeded"),
-            "web_search_tool is not wrapped in RateLimitedTool; got: {error}"
+            "the resurrected web_search_tool is not wrapped in RateLimitedTool; got: {error}"
         );
     }
 
