@@ -4379,6 +4379,12 @@ impl SopEngine {
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
         run.llm_calls_saved = state.llm_calls_saved;
+        // Resuming past step 0 re-enters at the last completed step. Set it
+        // here, under the lookup that just validated the run, so the dispatch
+        // below never needs a second, fallible lookup of the same run.
+        if state.last_completed_step != 0 {
+            run.current_step = state.last_completed_step;
+        }
         for (step_number, output) in &state.step_outputs {
             let already_recorded = run
                 .step_results
@@ -4407,13 +4413,6 @@ impl SopEngine {
         let outcome = if state.last_completed_step == 0 {
             self.dispatch_deterministic_step(&run_id, &sop, 1, last_output)
         } else {
-            {
-                let Some(run) = self.active_runs.get_mut(&run_id) else {
-                    self.release_claim_on_park(&run_id);
-                    bail!("Active run not found: {run_id}");
-                };
-                run.current_step = state.last_completed_step;
-            }
             self.resolve_sop_step(&sop, state.last_completed_step)
                 .and_then(|current_step| {
                     self.route_recorded_step(
