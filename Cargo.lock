@@ -14140,6 +14140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-dist"
+version = "0.8.5"
+
+[[package]]
 name = "zeroclaw-egress-plugin-fixture"
 version = "0.0.0"
 dependencies = [
@@ -14703,6 +14707,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "webpki-roots 0.26.11",
+ "zeroclaw-api",
  "zeroize",
 ]
 
