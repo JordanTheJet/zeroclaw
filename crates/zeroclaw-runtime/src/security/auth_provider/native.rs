@@ -124,7 +124,11 @@ mod tests {
     async fn revocation_on_the_shared_guard_applies_live() {
         // The RFC's live-authority requirement: revoking a token on the
         // guard the gateway serves invalidates it here with no reload.
-        let guard = Arc::new(PairingGuard::new(true, &["zc_tok".to_string()]));
+        let guard = Arc::new(PairingGuard::new(
+            true,
+            &["zc_tok".to_string()],
+            PairingCodePolicy::default(),
+        ));
         let provider = NativeAuthProvider::new(Arc::clone(&guard));
         assert!(
             provider
