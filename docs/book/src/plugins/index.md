@@ -348,9 +348,19 @@ command copied out of `zeroclaw --config-dir /srv/a plugin list` would
 otherwise act on whichever configuration your shell resolves by default. The
 `zpi1_…` row key names the package, capability and binding but not the
 profile, so that command would replace a different profile's allowlist with a
-list computed from this one. The directory and the host list are each single-quoted as one literal
-argument, so nothing a manifest declares can be expanded or substituted by
-your shell; paste the command as printed.
+list computed from this one. The directory and the host list are each
+single-quoted as one literal argument, so nothing a manifest declares can be
+expanded or substituted by your shell; paste the command as printed.
+
+The quoting follows the shell of the platform the command was printed on. On
+Linux and macOS it is the POSIX form (`sh`, `bash`, `zsh`, `fish`), where an
+embedded quote is written `'\''`. On Windows it is PowerShell's literal string,
+where an embedded quote is doubled (`''`): paste the command into PowerShell,
+the shell Windows Terminal opens by default. `cmd.exe` is not a supported paste
+target, because it has no quoting form that keeps every character literal
+(`%name%` expands inside double quotes, and a single quote is an ordinary
+character there), so it could not be trusted with a host list a plugin author
+wrote.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
 for every installed plugin holding `http_client`, one line naming the

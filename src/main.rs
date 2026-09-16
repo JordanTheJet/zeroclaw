@@ -15557,15 +15557,22 @@ mod tests {
         let open = quoted
             .find('\'')
             .expect("the printed command single-quotes its value");
-        // Undo `shell_single_quote`: the argument runs to the closing quote,
-        // and an embedded quote was written as `'\''`.
+        // Undo `shell_single_quote` in the host shell's dialect: the argument
+        // runs to the closing quote, and an embedded quote was written as
+        // `'\''` (POSIX) or `''` (PowerShell).
+        use crate::plugins::egress_ceremony::ShellDialect;
+        let dialect = ShellDialect::host();
         let mut value = String::new();
         let mut rest = &quoted[open + 1..];
         loop {
             let close = rest.find('\'').expect("the quoted value must close");
             value.push_str(&rest[..close]);
             rest = &rest[close + 1..];
-            if let Some(after) = rest.strip_prefix("\\''") {
+            let escaped_quote = match dialect {
+                ShellDialect::Posix => rest.strip_prefix("\\''"),
+                ShellDialect::PowerShell => rest.strip_prefix('\''),
+            };
+            if let Some(after) = escaped_quote {
                 value.push('\'');
                 rest = after;
             } else {

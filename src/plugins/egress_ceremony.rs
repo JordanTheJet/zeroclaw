@@ -46,7 +46,9 @@ pub fn egress_hosts_path(instance_key: &str) -> String {
 /// substitution, so a declared `$(id).example.com` would run `id` before
 /// ZeroClaw saw the argument. Single quotes make every byte literal, including
 /// the `*` that starts a suffix pattern, and [`shell_single_quote`] escapes an
-/// embedded quote. The one thing the shell may do to this argument is nothing.
+/// embedded quote the way the operator's shell on this host expects (see
+/// [`ShellDialect`]). The one thing the shell may do to this argument is
+/// nothing.
 ///
 /// The directory carries the same treatment. `--config-dir` (and the
 /// `ZEROCLAW_CONFIG_DIR` it sets) is process-local, so a command copied out of
@@ -62,11 +64,23 @@ pub fn egress_set_command(
     instance_key: &str,
     hosts: &[String],
 ) -> String {
+    egress_set_command_for(ShellDialect::host(), config_dir, instance_key, hosts)
+}
+
+/// [`egress_set_command`] rendered for an explicit shell dialect, so the form
+/// printed on one host can be proven on another.
+#[must_use]
+pub fn egress_set_command_for(
+    dialect: ShellDialect,
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    hosts: &[String],
+) -> String {
     format!(
         "{} config set {} {}",
-        zeroclaw_invocation(config_dir),
+        zeroclaw_invocation_for(dialect, config_dir),
         egress_hosts_path(instance_key),
-        shell_single_quote(&hosts.join(","))
+        dialect.quote_literal(&hosts.join(","))
     )
 }
 
@@ -75,17 +89,73 @@ pub fn egress_set_command(
 /// inspected rather than whichever one their shell resolves by default.
 #[must_use]
 pub fn zeroclaw_invocation(config_dir: &std::path::Path) -> String {
+    zeroclaw_invocation_for(ShellDialect::host(), config_dir)
+}
+
+/// [`zeroclaw_invocation`] rendered for an explicit shell dialect.
+#[must_use]
+pub fn zeroclaw_invocation_for(dialect: ShellDialect, config_dir: &std::path::Path) -> String {
     format!(
         "zeroclaw --config-dir {}",
-        shell_single_quote(&config_dir.to_string_lossy())
+        dialect.quote_literal(&config_dir.to_string_lossy())
     )
 }
 
-/// Quote `raw` for a POSIX shell: single quotes protect every character but
-/// the single quote itself, which is closed, escaped and reopened.
+/// Quote `raw` as one literal argument for the operator's shell on this host:
+/// [`ShellDialect::host`] picks the dialect.
 #[must_use]
 pub fn shell_single_quote(raw: &str) -> String {
-    format!("'{}'", raw.replace('\'', "'\\''"))
+    ShellDialect::host().quote_literal(raw)
+}
+
+/// The quoting dialect of the shell an operator pastes a printed command into.
+///
+/// The commands this module renders are copied out of `zeroclaw plugin install`
+/// and `zeroclaw plugin list` output and pasted into the operator's interactive
+/// shell, so a value is quoted for *that* shell, not for the shell the runtime
+/// uses to execute tools. Two dialects cover the supported hosts, and both use
+/// single quotes because single quotes are the only form in which either shell
+/// performs no expansion at all; they differ only in how an embedded quote is
+/// written.
+///
+/// `cmd.exe` is deliberately not a target. It has no literal-quoting form:
+/// `%name%` expands inside double quotes, an embedded `"` cannot be escaped,
+/// and a single quote is an ordinary character. No rendering could promise
+/// that a publisher-controlled host list reaches `config set` untouched from
+/// `cmd.exe`, so the Windows form targets PowerShell, the shell Windows
+/// Terminal opens by default, and the documentation says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellDialect {
+    /// `sh`, `bash`, `zsh`, `fish`: single quotes protect every character but
+    /// the single quote itself, which is closed, escaped and reopened
+    /// (`'it'\''s'`).
+    Posix,
+    /// PowerShell (`powershell`, `pwsh`): single quotes protect every character
+    /// but the single quote itself, which is doubled (`'it''s'`).
+    PowerShell,
+}
+
+impl ShellDialect {
+    /// The dialect of the operator's shell on the host this binary runs on:
+    /// PowerShell on Windows, POSIX everywhere else.
+    #[must_use]
+    pub const fn host() -> Self {
+        if cfg!(windows) {
+            Self::PowerShell
+        } else {
+            Self::Posix
+        }
+    }
+
+    /// Quote `raw` as one literal argument in this dialect: after the shell has
+    /// parsed the result, the argument is `raw`, byte for byte.
+    #[must_use]
+    pub fn quote_literal(self, raw: &str) -> String {
+        match self {
+            Self::Posix => format!("'{}'", raw.replace('\'', "'\\''")),
+            Self::PowerShell => format!("'{}'", raw.replace('\'', "''")),
+        }
+    }
 }
 
 /// The legacy `[[plugins.entries]]` row an instance's grant is stranded on, if
@@ -590,16 +660,86 @@ mod tests {
     #[test]
     fn every_printed_command_targets_the_selected_configuration_shell_quoted() {
         let awkward = std::path::Path::new("/tmp/it's here/profile a");
-        let command =
-            super::egress_set_command(awkward, "zpi1_k", &["api.example.com".to_string()]);
+        let command = super::egress_set_command_for(
+            super::ShellDialect::Posix,
+            awkward,
+            "zpi1_k",
+            &["api.example.com".to_string()],
+        );
         assert_eq!(
             command,
             "zeroclaw --config-dir '/tmp/it'\\''s here/profile a' config set \
              plugins.entries.zpi1_k.egress_hosts 'api.example.com'"
         );
         assert!(
-            command.starts_with(&super::zeroclaw_invocation(awkward)),
+            command.starts_with(&super::zeroclaw_invocation_for(
+                super::ShellDialect::Posix,
+                awkward
+            )),
             "the grant command must start with the selected-configuration invocation"
+        );
+    }
+
+    /// The host form is the dialect of the shell an operator on this platform
+    /// pastes into, and the plain renderers are that form exactly.
+    #[test]
+    fn the_printed_form_is_the_host_shells_dialect() {
+        let expected = if cfg!(windows) {
+            super::ShellDialect::PowerShell
+        } else {
+            super::ShellDialect::Posix
+        };
+        assert_eq!(super::ShellDialect::host(), expected);
+        let dir = std::path::Path::new("/srv/it's here/profile a");
+        let hosts = [
+            "it's.example.com".to_string(),
+            "*.cdn.example.com".to_string(),
+        ];
+        assert_eq!(
+            super::egress_set_command(dir, "zpi1_k", &hosts),
+            super::egress_set_command_for(expected, dir, "zpi1_k", &hosts)
+        );
+        assert_eq!(
+            super::zeroclaw_invocation(dir),
+            super::zeroclaw_invocation_for(expected, dir)
+        );
+        assert_eq!(
+            super::shell_single_quote("it's"),
+            expected.quote_literal("it's")
+        );
+    }
+
+    /// The Windows form is PowerShell's literal string: single quotes, with an
+    /// embedded quote doubled rather than backslash-escaped, because PowerShell
+    /// gives a backslash no meaning and would print `'it'\''s'` as three
+    /// tokens. Every metacharacter PowerShell expands inside double quotes
+    /// (`$env:NAME`, `$(...)`, a backtick escape) stays literal, as does the
+    /// space in the profile path and the `*` of a suffix pattern. The egress
+    /// grammar (`normalize_egress_pattern`) rejects none of these characters,
+    /// so a manifest can declare each of these host shapes.
+    #[test]
+    fn the_windows_form_is_powershells_literal_string() {
+        let hosts = [
+            "$(id).example.com",
+            "`id`.example.com",
+            "$env:username.example.com",
+            "*.cdn.example.com",
+            "it's.example.com",
+        ]
+        .map(String::from);
+        let dir = std::path::Path::new(r"C:\Users\op erator\it's\.zeroclaw");
+        let command =
+            super::egress_set_command_for(super::ShellDialect::PowerShell, dir, "zpi1_k", &hosts);
+        let expected = concat!(
+            r"zeroclaw --config-dir 'C:\Users\op erator\it''s\.zeroclaw' ",
+            "config set plugins.entries.zpi1_k.egress_hosts ",
+            "'$(id).example.com,`id`.example.com,$env:username.example.com,",
+            "*.cdn.example.com,it''s.example.com'"
+        );
+        assert_eq!(command, expected);
+        assert!(
+            !command.contains("\\'"),
+            "PowerShell has no backslash escape, so none may be printed: {command}"
         );
     }
 
