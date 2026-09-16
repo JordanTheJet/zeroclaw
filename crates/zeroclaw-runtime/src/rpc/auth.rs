@@ -284,6 +284,7 @@ pub fn validate_accepted_auth_config(config: &Config) -> anyhow::Result<()> {
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
     ));
     let _ = AcceptedAuthState::from_config(config, pairing, 1)?;
     Ok(())
@@ -334,6 +335,7 @@ impl RpcInboundAuth {
         let pairing = Arc::new(PairingGuard::new(
             config.gateway.require_pairing,
             &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
         ));
         Arc::new(Self::from_config(config, pairing).expect("test auth config is valid"))
     }
@@ -538,6 +540,7 @@ mod tests {
     use super::*;
     use zeroclaw_api::grants::{Resource, Verb};
     use zeroclaw_api::principal::{ActorKind, PrincipalId};
+    use zeroclaw_config::pairing::PairingCodePolicy;
     use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig, UserConfig};
 
     fn base_config() -> Config {
@@ -570,8 +573,15 @@ mod tests {
 
     fn auth_for(config: &Config, tokens: &[&str]) -> RpcInboundAuth {
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
-        RpcInboundAuth::from_config(config, Arc::new(PairingGuard::new(true, &tokens)))
-            .expect("valid")
+        RpcInboundAuth::from_config(
+            config,
+            Arc::new(PairingGuard::new(
+                true,
+                &tokens,
+                PairingCodePolicy::default(),
+            )),
+        )
+        .expect("valid")
     }
 
     #[tokio::test]
@@ -806,7 +816,11 @@ mod tests {
         config.wss.enabled = true;
         config.gateway.require_pairing = true;
         assert!(
-            RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(true, &[]))).is_ok(),
+            RpcInboundAuth::from_config(
+                &config,
+                Arc::new(PairingGuard::new(true, &[], PairingCodePolicy::default()))
+            )
+            .is_ok(),
             "pairing-capable WSS config is startable; handshakes deny until paired"
         );
     }
@@ -826,7 +840,7 @@ mod tests {
         );
         let auth = RpcInboundAuth::from_config(
             &unusable_listener,
-            Arc::new(PairingGuard::new(false, &[])),
+            Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
         )
         .expect("the daemon still boots so an operator can repair it");
         assert!(
@@ -845,8 +859,11 @@ mod tests {
                 permission_profiles: vec!["not-configured".into()],
             },
         );
-        let auth = RpcInboundAuth::from_config(&dangling, Arc::new(PairingGuard::new(false, &[])))
-            .expect("an invalid policy installs deny-all rather than refusing to load");
+        let auth = RpcInboundAuth::from_config(
+            &dangling,
+            Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+        )
+        .expect("an invalid policy installs deny-all rather than refusing to load");
         assert!(
             auth.resolve(&shared_operator_identity()).is_err(),
             "a deny-all state refuses even the shared operator's ordinary grants"
@@ -901,8 +918,11 @@ mod tests {
     #[test]
     fn publish_accepted_refuses_an_older_revision() {
         let config = config_with_roster(4242);
-        let auth = RpcInboundAuth::from_config(&config, Arc::new(PairingGuard::new(false, &[])))
-            .expect("the fixture policy compiles");
+        let auth = RpcInboundAuth::from_config(
+            &config,
+            Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+        )
+        .expect("the fixture policy compiles");
         assert_eq!(auth.accepted_revision(), 0);
 
         let first = auth

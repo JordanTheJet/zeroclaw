@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     async fn strict_token_check_ignores_require_pairing() {
-        let guard = PairingGuard::new(false, &["zc_tok".to_string()]);
+        let guard = PairingGuard::new(false, &["zc_tok".to_string()], PairingCodePolicy::default());
         assert!(
             guard.is_authenticated("anything"),
             "gateway convenience fails open when pairing is disabled"
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     async fn empty_guard_strict_check_denies_everything() {
-        let guard = PairingGuard::new(false, &[]);
+        let guard = PairingGuard::new(false, &[], PairingCodePolicy::default());
         assert!(!guard.token_is_paired("anything"));
         assert!(!guard.token_hash_is_paired(&PairingGuard::token_hash("anything")));
     }
