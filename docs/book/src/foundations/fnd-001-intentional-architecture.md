@@ -1,8 +1,8 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
 
-> Starting v0.7.0 · Type: Architecture · Rev. 9
+> Starting v0.7.0 · Type: Architecture · Rev. 10
 >
-> **Canonical reference** · Ratified by the team · Rev. 9
+> **Canonical reference** · Ratified by the team · Rev. 10
 > Original RFC discussion and draft history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
 
 ---
@@ -41,6 +41,7 @@
 | 7 | 2026-07-04 | Restored the desktop installer and its release, architecture, roadmap, and success-criteria obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
 | 8 | 2026-07-20 | Made root `AGENTS.md` the compact project contract, routed maintained detail through the architecture map and coding-agent guidelines, and prevented crate policy from weakening project safety, privacy, or authorization requirements ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
 | 9 | 2026-08-11 | Removed WATI from the current-state gateway inventory and v0.9.0 plugin-migration target after the channel was retired in [#9571](https://github.com/zeroclaw-labs/zeroclaw/pull/9571); the generic webhook/plugin boundary remains unchanged |
+| 10 | 2026-08-19 | Removed `aardvark-sys` and `zeroclaw-robot-kit` from the workspace-inheritance and independent-release guidance after both crates were retired in [#9853](https://github.com/zeroclaw-labs/zeroclaw/pull/9853); the published 0.1.0 releases stay on crates.io and are unaffected |
 
 Revision numbers in this canonical document follow the ratified repository
 history. The linked RFC issue also labels a configuration-discipline edit as
@@ -146,7 +147,7 @@ This diagnosis should not obscure what is genuinely well-designed:
 
 - **The trait layer is excellent.** `Provider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral` are clean, well-documented Rust traits. These are the right seams. The problem is they do not correspond to crate boundaries, so the compiler cannot enforce the layering.
 - **The WASM plugin system is partially built.** `PluginHost`, `WasmTool`, `WasmChannel`, `PluginManifest`, and Ed25519 signature verification all exist in `src/plugins/`. The execution bridge is a stub, but the structure is correct.
-- **The observability system is mature.** OpenTelemetry, Prometheus, and DORA metrics are all implemented against a clean `Observer` trait. This is production-quality work.
+- **The observability system has strong foundations.** OpenTelemetry and Prometheus are implemented against a clean `Observer` trait. The remaining work is to standardize how production paths emit through that interface.
 - **The security model is thoughtful.** Pairing codes, autonomy levels, sandboxing, and policy enforcement show real design intent.
 
 We are not rewriting ZeroClaw. We are giving its existing good ideas a structure they can grow in.
@@ -279,12 +280,11 @@ All application crates, the kernel, the gateway, tool plugin crates, channel plu
 - It reflects ZeroClaw's identity as a **product**, not a library ecosystem
 - The WIT interface version, not the Rust crate version, is the actual plugin ABI contract (see §5.2)
 
-Three crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
+Two crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
 
 | Crate | Reason for independence |
 |---|---|
 | `zeroclaw-api` | Starts at `0.1.0`; its `1.0.0` release is a formal milestone deliverable of v1.0.0, signalling a stable Rust trait surface for plugin SDK authors |
-| `aardvark-sys`, `zeroclaw-robot-kit` | Hardware library crates with their own user audiences and maintenance cadences; not application components |
 | WIT interface files (`wit/*.wit`) | Versioned via `@since` and `@unstable` annotations per the WASI component model spec; these are the primary plugin ABI contract and are independent of Cargo semver entirely |
 
 ---
@@ -317,7 +317,7 @@ Stability tiers are **promoted, never demoted** through a deliberate team decisi
 
 ##### Release automation
 
-Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. Crates with independent versions (`zeroclaw-api`, hardware library crates) are managed separately using the same tool's per-crate configuration.
+Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. The independently versioned `zeroclaw-api` crate is managed separately using the same tool's per-crate configuration.
 
 #### 4.4.2 Release Artifacts
 
@@ -436,7 +436,7 @@ Standards are agreements that have been made by many smart people over many year
 
 **What it is:** OpenTelemetry (OTel) is the industry standard for collecting traces, metrics, and logs from software systems. It is maintained by the Cloud Native Computing Foundation and supported by every major cloud provider and monitoring tool.
 
-**Why it matters for ZeroClaw:** We have already implemented `OtelObserver` against our `Observer` trait. We have Prometheus metrics and DORA metrics. The issue is that these are not yet standardized across the codebase: some modules log with `tracing::info!`, others emit `ObserverEvent`s, and the two are not connected.
+**Why it matters for ZeroClaw:** We have already implemented `OtelObserver` against our `Observer` trait and expose Prometheus metrics. The issue is that these are not yet standardized across the codebase: some modules log with `tracing::info!`, others emit `ObserverEvent`s, and the two are not connected.
 
 **What we should do:**
 - Adopt OpenTelemetry as the single observability interface for all components
@@ -649,7 +649,7 @@ zeroclaw plugin remove <name>     # remove an installed plugin
 zeroclaw plugin update            # update all installed plugins
 ```
 
-The registry is a JSON index file served from a known URL (e.g., `https://plugins.zeroclawlabs.ai/index.json`). Each entry includes name, version, download URL, SHA-256 checksum, and the publisher's Ed25519 public key. The `PluginHost` signature verification already handles the security model.
+The registry is a JSON index file served from a known URL (e.g., `https://plugins.zeroclaw.com/index.json`). Each entry includes name, version, download URL, SHA-256 checksum, and the publisher's Ed25519 public key. The `PluginHost` signature verification already handles the security model.
 
 ##### D4: Integrate `zeroclaw onboard` with the plugin system
 

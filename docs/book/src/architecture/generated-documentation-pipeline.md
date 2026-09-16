@@ -11,6 +11,7 @@ Use this page when a change touches a schema, CLI flag, feature or hardware inve
 | Config reference | `zeroclaw_config::schema::Config` plus `Configurable` derives | `cargo mdbook refs` or `cargo mdbook build`, through `markdown-schema` | `docs/book/src/reference/config.md` | Ignored derived file | Config reference chapter and schema-backed directives |
 | CLI reference | Clap command tree in `src/main.rs` | `cargo mdbook refs` or `cargo mdbook build`, through `markdown-help` | `docs/book/src/reference/cli.md` | Ignored derived file | CLI reference chapter |
 | Installation paths | Typed route contracts in `xtask/src/generate/spec.rs` and generated behavior bodies in the installer renderers | `cargo generate installers`, through `xtask/src/generate/docs.rs` and `xtask/src/generate/install_sh.rs` | `docs/book/src/_snippets/install.md`, generated Unix command blocks in README and platform guides, generated route and picker-helper regions in `install.sh`, and the Windows prebuilt block in `docs/book/src/setup/windows.md` | Tracked generated surfaces | README-linked first-time setup, executable Unix routes, Quickstart, and platform setup pages |
+| SOP syntax reference | `parse_steps` syntax catalog in `crates/zeroclaw-runtime/src/sop/mod.rs` and `ConditionOp::catalog()` | `cargo generate sop-syntax`, through `xtask/src/generate/sop_syntax.rs` | Marked parser-behavior and condition-operator regions in `docs/book/src/sop/syntax.md` | Tracked generated regions | SOP authoring reference |
 | Rust API reference | Public Rust items across workspace crates | `cargo doc` inside `cargo mdbook refs` or `cargo mdbook build` | `target/doc/`, copied to `docs/book/book/api/` | Ignored build output | Published API reference |
 | Feature matrix | Channel inventory, model-provider slots, default tools, and `docs/book/feature-matrix-parity.toml` | `xtask/src/cmd/mdbook/feature_matrix.rs` during locale builds | `docs/book/src/_snippets/feature-matrix-*.md` | Ignored derived snippets | Feature comparison pages through `{{#include}}` |
 | Hardware tables | Hardware board registry and tool catalog, transport descriptions in the generator, release workflow targets, and the low-memory threshold in `install.sh` | `xtask/src/cmd/mdbook/hardware.rs` during locale builds | `docs/book/src/_snippets/hardware-*.md` | Ignored derived snippets | Hardware and release-target guides |
@@ -34,12 +35,13 @@ This matrix describes the current high-value surfaces, not every helper file pro
 2. Build workspace rustdoc.
 3. Materialize theme, keymap, hardware, feature-matrix, and plugin snippets.
 4. Run mdBook once for every locale in `locales.toml`, with preprocessors configured by `docs/book/book.toml`.
-5. Check links in the rendered primary locale.
-6. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
+5. Run mdBook once more for the primary locale with only the in-tree `llms` backend, writing `llms.txt` (a page index with one-line descriptions) and `llms-full.txt` (every page as one Markdown stream) beside that locale's HTML. The preprocessors that support the `llms` renderer (gettext, peer-groups, placeholders) run for this pass; `mdbook-mermaid` serves only the HTML renderer, so the text keeps fenced Mermaid source instead of rendered diagrams. Page entries carry the deployed `https://docs.zeroclaw.com/<tag>/<locale>/` URL, while page bodies keep their authored `.md` links unrewritten. Only `cargo mdbook build` produces the pair: `cargo mdbook serve` skips this pass, and an HTML watch rebuild of the locale directory discards any pair already there.
+6. Check links in the rendered primary locale.
+7. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
 
 The peer-group preprocessor expands its directives while mdBook processes each chapter. Other standard mdBook preprocessors handle links, Mermaid blocks, and gettext localization. Generated references therefore need to exist before chapter preprocessing, while directive expansion and translation happen during the locale build.
 
-The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. It does not call a translation provider or repair catalogs during deployment.
+The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. Each deployed `<tag>/en/` directory keeps its own `llms.txt` and `llms-full.txt`. The root pair at `https://docs.zeroclaw.com/llms.txt` and `llms-full.txt` mirrors the version the site root redirects to (the stable pointer target, or `master` when no pointer resolves), and only when that version's build carries both files. A stable release built before the `llms` backend existed has no pair, so the deploy removes any root copies rather than leaving them serving an older release; the root pair appears with the first stable release built after this backend landed. It does not call a translation provider or repair catalogs during deployment.
 
 ## Tracked and build-only outputs
 
@@ -70,6 +72,7 @@ Required PR CI runs the docs quality and added-link gates, but it does not run t
 - Fix config reference errors in the typed schema, derives, or schema-to-Markdown generator.
 - Fix CLI reference errors in the Clap command definition or Markdown-help generator.
 - Fix stable installation behavior in the typed route contract or its renderer, then run `cargo generate installers`; do not hand-edit the tracked installation snippet.
+- Fix SOP syntax behavior or operator descriptions in the runtime parser catalog, then run `cargo generate sop-syntax`; do not hand-edit the marked lists in the syntax reference.
 - Fix source-backed snippet errors in the owning registry, metadata file, contract, or snippet generator.
 - Fix theme-list drift in `themes.json` or the marked-region generator, not by hand-editing generated buttons.
 - Fix translated content or fallback behavior through the catalog lifecycle, not in rendered locale HTML.

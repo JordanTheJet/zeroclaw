@@ -2497,9 +2497,7 @@ pub async fn handle_options_prop(
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, DELETE, OPTIONS"),
     );
-    response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+    insert_etag(&mut response, etag);
     response
 }
 
@@ -2510,10 +2508,14 @@ fn schema_response(_label: &'static str) -> Response {
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, PATCH, OPTIONS"),
     );
+    insert_etag(&mut response, etag);
     response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
-    response
+}
+
+fn insert_etag(response: &mut Response, etag: &str) {
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
 }
 
 fn cached_schema() -> (&'static serde_json::Value, &'static str) {
@@ -2562,6 +2564,13 @@ mod tests {
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    #[test]
+    fn invalid_etag_value_is_omitted_instead_of_panicking() {
+        let mut response = StatusCode::OK.into_response();
+        insert_etag(&mut response, "invalid\nheader");
+        assert!(!response.headers().contains_key(header::ETAG));
+    }
 
     // dirty_entry_for / CascadeReport::dirty_paths tests live in
     // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI
@@ -2625,8 +2634,11 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -2886,6 +2898,56 @@ mod tests {
                 .openai
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/allowed_tools",
+                        "value": ["shell"]
+                    },
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/deny_all_tools",
+                        "value": false
+                    }
+                ])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["saved"], true);
+
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        let profile = reloaded.risk_profiles.get("default").unwrap();
+        assert_eq!(profile.allowed_tools, vec!["shell"]);
+        assert!(!profile.deny_all_tools);
+
+        let policy =
+            zeroclaw_config::policy::SecurityPolicy::from_profiles(profile, None, tmp.path());
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("memory_recall"));
     }
 
     #[tokio::test]
@@ -3908,7 +3970,7 @@ mod tests {
 
     #[test]
     fn every_gateway_secret_is_classified() {
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.webhook_secret"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg
@@ -4209,7 +4271,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = config_with_telegram_alias(&tmp, "alerts");
         let mut state = test_state(config);
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let (status, _json) = response_json(
             handle_api_channel_bind(
@@ -4271,7 +4337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_context_window_forwards_api_key() {
+    async fn refresh_context_window_allows_slow_response_and_forwards_api_key() {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
         use wiremock::matchers::{header, method, path};
@@ -4282,12 +4348,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer test-api-key-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{
-                    "id": "llama-3.1-70b",
-                    "context_length": 4096
-                }]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(3_100))
+                    .set_body_json(serde_json::json!({
+                        "data": [{
+                            "id": "llama-3.1-70b",
+                            "context_length": 4096
+                        }]
+                    })),
+            )
             .expect(1)
             .mount(&mock)
             .await;

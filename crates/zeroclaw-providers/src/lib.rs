@@ -12,28 +12,110 @@ pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
+pub mod hailo_ollama;
 pub mod kilocli;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
+mod ollama_wire;
 pub mod openai;
 pub mod openai_codex;
+pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
 pub mod reliable;
 pub mod router;
+pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
+pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
-pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
+pub use reliable::{
+    ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+    ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion,
+};
+pub use safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback, visible_provider_fallback,
+};
 
+/// Return the typed refusal that terminated a provider result, if any.
+///
+/// Reliable keeps the final cause underneath its rejected-usage and terminal
+/// failure envelopes, and a streamed refusal arrives inside `StreamError`, so
+/// the leaf type is found by walking the chain rather than by an outer
+/// downcast. A later non-refusal failure replaces the refusal as the final
+/// cause and therefore yields `None`.
+pub fn model_refusal_from_error(error: &anyhow::Error) -> Option<&AnthropicRefusalError> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<AnthropicRefusalError>().or_else(|| {
+            match cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>() {
+                Some(zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal)) => {
+                    Some(refusal.as_ref())
+                }
+                _ => None,
+            }
+        })
+    })
+}
+
+/// Return billed usage carried by a rejected provider result.
+///
+/// Reliable's aggregate is authoritative when present; a leaf refusal's own
+/// usage is the fallback for direct-provider and interrupted-stream paths.
+pub fn rejected_attempt_usage_from_error(error: &anyhow::Error) -> Option<&traits::TokenUsage> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ReliableRejectedCompletionUsage>()
+                .map(|rejected| &rejected.usage)
+        })
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<AnthropicRefusalError>()
+                    .and_then(|refusal| refusal.usage.as_deref())
+            })
+        })
+}
 mod request_payload;
+
+#[cfg(test)]
+pub(crate) static RUNTIME_PROXY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct RuntimeProxyTestGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl RuntimeProxyTestGuard {
+    pub(crate) async fn acquire() -> Self {
+        let guard = RUNTIME_PROXY_TEST_LOCK.lock().await;
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimeProxyTestGuard {
+    fn drop(&mut self) {
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+    }
+}
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -57,6 +139,36 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+
+/// Test-only override for the Qwen OAuth token endpoint URL.
+/// When set via [`set_qwen_oauth_endpoint_for_test`], the refresh
+/// function uses this URL instead of the hardcoded production endpoint.
+/// Gated on `test-helpers` feature so downstream crates can use it in
+/// their own tests.
+#[cfg(any(test, feature = "test-helpers"))]
+static QWEN_OAUTH_ENDPOINT_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Override the Qwen OAuth token endpoint for deterministic testing.
+/// Call with `None` to restore the production endpoint after a test.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_qwen_oauth_endpoint_for_test(url: Option<String>) {
+    *QWEN_OAUTH_ENDPOINT_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = url;
+}
+
+/// Return the active Qwen OAuth token endpoint: the test override
+/// when running under `#[cfg(test)]`, or the production constant.
+fn qwen_oauth_token_endpoint() -> String {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Ok(guard) = QWEN_OAUTH_ENDPOINT_OVERRIDE.read()
+        && let Some(ref url) = *guard
+    {
+        return url.clone();
+    }
+    QWEN_OAUTH_TOKEN_ENDPOINT.to_string()
+}
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -293,7 +405,7 @@ pub(crate) fn refresh_qwen_oauth_access_token(
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(qwen_oauth_token_endpoint())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -622,6 +734,18 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// How compatible chat-completions providers handle image markers in
+    /// native role=`tool` results.
+    pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
+    /// Root `[multimodal]` policy applied when a provider expands
+    /// `[IMAGE:...]` markers into inline data URIs.
+    ///
+    /// Provider adapters run their own `prepare_messages_for_provider` pass, so
+    /// without this they silently fall back to `MultimodalConfig::default()` and
+    /// an operator's `max_images` / `max_image_size_mb` / `max_image_turns`
+    /// never reach the request that actually carries the images. Root-scoped,
+    /// not per-entry: every alias resolves the same section.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -647,6 +771,8 @@ impl Default for ModelProviderRuntimeOptions {
             vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            tool_result_image_policy: Default::default(),
+            multimodal: Default::default(),
         }
     }
 }
@@ -710,6 +836,10 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        tool_result_image_policy: entry
+            .map(|e| e.tool_result_image_policy)
+            .unwrap_or_default(),
+        multimodal: config.multimodal.clone(),
     }
 }
 
@@ -773,8 +903,38 @@ pub fn options_for_provider_ref(
             // the fallback provider's capability flag. Clearing it falls back to
             // the family default (or the choke point's own resolution).
             options.vision = None;
+            // Tool-result image handling is provider-specific: a bare
+            // fallback family must use its own default rather than inherit
+            // the previous provider alias's policy.
+            options.tool_result_image_policy = Default::default();
+            // `multimodal` is deliberately NOT reset: it is the root
+            // `[multimodal]` section, identical for every alias, so a bare
+            // family ref inherits the same operator policy rather than
+            // silently reverting to library defaults.
             options
         }
+    }
+}
+
+/// Runtime options for a **bare family** reference (`ollama`) or an inline
+/// `custom:<url>` reference, neither of which resolves a configured entry.
+///
+/// Everything provider-specific (kind, URI, credentials, `vision`, ...) stays at
+/// its default because there is no entry to read it from. The root
+/// `[multimodal]` policy is not provider-specific, so it must still reach the
+/// adapter: `ModelProviderRuntimeOptions::default()` embeds
+/// `MultimodalConfig::default()`, and an adapter built that way re-applies
+/// library image limits to messages the runtime already prepared under the
+/// operator's policy — silently dropping attachments the operator allowed.
+///
+/// This path is reached in production by `resolve_vision_provider` for a
+/// configured `multimodal.vision_model_provider`.
+fn bare_family_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
     }
 }
 
@@ -794,13 +954,15 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
-/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+/// Remove credentials from HTTP(S) URLs embedded in error text.
 ///
 /// Query-value punctuation cannot safely identify where a credential ends:
 /// commas, apostrophes, and parentheses are all legal query data. Treat the
 /// URL's entire non-whitespace query tail as sensitive instead. This also
 /// covers credential parameter names that the sanitizer does not know about.
-fn scrub_url_queries(input: &str) -> String {
+/// URL userinfo is likewise always sensitive and is replaced as one unit while
+/// retaining the host and path needed for an actionable endpoint diagnostic.
+fn scrub_url_credentials(input: &str) -> String {
     let lowercase = input.to_ascii_lowercase();
     let mut scrubbed = String::with_capacity(input.len());
     let mut cursor = 0;
@@ -825,10 +987,22 @@ fn scrub_url_queries(input: &str) -> String {
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
         let url_token = &input[url_start..url_end];
-        if let Some(query_start) = url_token.find('?') {
-            scrubbed.push_str(&url_token[..query_start]);
+        let without_query = url_token
+            .find('?')
+            .map_or(url_token, |query_start| &url_token[..query_start]);
+        let scheme_end = without_query
+            .find("://")
+            .map_or(0, |separator| separator + 3);
+        let authority_end = without_query[scheme_end..]
+            .find(['/', '#'])
+            .map_or(without_query.len(), |end| scheme_end + end);
+        let authority = &without_query[scheme_end..authority_end];
+        if let Some(userinfo_end) = authority.rfind('@') {
+            scrubbed.push_str(&without_query[..scheme_end]);
+            scrubbed.push_str("[REDACTED]@");
+            scrubbed.push_str(&without_query[scheme_end + userinfo_end + 1..]);
         } else {
-            scrubbed.push_str(url_token);
+            scrubbed.push_str(without_query);
         }
         cursor = url_end;
     }
@@ -837,13 +1011,13 @@ fn scrub_url_queries(input: &str) -> String {
 }
 
 /// Scrub known secret-like token prefixes from model_provider error strings.
-/// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
-/// are removed from embedded HTTP(S) URLs because query parameters may carry
-/// credentials under provider-specific names.
+/// Provider API-key prefixes come from the same canonical table used for
+/// credential-family validation; non-provider prefixes cover Slack, GitHub,
+/// and Google/Gemini credentials. Complete query strings are removed from
+/// embedded HTTP(S) URLs because query parameters may carry credentials under
+/// provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 8] = [
-        "sk-",
+    const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
         "xoxb-",
         "xoxp-",
         "ghp_",
@@ -853,9 +1027,13 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "AIza",
     ];
 
-    let mut scrubbed = scrub_url_queries(input);
+    let mut scrubbed = scrub_url_credentials(input);
 
-    for prefix in PREFIXES {
+    for prefix in KEY_PREFIX_MODEL_PROVIDERS
+        .iter()
+        .map(|(prefix, _)| *prefix)
+        .chain(NON_PROVIDER_SECRET_PREFIXES.iter().copied())
+    {
         let mut search_from = 0;
         while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
@@ -876,20 +1054,148 @@ pub fn scrub_secret_patterns(input: &str) -> String {
     scrubbed
 }
 
-/// Sanitize API error text by scrubbing secrets and truncating length.
-pub fn sanitize_api_error(input: &str) -> String {
-    let scrubbed = scrub_secret_patterns(input);
-
-    if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
-        return scrubbed;
+pub(crate) fn truncate_api_error(input: &str) -> String {
+    if input.chars().count() <= MAX_API_ERROR_CHARS {
+        return input.to_string();
     }
 
     let mut end = MAX_API_ERROR_CHARS;
-    while end > 0 && !scrubbed.is_char_boundary(end) {
+    while end > 0 && !input.is_char_boundary(end) {
         end -= 1;
     }
 
-    format!("{}...", &scrubbed[..end])
+    format!("{}...", &input[..end])
+}
+
+/// Sanitize API error text by scrubbing secrets and truncating length.
+pub fn sanitize_api_error(input: &str) -> String {
+    truncate_api_error(&scrub_secret_patterns(input))
+}
+
+/// Whether `message` mentions tools as a standalone word rather than as a
+/// fragment of a larger identifier.
+///
+/// Hyphens and underscores count as word characters so model names and
+/// identifiers such as `tool-model`, `toolformer-v2`, `multi_tool` or
+/// `toolkit` are not mistaken for the endpoint reporting a tools conflict.
+/// Only a bare `tool` / `tools` token matches.
+fn mentions_tools_token(message: &str) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let bytes = message.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(found) = message[search_from..].find("tool") {
+        let start = search_from + found;
+        let mut end = start + "tool".len();
+        // Accept the plural form as part of the same token.
+        if message[end..].starts_with('s') {
+            end += 1;
+        }
+
+        let preceded_by_word_char = message[..start]
+            .chars()
+            .next_back()
+            .is_some_and(&is_word_char);
+        let followed_by_word_char = bytes
+            .get(end)
+            .map(|byte| *byte as char)
+            .is_some_and(&is_word_char);
+
+        if !preceded_by_word_char && !followed_by_word_char {
+            return true;
+        }
+        search_from = start + "tool".len();
+    }
+
+    false
+}
+
+/// Split a provider error message into independent clauses at `;`, newlines,
+/// and sentence-ending periods (a `.` followed by whitespace or end of
+/// input, so identifiers like `gpt-4.1` stay intact).
+///
+/// Compound provider errors can chain unrelated failures in one message;
+/// capability predicates must be evaluated within a single clause so that
+/// independent clauses cannot collectively satisfy them.
+fn error_message_clauses(message: &str) -> Vec<&str> {
+    let bytes = message.as_bytes();
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in message.char_indices() {
+        let is_boundary = match c {
+            ';' | '\n' => true,
+            '.' => bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace),
+            _ => false,
+        };
+        if is_boundary {
+            clauses.push(&message[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    clauses.push(&message[start..]);
+    clauses
+}
+
+/// Whether an endpoint explicitly rejected combining function tools with
+/// `reasoning_effort`.
+///
+/// This predicate is intentionally narrow: callers may retry once with
+/// `reasoning_effort: "none"` only when the endpoint itself reports this exact
+/// capability mismatch. Other reasoning or tool errors must propagate
+/// unchanged. A single clause of the message must report the relationship —
+/// unrelated clauses of a compound error (e.g. `reasoning_effort value is
+/// unsupported; tools must be an array`) do not collectively qualify.
+pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let (message, parameter) = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => {
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .or_else(|| value.get("detail"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let parameter = value
+                .pointer("/error/param")
+                .or_else(|| value.get("param"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            (message, parameter)
+        }
+        Err(_) => (body.to_ascii_lowercase(), String::new()),
+    };
+    let clauses = error_message_clauses(&message);
+    // The structured `param` field is message-global; letting it satisfy an
+    // arbitrary clause would recreate the cross-clause false positive, so it
+    // counts as the reasoning signal only when the message has a single
+    // substantive clause for it to describe.
+    let single_clause = clauses.iter().filter(|c| !c.trim().is_empty()).count() <= 1;
+    clauses.into_iter().any(|clause| {
+        let mentions_reasoning_effort = clause.contains("reasoning_effort")
+            || clause.contains("reasoning effort")
+            || (single_clause && parameter == "reasoning_effort");
+        let mentions_tools = mentions_tools_token(clause);
+        let reports_incompatibility = [
+            "not supported",
+            "unsupported",
+            "cannot be used",
+            "can't be used",
+            "incompatible",
+            "not allowed",
+        ]
+        .iter()
+        .any(|hint| clause.contains(hint));
+
+        mentions_reasoning_effort && mentions_tools && reports_incompatibility
+    })
 }
 
 /// Format an error including its full source chain and sanitize the result.
@@ -911,7 +1217,17 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    let sanitized = sanitize_api_error(&body);
+    api_error_from_parts(model_provider, status, &body)
+}
+
+/// Build a sanitized model_provider error after a caller has already consumed
+/// the response body to classify a narrowly bounded fallback.
+pub(crate) fn api_error_from_parts(
+    model_provider: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let sanitized = sanitize_api_error(body);
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -955,6 +1271,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("xai-", "xai"),
     ("nvapi-", "nvidia"),
     ("KEY-", "telnyx"),
+    ("zcr_", "zerorouter"),
 ];
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
@@ -1114,6 +1431,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "volcengine" | "ark" | "doubao-cn" => "doubao",
         // Gemini CLI is its own typed slot (subprocess runtime).
         "gemini-cli" => "gemini_cli",
+        // Grok Build CLI is its own typed slot (subprocess runtime).
+        "grok-cli" | "grokcli" => "grok_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1584,7 +1903,7 @@ pub fn create_model_provider_from_ref_with_model(
         "default",
         None,
         None,
-        &ModelProviderRuntimeOptions::default(),
+        &bare_family_runtime_options(config),
     )?;
     Ok(ResolvedModelProviderRef {
         provider,
@@ -1856,6 +2175,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("telnyx", "Telnyx", false),
             ("azure", "Azure OpenAI", false),
             ("ollama", "Ollama", true),
+            ("hailo_ollama", "Hailo-Ollama", true),
             ("gemini", "Google Gemini", false),
         ],
     );
@@ -1881,6 +2201,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("groq", "Groq", false),
             ("mistral", "Mistral", false),
             ("xai", "xAI (Grok)", false),
+            ("crusoe", "Crusoe Managed Inference", false),
             ("deepseek", "DeepSeek", false),
             ("together", "Together AI", false),
             ("fireworks", "Fireworks AI", false),
@@ -1889,8 +2210,10 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
+            ("zerorouter", "ZeroRouter", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2267,6 +2590,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_zerorouter() {
+        let model_provider = create_model_provider("zerorouter", Some("zcr_test")).unwrap();
+        // ZeroRouter speaks the OpenAI chat-completions wire: Bearer auth +
+        // native tool calling, no .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "ZeroRouter should use OpenAI-compatible native tool calling"
+        );
+    }
+
+    #[test]
     fn factory_nearai() {
         let model_provider = create_model_provider("nearai", Some("nearai-key")).unwrap();
         // NEAR AI Cloud is OpenAI-protocol-compatible: default Bearer auth +
@@ -2524,6 +2858,54 @@ mod tests {
             Some(&entry),
         );
         assert_eq!(opts.vision, Some(false));
+    }
+
+    #[test]
+    fn tool_result_image_policy_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, ToolResultImagePolicy};
+        let entry = ModelProviderConfig {
+            tool_result_image_policy: ToolResultImagePolicy::Omit,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
+    fn root_multimodal_section_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        config.multimodal.max_image_size_mb = 2;
+        config.multimodal.max_image_turns = 3;
+
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig::default()),
+        );
+
+        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // markers; library defaults here mean the section is inert.
+        assert_eq!(opts.multimodal.max_images, 1);
+        assert_eq!(opts.multimodal.max_image_size_mb, 2);
+        assert_eq!(opts.multimodal.max_image_turns, 3);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_inherits_root_multimodal_policy() {
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+
+        let fallback = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        let options = options_for_provider_ref(&config, "ollama", &fallback);
+
+        // `[multimodal]` is root-scoped, so unlike the provider-specific
+        // `tool_result_image_policy` it must survive a bare family ref.
+        assert_eq!(options.multimodal.max_images, 1);
     }
 
     #[test]
@@ -2883,10 +3265,11 @@ mod tests {
     }
 
     #[test]
-    fn route_provider_options_clear_primary_only_state_for_bare_routes() {
+    fn route_provider_options_clear_alias_only_state_for_bare_routes() {
         let inherited = ModelProviderRuntimeOptions {
             provider_kind: Some("openai-compatible".to_string()),
             provider_api_url: Some("http://primary.example/v1".to_string()),
+            tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy::Omit,
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config::default();
@@ -2895,6 +3278,10 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        assert_eq!(
+            route_options.tool_result_image_policy,
+            zeroclaw_config::schema::ToolResultImagePolicy::ImageUrl
+        );
     }
 
     #[test]
@@ -3027,6 +3414,15 @@ mod tests {
 
     #[test]
     fn factory_gemini_cli() {}
+
+    #[test]
+    fn factory_grok_cli() {
+        let error = match create_model_provider("grok_cli", None) {
+            Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
 
     #[test]
     fn factory_kilocli() {
@@ -3163,6 +3559,10 @@ mod tests {
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
         );
+        assert_eq!(
+            default_model_provider_url("crusoe"),
+            Some("https://api.inference.crusoecloud.com/v1")
+        );
     }
 
     #[test]
@@ -3192,6 +3592,22 @@ mod tests {
     }
 
     #[test]
+    fn crusoe_default_url_matches_endpoint_enum() {
+        use crate::factory::CompatFamilySpec;
+        use zeroclaw_config::schema::CrusoeModelProviderConfig;
+        // Cross-surface drift guard: the factory default URL must equal the
+        // config-owned `CrusoeEndpoint` URI. Both reference
+        // `CrusoeEndpoint::DEFAULT_URI`, so this asserts the single-source-of-
+        // truth wiring stays intact if either surface is edited independently.
+        assert_eq!(
+            <CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            <zeroclaw_config::schema::CrusoeEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+                &zeroclaw_config::schema::CrusoeEndpoint::Default,
+            ),
+        );
+    }
+
+    #[test]
     fn factory_custom_with_resolved_uri() {
         let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://my-llm.example.com".to_string()),
@@ -3211,6 +3627,106 @@ mod tests {
                 panic!("Expected error when custom model model_provider has no URI configured")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bare_family_ref_carries_multimodal_policy_into_prepared_images() {
+        // `resolve_vision_provider` builds the configured vision provider through
+        // this factory, and a bare/`custom:<url>` ref resolves no entry. Building
+        // it with default runtime options made the adapter re-apply library image
+        // limits to messages the runtime had already prepared under the
+        // operator's policy, dropping allowed attachments. Drive a real request
+        // and count the images that actually leave.
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_api::model_provider::ChatRequest;
+        use zeroclaw_config::schema::Config;
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = Some(body.to_string());
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = Vec::new();
+        for index in 0..2 {
+            let path = temp.path().join(format!("bare-{index}.png"));
+            std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+            markers.push(format!("[IMAGE:{}]", path.display()));
+        }
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both would measure that eviction granularity instead of
+        // whether the operator policy reached this adapter at all.
+        let prompts: Vec<String> = markers
+            .iter()
+            .map(|marker| format!("look {marker}"))
+            .collect();
+
+        // Same server, same ref, same messages; only the operator policy differs.
+        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+            let capture: Capture = Arc::new(Mutex::new(None));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/chat/completions", post(capture_chat_request))
+                .with_state(capture.clone());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+
+            let mut config = Config::default();
+            config.multimodal.max_images = max_images;
+
+            let resolved = create_model_provider_from_ref_with_model(
+                &config,
+                &format!("custom:http://{addr}"),
+            )
+            .expect("bare custom:<url> ref builds a provider");
+
+            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
+            let _ = resolved
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+
+            let body = capture
+                .lock()
+                .expect("capture lock poisoned")
+                .clone()
+                .expect("provider must have sent a request");
+            server.abort();
+            body.matches("data:image/png;base64,").count()
+        };
+
+        assert_eq!(
+            outbound_images(2, prompts.clone()).await,
+            2,
+            "a policy admitting both images must send both"
+        );
+        assert_eq!(
+            outbound_images(1, prompts).await,
+            1,
+            "an operator cap of one must reach the adapter built from a bare ref"
+        );
     }
 
     #[test]
@@ -3407,6 +3923,13 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
+        // `listed_model_providers_are_constructible` skip list); `custom` is
+        // excluded (URI required); `grok_cli` is excluded because ACP requires
+        // an explicit absolute working_directory. Dedicated factory tests cover
+        // each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3498,9 +4021,18 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
+            // Grok ACP deliberately refuses the daemon cwd as an implicit
+            // trust boundary; a typed alias must provide working_directory.
+            if model_provider.name == "grok_cli" {
+                continue;
+            }
+            let api_key = if model_provider.name == "hailo_ollama" {
+                None
+            } else {
+                Some("provider-test-credential")
+            };
             assert!(
-                create_model_provider(model_provider.name, Some("provider-test-credential"))
-                    .is_ok(),
+                create_model_provider(model_provider.name, api_key).is_ok(),
                 "Canonical model model_provider id should be constructible: {}",
                 model_provider.name
             );
@@ -3508,6 +4040,130 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn tool_reasoning_rejection_detection_is_narrow() {
+        let reported = r#"{"error":{"message":"Function tools with reasoning effort are not supported for this model.","param":"reasoning_effort"}}"#;
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNAUTHORIZED,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"function tools are not supported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"model":"tool-model"}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"request_id":"tool-call-123"}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Function tools with reasoning_effort are incompatible"
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_ignores_tool_substrings_in_identifiers() {
+        // A bad-value error that merely names a model containing "tool" must
+        // not be misread as a tools/reasoning capability conflict: retrying
+        // would silently downgrade the operator's configured effort.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value 'xhigh' is unsupported for tool-model","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not allowed for model toolformer-v2","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for deployment multi_tool_router","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported by toolkit","param":"reasoning_effort"}}"#
+        ));
+
+        // Genuine conflicts still match, including the plural token and
+        // punctuation-adjacent forms.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported when tools are provided","param":"reasoning_effort"}}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_requires_conflict_within_one_clause() {
+        // Independent clauses of a compound error must not collectively
+        // satisfy the predicate: neither clause below reports a relationship
+        // between tools and reasoning effort, so retrying with
+        // reasoning_effort "none" would silently downgrade the operator's
+        // configured effort before the unrelated tools error propagates.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported; tools must be an array"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "reasoning_effort value is unsupported; tools must be an array"
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid. Tools are not allowed for this endpoint."}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is unsupported\ntools are not allowed"
+        ));
+
+        // The structured `param` field must not bridge clauses either: it is
+        // message-global, so in a compound error it cannot supply the
+        // reasoning signal for an unrelated tools clause — in either order.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are unsupported; reasoning_effort value is invalid","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid; tools are unsupported","param":"reasoning_effort"}}"#
+        ));
+
+        // A single-clause structured error may rely on `param` alone for the
+        // reasoning signal.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are not supported at the requested effort","param":"reasoning_effort"}}"#
+        ));
+
+        // A genuine relationship stated in one clause still matches, even
+        // when other clauses surround it.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"The request was rejected. reasoning_effort cannot be used with tools. Remove one and retry."}}"#
+        ));
+        // A sentence-internal period (e.g. a version number) is not a clause
+        // boundary.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
+        ));
+    }
 
     #[test]
     fn format_error_chain_includes_sources_and_sanitizes_output() {
@@ -3660,6 +4316,32 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_removes_url_userinfo_and_query_credentials() {
+        let input = "GET https://catalog-user:s3cr3t-password@api.example.com/v1/models?signature=signed-query-value failed";
+        let result = sanitize_api_error(input);
+
+        assert!(!result.contains("catalog-user"), "{result}");
+        assert!(!result.contains("s3cr3t-password"), "{result}");
+        assert!(!result.contains("signed-query-value"), "{result}");
+        assert!(result.contains("https://[REDACTED]@api.example.com/v1/models"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_every_canonical_model_provider_key_prefix() {
+        for (prefix, provider) in KEY_PREFIX_MODEL_PROVIDERS {
+            let secret = format!("{prefix}syntheticSecretValue12345");
+            let result = sanitize_api_error(&format!(
+                "configured {provider} credential excerpt: {secret}"
+            ));
+            assert!(!result.contains(&secret), "{provider} key leaked: {result}");
+            assert!(
+                result.contains("[REDACTED]"),
+                "{provider} key was not marked redacted: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn sanitize_removes_query_values_containing_url_punctuation() {
         let secret = "abc,def'ghi(jkl)";
         let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
@@ -3802,6 +4484,7 @@ mod tests {
                 uri: Some("https://api.default.example/v1/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            ..Default::default()
         };
         let work_alias = AnthropicModelProviderConfig {
             base: ModelProviderConfig {
@@ -3810,6 +4493,7 @@ mod tests {
                 uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            ..Default::default()
         };
         config
             .providers
@@ -4692,6 +5376,7 @@ mod tests {
                     max_tokens: Some(8_192),
                     ..ModelProviderConfig::default()
                 },
+                ..AnthropicModelProviderConfig::default()
             },
         );
 
@@ -4767,6 +5452,238 @@ mod tests {
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
+
+    // ── Crusoe catalog / context-window boundary regression ────
+    //
+    // The bot review identified a missing boundary regression for the
+    // Crusoe catalog and context-window discovery paths. Crusoe has
+    // `MODELS_DEV_KEY = None`, so a configured credential forces the shared
+    // native `/models` path. This test pins the response contract (id-shaped
+    // entries, bearer auth, context_length field) so the three user-visible
+    // paths — `list_models`, `list_models_with_pricing`, and
+    // `fetch_context_window` — cannot silently drift.
+
+    /// Redacted Crusoe-shaped `/v1/models` response fixture.
+    /// Crusoe's Serverless Inference API returns OpenAI-compatible entries
+    /// with an `id` field (not `name`) and a `context_length` field.
+    const CRUSOE_MODELS_FIXTURE: &str = r#"{
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-ai/DeepSeek-V4-Flash",
+                "object": "model",
+                "context_length": 1000000
+            },
+            {
+                "id": "zai/GLM-5.2",
+                "object": "model",
+                "context_length": 256000
+            },
+            {
+                "id": "nvidia/Nemotron-3-Super-120B-A12B",
+                "object": "model",
+                "context_length": 262000
+            }
+        ]
+    }"#;
+
+    /// Spawn a mock server that serves the Crusoe `/models` fixture and
+    /// captures the Authorization header. Returns `(base_url, captured_auth)`.
+    async fn spawn_crusoe_models_mock(
+        fixture: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_for_route = std::sync::Arc::clone(&captured_auth);
+
+        let app = Router::new().route(
+            "/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                let body = fixture;
+                async move {
+                    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                        captured.lock().unwrap().replace(auth.to_string());
+                    }
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), captured_auth, server)
+    }
+
+    /// `list_models` must parse the `id` field from Crusoe's `/models`
+    /// response and return sorted, deduplicated model IDs.
+    #[tokio::test]
+    async fn crusoe_list_models_parses_id_field_from_models_endpoint() {
+        let (base_url, captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let provider =
+            create_model_provider_with_url("crusoe", Some("cr_test-key"), Some(&base_url))
+                .expect("crusoe provider builds with mock URL");
+
+        let models = provider
+            .list_models()
+            .await
+            .expect("list_models succeeds against the mock /models endpoint");
+
+        assert_eq!(
+            models,
+            vec![
+                "deepseek-ai/DeepSeek-V4-Flash",
+                "nvidia/Nemotron-3-Super-120B-A12B",
+                "zai/GLM-5.2",
+            ],
+            "list_models must return the id-shaped entries sorted alphabetically"
+        );
+
+        // The credential must be sent as a bearer token.
+        let auth = captured_auth.lock().unwrap().clone();
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer cr_test-key"),
+            "Crusoe /models request must include the bearer auth header"
+        );
+    }
+
+    /// `list_models_with_pricing` must parse the same `id` field and return
+    /// `ModelInfo` entries. Crusoe's `/models` endpoint does not include
+    /// pricing, so the `pricing` field should be `None`.
+    #[tokio::test]
+    async fn crusoe_list_models_with_parsing_parses_id_field() {
+        let (base_url, _captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let provider =
+            create_model_provider_with_url("crusoe", Some("cr_test-key"), Some(&base_url))
+                .expect("crusoe provider builds with mock URL");
+
+        let models = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list_models_with_pricing succeeds against the mock /models endpoint");
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-ai/DeepSeek-V4-Flash",
+                "nvidia/Nemotron-3-Super-120B-A12B",
+                "zai/GLM-5.2",
+            ],
+            "list_models_with_pricing must return the same id-shaped entries"
+        );
+        // Crusoe's /models endpoint does not expose pricing data.
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "pricing should be None when the /models response has no pricing field"
+        );
+    }
+
+    /// `fetch_context_window` must match the configured model by `id` and
+    /// extract the `context_length` field from the Crusoe `/models` response.
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_extracts_context_length_by_id() {
+        let (base_url, captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("deepseek-ai/DeepSeek-V4-Flash".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config)
+            .await
+            .expect("context window must be discovered from the mock /models response");
+
+        assert_eq!(
+            ctx, 1_000_000,
+            "fetch_context_window must return the context_length for the matched model"
+        );
+
+        // The credential must be sent as a bearer token.
+        let auth = captured_auth.lock().unwrap().clone();
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer cr_test-key"),
+            "Crusoe context-window request must include the bearer auth header"
+        );
+    }
+
+    /// `fetch_context_window` must return `None` when the configured model
+    /// is not present in the `/models` response — the operator retains the
+    /// fallback context window.
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_returns_none_for_unknown_model() {
+        let (base_url, _captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("nonexistent/model".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config).await;
+        assert!(
+            ctx.is_none(),
+            "fetch_context_window must return None when the model is not in the /models response"
+        );
+    }
+
+    /// `fetch_context_window` must also accept the `context_window` field
+    /// name (some OpenAI-compatible providers use it instead of
+    /// `context_length`).
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_accepts_context_window_field_name() {
+        let fixture = r#"{
+            "object": "list",
+            "data": [
+                {
+                    "id": "deepseek-ai/DeepSeek-V4-Flash",
+                    "object": "model",
+                    "context_window": 1000000
+                }
+            ]
+        }"#;
+        let (base_url, _captured_auth, _server) = spawn_crusoe_models_mock(fixture).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("deepseek-ai/DeepSeek-V4-Flash".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config)
+            .await
+            .expect("context window must be discovered via the context_window field");
+
+        assert_eq!(
+            ctx, 1_000_000,
+            "fetch_context_window must accept the context_window field name"
+        );
+    }
 }
 
 /// Attempt to fetch context window from provider's /models endpoint.
@@ -4778,7 +5695,9 @@ pub async fn fetch_context_window(
     match provider_type {
         "openrouter" => fetch_openrouter_context_window(config).await,
         "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
-        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        | "nebius" | "crusoe" => {
+            fetch_openai_compatible_context_window(provider_type, config).await
+        }
         _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
     }
 }

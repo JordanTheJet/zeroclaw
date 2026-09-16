@@ -11,9 +11,11 @@ pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
+pub(crate) mod media_degrade;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
+pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
@@ -29,7 +31,11 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, StreamDelta};
+pub use events::{
+    DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
+    StreamDelta, THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
+};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -41,15 +47,16 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
-    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
-    terminal_completion_error_message,
+    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
+    semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
-    interpret_chat_response, resolve_display_text, unforwarded_narration,
+    interpret_chat_response, record_accepted_chat_response, resolve_display_text,
+    unforwarded_narration,
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
@@ -392,7 +399,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         event_tx,
         mut steering,
         new_messages_out: raw_canonical,
-        mut image_cache,
+        image_cache,
         ingress,
         memory,
         agent_alias,
@@ -400,6 +407,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         sop_reassembly,
     } = p;
+    let mut loop_local_image_cache = None;
+    let mut image_cache = Some(match image_cache {
+        Some(cache) => cache,
+        None => {
+            loop_local_image_cache.insert(zeroclaw_providers::multimodal::LocalImageCache::new())
+        }
+    });
     let ResolvedAgentExecution {
         model_access:
             ResolvedModelAccess {
@@ -520,6 +534,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             enabled: pacing.loop_detection_enabled,
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
+            no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
         },
     );
 
@@ -547,6 +562,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
+        draft_reasoning: knobs.draft_reasoning,
         turn_id,
         agent_alias,
         parent_agent_alias,
@@ -889,7 +905,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
-            rejected_attempt_usage,
+            attempts,
+            accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
@@ -904,13 +921,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        if let Some(usage) = rejected_attempt_usage.as_ref() {
-            crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                ctx.provider_name,
-                ctx.model,
-                usage,
-            );
-        }
+        // Reliable reports its actually served candidate; direct providers
+        // intentionally retain the requested route as the accounting fallback.
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref(), route.model()))
+            .unwrap_or((ctx.provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -918,13 +934,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if response.is_semantically_empty_terminal() {
-                if let Some(usage) = response.usage.as_ref() {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
-                        usage,
-                    );
-                }
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
                 ));
@@ -942,16 +951,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
+            response_usage,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
-                    provider_request_model,
+                    served_provider,
+                    served_model,
                     resp,
                     &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
-                    llm_started_at,
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
@@ -966,18 +976,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
+                    interpreted.usage,
                 )
             }
             Err(e) => {
-                if let Some(rejected) = e.chain().find_map(|cause| {
-                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                }) {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
-                        &rejected.usage,
-                    );
-                }
+                crate::agent::cost::settle_provider_attempts(&attempts, None);
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1029,9 +1032,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             !native_tool_calls.is_empty(),
         );
 
-        // Native provider tool_calls are converted into parsed `tool_calls`
-        // above; if this branch is reached there is no valid native call to run.
-        if tool_calls.is_empty() && parse_issue_detected {
+        // Any parser or stream-protocol guard finding rejects the transport
+        // candidate, including a response that also carries native tool calls.
+        if parse_issue_detected {
+            crate::agent::cost::settle_provider_attempts(&attempts, None);
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1087,6 +1091,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.push_dual(msg);
             return Ok(accumulated_display_text);
         }
+
+        // Earlier physical leaves are rejected routing/retry work. The final
+        // accepted response remains settled by `record_accepted_chat_response`
+        // so only it updates context-window telemetry.
+        crate::agent::cost::settle_provider_attempts(
+            &attempts[..attempts.len().saturating_sub(1)],
+            None,
+        );
+        record_accepted_chat_response(
+            &ctx,
+            served_provider,
+            served_model,
+            &response_text,
+            &native_tool_calls,
+            tool_calls.len(),
+            response_usage.as_ref(),
+            &provider_request_messages,
+            llm_started_at,
+            iteration,
+        )
+        .await;
+
+        // A provider transport success is only a candidate. Commit (or clear)
+        // presentation state after parsing has accepted the response, so a
+        // malformed fallback completion cannot leak a stale recovery notice.
+        zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1181,8 +1211,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            stream_calls,
         } = prepare_tool_calls(
             &ctx,
+            tools_registry,
+            activated_tools,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
@@ -1238,23 +1271,39 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Err(e) if is_tool_loop_cancelled(&e) => {
                 (0..executable_calls.len()).map(|_| None).collect()
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // The batch failed outright: no executable context reached
+                // post-execution handling, so every one is abandoned before
+                // the turn aborts.
+                call_prep::abandon_unexecuted_prepared_contexts(
+                    &ctx,
+                    iteration,
+                    &executable_indices,
+                    &executable_calls,
+                    &[],
+                )
+                .await;
+                return Err(e);
+            }
         };
 
         let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
+        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
             executable_indices
                 .iter()
                 .copied()
-                .zip(executable_calls.iter()),
+                .zip(executable_calls.iter())
+                .zip(stream_calls),
         ) {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
         }
@@ -1263,12 +1312,24 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,
         )
         .await;
         if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -1430,6 +1491,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
+        event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
     )
     .await
@@ -1573,7 +1635,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's own configured provider temperature — the same source
     /// the headless driver hands `crate::agent::run`.
     temperature: Option<f64>,
-    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
+    /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
+    pub(crate) tools_registry: crate::tools::scoped::ScopedToolRegistry,
     approval: crate::approval::ApprovalManager,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// The step agent's fully-resolved config (identity + every runtime-profile
@@ -1591,6 +1656,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's deferred+pinned MCP prompt section (single-block
     /// shape, same as `run` / `process_message`).
     mcp_prompt_section: String,
+    /// The shell this step's runtime adapter will spawn, carried so the step's
+    /// system prompt reports the same dialect the step will execute under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1675,6 +1744,8 @@ pub(crate) async fn assemble_owned_execution(
         None,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // Capture before `runtime` is moved into `ScopedAssembly` below.
+    let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -1709,7 +1780,8 @@ pub(crate) async fn assemble_owned_execution(
         mcp_tool_names,
         ..
     } = assembled;
-    let tools_registry = registry.into_inner();
+    // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
+    let tools_registry = registry;
 
     let provider_ref = config
         .resolved_model_provider_for_agent(alias)
@@ -1748,6 +1820,9 @@ pub(crate) async fn assemble_owned_execution(
         skills,
         mcp_tool_names,
         mcp_prompt_section,
+        // Captured from the same adapter this step's tools were built with, so
+        // the prompt names the shell the step will actually run under.
+        shell_profile,
     })
 }
 
@@ -1794,6 +1869,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        owned.shell_profile.as_ref(),
     )
 }
 
@@ -1805,7 +1881,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    tools_registry: &[Box<dyn crate::tools::Tool>],
+    tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
@@ -1859,6 +1935,11 @@ async fn drive_live_sop_actions(
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
         let mut action = queued.action.clone();
+        // Per-run budget for deterministic capabilities driven inside this
+        // turn, matching `MAX_HEADLESS_DRIVE_STEPS` in the two headless
+        // drivers. Reset per queued action so one run's routing cycle cannot
+        // consume a later run's allowance.
+        let mut deterministic_steps_driven = 0usize;
         loop {
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
@@ -1972,7 +2053,7 @@ async fn drive_live_sop_actions(
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
                                 o.model.as_str(),
-                                o.tools_registry.as_slice(),
+                                &o.tools_registry,
                                 Some(&o.approval),
                                 o.activated_tools.as_ref(),
                             ),
@@ -2274,17 +2355,33 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
-                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "step": step.number,
-                            })),
-                        "SOP live executor yielded deterministic step"
-                    );
-                    break;
+                crate::sop::SopRunAction::DeterministicStep { ref run_id, .. } => {
+                    let run_id = run_id.clone();
+                    // Bound this action type exactly as both headless drivers
+                    // do. `StepFailure::Goto` takes an arbitrary step number
+                    // and nothing validates that routes are acyclic, so a
+                    // capability that keeps failing and routes backwards would
+                    // otherwise spin the enclosing loop at full speed, taking
+                    // and releasing the engine mutex on every iteration and
+                    // starving every other SOP surface. `yield_now` keeps the
+                    // async runtime responsive but does not end the loop.
+                    if deterministic_steps_driven >= crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS
+                    {
+                        crate::sop::executor::fail_exhausted_step_budget(&queued.engine, &run_id);
+                        break;
+                    }
+                    deterministic_steps_driven += 1;
+                    let next = {
+                        let mut engine = match queued.engine.lock() {
+                            Ok(engine) => engine,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        engine.advance_headless_deterministic_step(&run_id, action)?
+                    };
+                    action = next;
+                    // Let an operator request acquire the engine before the next
+                    // deterministic capability is dispatched.
+                    tokio::task::yield_now().await;
                 }
                 crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
                     ::zeroclaw_log::record!(
@@ -2325,6 +2422,18 @@ async fn drive_live_sop_actions(
                                 "sop_name": sop_name,
                             })),
                         "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Cancelled { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor observed cancelled run"
                     );
                     break;
                 }
@@ -3089,7 +3198,7 @@ mod sop_step_reassembly_tests {
             provider_name: "capture".into(),
             model: "capture-model".into(),
             temperature,
-            tools_registry: tools,
+            tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             ),
@@ -3099,6 +3208,7 @@ mod sop_step_reassembly_tests {
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
+            shell_profile: None,
         }
     }
 
@@ -3171,7 +3281,7 @@ mod sop_step_reassembly_tests {
         engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         action: crate::sop::types::SopRunAction,
         parent_provider: &dyn ModelProvider,
-        parent_tools: &[Box<dyn crate::tools::Tool>],
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
@@ -3281,7 +3391,7 @@ mod sop_step_reassembly_tests {
         );
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("parent system prompt"),
             ChatMessage::user(PARENT_MARKER.to_string()),
@@ -3391,9 +3501,12 @@ mod sop_step_reassembly_tests {
         let parent_provider = TextProvider;
         // Parent scope carries a sensitive tool the child must never be offered.
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3469,7 +3582,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3514,7 +3627,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut exec_cache = std::collections::HashMap::new();
 
@@ -3565,7 +3678,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut capture: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3616,9 +3729,12 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly { config: &config };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3661,9 +3777,12 @@ mod sop_step_reassembly_tests {
         let shell_calls = Arc::new(AtomicUsize::new(0));
         // Parent/delegate scope: a sensitive tool the cross-agent step must never
         // reach.
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3822,7 +3941,9 @@ mod sop_step_reassembly_tests {
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
                 temperature: None,
-                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(ChildModelSwitchTool),
+                ]),
                 approval: crate::approval::ApprovalManager::for_non_interactive(
                     &stepper_risk_profile,
                 ),
@@ -3832,6 +3953,7 @@ mod sop_step_reassembly_tests {
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
+                shell_profile: None,
             },
         );
 
@@ -3841,7 +3963,7 @@ mod sop_step_reassembly_tests {
         let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3886,6 +4008,797 @@ mod sop_step_reassembly_tests {
             step.output.contains("child-provider") && step.output.contains("child-model"),
             "the step failure must name the CHILD's own requested switch: {}",
             step.output
+        );
+    }
+
+    /// Regression for the unbounded live-turn deterministic drive: both
+    /// headless drivers cap at `MAX_HEADLESS_DRIVE_STEPS` because
+    /// `StepFailure::Goto`/`routing.next` take arbitrary step numbers and
+    /// nothing validates that routes are acyclic. `drive_live_sop_actions`
+    /// advanced `DeterministicStep` in place and continued its enclosing
+    /// `loop` with no iteration bound, so a cyclic route reached through an
+    /// agent turn spun forever, taking and releasing the engine mutex on
+    /// every iteration. The live path must agree with the other two drivers:
+    /// terminalize the run as `Failed` and release its admission claim.
+    #[tokio::test]
+    async fn cyclic_deterministic_route_exhausts_the_live_turn_step_budget() {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+            SopTrigger, SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        // 1 -> 2 -> 1 -> ... : a two-node cycle of always-succeeding
+        // capabilities, so nothing but the budget can end the run.
+        let cap_step = |number: u32, next: u32| {
+            let mut step = SopStep {
+                number,
+                title: format!("Capability {number}"),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".into()),
+                ..SopStep::default()
+            };
+            step.routing.next = Some(next);
+            step
+        };
+        let sop = Sop {
+            name: "cyclic".to_string(),
+            description: "cyclic deterministic route".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![cap_step(1, 2), cap_step(2, 1)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        // A step is revisited every other iteration, so the per-step visit
+        // bound must stay well above the drive budget for this test to prove
+        // the BUDGET is what stops the loop.
+        let mut engine = crate::sop::SopEngine::new(SopConfig {
+            max_step_visits: u32::MAX,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "cyclic",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-08-22T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts");
+        let run_id = match &action {
+            crate::sop::types::SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected a DeterministicStep, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        // Without the bound this call never returns.
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            None,
+            None,
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("run retained after budget");
+        assert_eq!(
+            run.status,
+            SopRunStatus::Failed,
+            "an exhausted live-turn budget must terminalize the run"
+        );
+        assert!(
+            !guard.active_runs().contains_key(&run_id),
+            "the failed run must leave the active set so its admission claim is released"
+        );
+        assert_eq!(
+            run.step_results.len(),
+            crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS,
+            "the live driver must execute exactly MAX_HEADLESS_DRIVE_STEPS capabilities, \
+             the same bound both headless drivers use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_lifecycle_abandonment_tests {
+    //! Behavior-level coverage of the tool-call lifecycle invariant at the
+    //! turn-loop boundary: every correlated context whose before hook ran
+    //! reaches exactly one terminal operation — the matching after hook on
+    //! completion, or one abandonment callback when the call cannot reach
+    //! after.
+
+    use super::*;
+    use crate::observability::NoopObserver;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use zeroclaw_api::hook::ToolCallHookContext;
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    struct LifecycleRecorder {
+        events: Arc<Mutex<Vec<String>>>,
+        cancel_before_for: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for LifecycleRecorder {
+        fn name(&self) -> &str {
+            "lifecycle-recorder"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("before:{}:{}", name, context.invocation_id()));
+            if self.cancel_before_for.iter().any(|tool| tool == &name) {
+                return crate::hooks::HookResult::Cancel("blocked by test".to_string());
+            }
+            crate::hooks::HookResult::Continue((name, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            tool: &str,
+            _result: &zeroclaw_api::tool::ToolResult,
+            _duration: Duration,
+        ) {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("after:{}:{}", tool, context.invocation_id()));
+        }
+
+        async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("abandoned:{}:{}", tool, context.invocation_id()));
+        }
+    }
+
+    fn lifecycle_runner(
+        events: Arc<Mutex<Vec<String>>>,
+        cancel_for: Vec<String>,
+    ) -> crate::hooks::HookRunner {
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events,
+            cancel_before_for: cancel_for,
+        }));
+        runner
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            extra_content: None,
+        }
+    }
+
+    fn text_response() -> ChatResponse {
+        ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// Provider that hands out scripted responses in order; falls back to a
+    /// text-only response once the script is exhausted.
+    struct ScriptedProvider {
+        responses: Mutex<Vec<ChatResponse>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ScriptedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ScriptedProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut queue = self.responses.lock().expect("script queue lock");
+            if queue.is_empty() {
+                return Ok(text_response());
+            }
+            Ok(queue.remove(0))
+        }
+    }
+
+    struct EchoTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for EchoTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for EchoTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "echoes success"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: args.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Succeeds, but first cancels the turn token: the executor's select!
+    /// deterministically reports the cancellation instead of the tool's own
+    /// result, simulating an operator interrupt landing mid-execution.
+    struct InterruptingTool {
+        name: String,
+        token: CancellationToken,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for InterruptingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for InterruptingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "cancels the turn mid-execution"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.token.cancel();
+            // Keep the tool future pending past cancellation so the
+            // executor's cancellation branch wins deterministically.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(crate::tools::ToolResult::ok("never observed"))
+        }
+    }
+
+    /// A tool whose execution FAILS: the failed result is still a completed
+    /// call that reaches its after hook — abandonment is not for it.
+    struct FailingTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "always returns a failed result"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: "failed".into(),
+                error: Some("boom".to_string()),
+            })
+        }
+    }
+
+    async fn run_scripted_loop(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &NoopObserver,
+        hooks: Option<&crate::hooks::HookRunner>,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+        turn_id: &str,
+        parallel_tools: bool,
+        cancellation_token: Option<CancellationToken>,
+        history: &mut Vec<ChatMessage>,
+    ) -> anyhow::Result<String> {
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+        })
+        .await
+    }
+
+    fn registry_with(
+        tools: Vec<Box<dyn crate::tools::Tool>>,
+    ) -> crate::tools::scoped::ScopedToolRegistry {
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    #[tokio::test]
+    async fn completed_batch_pairs_before_with_after_and_never_abandons() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    tool_call("call-a", "echo_first", serde_json::json!({"n": 1})),
+                    tool_call("call-b", "echo_second", serde_json::json!({"n": 2})),
+                ],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![
+            Box::new(EchoTool {
+                name: "echo_first".to_string(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".to_string(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("run the tools".to_string())];
+
+        run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-ok",
+            false,
+            None,
+            &mut history,
+        )
+        .await
+        .expect("the scripted turn completes");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:echo_first:turn-ok:0:0".to_string(),
+                "before:echo_second:turn-ok:0:1".to_string(),
+                "after:echo_first:turn-ok:0:0".to_string(),
+                "after:echo_second:turn-ok:0:1".to_string(),
+            ],
+            "each completed call pairs its before hook with exactly one after hook and is never abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_tool_outcome_reaches_after_not_abandonment() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "call-1",
+                    "failing_tool",
+                    serde_json::json!({"n": 1}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(FailingTool {
+            name: "failing_tool".to_string(),
+        })]);
+        let mut history = vec![ChatMessage::user("run it".to_string())];
+
+        run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-fail",
+            false,
+            None,
+            &mut history,
+        )
+        .await
+        .expect("a failed tool outcome is a completed call, not a turn error");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:failing_tool:turn-fail:0:0".to_string(),
+                "after:failing_tool:turn-fail:0:0".to_string(),
+            ],
+            "a failed result is still execution completion: after fires, abandonment must not"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_batch_interruption_abandons_every_unexecuted_context() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let token = CancellationToken::new();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    tool_call("call-a", "interrupt_tool", serde_json::json!({"n": 1})),
+                    tool_call("call-b", "echo_second", serde_json::json!({"n": 2})),
+                ],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![
+            Box::new(InterruptingTool {
+                name: "interrupt_tool".to_string(),
+                token: token.clone(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".to_string(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("run then interrupt".to_string())];
+
+        let error = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-interrupted",
+            false,
+            Some(token),
+            &mut history,
+        )
+        .await
+        .expect_err("an interrupted turn surfaces as cancellation");
+
+        assert!(
+            is_tool_loop_cancelled(&error),
+            "the turn must report tool-loop cancellation, got {error:?}"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:interrupt_tool:turn-interrupted:0:0".to_string(),
+                "before:echo_second:turn-interrupted:0:1".to_string(),
+                "abandoned:interrupt_tool:turn-interrupted:0:0".to_string(),
+                "abandoned:echo_second:turn-interrupted:0:1".to_string(),
+            ],
+            "every executable context of the interrupted batch gets exactly one abandonment; none reaches after"
+        );
+    }
+
+    /// Tool that never completes on its own: the containing wrapper decides
+    /// the turn's fate, not the tool.
+    struct HangingTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for HangingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for HangingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "sleeps far past any test timeout"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(crate::tools::ToolResult::ok("never observed"))
+        }
+    }
+
+    /// Hook that retains per-invocation state in the before phase and releases
+    /// it on after/abandonment — the integrator pattern the abandonment API
+    /// documents as cooperative-path-only. Used to pin what a hard future drop
+    /// does and does not deliver.
+    struct RetainingHook {
+        events: Arc<Mutex<Vec<String>>>,
+        retained: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for RetainingHook {
+        fn name(&self) -> &str {
+            "retaining-hook"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("before:{}:{}", name, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .push(context.invocation_id().to_string());
+            crate::hooks::HookResult::Continue((name, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            tool: &str,
+            _result: &zeroclaw_api::tool::ToolResult,
+            _duration: Duration,
+        ) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("after:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+
+        async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("abandoned:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_turn_drop_fires_no_lifecycle_callbacks() {
+        // Mirrors the channel orchestrator's containing-future race
+        // (orchestrator/mod.rs): the whole turn future is wrapped in a
+        // timeout and raced against the turn's cancellation token. A winning
+        // outer branch DROPS the turn future, so awaited cooperative cleanup
+        // inside the loop never runs. This pins the documented lifecycle
+        // boundary: after and abandonment fire on awaited non-completion
+        // paths only; a hard drop fires neither, and stateful hooks must
+        // design for that (the webhook audit hook retains no arguments at
+        // all, so a drop leaves nothing behind).
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RetainingHook {
+            events: Arc::clone(&events),
+            retained: Arc::clone(&retained),
+        }));
+        let token = CancellationToken::new();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "call-a",
+                    "hang_tool",
+                    serde_json::json!({"n": 1}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(HangingTool {
+            name: "hang_tool".to_string(),
+        })]);
+        let mut history = vec![ChatMessage::user("hang forever".to_string())];
+
+        let turn_future = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-drop",
+            false,
+            Some(token.clone()),
+            &mut history,
+        );
+        let outcome = tokio::select! {
+            () = token.cancelled() => "cancelled",
+            result = tokio::time::timeout(Duration::from_millis(300), turn_future) => {
+                match result {
+                    Ok(_) => "completed",
+                    Err(_elapsed) => "timeout",
+                }
+            }
+        };
+        assert_eq!(
+            outcome, "timeout",
+            "the outer timeout must win while the tool hangs"
+        );
+
+        // The dropped turn fired exactly its before phase: neither the after
+        // hook nor abandonment can run inside a dropped future.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["before:hang_tool:turn-drop:0:0".to_string()],
+            "a hard future drop must fire no after or abandonment callback"
+        );
+        // The hook's own retained entry survives the drop — the runtime makes
+        // no callback promise under hard drop, which is why argument-carrying
+        // completion exists: hooks that must not leak retain nothing.
+        assert_eq!(
+            retained.lock().unwrap().len(),
+            1,
+            "the retained entry documents the hard-drop boundary; release is the hook's design obligation"
+        );
+
+        // The runner itself is unharmed by the dropped turn: a direct
+        // cooperative dispatch still reaches the hook and releases the entry.
+        runner
+            .fire_tool_call_abandoned(
+                &zeroclaw_api::hook::ToolCallHookContext::new("turn-drop:0:0"),
+                "hang_tool",
+            )
+            .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:hang_tool:turn-drop:0:0".to_string(),
+                "abandoned:hang_tool:turn-drop:0:0".to_string(),
+            ],
+            "cooperative abandonment still works after a dropped turn"
+        );
+        assert!(
+            retained.lock().unwrap().is_empty(),
+            "the cooperative dispatch releases exactly the retained entry"
         );
     }
 }

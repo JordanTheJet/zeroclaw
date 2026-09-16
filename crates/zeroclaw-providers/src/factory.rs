@@ -76,10 +76,12 @@ pub(crate) trait FamilyProviderFactory {
 }
 
 fn fixed_family_endpoint<T: FamilyProviderFactory>() -> &'static str {
-    match T::ENDPOINT {
-        ProviderEndpoint::Fixed(url) => url,
-        _ => unreachable!("fixed endpoint helper used for a non-fixed provider family"),
-    }
+    // INVARIANT: this helper is called only by factory implementations whose
+    // associated endpoint is declared `Fixed`; registry tests enumerate the
+    // canonical families and enforce that classification.
+    T::ENDPOINT
+        .fixed_url()
+        .expect("fixed endpoint helper requires a fixed provider family")
 }
 
 /// Spec trait for OpenAI-compatible families. Implementing this gives a
@@ -248,6 +250,8 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         b = b.tls_ca_cert_path(cert_path);
     }
+    b = b.tool_result_image_policy(opts.tool_result_image_policy);
+    b = b.multimodal(opts.multimodal.clone());
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
@@ -477,26 +481,28 @@ use zeroclaw_config::schema::{
     AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
-    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
-    GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
-    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
-    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
-    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
-    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
-    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
-    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
+    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -542,6 +548,12 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
 }
+impl CompatFamilySpec for ZerorouterModelProviderConfig {
+    const DISPLAY: &'static str = "ZeroRouter";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::ZEROROUTER_DEFAULT_URL;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
     const DEFAULT_URL: &'static str = "https://api.synthetic.new/openai/v1";
@@ -581,6 +593,12 @@ impl CompatFamilySpec for TogetherModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.together.xyz";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("togetherai");
+}
+impl CompatFamilySpec for CrusoeModelProviderConfig {
+    const DISPLAY: &'static str = "Crusoe Managed Inference";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::CrusoeEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = None;
 }
 impl CompatFamilySpec for FireworksModelProviderConfig {
     const DISPLAY: &'static str = "Fireworks AI";
@@ -1081,6 +1099,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone())
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
@@ -1213,6 +1232,90 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
         Ok(apply_compat_options(
             build_ollama_compat_provider(alias, key, api_url, opts),
             opts,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(HAILO_OLLAMA_DEFAULT_URI);
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
+        if opts.tls_ca_cert_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support tls_ca_cert_path");
+        }
+        if opts.think == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "thinking".to_string(),
+                message: "Hailo-Ollama does not support think=true".to_string(),
+            }));
+        }
+        if opts.vision == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "vision".to_string(),
+                message: "Hailo-Ollama does not support vision=true".to_string(),
+            }));
+        }
+        if opts.provider_extra.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support provider_extra");
+        }
+        if opts.api_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support api_path");
+        }
+        if opts.wire_api.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support wire_api overrides");
+        }
+        if opts.chat_template_kwargs.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support chat_template_kwargs");
+        }
+        if opts.native_tools == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "native_tools".to_string(),
+                message: "Hailo-Ollama does not support native tool calling".to_string(),
+            }));
+        }
+
+        let max_tokens = opts
+            .provider_max_tokens
+            .map_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+                i32::try_from(value).unwrap_or(i32::MAX)
+            });
+        let tuning = crate::ollama::OllamaTuning {
+            num_ctx: self
+                .base
+                .context_window
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
+            num_predict: max_tokens,
+            temperature_override: None,
+        };
+        let endpoint = HailoOllamaEndpoint::default();
+        let base_url = api_url.unwrap_or_else(|| endpoint.uri());
+        Ok(Box::new(
+            crate::hailo_ollama::HailoOllamaModelProvider::new(
+                alias,
+                Some(base_url),
+                opts.provider_timeout_secs
+                    .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+                self.queue_timeout_secs
+                    .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+                tuning,
+            )?
+            .with_auth_headers(key, &opts.extra_headers)?,
         ))
     }
 
@@ -1508,6 +1611,43 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
             crate::gemini_cli::GeminiCliModelProvider::builder(alias)
                 .binary_path(self.binary_path.as_deref())
                 .build(),
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for GrokCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if has_api_key(key) {
+            anyhow::bail!(
+                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
+            );
+        }
+        Ok(Box::new(
+            crate::grok_cli::GrokCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
+                .timeout_secs(self.base.timeout_secs)
+                // Optional send-path only: alias `vision = true` makes
+                // ZeroClaw emit ACP image blocks. Grok still advertises
+                // image=false through 0.2.118 and does not reliably use the
+                // pixels; leave unset in production until upstream vision works.
+                .vision_enabled(opts.vision == Some(true))
+                .build()?,
         ))
     }
 
@@ -1846,7 +1986,7 @@ mod tests {
                 "{family} requires operator endpoint input"
             );
         }
-        for family in ["gemini_cli", "kilocli"] {
+        for family in ["gemini_cli", "grok_cli", "kilocli"] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::CliBacked),
@@ -1867,6 +2007,67 @@ mod tests {
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
         );
+    }
+
+    #[test]
+    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            Some("typed-test-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not accept api_key"));
+    }
+
+    #[test]
+    fn grok_cli_factory_forwards_acp_stdout_limit() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            max_acp_stdout_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("invalid ACP stdout limit must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("max_acp_stdout_bytes"));
+    }
+
+    #[test]
+    fn grok_cli_factory_enables_explicit_vision_override() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let provider = config
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("vision opt-in must build the Grok CLI provider");
+
+        assert!(provider.capabilities().vision);
     }
 
     #[test]
@@ -1946,6 +2147,108 @@ mod tests {
             merge_extra_body(None, None).is_none(),
             "no extras must yield None so the caller skips extra_body"
         );
+    }
+
+    #[test]
+    fn zerorouter_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+        assert_eq!(
+            <ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ZerorouterEndpoint::default().uri(),
+            "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
+        );
+        assert_eq!(
+            ZerorouterEndpoint::default().uri(),
+            "https://zerorouter.ai/v1",
+            "the default must be the hosted deployment — a localhost default \
+             gives a zero-config user a connection refusal or a stray dev \
+             instance's partial catalog"
+        );
+        assert!(
+            !ZerorouterModelProviderConfig::default()
+                .fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()),
+            "keyless inference must not be viable without the deferred login flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn zerorouter_public_catalog_needs_no_credential() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let with_header = Arc::clone(&authorized);
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen);
+                let with_header = Arc::clone(&with_header);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                        with_header.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "router/model-1",
+                            "pricing": {
+                                "prompt": "0.000001",
+                                "completion": "0.000002"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public catalog fixture");
+        let addr = listener.local_addr().expect("read fixture address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve public catalog fixture");
+        });
+
+        let provider = ZerorouterModelProviderConfig::default()
+            .create_provider(
+                "public",
+                None,
+                Some(&format!("http://{addr}/v1")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("construct a keyless ZeroRouter catalog client");
+
+        assert_eq!(
+            provider.list_models().await.expect("list public models"),
+            vec!["router/model-1".to_string()]
+        );
+        let priced = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list public model pricing");
+        assert_eq!(priced.len(), 1);
+        assert_eq!(priced[0].id, "router/model-1");
+        let pricing = priced[0]
+            .pricing
+            .as_ref()
+            .expect("the public catalog pricing must be preserved");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.000001"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.000002"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            authorized.load(Ordering::SeqCst),
+            0,
+            "public ZeroRouter catalog requests must omit Authorization"
+        );
+
+        server.abort();
     }
 
     #[test]

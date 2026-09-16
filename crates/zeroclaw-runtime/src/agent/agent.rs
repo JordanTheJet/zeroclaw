@@ -1,6 +1,8 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::prompt::{
+    InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
+};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -76,7 +78,7 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -321,7 +323,10 @@ async fn forward_history_trim_notice(
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
-    tools: Vec<Box<dyn Tool>>,
+    /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so it can only be handed to the turn engine after passing through
+    /// `assemble()` (the seal).
+    tools: crate::tools::scoped::ScopedToolRegistry,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -346,6 +351,7 @@ pub struct Agent {
     /// session cwd for IDE-driven sessions (ACP, gateway WS).
     agent_workspace_dir: std::path::PathBuf,
     identity_config: zeroclaw_config::schema::IdentityConfig,
+    interaction_context: Option<InteractionContext>,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
@@ -363,6 +369,16 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// False for isolated / ACP sessions built with `exclude_memory: true`.
+    /// Drives `PromptContext::inject_memory` so `IdentitySection` cannot pull
+    /// `MEMORY.md` into the provider-visible system prompt for a session that
+    /// advertises persistent-memory isolation. Set from the same builder value
+    /// that installs `NoneMemory` and forces `auto_save` off.
+    inject_memory: bool,
+    /// The shell this agent's runtime adapter will spawn, so the system
+    /// prompt reports the dialect the agent actually executes under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     /// Cross-channel HITL: resolved from the active risk profile's
     /// `approval_route`. When set, the per-turn approval bridge asks the named
     /// approver channel (bounded + fail-closed) instead of the originating
@@ -397,6 +413,20 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    /// The `DelegateTool` this Agent's registry registered, in its concrete
+    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
+    /// otherwise cannot drive the *constructed* delegate's nested-registry
+    /// build and can only re-derive the wiring by hand - which is precisely
+    /// what must not be trusted for live-config threading. `None` when the
+    /// agent has no configured delegation targets.
+    ///
+    /// `allow(dead_code)`: its only reader is the delegated live-config
+    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
+    /// plugin tool to execute at all. Under a narrower test feature set the
+    /// field is written and never read.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Drop for Agent {
@@ -419,6 +449,9 @@ impl Drop for Agent {
 pub struct StreamedTurnSuccess {
     pub response: String,
     pub new_messages: Vec<ConversationMessage>,
+    /// Display-only accepted safeguard attribution. Callers choose the
+    /// transport presentation; `new_messages` remains undecorated.
+    pub safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
 }
 
 #[derive(Debug)]
@@ -489,7 +522,7 @@ impl AgentChannelHandles {
 
 pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
-    tools: Option<Vec<Box<dyn Tool>>>,
+    tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
@@ -504,6 +537,7 @@ pub struct AgentBuilder {
     workspace_dir: Option<std::path::PathBuf>,
     agent_workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
+    interaction_context: Option<InteractionContext>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
@@ -515,6 +549,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
@@ -527,6 +562,8 @@ pub struct AgentBuilder {
     provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Default for AgentBuilder {
@@ -554,6 +591,7 @@ impl AgentBuilder {
             workspace_dir: None,
             agent_workspace_dir: None,
             identity_config: None,
+            interaction_context: None,
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
@@ -565,6 +603,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            shell_profile: None,
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
@@ -577,6 +616,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 
@@ -585,7 +626,15 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    /// Set the agent's sealed tool set. Production callers obtain the
+    /// [`crate::tools::scoped::ScopedToolRegistry`] from
+    /// `ScopedToolRegistry::assemble(...)` (the `.registry` field of its
+    /// output); raw `Vec<Box<dyn Tool>>` fixtures use
+    /// `ScopedToolRegistry::from_raw_for_test`, available to this crate's unit
+    /// tests and, via the dev-only `test-util` feature, to other crates' test
+    /// builds. [`Self::build`] applies the `allowed_tools` and ACP
+    /// memory-strip filters on top of the sealed set.
+    pub fn tools(mut self, tools: crate::tools::scoped::ScopedToolRegistry) -> Self {
         self.tools = Some(tools);
         self
     }
@@ -680,6 +729,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn interaction_context(mut self, interaction: Option<InteractionContext>) -> Self {
+        self.interaction_context = interaction;
+        self
+    }
+
     pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
         self.skills = Some(skills);
         self
@@ -744,6 +798,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the shell reported in the system prompt.
+    ///
+    /// Pass `RuntimeAdapter::shell_profile()` from the same adapter the
+    /// agent's tools were built with, so the prompt cannot name a shell other
+    /// than the one that will execute. Unset means no shell is reported.
+    pub fn shell_profile(
+        mut self,
+        profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    ) -> Self {
+        self.shell_profile = profile;
+        self
+    }
+
     pub fn approval_route(
         mut self,
         route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
@@ -788,6 +855,14 @@ impl AgentBuilder {
 
     pub fn channel_name(mut self, name: String) -> Self {
         self.channel_name = Some(name);
+        self
+    }
+
+    /// Retain the concrete `DelegateTool` the registry built, for regressions
+    /// that must drive the *constructed* delegate rather than a hand-rolled one.
+    #[cfg(test)]
+    fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
+        self.delegate_tool = delegate_tool;
         self
     }
 
@@ -910,6 +985,7 @@ impl AgentBuilder {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             }),
             identity_config: self.identity_config.unwrap_or_default(),
+            interaction_context: self.interaction_context,
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: if exclude_memory {
@@ -929,6 +1005,11 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            // One policy, one source: the same `exclude_memory` that strips
+            // memory tools and installs `NoneMemory` also withholds MEMORY.md
+            // from the prompt.
+            inject_memory: !exclude_memory,
+            shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
@@ -941,6 +1022,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            delegate_tool: self.delegate_tool,
         })
     }
 }
@@ -982,8 +1065,30 @@ impl Agent {
         chrono::Local::now()
     }
 
+    /// Prefixes a user message with the current date/time in the labeled
+    /// shape both embedded Agent turn paths store in history, including the
+    /// streamed path used by RPC and ACP. Other runtime owners format their
+    /// own user-message envelopes independently.
+    fn enrich_user_message(&self, user_message: &str) -> String {
+        let now = self.current_turn_datetime();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
+        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+    }
+
     pub fn set_channel_name(&mut self, name: String) {
         self.channel_name = name;
+    }
+
+    /// Set the host-resolved, descriptive interaction context for this live
+    /// session. This does not alter tools, policy, routing, memory, or storage.
+    pub fn set_interaction_context(&mut self, interaction: Option<InteractionContext>) {
+        self.interaction_context = interaction;
+        self.refresh_system_prompt();
     }
 
     fn new_turn_id() -> String {
@@ -1000,6 +1105,70 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Remove the trailing assistant interruption marker
+    /// (`turn-interrupted-by-user`) the tool loop appends to live history when a
+    /// turn is cancelled, returning whether one was removed. When cancellation
+    /// folds the marker into a partial assistant response, preserve the partial
+    /// response and remove only the runtime-owned marker suffix.
+    ///
+    /// External surfaces that project cancellation differently on their durable
+    /// transcript (the ACP channel records a structured, replay-only cancellation
+    /// event instead) call this so the generic marker is not re-sent to the
+    /// provider on the next turn of the same still-active session. The marker
+    /// string stays owned by the runtime here rather than being re-derived and
+    /// content-matched at the call site.
+    pub fn strip_trailing_interruption_marker(&mut self) -> bool {
+        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let is_marker = matches!(
+            self.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == marker
+        );
+        if is_marker {
+            self.history.pop();
+            return true;
+        }
+
+        let folded_suffix = format!("\n\n{marker}");
+        let Some(ConversationMessage::Chat(message)) = self.history.last_mut() else {
+            return false;
+        };
+        if message.role != "assistant" || !message.content.ends_with(&folded_suffix) {
+            return false;
+        }
+
+        message
+            .content
+            .truncate(message.content.len() - folded_suffix.len());
+        true
+    }
+
+    /// Degrade image references in the trailing turn of live history.
+    ///
+    /// A turn that just ended in a non-retryable failure is the newest whole
+    /// turn: its opening user prompt is the last turn-opening user message and
+    /// nothing was appended after the failure. Prompt-mode `[Tool results]`
+    /// carriers inside the turn are not turn openings, so the span reaches
+    /// back past them to the prompt that actually opened the turn. Any
+    /// attachment in that span was already rejected (or already defeated the
+    /// request), so leaving it in place resends it on the next prompt of the
+    /// same still-active session and reproduces the failure. The span is
+    /// projected in place with the shared failed-turn media degradation (see
+    /// `media_degrade::degrade_media_in_messages`); the durable transcript
+    /// keeps the original content for client replay.
+    ///
+    /// Returns the number of image references degraded.
+    pub fn degrade_trailing_turn_media(&mut self) -> usize {
+        let Some(start) = self
+            .history
+            .iter()
+            .rposition(crate::agent::turn::media_degrade::is_turn_opening_user_message)
+        else {
+            return 0;
+        };
+        crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -1148,8 +1317,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = format!("[{now}] {user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1592,12 +1760,25 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority, and
+            // the A2A outbound client) must follow reloads rather than this
+            // call's `config` snapshot. `None` here would silently pin them to
+            // startup state for the Agent's whole lifetime. One-shot callers
+            // pass `None` and keep the documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Captured before `assemble` consumes the result: the concrete delegate
+        // instance this registry built, so live-config regressions can drive its
+        // nested-registry construction instead of re-deriving the wiring.
+        #[cfg(test)]
+        let built_delegate_tool = all_tools_result.delegate_tool.clone();
+        // Capture before `runtime` is moved into `ScopedAssembly`.
+        let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -1642,7 +1823,9 @@ impl Agent {
             // already-consumed sibling fields via `..`.
             ..
         } = assembled;
-        let tools = registry.into_inner();
+        // Thread the sealed registry straight to the builder - `.tools(...)` now
+        // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
+        let tools = registry;
 
         let model_name = match agent_model_provider
             .and_then(|e| e.model.as_deref())
@@ -1718,7 +1901,10 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let builder = Agent::builder();
+        #[cfg(test)]
+        let builder = builder.delegate_tool(built_delegate_tool);
+        let mut agent = builder
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -1732,6 +1918,7 @@ impl Agent {
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())
+            .shell_profile(shell_profile)
             .config(
                 config
                     .resolved_agent_config(agent_alias)
@@ -1741,7 +1928,7 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -1897,10 +2084,33 @@ impl Agent {
     /// and streamed as a trailing [`TurnEvent::Chunk`] (rendered by streaming
     /// consumers that discard the final text on a clean finish, e.g. the
     /// ZeroCode TUI).
+    ///
+    /// A safeguard notice composed from the original request replaces this
+    /// generic notice; a server-side safeguard notice does not, because the
+    /// generic record is then the only presentation of the ordinary leg that
+    /// preceded it. The safeguard notice itself is rendered by the caller.
     async fn append_model_fallback_notice(
         response: String,
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+        safeguard: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> String {
+        let fallback = zeroclaw_providers::visible_provider_fallback(fallback, safeguard);
+        let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
+        if with_notice == response {
+            return response;
+        }
+        let Some(delta) = with_notice.strip_prefix(&response) else {
+            return response;
+        };
+        let delta = delta.to_string();
+        let _ = event_tx.send(TurnEvent::Chunk { delta }).await;
+        with_notice
+    }
+
+    fn format_model_fallback_notice(
+        response: String,
+        fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
     ) -> String {
         let Some(fallback) = fallback else {
             return response;
@@ -1921,16 +2131,10 @@ impl Agent {
                 ("actual_provider", fallback.actual_provider.as_str()),
             ],
         );
-        let delta = format!("\n\n{notice}");
-        let _ = event_tx
-            .send(TurnEvent::Chunk {
-                delta: delta.clone(),
-            })
-            .await;
         if response.is_empty() {
             notice
         } else {
-            format!("{response}{delta}")
+            format!("{response}\n\n{notice}")
         }
     }
 
@@ -1952,7 +2156,10 @@ impl Agent {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
-        let prompt_tools = if expose_text_tool_protocol {
+        // Both arms resolve to `&[Box<dyn Tool>]`: the sealed registry derefs to
+        // the same slice the raw `Vec` used to expose, so downstream prompt
+        // construction is unchanged.
+        let prompt_tools: &[Box<dyn Tool>] = if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
@@ -1966,13 +2173,17 @@ impl Agent {
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
+            interaction: self.interaction_context.as_ref(),
             dispatcher_instructions: &instructions,
             sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            inject_memory: self.inject_memory,
+            shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
+        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -2322,14 +2533,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -2405,6 +2609,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2511,20 +2716,34 @@ impl Agent {
         // entering either task-local scope: boxing inside a nested async block
         // still captures the large turn-loop future on the worker stack.
         let turn_loop = Box::pin(turn_loop);
-        let (loop_result, turn_provider_recovery, turn_provider_context_truncated) =
-            zeroclaw_providers::reliable::scope_provider_fallback(async {
-                let result = crate::agent::turn::scope_tool_protocol_prompts(
-                    Arc::clone(&tool_protocol_prompts),
-                    turn_loop,
-                )
+        let (
+            loop_result,
+            turn_provider_recovery,
+            turn_provider_context_truncated,
+            turn_safeguard_fallback,
+        ) = zeroclaw_providers::scope_safeguard_fallback(async {
+            let (result, recovery, context_truncated) =
+                zeroclaw_providers::reliable::scope_provider_fallback(async {
+                    let result = crate::agent::turn::scope_tool_protocol_prompts(
+                        Arc::clone(&tool_protocol_prompts),
+                        turn_loop,
+                    )
+                    .await;
+                    (
+                        result,
+                        zeroclaw_providers::reliable::take_last_provider_fallback(),
+                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                    )
+                })
                 .await;
-                (
-                    result,
-                    zeroclaw_providers::reliable::take_last_provider_fallback(),
-                    zeroclaw_providers::reliable::take_last_provider_context_truncation(),
-                )
-            })
-            .await;
+            (
+                result,
+                recovery,
+                context_truncated,
+                zeroclaw_providers::take_last_safeguard_fallback(),
+            )
+        })
+        .await;
 
         // Feed the accumulated per-call usage into the AgentEnd guard before
         // any return below drops it — including the error path, which must
@@ -2554,12 +2773,27 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
+        // The ordinary recovery leg is rendered first so the route reads in
+        // order: an ordinary provider fallback, then any safeguard switch the
+        // accepted attempt itself went through.
+        let response = Self::format_model_fallback_notice(
+            response,
+            zeroclaw_providers::visible_provider_fallback(
+                turn_provider_recovery.as_ref(),
+                turn_safeguard_fallback.as_ref(),
+            ),
+        );
+        let response = crate::agent::append_safeguard_fallback_notice(
+            response,
+            turn_safeguard_fallback.as_ref(),
+        );
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
             && turn_provider_recovery.is_none()
+            && turn_safeguard_fallback.is_none()
             && !turn_provider_context_truncated
             && loop_new_messages.len() == 2
             && loop_new_messages
@@ -2602,10 +2836,29 @@ impl Agent {
             ));
         }
 
-        self.turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
+        let display_event_tx = event_tx.clone();
+        let StreamedTurnSuccess {
+            response: raw_response,
+            new_messages,
+            safeguard_fallback,
+        } = self
+            .turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
             .await
-            .map(|outcome| (outcome.response, outcome.new_messages))
-            .map_err(|err| err.error)
+            .map_err(|err| err.error)?;
+        let response = crate::agent::append_safeguard_fallback_notice(
+            raw_response.clone(),
+            safeguard_fallback.as_ref(),
+        );
+        if safeguard_fallback.is_some()
+            && let Some(delta) = response.strip_prefix(&raw_response)
+        {
+            let _ = display_event_tx
+                .send(TurnEvent::Chunk {
+                    delta: delta.to_string(),
+                })
+                .await;
+        }
+        Ok((response, new_messages))
     }
 
     pub async fn turn_streamed_with_steering_state(
@@ -2664,8 +2917,8 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
-            None;
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
+        let mut turn_safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>;
         let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
@@ -2750,6 +3003,7 @@ impl Agent {
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
+                    safeguard_fallback: None,
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -2778,6 +3032,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -2851,8 +3106,7 @@ impl Agent {
                         turn_id: Some(turn_id.clone()),
                     });
                 }
-                let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-                let enriched = format!("[{now}] {steering_message}");
+                let enriched = self.enrich_user_message(&steering_message);
                 round_added.push(ChatMessage::user(enriched));
             }
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -2953,23 +3207,36 @@ impl Agent {
             // the nested task-locals do not capture the full round future on
             // the worker stack in debug builds.
             let round_loop = Box::pin(round_loop);
-            let (loop_result, round_fallback, round_context_truncated) =
-                zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = crate::agent::turn::scope_tool_protocol_prompts(
-                        Arc::clone(&tool_protocol_prompts),
-                        round_loop,
-                    )
-                    .await;
+            let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
+                zeroclaw_providers::scope_safeguard_fallback(async {
+                    let (result, fallback, context_truncated) =
+                        zeroclaw_providers::reliable::scope_provider_fallback(async {
+                            let result = crate::agent::turn::scope_tool_protocol_prompts(
+                                Arc::clone(&tool_protocol_prompts),
+                                round_loop,
+                            )
+                            .await;
+                            (
+                                result,
+                                zeroclaw_providers::reliable::take_last_provider_fallback(),
+                                zeroclaw_providers::reliable::take_last_provider_context_truncation(
+                                ),
+                            )
+                        })
+                        .await;
                     (
                         result,
-                        zeroclaw_providers::reliable::take_last_provider_fallback(),
-                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                        fallback,
+                        context_truncated,
+                        zeroclaw_providers::take_last_safeguard_fallback(),
                     )
                 })
                 .await;
-            if round_fallback.is_some() {
-                turn_provider_recovery = round_fallback;
-            }
+            // Each accepted round owns the recovery presentation state. A
+            // later primary/direct response must clear an earlier fallback,
+            // rather than leaving its notice attached to the final answer.
+            turn_provider_recovery = round_fallback;
+            turn_safeguard_fallback = round_safeguard;
             turn_provider_context_truncated |= round_context_truncated;
 
             // Feed cumulative usage into the AgentEnd guard before any return
@@ -3021,6 +3288,7 @@ impl Agent {
                     // exchange, mirroring the old "no tool calls" condition.
                     if single_text_exchange
                         && turn_provider_recovery.is_none()
+                        && turn_safeguard_fallback.is_none()
                         && !turn_provider_context_truncated
                         && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
@@ -3035,12 +3303,14 @@ impl Agent {
                     let committed_response = Self::append_model_fallback_notice(
                         committed_response,
                         turn_provider_recovery.as_ref(),
+                        turn_safeguard_fallback.as_ref(),
                         &event_tx,
                     )
                     .await;
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
+                        safeguard_fallback: turn_safeguard_fallback,
                     });
                 }
                 Err(error) => {
@@ -3245,6 +3515,14 @@ mod safety_net;
 #[path = "parity.rs"]
 mod parity;
 
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3277,6 +3555,29 @@ mod tests {
             err.to_string().contains("no `model` configured"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn build_session_model_provider_returns_full_canonical_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (_provider, provider_ref, model) =
+            build_session_model_provider(&config, "openai.fast", None).unwrap();
+
+        assert_eq!(provider_ref, "openai.fast");
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -3338,6 +3639,220 @@ mod tests {
         }
     }
 
+    struct SafeguardNoticeProvider;
+
+    #[async_trait]
+    impl ModelProvider for SafeguardNoticeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: "requested-model".into(),
+                    served_model: "served-model".into(),
+                    category: Some("private-category".into()),
+                },
+            ));
+            Ok("accepted response".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: "requested-model".into(),
+                    served_model: "served-model".into(),
+                    category: Some("private-category".into()),
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("accepted response".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SafeguardNoticeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SafeguardNoticeProvider"
+        }
+    }
+
+    struct RefusingCandidateProvider {
+        /// Usage billed by the refusing attempt, when the provider reports it.
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    }
+
+    impl RefusingCandidateProvider {
+        fn refusal(&self, model: &str) -> anyhow::Error {
+            anyhow::Error::new(zeroclaw_providers::AnthropicRefusalError {
+                requested_model: model.into(),
+                category: Some("private-category".into()),
+                usage: self.usage.clone().map(Box::new),
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusingCandidateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Err(self.refusal(model))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Err(self.refusal(model))
+        }
+    }
+
+    /// Candidate that fails with an ordinary transport error, never a refusal.
+    struct UnavailableCandidateProvider;
+
+    #[async_trait]
+    impl ModelProvider for UnavailableCandidateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UnavailableCandidateProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UnavailableCandidateProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RefusingCandidateProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RefusingCandidateProvider"
+        }
+    }
+
+    /// Keep the real Anthropic non-streaming implementation while making the
+    /// runtime test enter the non-streaming turn path deterministically.
+    struct NonStreamingAnthropicProvider {
+        inner: zeroclaw_providers::anthropic::AnthropicModelProvider,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingAnthropicProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<String> {
+            self.inner
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NonStreamingAnthropicProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NonStreamingAnthropicProvider"
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedAnthropicResponder {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<Vec<serde_json::Value>>,
+    }
+
+    impl wiremock::Respond for SequencedAnthropicResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let body = self
+                .bodies
+                .get(index)
+                .or_else(|| self.bodies.last())
+                .expect("sequence must contain a response")
+                .clone();
+            wiremock::ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
     const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
 
     fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
@@ -3352,7 +3867,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -3407,7 +3924,8 @@ mod tests {
         // orchestrator's family check suppresses; direct-turn surfaces must
         // still see it.
         let info = fallback_info("anthropic", "model-requested", "anthropic", "model-served");
-        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        let out =
+            Agent::append_model_fallback_notice("hello".to_string(), Some(&info), None, &tx).await;
         assert!(
             out.starts_with("hello\n\n"),
             "reply text must be preserved ahead of the notice: {out}"
@@ -3434,7 +3952,8 @@ mod tests {
         // primary entry); an identical requested/served pair is not a
         // downgrade and must stay silent.
         let info = fallback_info("anthropic", "same-model", "anthropic", "same-model");
-        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        let out =
+            Agent::append_model_fallback_notice("hello".to_string(), Some(&info), None, &tx).await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err(), "no chunk for a retry");
     }
@@ -3442,15 +3961,553 @@ mod tests {
     #[tokio::test]
     async fn model_fallback_notice_absent_without_fallback_info() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let out = Agent::append_model_fallback_notice("hello".to_string(), None, &tx).await;
+        let out = Agent::append_model_fallback_notice("hello".to_string(), None, None, &tx).await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn safeguard_notice_suppresses_generic_model_fallback_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let info = fallback_info("anthropic", "requested-model", "openai", "served-model");
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ClientSide,
+            requested_model: "requested-model".into(),
+            served_model: "served-model".into(),
+            category: None,
+        };
+        let out = Agent::append_model_fallback_notice(
+            "hello".to_string(),
+            Some(&info),
+            Some(&safeguard),
+            &tx,
+        )
+        .await;
+        assert_eq!(out, "hello");
+        assert!(rx.try_recv().is_err(), "no generic fallback chunk");
+    }
+
+    #[tokio::test]
+    async fn server_side_safeguard_keeps_generic_model_fallback_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // Ordinary failure on model A moved the request to pinned model B;
+        // Anthropic then served B's request with C. The safeguard notice
+        // covers only B to C, so the generic A to B leg must stay visible.
+        let info = fallback_info("anthropic", "model-a", "anthropic", "model-b");
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+            requested_model: "model-b".into(),
+            served_model: "model-c".into(),
+            category: None,
+        };
+        let out = Agent::append_model_fallback_notice(
+            "hello".to_string(),
+            Some(&info),
+            Some(&safeguard),
+            &tx,
+        )
+        .await;
+        assert!(out.starts_with("hello\n\n"), "reply text preserved: {out}");
+        assert!(
+            out.contains("model-a") && out.contains("model-b"),
+            "the ordinary leg must keep naming the original request: {out}"
+        );
+        assert!(
+            !out.contains("model-c"),
+            "the safeguard leg is rendered by the caller, not here: {out}"
+        );
+        match rx.try_recv() {
+            Ok(TurnEvent::Chunk { delta }) => {
+                assert!(
+                    delta.contains("model-a"),
+                    "streamed chunk carries the leg: {delta}"
+                );
+            }
+            other => panic!("expected the generic notice chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_agent_turn_presents_one_safeguard_without_persisting_it() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let response = agent.turn("hello").await.expect("direct turn succeeds");
+
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        assert!(response.contains("requested-model"));
+        assert!(response.contains("served-model"));
+        assert!(!response.contains("private-category"));
+        let persisted = agent
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "assistant" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .expect("assistant response persisted");
+        assert_eq!(persisted, "accepted response");
+    }
+
+    #[tokio::test]
+    async fn direct_streamed_turn_returns_typed_safeguard_and_raw_transcript() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("streamed turn succeeds");
+
+        assert_eq!(outcome.response, "accepted response");
+        let notice = outcome
+            .safeguard_fallback
+            .expect("accepted safeguard attribution");
+        assert_eq!(notice.requested_model, "requested-model");
+        assert_eq!(notice.served_model, "served-model");
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn direct_streaming_api_emits_one_display_notice_for_cli_and_acp() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (response, messages) = agent
+            .turn_streamed("hello", tx, None)
+            .await
+            .expect("streamed API succeeds");
+
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed.matches("Safety safeguards").count(), 1);
+        assert!(messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn refusal_then_real_anthropic_server_fallback_reaches_publisher_once() {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "served-c",
+                    "content": [{"type": "text", "text": "accepted from c"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "iterations": [
+                            {"type": "message"},
+                            {"type": "fallback_message"}
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "candidate-a".into(),
+                    Box::new(RefusingCandidateProvider { usage: None }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "candidate-b".into(),
+                    Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                        as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        assert_eq!(outcome.response, "accepted from c");
+        let notice = outcome
+            .safeguard_fallback
+            .as_ref()
+            .expect("composed accepted-route attribution");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ClientAndServer
+        );
+        assert_eq!(notice.requested_model, "requested-a");
+        assert_eq!(notice.served_model, "served-c");
+        assert_eq!(notice.category.as_deref(), Some("private-category"));
+
+        let display =
+            crate::agent::append_safeguard_fallback_notice(outcome.response.clone(), Some(notice));
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(display.contains("requested-a"));
+        assert!(display.contains("served-c"));
+        assert!(!display.contains("private-category"));
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+        assert!(agent.history.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejected_empty_server_fallback_does_not_leak_into_normal_retry() {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(vec![
+            serde_json::json!({
+                "model": "served-c",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "iterations": [{"type": "fallback_message"}]
+                }
+            }),
+            serde_json::json!({
+                "model": "requested-a",
+                "content": [{"type": "text", "text": "normal retry"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 2,
+                    "iterations": [{"type": "message"}]
+                }
+            }),
+        ]);
+        Mock::given(method("POST"))
+            .respond_with(SequencedAnthropicResponder {
+                calls: Arc::clone(&calls),
+                bodies,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![(
+                "candidate-b".into(),
+                Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                    as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("normal retry is accepted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.response, "normal retry");
+        assert!(
+            outcome.safeguard_fallback.is_none(),
+            "rejected server-fallback attribution must be cleared before retry"
+        );
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("served-c"),
+            _ => true,
+        }));
+    }
+
+    /// One accepted native response served by Anthropic's server fallback C.
+    async fn served_by_c_anthropic_server() -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "served-c",
+                    "content": [{"type": "text", "text": "accepted from c"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "iterations": [
+                            {"type": "message"},
+                            {"type": "fallback_message"}
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Candidate A fails with an ordinary 503, Reliable advances to candidate
+    /// B (the real Anthropic client), and Anthropic serves B's request with C.
+    fn ordinary_failure_then_server_fallback_reliable(
+        server_uri: &str,
+    ) -> zeroclaw_providers::reliable::ReliableModelProvider {
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(server_uri)
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "candidate-a".into(),
+                    Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "candidate-b".into(),
+                    Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                        as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    fn last_assistant_content(messages: &[ConversationMessage]) -> Option<&str> {
+        messages.iter().rev().find_map(|message| match message {
+            ConversationMessage::Chat(message) if message.role == "assistant" => {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_real_anthropic_server_fallback_keeps_original_request_visible() {
+        let server = served_by_c_anthropic_server().await;
+        let mut agent = blank_input_agent(Box::new(
+            ordinary_failure_then_server_fallback_reliable(&server.uri()),
+        ));
+        agent.model_name = "requested-a".into();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        let notice = outcome
+            .safeguard_fallback
+            .as_ref()
+            .expect("server-side attribution for the accepted attempt");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+            "an ordinary 503 is not a refusal-triggered client recovery"
+        );
+        assert_eq!(notice.requested_model, "requested-a");
+        assert_eq!(notice.served_model, "served-c");
+
+        // The ordinary A to B leg is delivered as the generic notice, both in
+        // the returned text and as a streamed chunk, so the original route is
+        // not erased by the safeguard notice.
+        assert!(
+            outcome.response.starts_with("accepted from c\n\n"),
+            "reply text precedes the route notices: {}",
+            outcome.response
+        );
+        assert!(
+            outcome.response.contains("candidate-a") && outcome.response.contains("candidate-b"),
+            "the ordinary leg must name the original route: {}",
+            outcome.response
+        );
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("candidate-a"),
+            "delta-only consumers must also receive the ordinary leg: {streamed}"
+        );
+
+        let display =
+            crate::agent::append_safeguard_fallback_notice(outcome.response.clone(), Some(notice));
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(display.contains("served-c"));
+        assert!(
+            display.find("candidate-a") < display.find("Safety safeguards"),
+            "the ordinary leg precedes the safety leg: {display}"
+        );
+        assert!(
+            !display.contains("fallback chain"),
+            "the client leg was an ordinary failure, not a refusal chain: {display}"
+        );
+        assert_eq!(
+            last_assistant_content(&outcome.new_messages),
+            Some("accepted from c"),
+            "persisted content stays undecorated"
+        );
+        assert_eq!(
+            last_assistant_content(&agent.history),
+            Some("accepted from c")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_server_fallback_direct_turn_renders_both_legs_once() {
+        let server = served_by_c_anthropic_server().await;
+        let mut agent = blank_input_agent(Box::new(
+            ordinary_failure_then_server_fallback_reliable(&server.uri()),
+        ));
+        agent.model_name = "requested-a".into();
+
+        let response = agent
+            .turn("hello")
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        assert!(
+            response.starts_with("accepted from c\n\n"),
+            "reply text precedes the route notices: {response}"
+        );
+        assert!(
+            response.contains("candidate-a"),
+            "the ordinary leg must keep the original request visible: {response}"
+        );
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        assert!(response.contains("served-c"));
+        assert!(
+            response.find("candidate-a") < response.find("Safety safeguards"),
+            "the ordinary leg precedes the safety leg: {response}"
+        );
+        assert!(!response.contains("fallback chain"));
+        assert_eq!(
+            last_assistant_content(&agent.history),
+            Some("accepted from c"),
+            "persisted content stays undecorated"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_refusal_with_billed_usage_delivers_safety_guidance() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![(
+                "candidate-a".into(),
+                Box::new(RefusingCandidateProvider {
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+
+        let error = agent
+            .turn("hello")
+            .await
+            .expect_err("an unrescued refusal fails the turn");
+
+        let usage = zeroclaw_providers::rejected_attempt_usage_from_error(&error)
+            .expect("billed refusal usage survives the terminal error");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(3));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_providers::AnthropicRefusalError>()
+                .is_none(),
+            "production shape keeps the refusal beneath Reliable's envelopes: {error:#}"
+        );
+
+        let message = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("an exhausted refusal projects a user-facing message");
+        assert_eq!(
+            message,
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-refusal")
+        );
+        assert!(message.contains("safety system"), "{message}");
+        assert!(!message.contains("private-category"));
+        assert!(
+            zeroclaw_providers::reliable::transient_error_hint(&error)
+                .is_some_and(|hint| hint.contains("safety system")),
+            "the channel hint fallback must also see the refusal"
+        );
+    }
+
+    #[test]
+    fn fallback_notice_fluent_key_stays_localized_without_new_keys() {
+        let args = [
+            ("requested_model", "requested-model"),
+            ("requested_provider", "primary"),
+            ("actual_model", "served-model"),
+            ("actual_provider", "fallback"),
+        ];
+        let english =
+            crate::i18n::get_english_cli_string_with_args("turn-model-fallback-notice", &args);
+        let french = crate::i18n::get_disk_override_cli_string_for_test(
+            "fr",
+            include_str!("../../locales/fr/cli.ftl"),
+            "turn-model-fallback-notice",
+            &args,
+        );
+
+        assert_ne!(french, "{turn-model-fallback-notice}");
+        assert_ne!(french, english, "French must not fall back to English");
+        for (_, value) in args {
+            assert!(
+                french.contains(value),
+                "localized fallback notice lost {value}"
+            );
+        }
     }
 
     #[derive(Clone, Copy)]
     enum RuntimeStreamPlan {
         Unsupported,
         Text(&'static str),
+        EmptyWithUsage,
         Error,
     }
 
@@ -3509,6 +4566,18 @@ mod tests {
                 RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
                     Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
                         zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::EmptyWithUsage => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::Usage(
+                        zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(13),
+                            output_tokens: Some(7),
+                            cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                        },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
                 ])
@@ -3704,6 +4773,229 @@ mod tests {
         assert_eq!(
             outcome.response, "primary final",
             "failed fallback streams must not leave stale fallback notice state"
+        );
+    }
+
+    /// A billed fallback stream is only a transport candidate. If its final
+    /// response is semantically empty and Reliable recovers to primary chat,
+    /// neither the Agent result nor its chunks may retain the fallback notice.
+    #[tokio::test]
+    async fn streamed_empty_fallback_recovery_does_not_leak_a_provider_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary recovery"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::EmptyWithUsage,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("primary recovery must succeed after an empty fallback stream");
+
+        assert_eq!(outcome.response, "primary recovery");
+        let mut chunks = String::new();
+        while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
+            chunks.push_str(&delta);
+        }
+        assert!(
+            !chunks.contains("provider-served") && !chunks.contains("provider-requested"),
+            "rejected fallback must not leak its notice into streamed chunks: {chunks}"
+        );
+    }
+
+    /// A tool-call response is accepted for this iteration, but its recovery
+    /// record must be replaced by the route of the final accepted answer.
+    #[tokio::test]
+    async fn tool_call_then_final_fallback_surfaces_exactly_one_final_notice() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(ToolThenFailingModelProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some("fallback final".to_string()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("test memory must initialize"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(memory)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        let response = agent.turn("run the tool").await.expect("turn must recover");
+        assert_eq!(
+            response.matches("fallback").count(),
+            2,
+            "final text plus one notice"
+        );
+        assert!(
+            response.contains("primary"),
+            "notice identifies the requested route"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tool_call_then_primary_final_clears_the_stale_notice() {
+        struct PrimaryFailsOnceThenFinal(std::sync::atomic::AtomicUsize);
+        struct FallbackToolCall;
+
+        macro_rules! attributable {
+            ($type:ty, $alias:literal) => {
+                impl ::zeroclaw_api::attribution::Attributable for $type {
+                    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                        ::zeroclaw_api::attribution::Role::Provider(
+                            ::zeroclaw_api::attribution::ProviderKind::Model(
+                                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                            ),
+                        )
+                    }
+                    fn alias(&self) -> &str {
+                        $alias
+                    }
+                }
+            };
+        }
+        attributable!(PrimaryFailsOnceThenFinal, "PrimaryFailsOnceThenFinal");
+        attributable!(FallbackToolCall, "FallbackToolCall");
+
+        #[async_trait]
+        impl ModelProvider for PrimaryFailsOnceThenFinal {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    anyhow::bail!("primary unavailable for first tool request");
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("primary final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for FallbackToolCall {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("tool request".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PrimaryFailsOnceThenFinal(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    )) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(FallbackToolCall) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..Default::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("test memory must initialize"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        assert_eq!(
+            agent.turn("run the tool").await.expect("turn must recover"),
+            "primary final"
         );
     }
 
@@ -3956,6 +5248,102 @@ mod tests {
 
         fn alias(&self) -> &str {
             "counting-answer"
+        }
+    }
+
+    struct CountingSafeguardModelProvider {
+        calls: Arc<AtomicUsize>,
+        answer: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingSafeguardModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(self.answer.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(self.answer.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            let delta = self.answer.clone();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta(delta),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingSafeguardModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-safeguard"
         }
     }
 
@@ -4421,7 +5809,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -4615,7 +6005,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -4660,9 +6052,11 @@ mod tests {
         };
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(CountingTool {
-                calls: Arc::clone(&calls),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(CountingTool {
+                    calls: Arc::clone(&calls),
+                })],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -4706,7 +6100,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(Arc::clone(&mem))
             .observer(Arc::clone(&observer))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -4721,7 +6117,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -4874,7 +6272,9 @@ mod tests {
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
             let mut builder = Agent::builder()
                 .model_provider(provider)
-                .tools(tools)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    tools,
+                ))
                 .memory(mem)
                 .observer(observer)
                 .workspace_dir(workspace.path().to_path_buf());
@@ -4887,6 +6287,119 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        /// Builds an Agent over a temp workspace holding a `MEMORY.md` sentinel
+        /// and a `SOUL.md` control, at the given `exclude_memory` setting, and
+        /// returns its assembled system prompt.
+        fn system_prompt_with_memory_sentinel(exclude_memory: bool) -> String {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            std::fs::write(
+                workspace.path().join("MEMORY.md"),
+                "MEMORY_MD_SENTINEL_9341",
+            )
+            .expect("write MEMORY.md");
+            std::fs::write(workspace.path().join("SOUL.md"), "SOUL_MD_CONTROL_9341")
+                .expect("write SOUL.md");
+
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .agent_workspace_dir(workspace.path().to_path_buf())
+                .exclude_memory(exclude_memory)
+                .build()
+                .expect("agent builder should succeed");
+
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .expect("system prompt builds")
+        }
+
+        /// `exclude_memory: true` is the ACP / isolated-session policy. It
+        /// already strips memory tools, installs `NoneMemory` and forces
+        /// `auto_save` off; it must also keep curated `MEMORY.md` *content* out
+        /// of the provider-visible system prompt, otherwise the "persistent
+        /// memory isolated" copy is a claim the prompt path violates.
+        #[test]
+        fn build_system_prompt_omits_memory_md_when_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(true);
+
+            assert!(
+                !prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must not reach the ACP system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "other personality files must still load under exclude_memory"
+            );
+        }
+
+        /// Chat sessions (`exclude_memory: false`) are unchanged.
+        #[test]
+        fn build_system_prompt_includes_memory_md_without_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(false);
+
+            assert!(
+                prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must still reach the Chat system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "SOUL.md must still reach the Chat system prompt"
+            );
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
+            let (provider, captured) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+            agent
+                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .await
+                .expect("streamed Agent turn should succeed");
+
+            let captured = captured.lock();
+            let first_request = captured.first().expect("provider request captured");
+            let system = first_request
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("system prompt");
+            let user = first_request
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("user message");
+
+            assert!(
+                system
+                    .content
+                    .contains("timestamp metadata added by the runtime"),
+                "Agent prompt must explain its runtime-owned user envelope"
+            );
+            assert!(
+                user.content.starts_with("[CURRENT DATE & TIME:")
+                    && user.content.ends_with("\n\nhi from zerocode"),
+                "provider must receive the labeled envelope and original text: {}",
+                user.content
+            );
         }
 
         #[test]
@@ -4905,7 +6418,9 @@ mod tests {
                 .model_provider(Box::new(MockModelProvider {
                     responses: Mutex::new(vec![]),
                 }))
-                .tools(vec![Box::new(MockTool)])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
                 .memory(mem)
                 .observer(observer)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -4927,6 +6442,50 @@ mod tests {
             assert!(
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn build_system_prompt_with_dispatcher_uses_assembled_skill_tool_names() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("ops__shell"))],
+                ))
+                .skills(vec![make_skill("ops", &["fetch", "shell"])])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .expect("system prompt should build");
+            let callable = prompt
+                .split_once("<callable_tools")
+                .and_then(|(_, rest)| rest.split_once("</callable_tools>"))
+                .map(|(block, _)| block)
+                .expect("surviving skill tool should create callable block");
+
+            assert!(callable.contains("<name>ops__shell</name>"));
+            assert!(!callable.contains("<name>ops__fetch</name>"));
+            assert!(
+                prompt.contains("<name>fetch</name>"),
+                "unavailable tool metadata should remain descriptive"
             );
         }
 
@@ -5019,7 +6578,9 @@ mod tests {
             }];
             let mut agent = Agent::builder()
                 .model_provider(provider)
-                .tools(vec![Box::new(MockTool)])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
                 .memory(mem)
                 .observer(observer)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5227,7 +6788,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5272,7 +6835,9 @@ mod tests {
         route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5461,6 +7026,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn from_config_preserves_alias_for_cost_recording() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing, record_tool_loop_cost_usage,
+        };
+        use crate::cost::CostTracker;
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        assert_eq!(agent.model_provider_name, "openai.fast");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
+        };
+
+        let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                record_tool_loop_cost_usage(&agent.model_provider_name, &agent.model_name, &usage)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            (cost_usd - 0.75).abs() < 1e-12,
+            "selected alias must charge its own rates, not the sibling's $12.50"
+        );
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
+    }
+
     #[test]
     fn builder_allowed_tools_none_keeps_all_tools() {
         let model_provider = Box::new(MockModelProvider {
@@ -5479,7 +7136,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5510,7 +7169,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5574,7 +7235,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5620,7 +7283,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -5671,7 +7336,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6064,7 +7731,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6180,7 +7849,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6262,7 +7933,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6448,7 +8121,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6601,7 +8276,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6667,7 +8344,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6720,7 +8399,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6765,7 +8446,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6857,7 +8540,7 @@ mod tests {
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == "done"
         ));
-        for (index, pair) in agent.history[1..63].chunks_exact(2).enumerate() {
+        for (index, pair) in agent.history[1..63].as_chunks::<2>().0.iter().enumerate() {
             let expected_id = format!("trim-history-call-{}", index + 1);
             match pair {
                 [
@@ -6971,7 +8654,9 @@ mod tests {
             .model_provider(Box::new(ToolThenFailingModelProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7039,7 +8724,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(
             capturing
@@ -7069,7 +8757,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(drain_history_trim_events(&mut event_rx), 1);
     }
@@ -7341,7 +9032,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7485,7 +9178,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7559,7 +9254,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent_a = Agent::builder()
             .model_provider(provider_a)
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_a)
             .observer(observer.clone())
             .response_cache(Some(cache.clone()))
@@ -7576,7 +9273,9 @@ mod tests {
 
         let mut agent_b = Agent::builder()
             .model_provider(provider_b)
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
@@ -7634,7 +9333,9 @@ mod tests {
                 seen_messages: seed_seen,
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory())
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .response_cache(Some(cache.clone()))
@@ -7666,7 +9367,9 @@ mod tests {
                 seen_messages: guarded_seen.clone(),
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory())
             .observer(capturing.clone())
             .response_cache(Some(cache))
@@ -7734,6 +9437,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -7787,7 +9491,9 @@ mod tests {
                 seen_models: seen_models.clone(),
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(capturing.clone())
             .hook_runner(Some(Arc::new(hooks)))
@@ -7905,7 +9611,9 @@ mod tests {
             .model_provider(Box::new(router))
             .model_provider_name("hook-router".into())
             .model_name("native-model".into())
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .hook_runner(Some(Arc::new(hooks)))
@@ -8023,7 +9731,9 @@ mod tests {
             .model_provider(Box::new(router))
             .model_provider_name("hook-router".into())
             .model_name("native-model".into())
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .hook_runner(Some(Arc::new(hooks)))
@@ -8067,7 +9777,9 @@ mod tests {
         let mut agent = Agent::builder()
             .model_provider(Box::new(FailingModelProvider))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(capturing.clone())
             .hook_runner(Some(Arc::new(hooks)))
@@ -8141,7 +9853,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-family".into())
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -8197,7 +9911,9 @@ mod tests {
                 ),
             ))
             .model_provider_name("provider-family".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .response_cache(Some(cache))
@@ -8349,7 +10065,9 @@ mod tests {
                     ),
                 ))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -8426,7 +10144,9 @@ mod tests {
                     ),
                 ))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -8457,6 +10177,145 @@ mod tests {
         assert!(second_response.contains("fallback-b"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_non_streaming_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-answer");
+        let mut second = build("second-answer");
+
+        let first_resp = first.turn("hello").await.unwrap();
+        assert!(first_resp.contains("first-answer"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "non-streaming safeguard fallback turn must append fallback notice"
+        );
+        let history_text = match first.history.last() {
+            Some(ConversationMessage::Chat(chat)) => chat.content.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            !history_text.contains("server-fallback-model"),
+            "canonical history must not contain appended safeguard notice: {history_text}"
+        );
+
+        let second_resp = second.turn("hello").await.unwrap();
+        assert!(second_resp.contains("second-answer"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "safeguard fallback turn must bypass cache and reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_streamed_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-stream");
+        let mut second = build("second-stream");
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+
+        let (first_resp, _) = first
+            .turn_streamed("hello", event_tx_a, None)
+            .await
+            .unwrap();
+        assert!(first_resp.contains("first-stream"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+
+        let (second_resp, _) = second
+            .turn_streamed("hello", event_tx_b, None)
+            .await
+            .unwrap();
+        assert!(second_resp.contains("second-stream"));
+        assert!(
+            second_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "streamed safeguard fallback turn must bypass cache and reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -8503,7 +10362,9 @@ mod tests {
             Agent::builder()
                 .model_provider(Box::new(reliable))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -8583,7 +10444,9 @@ mod tests {
             Agent::builder()
                 .model_provider(Box::new(router))
                 .model_provider_name("router".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -8662,7 +10525,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-family".into())
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -8681,6 +10546,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1_024,
+                    display: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -8690,6 +10556,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 2_048,
+                    display: None,
                 }),
                 agent_b.turn("same request"),
             )
@@ -8737,7 +10604,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-a".into())
-                    .tools(vec![Box::new(MockTool)])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![Box::new(MockTool)],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -8899,7 +10768,9 @@ mod tests {
                 });
                 Agent::builder()
                     .model_provider(provider)
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(mem)
                     .observer(observer.clone())
                     .response_cache(Some(cache))
@@ -9001,7 +10872,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::from(
                 zeroclaw_memory::create_memory(
                     &zeroclaw_config::schema::MemoryConfig {
@@ -9097,7 +10970,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9154,6 +11029,24 @@ mod tests {
                 .any(|(role, content)| { *role == "user" && content.contains("second") }),
             "accepted steering must be retained as its own user turn"
         );
+        // The steering turn must reach history in the SAME canonical
+        // labeled envelope as the initial streamed user message. A bare
+        // `[timestamp] text` prefix is the log/API-payload shape this
+        // change exists to remove, so assert the exact envelope rather
+        // than only that the text survived.
+        let committed_steering = new_chat_messages
+            .iter()
+            .find(|(role, content)| *role == "user" && content.contains("second"))
+            .expect("accepted steering must be retained as its own user turn")
+            .1;
+        assert!(
+            committed_steering.starts_with("[CURRENT DATE & TIME: "),
+            "committed steering must carry the labeled envelope, got: {committed_steering}"
+        );
+        assert!(
+            committed_steering.ends_with("]\n\nsecond"),
+            "committed steering must end with the raw user text after the envelope, got: {committed_steering}"
+        );
 
         let seen = seen_messages.lock();
         assert_eq!(seen.len(), 2);
@@ -9164,12 +11057,22 @@ mod tests {
                 .any(|msg| msg.role == "assistant" && msg.content == "draft"),
             "second provider call must see the committed streamed assistant text"
         );
+        let provider_steering = second_call
+            .iter()
+            .filter(|msg| msg.role == "user")
+            .find(|msg| msg.content.contains("second"))
+            .expect("second provider call must include the accepted steering user message");
         assert!(
-            second_call
-                .iter()
-                .filter(|msg| msg.role == "user")
-                .any(|msg| msg.content.contains("second")),
-            "second provider call must include the accepted steering user message"
+            provider_steering
+                .content
+                .starts_with("[CURRENT DATE & TIME: "),
+            "the provider must receive the steering turn in the labeled envelope, got: {}",
+            provider_steering.content
+        );
+        assert!(
+            provider_steering.content.ends_with("]\n\nsecond"),
+            "the provider's steering turn must end with the raw user text, got: {}",
+            provider_steering.content
         );
     }
 
@@ -9195,7 +11098,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9266,7 +11171,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9331,7 +11238,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9403,7 +11312,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9466,7 +11377,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9523,7 +11436,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9626,7 +11541,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9856,6 +11773,56 @@ mod tests {
     }
 
     #[test]
+    fn register_skill_tools_deny_all_allowlist_denies_skill_tools() {
+        // Deny-all (the runtime `Some(vec![])` produced by
+        // `deny_all_tools = true`) applies to skill-defined tools as well as
+        // built-ins and MCP. A nonempty allowlist still leaves skill tools
+        // visible (see register_skill_tools_allowlist_does_not_hide_skills).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            allowed_tools: Some(vec![]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let skills = vec![
+            make_skill("deploy", &["run"]),
+            crate::skills::Skill {
+                name: "weather".to_string(),
+                description: "weather skill".to_string(),
+                description_localizations: Default::default(),
+                version: "0.1.0".to_string(),
+                author: None,
+                tags: vec![],
+                tools: vec![crate::skills::SkillTool {
+                    name: "get_weather".to_string(),
+                    description: "http weather".to_string(),
+                    kind: "http".to_string(),
+                    command: String::new(),
+                    args: std::collections::HashMap::new(),
+                    target: Some("https://example.invalid/weather".to_string()),
+                    locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
+                }],
+                prompts: vec![],
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            },
+        ];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"deploy__run"),
+            "deny-all must hide shell skill tools, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("weather")),
+            "deny-all must hide HTTP skill tools, got {names:?}"
+        );
+    }
+
+    #[test]
     fn from_config_policy_filter_blocks_raw_target_but_keeps_scoped_wrapper() {
         use crate::skills::{Skill, SkillTool};
 
@@ -9999,7 +11966,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10285,12 +12254,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_a)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
@@ -10316,7 +12288,9 @@ mod tests {
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
@@ -10367,12 +12341,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(SlowTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SlowTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10469,12 +12446,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10568,12 +12548,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10638,7 +12621,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(Box::new(FailingModelProvider))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10685,7 +12670,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10731,7 +12718,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10777,7 +12766,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut builder = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10788,6 +12779,35 @@ mod tests {
             builder = builder.provider_switch_config(cfg);
         }
         builder.build().expect("agent builder")
+    }
+
+    #[test]
+    fn strip_trailing_interruption_marker_preserves_folded_partial_response() {
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("prompt")),
+            ConversationMessage::Chat(ChatMessage::assistant(format!("partial text\n\n{marker}"))),
+        ];
+
+        assert!(agent.strip_trailing_interruption_marker());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == "partial text"
+        ));
+
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                "ordinary assistant text",
+            )));
+        assert!(!agent.strip_trailing_interruption_marker());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.content == "ordinary assistant text"
+        ));
     }
 
     #[test]
@@ -11110,10 +13130,12 @@ mod tests {
 
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "ollama".to_string(),
-                target_model: "llama3".to_string(),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "ollama".to_string(),
+                    target_model: "llama3".to_string(),
+                })],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11190,6 +13212,114 @@ mod tests {
         );
         drop(events);
     }
+
+    fn turn_datetime_agent(
+        model_provider: Box<dyn ModelProvider>,
+        fixed: chrono::DateTime<chrono::Local>,
+    ) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .turn_datetime(move || fixed)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn stored_user_message(agent: &Agent) -> String {
+        agent
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.clone())
+                }
+                _ => None,
+            })
+            .expect("a user message must be stored in history")
+    }
+
+    #[tokio::test]
+    async fn streamed_history_uses_labeled_shape_not_bare_timestamp() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = turn_datetime_agent(model_provider, fixed);
+
+        let mut new_msgs = Vec::new();
+        agent
+            .append_streamed_user_message_to_history("hello there", &mut new_msgs, "test-turn")
+            .await;
+
+        let stored = stored_user_message(&agent);
+        assert!(
+            stored.starts_with("[CURRENT DATE & TIME: 2026-03-14 09:30:00"),
+            "streamed history must use the labeled shape, got: {stored}"
+        );
+        assert!(
+            stored.contains("hello there"),
+            "stored message must retain the original text: {stored}"
+        );
+        assert!(
+            !stored.starts_with("[2026-03-14 09:30:00"),
+            "streamed history must not fall back to the bare `[{{ts}}] {{msg}}` shape: {stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_and_non_streamed_enrichment_match_for_same_clock_and_message() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+
+        let mut streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        let mut new_msgs = Vec::new();
+        streamed_agent
+            .append_streamed_user_message_to_history("same message", &mut new_msgs, "turn-a")
+            .await;
+        let streamed_content = stored_user_message(&streamed_agent);
+
+        let mut non_streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        non_streamed_agent
+            .turn("same message")
+            .await
+            .expect("turn should succeed");
+        let non_streamed_content = stored_user_message(&non_streamed_agent);
+
+        assert_eq!(
+            streamed_content, non_streamed_content,
+            "streamed and non-streamed enrichment must be byte-identical for the same clock and message"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -11265,6 +13395,7 @@ mod approval_route_tests {
             tool_name: "shell".into(),
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
+            position: None,
         }
     }
 
