@@ -168,15 +168,10 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// Strip the Windows verbatim (`\\?\`) prefix that `canonicalize` prepends so
-/// model-visible file markers contain ordinary local paths.
+/// model-visible file markers contain ordinary local paths. Delegates to the
+/// canonical normalizer next to the shared content-addressed writer.
 fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
-    }
-    if let Some(rest) = path.strip_prefix(r"\\?\") {
-        return std::borrow::Cow::Borrowed(rest);
-    }
-    std::borrow::Cow::Borrowed(path)
+    zeroclaw_tools::embedded_resource::strip_windows_verbatim_prefix(path)
 }
 
 #[cfg(test)]
