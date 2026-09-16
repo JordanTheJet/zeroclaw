@@ -266,6 +266,7 @@ pub mod error_codes {
     pub const SESSION_NOT_OWNED: i32 = -32003;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+    pub const FORBIDDEN: i32 = -32012;
 
     // SOP authoring
     pub const SOP_ALREADY_EXISTS: i32 = -32020;
@@ -517,6 +518,12 @@ pub struct SopRunResponse {
 pub struct SopRunsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sop: Option<String>,
+}
+
+/// Parameters for `sops/run-detail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetailRequest {
+    pub run_id: String,
 }
 
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the

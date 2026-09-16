@@ -211,6 +211,7 @@ cli-acp-long-about =
 
     Examples:
       zeroclaw acp                        # start ACP server
+      zeroclaw acp --agent fable         # default new sessions to agent fable
       zeroclaw acp --max-sessions 5       # limit concurrent sessions
 
 cli-daemon-long-about =
@@ -679,6 +680,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -956,6 +958,8 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-failed = [turn failed]
+turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
@@ -992,6 +996,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large t
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-conversation-busy = This conversation has too many pending messages; this one was dropped. Wait for a reply, or send /stop to clear your queued requests.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
@@ -1052,6 +1057,12 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-safeguard-footer-server =
+    🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client =
+    🛡️ Safety safeguards flagged this request — switched to **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client-server =
+    🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
@@ -1172,6 +1183,7 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1241,6 +1253,17 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
 channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
 channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
@@ -1252,3 +1275,18 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# ── RPC inbound authentication ──
+rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid
+rpc-auth-credential-rejected = Credential rejected
+rpc-auth-credential-expired = Credential expired: re-initialize with a fresh token
+rpc-auth-assurance-required = Authentication assurance not met (MFA/ACR required)
+rpc-auth-unknown-provider = Unknown auth_provider selection
+rpc-auth-not-entitled = Authenticated, but no permission profile grants this identity anything
+rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
+rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
+rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
+rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-first-call-initialize = First call must be 'initialize'
+rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize

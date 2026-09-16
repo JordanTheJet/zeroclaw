@@ -554,9 +554,20 @@ pub async fn run(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
+    // Canonical live pairing authority for this daemon generation. The
+    // gateway serves /pair, rotation, and revocation from THIS instance
+    // and the RPC native auth provider verifies against it, so a pairing
+    // change reaches both surfaces immediately (no boot-time snapshot).
+    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
+    ));
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
+        let gateway_pairing = pairing_guard.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -578,6 +589,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let pairing = gateway_pairing.as_ref().clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -589,6 +601,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(pairing),
                         readiness_reporter,
                     )
                     .await
@@ -790,6 +803,16 @@ pub async fn run(
             None
         };
 
+        let rpc_auth = std::sync::Arc::new(
+            crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+                |e| {
+                    anyhow::Error::msg(format!(
+                        "building the RPC inbound authentication layer: {e:#}"
+                    ))
+                },
+            )?,
+        );
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -815,6 +838,7 @@ pub async fn run(
             sop_audit,
             hooks,
             cert_audit,
+            auth: rpc_auth,
         }))
     } else {
         None
@@ -1404,17 +1428,18 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, format!("{e:#}"));
+                    let error_chain = format!("{e:#}");
+                    crate::health::mark_component_error(name, &error_chain);
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{e:#}"),
+                                "error": &error_chain,
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e:#}")
+                        &format!("Daemon component '{name}' failed: {error_chain}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -3156,6 +3181,37 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_preserves_component_error_chain() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
+                Err(anyhow::Error::msg("provider entry has no model")
+                    .context("agents.ox.model_provider"))
+            });
+
+        let expected_chain = "agents.ox.model_provider: provider entry has no model";
+        let expected_message =
+            format!("Daemon component 'daemon-test-error-chain' failed: {expected_chain}");
+        let value = recv_log_event(&mut rx, &expected_message).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(value["attributes"]["error"], expected_chain);
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(
+            snapshot["components"]["daemon-test-error-chain"]["last_error"],
+            expected_chain
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -3338,6 +3394,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3639,6 +3696,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3668,6 +3726,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3756,7 +3815,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _pairing,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -4040,7 +4106,14 @@ mod tests {
         // The gateway asks for the reload once the connection exists, then
         // parks: an unrelated pending component must not extend shutdown.
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
                     let reload_tx = reload_controls
@@ -4091,7 +4164,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)
