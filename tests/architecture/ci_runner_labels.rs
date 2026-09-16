@@ -73,9 +73,7 @@ fn job_blocks(workflow: &str) -> BTreeMap<String, String> {
 
     let mut blocks = BTreeMap::new();
     for (index, (offset, name)) in starts.iter().enumerate() {
-        let end = starts
-            .get(index + 1)
-            .map_or(jobs.len(), |(next, _)| *next);
+        let end = starts.get(index + 1).map_or(jobs.len(), |(next, _)| *next);
         let previous = blocks.insert(name.clone(), jobs[*offset..end].to_string());
         assert!(previous.is_none(), "duplicate job id {name} in ci.yml");
     }
