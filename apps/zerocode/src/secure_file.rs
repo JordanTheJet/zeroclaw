@@ -62,8 +62,8 @@ pub(crate) fn sync_dir_where_supported(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace `path` with `bytes` in one step: stage a sibling created `0600`,
-/// fsync it, rename it over the target, then fsync the directory.
+/// Replace `path` with `bytes` in one step: stage a fresh sibling created
+/// `0600`, fsync it, rename it over the target, then fsync the directory.
 ///
 /// The rename is what makes a reader see either the whole previous file or the
 /// whole new one, never a truncated middle. The creation mode only covers a
@@ -76,13 +76,52 @@ pub(crate) fn sync_dir_where_supported(dir: &Path) -> Result<()> {
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let staged = staging_path(path);
-    // A staged file left by an interrupted earlier write is stale by
-    // definition; the create-truncate below replaces it.
-    write_durable(&staged, bytes, true)?;
-    std::fs::rename(&staged, path).with_context(|| format!("publishing {}", path.display()))?;
+    let staged = write_staged(path, bytes)?;
+    if let Err(e) = std::fs::rename(&staged, path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).with_context(|| format!("publishing {}", path.display()));
+    }
     restrict_to_owner(path, parent)?;
     sync_dir_where_supported(parent)
+}
+
+/// Stage `bytes` in a sibling of `path` that this call alone created, and
+/// return its path.
+///
+/// Each candidate name is opened with `create_new`, which refuses any
+/// existing entry, a symlink included. A link planted at a staging name
+/// therefore cannot redirect the write, and concurrent writers never share or
+/// truncate one staging file. A failed write removes its own staging file.
+fn write_staged(path: &Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    let file_name = path.file_name().unwrap_or_default();
+    let pid = std::process::id();
+    for attempt in 0u32..64 {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(file_name);
+        name.push(format!(".{pid}.{attempt}.tmp"));
+        let staged = path.with_file_name(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&staged) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", staged.display()));
+            }
+        };
+        if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).with_context(|| format!("writing {}", staged.display()));
+        }
+        return Ok(staged);
+    }
+    anyhow::bail!("no free staging name next to {}", path.display())
 }
 
 /// Tighten an existing file to `0600` and its directory to `0700`.
@@ -106,12 +145,6 @@ pub(crate) fn restrict_to_owner(path: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn staging_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +157,70 @@ mod tests {
         write_private_atomic(&path, b"second = 2\n").expect("the second write publishes");
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second = 2\n");
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["config.toml".to_string()], "{entries:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_atomic_does_not_follow_a_planted_staging_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "untouched\n").unwrap();
+        let path = tmp.path().join("config.toml");
+        let pid = std::process::id();
+        for attempt in 0..4 {
+            std::os::unix::fs::symlink(
+                &victim,
+                tmp.path().join(format!(".config.toml.{pid}.{attempt}.tmp")),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&victim, tmp.path().join("config.toml.tmp")).unwrap();
+
+        write_private_atomic(&path, b"fresh = true\n").expect("the write publishes");
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh = true\n");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the published file must be the staged file, not a link"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_each_publish_a_whole_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = std::sync::Arc::new(tmp.path().join("config.toml"));
+        let payloads: Vec<String> = (0..8)
+            .map(|writer| format!("writer = {writer}\n{}\n", "x".repeat(64 * 1024)))
+            .collect();
+        let handles: Vec<_> = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                let path = std::sync::Arc::clone(&path);
+                std::thread::spawn(move || write_private_atomic(&path, payload.as_bytes()))
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("every concurrent write publishes");
+        }
+
+        let published = std::fs::read_to_string(path.as_ref()).unwrap();
+        assert!(
+            payloads.contains(&published),
+            "the published file must be one writer's whole payload"
+        );
         let entries: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
