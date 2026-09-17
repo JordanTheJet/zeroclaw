@@ -5580,9 +5580,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = svc
             .read_skill(&skill_ref)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
@@ -5599,9 +5597,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = crate::skills::document::SkillDocument {
             frontmatter: req.frontmatter,
             body: req.body,
@@ -5620,9 +5616,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
         to_result(SkillsDeleteResult {
@@ -7028,6 +7022,32 @@ fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<
         return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
     }
     Ok(())
+}
+
+/// Resolve an RPC skill reference whose name is one plain directory name.
+///
+/// The skills service joins the name onto the bundle directory, so a name
+/// with a separator, `.` or `..`, or an absolute or prefixed path would read,
+/// overwrite, or archive a `SKILL.md` directory outside every bundle. Refuse
+/// such a name before the service sees it.
+fn resolve_skill_ref(
+    svc: &crate::skills::service::SkillsService<'_>,
+    name: &str,
+    bundle: &str,
+) -> Result<crate::skills::reference::SkillRef, JsonRpcError> {
+    let mut components = std::path::Path::new(name).components();
+    let single_name = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !name.contains(['/', '\\', '\0']);
+    if !single_name {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            format!("Invalid skill ref: {name:?} is not a single skill directory name"),
+        ));
+    }
+    svc.resolve_ref(name, Some(bundle))
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -9425,6 +9445,80 @@ mod tests {
         )
         .await;
         assert!(configured.get("result").is_some(), "{configured}");
+    }
+
+    #[tokio::test]
+    async fn skills_surfaces_refuse_a_name_outside_the_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        let bundle_dir = tmp.path().join("bundle");
+        let good = bundle_dir.join("good");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let manifest = "---\nname: good\ndescription: A bundled skill\n---\n\nbody\n";
+        std::fs::write(good.join("SKILL.md"), manifest).unwrap();
+        let foreign = "---\nname: outside\ndescription: Not a bundled skill\n---\n\nsecret\n";
+        std::fs::write(outside.join("SKILL.md"), foreign).unwrap();
+        config.skill_bundles.insert(
+            "team".into(),
+            zeroclaw_config::schema::SkillBundleConfig {
+                directory: Some(bundle_dir.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Skills,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Update,
+                    zeroclaw_api::grants::Verb::Delete,
+                ],
+            );
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let read = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "skills/read",
+            json!({"bundle": "team", "name": "good"}),
+        )
+        .await;
+        let frontmatter = read["result"]["frontmatter"].clone();
+        assert!(frontmatter.is_object(), "{read}");
+
+        let absolute = outside.to_string_lossy().to_string();
+        let mut id = 1u64;
+        for name in ["../outside", absolute.as_str(), "..", "good/../../outside"] {
+            for (method, params) in [
+                ("skills/read", json!({"bundle": "team", "name": name})),
+                (
+                    "skills/write",
+                    json!({"bundle": "team", "name": name, "frontmatter": frontmatter, "body": "overwritten"}),
+                ),
+                ("skills/delete", json!({"bundle": "team", "name": name})),
+            ] {
+                id += 1;
+                let response = rpc(&mut alice, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(INVALID_PARAMS),
+                    "{method} {name}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+            foreign,
+            "a skill name must not reach a manifest outside the bundle"
+        );
     }
 
     #[tokio::test]
