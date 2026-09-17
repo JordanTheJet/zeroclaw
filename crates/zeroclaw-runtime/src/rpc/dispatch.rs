@@ -1081,15 +1081,16 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Fine-grained agent selector for surfaces that address an agent without
-    /// running its tool loop: cron rows, attachments, personality files, and
-    /// per-agent cost. Composes with the coarse grant the gate already
-    /// enforced: both are required.
+    /// Fine-grained agent selector for surfaces that address an agent: cron
+    /// rows, attachments, personality files, per-agent cost, and SOP
+    /// authoring. Composes with the coarse grant the gate already enforced:
+    /// both are required.
     ///
     /// This deliberately omits `selector_session_agent`'s constrained-tools
-    /// refusal. That refusal exists because an agent session runs the model's
-    /// whole tool loop with no per-tool principal awareness yet; none of these
-    /// surfaces does, so the tool selector is not the boundary here.
+    /// refusal, which guards the tool loop an interactive session runs. Cron
+    /// jobs do later run an agent turn or a shell command, and keep the posture
+    /// the cron surface settled on; SOP runs and approvals use the session
+    /// posture instead.
     fn selector_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
@@ -1282,8 +1283,8 @@ impl RpcDispatcher {
             return Ok(());
         }
         let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted a listing of {:?}: only the workspaces and allowed \
-             roots of the agents it may use can be listed",
+            "Principal is not granted a listing of {:?}: only absolute paths that an agent \
+             it may use can read can be listed",
             req.path
         ));
         self.audit_auth_denial(Method::FsListDir, &denied);

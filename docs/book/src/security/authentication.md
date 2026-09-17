@@ -22,17 +22,28 @@ importantly, what changes for existing remote connections.
    refused without it. Fine-grained selectors compose on top:
    - config writes check `config_write_paths`;
    - session methods check the agent selector and hold the session's
-     workspace to that agent's workspace and allowed roots, whether the
-     workspace was named by the request, stored with a resumed session, or
-     restored from a durable one;
-   - attachments, personality files, per-agent cost queries, and cron jobs
-     check the agent selector;
-   - `fs/list_dir` lists only inside the workspaces and allowed roots of the
-     agents the principal may use.
+     workspace to a directory that agent's risk profile lets it both read and
+     write, whether the workspace was named by the request, stored with a
+     resumed session, or restored from a durable one;
+   - running or approving an SOP requires every agent it runs as, with the
+     same tool-selector rule as a session, and creating, saving, or deleting
+     one requires the agents it runs as;
+   - attachments, personality files, cost queries that name an agent, and
+     cron jobs check the agent selector, and a fleet cost summary lists only
+     the agents the principal may use;
+   - `fs/list_dir` lists only absolute paths that the risk profile of an
+     enabled agent the principal may use lets that agent read, and refuses
+     relative paths and `..` components.
 
-   Session methods repeat these checks after waiting for the session's
-   queue, so a request queued before its principal was narrowed or its
-   credential expired is refused when its turn comes.
+   These roots are whatever each agent's risk profile allows. An agent that
+   is not workspace-only (autonomy `full`, the `yolo` preset, or
+   `workspace.unrestricted_filesystem = true`) may read any path outside its
+   forbidden paths, so a principal entitled to such an agent may list and
+   open sessions anywhere that agent could.
+
+   `session/new` and `session/prompt` repeat these checks after waiting for
+   the session's queue, so a request queued before its principal was
+   narrowed or its credential expired is refused when its turn comes.
 
 Authorization is **live** for edits made through the daemon's RPC config
 methods, which is what zerocode's config editor uses: editing
@@ -41,8 +52,11 @@ that way re-compiles the policy at save time, and established connections
 re-resolve at their next operation, with no reconnect or restart. Edits made
 outside the daemon, directly in `config.toml`, through the web dashboard, or
 with `zeroclaw config set`, apply at the next daemon reload or restart.
-Revoking a gateway pairing token, from any surface, invalidates connections
-authenticated with it before their next operation.
+Revoking a gateway pairing token through the gateway's pairing controls
+invalidates connections authenticated with it before their next operation.
+Removing a token from `gateway.paired_tokens` by editing config does not
+revoke it: the edit never reaches the live pairing authority, which can
+write the token back.
 
 ## Providers
 
@@ -67,7 +81,14 @@ roster or present a token.
 
 Any **other** uid must be mapped by an explicit `[users.<name>].uid`
 entry. An unmapped uid (root included) is denied; there is no fallback to
-shared-operator access.
+shared-operator access. The listener creates the socket owner-only, so
+today only the daemon's own account and root can reach it; a roster entry
+decides what any other uid may do once it can.
+
+Windows named pipes carry no peer uid. Once a `[users]` roster exists, a
+local client there must present a token, `security.trust_daemon_uid` has no
+effect, and the daemon's own account has no trusted local route, so a
+lockout is repaired by editing `config.toml` and restarting.
 
 A client may forward its shell environment in `initialize` so the
 daemon's subprocesses see its `PATH` and credential sockets (see
@@ -211,6 +232,22 @@ boundary is its own tracked change), gateway HTTP routes keep their
 existing pairing checks, and channel identities do not resolve into this
 principal model. The daemon's own uid and the shared operator retain full
 access throughout, so single-operator installs behave exactly as before.
+
+Permission profiles limit what a principal can do over RPC. They do not
+isolate the code a principal causes an agent to run. Session turns, cron
+jobs, and SOP steps run as the daemon account, and with
+`security.trust_daemon_uid = true` (the default) anything running as that
+account can connect to the local socket as the shared operator. Grant
+session, cron, or SOP execution only to principals you would trust with
+operator access, or set `security.trust_daemon_uid = false` and map the
+operator through the roster.
+
+Some config paths carry authority themselves. A principal whose
+`config_write_paths` cover `permission_profiles`, `users`, `oidc`,
+`security`, or `gateway.paired_tokens` can grant itself anything, and one
+that can write `agents`, `risk_profiles`, `cron`, `channels`, or provider
+settings can change which agents run, with which tools, and where they may
+read and write. Grant those paths only to operators.
 
 zerocode's remote directory picker opens at the daemon's filesystem root,
 which a principal without operator grants may not list, so for such a
