@@ -187,6 +187,7 @@ impl AcpSessionStore {
         let mut rows = stmt
             .query([])
             .context("Failed to read ACP session schema")?;
+        let mut column_present = false;
         while let Some(row) = rows
             .next()
             .context("Failed to read ACP session schema row")?
@@ -195,17 +196,23 @@ impl AcpSessionStore {
                 .get(1)
                 .context("Failed to read ACP session column name")?;
             if column == "principal_id" {
-                return Ok(());
+                column_present = true;
+                break;
             }
         }
         drop(rows);
         drop(stmt);
 
-        match conn.execute("ALTER TABLE acp_sessions ADD COLUMN principal_id TEXT", []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(e).context("Failed to add ACP session principal owner"),
+        // The column and its index are one migration. An interrupted earlier
+        // run can leave the column without the index, so the index statement
+        // runs whenever the column exists, not only when it was just added.
+        if !column_present {
+            match conn.execute("ALTER TABLE acp_sessions ADD COLUMN principal_id TEXT", []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e).context("Failed to add ACP session principal owner"),
+            }
         }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_acp_sessions_principal \
@@ -1765,6 +1772,37 @@ mod tests {
         );
         assert_eq!(store.session_principal("unowned").unwrap(), Some(None));
         assert_eq!(store.session_principal("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn principal_index_is_repaired_when_the_column_exists_without_it() {
+        // An interrupted first migration can leave the column in place with
+        // no index. The migration must not treat "column present" as "done".
+        let tmp = TempDir::new().unwrap();
+        {
+            let store = AcpSessionStore::new(tmp.path()).unwrap();
+            store
+                .conn
+                .lock()
+                .execute("DROP INDEX idx_acp_sessions_principal", [])
+                .unwrap();
+        }
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let indexed: bool = reopened
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_acp_sessions_principal'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1;
+        assert!(
+            indexed,
+            "reopening must recreate the missing principal index"
+        );
     }
 
     #[test]

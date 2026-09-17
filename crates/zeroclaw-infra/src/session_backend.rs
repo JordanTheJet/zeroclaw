@@ -348,7 +348,13 @@ pub trait SessionBackend: Send + Sync {
         _session_key: &str,
         _principal_id: &str,
     ) -> std::io::Result<()> {
-        Ok(())
+        // Fail closed: a backend that cannot record the owner cannot isolate
+        // the session after a restart. Callers that need isolation treat this
+        // as a failed creation rather than a silently ownerless row.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this session backend does not record an owning principal",
+        ))
     }
 
     /// Delete a session ONLY if `owner_principal_id` matches the stored
