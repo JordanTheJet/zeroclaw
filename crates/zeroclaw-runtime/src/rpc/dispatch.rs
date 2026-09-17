@@ -1306,6 +1306,57 @@ impl RpcDispatcher {
         Err(rpc_err(denied.code, denied.message))
     }
 
+    /// Hold path-mode attachment sources to the destination agent's policy.
+    ///
+    /// Path mode makes the daemon read a local file on the caller's behalf and
+    /// copy it into the agent's workspace. A principal without operator grants
+    /// may name only an absolute local path that the destination agent's own
+    /// policy lets it read, the rule a listing follows, so the daemon
+    /// account's wider read access is not lent to the caller. Inline
+    /// `data_b64` entries carry their own bytes and pass. `None` grants are an
+    /// unbound dispatcher (the direct unit-test handlers) and pass.
+    fn authorize_attachment_sources(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        alias: &str,
+        entries: &[FileEntry],
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = grants else {
+            return Ok(());
+        };
+        if grants.admin {
+            return Ok(());
+        }
+        let sources: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.data_b64.is_none())
+            .filter_map(|entry| entry.path.as_deref())
+            .collect();
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let config = self.ctx.config.read();
+        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok();
+        for source in sources {
+            let path = std::path::Path::new(source);
+            let allowed = path.is_absolute()
+                && super::fs::resolves_locally(path)
+                && policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.is_resolved_path_readable(path));
+            if !allowed {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal is not granted attachment source {source:?}: only an absolute local \
+                     path that agent {alias:?} may read can be attached by path"
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(rpc_err(denied.code, denied.message));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this connection holds operator-level (admin) grants. An
     /// unauthenticated dispatcher (the direct unit-test handlers, which never
     /// reach a gated method through `process_line`) is not admin.
@@ -3410,6 +3461,18 @@ impl RpcDispatcher {
                 .to_string_lossy()
                 .to_string();
             let is_wss = self.peer_label.starts_with("wss:");
+            if !is_wss
+                && let Err(denied) = self.authorize_attachment_sources(
+                    Method::SessionPrompt,
+                    grants.as_ref(),
+                    &agent_alias,
+                    &req.attachments,
+                )
+            {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
             if !prompt.is_empty() {
                 prompt.push('\n');
             }
@@ -6033,6 +6096,14 @@ impl RpcDispatcher {
             .to_string();
 
         let is_wss = self.peer_label.starts_with("wss:");
+        if !is_wss {
+            self.authorize_attachment_sources(
+                Method::FileAttach,
+                self.stamped_grants(),
+                &agent_alias,
+                &req.files,
+            )?;
+        }
 
         let mut total_bytes: u64 = 0;
         let mut results = Vec::with_capacity(req.files.len());
@@ -9507,6 +9578,119 @@ mod tests {
             files_under(&agent_workspace),
             files_before,
             "a refused upload must not write into the agent's workspace"
+        );
+    }
+
+    /// `session_cwd_config` with alice also granted `Files:Create`, plus a
+    /// live session for `test-agent` rooted in its workspace, and a readable
+    /// file inside that workspace and another outside every agent root.
+    async fn attachment_source_fixture(
+        tmp: &tempfile::TempDir,
+        outside: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let mut config = session_cwd_config(tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Create],
+            );
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let inside = agent_workspace.join("inside.txt");
+        std::fs::write(&inside, "inside the workspace").unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside every agent root").unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, started_rx, _release_tx) = gated_provider();
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            "s-sources",
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        (ctx, agent_workspace, inside, secret, started_rx)
+    }
+
+    #[tokio::test]
+    async fn file_attach_by_path_reads_only_a_source_the_agent_may_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, inside, secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": secret.to_string_lossy()}]}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused source must not be copied into the agent's workspace"
+        );
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": inside.to_string_lossy()}]}),
+        )
+        .await;
+        assert!(attached["result"]["files"].is_array(), "{attached}");
+    }
+
+    #[tokio::test]
+    async fn session_prompt_by_path_refuses_a_source_the_agent_may_not_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, _inside, secret, mut started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "session_id": "s-sources",
+                "prompt": "summarize",
+                "attachments": [{"path": secret.to_string_lossy()}],
+                "client_turn_generation": 5,
+            },
+        })
+        .to_string();
+        alice.process_line(&line).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 3).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, "s-sources", 5);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused source must not be copied into the agent's workspace"
         );
     }
 
