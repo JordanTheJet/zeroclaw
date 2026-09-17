@@ -1515,6 +1515,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            lifecycle_commands: Vec::new(),
         };
 
         let runner = HookRunner::from_config(&config);
