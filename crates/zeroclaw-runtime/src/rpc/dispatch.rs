@@ -1264,10 +1264,20 @@ impl RpcDispatcher {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
-        let allowed = {
-            let config = self.ctx.config.read();
-            super::fs::listing_is_authorized(&config, grants, std::path::Path::new(&req.path))
-        };
+        let requested = std::path::Path::new(&req.path);
+        // Resolving a '..' component succeeds only when everything before it
+        // exists, so resolving one for a scoped principal would answer whether
+        // an arbitrary path exists. Refuse relative and parent-component paths
+        // outright, with the same answer as any other refusal.
+        let plain = requested.is_absolute()
+            && !requested
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir));
+        let allowed = grants.admin
+            || (plain && {
+                let config = self.ctx.config.read();
+                super::fs::listing_is_authorized(&config, grants, requested)
+            });
         if allowed {
             return Ok(());
         }
@@ -9656,6 +9666,50 @@ mod tests {
         narrow_alice_to_no_agents(&ctx);
         let response = list_dir(&mut alice, &mut rx, &workspace).await;
         assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    #[tokio::test]
+    async fn scoped_listing_refuses_parent_components_whether_or_not_the_path_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Climb from a probe back to the root and then down into the entitled
+        // workspace. Resolving this succeeds only if the probe exists.
+        let back_into_workspace = |probe: &std::path::Path| {
+            let depth = probe
+                .canonicalize()
+                .unwrap_or_else(|_| probe.to_path_buf())
+                .components()
+                .count();
+            let mut path = probe.to_path_buf();
+            for _ in 0..depth {
+                path.push("..");
+            }
+            path.join(workspace.strip_prefix("/").unwrap())
+        };
+        let existing = back_into_workspace(outside.path());
+        let absent = back_into_workspace(&outside.path().join("absent"));
+        let mut codes = Vec::new();
+        for path in [
+            existing.as_path(),
+            absent.as_path(),
+            std::path::Path::new("agent-workspace"),
+        ] {
+            let response = list_dir(&mut alice, &mut rx, path).await;
+            codes.push(response["error"]["code"].clone());
+        }
+        assert_eq!(
+            codes,
+            vec![json!(FORBIDDEN), json!(FORBIDDEN), json!(FORBIDDEN)],
+            "existing, absent, and relative probes must be indistinguishable"
+        );
     }
 
     #[tokio::test]
