@@ -1091,11 +1091,17 @@ impl RpcDispatcher {
     /// jobs do later run an agent turn or a shell command, and keep the posture
     /// the cron surface settled on; SOP runs and approvals use the session
     /// posture instead.
+    ///
+    /// A wildcard selector covers every configured agent, not every string.
+    /// Handlers derive paths from the alias, such as an agent's workspace, so
+    /// a principal without operator grants may address only an agent the
+    /// current configuration defines.
     fn selector_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        if auth.grants.may_use_agent(alias) {
+        let configured = auth.grants.admin || self.ctx.config.read().agents.contains_key(alias);
+        if configured && auth.grants.may_use_agent(alias) {
             return Ok(());
         }
         let denied = rpc_err(
@@ -9265,6 +9271,62 @@ mod tests {
             "beta's own soul",
             "a refused personality/put must not write"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let mut config = agent_scoped_config_in(&tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        let escaped = outside.path().join("workspace");
+        std::fs::create_dir_all(&escaped).unwrap();
+        std::fs::write(escaped.join("SOUL.md"), "not an agent's soul").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let absolute = outside.path().to_string_lossy().to_string();
+        let mut id = 0u64;
+        for alias in [absolute.as_str(), "../escape", "gamma"] {
+            for (method, params) in [
+                (
+                    "personality/get",
+                    json!({"agent": alias, "filename": "SOUL.md"}),
+                ),
+                (
+                    "personality/put",
+                    json!({"agent": alias, "filename": "SOUL.md", "content": "overwritten"}),
+                ),
+                ("personality/list", json!({"agent": alias})),
+            ] {
+                id += 1;
+                let response = rpc(&mut alice, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "{method} {alias}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(escaped.join("SOUL.md")).unwrap(),
+            "not an agent's soul",
+            "a wildcard selector must not reach a path named by an unconfigured alias"
+        );
+
+        let configured = rpc(
+            &mut alice,
+            &mut rx,
+            id + 1,
+            "personality/get",
+            json!({"agent": "beta", "filename": "SOUL.md"}),
+        )
+        .await;
+        assert!(configured.get("result").is_some(), "{configured}");
     }
 
     #[tokio::test]
