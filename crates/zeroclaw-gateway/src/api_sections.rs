@@ -819,6 +819,7 @@ pub struct SectionSelectBody {
 
 pub async fn handle_section_select(
     State(state): State<AppState>,
+    principal: crate::principal_gate::RequestPrincipal,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
     body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
@@ -1040,12 +1041,32 @@ pub async fn handle_section_select(
         working.mark_dirty(&fields_prefix);
     }
 
+    // Selecting an existing item writes nothing; creating one writes the
+    // new item's fields. Authorized before the save either way.
+    let before = state.config.read().clone();
+    let mut writes = crate::principal_gate::ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    if created {
+        writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
+    }
+    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    if let Err(denied) = authorization.covers_all(working.dirty_paths.iter().map(String::as_str)) {
+        return denied.into_response();
+    }
+
     if let Err(e) = working.save_dirty().await {
         return error_response(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save after select failed: {e}"),
         ));
     }
+    authorization.publish_persisted(&working);
     *state.config.write() = working;
 
     axum::Json(SelectItemResponse {
@@ -1732,6 +1753,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
