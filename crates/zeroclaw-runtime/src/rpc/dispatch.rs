@@ -1207,6 +1207,43 @@ impl RpcDispatcher {
         )))
     }
 
+    /// Hold one session binding, its agent and its workspace, to `grants`:
+    /// the agent and tool-posture selector, then workspace confinement. `None`
+    /// is an unbound dispatcher (the direct unit-test handlers) and passes.
+    fn authorize_session_binding(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        config: &Config,
+        alias: &str,
+        workspace: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = grants else {
+            return Ok(());
+        };
+        self.selector_session_agent_with_grants(method, grants, alias)?;
+        self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
+    }
+
+    /// [`Self::authorize_session_binding`] for a live session that
+    /// `session/new` is about to hand back instead of building a new one. The
+    /// live session keeps the workspace it was created with, possibly by
+    /// another principal or under an older policy.
+    fn authorize_resumed_session(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        existing: &crate::rpc::session::ResumedRpcSession,
+    ) -> Result<(), JsonRpcError> {
+        let config = self.ctx.config.read();
+        self.authorize_session_binding(
+            Method::SessionNew,
+            grants,
+            &config,
+            &existing.agent_alias,
+            &existing.workspace_dir,
+        )
+    }
+
     /// Whether this connection holds operator-level (admin) grants. An
     /// unauthenticated dispatcher (the direct unit-test handlers, which never
     /// reach a gated method through `process_line`) is not admin.
@@ -2338,6 +2375,9 @@ impl RpcDispatcher {
                 .await
             {
                 Ok(Some(existing)) => {
+                    // Nothing has waited yet, so the stamped grants are as
+                    // current as the gate that just ran.
+                    self.authorize_resumed_session(self.stamped_grants(), &existing)?;
                     return self
                         .finish_existing_session_resume(session_id, &chat_mode, existing)
                         .await;
@@ -2383,6 +2423,7 @@ impl RpcDispatcher {
                 .await
                 .map_err(|message| rpc_err(INVALID_PARAMS, message))?
         {
+            self.authorize_resumed_session(grants.as_ref(), &existing)?;
             return self
                 .finish_existing_session_resume(session_id, &chat_mode, existing)
                 .await;
@@ -2502,12 +2543,12 @@ impl RpcDispatcher {
                     .to_string()
             });
 
-        // A caller-selected cwd replaces the agent's workspace jail further
-        // down, so it is authorized here. A resumed ACP session's persisted
-        // workspace and the agent's own default are host-owned and skip it.
-        if req.cwd.is_some()
-            && let Some(grants) = grants.as_ref()
-        {
+        // Whichever workspace was chosen becomes the agent's jail root below,
+        // so it is authorized here, before anything is built or inserted. A
+        // caller-selected cwd and a resumed ACP row's persisted workspace were
+        // both chosen by a request, possibly another principal's or one made
+        // under an older policy; the agent's own default passes trivially.
+        if let Some(grants) = grants.as_ref() {
             self.confine_session_workspace_with_grants(
                 Method::SessionNew,
                 grants,
@@ -2977,13 +3018,21 @@ impl RpcDispatcher {
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh
     /// prompt recovers to a working session instead of hanging. Returns the
-    /// live agent on success; returns `None` for missing, killed, or unreadable
-    /// durable state.
+    /// live agent on success, and `Ok(None)` for missing, killed, or
+    /// unreadable durable state.
+    ///
+    /// The durable row names the agent and the workspace the session is
+    /// rebuilt with, and it may have been written by another principal or
+    /// under an older policy. With `grants` bound, both are held to them
+    /// before anything is built or installed, and a refusal is the `Err`.
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
-        let store = self.ctx.acp_session_store.clone()?;
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
+        let Some(store) = self.ctx.acp_session_store.clone() else {
+            return Ok(None);
+        };
         let sid_owned = sid.to_string();
         let loaded =
             tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
@@ -2997,7 +3046,7 @@ impl RpcDispatcher {
                         .with_outcome(::zeroclaw_log::EventOutcome::Success),
                     "session/prompt: refusing to rehydrate admin-killed ACP session"
                 );
-                return None;
+                return Ok(None);
             }
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -3011,9 +3060,11 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: failed to query ACP killed marker before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {
+                return Ok(None);
+            }
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3026,9 +3077,20 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: ACP killed-marker query task failed before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
         };
+
+        {
+            let config = self.ctx.config.read();
+            self.authorize_session_binding(
+                Method::SessionPrompt,
+                grants,
+                &config,
+                &data.agent_alias,
+                &data.workspace_dir,
+            )?;
+        }
 
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
@@ -3037,7 +3099,7 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let Ok(mut agent) = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -3048,7 +3110,9 @@ impl RpcDispatcher {
             self.ctx.sop_audit.clone(),
         )
         .await
-        .ok()?;
+        else {
+            return Ok(None);
+        };
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
                 Some(surface) => Some(surface.resolve()),
@@ -3064,7 +3128,7 @@ impl RpcDispatcher {
                             })),
                         "session/prompt: refusing to rehydrate an unsupported interaction surface"
                     );
-                    return None;
+                    return Ok(None);
                 }
             },
             None => None,
@@ -3084,7 +3148,8 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
-        self.ctx
+        if self
+            .ctx
             .sessions
             .insert(
                 sid.to_string(),
@@ -3097,7 +3162,10 @@ impl RpcDispatcher {
                 .with_owner(self.tui_id.clone()),
             )
             .await
-            .ok()?;
+            .is_err()
+        {
+            return Ok(None);
+        }
         let seed_event = self
             .ctx
             .sessions
@@ -3119,7 +3187,7 @@ impl RpcDispatcher {
             "rehydrated reaped session from durable store; turn continues on a working session"
         );
 
-        self.ctx.sessions.get_agent(sid).await
+        Ok(self.ctx.sessions.get_agent(sid).await)
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -3180,9 +3248,14 @@ impl RpcDispatcher {
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => match self.rehydrate_reaped_session(sid).await {
-                Some(a) => a,
-                None => {
+            None => match self.rehydrate_reaped_session(sid, grants.as_ref()).await {
+                Ok(Some(a)) => a,
+                Err(denied) => {
+                    return Err(self
+                        .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                        .await);
+                }
+                Ok(None) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
@@ -3203,24 +3276,37 @@ impl RpcDispatcher {
                 }
             },
         };
-        // Session/new performs its selector only for the initial admission.
-        // Reused and rehydrated sessions enter through session/prompt, so the
-        // same agent/tool posture is enforced here, against the grants
-        // resolved after admission, before any prompt-side effect. An unbound
-        // dispatcher (the direct unit-test handlers) has no grants to apply.
+        // Session/new authorizes a binding only when it creates or reattaches
+        // a session. Reused and rehydrated sessions enter through
+        // session/prompt, so the same agent/tool posture and workspace
+        // confinement are enforced here, against the grants resolved after
+        // admission, before any prompt-side effect. An unbound dispatcher (the
+        // direct unit-test handlers) has no grants to apply.
         let agent_alias = self
             .ctx
             .sessions
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        if let Some(grants) = grants.as_ref()
-            && let Err(denied) =
-                self.selector_session_agent_with_grants(Method::SessionPrompt, grants, &agent_alias)
-        {
-            return Err(self
-                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                .await);
+        if grants.is_some() {
+            let binding = match self.ctx.sessions.get_workspace_dir(sid).await {
+                Some(workspace) => {
+                    let config = self.ctx.config.read();
+                    self.authorize_session_binding(
+                        Method::SessionPrompt,
+                        grants.as_ref(),
+                        &config,
+                        &agent_alias,
+                        &workspace,
+                    )
+                }
+                None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+            };
+            if let Err(denied) = binding {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
         }
 
         // Process inline attachments: upload each, append markers to prompt.
@@ -8550,6 +8636,211 @@ mod tests {
         );
     }
 
+    // ── Resumed, rehydrated, and live session workspaces are confined ──
+    //
+    // A session keeps the workspace it was created with. Reattaching to it,
+    // rebuilding it from its durable row, or prompting it must hold that
+    // workspace to the prompting principal's roots, exactly as a
+    // caller-selected cwd is held.
+
+    /// Create an ACP session as `dispatcher` with an explicit `cwd`, then reap
+    /// it from memory so only the durable row remains.
+    async fn durable_acp_session_at(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) {
+        let created = rpc(
+            dispatcher,
+            rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": session_id,
+                "chat_mode": "acp",
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created["result"]["session_id"],
+            json!(session_id),
+            "{created}"
+        );
+        assert!(
+            ctx.sessions.remove(session_id).await,
+            "reap the live session, keeping only the durable row"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_resume_a_durable_acp_workspace_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, _chat_backend, acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let sid = "s-durable-outside";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        durable_acp_session_at(&ctx, &mut operator, &mut op_rx, sid, outside.path()).await;
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let resumed = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert_eq!(resumed["error"]["code"], json!(FORBIDDEN), "{resumed}");
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_none(),
+            "a refused resume must not install the session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "the durable row is left intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_resumes_a_durable_acp_workspace_inside_an_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-durable-root";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        durable_acp_session_at(&ctx, &mut operator, &mut op_rx, sid, &root).await;
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let resumed = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert_eq!(
+            resumed["result"]["workspace_dir"],
+            json!(root.to_string_lossy()),
+            "{resumed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_reattach_a_live_session_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let sid = "s-live-outside";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let created = session_new_with_cwd(&mut operator, &mut op_rx, sid, outside.path()).await;
+        assert_eq!(created["result"]["session_id"], json!(sid), "{created}");
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let reattached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            reattached["error"]["code"],
+            json!(FORBIDDEN),
+            "{reattached}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_refuses_to_rehydrate_a_workspace_whose_allowed_root_was_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-rehydrate-narrowed";
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        durable_acp_session_at(&ctx, &mut alice, &mut rx, sid, &root).await;
+        ctx.config
+            .write()
+            .risk_profiles
+            .get_mut("test-profile")
+            .expect("the fixture risk profile exists")
+            .allowed_roots
+            .clear();
+
+        send_prompt(&mut alice, 3, sid, 5).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 3).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 5);
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_none(),
+            "a refused rehydration must not install the session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "the durable row is left intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_rehydrates_a_workspace_inside_an_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-rehydrate-root";
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        durable_acp_session_at(&ctx, &mut alice, &mut rx, sid, &root).await;
+
+        let recovered = alice
+            .rehydrate_reaped_session(sid, alice.stamped_grants())
+            .await
+            .expect("a workspace inside an allowed root is not refused");
+        assert!(
+            recovered.is_some(),
+            "the durable row rehydrates to a live agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_prompt_a_live_session_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-outside";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            outside.path(),
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        send_prompt(&mut alice, 4, sid, 11).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 4).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 11);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+    }
+
     #[tokio::test]
     async fn session_prompt_admitted_with_an_expired_credential_is_refused() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -13784,7 +14075,10 @@ mod tests {
             "post-reap the session must be absent from memory"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             recovered.is_some(),
             "a reaped session with a live durable row must rehydrate to a \
@@ -13864,8 +14158,9 @@ mod tests {
         assert!(sessions.remove(sid).await, "reap must remove the session");
 
         let recovered = dispatcher
-            .rehydrate_reaped_session(sid)
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
             .await
+            .expect("an operator's rehydration is never refused")
             .expect("a reaped ACP session must rehydrate to a working agent");
 
         let agent = recovered.lock().await;
@@ -13920,7 +14215,10 @@ mod tests {
             "session/kill must preserve durable history"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             recovered.is_none(),
             "admin-killed ACP sessions must stay killed instead of rehydrating \
@@ -18252,7 +18550,10 @@ mod tests {
 
         // Replace the session via ACP rehydration while the stale refresh
         // is paused. This installs a same-ID successor via SessionStore::insert.
-        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        let rehydrated = dispatcher
+            .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             rehydrated.is_some(),
             "ACP rehydration must install the same-ID successor"
