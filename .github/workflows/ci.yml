@@ -80,7 +80,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -93,7 +93,7 @@ jobs:
 
   history-guard:
     name: Common Ancestor
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -108,7 +108,7 @@ jobs:
 
   repo-structure:
     name: Repository Structure
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -172,7 +172,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -212,7 +212,7 @@ jobs:
     name: Relay Container Fresh-Volume Smoke
     needs: [relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -283,7 +283,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -766,7 +766,7 @@ jobs:
   windows-test-scope:
     name: Advisory Windows test selection
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
@@ -1110,7 +1110,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -1209,7 +1209,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1268,7 +1268,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
@@ -1326,7 +1326,7 @@ jobs:
     name: Nix Module Eval
     needs: [path-changes]
     if: needs.path-changes.outputs.nix == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1341,7 +1341,7 @@ jobs:
     name: Nix Hash Drift
     needs: [path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1383,7 +1383,7 @@ jobs:
     name: Docs Style
     needs: [path-changes]
     if: needs.path-changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1407,7 +1407,7 @@ jobs:
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1468,7 +1468,7 @@ jobs:
     name: Web Permission Tests
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1505,7 +1505,7 @@ jobs:
     name: CI Required Gate
     if: always()
     needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
         run: |

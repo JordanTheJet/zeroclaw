@@ -20,6 +20,46 @@ use regex::Regex;
 /// changing this constant and every job below in the same reviewed commit.
 const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 
+/// The runner label for housekeeping jobs: formatting, change detection,
+/// repository guards, docs and policy gates, the Nix checks, the container
+/// smoke, the Windows-test selector, and the required-gate aggregator. None of
+/// them needs 8 vCPUs, but all of them were stranded on `ubuntu-latest` during
+/// the 2026-09-14 hosted-runner assignment outage while the Blacksmith fleet
+/// ran untouched, so the whole required gate stalled on jobs whose combined
+/// work is minutes. Hosting them on Blacksmith removes GitHub's hosted pool
+/// from the required gate's critical path entirely.
+const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
+
+/// Every housekeeping job on the Blacksmith 4-vCPU class. Same contract as
+/// `COMPILE_JOBS`: this list is the reviewable inventory the workflow is
+/// checked against.
+const HOUSEKEEPING_JOBS: [&str; 16] = [
+    "fmt",
+    "gate",
+    "history-guard",
+    "repo-structure",
+    "docs-style",
+    "zerocode-rpc-boundary",
+    "parallel-runtime-test-changes",
+    "path-changes",
+    "relay-container-smoke-changes",
+    "windows-clippy-tools-changes",
+    "nix-eval",
+    "nix-hash-drift",
+    "relay-container-smoke",
+    "windows-test-scope",
+    "security",
+    "web-permission-tests",
+];
+
+/// Jobs that stay on GitHub-hosted `ubuntu-latest` because they depend on the
+/// hosted image itself. `test-landlock` exercises the Landlock LSM, which the
+/// GitHub kernel enables; a different runner class could silently skip that
+/// security coverage. Adding a job here requires a reason of that kind, not
+/// convenience: during a hosted outage, every entry in this list is a check
+/// that cannot run.
+const HOSTED_LINUX_JOBS: [&str; 1] = ["test-landlock"];
+
 /// Every job that compiles the workspace on the Blacksmith fleet. A new compile
 /// job must be added here, which is the point: the list is the inventory this
 /// gate checks the workflow against.
@@ -159,6 +199,61 @@ fn rust_cache_callers_pass_a_reviewed_provider_input() {
              cache the rest of the fleet never reads silently loses its cache"
         );
     }
+}
+
+#[test]
+fn housekeeping_jobs_pin_the_four_vcpu_label() {
+    let workflow = ci_workflow();
+    let blocks = job_blocks(&workflow);
+
+    for name in HOUSEKEEPING_JOBS {
+        let block = blocks
+            .get(name)
+            .unwrap_or_else(|| panic!("ci.yml must define the {name} job"));
+        assert!(
+            block.contains(&format!("    runs-on: {HOUSEKEEPING_LABEL}\n")),
+            "{name} must run on {HOUSEKEEPING_LABEL}"
+        );
+    }
+}
+
+#[test]
+fn only_the_declared_housekeeping_jobs_claim_the_four_vcpu_class() {
+    let workflow = ci_workflow();
+    let blocks = job_blocks(&workflow);
+
+    let claiming: BTreeSet<&str> = blocks
+        .iter()
+        .filter(|(_, block)| block.contains(HOUSEKEEPING_LABEL))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let declared: BTreeSet<&str> = HOUSEKEEPING_JOBS.into_iter().collect();
+
+    assert_eq!(
+        claiming, declared,
+        "every job using {HOUSEKEEPING_LABEL} must be listed in \
+         HOUSEKEEPING_JOBS, so this inventory stays reviewable in one place"
+    );
+}
+
+#[test]
+fn hosted_linux_stays_an_explicit_allowlist() {
+    let workflow = ci_workflow();
+    let blocks = job_blocks(&workflow);
+
+    let hosted: BTreeSet<&str> = blocks
+        .iter()
+        .filter(|(_, block)| block.contains("    runs-on: ubuntu-latest\n"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let declared: BTreeSet<&str> = HOSTED_LINUX_JOBS.into_iter().collect();
+
+    assert_eq!(
+        hosted, declared,
+        "a Linux job may use GitHub-hosted ubuntu-latest only when it depends \
+         on the hosted image itself (see HOSTED_LINUX_JOBS): every job here is \
+         one the required gate cannot run during a hosted-runner outage"
+    );
 }
 
 #[test]
