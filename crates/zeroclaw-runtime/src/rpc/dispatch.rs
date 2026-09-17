@@ -1291,15 +1291,16 @@ impl RpcDispatcher {
     fn authorize_resumed_session(
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
-        existing: &crate::rpc::session::ResumedRpcSession,
+        agent_alias: &str,
+        workspace_dir: &str,
     ) -> Result<(), JsonRpcError> {
         let config = self.ctx.config.read();
         self.authorize_session_binding(
             Method::SessionNew,
             grants,
             &config,
-            &existing.agent_alias,
-            &existing.workspace_dir,
+            agent_alias,
+            workspace_dir,
         )
     }
 
@@ -2540,15 +2541,17 @@ impl RpcDispatcher {
                     &req.agent_alias,
                     &chat_mode,
                     self.tui_id.clone(),
+                    // Nothing has waited yet, so the stamped grants are as
+                    // current as the gate that just ran.
+                    |alias, workspace| {
+                        self.authorize_resumed_session(self.stamped_grants(), alias, workspace)
+                    },
                 )
                 .await
             {
                 Ok(Some(existing)) => {
-                    // Nothing has waited yet, so the stamped grants are as
-                    // current as the gate that just ran.
-                    self.authorize_resumed_session(self.stamped_grants(), &existing)?;
                     return self
-                        .finish_existing_session_resume(session_id, &chat_mode, existing)
+                        .finish_existing_session_resume(session_id, &chat_mode, existing?)
                         .await;
                 }
                 Ok(None) | Err("session uses a different chat mode") => {}
@@ -2588,13 +2591,15 @@ impl RpcDispatcher {
                     &req.agent_alias,
                     &chat_mode,
                     self.tui_id.clone(),
+                    |alias, workspace| {
+                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)
+                    },
                 )
                 .await
                 .map_err(|message| rpc_err(INVALID_PARAMS, message))?
         {
-            self.authorize_resumed_session(grants.as_ref(), &existing)?;
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing)
+                .finish_existing_session_resume(session_id, &chat_mode, existing?)
                 .await;
         }
         if admitted_mode.is_some() {
@@ -9276,6 +9281,12 @@ mod tests {
         let created = session_new_with_cwd(&mut operator, &mut op_rx, sid, outside.path()).await;
         assert_eq!(created["result"]["session_id"], json!(sid), "{created}");
 
+        let owner_before = ctx.sessions.session_owner_tui_id(sid).await;
+        assert!(
+            owner_before.as_ref().is_some_and(Option::is_some),
+            "the operator's session has an owner"
+        );
+
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let reattached = rpc(
             &mut alice,
@@ -9289,6 +9300,11 @@ mod tests {
             reattached["error"]["code"],
             json!(FORBIDDEN),
             "{reattached}"
+        );
+        assert_eq!(
+            ctx.sessions.session_owner_tui_id(sid).await,
+            owner_before,
+            "a refused reattach must not take over the session's ownership"
         );
     }
 
