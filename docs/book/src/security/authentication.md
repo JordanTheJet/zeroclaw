@@ -339,20 +339,47 @@ provider registry and resolver:
   historical 401 shape.
 - An **OIDC bearer** presented with the `X-ZeroClaw-Auth-Provider:
   oidc.<alias>` header is verified by that provider and resolved to a
-  scoped principal. Its `Config` grants then gate the request by HTTP
-  method: read for GET, delete for DELETE, update for everything else.
-  Selection is explicit, mirroring the RPC handshake's `auth_provider`
-  field: the named provider's denial is authoritative, and there is
-  never a fallback between providers.
+  scoped principal. Selection is explicit, mirroring the RPC
+  handshake's `auth_provider` field: the named provider's denial is
+  authoritative, and there is never a fallback between providers.
 - CORS preflight (`OPTIONS`) passes through unauthenticated, as it
-  always has.
+  always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
+  DELETE is refused.
 
-Scoped requests re-derive resolver policy from the live configuration,
-so a roster or profile change applied through the gateway takes effect
-on the next request. Changing a provider's verification settings
-(issuer, keys, validation mode) still requires the daemon reload the
-config write already flags. Other gateway surfaces keep the pairing
-check per handler and adopt the layer in follow-ups.
+A scoped principal's `Config` grants are enforced in two steps. The
+route layer applies a coarse floor per HTTP method: a read needs
+`read`, anything else needs at least one of `create`, `update` or
+`delete`, so a read-only principal never reaches a mutating handler.
+Each mutating handler then authorizes its **complete write set** before
+its first side effect: every config path the mutation will persist,
+classified by what it does to the configuration (`create` for a path it
+brings into being, `delete` for one it removes, `update` otherwise) and
+matched against the profile's `config_write_paths` selectors. The
+classification follows the operation, not the method: creating a map
+key through `POST /api/config/map-key`, or implicitly through a `PUT`
+under a new alias, needs `create`; a JSON Patch `remove` and
+`DELETE /api/config/map-key` need `delete`; a rename needs `delete` on
+its source and `create` on its destination; the references a delete or
+rename cascade rewrites elsewhere are part of the write set too. One
+unauthorized member refuses the whole mutation, batch or cascade, and
+nothing is written. Operations whose write set cannot be enumerated up
+front (a schema migration of the file, a Quickstart apply) require the
+`*` selector. The persist boundary re-checks the paths about to be
+written against what the handler authorized, so a handler cannot
+persist more than it authorized.
+
+Policy moves only at that persist boundary: the handler that writes a
+configuration publishes the authorization state compiled from it as
+the next accepted revision, and every request is verified and resolved
+against the accepted snapshot as it stands. Nothing on the request
+path recompiles policy, so a request that read the configuration
+before a concurrent persist can never reinstall the older policy over
+the newer one; a persisted change to a provider's verification
+settings, a roster or a profile takes effect on the next request. The
+daemon's own RPC surface holds a separate live configuration and
+reaches the same state through the reload the gateway write flags.
+Other gateway surfaces keep the pairing check per handler and adopt the
+layer in follow-ups.
 
 ## Credential lifecycle
 

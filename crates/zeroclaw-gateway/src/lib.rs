@@ -1892,12 +1892,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // The gateway's inbound-auth authority: same registry/resolver stack
-    // as the RPC layer, same canonical pairing guard, plus the live
-    // config handle for scoped-principal policy freshness.
+    // as the RPC layer, same canonical pairing guard. Its accepted policy
+    // moves only when a config mutation persists (see `persist_and_swap`).
     let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
         &config,
         Arc::clone(&pairing),
-        Arc::clone(&config_state),
     )?);
 
     let state = AppState {
