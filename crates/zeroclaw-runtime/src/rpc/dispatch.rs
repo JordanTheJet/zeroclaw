@@ -1127,10 +1127,29 @@ impl RpcDispatcher {
     /// a principal without operator grants may address only an agent the
     /// current configuration defines.
     fn selector_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.check_agent_selector(method, alias, true)
+    }
+
+    /// [`Self::selector_agent`] for a surface that only names an agent and
+    /// derives no path from it, such as rendering personality templates for
+    /// an agent Quickstart is about to create, so the alias need not be
+    /// configured yet.
+    fn selector_agent_name(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.check_agent_selector(method, alias, false)
+    }
+
+    fn check_agent_selector(
+        &self,
+        method: Method,
+        alias: &str,
+        require_configured: bool,
+    ) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let configured = auth.grants.admin || self.ctx.config.read().agents.contains_key(alias);
+        let configured = !require_configured
+            || auth.grants.admin
+            || self.ctx.config.read().agents.contains_key(alias);
         if configured && auth.grants.may_use_agent(alias) {
             return Ok(());
         }
@@ -5784,7 +5803,7 @@ impl RpcDispatcher {
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
         if let Some(agent) = req.agent.as_deref() {
-            self.selector_agent(Method::PersonalityTemplates, agent)?;
+            self.selector_agent_name(Method::PersonalityTemplates, agent)?;
         }
         let config = self.ctx.config.read().clone();
         let ctx = personality_template_context(&config, &req);
@@ -9514,6 +9533,18 @@ mod tests {
         )
         .await;
         assert!(configured.get("result").is_some(), "{configured}");
+
+        // Templates build no path from the alias, so Quickstart can still
+        // render them for an agent it has not created yet.
+        let templates = rpc(
+            &mut alice,
+            &mut rx,
+            id + 2,
+            "personality/templates",
+            json!({"agent": "gamma"}),
+        )
+        .await;
+        assert!(templates.get("result").is_some(), "{templates}");
     }
 
     #[tokio::test]
