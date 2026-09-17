@@ -8138,6 +8138,7 @@ mod tests {
             ("session/new", Resource::Sessions, Verb::Create),
             ("memory/delete", Resource::Memory, Verb::Delete),
             ("sops/run", Resource::Sops, Verb::Execute),
+            ("sops/run-detail", Resource::Sops, Verb::Read),
             ("skills/write", Resource::Skills, Verb::Update),
             ("cron/trigger", Resource::Cron, Verb::Execute),
         ] {
