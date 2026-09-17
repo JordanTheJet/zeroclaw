@@ -1254,6 +1254,17 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
 channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
 channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
