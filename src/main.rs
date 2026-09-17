@@ -5323,6 +5323,18 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // Enrollment's contract is that stdout carries exactly the token and
+    // nothing else, so the `oidc` commands are dispatched before any
+    // startup prelude that may print: the OTP prelude below discloses a
+    // freshly minted seed's enrollment URI on stdout, which must never be
+    // captured alongside an access token by a command substitution.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::Oidc { .. }) {
+        let Commands::Oidc { oidc_command } = cli.command else {
+            unreachable!("matched the Oidc variant above")
+        };
+        return handle_oidc_command(oidc_command, &config).await;
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -9807,7 +9819,7 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
             format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
         ));
     };
-    let enrollment = Enrollment::new(entry.clone())?;
+    let enrollment = Enrollment::new(&alias, entry.clone())?;
 
     let token = if want_client_credentials {
         enrollment.client_credentials().await?
@@ -9836,19 +9848,34 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
                 ),
             )
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
-        let mut interval = start.interval.max(1);
+        // The device code's lifetime bounds everything below: sleeps are
+        // clipped to what remains, no poll is sent after expiry, and the
+        // arithmetic is checked so an absurd `expires_in` cannot wrap.
+        let lifetime = std::time::Duration::from_secs(start.expires_in.min(3600));
+        let deadline = std::time::Instant::now()
+            .checked_add(lifetime)
+            .context("device code lifetime overflows the clock")?;
+        let expired = || {
+            anyhow::Error::msg(t(
+                "cli-oidc-device-expired",
+                "The device code expired before approval; run the command again.",
+            ))
+        };
+        let mut interval = start.interval.clamp(1, 300);
         loop {
-            if std::time::Instant::now() >= deadline {
-                bail!(t(
-                    "cli-oidc-device-expired",
-                    "The device code expired before approval; run the command again.",
-                ));
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(expired());
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let wait = std::time::Duration::from_secs(interval)
+                .min(deadline.saturating_duration_since(now));
+            tokio::time::sleep(wait).await;
+            if std::time::Instant::now() >= deadline {
+                return Err(expired());
+            }
             match enrollment.device_grant_poll(&start.device_code).await? {
                 DevicePollOutcome::Pending => {}
-                DevicePollOutcome::SlowDown => interval += 5,
+                DevicePollOutcome::SlowDown => interval = interval.saturating_add(5).min(300),
                 DevicePollOutcome::Token(token) => break *token,
             }
         }
