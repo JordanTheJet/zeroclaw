@@ -272,6 +272,7 @@ impl WssSection {
             && self.direct_timeout_secs.is_none()
             && self.reprobe_secs.is_none()
             && self.auth_token.is_none()
+            && self.auth_token_file.is_none()
             && self.auth_provider.is_none()
     }
 }
@@ -2054,6 +2055,19 @@ mod tests {
         assert_eq!(
             back.connection.wss.tls.skip_verify_routes,
             vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn a_token_file_alone_keeps_the_connection_section() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.auth_token_file = Some("/etc/zeroclaw/zerocode-bearer".to_string());
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            back.connection.wss.auth_token_file.as_deref(),
+            Some("/etc/zeroclaw/zerocode-bearer"),
+            "got:\n{body}"
         );
     }
 
