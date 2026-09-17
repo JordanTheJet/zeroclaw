@@ -231,20 +231,42 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
-Scoped principals get PRIVATE memory: their memory operations read and
-write a per-principal plane whose owner travels in every storage
-statement, invisible to and untouchable from the shared plane (and vice
-versa). Private writes pass the same content scanning and policy gates as
-shared writes, and private operations are audited with principal
-attribution. On memory backends without principal support (markdown,
-lucid, postgres, qdrant today) private memory fails closed with a clear
-denial rather than silently un-scoping.
+Every authenticated principal gets PRIVATE memory: their memory operations
+read and write a per-principal plane whose owner travels in every storage
+statement, composed with the agent, namespace and tenant dimensions (the
+same key under two agents is two rows). The plane follows the principal's
+identity, not the admin bypass: a named administrator's memory is their
+own private plane, so promoting or demoting a user never hides their notes
+or redirects their writes. Only the unauthenticated shared operator is on
+the shared plane by default; a caller with the admin bypass may name
+`plane = "shared"` on a `memory/*` request explicitly, which is audited,
+and a scoped principal cannot.
+
+The two planes are untouchable from each other in both directions: a
+shared write can neither name a private row's storage key nor overwrite a
+private row, a private write never converts a shared row, ordinary exports
+and the markdown snapshot carry shared rows only, and the legacy bulk
+purges reach shared rows only. Private rows are exported and purged
+through owner-carrying operations.
+
+A session created by a principal has its memory handle pinned to that
+principal's private plane for the session's whole life, whoever prompts it
+later (an administrator restoring a reaped session restores it on the
+durable owner's plane), so the memory tools and per-turn recall inside a
+scoped session never touch the shared plane. There is no grant that opens
+the shared plane to a scoped session. Private writes pass the same content
+scanning and policy gates as shared writes, and private operations are
+audited with the full scope. On memory backends without principal support
+(markdown, lucid, postgres, qdrant today) private memory fails closed with a
+clear denial rather than silently un-scoping, which for a scoped session
+means its memory tools refuse.
 
 ## What this layer does not do (yet)
 
-Agent-loop memory (auto-save and per-turn recall inside sessions) stays
-on the shared plane, administrative access into another principal's
-private memory has no surfaced pathway yet (deny-by-default), gateway
-HTTP routes keep their existing pairing checks, and channel identities do
-not resolve into this principal model. The daemon's own uid and the shared operator retain full
-access throughout, so single-operator installs behave exactly as before.
+Consolidation and governance derive shared-plane rows and do not run for
+private sessions; administrative access into another principal's private
+memory has no surfaced pathway yet (deny-by-default); gateway HTTP routes
+keep their existing pairing checks; and channel identities do not resolve
+into this principal model. The daemon's own uid and the shared operator
+retain full access throughout, so single-operator installs behave exactly
+as before.
