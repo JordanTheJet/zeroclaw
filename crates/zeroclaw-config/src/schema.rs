@@ -31,6 +31,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.copilot",
     "model_provider.gemini",
     "model_provider.glm",
+    "model_provider.hailo_ollama",
     "model_provider.ollama",
     "model_provider.openai",
     "model_provider.openrouter",
@@ -46,6 +47,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.telegram",
     "channel.wechat",
     "channel.whatsapp",
+    "tool.a2a",
     "tool.browser",
     "tool.composio",
     "tool.http_request",
@@ -935,6 +937,29 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through this OpenAI-compatible
+    /// provider. When true, request bodies on the structured paths (agent
+    /// turns, tool calls, structured streaming) gain an Anthropic-shaped
+    /// `cache_control` breakpoint on the system prompt and on the last
+    /// message once the conversation has more than one non-system message,
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage populates the cached-token counters.
+    /// With `merge_system_into_user`, the merged first user message carries
+    /// the system breakpoint instead. The text-only helpers (`chat_with_system`,
+    /// `chat_with_history`, the legacy chunk-stream APIs) deliberately emit
+    /// no breakpoints: their responses drop usage, so a premium cache write
+    /// they triggered could never be accounted for.
+    /// Only gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic Messages API forward these breakpoints (e.g. LiteLLM).
+    /// Default `false`: request bodies and response handling are unchanged.
+    ///
+    /// Before relying on it, verify the configured route serves cache reads:
+    /// an immediate repeat of a cache-creating request must report
+    /// `cache_read_input_tokens > 0`. Some gateway routes accept and bill
+    /// cache writes without ever serving reads.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -1182,6 +1207,18 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Models Anthropic may fall back to **server-side, inside one API call**
+    /// when the requested model's safety classifiers decline a request
+    /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
+    /// the `server-side-fallback-2026-06-01` beta; entries are tried in order,
+    /// must differ from the requested model, and must be permitted fallback
+    /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
+    /// non-permitted entry is rejected by the API). Applies to non-streaming
+    /// requests only. Distinct from the generic `fallback_models`, which
+    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// sends no fallback parameter and no beta value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_fallback_models: Vec<String>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -1387,6 +1424,40 @@ pub struct OllamaModelProviderConfig {
     pub temperature_override: Option<f64>,
 }
 
+// ── Hailo-Ollama (native local-default endpoint) ──
+
+/// Native Hailo-Ollama loopback endpoint used when an alias omits `uri`.
+pub const HAILO_OLLAMA_DEFAULT_URI: &str = "http://localhost:8000";
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HailoOllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for HailoOllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => HAILO_OLLAMA_DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hailo_ollama"]
+pub struct HailoOllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_secs: Option<u64>,
+}
+
 // ── Together ──
 
 #[derive(
@@ -1472,6 +1543,81 @@ pub struct GroqModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+}
+
+// ── Crusoe ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CrusoeEndpoint {
+    #[default]
+    Default,
+}
+
+impl CrusoeEndpoint {
+    /// Canonical Crusoe Managed Inference endpoint. Single source of truth —
+    /// `CompatFamilySpec::DEFAULT_URL` for `CrusoeModelProviderConfig` references
+    /// this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.inference.crusoecloud.com/v1";
+}
+
+impl ModelEndpoint for CrusoeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.crusoe"]
+pub struct CrusoeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod crusoe_tests {
+    use super::*;
+
+    #[test]
+    fn crusoe_endpoint_uri() {
+        assert_eq!(
+            CrusoeEndpoint::Default.uri(),
+            "https://api.inference.crusoecloud.com/v1"
+        );
+    }
+
+    #[test]
+    fn crusoe_config_defaults_empty() {
+        let cfg = CrusoeModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn crusoe_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.crusoe.default]
+model = "deepseek-ai/DeepSeek-V4-Flash"
+"#;
+        let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .crusoe
+            .get("default")
+            .expect("crusoe.default present");
+        assert_eq!(
+            alias.base.model.as_deref(),
+            Some("deepseek-ai/DeepSeek-V4-Flash")
+        );
+    }
 }
 
 // ── Mistral ──
@@ -3438,6 +3584,7 @@ impl_default_family_endpoint! {
     AtomicChatModelProviderConfig,
     OpenRouterModelProviderConfig,
     OllamaModelProviderConfig,
+    HailoOllamaModelProviderConfig,
     TogetherModelProviderConfig,
     FireworksModelProviderConfig,
     GroqModelProviderConfig,
@@ -3447,6 +3594,7 @@ impl_default_family_endpoint! {
     PerplexityModelProviderConfig,
     XaiModelProviderConfig,
     CerebrasModelProviderConfig,
+    CrusoeModelProviderConfig,
     SambanovaModelProviderConfig,
     HyperbolicModelProviderConfig,
     DeepinfraModelProviderConfig,
@@ -8369,7 +8517,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), or "anysearch" (optional API key; anonymous requests use a lower quota)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), or "serply" (Google web results, requires API key)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8402,6 +8550,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub anysearch_api_key: Option<String>,
+    /// Serply API key (required if search_provider is `"serply"`). Obtain at <https://serply.io>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub serply_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8435,6 +8589,7 @@ impl Default for WebSearchConfig {
             jina_api_key: None,
             bocha_api_key: None,
             anysearch_api_key: None,
+            serply_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -10337,6 +10492,42 @@ impl ProxyConfig {
         }
     }
 
+    /// Apply a selected proxy to a client builder without falling back to
+    /// direct traffic when proxy construction fails.
+    pub fn try_apply_to_reqwest_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+        service_key: &str,
+    ) -> Result<reqwest::ClientBuilder> {
+        if !self.should_apply_to_service(service_key) {
+            return Ok(builder);
+        }
+
+        let no_proxy = self.no_proxy_value();
+
+        if let Some(url) = normalize_proxy_url_option(self.all_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::all(&url)
+                .with_context(|| format!("Invalid all_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.http_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::http(&url)
+                .with_context(|| format!("Invalid http_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.https_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::https(&url)
+                .with_context(|| format!("Invalid https_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
+        }
+
+        Ok(builder)
+    }
+
+    /// Apply a selected proxy to a client builder, preserving the legacy
+    /// best-effort behavior for callers that may fall back to direct traffic.
     pub fn apply_to_reqwest_builder(
         &self,
         mut builder: reqwest::ClientBuilder,
@@ -10988,6 +11179,21 @@ pub fn runtime_proxy_config() -> ProxyConfig {
     runtime_proxy_config_snapshot().1
 }
 
+pub fn try_apply_runtime_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> Result<reqwest::ClientBuilder> {
+    let proxy = runtime_proxy_config();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    proxy.try_apply_to_reqwest_builder(builder, service_key)
+}
+
 pub fn apply_runtime_proxy_to_builder(
     builder: reqwest::ClientBuilder,
     service_key: &str,
@@ -11200,7 +11406,9 @@ fn apply_explicit_proxy_to_builder(
 // handshake.
 
 /// Combined async IO trait for boxed WebSocket transport streams.
+#[cfg(feature = "ws-transport")]
 trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+#[cfg(feature = "ws-transport")]
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 /// A boxed async IO stream used when a WebSocket connection is tunnelled
@@ -11210,8 +11418,10 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWr
 /// We wrap in a newtype so we can implement `AsyncRead` and `AsyncWrite`
 /// via delegation, since Rust trait objects cannot combine multiple
 /// non-auto traits.
+#[cfg(feature = "ws-transport")]
 pub struct BoxedIo(Box<dyn AsyncReadWrite>);
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncRead for BoxedIo {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -11222,6 +11432,7 @@ impl tokio::io::AsyncRead for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncWrite for BoxedIo {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -11246,15 +11457,18 @@ impl tokio::io::AsyncWrite for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl Unpin for BoxedIo {}
 
 /// Convenience alias for the WebSocket stream returned by the proxy-aware
 /// connect helpers.
+#[cfg(feature = "ws-transport")]
 pub type ProxiedWsStream = tokio_tungstenite::WebSocketStream<BoxedIo>;
 
 /// Resolve the effective proxy URL for a WebSocket connection to the
 /// given `ws_url`, taking into account the per-channel `proxy_url`
 /// override, the runtime proxy config, scope and no_proxy list.
+#[cfg(feature = "ws-transport")]
 fn resolve_ws_proxy_url(
     service_key: &str,
     ws_url: &str,
@@ -11319,6 +11533,7 @@ fn resolve_ws_proxy_url(
 ///
 /// `service_key` is the proxy-service selector (e.g. `"channel.discord"`).
 /// `channel_proxy_url` is the optional per-channel proxy override.
+#[cfg(feature = "ws-transport")]
 pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
@@ -11418,6 +11633,7 @@ pub async fn ws_connect_with_proxy(
 }
 
 /// Establish a WebSocket connection tunnelled through the given proxy URL.
+#[cfg(feature = "ws-transport")]
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
@@ -11574,6 +11790,7 @@ async fn ws_connect_via_proxy(
 }
 
 /// Find the `\r\n\r\n` boundary marking the end of HTTP headers.
+#[cfg(feature = "ws-transport")]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
@@ -12926,6 +13143,32 @@ fn default_always_ask() -> Vec<String> {
 }
 
 impl RiskProfileConfig {
+    /// Legacy serialized marker used by older operators to represent an
+    /// explicit deny-all profile before `deny_all_tools` existed.
+    pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
+
+    /// Resolve the profile's effective tool allowlist without changing the
+    /// persisted representation. `None` is unrestricted, while `Some([])` is
+    /// explicit deny-all. Mixed legacy sentinel lists retain only real tool
+    /// names.
+    #[must_use]
+    pub fn effective_allowed_tools(&self) -> Option<Vec<String>> {
+        if self.deny_all_tools {
+            return Some(Vec::new());
+        }
+
+        let real = self
+            .allowed_tools
+            .iter()
+            .filter(|name| name.as_str() != Self::LEGACY_DENY_ALL_TOOLS_SENTINEL)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !self.allowed_tools.is_empty() && real.is_empty() {
+            return Some(Vec::new());
+        }
+        (!real.is_empty()).then_some(real)
+    }
+
     /// Merge the built-in default `auto_approve` entries into the current
     /// list, preserving any user-supplied additions.
     pub fn ensure_default_auto_approve(&mut self) {
@@ -13586,19 +13829,13 @@ pub struct RiskProfileConfig {
     /// (fail-closed deny under the default `on_no_approver`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_route: Option<crate::autonomy::ApprovalRoute>,
-    /// Tools the agent may call in agentic mode. Empty = inherit / no
-    /// authorization constraint. Authorization decision: which tools is
-    /// the agent permitted to invoke at all. See `excluded_tools` for
-    /// the inverse denylist scoped to non-CLI channels.
-    ///
-    /// The TOML config does not distinguish an omitted field from
-    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
-    /// `SecurityPolicy::from_profiles` maps that to "no authorization
-    /// constraint" at this layer. If you need an explicit deny-all gate,
-    /// apply it on the caller-supplied per-run `allowed_tools` (cron
-    /// jobs and other narrowers pass that list in directly to
-    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
-    /// via `excluded_tools` covering the specific tools you want blocked.
+    /// Tools the agent may call in agentic mode. An omitted field and an
+    /// explicit `allowed_tools = []` are the same legacy state: no
+    /// authorization constraint (unrestricted). A non-empty list is an
+    /// explicit closed set for built-ins and MCP; skill tools remain
+    /// registered unless listed in `excluded_tools`. For an explicit
+    /// deny-all gate, set [`Self::deny_all_tools`] — an empty list does
+    /// NOT mean deny-all.
     ///
     /// MCP exception: when the list is non-empty, runtime-discovered MCP
     /// tools (any name containing `__`, which is the `<server>__<tool>`
@@ -13615,6 +13852,14 @@ pub struct RiskProfileConfig {
     /// will not see runtime-discovered MCP tools unless it names them.
     ///
     pub allowed_tools: Vec<String>,
+    /// Explicit deny-all for this profile: no tool may be invoked under it
+    /// (built-ins, MCP tools, and skill-defined tools alike — there is no
+    /// `__` auto-admit under deny-all). `allowed_tools = []` remains
+    /// legacy-unrestricted; setting both `deny_all_tools = true` and a
+    /// non-empty `allowed_tools` is a configuration error rejected by
+    /// [`Config::validate`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deny_all_tools: bool,
     /// Tools excluded from non-CLI channels under this profile.
     ///
     /// Also subtracts from the agentic-delegate allow-list resolved at
@@ -13652,6 +13897,7 @@ impl Default for RiskProfileConfig {
             delegation_policy: DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: Vec::new(),
+            deny_all_tools: false,
             excluded_tools: Vec::new(),
             sandbox_enabled: None,
             sandbox_backend: None,
@@ -15690,6 +15936,21 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When `true` (default), group-chat sessions key on the sender, so
+    /// distinct members of the same group (or forum topic) each get an
+    /// isolated conversation context (matches the existing behavior). When
+    /// `false`, all members of a group chat share one session scoped to the
+    /// chat (and forum topic, when present), so the agent keeps full
+    /// conversation context regardless of which member writes. Sharing the
+    /// session shares its session-scoped controls too: any member's `/new`
+    /// resets the shared history for the whole group/topic, and a member's
+    /// session-level `/model` route override applies to everyone in it,
+    /// while `/stop` and message debouncing stay personal to each sender.
+    /// 1-on-1 chats are unaffected (chat_id is already unique per user-bot
+    /// pair).
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub per_user_session: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -15735,6 +15996,7 @@ impl Default for TelegramConfig {
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            per_user_session: true,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -21370,6 +21632,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -21872,6 +22135,46 @@ impl Config {
                     ),
                     path,
                 ));
+            }
+        }
+    }
+
+    /// Surface `server_fallback_models` entries the Anthropic request builder
+    /// drops before sending: blank entries and entries that duplicate the
+    /// alias's primary `model` (the requested model can never be its own
+    /// server-side fallback target). This is the Anthropic-only sibling of
+    /// [`Self::collect_fallback_model_warnings`], which iterates the flattened
+    /// `base` and cannot see this typed-slot field. The empty-entry check runs
+    /// even when the alias configures no primary `model`; only the
+    /// duplicates-primary check is gated on a primary being set.
+    fn collect_server_fallback_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, cfg) in &self.providers.models.anthropic {
+            let primary = cfg.base.model.as_deref();
+            for (i, model) in cfg.server_fallback_models.iter().enumerate() {
+                let path =
+                    format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
+                if model.trim().is_empty() {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::EMPTY_SERVER_FALLBACK_MODEL,
+                        format!(
+                            "server_fallback_models entry {i} on anthropic.{alias} is empty; \
+                             it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                } else if primary == Some(model.as_str()) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY,
+                        format!(
+                            "server_fallback_models entry {model:?} on anthropic.{alias} \
+                             duplicates the primary model; it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                }
             }
         }
     }
@@ -22558,6 +22861,15 @@ impl Config {
                         "risk_profiles.{profile_alias}.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                     );
                 }
+            }
+            // `deny_all_tools` is the explicit deny-all gate; `allowed_tools = []`
+            // stays legacy-unrestricted. Combining the flag with a non-empty
+            // allowlist is contradictory — reject it instead of silently
+            // preferring one side.
+            if profile.deny_all_tools && !profile.allowed_tools.is_empty() {
+                anyhow::bail!(
+                    "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+                );
             }
         }
 
@@ -23650,14 +23962,36 @@ impl Config {
                 }
             }
 
-            // workspace.read_memory_from: every alias must exist as a
-            // configured agent and must use the same MemoryBackendKind
-            // as the declaring agent. Mismatched backends fail at
-            // config load rather than producing a runtime error when
-            // the per-agent memory plumbing consumes the allowlist.
+            // workspace.read_memory_from: every grant must name a configured
+            // agent, use the same MemoryBackendKind as the declaring agent,
+            // and appear at most once. Legacy string grants are unrestricted;
+            // structured grants may carry an exact category allowlist. An
+            // explicitly empty category list is invalid rather than silently
+            // becoming unrestricted. Mismatched backends fail at config load
+            // rather than producing a runtime error when the per-agent memory
+            // plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
+            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();
+                if target
+                    .categories()
+                    .is_some_and(|categories| categories.is_empty())
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                    );
+                }
+                if !seen_memory_grants.insert(target_str) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                    );
+                }
                 if target_str == alias.as_str() {
                     validation_bail!(
                         InvalidFormat,
@@ -23672,6 +24006,18 @@ impl Config {
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                 };
+                if target.categories().is_some()
+                    && matches!(
+                        agent_backend,
+                        crate::multi_agent::MemoryBackendKind::Markdown
+                    )
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                    );
+                }
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
                     validation_bail!(
@@ -25854,6 +26200,18 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn cache_passthrough_deserializes_and_defaults_to_omitted() {
+        let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
+        assert!(enabled.cache_passthrough);
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_passthrough"),
+            "default cache_passthrough must be omitted from serialized config"
+        );
+    }
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
@@ -29157,6 +29515,7 @@ log_tool_io = "off"
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
         assert!(a.allowed_tools.is_empty());
+        assert!(!a.deny_all_tools);
     }
 
     #[test]
@@ -29694,6 +30053,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        per_user_session: true,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -29987,6 +30347,91 @@ auto_approve = []
                 "default tool '{tool}' must be present"
             );
         }
+    }
+
+    /// `allowed_tools = []` keeps its legacy meaning (unrestricted): it does
+    /// not flip the profile to deny-all, and it is not a validation error.
+    #[test]
+    async fn risk_profile_empty_allowed_tools_stays_unrestricted() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            profile.allowed_tools.is_empty(),
+            "explicit [] must deserialize as the legacy unrestricted state"
+        );
+        assert!(!profile.deny_all_tools);
+        parsed.validate().expect("allowed_tools = [] must validate");
+    }
+
+    #[test]
+    async fn risk_profile_effective_allowed_tools_normalizes_legacy_deny_all_sentinel() {
+        let mut profile = RiskProfileConfig::default();
+        assert_eq!(profile.effective_allowed_tools(), None);
+
+        profile.allowed_tools = vec![RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into()];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+        ];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            "shell".into(),
+        ];
+        assert_eq!(
+            profile.effective_allowed_tools(),
+            Some(vec!["shell".into()])
+        );
+    }
+
+    /// `deny_all_tools = true` is the explicit deny-all representation and is
+    /// valid on its own.
+    #[test]
+    async fn risk_profile_deny_all_tools_flag_parses_and_validates() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(profile.deny_all_tools);
+        parsed
+            .validate()
+            .expect("deny_all_tools = true alone must validate");
+    }
+
+    /// `deny_all_tools = true` combined with a non-empty `allowed_tools` is a
+    /// configuration error and must fail validation loudly instead of one
+    /// side silently winning.
+    #[test]
+    async fn risk_profile_deny_all_tools_with_nonempty_allowed_tools_is_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+allowed_tools = ["shell"]
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("deny_all_tools + non-empty allowed_tools must be rejected");
+        assert!(
+            err.to_string()
+                .contains("risk_profiles.default.deny_all_tools"),
+            "error must name the offending path, got: {err}"
+        );
     }
 
     /// When no risk_profiles section is provided, defaults are applied to the
@@ -30684,6 +31129,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         config.save().await.unwrap();
@@ -30878,6 +31324,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -31294,6 +31741,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            per_user_session: true,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -32949,6 +33397,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -34458,6 +34907,70 @@ api_token = "tok"
                 .collect_warnings()
                 .iter()
                 .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
+    }
+
+    #[test]
+    async fn proxy_config_accepts_exact_hailo_model_provider_selector() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        proxy
+            .validate()
+            .expect("canonical Hailo selector validates");
+        assert!(ProxyConfig::supported_service_keys().contains(&"model_provider.hailo_ollama"));
+        assert!(proxy.should_apply_to_service("model_provider.hailo_ollama"));
+        assert!(!proxy.should_apply_to_service("model_provider.ollama"));
+    }
+
+    #[test]
+    async fn selected_invalid_proxy_fails_closed_when_applying_to_a_client_builder() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        let error = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.hailo_ollama")
+            .expect_err("selected invalid proxy must fail before a direct client is built");
+        assert!(error.to_string().contains("Invalid http_proxy URL"));
+
+        let _ = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.ollama")
+            .expect("unselected proxy must not affect another provider");
+    }
+
+    #[test]
+    async fn selected_invalid_runtime_proxy_fails_closed_before_client_construction() {
+        let _env_guard = env_override_lock().await;
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        });
+
+        let result = try_apply_runtime_proxy_to_builder(
+            reqwest::Client::builder(),
+            "model_provider.hailo_ollama",
+        );
+        set_runtime_proxy_config(previous);
+
+        let error = result.expect_err("selected invalid runtime proxy must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid runtime proxy configuration for model_provider.hailo_ollama")
         );
     }
 
@@ -36879,6 +37392,7 @@ high_entropy_tokens = false
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -42140,7 +42654,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("alpha"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("alpha"),
+            ));
         let err = config
             .validate()
             .expect_err("self-reference must fail validation");
@@ -42171,7 +42687,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("beta"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("beta"),
+            ));
 
         let err = config
             .validate()
@@ -42180,6 +42698,104 @@ allowed_users = []
         assert!(
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_empty_memory_grant_categories() {
+        let mut config = multi_agent_test_config();
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(Vec::new()),
+            });
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("an explicitly empty category list must fail validation");
+        assert!(
+            err.to_string()
+                .contains("categories must contain at least one category"),
+            "expected empty-category explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_scoped_grants_for_markdown_memory() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(vec!["core".to_string()]),
+            });
+
+        let err = config
+            .validate()
+            .expect_err("Markdown must fail closed for scoped grants");
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown fail-closed explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_duplicate_memory_grants() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .extend([
+                crate::multi_agent::MemoryGrant::Agent(crate::multi_agent::AgentAlias::new("beta")),
+                crate::multi_agent::MemoryGrant::Scoped {
+                    agent: crate::multi_agent::AgentAlias::new("beta"),
+                    categories: Some(vec!["core".to_string()]),
+                },
+            ]);
+
+        let err = config
+            .validate()
+            .expect_err("duplicate grants for one source agent must fail validation");
+        assert!(
+            err.to_string()
+                .contains("duplicates an earlier memory grant"),
+            "expected duplicate-grant explanation, got: {err}"
         );
     }
 
@@ -44601,6 +45217,66 @@ group_policy = "all"
             .models
             .openai
             .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn empty_server_fallback_model_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        // No primary `model` configured: the empty-entry check must still fire.
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                server_fallback_models: vec!["".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_server_fallback_model");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.anthropic.primary.server_fallback_models[0]"
+        );
+    }
+
+    #[test]
+    async fn server_fallback_model_duplicates_primary_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-fable-5".to_string()],
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "server_fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn server_fallback_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-opus-4-8".to_string()],
+            },
+        );
 
         assert!(config.collect_warnings().is_empty());
     }

@@ -11,6 +11,7 @@ pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
+pub(crate) mod media_degrade;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
@@ -46,11 +47,11 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
-    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
-    terminal_completion_error_message,
+    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
+    semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -708,10 +709,26 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback
-            && let Ok(guard) = callback.lock()
-            && let Some((new_model_provider, new_model)) = guard.as_ref()
+        // Check if model switch was requested via model_switch tool. The tool
+        // writes the request through a poisoned guard (`ModelSwitchTool::handle_set`),
+        // so this read must recover a poisoned guard too or the request is lost.
+        let pending_model_switch = model_switch_callback.as_ref().and_then(|callback| {
+            let guard = match callback.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "model-switch lock poisoned while checking for a pending switch; recovering guard for read"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.clone()
+        });
+        if let Some((new_model_provider, new_model)) = pending_model_switch.as_ref()
             && (new_model_provider != provider_name || new_model != model)
         {
             ::zeroclaw_log::record!(

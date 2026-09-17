@@ -1154,7 +1154,7 @@ mod tests {
     async fn unambiguous_charset_excludes_confusable_glyphs() {
         let alphabet = PairingCodeCharset::Unambiguous.alphabet();
         assert_eq!(alphabet.len(), 32, "Crockford Base32 is 32 symbols");
-        for &confusable in b"ILOUlo" {
+        for confusable in *b"ILOUlo" {
             assert!(
                 !alphabet.contains(&confusable),
                 "{} must not appear in the unambiguous alphabet",

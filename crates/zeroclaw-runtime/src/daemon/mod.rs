@@ -2761,6 +2761,17 @@ mod tests {
         config.agents.insert(agent_alias.to_string(), agent);
     }
 
+    /// Hold the process-global log broadcast still for a daemon lifecycle test.
+    ///
+    /// `run` calls `set_broadcast_hook`, replacing the sender every
+    /// log-assertion test subscribed to, and those tests only serialize
+    /// against each other. A lifecycle test that calls `run` without this lock
+    /// closes their receiver mid-read, which surfaces as a missing log event.
+    #[must_use]
+    fn hold_log_broadcast() -> impl Drop {
+        zeroclaw_log::__private_test_hook_lock()
+    }
+
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
@@ -2779,7 +2790,12 @@ mod tests {
                     return value;
                 }
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                // A closed channel means the global broadcast hook was replaced
+                // or cleared, not that the record was slow; keep that distinct
+                // from a deadline miss so the failure names the real cause.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before event arrived: {message}");
+                }
                 Err(_elapsed) => {}
             }
         }
@@ -3394,6 +3410,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3695,6 +3712,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3724,6 +3742,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3803,8 +3822,10 @@ mod tests {
         assert_eq!(result, DaemonExit::Reload);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3882,10 +3903,12 @@ mod tests {
         assert!(has_tui_registry);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
+        let _broadcast_guard = hold_log_broadcast();
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -3962,12 +3985,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_invalid_input_fails_daemon_startup() {
         use std::io;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -4009,6 +4034,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn socket_addr_in_use_after_readiness_stays_supervised() {
         use std::io;
@@ -4016,6 +4042,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -4065,12 +4092,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -4149,10 +4178,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;

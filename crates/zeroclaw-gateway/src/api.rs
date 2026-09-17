@@ -270,7 +270,8 @@ pub struct StatusResponse {
     pub check_updates: bool,
     /// Whether browser-triggered self-upgrade is enabled.
     pub allow_self_upgrade: bool,
-    /// How the daemon is restarted after an upgrade: supervised, self-respawn, or manual.
+    /// How the daemon is restarted after an upgrade: supervised, desktop_supervised,
+    /// self-respawn, or manual.
     pub restart_mode: crate::version::RestartMode,
     /// Operator-facing command or instruction for completing an upgrade restart.
     pub restart_hint: String,
