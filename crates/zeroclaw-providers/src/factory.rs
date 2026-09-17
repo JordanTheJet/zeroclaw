@@ -255,6 +255,9 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.cache_passthrough {
+        b = b.with_cache_passthrough();
+    }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
@@ -486,6 +489,7 @@ use zeroclaw_config::schema::{
     FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
     HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
     InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
     LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
@@ -1239,6 +1243,90 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(HAILO_OLLAMA_DEFAULT_URI);
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
+        if opts.tls_ca_cert_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support tls_ca_cert_path");
+        }
+        if opts.think == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "thinking".to_string(),
+                message: "Hailo-Ollama does not support think=true".to_string(),
+            }));
+        }
+        if opts.vision == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "vision".to_string(),
+                message: "Hailo-Ollama does not support vision=true".to_string(),
+            }));
+        }
+        if opts.provider_extra.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support provider_extra");
+        }
+        if opts.api_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support api_path");
+        }
+        if opts.wire_api.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support wire_api overrides");
+        }
+        if opts.chat_template_kwargs.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support chat_template_kwargs");
+        }
+        if opts.native_tools == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "native_tools".to_string(),
+                message: "Hailo-Ollama does not support native tool calling".to_string(),
+            }));
+        }
+
+        let max_tokens = opts
+            .provider_max_tokens
+            .map_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+                i32::try_from(value).unwrap_or(i32::MAX)
+            });
+        let tuning = crate::ollama::OllamaTuning {
+            num_ctx: self
+                .base
+                .context_window
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
+            num_predict: max_tokens,
+            temperature_override: None,
+        };
+        let endpoint = HailoOllamaEndpoint::default();
+        let base_url = api_url.unwrap_or_else(|| endpoint.uri());
+        Ok(Box::new(
+            crate::hailo_ollama::HailoOllamaModelProvider::new(
+                alias,
+                Some(base_url),
+                opts.provider_timeout_secs
+                    .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+                self.queue_timeout_secs
+                    .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+                tuning,
+            )?
+            .with_auth_headers(key, &opts.extra_headers)?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
 impl FamilyProviderFactory for GeminiModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 
@@ -1819,6 +1907,33 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn cache_passthrough_runtime_option_reaches_provider_capability() {
+        let provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions {
+                cache_passthrough: true,
+                ..ModelProviderRuntimeOptions::default()
+            },
+        );
+        assert!(
+            provider.capabilities().prompt_caching,
+            "factory must thread cache_passthrough into the provider capability"
+        );
+
+        let default_provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(!default_provider.capabilities().prompt_caching);
+    }
 
     #[test]
     fn endpoint_registry_classifies_every_canonical_family() {
