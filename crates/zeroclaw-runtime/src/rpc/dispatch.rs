@@ -886,10 +886,29 @@ impl RpcDispatcher {
     /// selector is constrained (neither `admin` nor the explicit `"*"`)
     /// is refused a session rather than silently un-enforced.
     fn selector_session_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
+        let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        if !auth.grants.may_use_agent(alias) {
+        self.selector_session_agent_with_grants(method, grants, alias)
+    }
+
+    /// The grants stamped on this connection by the last pass through the
+    /// gate, or `None` for an unbound dispatcher.
+    fn stamped_grants(&self) -> Option<&zeroclaw_api::grants::ResolvedGrants> {
+        self.auth.as_ref().map(|auth| &auth.grants)
+    }
+
+    /// [`Self::selector_session_agent`] evaluated against an explicit grant
+    /// set. A handler that has re-resolved its principal after waiting for
+    /// admission passes the fresh grants here, because the grants stamped on
+    /// the connection are only as current as the last gate.
+    fn selector_session_agent_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+    ) -> Result<(), JsonRpcError> {
+        if !grants.may_use_agent(alias) {
             let denied = rpc_err(
                 FORBIDDEN,
                 format!("Principal is not entitled to agent {alias:?}"),
@@ -903,9 +922,8 @@ impl RpcDispatcher {
             );
             return Err(denied);
         }
-        let tools_unrestricted = auth.grants.admin
-            || auth
-                .grants
+        let tools_unrestricted = grants.admin
+            || grants
                 .allowed_tools
                 .iter()
                 .any(|t| t == zeroclaw_api::grants::WILDCARD);
@@ -929,39 +947,37 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Re-establish the caller's authority to write `path` after the config
-    /// write lock has been granted.
+    /// Re-establish the caller's authority after a handler has waited for
+    /// admission to a serialized section (the config write lock, or a
+    /// session's actor queue).
     ///
-    /// Every mutation handler tests its grants before it queues for the lock,
-    /// and the wait is unbounded: another connection can revoke or narrow the
-    /// waiting principal's profile, the credential can expire, the
-    /// revalidation deadline can pass, or the native pairing can be dropped
-    /// while the writer is parked. This repeats those checks against the
-    /// policy generation that is in force now.
-    ///
-    /// The generation observed here is the one the commit runs under.
-    /// `refresh_from_config` is reached only from `save_and_swap_config`,
-    /// which asserts this same lock is held, so no accepted policy can be
-    /// installed between this check and the commit. `config/reload` signals
-    /// the supervisor instead of refreshing in process, so it opens no window
-    /// either.
+    /// Every such handler tests its grants before it queues, and the wait is
+    /// unbounded: another connection can revoke or narrow the waiting
+    /// principal's profile, the credential can expire, the revalidation
+    /// deadline can pass, or the native pairing can be dropped while the
+    /// request is parked. This repeats those checks, and the method's coarse
+    /// grant, against the policy generation that is in force now, and returns
+    /// the freshly resolved grants for the handler's fine-grained selectors.
     ///
     /// This re-resolves rather than comparing against the grants stamped on
     /// the connection, so a policy change that WIDENS the principal's
     /// authority while it waits is honoured rather than refused. It is
     /// non-mutating: the handlers take `&self`, and leaving the stamped
-    /// binding alone keeps `authorize` the single place that re-stamps it.
+    /// binding alone keeps `authorize` the single place that re-stamps it. A
+    /// spawned prompt handle carries a copy of the stamped binding, which is
+    /// exactly why the fresh grants are returned instead of read back.
     ///
-    /// `path` is the concrete config path the handler is about to write, or
-    /// `None` on a surface that has no path selector to repeat (Quickstart
-    /// applies a whole submission); the liveness, generation and coarse-grant
-    /// checks still run there.
-    fn recheck_config_write_authority(
+    /// A publication that lands between the resolution and the generation
+    /// read fails the operation closed. The config path holds the lock that
+    /// every publication takes, so it cannot see that race; a session path
+    /// can, and the refused client's next request re-gates normally.
+    ///
+    /// `Ok(None)` means no principal is bound, which only the direct
+    /// unit-test handlers reach; each caller decides what that means for it.
+    fn recheck_authority_after_admission(
         &self,
         method: Method,
-        path: Option<&str>,
-        _guard: &ConfigWriteGuard,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
         let refuse = |denied: AuthDenied| -> JsonRpcError {
@@ -969,9 +985,7 @@ impl RpcDispatcher {
             rpc_err(denied.code, denied.message)
         };
         let Some(auth) = self.auth.as_ref() else {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
-            )));
+            return Ok(None);
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1018,8 +1032,43 @@ impl RpcDispatcher {
                 method.wire_name()
             ))));
         }
+        Ok(Some(resolved.grants))
+    }
+
+    /// Re-establish the caller's authority to write `path` after the config
+    /// write lock has been granted: [`Self::recheck_authority_after_admission`]
+    /// followed by the concrete path selector.
+    ///
+    /// The generation observed here is the one the commit runs under.
+    /// `refresh_from_config` is reached only from `save_and_swap_config`,
+    /// which asserts this same lock is held, so no accepted policy can be
+    /// installed between this check and the commit. `config/reload` signals
+    /// the supervisor instead of refreshing in process, so it opens no window
+    /// either.
+    ///
+    /// `path` is the concrete config path the handler is about to write, or
+    /// `None` on a surface that has no path selector to repeat (Quickstart
+    /// applies a whole submission); the liveness, generation and coarse-grant
+    /// checks still run there.
+    fn recheck_config_write_authority(
+        &self,
+        method: Method,
+        path: Option<&str>,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
         if let Some(path) = path
-            && !resolved.grants.may_write_config(path)
+            && !grants.may_write_config(path)
         {
             return Err(refuse(AuthDenied::forbidden(format!(
                 "Principal is not granted config write access to {path:?}"
@@ -1098,31 +1147,28 @@ impl RpcDispatcher {
         Err(denied)
     }
 
-    /// Confine a caller-selected session workspace to roots the agent is
-    /// authorized to reach.
+    /// Confine a session workspace to roots the agent is authorized to reach.
     ///
-    /// `session/new` lets the caller name a `cwd`, and the agent builder then
-    /// makes that path the session's workspace root, so selecting an entitled
-    /// agent must not also select an arbitrary directory on the daemon host.
-    /// Operator-level principals keep today's behaviour, which is what the
-    /// local TUI, ACP and editor flows use; every other principal is held to
-    /// the agent's own risk-profile policy, whose `allowed_roots` is the
-    /// operator's escape hatch for a project directory outside the workspace.
+    /// The agent builder makes a session's workspace its jail root, so
+    /// selecting an entitled agent must not also select an arbitrary
+    /// directory on the daemon host. Operator-level principals keep today's
+    /// behaviour, which is what the local TUI, ACP and editor flows use; every
+    /// other principal is held to the agent's own risk-profile policy, whose
+    /// `allowed_roots` is the operator's escape hatch for a project directory
+    /// outside the workspace.
     ///
     /// The check runs against the resolved path, so a symlink out of the
     /// workspace is refused, and a path that cannot be resolved at all is
     /// refused rather than assumed benign.
-    fn confine_session_cwd(
+    fn confine_session_workspace_with_grants(
         &self,
         method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
         config: &Config,
         alias: &str,
-        cwd: &str,
+        workspace: &str,
     ) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(());
-        };
-        if auth.grants.admin {
+        if grants.admin {
             return Ok(());
         }
         let refuse = |detail: String| {
@@ -1143,11 +1189,11 @@ impl RpcDispatcher {
                     format!("Failed to resolve agent policy: {e}"),
                 )
             })?;
-        let requested = std::path::Path::new(cwd);
+        let requested = std::path::Path::new(workspace);
         let resolved = requested.canonicalize().map_err(|_| {
             refuse(format!(
-                "Session workspace {cwd:?} cannot be resolved; a scoped principal may only \
-                 select an existing directory inside agent {alias:?}'s workspace or one of \
+                "Session workspace {workspace:?} cannot be resolved; a scoped principal may \
+                 only use an existing directory inside agent {alias:?}'s workspace or one of \
                  its risk profile's allowed_roots"
             ))
         })?;
@@ -1155,8 +1201,8 @@ impl RpcDispatcher {
             return Ok(());
         }
         Err(refuse(format!(
-            "Session workspace {cwd:?} is outside agent {alias:?}'s workspace {:?}; add the \
-             directory to the agent's risk profile allowed_roots to authorize it",
+            "Session workspace {workspace:?} is outside agent {alias:?}'s workspace {:?}; add \
+             the directory to the agent's risk profile allowed_roots to authorize it",
             policy.workspace_dir
         )))
     }
@@ -2450,8 +2496,16 @@ impl RpcDispatcher {
         // A caller-selected cwd replaces the agent's workspace jail further
         // down, so it is authorized here. A resumed ACP session's persisted
         // workspace and the agent's own default are host-owned and skip it.
-        if req.cwd.is_some() {
-            self.confine_session_cwd(Method::SessionNew, &config, &req.agent_alias, &cwd)?;
+        if req.cwd.is_some()
+            && let Some(grants) = self.stamped_grants()
+        {
+            self.confine_session_workspace_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+                &cwd,
+            )?;
         }
 
         let cwd_path = Some(std::path::Path::new(&cwd));
