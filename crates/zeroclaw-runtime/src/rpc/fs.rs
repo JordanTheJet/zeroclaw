@@ -14,6 +14,22 @@ use zeroclaw_api::jsonrpc::{FsEntry, FsListDirRequest, FsListDirResponse};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
+/// Whether resolving `path` stays on local storage and cannot climb out of what
+/// it names: no `..` components and, on Windows, no UNC, verbatim-UNC, or
+/// device-namespace prefix. Resolving such a path would make the daemon open a
+/// network share or device while merely checking it, so a scoped principal's
+/// path is tested lexically first and refused without being resolved.
+pub fn resolves_locally(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    path.components().all(|component| match component {
+        Component::ParentDir => false,
+        Component::Prefix(prefix) => {
+            matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        }
+        _ => true,
+    })
+}
+
 /// Whether a principal holding `grants` may list the directory at `requested`.
 ///
 /// Operator-level principals may list anything. Every other principal may list
@@ -119,5 +135,32 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> zeroclaw_api::jsonrpc::JsonRpcE
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolves_locally;
+    use std::path::Path;
+
+    #[test]
+    fn resolves_locally_refuses_parent_components() {
+        assert!(resolves_locally(Path::new("/srv/agent/workspace")));
+        assert!(resolves_locally(Path::new("relative/dir")));
+        assert!(!resolves_locally(Path::new("/srv/agent/../other")));
+        assert!(!resolves_locally(Path::new("..")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_locally_refuses_network_and_device_prefixes() {
+        assert!(resolves_locally(Path::new(r"C:\agents\workspace")));
+        assert!(resolves_locally(Path::new(r"\\?\C:\agents\workspace")));
+        assert!(!resolves_locally(Path::new(r"\\attacker.example\share\x")));
+        assert!(!resolves_locally(Path::new(r"\\attacker.example@80\x")));
+        assert!(!resolves_locally(Path::new(
+            r"\\?\UNC\attacker.example\share"
+        )));
+        assert!(!resolves_locally(Path::new(r"\\.\pipe\zeroclaw")));
     }
 }

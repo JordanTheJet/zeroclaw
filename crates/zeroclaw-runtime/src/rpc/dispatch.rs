@@ -1165,7 +1165,11 @@ impl RpcDispatcher {
     ///
     /// The check runs against the resolved path, so a symlink out of the
     /// workspace is refused, and a path that cannot be resolved at all is
-    /// refused rather than assumed benign.
+    /// refused rather than assumed benign. Any path other than the agent's
+    /// configured workspace is refused before it is resolved when it has `..`
+    /// components or a Windows network or device prefix, and every refusal
+    /// carries the same message, so the answer does not reveal whether a path
+    /// exists.
     fn confine_session_workspace_with_grants(
         &self,
         method: Method,
@@ -1195,14 +1199,22 @@ impl RpcDispatcher {
                     format!("Failed to resolve agent policy: {e}"),
                 )
             })?;
-        let requested = std::path::Path::new(workspace);
-        let resolved = requested.canonicalize().map_err(|_| {
+        let refusal = || {
             refuse(format!(
-                "Session workspace {workspace:?} cannot be resolved; a scoped principal may \
-                 only use an existing directory inside agent {alias:?}'s workspace or one of \
-                 its risk profile's allowed_roots"
+                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
+                 may both read and write; add it to the agent's risk profile allowed_roots to \
+                 authorize it",
             ))
-        })?;
+        };
+        let requested = std::path::Path::new(workspace);
+        // The agent's configured workspace was chosen by the operator, not by
+        // the request, so it is resolved even when it is spelled with `..` or
+        // lives on a network share.
+        if requested != config.agent_workspace_dir(alias) && !super::fs::resolves_locally(requested)
+        {
+            return Err(refusal());
+        }
+        let resolved = requested.canonicalize().map_err(|_| refusal())?;
         // The workspace becomes the session's jail root, and a jail root is
         // readable and writable to the agent. Accept only a directory the
         // agent's own policy already lets it both read and write, so a
@@ -1213,10 +1225,7 @@ impl RpcDispatcher {
         {
             return Ok(());
         }
-        Err(refuse(format!(
-            "Session workspace {workspace:?} is not a directory agent {alias:?} may both read \
-             and write; add it to the agent's risk profile allowed_roots to authorize it",
-        )))
+        Err(refusal())
     }
 
     /// Hold one session binding, its agent and its workspace, to `grants`:
@@ -1267,13 +1276,11 @@ impl RpcDispatcher {
         let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
         let requested = std::path::Path::new(&req.path);
         // Resolving a '..' component succeeds only when everything before it
-        // exists, so resolving one for a scoped principal would answer whether
-        // an arbitrary path exists. Refuse relative and parent-component paths
-        // outright, with the same answer as any other refusal.
-        let plain = requested.is_absolute()
-            && !requested
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir));
+        // exists, which would tell a scoped principal whether an arbitrary path
+        // exists, and resolving a Windows UNC or device path makes the daemon
+        // open it. Refuse relative, parent-component, and network or device
+        // paths outright, with the same answer as any other refusal.
+        let plain = requested.is_absolute() && super::fs::resolves_locally(requested);
         let allowed = grants.admin
             || (plain && {
                 let config = self.ctx.config.read();
@@ -8481,6 +8488,65 @@ mod tests {
         assert!(
             ctx.sessions.get_agent("s-outside").await.is_none(),
             "a refused session/new must not leave a session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_cwd_refusals_do_not_reveal_whether_a_path_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let workspace = tmp.path().join("agent-workspace");
+        let mut messages = Vec::new();
+        for (sid, cwd) in [
+            ("s-exists", outside.path().to_path_buf()),
+            ("s-absent", outside.path().join("absent")),
+            ("s-parent", workspace.join("..").join("agent-workspace")),
+        ] {
+            let response = session_new_with_cwd(&mut alice, &mut rx, sid, &cwd).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{sid}: {response}"
+            );
+            let message = response["error"]["message"].as_str().unwrap().to_string();
+            messages.push(message.replace(&*cwd.to_string_lossy(), "<cwd>"));
+        }
+        assert!(
+            messages.windows(2).all(|pair| pair[0] == pair[1]),
+            "existing, absent, and parent-component refusals must read alike: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_keeps_a_configured_workspace_spelled_with_parent_components() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        let spelled = tmp.path().join("sub").join("..").join("agent-workspace");
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .workspace
+            .path = Some(spelled);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-default"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-default"),
+            "{response}"
         );
     }
 
