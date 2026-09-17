@@ -4618,10 +4618,18 @@ impl RpcDispatcher {
     async fn handle_cron_runs(&self, params: &Value) -> RpcResult {
         let req: CronRunsParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
+        let job = self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
         let limit = req.limit.unwrap_or(20) as usize;
-        let runs = crate::cron::list_runs(&config, &req.id, limit)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
+        // A scoped principal was authorized against the job's owner at lookup.
+        // Read history only while that agent still owns the job, so an
+        // ownership change between the lookup and the read cannot return
+        // another agent's runs.
+        let runs = if self.has_admin_grants() {
+            crate::cron::list_runs(&config, &req.id, limit)
+        } else {
+            crate::cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
         to_result(CronRunsResult { runs })
     }
 
@@ -8323,6 +8331,25 @@ mod tests {
         let mut expected = vec![alpha.id.as_str(), beta.id.as_str()];
         expected.sort_unstable();
         assert_eq!(ids, expected, "the operator still sees every job");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_serves_a_scoped_principal_its_own_jobs_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let alpha = seed_cron_job(&config, "alpha", "alpha-job");
+        let now = chrono::Utc::now();
+        crate::cron::record_run(&config, &alpha.id, now, now, "ok", Some("done"), 5)
+            .expect("the fixture run is recorded");
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(&mut alice, &mut rx, 1, "cron/runs", json!({"id": alpha.id})).await;
+        let runs = response["result"]["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{response}"));
+        assert_eq!(runs.len(), 1, "{response}");
+        assert_eq!(runs[0]["status"], json!("ok"), "{response}");
     }
 
     #[tokio::test]
