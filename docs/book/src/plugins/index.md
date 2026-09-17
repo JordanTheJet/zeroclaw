@@ -348,19 +348,27 @@ command copied out of `zeroclaw --config-dir /srv/a plugin list` would
 otherwise act on whichever configuration your shell resolves by default. The
 `zpi1_…` row key names the package, capability and binding but not the
 profile, so that command would replace a different profile's allowlist with a
-list computed from this one. The directory and the host list are each
-single-quoted as one literal argument, so nothing a manifest declares can be
-expanded or substituted by your shell; paste the command as printed.
+list computed from this one. The directory and the host list are each quoted
+as one literal argument, so nothing a manifest declares can be expanded or
+substituted by your shell; paste the command as printed.
 
 The quoting follows the shell of the platform the command was printed on. On
-Linux and macOS it is the POSIX form (`sh`, `bash`, `zsh`, `fish`), where an
-embedded quote is written `'\''`. On Windows it is PowerShell's literal string,
-where an embedded quote is doubled (`''`): paste the command into PowerShell,
-the shell Windows Terminal opens by default. `cmd.exe` is not a supported paste
-target, because it has no quoting form that keeps every character literal
-(`%name%` expands inside double quotes, and a single quote is an ordinary
-character there), so it could not be trusted with a host list a plugin author
-wrote.
+Linux and macOS it is the POSIX single-quoted form (`sh`, `bash`, `zsh`,
+`fish`), where an embedded quote is written `'\''`. On Windows, ZeroClaw
+cannot tell whether you are in `cmd.exe` or PowerShell, so it prints the one
+form both pass literally: each value in double quotes, which is correct to
+paste into either shell as long as the value contains nothing either shell
+expands inside double quotes. An ordinary host list and an ordinary profile
+path, spaces included, always qualify. When a value does not (it contains `"`,
+`%`, `!`, `$` or a backtick, or ends in a backslash; `$(id).example.com` is the
+shape a hostile manifest would declare), the whole line is printed instead as
+`# PowerShell only, cmd.exe cannot pass this value literally: ` followed by the
+PowerShell form, where an embedded quote is doubled (`''`). Pasted whole, that
+line runs nothing in either shell (`cmd.exe` cannot run `#`, and PowerShell
+reads it as a comment); copy the command after the marker into PowerShell
+alone. `cmd.exe` has no quoting that keeps such a value literal (`%name%`
+expands inside its double quotes, and a single quote is an ordinary character
+there), so it is never trusted with one.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
 for every installed plugin holding `http_client`, one line naming the

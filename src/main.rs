@@ -15550,18 +15550,33 @@ mod tests {
     /// first quote on the line.
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
     fn printed_command_value(line: &str) -> String {
+        use crate::plugins::egress_ceremony::{POWERSHELL_ONLY_MARKER, ShellDialect};
         let start = line
             .find("config set plugins.entries")
             .expect("the line must carry a config set command");
         let quoted = &line[start..];
+        // Undo the host shell's quoting. A Windows line is one double-quoted
+        // argument with no escapes inside, unless it was refused, in which case
+        // the marker names the PowerShell form that follows it.
+        let dialect = match ShellDialect::host() {
+            ShellDialect::Windows if line.starts_with(POWERSHELL_ONLY_MARKER) => {
+                ShellDialect::PowerShell
+            }
+            ShellDialect::Windows => {
+                let open = quoted
+                    .find('"')
+                    .expect("the printed Windows command double-quotes its value");
+                let rest = &quoted[open + 1..];
+                let close = rest.find('"').expect("the quoted value must close");
+                return rest[..close].to_string();
+            }
+            other => other,
+        };
         let open = quoted
             .find('\'')
             .expect("the printed command single-quotes its value");
-        // Undo `shell_single_quote` in the host shell's dialect: the argument
-        // runs to the closing quote, and an embedded quote was written as
-        // `'\''` (POSIX) or `''` (PowerShell).
-        use crate::plugins::egress_ceremony::ShellDialect;
-        let dialect = ShellDialect::host();
+        // The argument runs to the closing quote, and an embedded quote was
+        // written as `'\''` (POSIX) or `''` (PowerShell).
         let mut value = String::new();
         let mut rest = &quoted[open + 1..];
         loop {
@@ -15571,6 +15586,7 @@ mod tests {
             let escaped_quote = match dialect {
                 ShellDialect::Posix => rest.strip_prefix("\\''"),
                 ShellDialect::PowerShell => rest.strip_prefix('\''),
+                ShellDialect::Windows => unreachable!("handled above"),
             };
             if let Some(after) = escaped_quote {
                 value.push('\'');

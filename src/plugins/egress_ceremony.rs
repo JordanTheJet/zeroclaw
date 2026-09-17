@@ -39,16 +39,18 @@ pub fn egress_hosts_path(instance_key: &str) -> String {
 /// therefore pass the union (see [`EgressDeclarationDiff::union`]), not just the
 /// additions.
 ///
-/// The joined list is one single-quoted argument. The hosts come from a
-/// plugin's manifest, which is publisher-controlled text, and the operator
-/// pastes this command into their shell with their own authority: inside
-/// double quotes a shell still performs `$(...)`, backtick and `$var`
-/// substitution, so a declared `$(id).example.com` would run `id` before
-/// ZeroClaw saw the argument. Single quotes make every byte literal, including
-/// the `*` that starts a suffix pattern, and [`shell_single_quote`] escapes an
-/// embedded quote the way the operator's shell on this host expects (see
-/// [`ShellDialect`]). The one thing the shell may do to this argument is
-/// nothing.
+/// The joined list is one quoted argument. The hosts come from a plugin's
+/// manifest, which is publisher-controlled text, and the operator pastes this
+/// command into their shell with their own authority: a POSIX shell performs
+/// `$(...)`, backtick and `$var` substitution inside double quotes, so a
+/// declared `$(id).example.com` would run `id` before ZeroClaw saw the
+/// argument. The value is therefore quoted so that the operator's shell on
+/// this host passes every byte literally, including the `*` that starts a
+/// suffix pattern (see [`ShellDialect`]); on Windows, where the shell cannot
+/// be known and `cmd.exe` has no fully literal form, a value that either
+/// Windows shell would expand is refused rather than rendered (see
+/// [`POWERSHELL_ONLY_MARKER`]). The one thing the shell may do to this
+/// argument is nothing.
 ///
 /// The directory carries the same treatment. `--config-dir` (and the
 /// `ZEROCLAW_CONFIG_DIR` it sets) is process-local, so a command copied out of
@@ -76,11 +78,13 @@ pub fn egress_set_command_for(
     instance_key: &str,
     hosts: &[String],
 ) -> String {
+    let joined = hosts.join(",");
+    let (dialect, marker) = dialect.command_form(&[&config_dir.to_string_lossy(), &joined]);
     format!(
-        "{} config set {} {}",
+        "{marker}{} config set {} {}",
         zeroclaw_invocation_for(dialect, config_dir),
         egress_hosts_path(instance_key),
-        dialect.quote_literal(&hosts.join(","))
+        dialect.quote_literal(&joined)
     )
 }
 
@@ -102,7 +106,9 @@ pub fn zeroclaw_invocation_for(dialect: ShellDialect, config_dir: &std::path::Pa
 }
 
 /// Quote `raw` as one literal argument for the operator's shell on this host:
-/// [`ShellDialect::host`] picks the dialect.
+/// [`ShellDialect::host`] picks the dialect. On Windows this is the per-value
+/// half only; a whole command line is rendered by [`egress_set_command`],
+/// which is where a value no Windows shell passes literally is refused.
 #[must_use]
 pub fn shell_single_quote(raw: &str) -> String {
     ShellDialect::host().quote_literal(raw)
@@ -113,35 +119,76 @@ pub fn shell_single_quote(raw: &str) -> String {
 /// The commands this module renders are copied out of `zeroclaw plugin install`
 /// and `zeroclaw plugin list` output and pasted into the operator's interactive
 /// shell, so a value is quoted for *that* shell, not for the shell the runtime
-/// uses to execute tools. Two dialects cover the supported hosts, and both use
-/// single quotes because single quotes are the only form in which either shell
-/// performs no expansion at all; they differ only in how an embedded quote is
-/// written.
-///
-/// `cmd.exe` is deliberately not a target. It has no literal-quoting form:
-/// `%name%` expands inside double quotes, an embedded `"` cannot be escaped,
-/// and a single quote is an ordinary character. No rendering could promise
-/// that a publisher-controlled host list reaches `config set` untouched from
-/// `cmd.exe`, so the Windows form targets PowerShell, the shell Windows
-/// Terminal opens by default, and the documentation says so.
+/// uses to execute tools. ZeroClaw cannot see which shell its output lands in.
+/// On Linux and macOS every supported shell shares the POSIX single-quote
+/// form. On Windows the operator may be in either of two shells, `cmd.exe`
+/// (the default the native runtime documents) or PowerShell (the default
+/// Windows Terminal opens), so the Windows form has to be literal in both, and
+/// a value that is literal in neither is refused rather than trusted to
+/// whichever shell happens to be open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellDialect {
     /// `sh`, `bash`, `zsh`, `fish`: single quotes protect every character but
     /// the single quote itself, which is closed, escaped and reopened
     /// (`'it'\''s'`).
     Posix,
-    /// PowerShell (`powershell`, `pwsh`): single quotes protect every character
-    /// but the single quote itself, which is doubled (`'it''s'`).
+    /// PowerShell (`powershell`, `pwsh`) on its own: single quotes protect
+    /// every character but the single quote itself, which is doubled
+    /// (`'it''s'`). This form is never printed unmarked; it is what a
+    /// [`Self::Windows`] line falls back to, behind [`POWERSHELL_ONLY_MARKER`],
+    /// when a value cannot be passed literally from `cmd.exe`.
     PowerShell,
+    /// A Windows console, whichever of `cmd.exe` and PowerShell is running it:
+    /// one double-quoted argument, which both shells hand to the native binary
+    /// untouched as long as the value holds nothing either of them expands
+    /// inside double quotes. [`windows_form_is_literal`] is that test.
+    Windows,
 }
+
+/// Whether `raw` survives a Windows console as one double-quoted argument, in
+/// both `cmd.exe` and PowerShell.
+///
+/// `cmd.exe` has no fully literal quoting form: inside double quotes it still
+/// expands `%name%`, expands `!name!` under delayed expansion, cannot escape an
+/// embedded `"`, and treats a single quote as an ordinary character.
+/// PowerShell's double quotes interpolate `$` and the backtick. Both shells
+/// then hand the argument to the native binary through the C runtime's
+/// command-line rules, where a trailing backslash swallows the closing quote.
+/// A value is literal in both shells only when it contains none of `"`, `%`,
+/// `!`, `$` and `` ` ``, no control character, and does not end in `\`.
+///
+/// Every declared host of the ordinary shape (`api.example.com`,
+/// `*.cdn.example.com`) and every ordinary profile path, spaces included,
+/// passes. A manifest that declares `$(id).example.com` does not: the egress
+/// grammar accepts it, and no Windows form could promise it reaches
+/// `config set` unexpanded, so [`egress_set_command`] refuses it instead.
+#[must_use]
+pub fn windows_form_is_literal(raw: &str) -> bool {
+    !raw.ends_with('\\')
+        && !raw
+            .chars()
+            .any(|c| matches!(c, '"' | '%' | '!' | '$' | '`') || c.is_control())
+}
+
+/// The prefix of a Windows command line whose value cannot be passed literally
+/// from `cmd.exe`.
+///
+/// It begins with `#`, which `cmd.exe` cannot run and PowerShell reads as a
+/// comment to the end of the line, so pasting the whole line into either shell
+/// executes nothing. The command after the marker is the
+/// [`ShellDialect::PowerShell`] form, and the marker says so: the operator
+/// copies that part into PowerShell alone, where single quotes make every byte
+/// literal.
+pub const POWERSHELL_ONLY_MARKER: &str =
+    "# PowerShell only, cmd.exe cannot pass this value literally: ";
 
 impl ShellDialect {
     /// The dialect of the operator's shell on the host this binary runs on:
-    /// PowerShell on Windows, POSIX everywhere else.
+    /// the Windows console form on Windows, POSIX everywhere else.
     #[must_use]
     pub const fn host() -> Self {
         if cfg!(windows) {
-            Self::PowerShell
+            Self::Windows
         } else {
             Self::Posix
         }
@@ -149,11 +196,37 @@ impl ShellDialect {
 
     /// Quote `raw` as one literal argument in this dialect: after the shell has
     /// parsed the result, the argument is `raw`, byte for byte.
+    ///
+    /// For [`Self::Windows`] that promise holds only while
+    /// [`windows_form_is_literal`] does; a value outside it is rendered in the
+    /// [`Self::PowerShell`] form, and it is the command renderer's job
+    /// ([`Self::command_form`]) to mark the whole line so `cmd.exe` never runs
+    /// it.
     #[must_use]
     pub fn quote_literal(self, raw: &str) -> String {
         match self {
             Self::Posix => format!("'{}'", raw.replace('\'', "'\\''")),
             Self::PowerShell => format!("'{}'", raw.replace('\'', "''")),
+            Self::Windows if windows_form_is_literal(raw) => format!("\"{raw}\""),
+            Self::Windows => Self::PowerShell.quote_literal(raw),
+        }
+    }
+
+    /// The dialect a whole command line carrying `values` is rendered in, and
+    /// the marker it starts with.
+    ///
+    /// Every dialect but [`Self::Windows`] renders itself, unmarked. A Windows
+    /// line renders itself only when every value passes
+    /// [`windows_form_is_literal`]; otherwise the line is the PowerShell form
+    /// behind [`POWERSHELL_ONLY_MARKER`], so that no part of it can execute in
+    /// `cmd.exe` and the shell it is meant for is named in the line itself.
+    #[must_use]
+    pub fn command_form(self, values: &[&str]) -> (Self, &'static str) {
+        match self {
+            Self::Windows if !values.iter().all(|value| windows_form_is_literal(value)) => {
+                (Self::PowerShell, POWERSHELL_ONLY_MARKER)
+            }
+            other => (other, ""),
         }
     }
 }
@@ -685,7 +758,7 @@ mod tests {
     #[test]
     fn the_printed_form_is_the_host_shells_dialect() {
         let expected = if cfg!(windows) {
-            super::ShellDialect::PowerShell
+            super::ShellDialect::Windows
         } else {
             super::ShellDialect::Posix
         };
@@ -709,16 +782,17 @@ mod tests {
         );
     }
 
-    /// The Windows form is PowerShell's literal string: single quotes, with an
-    /// embedded quote doubled rather than backslash-escaped, because PowerShell
-    /// gives a backslash no meaning and would print `'it'\''s'` as three
-    /// tokens. Every metacharacter PowerShell expands inside double quotes
-    /// (`$env:NAME`, `$(...)`, a backtick escape) stays literal, as does the
-    /// space in the profile path and the `*` of a suffix pattern. The egress
-    /// grammar (`normalize_egress_pattern`) rejects none of these characters,
-    /// so a manifest can declare each of these host shapes.
+    /// The PowerShell form is PowerShell's literal string: single quotes, with
+    /// an embedded quote doubled rather than backslash-escaped, because
+    /// PowerShell gives a backslash no meaning and would print `'it'\''s'` as
+    /// three tokens. Every metacharacter PowerShell expands inside double
+    /// quotes (`$env:NAME`, `$(...)`, a backtick escape) stays literal, as does
+    /// the space in the profile path and the `*` of a suffix pattern. The
+    /// egress grammar (`normalize_egress_pattern`) rejects none of these
+    /// characters, so a manifest can declare each of these host shapes, and
+    /// this is the form a Windows line falls back to for them.
     #[test]
-    fn the_windows_form_is_powershells_literal_string() {
+    fn the_powershell_form_is_powershells_literal_string() {
         let hosts = [
             "$(id).example.com",
             "`id`.example.com",
@@ -741,6 +815,269 @@ mod tests {
             !command.contains("\\'"),
             "PowerShell has no backslash escape, so none may be printed: {command}"
         );
+    }
+
+    /// The Windows form is one double-quoted argument per value: the only
+    /// quoting `cmd.exe` and PowerShell agree on, which both pass to the native
+    /// binary untouched for a value that holds nothing either shell expands.
+    /// An ordinary host list and an ordinary profile path, spaces included,
+    /// render this way, and the line carries no marker.
+    #[test]
+    fn the_windows_form_is_one_double_quoted_argument_for_both_windows_shells() {
+        let hosts = ["api.example.com", "*.cdn.example.com"].map(String::from);
+        let dir = std::path::Path::new(r"C:\Users\op erator\.zeroclaw");
+        let command =
+            super::egress_set_command_for(super::ShellDialect::Windows, dir, "zpi1_k", &hosts);
+        assert_eq!(
+            command,
+            concat!(
+                r#"zeroclaw --config-dir "C:\Users\op erator\.zeroclaw" "#,
+                r#"config set plugins.entries.zpi1_k.egress_hosts "api.example.com,*.cdn.example.com""#
+            )
+        );
+        assert!(command.starts_with(&super::zeroclaw_invocation_for(
+            super::ShellDialect::Windows,
+            dir
+        )));
+        assert!(!command.starts_with(super::POWERSHELL_ONLY_MARKER));
+    }
+
+    /// A value that either Windows shell would alter inside double quotes has
+    /// no form both shells pass literally, so the Windows line is refused: it
+    /// becomes the PowerShell form behind a `#` marker, which `cmd.exe` cannot
+    /// run and PowerShell reads as a comment. The refusal is per line, not per
+    /// value: one awkward host marks the whole command, and an awkward profile
+    /// path does the same even when every host is plain. An embedded single
+    /// quote is not awkward: both shells treat it as an ordinary character
+    /// inside double quotes.
+    #[test]
+    fn the_windows_form_refuses_a_value_either_windows_shell_would_expand() {
+        let plain_dir = std::path::Path::new(r"C:\Users\operator\.zeroclaw");
+        for host in [
+            "$(id).example.com",
+            "`id`.example.com",
+            "$env:username.example.com",
+            "%USERNAME%.example.com",
+            "it!s.example.com",
+        ] {
+            assert!(!super::windows_form_is_literal(host), "{host}");
+            let hosts = ["api.example.com".to_string(), host.to_string()];
+            let command = super::egress_set_command_for(
+                super::ShellDialect::Windows,
+                plain_dir,
+                "zpi1_k",
+                &hosts,
+            );
+            let rest = command
+                .strip_prefix(super::POWERSHELL_ONLY_MARKER)
+                .unwrap_or_else(|| panic!("the line for {host} must be marked: {command}"));
+            assert_eq!(
+                rest,
+                super::egress_set_command_for(
+                    super::ShellDialect::PowerShell,
+                    plain_dir,
+                    "zpi1_k",
+                    &hosts
+                ),
+                "after the marker comes the PowerShell form exactly"
+            );
+        }
+        for dir in [
+            r"C:\Users\op erator\.zeroclaw\",
+            r"C:\%USERPROFILE%\.zeroclaw",
+        ] {
+            assert!(!super::windows_form_is_literal(dir), "{dir}");
+            let command = super::egress_set_command_for(
+                super::ShellDialect::Windows,
+                std::path::Path::new(dir),
+                "zpi1_k",
+                &["api.example.com".to_string()],
+            );
+            assert!(
+                command.starts_with(super::POWERSHELL_ONLY_MARKER),
+                "a profile path no Windows shell passes literally marks the line: {command}"
+            );
+        }
+        // A single quote is an ordinary character inside double quotes in both
+        // Windows shells, so an embedded quote needs no refusal here.
+        for plain in [
+            "api.example.com",
+            "*.cdn.example.com",
+            "it's.example.com",
+            r"C:\Users\op erator\.zeroclaw",
+        ] {
+            assert!(super::windows_form_is_literal(plain), "{plain}");
+        }
+    }
+
+    /// The Windows shells, driven for real. `zeroclaw` is swapped for a native
+    /// argv echo: `powershell -File echo.ps1`, whose arguments arrive through
+    /// the same C-runtime command-line parsing a native `zeroclaw.exe` would
+    /// see, so what the script prints is what `config set` would receive.
+    #[cfg(windows)]
+    mod windows_shells {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+
+        struct ArgvEcho {
+            _dir: tempfile::TempDir,
+            invocation: String,
+        }
+
+        fn argv_echo() -> ArgvEcho {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let script = dir.path().join("echo.ps1");
+            std::fs::write(
+                &script,
+                "foreach ($a in $args) { [Console]::Out.WriteLine($a) }\r\n",
+            )
+            .expect("write echo.ps1");
+            let path = script.to_string_lossy().into_owned();
+            assert!(
+                super::super::windows_form_is_literal(&path),
+                "the temp path must be plain for both shells: {path}"
+            );
+            ArgvEcho {
+                _dir: dir,
+                invocation: format!(
+                    "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{path}\""
+                ),
+            }
+        }
+
+        /// The printed line with `zeroclaw` replaced by the argv echo.
+        fn line_with_echo(echo: &ArgvEcho, command: &str) -> String {
+            command
+                .strip_prefix("zeroclaw ")
+                .map(|rest| format!("{} {rest}", echo.invocation))
+                .expect("the command starts with the binary name")
+        }
+
+        /// Run `line` as if pasted into `cmd.exe`: `/C` takes the rest of the
+        /// command line verbatim, so nothing is re-quoted on the way in.
+        fn cmd_exe(line: &str) -> std::process::Output {
+            std::process::Command::new("cmd.exe")
+                .arg("/C")
+                .raw_arg(line)
+                .output()
+                .expect("cmd.exe must be available")
+        }
+
+        /// Run `line` as if pasted into PowerShell: `-Command -` reads the
+        /// command text from stdin, unmodified.
+        fn powershell(line: &str) -> std::process::Output {
+            let mut child = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "-",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("powershell.exe must be available");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(format!("{line}\r\n").as_bytes())
+                .expect("write the pasted line");
+            child.wait_with_output().expect("powershell output")
+        }
+
+        fn argv(output: &std::process::Output) -> Vec<String> {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn expected(dir: &std::path::Path, hosts: &[String]) -> Vec<String> {
+            vec![
+                "--config-dir".to_string(),
+                dir.to_string_lossy().into_owned(),
+                "config".to_string(),
+                "set".to_string(),
+                super::super::egress_hosts_path("zpi1_k"),
+                hosts.join(","),
+            ]
+        }
+
+        /// The plain Windows line, pasted into `cmd.exe`: the directory with a
+        /// space and the host list with a `*` suffix pattern each arrive as one
+        /// argument.
+        #[test]
+        fn the_windows_form_survives_cmd_exe_as_the_intended_arguments() {
+            let echo = argv_echo();
+            let hosts = ["api.example.com", "*.cdn.example.com"].map(String::from);
+            let dir = std::path::Path::new(r"C:\Users\op erator\.zeroclaw");
+            let command = super::super::egress_set_command(dir, "zpi1_k", &hosts);
+            assert!(!command.starts_with(super::super::POWERSHELL_ONLY_MARKER));
+            let output = cmd_exe(&line_with_echo(&echo, &command));
+            assert_eq!(argv(&output), expected(dir, &hosts), "{command}");
+        }
+
+        /// The same plain line, pasted into PowerShell, where the arguments
+        /// additionally pass through PowerShell's native-command re-quoting.
+        #[test]
+        fn the_windows_form_survives_powershell_as_the_intended_arguments() {
+            let echo = argv_echo();
+            let hosts = ["api.example.com", "*.cdn.example.com"].map(String::from);
+            let dir = std::path::Path::new(r"C:\Users\op erator\.zeroclaw");
+            let command = super::super::egress_set_command(dir, "zpi1_k", &hosts);
+            let output = powershell(&line_with_echo(&echo, &command));
+            assert_eq!(argv(&output), expected(dir, &hosts), "{command}");
+        }
+
+        /// A refused line, pasted whole, runs nothing in either shell, and the
+        /// PowerShell form after the marker delivers a publisher-controlled
+        /// `$(id)` host to the native binary byte for byte.
+        #[test]
+        fn a_refused_windows_line_runs_nothing_and_its_powershell_form_is_literal() {
+            let echo = argv_echo();
+            let hosts = [
+                "$(id).example.com",
+                "`id`.example.com",
+                "$env:username.example.com",
+                "*.cdn.example.com",
+            ]
+            .map(String::from);
+            let dir = std::path::Path::new(r"C:\Users\op erator\.zeroclaw");
+            let command = super::super::egress_set_command(dir, "zpi1_k", &hosts);
+            let rest = command
+                .strip_prefix(super::super::POWERSHELL_ONLY_MARKER)
+                .expect("a $(id) host marks the line");
+            let pasted_whole = line_with_echo(&echo, rest);
+            let pasted_whole = format!("{}{pasted_whole}", super::super::POWERSHELL_ONLY_MARKER);
+
+            let in_cmd = cmd_exe(&pasted_whole);
+            assert!(!in_cmd.status.success(), "cmd.exe cannot run a # line");
+            assert!(
+                in_cmd.stdout.is_empty(),
+                "nothing may execute: {}",
+                String::from_utf8_lossy(&in_cmd.stdout)
+            );
+
+            let in_powershell = powershell(&pasted_whole);
+            assert!(in_powershell.status.success());
+            assert!(
+                in_powershell.stdout.is_empty(),
+                "a # line is a comment: {}",
+                String::from_utf8_lossy(&in_powershell.stdout)
+            );
+
+            let output = powershell(&line_with_echo(&echo, rest));
+            assert_eq!(argv(&output), expected(dir, &hosts), "{rest}");
+        }
     }
 
     /// The printed command is pasted into the operator's shell, so the proof
