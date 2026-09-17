@@ -1199,10 +1199,13 @@ mod tests {
         // config and grant stay on one row.
         let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
         let cmd = egress_set_command(dir(), key, &v(&["api.example.com", "*.cdn.example.com"]));
+        // The value is quoted for the host shell: POSIX single quotes on Unix,
+        // the double-quoted form both Windows shells share on Windows.
+        let quoted = ShellDialect::host().quote_literal("api.example.com,*.cdn.example.com");
         assert_eq!(
             cmd,
             format!(
-                "{} config set plugins.entries.{key}.egress_hosts 'api.example.com,*.cdn.example.com'",
+                "{} config set plugins.entries.{key}.egress_hosts {quoted}",
                 zeroclaw_invocation_for(ShellDialect::host(), dir())
             )
         );
@@ -1211,8 +1214,8 @@ mod tests {
             "the command must not address a package-name-keyed row: {cmd}"
         );
         assert!(
-            cmd.ends_with("'api.example.com,*.cdn.example.com'"),
-            "the list must be one single-quoted argument, so the `*` of a suffix \
+            cmd.ends_with(&quoted),
+            "the list must be one quoted argument, so the `*` of a suffix \
              pattern is never glob-expanded by the operator's shell: {cmd}"
         );
     }
