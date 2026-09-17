@@ -16315,7 +16315,8 @@ hosts = ["api.example.com", "api2.example.com"]
             "a refused install must never announce success before rolling back"
         );
         assert!(
-            rendered.contains(&crate::plugins::egress_ceremony::zeroclaw_invocation(
+            rendered.contains(&crate::plugins::egress_ceremony::zeroclaw_invocation_for(
+                crate::plugins::egress_ceremony::ShellDialect::host(),
                 config_dir.path()
             )),
             "the printed grant command must address the configuration the install \
@@ -16570,8 +16571,9 @@ hosts = ["api.example.com", "api2.example.com"]
         );
         let list_lines =
             egress_grant_gap_lines(&profile_a, &manifest).expect("gap lines must build");
-        let invocation_a = crate::plugins::egress_ceremony::zeroclaw_invocation(dir_a.path());
-        let invocation_b = crate::plugins::egress_ceremony::zeroclaw_invocation(dir_b.path());
+        use crate::plugins::egress_ceremony::{ShellDialect, zeroclaw_invocation_for};
+        let invocation_a = zeroclaw_invocation_for(ShellDialect::host(), dir_a.path());
+        let invocation_b = zeroclaw_invocation_for(ShellDialect::host(), dir_b.path());
         for (surface, lines) in [("install", &install_lines), ("list", &list_lines)] {
             let command = lines
                 .iter()

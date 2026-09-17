@@ -90,28 +90,14 @@ pub fn egress_set_command_for(
 
 /// `zeroclaw --config-dir '<dir>'`: the invocation prefix every printed
 /// operator command starts with, so it acts on the configuration the operator
-/// inspected rather than whichever one their shell resolves by default.
-#[must_use]
-pub fn zeroclaw_invocation(config_dir: &std::path::Path) -> String {
-    zeroclaw_invocation_for(ShellDialect::host(), config_dir)
-}
-
-/// [`zeroclaw_invocation`] rendered for an explicit shell dialect.
+/// inspected rather than whichever one their shell resolves by default,
+/// rendered for an explicit shell dialect.
 #[must_use]
 pub fn zeroclaw_invocation_for(dialect: ShellDialect, config_dir: &std::path::Path) -> String {
     format!(
         "zeroclaw --config-dir {}",
         dialect.quote_literal(&config_dir.to_string_lossy())
     )
-}
-
-/// Quote `raw` as one literal argument for the operator's shell on this host:
-/// [`ShellDialect::host`] picks the dialect. On Windows this is the per-value
-/// half only; a whole command line is rendered by [`egress_set_command`],
-/// which is where a value no Windows shell passes literally is refused.
-#[must_use]
-pub fn shell_single_quote(raw: &str) -> String {
-    ShellDialect::host().quote_literal(raw)
 }
 
 /// The quoting dialect of the shell an operator pastes a printed command into.
@@ -772,14 +758,6 @@ mod tests {
             super::egress_set_command(dir, "zpi1_k", &hosts),
             super::egress_set_command_for(expected, dir, "zpi1_k", &hosts)
         );
-        assert_eq!(
-            super::zeroclaw_invocation(dir),
-            super::zeroclaw_invocation_for(expected, dir)
-        );
-        assert_eq!(
-            super::shell_single_quote("it's"),
-            expected.quote_literal("it's")
-        );
     }
 
     /// The PowerShell form is PowerShell's literal string: single quotes, with
@@ -1225,7 +1203,7 @@ mod tests {
             cmd,
             format!(
                 "{} config set plugins.entries.{key}.egress_hosts 'api.example.com,*.cdn.example.com'",
-                zeroclaw_invocation(dir())
+                zeroclaw_invocation_for(ShellDialect::host(), dir())
             )
         );
         assert!(
