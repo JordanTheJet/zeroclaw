@@ -149,10 +149,12 @@ an address locked out of enrollment can still pair or present a webhook
 signature, and a lockout earned on either of those never blocks
 enrollment. A callback counts as an attempt only when it is
 unproductive: no live flow state for the `state` it carries, an issuer
-that does not match, an error handed back by the identity provider, or
-a code exchange that fails. A callback that completes a sign-in costs
-nothing, so a crowd of people signing in at once cannot lock their
-shared address out. Provider listings and device polls carry a
+that does not match, an error handed back by the identity provider, no
+authorization code, an alias removed while the flow was in flight, or a
+code exchange that fails. A callback that completes a sign-in costs
+nothing, and neither does one the gateway itself turns away because its
+relay capacity is in use, so a crowd of people signing in at once cannot
+lock their shared address out. Provider listings and device polls carry a
 per-client budget of 20 requests per minute, which leaves headroom over
 RFC 8628's five-second minimum polling interval (12 polls per minute)
 without letting a client spin. A poll counts as an attempt when the
@@ -162,9 +164,10 @@ existing lockout instead of polling forever; a transport failure on the
 gateway's own leg to the identity provider says nothing about the
 caller and is not billed to it. A client over its budget, or locked
 out, gets HTTP 429 with a `Retry-After` naming the delay in seconds,
-and zerocode waits that delay out before its next poll rather than
-adding the RFC's five seconds, and never polls faster than once every
-five seconds in any case. At most 16 outbound relays to the identity
+and zerocode waits at least that delay, and never less than the RFC's
+five-second increment, before its next poll (still clipped to the device
+code's remaining lifetime), and never polls faster than once every five
+seconds in any case. At most 16 outbound relays to the identity
 provider are in flight at once across all clients, which bounds what the
 gateway will do to the IdP on everyone's behalf. Loopback clients are
 exempt from the per-client budgets, as they are from every other gateway

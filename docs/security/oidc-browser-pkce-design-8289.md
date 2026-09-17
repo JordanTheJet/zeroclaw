@@ -41,9 +41,9 @@ The gateway becomes the OAuth client: it stores state server-side, exchanges the
 code, and must then deliver the resulting token to the browser session. Works
 whenever the dashboard itself is reachable, so also fine for LAN-only gateways.
 
-- Tradeoff: two new unauthenticated routes (the callback must be), a required
-  `redirect base URL` config field per deployment, a pending-flow store, rate
-  limiting on an unauthenticated starter, and a token-delivery design in the
+- Tradeoff: two new unauthenticated routes (the callback must be), a redirect
+  URI derived from the request `Host`, a pending-flow store, rate limiting on
+  an unauthenticated starter, and a token-delivery design in the
   browser (one-time display page vs httpOnly cookie session) that is really the
   "dashboard sign-in" feature, not enrollment. Larger blast radius for the same
   token.
@@ -91,10 +91,11 @@ Option A keeps the whole flow in the memory of one short-lived CLI process:
   the token-purpose separation #10255 enforces (the daemon still rejects
   nonce-marked ID tokens as credentials).
 
-Nothing is written to disk. If Option B is ever built, its server-side
-pending-flow store follows the `api_pairing::PairingStore` precedent: in-memory,
-keyed by `state`, single-use consume-on-arrival, short TTL, capped size, rate
-limited via the existing gateway auth limiter.
+Nothing is written to disk. Option B's server-side pending-flow store follows
+the `api_pairing::PairingStore` precedent: in-memory, keyed by `state`,
+single-use consume-on-arrival, short TTL, capped size, rate limited by an
+enrollment-specific instance of the gateway auth limiter (see the
+implementation notes below).
 
 ## Joining the canonical principal model
 
@@ -200,8 +201,10 @@ and webhook surfaces but on its own ledger, so an enrollment lockout never
 denies pairing or webhook authentication for that address and neither of those
 can deny enrollment. Accounting is unproductive-only: a callback is booked as
 an attempt when it finds no live flow state, names a mismatched issuer, carries
-an IdP error, or fails its code exchange, while a callback that completes a
-sign-in is booked as nothing at all. Provider listings and device polls get a
+an IdP error, carries no authorization code, finds its alias removed, or fails
+its code exchange, while a callback that completes a sign-in, or one the
+gateway turns away because its relay capacity is in use, is booked as nothing
+at all. Provider listings and device polls get a
 per-client budget of 20 requests per minute, which sits comfortably above RFC
 8628's five-second minimum polling interval (12 polls per minute) but still
 stops a client from spinning. A poll is booked as an attempt when the IdP
@@ -209,8 +212,9 @@ answers `slow_down` or rejects the device code, so a client relaying garbage
 device codes reaches the lockout instead of polling indefinitely, while a
 transport failure on the gateway's own leg to the IdP is the gateway's problem
 and is not billed to the caller. The 429 those limits produce carries a
-`Retry-After` in seconds (up to the 300s lockout), which zerocode waits out in
-full instead of adding the RFC's five seconds. A global
+`Retry-After` in seconds (up to the 300s lockout); zerocode waits at least that
+long, never less than the RFC's five-second increment, and still clips the wait
+to the device code's remaining lifetime. A global
 semaphore caps outbound IdP relays at 16 in flight across all clients, which
 bounds what the gateway will do to the IdP on everyone's behalf regardless of
 how many callers show up. Loopback clients are exempt from the per-client
