@@ -6148,6 +6148,62 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// The procedure as the engine will load it once `save_sop` has written it.
+    ///
+    /// Step titles and bodies are written into SOP.md as they are, and the
+    /// loader reads bullets and numbered items back out of that file, so text
+    /// inside a step can add steps or per-step agent overrides that the
+    /// submitted definition does not show.
+    fn sop_as_loaded(sop: &crate::sop::Sop) -> crate::sop::Sop {
+        let mut loaded = sop.clone();
+        loaded.steps = crate::sop::parse_steps(&crate::sop::render_steps(&sop.steps));
+        loaded
+    }
+
+    /// Hold a procedure a principal is about to write to its agent selector,
+    /// both as submitted and as it will load from disk.
+    fn authorize_sop_authoring(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+    ) -> Result<(), JsonRpcError> {
+        self.authorize_sop_agents(method, sop, false)?;
+        self.authorize_sop_agents(method, &Self::sop_as_loaded(sop), false)
+    }
+
+    /// Hold the procedure currently on disk under `name` to the principal
+    /// before it is replaced or deleted.
+    ///
+    /// A directory that exists but cannot be loaded names agents nobody can
+    /// read back, so a principal without operator grants is refused rather
+    /// than allowed to overwrite or remove it.
+    fn authorize_existing_sop(
+        &self,
+        method: Method,
+        dir: &std::path::Path,
+        name: &str,
+        mode: crate::sop::SopExecutionMode,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Ok(());
+        };
+        match crate::sop::load_sop_by_name(dir, name, mode) {
+            Ok(existing) => self.authorize_sop_agents(method, &existing, false),
+            Err(_) => {
+                let exists = crate::sop::resolve_sop_dir(dir, name).is_ok_and(|path| path.exists());
+                if !exists || grants.admin {
+                    return Ok(());
+                }
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal may not replace or delete procedure {name:?}: its definition \
+                     cannot be loaded to check which agents it runs as"
+                ));
+                self.audit_auth_denial(method, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+        }
+    }
+
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
         let install_root = config.install_root_dir();
@@ -6520,12 +6576,10 @@ impl RpcDispatcher {
         }
         let (dir, mode) = self.sops_dir_and_mode();
         // Saving replaces a procedure, so the principal must be entitled to the
-        // agents it runs as now and to the agents it would run as.
+        // agents it would run as and to the agents it runs as now.
         if self.stamped_grants().is_some() {
-            self.authorize_sop_agents(Method::SopsSave, &sop, false)?;
-            if let Ok(existing) = crate::sop::load_sop_by_name(&dir, &sop.name, mode) {
-                self.authorize_sop_agents(Method::SopsSave, &existing, false)?;
-            }
+            self.authorize_sop_authoring(Method::SopsSave, &sop)?;
+            self.authorize_existing_sop(Method::SopsSave, &dir, &sop.name, mode)?;
         }
         crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "saved": sop.name }))
@@ -6535,7 +6589,7 @@ impl RpcDispatcher {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
         let (dir, _mode) = self.sops_dir_and_mode();
-        self.authorize_sop_agents(Method::SopsCreate, &sop, false)?;
+        self.authorize_sop_authoring(Method::SopsCreate, &sop)?;
         crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
@@ -6549,11 +6603,7 @@ impl RpcDispatcher {
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
-        if self.stamped_grants().is_some()
-            && let Ok(existing) = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-        {
-            self.authorize_sop_agents(Method::SopsDelete, &existing, false)?;
-        }
+        self.authorize_existing_sop(Method::SopsDelete, &dir, &req.name, mode)?;
         crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
@@ -9548,6 +9598,89 @@ mod tests {
         )
         .await;
         assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_checks_the_definition_as_it_will_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A step body that renders into SOP.md as a per-step agent override.
+        let mut smuggled = gated_sop("smuggled", "alpha");
+        smuggled.steps[0].body = "ok\n- agent: beta".into();
+        assert_eq!(
+            RpcDispatcher::sop_as_loaded(&smuggled).steps[0]
+                .agent
+                .as_deref(),
+            Some("beta"),
+            "the fixture must reload with the injected override"
+        );
+        let created = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/create",
+            json!({"sop": smuggled}),
+        )
+        .await;
+        assert_eq!(created["error"]["code"], json!(FORBIDDEN), "{created}");
+        assert!(
+            !sops_dir.join("smuggled").exists(),
+            "a refused create must not write the procedure"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_refuses_to_replace_or_delete_an_unloadable_procedure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let broken = sops_dir.join("broken-sop");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join("SOP.toml"),
+            "[sop\nname = \"broken-sop\"\nagent = \"beta\"\n",
+        )
+        .unwrap();
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let deleted = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/delete",
+            json!({"name": "broken-sop"}),
+        )
+        .await;
+        assert_eq!(deleted["error"]["code"], json!(FORBIDDEN), "{deleted}");
+        let saved = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/save",
+            json!({"sop": gated_sop("broken-sop", "alpha")}),
+        )
+        .await;
+        assert_eq!(saved["error"]["code"], json!(FORBIDDEN), "{saved}");
+        assert_eq!(
+            std::fs::read_to_string(broken.join("SOP.toml")).unwrap(),
+            "[sop\nname = \"broken-sop\"\nagent = \"beta\"\n",
+            "the unloadable procedure is left as it was"
+        );
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let removed = rpc(
+            &mut operator,
+            &mut op_rx,
+            1,
+            "sops/delete",
+            json!({"name": "broken-sop"}),
+        )
+        .await;
+        assert!(
+            removed.get("error").is_none(),
+            "the operator may still remove it: {removed}"
+        );
     }
 
     // ── fs/list_dir is confined to the principal's entitled roots ──────
