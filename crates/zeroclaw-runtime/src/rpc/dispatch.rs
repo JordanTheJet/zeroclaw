@@ -1077,15 +1077,16 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Fine-grained agent selector for the cron surface. Composes with the
-    /// coarse `Cron` grant the gate already enforced: both are required.
+    /// Fine-grained agent selector for surfaces that address an agent without
+    /// running its tool loop: cron rows, attachments, personality files, and
+    /// per-agent cost. Composes with the coarse grant the gate already
+    /// enforced: both are required.
     ///
     /// This deliberately omits `selector_session_agent`'s constrained-tools
     /// refusal. That refusal exists because an agent session runs the model's
-    /// whole tool loop with no per-tool principal awareness yet; a cron row
-    /// carries an owner and a command, and its execution path is gated
-    /// separately, so the tool selector is not the boundary here.
-    fn selector_cron_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+    /// whole tool loop with no per-tool principal awareness yet; none of these
+    /// surfaces does, so the tool selector is not the boundary here.
+    fn selector_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
@@ -4423,7 +4424,7 @@ impl RpcDispatcher {
 
     async fn handle_cron_add(&self, params: &Value) -> RpcResult {
         let req: CronAddParams = parse_params(params)?;
-        self.selector_cron_agent(Method::CronAdd, &req.agent)?;
+        self.selector_agent(Method::CronAdd, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let schedule = Schedule::Cron {
             expr: req.schedule,
@@ -4444,7 +4445,7 @@ impl RpcDispatcher {
 
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
-        self.selector_cron_agent(Method::CronPatch, &req.agent)?;
+        self.selector_agent(Method::CronPatch, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
@@ -5339,12 +5340,17 @@ impl RpcDispatcher {
     // ── Cost handler ─────────────────────────────────────────────
 
     fn handle_cost_query(&self, params: &Value) -> RpcResult {
+        let req: CostQueryParams = parse_params(params)?;
+        // A per-agent summary is that agent's usage history; the fleet-wide
+        // summary needs only the coarse `Cost:Read` grant.
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent(Method::CostQuery, agent)?;
+        }
         let tracker = self
             .ctx
             .cost_tracker
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
-        let req: CostQueryParams = parse_params(params)?;
         // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
         // Reports view, or an external CLI report) pull day/month/quarter/YTD
         // scalars rather than only the daemon's today/this-month aggregates.
@@ -5494,6 +5500,9 @@ impl RpcDispatcher {
 
     fn handle_personality_list(&self, params: &Value) -> RpcResult {
         let req: PersonalityListParams = parse_params(params)?;
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent(Method::PersonalityList, agent)?;
+        }
         let config = self.ctx.config.read().clone();
         let workspace = req.agent.as_deref().map(|a| config.agent_workspace_dir(a));
         let files: Vec<PersonalityFileEntry> =
@@ -5529,6 +5538,7 @@ impl RpcDispatcher {
 
     fn handle_personality_get(&self, params: &Value) -> RpcResult {
         let req: PersonalityGetParams = parse_params(params)?;
+        self.selector_agent(Method::PersonalityGet, &req.agent)?;
         let config = self.ctx.config.read().clone();
 
         // Sandbox: only allow files from the allowlist.
@@ -5569,6 +5579,7 @@ impl RpcDispatcher {
 
     fn handle_personality_put(&self, params: &Value) -> RpcResult {
         let req: PersonalityPutParams = parse_params(params)?;
+        self.selector_agent(Method::PersonalityPut, &req.agent)?;
         let config = self.ctx.config.read().clone();
 
         if !crate::agent::personality::EDITABLE_PERSONALITY_FILES.contains(&req.filename.as_str()) {
@@ -5607,6 +5618,9 @@ impl RpcDispatcher {
 
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent(Method::PersonalityTemplates, agent)?;
+        }
         let config = self.ctx.config.read().clone();
         let ctx = personality_template_context(&config, &req);
         let templates = crate::agent::personality_templates::render_preset_default(&ctx);
@@ -5934,14 +5948,17 @@ impl RpcDispatcher {
         let req: FileAttachParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        // Uploads land in the per-agent workspace, not the session cwd.
-        // See `handle_send_message` for the rationale.
+        // Uploads land in the per-agent workspace, not the session cwd, the
+        // same way `session/prompt` lands its inline attachments. The session
+        // id is caller-selected, so the session's agent must be one the
+        // principal may use before anything is written into its workspace.
         let agent_alias = self
             .ctx
             .sessions
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        self.selector_agent(Method::FileAttach, &agent_alias)?;
         let upload_root = self
             .ctx
             .config
@@ -8866,6 +8883,199 @@ mod tests {
         assert!(
             started_rx.try_recv().is_err(),
             "a refused prompt must never reach the provider"
+        );
+    }
+
+    // ── Agent-addressed surfaces apply the agent selector ─────────────
+    //
+    // Two agents; alice is entitled to `alpha` only.
+
+    /// `cron_roster_config_in` with each agent given a workspace under `tmp`
+    /// and alice's `alpha`-only profile also granted personality read/update
+    /// and cost read.
+    fn agent_scoped_config_in(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = cron_roster_config_in(tmp, uid);
+        for alias in ["alpha", "beta"] {
+            let workspace = tmp.path().join(format!("{alias}-workspace"));
+            std::fs::create_dir_all(&workspace).expect("the agent workspace is creatable");
+            config
+                .agents
+                .get_mut(alias)
+                .expect("the fixture agent exists")
+                .workspace
+                .path = Some(workspace);
+        }
+        let grants = &mut config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants;
+        grants.insert(Resource::Personality, vec![Verb::Read, Verb::Update]);
+        grants.insert(Resource::Cost, vec![Verb::Read]);
+        config
+    }
+
+    #[tokio::test]
+    async fn personality_surfaces_refuse_an_agent_outside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = agent_scoped_config_in(&tmp, 4242);
+        let beta_soul = config.agent_workspace_dir("beta").join("SOUL.md");
+        std::fs::write(&beta_soul, "beta's own soul").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (id, method, params) in [
+            (
+                1u64,
+                "personality/get",
+                json!({"agent": "beta", "filename": "SOUL.md"}),
+            ),
+            (
+                2,
+                "personality/put",
+                json!({"agent": "beta", "filename": "SOUL.md", "content": "overwritten"}),
+            ),
+            (3, "personality/list", json!({"agent": "beta"})),
+            (4, "personality/templates", json!({"agent": "beta"})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&beta_soul).unwrap(),
+            "beta's own soul",
+            "a refused personality/put must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn personality_surfaces_serve_an_agent_inside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(agent_scoped_config_in(&tmp, 4242));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let put = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "personality/put",
+            json!({"agent": "alpha", "filename": "SOUL.md", "content": "alpha soul"}),
+        )
+        .await;
+        assert!(put.get("result").is_some(), "{put}");
+        let get = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "personality/get",
+            json!({"agent": "alpha", "filename": "SOUL.md"}),
+        )
+        .await;
+        assert_eq!(get["result"]["content"], json!("alpha soul"), "{get}");
+        for (id, method) in [(3u64, "personality/list"), (4, "personality/templates")] {
+            let response = rpc(&mut alice, &mut rx, id, method, json!({"agent": "alpha"})).await;
+            assert!(response.get("result").is_some(), "{method}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_query_refuses_an_agent_outside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(agent_scoped_config_in(&tmp, 4242));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cost/query",
+            json!({"agent": "beta"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        // This context has no cost tracker, so an admitted query fails as
+        // unavailable rather than being refused.
+        for (id, params) in [(2u64, json!({"agent": "alpha"})), (3, json!({}))] {
+            let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
+            assert_ne!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        }
+    }
+
+    fn files_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() { files_under(&path) } else { 1 }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn file_attach_refuses_a_session_whose_agent_the_principal_may_not_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Create],
+            );
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _started_rx, _release_tx) = gated_provider();
+        let sid = "s-attach";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+        )
+        .await;
+        assert!(attached["result"]["files"].is_array(), "{attached}");
+        let files_before = files_under(&agent_workspace);
+
+        narrow_alice_to_no_agents(&ctx);
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "d29ybGQ=", "filename": "world.txt"}]}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused upload must not write into the agent's workspace"
         );
     }
 
