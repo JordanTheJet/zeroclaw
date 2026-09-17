@@ -6075,6 +6075,56 @@ impl RpcDispatcher {
         to_result(body)
     }
 
+    /// Every agent a procedure executes as: each step's effective agent (its
+    /// own override, then the procedure's parent agent), or, where neither is
+    /// named, the lowest configured alias, which is what the headless driver
+    /// falls back to. The parent agent counts even for a procedure with no
+    /// steps.
+    fn sop_executing_agents(sop: &crate::sop::Sop, config: &Config) -> Vec<String> {
+        let fallback = config.agents.keys().min().cloned().unwrap_or_default();
+        let mut agents: Vec<String> = sop
+            .steps
+            .iter()
+            .map(|step| {
+                step.effective_agent(sop.agent.as_deref())
+                    .map_or_else(|| fallback.clone(), str::to_string)
+            })
+            .chain(sop.agent.clone())
+            .collect();
+        agents.sort();
+        agents.dedup();
+        agents
+    }
+
+    /// Hold a procedure's agents to the bound principal's selector.
+    ///
+    /// Running or approving a procedure drives its agents' tool loops
+    /// headlessly, so `executes` applies the session posture, constrained
+    /// tool selectors included. Authoring and deleting apply the plain agent
+    /// selector. An unbound dispatcher (the direct unit-test handlers) passes.
+    fn authorize_sop_agents(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        executes: bool,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Ok(());
+        };
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        for alias in &agents {
+            if executes {
+                self.selector_session_agent_with_grants(method, grants, alias)?;
+            } else {
+                self.selector_agent(method, alias)?;
+            }
+        }
+        Ok(())
+    }
+
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
         let install_root = config.install_root_dir();
@@ -6127,6 +6177,18 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        // The run executes as the procedure's agents, so the principal must be
+        // entitled to every one of them before anything is dispatched.
+        if self.stamped_grants().is_some() {
+            let sop = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+                .get_sop(&req.name)
+                .cloned();
+            if let Some(sop) = sop {
+                self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
+            }
+        }
         let audit = self
             .ctx
             .sop_audit
@@ -6284,6 +6346,25 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
+        // Approving resumes the run headlessly as its procedure's agents, so
+        // the principal must be entitled to every one of them before its
+        // decision reaches the broker. The loaded run's procedure is what
+        // executes, whatever is on disk.
+        if self.stamped_grants().is_some() {
+            let run_sop = {
+                let guard = engine
+                    .lock()
+                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+                guard
+                    .get_run(&req.run_id)
+                    .and_then(|run| guard.get_sop(&run.sop_name))
+                    .cloned()
+            };
+            if let Some(run_sop) = run_sop {
+                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
+            }
+        }
+
         let mut resolved_outcome = None;
         {
             let mut guard = engine
@@ -6414,7 +6495,15 @@ impl RpcDispatcher {
                 ),
             ));
         }
-        let (dir, _mode) = self.sops_dir_and_mode();
+        let (dir, mode) = self.sops_dir_and_mode();
+        // Saving replaces a procedure, so the principal must be entitled to the
+        // agents it runs as now and to the agents it would run as.
+        if self.stamped_grants().is_some() {
+            self.authorize_sop_agents(Method::SopsSave, &sop, false)?;
+            if let Ok(existing) = crate::sop::load_sop_by_name(&dir, &sop.name, mode) {
+                self.authorize_sop_agents(Method::SopsSave, &existing, false)?;
+            }
+        }
         crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
@@ -6423,6 +6512,7 @@ impl RpcDispatcher {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
         let (dir, _mode) = self.sops_dir_and_mode();
+        self.authorize_sop_agents(Method::SopsCreate, &sop, false)?;
         crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
@@ -6435,7 +6525,12 @@ impl RpcDispatcher {
 
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
         let req: SopSelectRequest = parse_params(params)?;
-        let (dir, _mode) = self.sops_dir_and_mode();
+        let (dir, mode) = self.sops_dir_and_mode();
+        if self.stamped_grants().is_some()
+            && let Ok(existing) = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+        {
+            self.authorize_sop_agents(Method::SopsDelete, &existing, false)?;
+        }
         crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
@@ -9104,6 +9199,228 @@ mod tests {
             files_before,
             "a refused upload must not write into the agent's workspace"
         );
+    }
+
+    // ── SOP runs, approvals, and authoring apply the agent selector ─────
+
+    fn gated_sop(name: &str, agent: &str) -> crate::sop::Sop {
+        use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger};
+        Sop {
+            name: name.to_string(),
+            description: format!("{agent} procedure"),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: Some(agent.to_string()),
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    /// Two agents; alice is entitled to `alpha` with unrestricted tools and
+    /// every SOP verb. The engine holds a gated procedure for each agent.
+    fn sop_scoped_ctx(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        std::path::PathBuf,
+    ) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let mut config = cron_roster_config_in(tmp, uid);
+        let sops_dir = tmp.path().join("sops");
+        config.sop = zeroclaw_config::schema::SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..zeroclaw_config::schema::SopConfig::default()
+        };
+        let profile = config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists");
+        profile.allowed_tools = vec![zeroclaw_api::grants::WILDCARD.into()];
+        profile.grants.insert(
+            Resource::Sops,
+            vec![
+                Verb::Create,
+                Verb::Read,
+                Verb::Update,
+                Verb::Delete,
+                Verb::Execute,
+            ],
+        );
+        for (name, agent) in [("alpha-sop", "alpha"), ("beta-sop", "beta")] {
+            crate::sop::save_sop(&sops_dir, &gated_sop(name, agent)).expect("save the fixture SOP");
+        }
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
+        engine.reload(tmp.path());
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        (ctx, engine, sops_dir)
+    }
+
+    fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
+        let action = engine
+            .lock()
+            .expect("engine lock")
+            .start_run(
+                name,
+                crate::sop::SopEvent {
+                    source: crate::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .expect("start the gated SOP");
+        let crate::sop::SopRunAction::WaitApproval { run_id, .. } = action else {
+            panic!("a supervised execute step parks for approval: {action:?}");
+        };
+        run_id
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_refuse_a_procedure_run_as_an_agent_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let beta_run = park_sop_run(&engine, "beta-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "beta-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "beta-sop", "run_id": beta_run, "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&beta_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::WaitingApproval),
+            "a refused approval must leave the run parked"
+        );
+
+        // alpha's procedure passes the selector. This context has no SOP audit
+        // log, so the run then fails as unavailable rather than as refused.
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+    }
+
+    #[tokio::test]
+    async fn sop_run_refuses_a_constrained_tool_selector_like_a_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_tools = vec!["calculator".into()];
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_refuses_procedures_bound_to_an_agent_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let created = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/create",
+            json!({"sop": gated_sop("beta-new", "beta")}),
+        )
+        .await;
+        assert_eq!(created["error"]["code"], json!(FORBIDDEN), "{created}");
+
+        let mut rebound = gated_sop("beta-sop", "alpha");
+        rebound.description = "taken over".into();
+        let saved = rpc(&mut alice, &mut rx, 2, "sops/save", json!({"sop": rebound})).await;
+        assert_eq!(
+            saved["error"]["code"],
+            json!(FORBIDDEN),
+            "rewriting another agent's procedure is refused: {saved}"
+        );
+
+        let deleted = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/delete",
+            json!({"name": "beta-sop"}),
+        )
+        .await;
+        assert_eq!(deleted["error"]["code"], json!(FORBIDDEN), "{deleted}");
+        let beta = crate::sop::load_sop_by_name(
+            &sops_dir,
+            "beta-sop",
+            crate::sop::SopExecutionMode::Supervised,
+        )
+        .expect("beta's procedure is still on disk");
+        assert_eq!(beta.agent.as_deref(), Some("beta"));
+        assert_eq!(beta.description, "beta procedure");
+
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            4,
+            "sops/create",
+            json!({"sop": gated_sop("alpha-new", "alpha")}),
+        )
+        .await;
+        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
     }
 
     // ── fs/list_dir is confined to the principal's entitled roots ──────
