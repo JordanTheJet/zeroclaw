@@ -951,13 +951,17 @@ impl RpcDispatcher {
     /// admission to a serialized section (the config write lock, or a
     /// session's actor queue).
     ///
-    /// Every such handler tests its grants before it queues, and the wait is
-    /// unbounded: another connection can revoke or narrow the waiting
-    /// principal's profile, the credential can expire, the revalidation
-    /// deadline can pass, or the native pairing can be dropped while the
-    /// request is parked. This repeats those checks, and the method's coarse
-    /// grant, against the policy generation that is in force now, and returns
-    /// the freshly resolved grants for the handler's fine-grained selectors.
+    /// Every such handler tests its grants before it queues, and the wait can
+    /// be long (a session queue waits up to its lock timeout, the config write
+    /// lock without limit): another connection can revoke or narrow the
+    /// waiting principal's profile, the credential can expire, the
+    /// revalidation deadline can pass, or the native pairing can be dropped
+    /// while the request is parked. This repeats those checks, and the
+    /// method's coarse grant, against the policy generation that is in force
+    /// now, and returns the freshly resolved grants for the handler's
+    /// fine-grained selectors. Local credential evidence is rechecked only
+    /// when the generation has moved, as the gate does, so an OIDC binding is
+    /// not refused merely for having waited.
     ///
     /// This re-resolves rather than comparing against the grants stamped on
     /// the connection, so a policy change that WIDENS the principal's
@@ -1015,7 +1019,7 @@ impl RpcDispatcher {
         let resolved = self
             .ctx
             .auth
-            .revalidate_and_resolve(auth)
+            .resolve_current(auth)
             .map_err(|reason| refuse(AuthDenied::from_deny_reason(reason)))?;
         if resolved.generation != self.ctx.auth.generation() {
             // The accepted state moved between the resolution and this read.
@@ -1356,6 +1360,29 @@ impl RpcDispatcher {
     #[cfg(test)]
     pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
         Arc::clone(&self.rpc)
+    }
+
+    /// Test-only: bind a provider-verified identity with the evidence
+    /// `initialize` would retain for it.
+    #[cfg(test)]
+    pub fn bind_identity_for_test(
+        &mut self,
+        identity: zeroclaw_api::principal::AuthenticatedIdentity,
+        local_evidence: crate::rpc::auth::LocalCredentialEvidence,
+    ) {
+        let resolved = self
+            .ctx
+            .auth
+            .resolve(&identity)
+            .expect("the test identity resolves");
+        self.auth = Some(crate::rpc::auth::ConnectionAuth {
+            identity,
+            principal: resolved.principal,
+            grants: resolved.grants,
+            generation: resolved.generation,
+            native_token_hash: None,
+            local_evidence,
+        });
     }
 
     /// Test-only: bind the shared-operator principal directly, standing in
@@ -9209,6 +9236,142 @@ mod tests {
             response["result"]["entries"].is_array(),
             "the local operator keeps unrestricted listing: {response}"
         );
+    }
+
+    // ── An OIDC principal is not refused for having waited ─────────────
+
+    /// `session_cwd_config` plus an `[oidc.corp]` trust relationship mapping the
+    /// `ops` group to a profile that may open and prompt `test-agent` sessions
+    /// and write provider settings.
+    fn oidc_session_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig};
+
+        let mut config = session_cwd_config(tmp, 4242, None);
+        config.permission_profiles.insert(
+            "oidc-ops".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["test-agent".into()],
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                config_write_paths: vec!["providers.*".into()],
+                grants: HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Execute],
+                    ),
+                    (Resource::Config, vec![Verb::Read, Verb::Update]),
+                ]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: HashMap::from([("ops".into(), "oidc-ops".into())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    fn oidc_identity() -> zeroclaw_api::principal::AuthenticatedIdentity {
+        let serde_json::Value::Object(claims) = json!({ "groups": ["ops"] }) else {
+            unreachable!()
+        };
+        zeroclaw_api::principal::AuthenticatedIdentity::new(
+            zeroclaw_api::principal::IdentitySubject::Oidc {
+                issuer: "https://sso.example.com".into(),
+                subject: "alice".into(),
+            },
+            zeroclaw_api::principal::AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims)
+    }
+
+    fn oidc_peer(ctx: &Arc<RpcContext>) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:oidc".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher.bind_identity_for_test(
+            oidc_identity(),
+            crate::rpc::auth::LocalCredentialEvidence::Oidc,
+        );
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn oidc_principal_opens_and_prompts_sessions_at_an_unchanged_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = oidc_session_config(&tmp);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+        let created = rpc(
+            &mut oidc,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-oidc-new"}),
+        )
+        .await;
+        assert_eq!(
+            created["result"]["session_id"],
+            json!("s-oidc-new"),
+            "{created}"
+        );
+
+        let (provider, mut started_rx, release_tx) = gated_provider();
+        let sid = "s-oidc-prompt";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        send_prompt(&mut oidc, 2, sid, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("an OIDC principal's prompt must reach the provider")
+            .expect("the provider channel stays open");
+        release_tx
+            .send(())
+            .expect("the turn is waiting on its provider");
+        let (response, _notifications) = response_and_notifications(&mut rx, 2).await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    #[test]
+    fn oidc_principal_writes_config_at_an_unchanged_generation() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, _chat_backend, _acp_store) =
+                persistence_enforcement_ctx(oidc_session_config(&tmp));
+            let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+            let response = rpc(
+                &mut oidc,
+                &mut rx,
+                1,
+                "config/set",
+                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model"}),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{response}");
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(on_disk.contains("oidc-model"), "{on_disk}");
+        });
     }
 
     #[tokio::test]

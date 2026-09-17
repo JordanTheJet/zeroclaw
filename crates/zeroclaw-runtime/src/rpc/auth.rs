@@ -456,6 +456,31 @@ impl RpcInboundAuth {
         state.resolve(&auth.identity)
     }
 
+    /// Resolve an established binding against the accepted policy, rechecking
+    /// its local credential evidence only when its stamped generation is no
+    /// longer current.
+    ///
+    /// At an unchanged generation that evidence cannot have been invalidated:
+    /// the OIDC verifiers, the uid roster, and the daemon-uid trust posture
+    /// change only through a new publication, and the caller checks expiry,
+    /// the revalidation deadline, and pairing liveness on every operation.
+    /// This is the rule the dispatcher's gate applies, and it is what keeps an
+    /// OIDC binding, whose bearer is never retained, usable until the policy
+    /// actually changes. After a change, [`Self::revalidate_and_resolve`]
+    /// applies and an OIDC binding must initialize again.
+    pub fn resolve_current(&self, auth: &ConnectionAuth) -> Result<ResolvedPrincipal, DenyReason> {
+        let state = self.state();
+        if auth.generation != state.resolver.generation() {
+            state.revalidates_local_evidence(
+                &auth.identity,
+                &auth.local_evidence,
+                auth.native_token_hash.as_deref(),
+                &self.pairing,
+            )?;
+        }
+        state.resolve(&auth.identity)
+    }
+
     /// Authenticate one `initialize` handshake into a [`ConnectionAuth`].
     pub async fn authenticate(
         &self,
@@ -913,6 +938,69 @@ mod tests {
         )
         .await
         .expect("a compiling policy keeps the daemon uid on the trusted local path");
+    }
+
+    fn oidc_config() -> Config {
+        let mut config = config_with_roster(4242);
+        config.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: std::collections::HashMap::from([("ops".into(), "operator".into())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    /// The binding `initialize` produces for a verified OIDC access token.
+    fn oidc_binding(auth: &RpcInboundAuth) -> ConnectionAuth {
+        let serde_json::Value::Object(claims) = serde_json::json!({ "groups": ["ops"] }) else {
+            unreachable!()
+        };
+        let identity = AuthenticatedIdentity::new(
+            zeroclaw_api::principal::IdentitySubject::Oidc {
+                issuer: "https://sso.example.com".into(),
+                subject: "alice".into(),
+            },
+            AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims);
+        let resolved = auth.resolve(&identity).expect("the OIDC identity resolves");
+        ConnectionAuth {
+            identity,
+            principal: resolved.principal,
+            grants: resolved.grants,
+            generation: resolved.generation,
+            native_token_hash: None,
+            local_evidence: LocalCredentialEvidence::Oidc,
+        }
+    }
+
+    #[test]
+    fn resolve_current_keeps_an_oidc_binding_until_the_generation_moves() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+
+        let resolved = auth
+            .resolve_current(&binding)
+            .expect("an OIDC binding at its own generation stays usable");
+        assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+        assert!(
+            auth.revalidate_and_resolve(&binding).is_err(),
+            "revalidation is for a changed generation, where an OIDC bearer cannot be reverified"
+        );
+
+        auth.refresh_from_config(&config)
+            .expect("republishing the same policy compiles");
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "after a publication the OIDC binding must initialize again"
+        );
     }
 
     #[test]
