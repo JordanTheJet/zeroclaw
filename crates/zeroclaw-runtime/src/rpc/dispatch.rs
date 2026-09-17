@@ -1225,12 +1225,20 @@ impl RpcDispatcher {
     /// refusing every constrained principal outright.
     fn principal_tool_narrowing(&self) -> Option<Vec<String>> {
         let auth = self.auth.as_ref()?;
-        if auth.grants.admin
-            || auth
-                .grants
-                .allowed_tools
-                .iter()
-                .any(|t| t == zeroclaw_api::grants::WILDCARD)
+        if auth.grants.admin {
+            return None;
+        }
+        if !auth.grants.permits(
+            zeroclaw_api::grants::Resource::Tools,
+            zeroclaw_api::grants::Verb::Execute,
+        ) {
+            return Some(Vec::new());
+        }
+        if auth
+            .grants
+            .allowed_tools
+            .iter()
+            .any(|t| t == zeroclaw_api::grants::WILDCARD)
         {
             return None;
         }
@@ -9546,22 +9554,33 @@ mod tests {
             .expect_err("no agent selector granted");
         assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
 
-        // A CONSTRAINED tool selector fails closed at session/new until
-        // in-session enforcement exists (never silently un-enforced).
-        {
-            let profile_grants_agents = PermissionProfileConfig {
+        // A CONSTRAINED tool selector composes as per-session narrowing on
+        // top of the coarse `tools:execute` grant. Without that grant the
+        // selector is moot: the session is created tool-less rather than
+        // refused, and never silently un-enforced.
+        let narrowed_profile = |with_tools_execute: bool| {
+            let mut grants = std::collections::HashMap::from([(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![zeroclaw_api::grants::Verb::Create],
+            )]);
+            if with_tools_execute {
+                grants.insert(
+                    zeroclaw_api::grants::Resource::Tools,
+                    vec![zeroclaw_api::grants::Verb::Execute],
+                );
+            }
+            PermissionProfileConfig {
                 allowed_agents: vec!["*".into()],
                 allowed_tools: vec!["calculator".into()],
-                grants: std::collections::HashMap::from([(
-                    zeroclaw_api::grants::Resource::Sessions,
-                    vec![zeroclaw_api::grants::Verb::Create],
-                )]),
+                grants,
                 ..PermissionProfileConfig::default()
-            };
+            }
+        };
+        {
             let mut narrowed = roster_config(4242);
             narrowed
                 .permission_profiles
-                .insert("reader".into(), profile_grants_agents);
+                .insert("reader".into(), narrowed_profile(false));
             ctx.auth
                 .refresh_from_config(&narrowed)
                 .expect("a narrowed profile is a valid refresh");
@@ -9575,43 +9594,77 @@ mod tests {
                 zeroclaw_api::grants::Verb::Create,
             )
             .expect("coarse grant passes after refresh");
-        // ...and the constrained tool selector now composes as per-session
-        // narrowing instead of refusing the session.
+        // ...and the constrained tool selector narrows the session instead of
+        // refusing it: to nothing, because `tools:execute` is not granted.
         alice
             .selector_session_agent(Method::SessionNew, "any-agent")
             .expect("constrained tools narrow the session, not refuse it");
         assert_eq!(
             alice.principal_tool_narrowing(),
+            Some(Vec::new()),
+            "a selector without tools:execute yields a tool-less session"
+        );
+        // With the coarse grant held, the named selector is the narrowing.
+        {
+            let mut narrowed = roster_config(4242);
+            narrowed
+                .permission_profiles
+                .insert("reader".into(), narrowed_profile(true));
+            ctx.auth
+                .refresh_from_config(&narrowed)
+                .expect("granting tools:execute is a valid refresh");
+        }
+        alice
+            .authorize(
+                Method::SessionNew,
+                zeroclaw_api::grants::Resource::Sessions,
+                zeroclaw_api::grants::Verb::Create,
+            )
+            .expect("coarse grant still passes");
+        assert_eq!(
+            alice.principal_tool_narrowing(),
             Some(vec!["calculator".to_string()]),
-            "the named selector becomes the per-run tool narrowing"
+            "with tools:execute the named selector becomes the per-run tool narrowing"
         );
 
-        // bob (operator): wildcard agents + wildcard tools pass.
+        // bob (operator): wildcard agents + wildcard tools. The wildcard
+        // selector is unrestricted only together with the coarse grant.
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut bob = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into()).with_transport(
             crate::rpc::transport::TransportKind::Local,
             crate::security::auth_provider::Credential::Peercred { uid: 4343 },
         );
-        // restore the two-user policy (the narrowed refresh above dropped bob)
-        let mut config = roster_config(4242);
-        config.permission_profiles.insert(
-            "operator".into(),
-            PermissionProfileConfig {
-                allowed_agents: vec!["*".into()],
-                allowed_tools: vec!["*".into()],
-                ..PermissionProfileConfig::default()
-            },
-        );
-        config.users.insert(
-            "bob".into(),
-            UserConfig {
-                principal_id: None,
-                uid: Some(4343),
-                permission_profiles: vec!["operator".into()],
-            },
-        );
+        let operator_roster = |with_tools_execute: bool| {
+            // restore the two-user policy (the narrowed refresh above dropped bob)
+            let mut config = roster_config(4242);
+            let mut grants = std::collections::HashMap::new();
+            if with_tools_execute {
+                grants.insert(
+                    zeroclaw_api::grants::Resource::Tools,
+                    vec![zeroclaw_api::grants::Verb::Execute],
+                );
+            }
+            config.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    allowed_tools: vec!["*".into()],
+                    grants,
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            config.users.insert(
+                "bob".into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(4343),
+                    permission_profiles: vec!["operator".into()],
+                },
+            );
+            config
+        };
         ctx.auth
-            .refresh_from_config(&config)
+            .refresh_from_config(&operator_roster(false))
             .expect("a valid roster refreshes");
         bob.handle_initialize(&json!({}))
             .await
@@ -9622,8 +9675,22 @@ mod tests {
         );
         assert_eq!(
             bob.principal_tool_narrowing(),
+            Some(Vec::new()),
+            "an explicit \"*\" selector without tools:execute still yields a tool-less session"
+        );
+        ctx.auth
+            .refresh_from_config(&operator_roster(true))
+            .expect("granting tools:execute is a valid refresh");
+        bob.authorize(
+            Method::SessionNew,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Create,
+        )
+        .expect_err("bob's operator profile grants no session verbs; the gate re-resolves");
+        assert_eq!(
+            bob.principal_tool_narrowing(),
             None,
-            "an explicit \"*\" selector is unrestricted"
+            "an explicit \"*\" selector with tools:execute is unrestricted"
         );
     }
 
@@ -12591,13 +12658,19 @@ mod tests {
             PermissionProfileConfig {
                 allowed_agents: vec!["*".into()],
                 allowed_tools: vec!["calculator".into()],
-                grants: std::collections::HashMap::from([(
-                    zeroclaw_api::grants::Resource::Sessions,
-                    vec![
-                        zeroclaw_api::grants::Verb::Create,
-                        zeroclaw_api::grants::Verb::Execute,
-                    ],
-                )]),
+                grants: std::collections::HashMap::from([
+                    (
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![
+                            zeroclaw_api::grants::Verb::Create,
+                            zeroclaw_api::grants::Verb::Execute,
+                        ],
+                    ),
+                    (
+                        zeroclaw_api::grants::Resource::Tools,
+                        vec![zeroclaw_api::grants::Verb::Execute],
+                    ),
+                ]),
                 ..PermissionProfileConfig::default()
             },
         );
@@ -12650,6 +12723,86 @@ mod tests {
         assert_eq!(denied.output, "Unknown tool: file_read");
     }
 
+    /// The selector composes with the coarse `tools:execute` grant, never
+    /// instead of it: the same `allowed_tools = ["calculator"]` profile
+    /// without that grant still gets its session, but a tool-less one, and
+    /// the named tool cannot be dispatched through it.
+    #[tokio::test]
+    async fn principal_without_tools_execute_gets_a_tool_less_session() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools = vec!["calculator".into(), "file_read".into()];
+        config.permission_profiles.insert(
+            "selector-only".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["calculator".into()],
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![
+                        zeroclaw_api::grants::Verb::Create,
+                        zeroclaw_api::grants::Verb::Execute,
+                    ],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["selector-only".into()],
+            },
+        );
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let mut dispatcher = dispatcher.with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster principal authenticates");
+        assert_eq!(
+            dispatcher.principal_tool_narrowing(),
+            Some(Vec::new()),
+            "no tools:execute means an empty narrowing, whatever the selector names"
+        );
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "toolless-001",
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "the session itself is granted (sessions:create): {:?}",
+            result.err()
+        );
+        let agent_arc = sessions
+            .get_agent("toolless-001")
+            .await
+            .expect("session registered");
+        let agent = agent_arc.lock().await;
+        assert!(
+            agent.tool_names().is_empty(),
+            "a selector without tools:execute must assemble no tools; got {:?}",
+            agent.tool_names()
+        );
+        let denied = agent
+            .dispatch_tool_for_test("calculator", json!({"function":"add", "values":[2,3]}))
+            .await;
+        assert!(!denied.success);
+        assert_eq!(denied.output, "Unknown tool: calculator");
+    }
+
     fn principal_test_config(
         tmp: &tempfile::TempDir,
         allowed_tools: &[&str],
@@ -12667,18 +12820,26 @@ mod tests {
             "delegate".into(),
             "spawn_subagent".into(),
         ];
+        // The coarse `tools:execute` grant is what the tool selector composes
+        // with; these ceiling tests are about the selector, so they hold it.
         config.permission_profiles.insert(
             "principal-test".into(),
             PermissionProfileConfig {
                 allowed_agents: allowed_agents.iter().map(|s| (*s).into()).collect(),
                 allowed_tools: allowed_tools.iter().map(|s| (*s).into()).collect(),
-                grants: std::collections::HashMap::from([(
-                    zeroclaw_api::grants::Resource::Sessions,
-                    vec![
-                        zeroclaw_api::grants::Verb::Create,
-                        zeroclaw_api::grants::Verb::Execute,
-                    ],
-                )]),
+                grants: std::collections::HashMap::from([
+                    (
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![
+                            zeroclaw_api::grants::Verb::Create,
+                            zeroclaw_api::grants::Verb::Execute,
+                        ],
+                    ),
+                    (
+                        zeroclaw_api::grants::Resource::Tools,
+                        vec![zeroclaw_api::grants::Verb::Execute],
+                    ),
+                ]),
                 ..Default::default()
             },
         );

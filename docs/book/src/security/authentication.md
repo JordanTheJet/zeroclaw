@@ -189,16 +189,22 @@ cron jobs, attachments, personality files, per-agent cost queries, and SOP
 authoring, `allowed_agents = ["*"]` covers only the agents the
 configuration defines, not any alias a request names.
 
-Tool selectors compose by intersection at agent assembly: a session
+Tool selectors compose by intersection at agent assembly, on top of the
+coarse grant: model-facing tool execution is `tools = ["execute"]`, and a
+principal without that grant receives a tool-less session whatever its
+`allowed_tools` names, including `"*"`. With the grant held, a session
 created by a constrained principal only receives the tools its
 `allowed_tools` names (an empty list yields a tool-less session), on top
 of whatever the agent's own risk profile allows. After a queued prompt is
 admitted, authorization is rechecked against the shared resolver, including
 credential expiry and revocation. The current principal selector narrows
-static tools, the deferred search registry, and already-activated tools;
-removed tools cannot be reactivated. Reused sessions are narrowed before their
-next turn, and rehydrated sessions are rebuilt under current grants. Agent
-selectors are checked before a turn and before rehydration.
+static tools, the deferred search registry, already-activated tools, and
+pinned MCP resource content (each pinned block is admitted under its
+`<server>__<uri>` name and is withdrawn from later prompts once the selector
+no longer names it); removed tools cannot be reactivated. Reused sessions
+are narrowed before their next turn, and rehydrated sessions are rebuilt
+under current grants. Agent selectors are checked before a turn and before
+rehydration.
 
 Narrowing never adds tools back to an existing agent. After expanding grants,
 create a new session to receive the expanded surface. No new config snapshot
