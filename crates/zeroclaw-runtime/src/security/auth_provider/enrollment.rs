@@ -22,13 +22,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::OidcConfig;
 
-use super::oidc::read_response_limited;
+use super::oidc::{read_response_limited, validate_discovered_endpoint};
 
 #[derive(Debug, Clone, Deserialize)]
 struct EnrollmentDiscovery {
     /// The identifier the document asserts for itself. Optional here only so
     /// that its absence is refused with a specific error rather than a serde
-    /// field error; [`Enrollment::discovery`] requires it.
+    /// field error; `Enrollment::discovery` requires it.
     #[serde(default)]
     issuer: Option<String>,
     #[serde(default)]
@@ -134,14 +134,23 @@ impl Enrollment {
 
     /// Fetch and verify the issuer's metadata document.
     ///
-    /// RFC 8414 section 3.3 (and OIDC Discovery 4.3): the `issuer` the
-    /// document asserts must be byte-identical to the identifier the client
-    /// started from. A document that names another identifier is not this
-    /// issuer's metadata, whatever URL served it, so none of its endpoints may
-    /// be used. The check runs here — before any endpoint leaves this function
-    /// — so every flow built on it (device start, device poll,
-    /// `client_credentials`, PKCE start) is covered by construction and no
-    /// substituted document can point an enrollment at another provider.
+    /// Two checks run here, before any endpoint leaves this function, so every
+    /// flow built on it (device start, device poll, `client_credentials`, PKCE
+    /// start) is covered by construction.
+    ///
+    /// The issuer check binds the document's identity. RFC 8414 section 3.3
+    /// (and OIDC Discovery 4.3): the `issuer` the document asserts must be
+    /// byte-identical to the identifier the client started from. A document
+    /// that names another identifier is not this issuer's metadata, whatever
+    /// URL served it, so none of its endpoints may be used.
+    ///
+    /// The endpoint check binds the document's transport. Each endpoint the
+    /// enrollment flows post to — the token endpoint always, the authorization
+    /// and device authorization endpoints when advertised — must be `https`,
+    /// or `http` on an exact loopback host for a local IdP, under the same rule
+    /// the verifier sibling applies to the endpoints it discovers. Without it a
+    /// document with the right identifier could still put the client secret,
+    /// the PKCE verifier and the device code on the wire in cleartext.
     ///
     /// Returns the document together with that verified issuer identifier.
     /// The body is read through the bounded reader shared with the verifier
@@ -170,6 +179,16 @@ impl Enrollment {
                  including any trailing slash",
                 self.config.issuer
             );
+        }
+        // The identifier is right; now the endpoints it hands out have to be
+        // safe to post credentials to. Refusing here keeps the request from
+        // ever being built, for whichever flow asked for the document.
+        validate_discovered_endpoint(&discovery.token_endpoint, "token_endpoint")?;
+        if let Some(endpoint) = discovery.authorization_endpoint.as_deref() {
+            validate_discovered_endpoint(endpoint, "authorization_endpoint")?;
+        }
+        if let Some(endpoint) = discovery.device_authorization_endpoint.as_deref() {
+            validate_discovered_endpoint(endpoint, "device_authorization_endpoint")?;
         }
         Ok((discovery, issuer))
     }
@@ -883,6 +902,112 @@ mod tests {
         }
     }
 
+    /// The right issuer identifier is not enough: a cleartext `token_endpoint`
+    /// on a routable host would carry the client secret, the PKCE verifier and
+    /// the device code in the clear. Every flow has to refuse before the
+    /// request is built, which the `expect(0)` mocks pin.
+    #[tokio::test]
+    async fn discovery_refuses_a_cleartext_token_endpoint() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": "http://203.0.113.5/token",
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        for endpoint in ["/device", "/token"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "never-minted",
+                })))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let enrollment = Enrollment::new(config(&issuer, Some("s3cret"))).unwrap();
+        let errors = [
+            enrollment.device_grant_start().await.unwrap_err(),
+            enrollment.device_grant_poll("dev-x").await.unwrap_err(),
+            enrollment.client_credentials().await.unwrap_err(),
+            enrollment
+                .pkce_start("http://127.0.0.1:1/cb")
+                .await
+                .unwrap_err(),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(msg.contains("token_endpoint"), "{msg}");
+            assert!(msg.contains("https"), "{msg}");
+        }
+    }
+
+    /// A cleartext `authorization_endpoint` would put the code challenge and
+    /// the redirect into a browser over plain HTTP, so `pkce_start` refuses it
+    /// even though the token endpoint beside it is fine.
+    #[tokio::test]
+    async fn pkce_start_refuses_a_cleartext_authorization_endpoint() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": "http://203.0.113.5/authorize",
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new(config(&issuer, Some("s3cret"))).unwrap();
+        let err = enrollment
+            .pkce_start("http://127.0.0.1:1/cb")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("authorization_endpoint"), "{msg}");
+        assert!(msg.contains("https"), "{msg}");
+    }
+
+    /// Same for the device authorization endpoint: the start request carries
+    /// the client identity and returns the device code, so a cleartext one is
+    /// refused before `device_grant_start` posts anything.
+    #[tokio::test]
+    async fn device_grant_start_refuses_a_cleartext_device_endpoint() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "device_authorization_endpoint": "http://203.0.113.5/device",
+                "token_endpoint": format!("{issuer}/token"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new(config(&issuer, Some("s3cret"))).unwrap();
+        let err = enrollment.device_grant_start().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("device_authorization_endpoint"), "{msg}");
+        assert!(msg.contains("https"), "{msg}");
+    }
+
     #[tokio::test]
     async fn discovery_refuses_a_document_without_an_issuer() {
         let server = MockServer::start().await;
@@ -1014,7 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_grant_poll_denied_is_an_error() {
+    async fn device_grant_poll_surfaces_an_idp_denial() {
         let server = idp_with_device_endpoint().await;
         Mock::given(method("POST"))
             .and(path("/token"))

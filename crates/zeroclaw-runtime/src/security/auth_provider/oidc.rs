@@ -178,7 +178,8 @@ fn is_loopback_host(host: &str) -> bool {
 /// OIDC discovery endpoints are token-verification roots of trust. Apply the
 /// same HTTPS/exact-loopback transport rule as the configured issuer before
 /// a request can carry a bearer token or client credentials.
-fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+/// Shared with the enrollment client, whose discovery runs the same rule.
+pub(super) fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
