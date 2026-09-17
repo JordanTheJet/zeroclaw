@@ -19,15 +19,30 @@ importantly, what changes for existing remote connections.
    OIDC identities are keyed by validated issuer + subject, local roster
    identities by their durable `[users.<name>]` principal id.
 3. Every RPC method is classified to a required resource-verb grant and
-   refused without it. Fine-grained selectors compose on top: config
-   writes check `config_write_paths`, `session/new` checks the agent
-   selector.
+   refused without it. Fine-grained selectors compose on top:
+   - config writes check `config_write_paths`;
+   - session methods check the agent selector and hold the session's
+     workspace to that agent's workspace and allowed roots, whether the
+     workspace was named by the request, stored with a resumed session, or
+     restored from a durable one;
+   - attachments, personality files, per-agent cost queries, and cron jobs
+     check the agent selector;
+   - `fs/list_dir` lists only inside the workspaces and allowed roots of the
+     agents the principal may use.
 
-Authorization is **live**: editing `[permission_profiles]`, `[users]`,
-`[oidc]`, or `security.trust_daemon_uid` re-compiles the policy at save
-time, and established connections re-resolve at their next operation, with
-no reconnect or restart. Revoking a gateway pairing token invalidates
-connections authenticated with it the same way.
+   Session methods repeat these checks after waiting for the session's
+   queue, so a request queued before its principal was narrowed or its
+   credential expired is refused when its turn comes.
+
+Authorization is **live** for edits made through the daemon's RPC config
+methods, which is what zerocode's config editor uses: editing
+`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
+that way re-compiles the policy at save time, and established connections
+re-resolve at their next operation, with no reconnect or restart. Edits made
+outside the daemon, directly in `config.toml`, through the web dashboard, or
+with `zeroclaw config set`, apply at the next daemon reload or restart.
+Revoking a gateway pairing token, from any surface, invalidates connections
+authenticated with it before their next operation.
 
 ## Providers
 
@@ -72,8 +87,11 @@ still compiles.
 local trusted path is intact. Connect locally as the daemon's own uid:
 with `security.trust_daemon_uid = true` (the default) that account is the
 trusted shared operator whatever the roster says. Repair the offending
-entry, for example `zeroclaw config set users.alice.uid 1001`, and the
-change is compiled and published at save time.
+entry over that local connection, for example in zerocode's config editor
+or with an RPC `config/set` of `users.alice.uid`, and the change is
+compiled and published at save time. Editing `config.toml` or running
+`zeroclaw config set` also repairs it, but only once the daemon reloads or
+restarts.
 
 **Locked out by a deny-all accepted state.** The policy did not compile,
 so the accepted state refuses every principal before resolution runs, the
@@ -193,3 +211,8 @@ boundary is its own tracked change), gateway HTTP routes keep their
 existing pairing checks, and channel identities do not resolve into this
 principal model. The daemon's own uid and the shared operator retain full
 access throughout, so single-operator installs behave exactly as before.
+
+zerocode's remote directory picker opens at the daemon's filesystem root,
+which a principal without operator grants may not list, so for such a
+principal the picker reports a refusal there until it opens inside an
+allowed root instead.
