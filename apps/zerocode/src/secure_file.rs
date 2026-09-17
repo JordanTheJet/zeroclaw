@@ -66,10 +66,10 @@ pub(crate) fn sync_dir_where_supported(dir: &Path) -> Result<()> {
 /// `0600`, fsync it, rename it over the target, then fsync the directory.
 ///
 /// The rename is what makes a reader see either the whole previous file or the
-/// whole new one, never a truncated middle. The creation mode only covers a
-/// file this call creates, so an existing file and its directory are repaired
-/// afterwards: a config file that was already `0644` does not become owner-only
-/// just because the next write is.
+/// whole new one, never a truncated middle. The published file is always the
+/// freshly staged `0600` one; the directory is tightened to `0700` afterwards,
+/// and the file is set to `0600` again in case an unusual umask narrowed it
+/// further.
 ///
 /// On platforms without Unix mode bits the permission work is a no-op and the
 /// directory ACL is the guard, matching the enrollment path's stance.

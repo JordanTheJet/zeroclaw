@@ -44,8 +44,9 @@ importantly, what changes for existing remote connections.
      paths, `..` components, and, on Windows, network and device paths.
 
    These roots come from each agent's resolved policy: its risk profile, the
-   sibling workspaces its `workspace.access` grants, and the shared skills
-   directory, which is read-only. An agent that is not workspace-only
+   sibling workspaces its `workspace.access` grants read access to (read and
+   write, for a session workspace), and the shared skills directory, which is
+   read-only. An agent that is not workspace-only
    (autonomy `full`, a risk profile with `workspace_only = false`, the
    `yolo` preset, or `workspace.unrestricted_filesystem = true`) may read
    any path outside its forbidden paths, so a principal entitled to such an
@@ -58,8 +59,9 @@ importantly, what changes for existing remote connections.
 Authorization is **live** for edits made through the daemon's RPC config
 methods, which is what zerocode's config editor uses: editing
 `[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time, and established connections
-re-resolve at their next operation, with no reconnect or restart. Edits made
+that way re-compiles the policy at save time. Established native-token and
+local connections re-resolve at their next operation, with no reconnect or
+restart, and an OIDC connection must initialize again. Edits made
 outside the daemon, directly in `config.toml`, through the web dashboard, or
 with `zeroclaw config set`, apply at the next daemon reload or restart.
 Revoking a gateway pairing token through the gateway's pairing controls
@@ -81,9 +83,9 @@ tokens through the pairing controls.
 
 ### Local connections
 
-On a Unix socket the kernel peer uid is always the local credential. While
-`security.trust_daemon_uid` is `true` (the default), the daemon's **own
-uid** connects as the trusted shared operator with full access, with or
+On a Unix socket, a connection that presents no token is identified by its
+kernel peer uid. While `security.trust_daemon_uid` is `true` (the default),
+the daemon's **own uid** connects as the trusted shared operator with full access, with or
 without a `[users]` roster, so an install with no roster behaves as before
 for the account that runs the daemon.
 
@@ -93,8 +95,9 @@ to `false` to require every local peer, including the daemon's own uid, to
 map through the roster or present a token.
 
 Any **other** uid must be mapped by an explicit `[users.<name>].uid`
-entry. An unmapped uid (root included) is denied, whether or not a roster
-exists; there is no fallback to shared-operator access. The listener
+entry. An unmapped uid (root included) that presents no token is denied,
+whether or not a roster exists; there is no fallback to shared-operator
+access. The listener
 creates the socket owner-only, so today only the daemon's own account and
 root can reach it; a roster entry decides what any other uid may do once
 it can.
@@ -112,9 +115,10 @@ by editing `config.toml` and restarting.
 A client may forward its shell environment in `initialize` so the
 daemon's subprocesses see its `PATH` and credential sockets (see
 [Environment variable pass-through](../zerocode/environment.md)). That
-snapshot is kept only for the trusted shared operator on a local
-connection. A roster principal, and every remote connection, gets the
-daemon's own environment instead.
+snapshot is kept only for an operator-level principal (the shared
+operator, or a roster principal with `admin = true`) on a local connection.
+Every other principal, and every remote connection, gets the daemon's own
+environment instead.
 
 #### Recovery
 
@@ -142,9 +146,11 @@ Edit `config.toml` directly as its owner, then restart the daemon so the
 repaired sections are compiled and published. The daemon ignores `SIGHUP`,
 so a restart is the step that reloads it.
 
-If `security.trust_daemon_uid` is set to `false`, the first route is gone
-too and both states repair the same way: edit `config.toml` as its owner
-and restart. Turn the setting off only where that is acceptable.
+If `security.trust_daemon_uid` is set to `false`, the trusted-uid route is
+gone. A policy that compiles can still be repaired live by a client that
+presents a paired gateway token, or by a roster principal with admin
+grants; otherwise both states repair the same way: edit `config.toml` as
+its owner and restart. Turn the setting off only where that is acceptable.
 
 ### The users roster
 
@@ -169,9 +175,10 @@ mapping, and the lifetime bounds are documented on the section reference:
 
 Profiles are deny-by-default: an unlisted resource is refused, an empty
 selector list grants no instances, and broad access requires the explicit
-`"*"` selector or `admin = true`. Multiple profiles merge by union. An
-`allowed_agents = ["*"]` selector covers every agent the configuration
-defines, not any alias a request names.
+`"*"` selector or `admin = true`. Multiple profiles merge by union. For
+cron jobs, attachments, personality files, per-agent cost queries, and SOP
+authoring, `allowed_agents = ["*"]` covers only the agents the
+configuration defines, not any alias a request names.
 
 One current limitation is deliberate: per-tool selectors are not yet
 enforced inside agent sessions, so a principal whose `allowed_tools` is
@@ -285,10 +292,11 @@ behaves as before.
 
 Permission profiles limit what a principal can do over RPC. They do not
 isolate the code a principal causes an agent to run. Session turns, cron
-jobs, and SOP steps run as the daemon account. That code can connect to
-the local socket as the daemon's uid, which is the shared operator while
-`security.trust_daemon_uid = true` (the default) and otherwise gets
-whatever roster entry maps that uid. It can also edit `config.toml`, which
+jobs, and SOP steps run as the daemon account. On Unix that code can
+connect to the local socket as the daemon's uid, which is the shared
+operator while `security.trust_daemon_uid = true` (the default) and
+otherwise gets whatever roster entry maps that uid. On Windows with no
+roster, the pipe makes it the shared operator. It can also edit `config.toml`, which
 the daemon applies at its next reload or restart. Setting
 `security.trust_daemon_uid = false` does not change either. Grant session,
 cron, or SOP execution or authoring only to principals you would trust
@@ -313,6 +321,6 @@ leaf settings. For example:
 
 zerocode's remote directory picker opens at the daemon's filesystem root.
 A principal without operator grants may list it only through an enabled
-agent that is not workspace-only and does not forbid it. For any other such
-principal the picker reports a refusal there until it opens inside an
-allowed root instead.
+agent whose policy lets it read `/`, such as one that is not workspace-only.
+For any other such principal the picker reports a refusal there until it
+opens inside an allowed root instead.
