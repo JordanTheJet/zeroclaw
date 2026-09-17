@@ -430,13 +430,22 @@ pub async fn config_route_auth(
         return next.run(request).await;
     }
 
-    let provider = request
-        .headers()
-        .get(AUTH_PROVIDER_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    // A provider header that is present but blank or not text is a
+    // malformed selection, not an absent one: it never falls through to
+    // the native provider or the open posture.
+    let provider = match request.headers().get(AUTH_PROVIDER_HEADER) {
+        None => None,
+        Some(value) => match value.to_str().ok().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => Some(name.to_owned()),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "Invalid auth_provider selection" })),
+                )
+                    .into_response();
+            }
+        },
+    };
 
     // Open posture preserved: with pairing disabled and no explicit
     // provider selection, the transport is trusted exactly as before
@@ -613,8 +622,26 @@ mod tests {
     #[tokio::test]
     async fn options_preflight_stays_unauthenticated() {
         let router = router_for(paired_config());
+        // A CORS preflight without credentials gets the intended answer:
+        // 204 with the allow list, not a denial.
+        let request = HttpRequest::builder()
+            .method("OPTIONS")
+            .uri("/api/config")
+            .header("access-control-request-method", "PATCH")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, PUT, PATCH, OPTIONS")
+        );
+        // A bare OPTIONS serves the schema document, also unauthenticated.
         let (status, _) = send(&router, "OPTIONS", "/api/config", None, None, None).await;
-        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::OK);
     }
 
     fn open_config() -> Config {
@@ -644,6 +671,37 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "Unknown auth_provider selection");
+    }
+
+    #[tokio::test]
+    async fn a_present_but_blank_or_non_text_provider_header_is_refused() {
+        // Open posture, so an "absent" header would pass: a blank one must
+        // not be read as absent.
+        let router = router_for(open_config());
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/api/quickstart/state",
+            Some("whatever"),
+            Some("   "),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "Invalid auth_provider selection");
+
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/quickstart/state")
+            .header("authorization", "Bearer whatever")
+            .header(
+                AUTH_PROVIDER_HEADER,
+                axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn now_unix() -> u64 {
