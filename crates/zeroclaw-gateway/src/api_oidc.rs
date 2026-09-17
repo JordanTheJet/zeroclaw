@@ -17,7 +17,7 @@
 //!
 //! Because nothing here is authenticated, every route is bounded *before*
 //! it can cause outbound work, by three independent limits held in
-//! [`OidcEnrollmentState`]: an attempt limiter refuses clients that are
+//! `OidcEnrollmentState`: an attempt limiter refuses clients that are
 //! already locked out, a per-client sliding-window budget caps relay
 //! requests per minute, and a process-wide semaphore caps how many IdP
 //! round trips can be in flight at once. Every response from these routes
