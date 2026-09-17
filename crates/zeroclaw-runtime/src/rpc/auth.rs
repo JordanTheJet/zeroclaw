@@ -1067,6 +1067,82 @@ mod tests {
     }
 
     #[test]
+    fn publish_accepted_moves_the_generation_for_every_authorization_input() {
+        type Mutation = fn(&mut Config);
+        let mutations: [(&str, Mutation); 6] = [
+            ("an OIDC field", |config| {
+                config.oidc.get_mut("corp").unwrap().audience = "zeroclaw-next".into();
+            }),
+            ("a nested OIDC claim mapping", |config| {
+                let corp = config.oidc.get_mut("corp").unwrap();
+                corp.profile_map =
+                    std::collections::HashMap::from([("admins".into(), "operator".into())]);
+            }),
+            ("a roster uid", |config| {
+                config.users.get_mut("alice").unwrap().uid = Some(4343);
+            }),
+            ("a new roster entry", |config| {
+                config.users.insert(
+                    "bob".into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(4344),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }),
+            ("a permission profile grant", |config| {
+                config
+                    .permission_profiles
+                    .get_mut("operator")
+                    .unwrap()
+                    .grants
+                    .insert(Resource::Cost, vec![Verb::Read]);
+            }),
+            ("the daemon uid trust posture", |config| {
+                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+        ];
+        for (input, mutate) in mutations {
+            let config = oidc_config();
+            let auth = auth_for(&config, &[]);
+            let generation = auth.generation();
+            let mut changed = config;
+            mutate(&mut changed);
+            let moved = auth
+                .publish_accepted(&changed, 1)
+                .unwrap_or_else(|e| panic!("{input}: the change publishes: {e}"));
+            assert!(moved > generation, "{input} must move the generation");
+        }
+    }
+
+    #[test]
+    fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
+        let mut dangling = base_config();
+        dangling.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["not-configured".into()],
+            },
+        );
+        let auth = auth_for(&dangling, &[]);
+        assert!(auth.resolve(&shared_operator_identity()).is_err());
+
+        let mut repaired = dangling;
+        repaired
+            .permission_profiles
+            .insert("not-configured".into(), PermissionProfileConfig::default());
+        auth.publish_accepted(&repaired, 1)
+            .expect("the repaired policy publishes");
+        assert!(
+            auth.resolve(&shared_operator_identity()).is_ok(),
+            "publishing a compiling policy lifts the deny-all state"
+        );
+    }
+
+    #[test]
     fn publish_accepted_refuses_an_older_revision() {
         let config = config_with_roster(4242);
         let auth = RpcInboundAuth::from_config(
