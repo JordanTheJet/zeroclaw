@@ -85,6 +85,43 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_dir_where_supported(parent)
 }
 
+/// Create `path` holding `bytes`, owner-only and durable, only when nothing
+/// exists there yet, and report whether this call created it.
+///
+/// The content is staged in a fresh sibling and published with a hard link,
+/// which fails instead of replacing an entry that appeared in the meantime.
+/// A default written by one caller therefore never overwrites a file another
+/// caller has just saved, and no reader sees a partial file. On a filesystem
+/// without hard links the staged file is renamed into place if the target is
+/// still absent.
+pub(crate) fn create_private_if_absent(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let staged = write_staged(path, bytes)?;
+    let created = match std::fs::hard_link(&staged, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&staged);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || path.exists() => {
+            let _ = std::fs::remove_file(&staged);
+            false
+        }
+        Err(_) => {
+            if let Err(e) = std::fs::rename(&staged, path) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e).with_context(|| format!("publishing {}", path.display()));
+            }
+            true
+        }
+    };
+    if created {
+        restrict_to_owner(path, parent)?;
+        sync_dir_where_supported(parent)?;
+    }
+    Ok(created)
+}
+
 /// Stage `bytes` in a sibling of `path` that this call alone created, and
 /// return its path.
 ///
@@ -192,6 +229,45 @@ mod tests {
                 .is_symlink(),
             "the published file must be the staged file, not a link"
         );
+    }
+
+    #[test]
+    fn create_private_if_absent_never_replaces_an_existing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "saved = true\n").unwrap();
+
+        let created = create_private_if_absent(&path, b"default = true\n").unwrap();
+
+        assert!(!created, "an existing file must be reported, not replaced");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved = true\n");
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["config.toml".to_string()], "{entries:?}");
+    }
+
+    #[test]
+    fn create_private_if_absent_creates_a_missing_file_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let created = create_private_if_absent(&path, b"default = true\n").unwrap();
+
+        assert!(created);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "default = true\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a created file must be owner-only");
+        }
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["config.toml".to_string()], "{entries:?}");
     }
 
     #[test]

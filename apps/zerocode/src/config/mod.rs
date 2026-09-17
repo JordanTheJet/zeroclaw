@@ -699,9 +699,12 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 
     let path = config_path(config_dir);
     if !path.exists() {
+        // Another writer may save a real config between the check above and
+        // this write, so the default is only ever created, never swapped in
+        // over a file that appeared meanwhile.
         let default = ZerocodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        crate::secure_file::write_private_atomic(&path, body.as_bytes())
+        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
             .with_context(|| format!("writing default {}", path.display()))?;
     } else {
         // An existing file may predate the owner-only rule, and reading it
