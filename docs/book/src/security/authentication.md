@@ -34,9 +34,11 @@ importantly, what changes for existing remote connections.
      sort order, which is the agent the headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
-     cron jobs check the agent selector. A fleet cost summary lists only the
-     principal's agents in its per-agent breakdown, but its totals and its
-     per-model usage still cover every agent;
+     cron jobs check the agent selector. An attachment sent by local path
+     must also name an absolute path the destination agent's policy lets it
+     read. A fleet cost summary lists only the principal's agents in its
+     per-agent breakdown, but its totals and its per-model usage still cover
+     every agent;
    - `fs/list_dir` lists only absolute paths that the policy of an enabled
      agent the principal may use lets that agent read. It refuses relative
      paths, `..` components, and, on Windows, network and device paths.
@@ -167,7 +169,9 @@ mapping, and the lifetime bounds are documented on the section reference:
 
 Profiles are deny-by-default: an unlisted resource is refused, an empty
 selector list grants no instances, and broad access requires the explicit
-`"*"` selector or `admin = true`. Multiple profiles merge by union.
+`"*"` selector or `admin = true`. Multiple profiles merge by union. An
+`allowed_agents = ["*"]` selector covers every agent the configuration
+defines, not any alias a request names.
 
 One current limitation is deliberate: per-tool selectors are not yet
 enforced inside agent sessions, so a principal whose `allowed_tools` is
@@ -247,6 +251,9 @@ An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
   revalidation deadline; past it, the next operation is refused until the
   client re-initializes (which re-verifies against the IdP).
 - **Pairing revocation** applies before the connection's next operation.
+- **Log subscriptions**: an open `logs/subscribe` stream is rechecked on
+  every delivery and ends at the first one after its credential expires,
+  its pairing is revoked, or its principal loses `Logs:Read`.
 - **Policy changes**: a config save that leaves `[oidc]`, `[users]`,
   `[permission_profiles]`, and `security.trust_daemon_uid` unchanged keeps
   every binding as it is. A change to any of them publishes a new policy.
