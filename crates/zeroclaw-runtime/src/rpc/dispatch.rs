@@ -9859,6 +9859,21 @@ mod tests {
             assert!(response.get("error").is_none(), "{response}");
             let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
             assert!(on_disk.contains("oidc-model"), "{on_disk}");
+
+            // The save changed no authorization input, so the same binding
+            // keeps working: zerocode's editor reads the config back and may
+            // save again on the same connection.
+            let listed = rpc(&mut oidc, &mut rx, 2, "config/list", json!({})).await;
+            assert!(listed.get("error").is_none(), "{listed}");
+            let again = rpc(
+                &mut oidc,
+                &mut rx,
+                3,
+                "config/set",
+                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model-2"}),
+            )
+            .await;
+            assert!(again.get("error").is_none(), "{again}");
         });
     }
 

@@ -153,6 +153,21 @@ pub struct AcceptedAuthState {
     trust_daemon_uid: Arc<AtomicBool>,
     daemon_uid: u32,
     deny_all: bool,
+    /// The configuration this state was compiled from (see [`auth_inputs`]),
+    /// or `None` for the deny-all state, which was compiled from nothing.
+    auth_inputs: Option<serde_json::Value>,
+}
+
+/// The parts of a configuration an accepted authorization state is compiled
+/// from: the OIDC, roster, and permission-profile sections and the daemon-uid
+/// trust posture. The pairing authority is shared live state, not config.
+fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::Value::Array(vec![
+        serde_json::to_value(&config.oidc)?,
+        serde_json::to_value(&config.users)?,
+        serde_json::to_value(&config.permission_profiles)?,
+        serde_json::Value::Bool(config.security.trust_daemon_uid),
+    ]))
 }
 
 impl AcceptedAuthState {
@@ -190,6 +205,7 @@ impl AcceptedAuthState {
             trust_daemon_uid,
             daemon_uid,
             deny_all: false,
+            auth_inputs: Some(auth_inputs(config)?),
         })
     }
 
@@ -218,6 +234,7 @@ impl AcceptedAuthState {
             trust_daemon_uid,
             daemon_uid,
             deny_all: true,
+            auth_inputs: None,
         }
     }
 
@@ -403,10 +420,21 @@ impl RpcInboundAuth {
     /// returned, which is what keeps a writer that was slow to publish from
     /// reinstalling superseded policy over a newer one.
     ///
+    /// A persistence that leaves every authorization input as it was (see
+    /// [`auth_inputs`]) records its revision without moving the generation.
+    /// Nothing the accepted state is compiled from changed, and moving the
+    /// generation would make every established binding re-resolve over an
+    /// unrelated edit, which an OIDC binding cannot survive.
+    ///
     /// Returns the generation in force after the call.
     pub fn publish_accepted(&self, config: &Config, revision: u64) -> anyhow::Result<u64> {
         let mut slot = self.state.write();
         if revision <= self.accepted_revision.load(Ordering::Acquire) {
+            return Ok(slot.resolver.generation());
+        }
+        config.validate_auth()?;
+        if slot.auth_inputs.as_ref() == Some(&auth_inputs(config)?) {
+            self.accepted_revision.store(revision, Ordering::Release);
             return Ok(slot.resolver.generation());
         }
         let generation = slot.resolver.generation().saturating_add(1);
@@ -465,9 +493,11 @@ impl RpcInboundAuth {
     /// change only through a new publication, and the caller checks expiry,
     /// the revalidation deadline, and pairing liveness on every operation.
     /// This is the rule the dispatcher's gate applies, and it is what keeps an
-    /// OIDC binding, whose bearer is never retained, usable until the policy
-    /// actually changes. After a change, [`Self::revalidate_and_resolve`]
-    /// applies and an OIDC binding must initialize again.
+    /// OIDC binding, whose bearer is never retained, usable until a
+    /// publication changes the authorization inputs; a config save that
+    /// leaves them unchanged does not move the generation. After such a
+    /// change, [`Self::revalidate_and_resolve`] applies and an OIDC binding
+    /// must initialize again.
     pub fn resolve_current(&self, auth: &ConnectionAuth) -> Result<ResolvedPrincipal, DenyReason> {
         let state = self.state();
         if auth.generation != state.resolver.generation() {
@@ -1000,6 +1030,39 @@ mod tests {
         assert!(
             auth.resolve_current(&binding).is_err(),
             "after a publication the OIDC binding must initialize again"
+        );
+    }
+
+    #[test]
+    fn publish_accepted_moves_the_generation_only_when_authorization_inputs_change() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+        let generation = auth.generation();
+
+        let mut unrelated = config.clone();
+        unrelated.gateway.port = unrelated.gateway.port.wrapping_add(1);
+        assert_eq!(
+            auth.publish_accepted(&unrelated, 1)
+                .expect("an unrelated save publishes"),
+            generation,
+            "a save that changes no authorization input keeps the generation"
+        );
+        assert_eq!(auth.accepted_revision(), 1);
+        auth.resolve_current(&binding)
+            .expect("an OIDC binding survives an unrelated save");
+
+        let mut narrowed = unrelated;
+        narrowed
+            .permission_profiles
+            .insert("reader".into(), PermissionProfileConfig::default());
+        let moved = auth
+            .publish_accepted(&narrowed, 2)
+            .expect("a profile change publishes");
+        assert!(moved > generation, "a profile change moves the generation");
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "after an authorization change the OIDC binding must initialize again"
         );
     }
 
