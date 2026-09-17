@@ -555,7 +555,10 @@ struct CallbackQuery {
 /// a mix-up, an IdP refusal, a code that would not exchange. Each one is
 /// billed to the caller before the fixed page goes out — sprayed `state`
 /// values and replayed codes are exactly what this route has to bound —
-/// while the callback that completes an enrollment costs nothing.
+/// while the callback that completes an enrollment costs nothing. A
+/// callback turned away because every outbound relay slot is taken is not
+/// routed here either: the refusal is the gateway's capacity limit, not a
+/// failure on the caller's side, so it answers with the busy page unbilled.
 fn unproductive_callback(
     enrollment_state: &OidcEnrollmentState,
     key: &str,
@@ -631,7 +634,9 @@ async fn handle_pkce_callback(
     // Counted by outcome, not on arrival: the callback that finishes a
     // browser sign-in is the successful end of a flow this gateway itself
     // started, and charging it would halve how many sign-ins a shared
-    // address gets. Every other way out of this handler records below.
+    // address gets. Every other way out of this handler records below,
+    // except a refusal for relay capacity: that limit is the gateway's own,
+    // and the caller did nothing wrong by arriving while it was reached.
     if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
     }
@@ -678,7 +683,6 @@ async fn handle_pkce_callback(
         Err(_) => return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST),
     };
     let Some(_permit) = outbound_permit(&relay) else {
-        relay.attempts.record_attempt(&key);
         return relay_busy_page();
     };
     match enrollment.pkce_exchange(&pending.flow, &code).await {
@@ -1627,6 +1631,73 @@ mod tests {
             requests_to(&server, "/token").await,
             0,
             "no code was exchanged while the relay was saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn callbacks_the_relay_turns_away_are_not_billed_as_attempts() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "never-relayed",
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Enough live flows for a lockout's worth of callbacks, started from
+        // loopback so starting them bills nothing to the remote caller.
+        let mut flow_states = Vec::new();
+        for _ in 0..MAX_ATTEMPTS {
+            flow_states.push(start_login(&router).await);
+        }
+
+        // Every outbound slot is taken while the remote caller's browsers
+        // come back from the IdP.
+        let permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+        for (round, flow_state) in flow_states.iter().enumerate() {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "callback {round}"
+            );
+        }
+        assert_eq!(requests_to(&server, "/token").await, 0);
+        drop(permits);
+
+        // Billing each of those would have put the caller at the lockout
+        // threshold, and this login would be refused with 429.
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "a callback refused for relay capacity is not the caller's failed attempt"
         );
     }
 
