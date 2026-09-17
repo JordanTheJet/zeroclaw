@@ -1244,6 +1244,31 @@ impl RpcDispatcher {
         )
     }
 
+    /// Confine `fs/list_dir` to what the bound principal may read, before the
+    /// handler probes the path, so a refusal does not reveal whether the path
+    /// exists. The coarse `Files:Read` grant has already passed the gate; see
+    /// [`super::fs::listing_is_authorized`] for the root policy.
+    fn authorize_fs_listing(&self, params: &Value) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
+        let allowed = {
+            let config = self.ctx.config.read();
+            super::fs::listing_is_authorized(&config, grants, std::path::Path::new(&req.path))
+        };
+        if allowed {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+            "Principal is not granted a listing of {:?}: only the workspaces and allowed \
+             roots of the agents it may use can be listed",
+            req.path
+        ));
+        self.audit_auth_denial(Method::FsListDir, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     /// Whether this connection holds operator-level (admin) grants. An
     /// unauthenticated dispatcher (the direct unit-test handlers, which never
     /// reach a gated method through `process_line`) is not admin.
@@ -1789,7 +1814,10 @@ impl RpcDispatcher {
 
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
-            Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+            Method::FsListDir => match self.authorize_fs_listing(&req.params) {
+                Ok(()) => super::fs::handle_fs_list_dir(&req.params).await,
+                Err(denied) => Err(denied),
+            },
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
@@ -8838,6 +8866,138 @@ mod tests {
         assert!(
             started_rx.try_recv().is_err(),
             "a refused prompt must never reach the provider"
+        );
+    }
+
+    // ── fs/list_dir is confined to the principal's entitled roots ──────
+
+    /// `session_cwd_config` with `Files:Read` added to alice's profile.
+    fn fs_listing_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        extra_allowed_root: Option<std::path::PathBuf>,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = session_cwd_config(tmp, uid, extra_allowed_root);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Read],
+            );
+        config
+    }
+
+    async fn list_dir(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        path: &std::path::Path,
+    ) -> Value {
+        rpc(
+            dispatcher,
+            rx,
+            1,
+            "fs/list_dir",
+            json!({"path": path.to_string_lossy()}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_list_outside_its_agents_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(fs_listing_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for path in [std::path::Path::new("/"), outside.path()] {
+            let response = list_dir(&mut alice, &mut rx, path).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{path:?}: {response}"
+            );
+        }
+        let absent = outside.path().join("does-not-exist");
+        let response = list_dir(&mut alice, &mut rx, &absent).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "an absent path outside the roots is refused before it is probed: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_lists_its_agent_workspace_and_allowed_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "root").unwrap();
+        let config = fs_listing_config(&tmp, 4242, Some(root.clone()));
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::write(workspace.join("readme.md"), "workspace").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (path, expected) in [(workspace, "readme.md"), (root, "notes.txt")] {
+            let response = list_dir(&mut alice, &mut rx, &path).await;
+            let names: Vec<&str> = response["result"]["entries"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path:?} must list: {response}"))
+                .iter()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect();
+            assert!(names.contains(&expected), "{path:?}: {names:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_principal_listing_does_not_follow_a_symlink_out_of_the_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let link = config.agent_workspace_dir("test-agent").join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = list_dir(&mut alice, &mut rx, &link).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    #[tokio::test]
+    async fn principal_narrowed_away_from_the_agent_cannot_list_its_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        assert!(
+            list_dir(&mut alice, &mut rx, &workspace)
+                .await
+                .get("result")
+                .is_some(),
+            "alice starts entitled to the agent's workspace"
+        );
+
+        narrow_alice_to_no_agents(&ctx);
+        let response = list_dir(&mut alice, &mut rx, &workspace).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    #[tokio::test]
+    async fn operator_lists_any_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(fs_listing_config(&tmp, 4242, None));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = list_dir(&mut operator, &mut rx, std::path::Path::new("/")).await;
+        assert!(
+            response["result"]["entries"].is_array(),
+            "the local operator keeps unrestricted listing: {response}"
         );
     }
 

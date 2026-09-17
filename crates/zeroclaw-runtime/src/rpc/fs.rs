@@ -1,10 +1,41 @@
 //! Filesystem RPC methods for remote directory browsing (WSS ACP CWD picker).
-//! These methods are only available to authenticated WSS sessions and are
-//! subject to daemon-side path policy.
+//!
+//! `fs/list_dir` requires the `Files:Read` grant, and the dispatcher confines
+//! it with [`listing_is_authorized`] before the handler touches the path: an
+//! operator-level principal may list anything the daemon account can read,
+//! and every other principal only the workspaces and readable allowed roots of
+//! the agents it is entitled to use.
 
 use std::path::Path;
+use zeroclaw_api::grants::ResolvedGrants;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{FsEntry, FsListDirRequest, FsListDirResponse};
+use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::Config;
+
+/// Whether a principal holding `grants` may list the directory at `requested`.
+///
+/// Operator-level principals may list anything. Every other principal may list
+/// only inside the workspace or a readable allowed root of an enabled agent it
+/// is entitled to use, judged by that agent's own risk-profile policy. The
+/// policy resolves the path first, so a symlink out of those roots is refused
+/// and a path that cannot be resolved is refused rather than assumed benign.
+///
+/// Resolving an agent's policy creates its workspace directory if it is
+/// missing, as every other use of that policy does.
+pub fn listing_is_authorized(config: &Config, grants: &ResolvedGrants, requested: &Path) -> bool {
+    if grants.admin {
+        return true;
+    }
+    config
+        .agents
+        .iter()
+        .filter(|(alias, agent)| agent.enabled && grants.may_use_agent(alias))
+        .any(|(alias, _)| {
+            SecurityPolicy::for_agent(config, alias)
+                .is_ok_and(|policy| policy.is_resolved_path_readable(requested))
+        })
+}
 
 /// Handle `fs/list_dir`.
 pub async fn handle_fs_list_dir(
