@@ -3580,6 +3580,10 @@ impl RpcDispatcher {
         })
     }
 
+    /// Upper bound on entries in one `config/set-many` batch. See
+    /// [`Self::handle_config_set_many`] for why the bound exists.
+    const CONFIG_SET_MANY_MAX_ENTRIES: usize = 256;
+
     /// `config/set-many`: stage an ordered batch of `config/set` entries on
     /// one working copy and commit it with a single `save_and_swap_config`,
     /// so fields that are only valid together (a `[users.<name>]` entry's
@@ -3594,12 +3598,29 @@ impl RpcDispatcher {
     /// `config/set` has no per-path write check today; if one is added, it
     /// must run here for every entry before the first is staged, so a batch
     /// never permits a write the caller could not make one entry at a time.
+    ///
+    /// The batch is capped at [`Self::CONFIG_SET_MANY_MAX_ENTRIES`]: every
+    /// entry re-walks `prop_fields()` on the working copy (it must, because
+    /// vivifying a map key changes the field set) while `config_write_lock`
+    /// is held, so an unbounded batch would let one frame hold every other
+    /// config writer off for as long as it liked. Real batches are a form's
+    /// worth of fields; an over-long batch is a caller error like an empty one.
     async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
         let req: ConfigSetManyParams = parse_params(params)?;
         if req.sets.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 "config/set-many requires at least one entry in `sets`",
+            ));
+        }
+        if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "config/set-many accepts at most {} entries in `sets`; got {}",
+                    Self::CONFIG_SET_MANY_MAX_ENTRIES,
+                    req.sets.len()
+                ),
             ));
         }
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
@@ -12919,6 +12940,65 @@ mod tests {
             "an empty batch is a caller error, not a silent no-op: {response}"
         );
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), disk_before);
+    }
+
+    /// The cap is inclusive: a batch of exactly the maximum commits, one more
+    /// is refused before the lock is taken and nothing reaches disk.
+    #[tokio::test]
+    async fn config_set_many_rejects_a_batch_over_the_entry_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+        let disk_before = std::fs::read_to_string(&config_path).unwrap();
+        let cap = RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES;
+        let port_sets = |n: usize| -> Value {
+            Value::Array(
+                (0..n)
+                    .map(|i| json!({"prop": "gateway.port", "value": 4000 + i}))
+                    .collect(),
+            )
+        };
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": port_sets(cap + 1)}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "a batch over the cap is a caller error: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("at most {cap} entries")),
+            "the error must name the cap: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            disk_before,
+            "a refused batch must not reach disk"
+        );
+        assert_ne!(dispatcher.ctx.config.read().gateway.port, 4000 + cap as u16);
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": port_sets(cap)}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "a batch of exactly the cap must commit: {response}"
+        );
+        assert_eq!(
+            dispatcher.ctx.config.read().gateway.port,
+            4000 + (cap - 1) as u16,
+            "the last entry of a full batch must win"
+        );
     }
 
     /// The batch's only commit point is `save_and_swap_config`: when that
