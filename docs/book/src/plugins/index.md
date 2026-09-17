@@ -362,8 +362,9 @@ expands inside double quotes. An ordinary host list and an ordinary profile
 path, spaces included, always qualify. When a value does not (it contains `"`,
 `%`, `!`, `$` or a backtick, or ends in a backslash; `$(id).example.com` is the
 shape a hostile manifest would declare), the whole line is printed instead as
-`# PowerShell only, cmd.exe cannot pass this value literally: ` followed by the
-PowerShell form, where an embedded quote is doubled (`''`). Pasted whole, that
+the marker `# PowerShell only, cmd.exe cannot pass this value literally:`
+followed by a space and the PowerShell form, where an embedded quote is
+doubled (`''`). Pasted whole, that
 line runs nothing in either shell (`cmd.exe` cannot run `#`, and PowerShell
 reads it as a comment); copy the command after the marker into PowerShell
 alone. `cmd.exe` has no quoting that keeps such a value literal (`%name%`
