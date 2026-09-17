@@ -831,31 +831,107 @@ impl RpcDispatcher {
     }
 
     fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
-        let (principal_id, auth_provider) = self
-            .auth
-            .as_ref()
-            .map(|auth| {
-                (
-                    Some(auth.principal.id.as_str()),
-                    Some(auth.principal.auth_provider_label()),
-                )
-            })
-            .unwrap_or((None, None));
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_category(::zeroclaw_log::EventCategory::System)
-                .with_attrs(::serde_json::json!({
-                    "method": method.wire_name(),
-                    "reason": denied.message,
-                    "code": denied.code,
-                    "principal_id": principal_id,
-                    "auth_provider": auth_provider,
-                })),
-            "RPC authorization denied"
-        );
+        audit_denial(self.auth.as_ref(), method, denied);
     }
+}
 
+/// Record one authorization denial for the connection bound to `auth`.
+fn audit_denial(
+    auth: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    denied: &crate::rpc::auth::AuthDenied,
+) {
+    let (principal_id, auth_provider) = auth
+        .map(|auth| {
+            (
+                Some(auth.principal.id.as_str()),
+                Some(auth.principal.auth_provider_label()),
+            )
+        })
+        .unwrap_or((None, None));
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_attrs(::serde_json::json!({
+                "method": method.wire_name(),
+                "reason": denied.message,
+                "code": denied.code,
+                "principal_id": principal_id,
+                "auth_provider": auth_provider,
+            })),
+        "RPC authorization denied"
+    );
+}
+
+/// Whether the credential behind `auth` is still live: not expired, not
+/// past its revalidation deadline, and, for a native pairing token, still
+/// paired.
+fn credential_is_live(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    auth: &crate::rpc::auth::ConnectionAuth,
+) -> Result<(), crate::rpc::auth::AuthDenied> {
+    use crate::rpc::auth::AuthDenied;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(expires_at) = auth.principal.expires_at
+        && expires_at <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+        ));
+    }
+    if let Some(revalidate_by) = auth.principal.revalidate_by
+        && revalidate_by <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    if let Some(hash) = auth.native_token_hash.as_deref()
+        && !inbound.pairing().token_hash_is_paired(hash)
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+        ));
+    }
+    Ok(())
+}
+
+/// The authority `auth` holds for `method` under the accepted policy in force
+/// now: a live credential, a fresh resolution, a generation that did not move
+/// underneath that resolution, and the method's coarse grant.
+fn current_authority(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    auth: &crate::rpc::auth::ConnectionAuth,
+    method: Method,
+) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
+    use crate::rpc::auth::AuthDenied;
+    credential_is_live(inbound, auth)?;
+    let resolved = inbound
+        .resolve_current(auth)
+        .map_err(AuthDenied::from_deny_reason)?;
+    if resolved.generation != inbound.generation() {
+        // The accepted state moved between the resolution and this read.
+        // Fail closed rather than act under a policy nobody observed.
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    if let MethodAuthz::Requires(resource, verb) = method.authz()
+        && !resolved.grants.permits(resource, verb)
+    {
+        return Err(AuthDenied::forbidden(format!(
+            "Principal is not granted {resource}:{verb} (required by {})",
+            method.wire_name()
+        )));
+    }
+    Ok(resolved.grants)
+}
+
+impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
     fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
@@ -982,61 +1058,15 @@ impl RpcDispatcher {
         &self,
         method: Method,
     ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
-        use crate::rpc::auth::AuthDenied;
-
-        let refuse = |denied: AuthDenied| -> JsonRpcError {
-            self.audit_auth_denial(method, &denied);
-            rpc_err(denied.code, denied.message)
-        };
         let Some(auth) = self.auth.as_ref() else {
             return Ok(None);
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Some(expires_at) = auth.principal.expires_at
-            && expires_at <= now
-        {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
-            )));
-        }
-        if let Some(revalidate_by) = auth.principal.revalidate_by
-            && revalidate_by <= now
-        {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-            )));
-        }
-        if let Some(hash) = auth.native_token_hash.as_deref()
-            && !self.ctx.auth.pairing().token_hash_is_paired(hash)
-        {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
-            )));
-        }
-        let resolved = self
-            .ctx
-            .auth
-            .resolve_current(auth)
-            .map_err(|reason| refuse(AuthDenied::from_deny_reason(reason)))?;
-        if resolved.generation != self.ctx.auth.generation() {
-            // The accepted state moved between the resolution and this read.
-            // Fail closed rather than commit under a policy nobody observed.
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-            )));
-        }
-        if let MethodAuthz::Requires(resource, verb) = method.authz()
-            && !resolved.grants.permits(resource, verb)
-        {
-            return Err(refuse(AuthDenied::forbidden(format!(
-                "Principal is not granted {resource}:{verb} (required by {})",
-                method.wire_name()
-            ))));
-        }
-        Ok(Some(resolved.grants))
+        current_authority(&self.ctx.auth, auth, method)
+            .map(Some)
+            .map_err(|denied| {
+                self.audit_auth_denial(method, &denied);
+                rpc_err(denied.code, denied.message)
+            })
     }
 
     /// Re-establish the caller's authority to write `path` after the config
@@ -5966,6 +5996,15 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
         let mut rx = event_tx.subscribe();
         let rpc = self.rpc.clone();
+        // A subscription outlives the call that opened it, so the gate alone
+        // cannot end it. Hold every delivery to the connection's authority:
+        // the credential must still be live, and whenever the accepted policy
+        // has moved, the principal is resolved again and must still hold
+        // `Logs:Read`. The first refusal ends the stream. An unbound
+        // dispatcher (the direct unit-test handlers) has nothing to recheck.
+        let inbound = Arc::clone(&self.ctx.auth);
+        let binding = self.auth.clone();
+        let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
         zeroclaw_spawn::spawn!(async move {
             loop {
                 tokio::select! {
@@ -5973,6 +6012,20 @@ impl RpcDispatcher {
                     _ = rpc.closed() => break,
                     event = rx.recv() => match event {
                         Ok(mut event) => {
+                            if let Some(auth) = binding.as_ref() {
+                                let generation = inbound.generation();
+                                let authority = if checked_generation == Some(generation) {
+                                    credential_is_live(&inbound, auth)
+                                } else {
+                                    current_authority(&inbound, auth, Method::LogsSubscribe)
+                                        .map(|_| ())
+                                };
+                                if let Err(denied) = authority {
+                                    audit_denial(Some(auth), Method::LogsSubscribe, &denied);
+                                    break;
+                                }
+                                checked_generation = Some(generation);
+                            }
                             // Pairing secrets (QR payloads, one-shot pair codes)
                             // ride the shared broadcast bus stamped with the
                             // ephemeral marker. `logs/subscribe` is NOT the
@@ -11494,6 +11547,82 @@ mod tests {
         assert!(
             !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
             "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
+    async fn next_frame_containing(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        needle: &str,
+        within: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(frame)) if frame.contains(needle) => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_subscription_stops_once_the_principal_loses_the_grant() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config.clone(), sessions, event_tx.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let subscribed = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        assert_eq!(
+            subscribed["result"]["subscribed"],
+            json!(true),
+            "{subscribed}"
+        );
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-BEFORE"}))
+            .expect("send the first frame");
+        assert!(
+            next_frame_containing(
+                &mut rx,
+                "SENTINEL-BEFORE",
+                std::time::Duration::from_secs(2)
+            )
+            .await,
+            "an entitled subscriber receives log frames"
+        );
+
+        let mut narrowed = config;
+        narrowed
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&Resource::Logs);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-AFTER"}))
+            .expect("send the second frame");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-AFTER",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a principal that lost Logs:Read must stop receiving log frames"
         );
     }
 
