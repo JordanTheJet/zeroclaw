@@ -1170,8 +1170,21 @@ mod tests {
                         b"token=opaque-token&token_type_hint=access_token"
                     );
                 }
-                assert!(
-                    sink.received_requests().await.unwrap().is_empty(),
+                // `MockServer::start` hands out servers from wiremock's
+                // process-wide pool, and a pooled listener outlives the test
+                // that last used it. Under an in-process parallel run another
+                // test's late request can therefore land on this sink, so only
+                // a request to the redirect target itself counts as a followed
+                // redirect.
+                let followed = sink
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|request| request.url.path() == "/capture")
+                    .count();
+                assert_eq!(
+                    followed, 0,
                     "{surface} status {status} must not deliver any request to the redirect target"
                 );
             }
