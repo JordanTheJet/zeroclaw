@@ -389,11 +389,14 @@ pub struct Agent {
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
-    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
-    /// construction from each server's `pinned_resources` and provenance-wrapped
-    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
-    /// were skipped. Appended to the system prompt in `build_system_prompt`.
-    mcp_pinned_section: String,
+    /// MCP pinned resources, read once at construction from each server's
+    /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
+    /// Kept as attributed blocks rather than pre-rendered text so a later
+    /// principal tool narrowing can withdraw a block whose `<server>__<uri>`
+    /// key the selector no longer names; `build_system_prompt` renders what
+    /// remains. Empty when no pins are configured, all were skipped, or all
+    /// were pruned.
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -553,7 +556,7 @@ pub struct AgentBuilder {
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    mcp_pinned_section: Option<String>,
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
@@ -607,7 +610,7 @@ impl AgentBuilder {
             shell_profile: None,
             approval_route: None,
             activated_tools: None,
-            mcp_pinned_section: None,
+            mcp_pinned: Vec::new(),
             mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
@@ -828,8 +831,11 @@ impl AgentBuilder {
         self
     }
 
-    pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
-        self.mcp_pinned_section = section;
+    pub fn mcp_pinned_blocks(
+        mut self,
+        blocks: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
+    ) -> Self {
+        self.mcp_pinned = blocks;
         self
     }
 
@@ -1013,7 +1019,7 @@ impl AgentBuilder {
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             tool_search: None,
-            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
@@ -1383,6 +1389,11 @@ impl Agent {
     /// intentionally narrowing-only: session construction already intersects
     /// the principal and agent policies, while a later policy refresh must
     /// never let an old static or activated tool survive a removed grant.
+    ///
+    /// Pinned MCP resource content is governed by the same selector: each
+    /// block was admitted at assembly under its `<server>__<uri>` name, so a
+    /// narrowing that no longer names it withdraws the block from every later
+    /// prompt rather than letting construction-time text outlive its grant.
     pub fn narrow_to_principal_tools(&mut self, allowed: Option<&[String]>) {
         let Some(allowed) = allowed else {
             return;
@@ -1399,6 +1410,7 @@ impl Agent {
                 .unwrap_or_else(|e| e.into_inner())
                 .retain_allowed(allowed);
         }
+        self.mcp_pinned.retain(|block| allowed.contains(&block.key));
         self.disable_principal_unaware_nested_tools();
     }
 
@@ -1912,12 +1924,13 @@ impl Agent {
         )
         .await;
         // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section` (the
-        // deferred tool-search listing) and `mcp_pinned_section` (pinned resources).
+        // deferred tool-search listing) and `mcp_pinned` (pinned resources, kept as
+        // attributed blocks so live narrowing can prune them).
         // `assemble` surfaces the two atomically, so from_config threads each into its
         // own slot below - no duplication, and the deferred advertisement the
         // regression suite asserts is preserved.
         let deferred_section = assembled.deferred_section().to_string();
-        let pinned_section = assembled.pinned_section().to_string();
+        let pinned_blocks = assembled.pinned_blocks().to_vec();
         let crate::tools::scoped::ScopedAssembled {
             mut registry,
             delegate_handle: _,
@@ -2063,7 +2076,7 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_handle)
             .mcp_deferred_section(Some(deferred_section))
-            .mcp_pinned_section(Some(pinned_section))
+            .mcp_pinned_blocks(pinned_blocks)
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -2320,9 +2333,11 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&deferred_section);
         }
-        if !self.mcp_pinned_section.is_empty() {
+        let pinned_section =
+            zeroclaw_tools::mcp_context::render_pinned_resources_section(&self.mcp_pinned);
+        if !pinned_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_pinned_section);
+            prompt.push_str(&pinned_section);
         }
         Ok(prompt)
     }
@@ -6210,6 +6225,71 @@ mod tests {
             "revoked tool must not execute again"
         );
         assert!(format!("{:?}", agent.history).contains("Unknown tool: echo"));
+    }
+
+    /// Pinned MCP resource text is admitted under the resource's
+    /// `<server>__<uri>` selector name. A later narrowing that drops the name
+    /// must withdraw the already-materialized block from every later prompt,
+    /// not only stop the executable tools.
+    #[tokio::test]
+    async fn narrowing_prunes_pinned_mcp_resources_from_later_prompts() {
+        use zeroclaw_tools::mcp_context::PinnedResourceBlock;
+        let tmp = tempfile::tempdir().unwrap();
+        let block = |key: &str, text: &str| PinnedResourceBlock {
+            key: key.into(),
+            rendered: format!(
+                "<mcp-resource server=\"docs\" uri=\"{key}\" mime=\"text/plain\" \
+                 trust=\"untrusted-external\">\n{text}\n</mcp-resource>"
+            ),
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_blocks(vec![
+                block("docs__handbook", "HANDBOOK-CONTENT"),
+                block("docs__roster", "ROSTER-CONTENT"),
+            ])
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(prompt.contains("## Pinned MCP Resources"));
+        assert!(prompt.contains("HANDBOOK-CONTENT") && prompt.contains("ROSTER-CONTENT"));
+
+        // Revoking one pinned resource withdraws exactly its block.
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__handbook".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("HANDBOOK-CONTENT"),
+            "the still-granted resource stays pinned"
+        );
+        assert!(
+            !prompt.contains("ROSTER-CONTENT"),
+            "the revoked resource must not reach later prompts: {prompt}"
+        );
+
+        // A selector that names no pinned resource leaves no section at all,
+        // and narrowing never brings a pruned block back.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert!(!prompt.contains("HANDBOOK-CONTENT"));
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__roster".into()]));
+        assert!(
+            !agent
+                .system_prompt_for_test()
+                .unwrap()
+                .contains("ROSTER-CONTENT"),
+            "narrowing is narrowing-only; a pruned block is not re-admitted"
+        );
     }
 
     #[tokio::test]

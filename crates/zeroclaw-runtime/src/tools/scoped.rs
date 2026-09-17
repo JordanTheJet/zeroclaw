@@ -148,6 +148,11 @@ pub struct ScopedAssembled {
     /// resources are granted. Private for the same reason as [`Self::deferred_section`]
     /// above - access via the same two accessor patterns.
     pinned_section: String,
+    /// The same pinned resources as attributed blocks (`<server>__<uri>` key plus the
+    /// rendered text), for holders that must be able to withdraw a block when the
+    /// caller's tool selector later narrows past its key. Always renders to exactly
+    /// [`Self::pinned_section`].
+    pinned_blocks: Vec<tools::mcp_context::PinnedResourceBlock>,
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
@@ -184,6 +189,12 @@ impl ScopedAssembled {
     /// The pinned-MCP-resources section on its own. See [`Self::deferred_section`].
     pub fn pinned_section(&self) -> &str {
         &self.pinned_section
+    }
+
+    /// The pinned resources as attributed blocks, for a holder that re-renders the
+    /// section itself and prunes blocks on live tool narrowing (`Agent`).
+    pub fn pinned_blocks(&self) -> &[tools::mcp_context::PinnedResourceBlock] {
+        &self.pinned_blocks
     }
 }
 
@@ -304,6 +315,7 @@ impl ScopedToolRegistry {
         // (`run`, `process_message`) append this onto their `deferred_section` copy;
         // `from_config` injects it into the Agent's distinct pinned-section slot.
         let mut pinned_section = String::new();
+        let mut pinned_blocks = Vec::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
         let mut tool_search_handle = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
@@ -391,12 +403,14 @@ impl ScopedToolRegistry {
                         mcp_tool_names.insert(capability_name);
                     }
                 }
-                pinned_section = tools::mcp_context::build_pinned_resources_section(
+                pinned_blocks = tools::mcp_context::build_pinned_resource_blocks(
                     &registry,
                     &agent_mcp_servers,
                     mcp_policy.as_ref(),
                 )
                 .await;
+                pinned_section =
+                    tools::mcp_context::render_pinned_resources_section(&pinned_blocks);
                 if config.mcp.deferred_loading {
                     let deferred_set = tools::DeferredMcpToolSet::from_registry(
                         Arc::clone(&registry),
@@ -640,6 +654,7 @@ impl ScopedToolRegistry {
             channel_room_handle,
             deferred_section,
             pinned_section,
+            pinned_blocks,
             activated_handle,
             tool_search_handle,
             mcp_tool_names,
@@ -1562,6 +1577,7 @@ mod tests {
             channel_room_handle: None,
             deferred_section: deferred.to_string(),
             pinned_section: pinned.to_string(),
+            pinned_blocks: Vec::new(),
             activated_handle: None,
             tool_search_handle: None,
             mcp_tool_names: HashSet::new(),
