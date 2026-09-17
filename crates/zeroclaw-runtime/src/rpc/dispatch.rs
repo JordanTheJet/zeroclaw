@@ -5374,8 +5374,9 @@ impl RpcDispatcher {
 
     fn handle_cost_query(&self, params: &Value) -> RpcResult {
         let req: CostQueryParams = parse_params(params)?;
-        // A per-agent summary is that agent's usage history; the fleet-wide
-        // summary needs only the coarse `Cost:Read` grant.
+        // A per-agent summary is that agent's usage history, so naming an agent
+        // takes the agent selector. The fleet-wide summary takes only the coarse
+        // `Cost:Read` grant, and its per-agent breakdown is filtered below.
         if let Some(agent) = req.agent.as_deref() {
             self.selector_agent(Method::CostQuery, agent)?;
         }
@@ -5397,7 +5398,7 @@ impl RpcDispatcher {
         // Precedence (inherited from the existing per-agent path): an explicit
         // `agent` selects that agent's summary and the [from, to) window does
         // NOT apply; the window scopes only the fleet-wide summary.
-        let summary = if let Some(agent) = req.agent {
+        let mut summary = if let Some(agent) = req.agent {
             tracker
                 .get_summary_for_agent(&agent)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
@@ -5410,6 +5411,11 @@ impl RpcDispatcher {
                 .get_summary()
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
         };
+        if let Some(grants) = self.stamped_grants() {
+            summary
+                .by_agent
+                .retain(|alias, _| grants.may_use_agent(alias));
+        }
         to_result(summary)
     }
 
@@ -9181,6 +9187,64 @@ mod tests {
             let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
             assert_ne!(response["error"]["code"], json!(FORBIDDEN), "{response}");
         }
+    }
+
+    #[tokio::test]
+    async fn fleet_cost_summary_lists_only_the_principals_agents() {
+        use zeroclaw_config::cost::types::TokenUsage;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = agent_scoped_config_in(&tmp, 4242);
+        let tracker = Arc::new(
+            zeroclaw_config::cost::tracker::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        for alias in ["alpha", "beta"] {
+            tracker
+                .record_usage_with_agent(
+                    TokenUsage::new("test-model", 100, 50, 0, 1.0, 1.0, 0.0),
+                    Some(alias),
+                )
+                .unwrap();
+        }
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, tracker);
+
+        let by_agent = |response: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = response["result"]["by_agent"]
+                .as_object()
+                .unwrap_or_else(|| panic!("a by_agent map: {response}"))
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        for (id, params) in [
+            (1u64, json!({})),
+            (2, json!({"from": "2000-01-01T00:00:00Z"})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
+            assert_eq!(by_agent(&response), vec!["alpha".to_string()], "{response}");
+        }
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(&mut operator, &mut op_rx, 1, "cost/query", json!({})).await;
+        assert_eq!(
+            by_agent(&response),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the operator still sees every agent: {response}"
+        );
     }
 
     fn files_under(dir: &std::path::Path) -> usize {
