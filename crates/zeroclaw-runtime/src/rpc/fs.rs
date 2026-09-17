@@ -3,9 +3,9 @@
 //! `fs/list_dir` requires the `Files:Read` grant, and the dispatcher confines
 //! it with [`listing_is_authorized`] before the handler touches the path: an
 //! operator-level principal may list anything the daemon account can read,
-//! and every other principal only absolute paths without '..' components that
-//! an enabled agent it is entitled to use may read under that agent's risk
-//! profile.
+//! and every other principal only absolute paths, without '..' components or
+//! Windows network and device prefixes, that an enabled agent it is entitled
+//! to use may read under that agent's resolved policy.
 
 use std::path::Path;
 use zeroclaw_api::grants::ResolvedGrants;
@@ -34,11 +34,12 @@ pub fn resolves_locally(path: &Path) -> bool {
 ///
 /// Operator-level principals may list anything. Every other principal may list
 /// only a path that an enabled agent it is entitled to use may read, judged by
-/// that agent's own risk-profile policy: its workspace and readable allowed
-/// roots when the profile is workspace-only, and anything outside its
-/// forbidden paths when it is not. The policy resolves the path first, so a
-/// symlink out of those roots is refused and a path that cannot be resolved is
-/// refused rather than assumed benign.
+/// that agent's resolved policy: its workspace, readable allowed roots,
+/// readable sibling workspaces, and the shared skills directory when the
+/// policy is workspace-only, and anything outside its forbidden paths when it
+/// is not. The policy resolves the path first, so a symlink is judged by its
+/// target and a path that cannot be resolved is refused rather than assumed
+/// benign.
 ///
 /// Resolving an agent's policy creates its workspace directory if it is
 /// missing, as every other use of that policy does.

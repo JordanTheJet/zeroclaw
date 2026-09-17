@@ -21,25 +21,33 @@ importantly, what changes for existing remote connections.
 3. Every RPC method is classified to a required resource-verb grant and
    refused without it. Fine-grained selectors compose on top:
    - config writes check `config_write_paths`;
-   - session methods check the agent selector and hold the session's
-     workspace to a directory that agent's risk profile lets it both read and
-     write, whether the workspace was named by the request, stored with a
-     resumed session, or restored from a durable one;
+   - `session/new` and `session/prompt` check the agent selector and hold
+     the session's workspace to a directory that agent's policy lets it both
+     read and write, whether the workspace was named by the request, stored
+     with a resumed session, or restored from a durable one. The other
+     session methods do not check the agent yet, as described under
+     [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
    - running or approving an SOP requires every agent it runs as, with the
      same tool-selector rule as a session, and creating, saving, or deleting
-     one requires the agents it runs as;
+     one requires the agents it runs as. A step that names no agent, on the
+     step or on the procedure, counts as the first configured agent alias in
+     sort order, which is the agent the headless executor falls back to.
+     Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
-     cron jobs check the agent selector, and a fleet cost summary lists only
-     the agents the principal may use;
-   - `fs/list_dir` lists only absolute paths that the risk profile of an
-     enabled agent the principal may use lets that agent read, and refuses
-     relative paths and `..` components.
+     cron jobs check the agent selector. A fleet cost summary lists only the
+     principal's agents in its per-agent breakdown, but its totals and its
+     per-model usage still cover every agent;
+   - `fs/list_dir` lists only absolute paths that the policy of an enabled
+     agent the principal may use lets that agent read. It refuses relative
+     paths, `..` components, and, on Windows, network and device paths.
 
-   These roots are whatever each agent's risk profile allows. An agent that
-   is not workspace-only (autonomy `full`, the `yolo` preset, or
-   `workspace.unrestricted_filesystem = true`) may read any path outside its
-   forbidden paths, so a principal entitled to such an agent may list and
-   open sessions anywhere that agent could.
+   These roots come from each agent's resolved policy: its risk profile, the
+   sibling workspaces its `workspace.access` grants, and the shared skills
+   directory, which is read-only. An agent that is not workspace-only
+   (autonomy `full`, a risk profile with `workspace_only = false`, the
+   `yolo` preset, or `workspace.unrestricted_filesystem = true`) may read
+   any path outside its forbidden paths, so a principal entitled to such an
+   agent may list and open sessions anywhere that agent could.
 
    `session/new` and `session/prompt` repeat these checks after waiting for
    the session's queue, so a request queued before its principal was
@@ -54,9 +62,12 @@ outside the daemon, directly in `config.toml`, through the web dashboard, or
 with `zeroclaw config set`, apply at the next daemon reload or restart.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
-Removing a token from `gateway.paired_tokens` by editing config does not
-revoke it: the edit never reaches the live pairing authority, which can
-write the token back.
+Removing a token from `gateway.paired_tokens` by editing config, over RPC
+or on disk, has no effect on the running daemon, and connections using the
+token stay authorized. The removal applies at the next daemon reload or
+restart, unless a pairing change made through the gateway before then
+writes the live token set, that token included, back to config. Revoke
+tokens through the pairing controls.
 
 ## Providers
 
@@ -68,27 +79,33 @@ write the token back.
 
 ### Local connections
 
-With no `[users]` roster configured, local behavior is unchanged: the
-socket's `0o600` mode is the credential and the connection is the trusted
-shared operator with full access.
+On a Unix socket the kernel peer uid is always the local credential. While
+`security.trust_daemon_uid` is `true` (the default), the daemon's **own
+uid** connects as the trusted shared operator with full access, with or
+without a `[users]` roster, so an install with no roster behaves as before
+for the account that runs the daemon.
 
-The daemon's **own uid** keeps that trusted path even after a roster is
-configured, controlled by `security.trust_daemon_uid` (default `true`).
 The operator who runs the daemon owns its config file, and local-only
-lockout recovery depends on that authority. Set it to `false` to require
-every local peer, including the daemon's own uid, to map through the
-roster or present a token.
+lockout recovery depends on that authority. Set `security.trust_daemon_uid`
+to `false` to require every local peer, including the daemon's own uid, to
+map through the roster or present a token.
 
 Any **other** uid must be mapped by an explicit `[users.<name>].uid`
-entry. An unmapped uid (root included) is denied; there is no fallback to
-shared-operator access. The listener creates the socket owner-only, so
-today only the daemon's own account and root can reach it; a roster entry
-decides what any other uid may do once it can.
+entry. An unmapped uid (root included) is denied, whether or not a roster
+exists; there is no fallback to shared-operator access. The listener
+creates the socket owner-only, so today only the daemon's own account and
+root can reach it; a roster entry decides what any other uid may do once
+it can.
 
-Windows named pipes carry no peer uid. Once a `[users]` roster exists, a
-local client there must present a token, `security.trust_daemon_uid` has no
-effect, and the daemon's own account has no trusted local route, so a
-lockout is repaired by editing `config.toml` and restarting.
+Windows named pipes carry no peer uid. With no roster, the pipe ACL is the
+credential and a local connection is the shared operator. Once a
+`[users]` roster exists, a local client there must present a token,
+`security.trust_daemon_uid` has no effect, and the daemon's own account has
+no trusted local route. A paired gateway token still authenticates as the
+shared operator while the policy compiles, so a client that sends one, over
+WSS or over the pipe, can repair the roster live. zerocode's local pipe
+connection sends no token, so without such a client a lockout is repaired
+by editing `config.toml` and restarting.
 
 A client may forward its shell environment in `initialize` so the
 daemon's subprocesses see its `PATH` and credential sockets (see
@@ -105,7 +122,8 @@ daemon. Which route applies depends on whether the authorization policy
 still compiles.
 
 **Locked out of a policy that compiles.** Authorization is live and the
-local trusted path is intact. Connect locally as the daemon's own uid:
+local trusted path is intact on a Unix socket; on Windows, see the named
+pipe note above. Connect locally as the daemon's own uid:
 with `security.trust_daemon_uid = true` (the default) that account is the
 trusted shared operator whatever the roster says. Repair the offending
 entry over that local connection, for example in zerocode's config editor
@@ -153,9 +171,17 @@ selector list grants no instances, and broad access requires the explicit
 
 One current limitation is deliberate: per-tool selectors are not yet
 enforced inside agent sessions, so a principal whose `allowed_tools` is
-constrained (neither `admin` nor `"*"`) is **refused** `session/new`
-rather than silently under-enforced. Grant `allowed_tools = ["*"]` until
-the session-assembly change lands.
+constrained (neither `admin` nor `"*"`) is **refused** `session/new`,
+`session/prompt`, `sops/run`, and `sops/decide` rather than silently
+under-enforced. Grant `allowed_tools = ["*"]` until the session-assembly
+change lands.
+
+That refusal does not cover every route to an agent's tools. Cron jobs and
+SOP authoring check only the agent selector. A constrained principal
+holding cron grants can create a shell job for its agent, or give an
+existing agent job a new prompt and trigger it, and one holding SOP create
+or update grants can save a procedure whose trigger runs it later. Treat
+cron and SOP authoring grants as grants of the agent's tools.
 
 ## Breaking change: remote WSS requires authentication
 
@@ -221,35 +247,65 @@ An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
   revalidation deadline; past it, the next operation is refused until the
   client re-initializes (which re-verifies against the IdP).
 - **Pairing revocation** applies before the connection's next operation.
+- **Policy changes**: a config save that leaves `[oidc]`, `[users]`,
+  `[permission_profiles]`, and `security.trust_daemon_uid` unchanged keeps
+  every binding as it is. A change to any of them publishes a new policy.
+  Native-token and local connections re-resolve against it in place, but
+  the daemon does not keep an OIDC bearer, so the next operation on an OIDC
+  connection is refused until the client re-initializes.
 - The `tui_id`/`tui_sig` reconnect mechanism is continuity only: it
   preserves the TUI's registry identity and grants **no** authority. Every
   `initialize` re-presents a credential.
 
 ## What this layer does not do (yet)
 
-Session and memory records are not yet principal-owned (that storage
-boundary is its own tracked change), gateway HTTP routes keep their
-existing pairing checks, and channel identities do not resolve into this
-principal model. The daemon's own uid and the shared operator retain full
-access throughout, so single-operator installs behave exactly as before.
+Session and memory records are not yet principal-owned; that storage
+boundary is its own tracked change. Until it lands, the session methods
+other than `session/new` and `session/prompt` do not check which agent a
+session belongs to. `session/close`, `session/kill`, `session/configure`,
+`session/approve`, `session/messages`, `session/state`, `session/delete`,
+and `session/git_branch` act on any session id or pending approval that a
+principal holding the method's grant names, and `session/list` and
+`session/list-acp` list every session. `session/cancel` also compares the
+caller's TUI registration with the session's. Gateway HTTP routes keep
+their existing pairing checks, and channel identities do not resolve into
+this principal model.
+
+While `security.trust_daemon_uid = true` (the default) and the policy
+compiles, the daemon's own uid on a Unix socket keeps full access, so a
+single-operator install with no `[users]` roster and valid auth sections
+behaves as before.
 
 Permission profiles limit what a principal can do over RPC. They do not
 isolate the code a principal causes an agent to run. Session turns, cron
-jobs, and SOP steps run as the daemon account, and with
-`security.trust_daemon_uid = true` (the default) anything running as that
-account can connect to the local socket as the shared operator. Grant
-session, cron, or SOP execution only to principals you would trust with
-operator access, or set `security.trust_daemon_uid = false` and map the
-operator through the roster.
+jobs, and SOP steps run as the daemon account. That code can connect to
+the local socket as the daemon's uid, which is the shared operator while
+`security.trust_daemon_uid = true` (the default) and otherwise gets
+whatever roster entry maps that uid. It can also edit `config.toml`, which
+the daemon applies at its next reload or restart. Setting
+`security.trust_daemon_uid = false` does not change either. Grant session,
+cron, or SOP execution or authoring only to principals you would trust
+with operator access. Only OS-level confinement that keeps agent processes
+away from the socket and `config.toml` isolates that code.
 
-Some config paths carry authority themselves. A principal whose
-`config_write_paths` cover `permission_profiles`, `users`, `oidc`,
-`security`, or `gateway.paired_tokens` can grant itself anything, and one
-that can write `agents`, `risk_profiles`, `cron`, `channels`, or provider
-settings can change which agents run, with which tools, and where they may
-read and write. Grant those paths only to operators.
+Some config paths carry authority themselves, so treat a broad
+`config_write_paths` grant as operator access unless it covers only vetted
+leaf settings. For example:
 
-zerocode's remote directory picker opens at the daemon's filesystem root,
-which a principal without operator grants may not list, so for such a
+- a principal that can write `permission_profiles`, `users`, `oidc`,
+  `security`, or `gateway.paired_tokens` can grant itself anything;
+- one that can write `agents`, `risk_profiles`, `cron`, `channels`, or
+  provider settings can change which agents run, with which tools, and
+  where they may read and write;
+- one that can write `mcp`, `mcp_bundles`, or
+  `tunnel.custom.start_command` can choose programs the daemon account
+  starts.
+
+`Config:Update` also grants `config/reload`, which applies whatever
+`config.toml` holds on disk.
+
+zerocode's remote directory picker opens at the daemon's filesystem root.
+A principal without operator grants may list it only through an enabled
+agent that is not workspace-only and does not forbid it. For any other such
 principal the picker reports a refusal there until it opens inside an
 allowed root instead.

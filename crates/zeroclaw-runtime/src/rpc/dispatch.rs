@@ -1153,19 +1153,21 @@ impl RpcDispatcher {
         Err(denied)
     }
 
-    /// Confine a session workspace to roots the agent is authorized to reach.
+    /// Confine a session workspace to a directory the agent's own policy lets
+    /// it both read and write.
     ///
     /// The agent builder makes a session's workspace its jail root, so
     /// selecting an entitled agent must not also select an arbitrary
     /// directory on the daemon host. Operator-level principals keep today's
-    /// behaviour, which is what the local TUI, ACP and editor flows use; every
-    /// other principal is held to the agent's own risk-profile policy, whose
-    /// `allowed_roots` is the operator's escape hatch for a project directory
-    /// outside the workspace.
+    /// behaviour, which is what the local TUI, ACP and editor flows use. Every
+    /// other principal is held to the agent's resolved policy: its workspace,
+    /// read-write allowed roots, and read-write sibling workspaces when the
+    /// policy is workspace-only, and any path outside its forbidden paths
+    /// when it is not.
     ///
-    /// The check runs against the resolved path, so a symlink out of the
-    /// workspace is refused, and a path that cannot be resolved at all is
-    /// refused rather than assumed benign. Any path other than the agent's
+    /// The check runs against the resolved path, so a symlink is judged by its
+    /// target, and a path that cannot be resolved at all is refused rather
+    /// than assumed benign. Any path other than the agent's
     /// configured workspace is refused before it is resolved when it has `..`
     /// components or a Windows network or device prefix, and every refusal
     /// carries the same message, so the answer does not reveal whether a path
@@ -1290,8 +1292,8 @@ impl RpcDispatcher {
             return Ok(());
         }
         let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted a listing of {:?}: only absolute paths that an agent \
-             it may use can read can be listed",
+            "Principal is not granted a listing of {:?}: only absolute local paths that an \
+             enabled agent it may use can read can be listed",
             req.path
         ));
         self.audit_auth_denial(Method::FsListDir, &denied);
@@ -6109,7 +6111,9 @@ impl RpcDispatcher {
     /// own override, then the procedure's parent agent), or, where neither is
     /// named, the lowest configured alias, which is what the headless driver
     /// falls back to. The parent agent counts even for a procedure with no
-    /// steps.
+    /// steps. Every step counts whatever the execution mode, so a
+    /// deterministic procedure that never starts an agent is still held to
+    /// these agents and fails closed.
     fn sop_executing_agents(sop: &crate::sop::Sop, config: &Config) -> Vec<String> {
         let fallback = config.agents.keys().min().cloned().unwrap_or_default();
         let mut agents: Vec<String> = sop
