@@ -9974,6 +9974,55 @@ mod tests {
         );
     }
 
+    /// `sop_as_loaded` restates how `save_sop` writes steps and how the loader
+    /// reads them back. Save and reload real procedures, including injected
+    /// overrides and extra steps, and require the same steps and agents.
+    #[test]
+    fn sop_as_loaded_matches_a_real_save_and_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut in_body = gated_sop("in-body", "alpha");
+        in_body.steps[0].body = "ok\n- agent: beta".into();
+        let mut in_title = gated_sop("in-title", "alpha");
+        in_title.steps[0].title = "Run\n   - agent: beta".into();
+        let mut extra_step = gated_sop("extra-step", "alpha");
+        extra_step.steps[0].body = "first\n2. **Second**\n   - agent: beta".into();
+        let mut overridden = gated_sop("overridden", "alpha");
+        overridden.steps[0].agent = Some("beta".into());
+
+        let mut saved = 0;
+        for sop in [
+            in_body,
+            in_title,
+            extra_step,
+            overridden,
+            gated_sop("plain", "alpha"),
+        ] {
+            if let Err(e) = crate::sop::save_sop(tmp.path(), &sop) {
+                assert_ne!(sop.name, "in-body", "the body case must save: {e}");
+                continue;
+            }
+            saved += 1;
+            let reloaded = crate::sop::load_sop_by_name(
+                tmp.path(),
+                &sop.name,
+                crate::sop::SopExecutionMode::Supervised,
+            )
+            .expect("a saved procedure loads");
+            let predicted = RpcDispatcher::sop_as_loaded(&sop);
+            let agents = |sop: &crate::sop::Sop| -> Vec<Option<String>> {
+                sop.steps.iter().map(|step| step.agent.clone()).collect()
+            };
+            assert_eq!(
+                agents(&predicted),
+                agents(&reloaded),
+                "{}: the authorized steps must be the steps that load",
+                sop.name
+            );
+            assert_eq!(predicted.agent, reloaded.agent, "{}", sop.name);
+        }
+        assert!(saved >= 3, "most fixtures must save, saved {saved}");
+    }
+
     #[tokio::test]
     async fn sop_authoring_refuses_to_replace_or_delete_an_unloadable_procedure() {
         let tmp = tempfile::TempDir::new().unwrap();
