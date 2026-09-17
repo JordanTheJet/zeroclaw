@@ -898,6 +898,22 @@ mod tests {
                         vec!["missing".into()];
                 }),
             ),
+            (
+                "client declared as both a service and an interactive client",
+                "declared in both service_clients and",
+                Box::new(|c| {
+                    let oidc = c.oidc.get_mut("corp").unwrap();
+                    oidc.service_clients = vec!["zerocode-cli".into()];
+                    oidc.interactive_clients = vec!["zerocode-cli".into()];
+                }),
+            ),
+            (
+                "blank interactive client id",
+                "interactive_clients must not contain a blank client id",
+                Box::new(|c| {
+                    c.oidc.get_mut("corp").unwrap().interactive_clients = vec!["  ".into()];
+                }),
+            ),
         ];
         for (label, expected, corrupt) in cases {
             let resolver =
