@@ -1202,13 +1202,19 @@ impl RpcDispatcher {
                  its risk profile's allowed_roots"
             ))
         })?;
-        if policy.is_resolved_path_allowed(&resolved) {
+        // The workspace becomes the session's jail root, and a jail root is
+        // readable and writable to the agent. Accept only a directory the
+        // agent's own policy already lets it both read and write, so a
+        // write-only sibling root cannot become readable this way.
+        if resolved.is_dir()
+            && policy.is_resolved_path_allowed(&resolved)
+            && policy.is_resolved_path_readable(&resolved)
+        {
             return Ok(());
         }
         Err(refuse(format!(
-            "Session workspace {workspace:?} is outside agent {alias:?}'s workspace {:?}; add \
-             the directory to the agent's risk profile allowed_roots to authorize it",
-            policy.workspace_dir
+            "Session workspace {workspace:?} is not a directory agent {alias:?} may both read \
+             and write; add it to the agent's risk profile allowed_roots to authorize it",
         )))
     }
 
@@ -8801,6 +8807,52 @@ mod tests {
             response.get("error").is_none(),
             "an unrelated republication must not refuse a still-authorized prompt: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_root_a_session_in_a_write_only_sibling_workspace() {
+        use zeroclaw_config::multi_agent::{AccessMode, AgentAlias};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        for (mode, admitted) in [(AccessMode::Write, false), (AccessMode::ReadWrite, true)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_cwd_config(&tmp, 4242, None);
+            let inbox = tmp.path().join("inbox-workspace");
+            std::fs::create_dir_all(&inbox).unwrap();
+            config.agents.insert(
+                "inbox".into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    risk_profile: "test-profile".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config.agents.get_mut("inbox").unwrap().workspace.path = Some(inbox.clone());
+            config
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .workspace
+                .access
+                .insert(AgentAlias::new("inbox"), mode);
+            let ctx = enforcement_ctx(config);
+            let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+            let response = session_new_with_cwd(&mut alice, &mut rx, "s-sibling", &inbox).await;
+            if admitted {
+                assert_eq!(
+                    response["result"]["session_id"],
+                    json!("s-sibling"),
+                    "a read-write sibling root is a valid workspace: {response}"
+                );
+            } else {
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "a write-only sibling root must not become a readable jail root: {response}"
+                );
+            }
+        }
     }
 
     // ── Resumed, rehydrated, and live session workspaces are confined ──
