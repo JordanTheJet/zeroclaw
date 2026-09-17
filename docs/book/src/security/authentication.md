@@ -195,9 +195,20 @@ export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
 ```
 
 Progress messages go to stderr; stdout carries only the token, so both
-commands compose with command substitution. Nothing is stored: present
-the token as `auth_token` in the RPC handshake (or via the environment
-variable) before it expires, then re-enroll.
+commands compose with command substitution (the `oidc` commands run before
+any startup prelude that could print, the OTP seed disclosure included).
+Nothing is stored: present the token as `auth_token` in the RPC handshake
+(or via the environment variable) before it expires, then re-enroll.
+
+The client trusts the issuer the entry names and nothing else: the
+discovery document must assert exactly that issuer before any endpoint it
+advertises is used, every endpoint that receives a credential must satisfy
+the same URL policy as the issuer (`https`, or `http` only for an exact
+loopback host), redirects are never followed, response bodies are
+size-capped, and a token response is accepted only when it carries a
+non-empty `Bearer` access token. A confidential client (an entry with a
+`client_secret`) authenticates with HTTP Basic on every request; a public
+client sends its `client_id` in the form.
 
 ## Permission profiles
 
