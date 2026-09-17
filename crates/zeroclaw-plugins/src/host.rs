@@ -23,8 +23,6 @@ struct LoadedPlugin {
     plugin_dir: PathBuf,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     wasm_path: Option<PathBuf>,
-    #[allow(dead_code)]
-    verification: VerificationResult,
 }
 
 /// The file name a staged component is held under while it is verified.
@@ -38,7 +36,6 @@ pub struct AdmittedSource {
     manifest: PluginManifest,
     manifest_toml: String,
     source_dir: PathBuf,
-    verification: VerificationResult,
     staging_dir: PathBuf,
     component: Option<StagedComponent>,
 }
@@ -237,7 +234,7 @@ impl PluginHost {
 
                     // Verify plugin signature
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
-                        Ok(verification) => {
+                        Ok(_) => {
                             if let Err(e) = validate_manifest_config(&manifest) {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid config schema");
                                 continue;
@@ -270,7 +267,6 @@ impl PluginHost {
                                     manifest,
                                     plugin_dir: path.clone(),
                                     wasm_path,
-                                    verification,
                                 },
                             );
                         }
@@ -392,8 +388,8 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        let verification =
-            self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        // Verify plugin signature before anything is staged.
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
         validate_manifest_config(&manifest)?;
 
         let staging_dir = self.fresh_staging_dir(&manifest.name)?;
@@ -403,7 +399,6 @@ impl PluginHost {
             manifest,
             manifest_toml,
             source_dir,
-            verification,
             staging_dir,
             component: None,
         };
@@ -481,7 +476,6 @@ impl PluginHost {
                 manifest: admitted.manifest.clone(),
                 plugin_dir: dest_dir,
                 wasm_path: wasm_dest,
-                verification: admitted.verification.clone(),
             },
         );
 
