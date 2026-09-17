@@ -2305,7 +2305,6 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
             .clone()
@@ -2356,6 +2355,16 @@ impl RpcDispatcher {
             .acquire(&session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        // The wait for admission is unbounded, so the principal's profile,
+        // credential, or pairing may have changed while this request was
+        // parked. Every selector below is judged by the grants resolved now,
+        // not by the ones stamped on the connection before the wait.
+        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+        if let Some(grants) = grants.as_ref() {
+            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+        }
+        let config = self.ctx.config.read().clone();
 
         // The mode may have changed while this request waited for admission.
         // Re-read under the permit so concurrent replacements cannot remove a
@@ -2497,7 +2506,7 @@ impl RpcDispatcher {
         // down, so it is authorized here. A resumed ACP session's persisted
         // workspace and the agent's own default are host-owned and skip it.
         if req.cwd.is_some()
-            && let Some(grants) = self.stamped_grants()
+            && let Some(grants) = grants.as_ref()
         {
             self.confine_session_workspace_with_grants(
                 Method::SessionNew,
@@ -3156,6 +3165,19 @@ impl RpcDispatcher {
             .wait_test_prompt_registration_pause()
             .await;
 
+        // Admission can wait behind an active turn for as long as that turn
+        // runs, and this handle carries a copy of the connection's binding
+        // from before the wait. Re-resolve against the accepted policy now,
+        // before any lookup, rehydration, attachment, or turn work.
+        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+            Ok(grants) => grants,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
+
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
             None => match self.rehydrate_reaped_session(sid).await {
@@ -3181,21 +3203,24 @@ impl RpcDispatcher {
                 }
             },
         };
-        // Session/new performs this selector only for the initial admission.
-        // Reused and rehydrated sessions enter through session/prompt, so
-        // enforce the same agent/tool posture before any prompt-side effect.
+        // Session/new performs its selector only for the initial admission.
+        // Reused and rehydrated sessions enter through session/prompt, so the
+        // same agent/tool posture is enforced here, against the grants
+        // resolved after admission, before any prompt-side effect. An unbound
+        // dispatcher (the direct unit-test handlers) has no grants to apply.
         let agent_alias = self
             .ctx
             .sessions
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        // `process_line` has already run the coarse SessionPrompt gate for
-        // production traffic. Direct unit handlers intentionally bypass that
-        // transport boundary, so only apply the selector when a connection is
-        // bound rather than changing unrelated prompt-fixture semantics.
-        if self.auth.is_some() {
-            self.selector_session_agent(Method::SessionPrompt, &agent_alias)?;
+        if let Some(grants) = grants.as_ref()
+            && let Err(denied) =
+                self.selector_session_agent_with_grants(Method::SessionPrompt, grants, &agent_alias)
+        {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
         }
 
         // Process inline attachments: upload each, append markers to prompt.
@@ -3619,6 +3644,30 @@ impl RpcDispatcher {
                 ))
             }
         }
+    }
+
+    /// Refuse a prompt that was already admitted to its session's queue.
+    ///
+    /// The client entered its working state when it sent the prompt, and it
+    /// leaves that state on the terminal `TurnComplete` notification, not on
+    /// the JSON-RPC response. The refusal therefore emits a `Failed`
+    /// completion carrying the same message as the error, as the
+    /// session-not-found path does.
+    async fn refuse_admitted_prompt(
+        &self,
+        session_id: &str,
+        client_turn_generation: Option<u64>,
+        denied: JsonRpcError,
+    ) -> JsonRpcError {
+        self.emit_turn_complete(
+            session_id,
+            crate::rpc::types::TurnCompletionOutcome::Failed,
+            format!("turn refused by daemon: {}", denied.message),
+            client_turn_generation,
+            None,
+        )
+        .await;
+        denied
     }
 
     /// Emit the terminal `session/update` notification for a turn.
@@ -8019,6 +8068,12 @@ mod tests {
     // workspace root. A scoped principal must not reach outside the agent's
     // own workspace with it.
 
+    /// A roster principal, alice, scoped to `test-agent` with session create,
+    /// read, and execute grants and unrestricted tools.
+    ///
+    /// The roster closes the legacy local path, so a dispatcher stamped with
+    /// `set_authenticated_for_test` does not revalidate against this config;
+    /// bind principals here through `roster_peer` or `local_operator`.
     fn session_cwd_config(
         tmp: &tempfile::TempDir,
         uid: u32,
@@ -8050,7 +8105,10 @@ mod tests {
             PermissionProfileConfig {
                 allowed_agents: vec!["test-agent".into()],
                 allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
-                grants: HashMap::from([(Resource::Sessions, vec![Verb::Create, Verb::Read])]),
+                grants: HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Create, Verb::Read, Verb::Execute],
+                )]),
                 ..PermissionProfileConfig::default()
             },
         );
@@ -8166,6 +8224,389 @@ mod tests {
             response["result"]["session_id"],
             json!("s-operator"),
             "the local operator's editor flows are untouched: {response}"
+        );
+    }
+
+    // ── Session authority is re-established after queue admission ─────
+    //
+    // `session/new` and `session/prompt` pass the gate before they wait on the
+    // session's actor queue, and that wait is unbounded. These park a request
+    // behind a held admission permit, change what the principal may do while
+    // it waits, and check the request is judged by the policy in force when
+    // it is admitted.
+
+    /// A persistence-backed context (chat backend and ACP store in the
+    /// config's data dir) for principals bound through the real handshake.
+    fn persistence_enforcement_ctx(
+        config: zeroclaw_config::schema::Config,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let data_dir = config.data_dir.clone();
+        std::fs::create_dir_all(&data_dir).expect("the data dir is creatable");
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        (ctx, chat_backend, acp_store)
+    }
+
+    /// Republish the accepted policy with alice entitled to no agent, keeping
+    /// her session grants so a refusal is the agent selector's.
+    fn narrow_alice_to_no_agents(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Republish the accepted policy for a reason unrelated to alice, so her
+    /// stamped generation goes stale while her authority stays the same.
+    fn republish_an_unrelated_profile(ctx: &Arc<RpcContext>) {
+        let mut republished = ctx.config.read().clone();
+        republished.permission_profiles.insert(
+            "unrelated-reader".into(),
+            zeroclaw_config::schema::PermissionProfileConfig::default(),
+        );
+        ctx.auth
+            .refresh_from_config(&republished)
+            .expect("the republished policy compiles");
+    }
+
+    /// Wait until a request is queued behind the held admission permit for
+    /// `session_id`.
+    async fn wait_for_session_admission_waiter(ctx: &Arc<RpcContext>, session_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request must park on session admission");
+    }
+
+    /// Park `rpc_call` behind a held admission permit for `session_id`, apply
+    /// `mutate` while it waits, then release the permit and return the call's
+    /// result.
+    async fn rpc_result_after_midwait_session_admission<F>(
+        ctx: Arc<RpcContext>,
+        session_id: &str,
+        rpc_call: F,
+        mutate: impl FnOnce(&Arc<RpcContext>),
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire(session_id)
+            .await
+            .expect("the test takes the admission permit first");
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+        wait_for_session_admission_waiter(&ctx, session_id).await;
+        mutate(&ctx);
+        drop(permit);
+        task.await.expect("the parked RPC task must not panic")
+    }
+
+    /// Read frames until the response with `id`, returning it and every
+    /// notification that preceded it.
+    async fn response_and_notifications(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        id: u64,
+    ) -> (Value, Vec<Value>) {
+        let mut notifications = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return (value, notifications);
+            }
+            notifications.push(value);
+        }
+    }
+
+    /// Send `session/prompt` through `process_line` with a client turn
+    /// generation.
+    async fn send_prompt(
+        dispatcher: &mut RpcDispatcher,
+        id: u64,
+        session_id: &str,
+        client_turn_generation: u64,
+    ) {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {
+                "session_id": session_id,
+                "prompt": "hello",
+                "client_turn_generation": client_turn_generation,
+            },
+        })
+        .to_string();
+        dispatcher.process_line(&line).await;
+    }
+
+    /// A refused, already-admitted prompt must still end the client's turn.
+    fn assert_turn_refused(notifications: &[Value], session_id: &str, generation: u64) {
+        let turn_complete = notifications
+            .iter()
+            .find(|frame| {
+                frame["method"] == notification::SESSION_UPDATE
+                    && frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["session_id"] == session_id
+            })
+            .unwrap_or_else(|| {
+                panic!("a refused prompt must emit TurnComplete: {notifications:?}")
+            });
+        assert_eq!(
+            turn_complete["params"]["outcome"], "failed",
+            "{turn_complete}"
+        );
+        assert_eq!(
+            turn_complete["params"]["client_turn_generation"],
+            json!(generation),
+            "{turn_complete}"
+        );
+        assert!(
+            turn_complete["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("turn refused by daemon")),
+            "{turn_complete}"
+        );
+    }
+
+    fn gated_provider() -> (
+        GatedProvider,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        (
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            started_rx,
+            release_tx,
+        )
+    }
+
+    #[test]
+    fn session_new_narrowed_while_parked_on_session_admission_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = rpc_result_after_midwait_session_admission(
+                Arc::clone(&ctx),
+                "s-parked",
+                async move {
+                    alice
+                        .handle_session_new_for_test(&json!({
+                            "agent_alias": "test-agent",
+                            "session_id": "s-parked",
+                        }))
+                        .await
+                },
+                narrow_alice_to_no_agents,
+            )
+            .await;
+
+            let err = result.expect_err("a principal narrowed while parked must not get a session");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(
+                ctx.sessions.get_agent("s-parked").await.is_none(),
+                "a refused session/new must not leave a session behind"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_still_succeeds_when_authority_is_unchanged_after_admission() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = rpc_result_after_midwait_session_admission(
+                Arc::clone(&ctx),
+                "s-parked",
+                async move {
+                    alice
+                        .handle_session_new_for_test(&json!({
+                            "agent_alias": "test-agent",
+                            "session_id": "s-parked",
+                        }))
+                        .await
+                },
+                republish_an_unrelated_profile,
+            )
+            .await;
+
+            let created = result.expect("an unchanged principal is still admitted");
+            assert_eq!(created["session_id"], json!("s-parked"));
+        });
+    }
+
+    #[tokio::test]
+    async fn session_prompt_narrowed_after_admission_is_refused_with_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-narrowed";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut alice, 7, sid, 3).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+        narrow_alice_to_no_agents(&ctx);
+        release_admitted.notify_one();
+
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_survives_an_unrelated_policy_republication_after_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, release_tx) = gated_provider();
+        let sid = "s-prompt-republished";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut alice, 8, sid, 4).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+        republish_an_unrelated_profile(&ctx);
+        release_admitted.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("a still-authorized prompt must reach the provider")
+            .expect("the provider channel stays open");
+        release_tx
+            .send(())
+            .expect("the turn is waiting on its provider");
+        let (response, _notifications) = response_and_notifications(&mut rx, 8).await;
+        assert!(
+            response.get("error").is_none(),
+            "an unrelated republication must not refuse a still-authorized prompt: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_admitted_with_an_expired_credential_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-expired";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Hold admission, expire the binding the prompt handle copies, and
+        // queue the prompt directly: the gate in `process_line` would refuse
+        // an expired credential before admission, which is not the boundary
+        // under test.
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("the test takes the admission permit first");
+        alice.expire_credential_for_test();
+        let handle = alice.spawn_handle();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "hello",
+                    "client_turn_generation": 9,
+                }))
+                .await
+        });
+        wait_for_session_admission_waiter(&ctx, sid).await;
+        drop(permit);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the admitted prompt must settle")
+            .expect("the prompt task must not panic")
+            .expect_err("an expired credential must not run a turn");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        let mut notifications = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            notifications.push(serde_json::from_str::<Value>(&frame).expect("valid frame"));
+        }
+        assert_turn_refused(&notifications, sid, 9);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
         );
     }
 
@@ -16672,6 +17113,27 @@ mod tests {
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
     ) -> String {
+        install_state_test_session_at(
+            sessions,
+            chat_backend,
+            sid,
+            provider,
+            owner_tui_id,
+            &std::env::temp_dir(),
+        )
+        .await
+    }
+
+    /// [`install_state_test_session_with_owner`] with an explicit session
+    /// workspace, for callers whose principal is held to the agent's roots.
+    async fn install_state_test_session_at(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+        workspace: &std::path::Path,
+    ) -> String {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(provider))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -16680,7 +17142,7 @@ mod tests {
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(std::env::temp_dir())
+            .workspace_dir(workspace.to_path_buf())
             .agent_alias("test-agent".to_string())
             .build()
             .expect("test agent should build");
@@ -16688,7 +17150,7 @@ mod tests {
         let rpc_session = crate::rpc::session::RpcSession::new(
             agent,
             "test-agent",
-            std::env::temp_dir().to_str().unwrap(),
+            workspace.to_str().unwrap(),
             crate::rpc::types::ChatMode::Chat,
         )
         .with_owner(owner_tui_id.map(str::to_string));
