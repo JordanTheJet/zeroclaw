@@ -42339,9 +42339,15 @@ Done."#;
         // It must reach the QQ arm rather than the dispatcher's reject path.
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = send_channel_message(&config, "qq.qq", "user:OPENID", "test message")
-            .await
-            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let err = send_channel_message(
+            &config,
+            "qq.qq",
+            "user:OPENID",
+            "test message",
+            ChannelSendEnvelope::default(),
+        )
+        .await
+        .expect_err("unconfigured alias should fail after dotted ref resolution");
         let message = format!("{err:#}");
         assert!(
             message.contains("[channels.qq.qq] not configured"),
