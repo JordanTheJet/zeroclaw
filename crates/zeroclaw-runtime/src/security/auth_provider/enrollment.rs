@@ -126,8 +126,15 @@ pub struct Enrollment {
 
 impl Enrollment {
     pub fn new(config: OidcConfig) -> Result<Self> {
+        // No redirects, the rule the verification sibling already applies.
+        // reqwest follows up to ten by default and re-sends the body on 307
+        // and 308, so a redirecting token, device or authorization endpoint
+        // could carry the client secret, the PKCE verifier or the device
+        // code to another origin, in cleartext at that, after discovery had
+        // already checked the transport of the endpoint it was handed.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self { config, http })
     }
@@ -950,6 +957,65 @@ mod tests {
     /// on a routable host would carry the client secret, the PKCE verifier and
     /// the device code in the clear. Every flow has to refuse before the
     /// request is built, which the `expect(0)` mocks pin.
+    /// A redirect is the way around the transport check discovery just ran:
+    /// the endpoint it approved answers 3xx and names somewhere else, and on
+    /// 307 or 308 reqwest re-sends the credential-bearing body there. The
+    /// verification sibling refuses redirects for the same reason, so the
+    /// mocks here pin that the enrollment endpoints really were reached and
+    /// that nothing followed them onward.
+    #[tokio::test]
+    async fn redirects_never_carry_enrollment_credentials_onward() {
+        for status in [302u16, 307, 308] {
+            let server = MockServer::start().await;
+            let sink = MockServer::start().await;
+            let issuer = server.uri();
+            let elsewhere = format!("{}/capture", sink.uri());
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "device_authorization_endpoint": format!("{issuer}/device"),
+                    "token_endpoint": format!("{issuer}/token"),
+                })))
+                .mount(&server)
+                .await;
+            for endpoint in ["/device", "/token"] {
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(
+                        ResponseTemplate::new(status).insert_header("location", &*elsewhere),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(path("/capture"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "followed-the-redirect",
+                })))
+                .expect(0)
+                .mount(&sink)
+                .await;
+
+            let enrollment = Enrollment::new(config(&issuer, Some("s3cret"))).unwrap();
+            assert!(
+                enrollment.device_grant_start().await.is_err(),
+                "device start followed a {status}"
+            );
+            assert!(
+                enrollment.client_credentials().await.is_err(),
+                "client credentials followed a {status}"
+            );
+            assert!(
+                sink.received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty(),
+                "a {status} carried enrollment credentials to another origin"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn discovery_refuses_a_cleartext_token_endpoint() {
         let server = MockServer::start().await;
