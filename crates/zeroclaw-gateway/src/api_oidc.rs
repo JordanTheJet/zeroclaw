@@ -8,7 +8,11 @@
 //!
 //! - `GET  /api/oidc/providers` lists configured aliases.
 //! - `POST /api/oidc/{alias}/device/start` proxies the RFC 8628 start.
-//! - `POST /api/oidc/{alias}/device/poll` proxies one token poll.
+//! - `POST /api/oidc/{alias}/device/poll` proxies one token poll. Its
+//!   statuses are a contract a polling client reads: 403 is the
+//!   authorization server's refusal and ends the flow, while 429 and
+//!   503 (both with `Retry-After`) and 502 are "not now" and are
+//!   retryable for as long as the device code lives.
 //! - `GET  /oidc/login/{alias}` starts Authorization Code + PKCE (302).
 //! - `GET  /oidc/callback` finishes it: the one-time page hands the token
 //!   to `window.opener` via `postMessage` (gateway origin only) with a
@@ -459,13 +463,20 @@ async fn handle_device_poll(
             // The IdP rejected the device code outright: what a caller
             // relaying guesses produces, so it counts as an attempt too.
             relay.attempts.record_attempt(&key);
+            // Not 502: the round trip succeeded and the authorization server
+            // made a decision, so this is a refusal rather than a relay
+            // failure. Sharing a status with the `Err` arm below would leave
+            // a polling client unable to tell "the user said no" from "try
+            // again", and it can only treat one of the two as retryable.
             error_json(
-                StatusCode::BAD_GATEWAY,
+                StatusCode::FORBIDDEN,
                 &format!("device grant failed: {reason}"),
             )
         }
         // A transport or parse failure on the way to the IdP says nothing
-        // about the caller, so it is not billed to them.
+        // about the caller, so it is not billed to them. 502 is reserved for
+        // exactly this: the relay could not complete the round trip, which a
+        // client may retry while the grant is still alive.
         Err(e) => error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
     }
 }
@@ -1395,7 +1406,7 @@ mod tests {
                 &[],
             )
             .await;
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "poll {attempt}");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "poll {attempt}");
         }
         let outbound = requests_to(&server, "/token").await;
         assert_eq!(outbound, MAX_ATTEMPTS as usize);

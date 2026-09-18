@@ -40,6 +40,14 @@ const MAX_POLL_INTERVAL_SECS: u64 = 300;
 /// Per-request timeout for one enrollment call.
 const ENROLL_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many polls in a row the gateway may fail to answer before enrollment
+/// gives up. Each unanswered poll is still followed by at least the RFC 8628
+/// interval floor, so this is roughly half a minute of a saturated or
+/// unreachable gateway: long enough to ride out a daemon restart or a burst
+/// of concurrent enrollments, short enough that a gateway that is simply gone
+/// does not hold the user at the prompt for the whole device-code lifetime.
+const MAX_CONSECUTIVE_UNAVAILABLE: u32 = 6;
+
 #[derive(Clone, Deserialize)]
 pub(crate) struct DeviceStart {
     pub device_code: String,
@@ -193,17 +201,46 @@ impl GatewayEnrollment {
     /// `Retry-After` the gateway named rather than the RFC's five seconds: a
     /// lockout can hold the client off for minutes, and polling through it
     /// only keeps the lockout alive.
+    ///
+    /// A gateway that cannot answer right now — [`is_transient_status`], or no
+    /// answer at all — is likewise not a verdict on the enrollment, so it
+    /// becomes [`DevicePoll::Unavailable`] rather than an error. The user may
+    /// still be approving on the IdP at that moment, and abandoning the flow
+    /// would throw away an approval that is about to land. Only an answer that
+    /// says something about *this* grant, or a body that cannot be read at
+    /// all, ends the flow.
     pub async fn device_poll(&self, alias: &str, device_code: &str) -> Result<DevicePoll> {
-        let response = self
+        let response = match self
             .http
             .post(format!("{}/api/oidc/{alias}/device/poll", self.base))
             .json(&serde_json::json!({ "device_code": device_code }))
             .send()
             .await
-            .context("cannot reach the gateway enrollment API")?;
+        {
+            Ok(response) => response,
+            // A gateway that does not answer at all is the same kind of "not
+            // now" as its own 503: the device code is untouched and the driver
+            // bounds how many of these in a row it will sit through.
+            Err(e) => {
+                return Ok(DevicePoll::Unavailable {
+                    retry_after: None,
+                    reason: format!("cannot reach the gateway enrollment API: {e}"),
+                });
+            }
+        };
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Ok(DevicePoll::SlowDown {
                 retry_after: retry_after_secs(response.headers()),
+            });
+        }
+        if is_transient_status(response.status()) {
+            // Read the header before the body: the body call consumes the
+            // response, and the gateway's capacity refusal carries its
+            // `Retry-After` there.
+            let retry_after = retry_after_secs(response.headers());
+            return Ok(DevicePoll::Unavailable {
+                retry_after,
+                reason: Self::gateway_error(response).await.to_string(),
             });
         }
         if !response.status().is_success() {
@@ -225,6 +262,29 @@ impl GatewayEnrollment {
             other => bail!("unexpected poll status from the gateway: {other}"),
         }
     }
+}
+
+/// The statuses that mean "not now" rather than "no".
+///
+/// The gateway answers 503 with a `Retry-After` when its outbound relay
+/// capacity is saturated, and 502 when the round trip to the IdP could not be
+/// completed. Both can happen while the user is still approving on the IdP,
+/// and both are fixed by asking again with the same device code. 504 is here
+/// for the reverse proxies that front a gateway and time a request out on
+/// their own.
+///
+/// 500 is deliberately absent: the gateway emits it only when a configured
+/// alias cannot be built into an enrollment client, which is a deployment
+/// fault that no amount of retrying will clear. 403 is absent for the opposite
+/// reason — it is the authorization server's refusal of this grant
+/// (`access_denied`, `expired_token`), which is final.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// The `Retry-After` delay in whole seconds, if the header names one.
@@ -254,6 +314,14 @@ pub(crate) enum DevicePoll {
     SlowDown {
         retry_after: Option<u64>,
     },
+    /// The gateway could not answer this poll: it refused for capacity, its
+    /// relay to the IdP failed, or it did not answer at all. The grant is
+    /// untouched, so this is a back-off rather than an outcome. `reason` is
+    /// what the driver reports if the gateway never comes back.
+    Unavailable {
+        retry_after: Option<u64>,
+        reason: String,
+    },
 }
 
 /// The granted variant carries the access token itself, so formatting it would
@@ -265,8 +333,13 @@ impl std::fmt::Debug for DevicePoll {
             Self::Granted(_) => f.write_str("Granted(<redacted>)"),
             Self::Pending => f.write_str("Pending"),
             // The back-off delay is a timing hint, not a secret, and it is
-            // what makes a throttled trace readable.
+            // what makes a throttled trace readable. The same goes for the
+            // gateway's own refusal text, which names nothing about the grant.
             Self::SlowDown { retry_after } => write!(f, "SlowDown({retry_after:?})"),
+            Self::Unavailable {
+                retry_after,
+                reason,
+            } => write!(f, "Unavailable({retry_after:?}, {reason})"),
         }
     }
 }
@@ -287,7 +360,10 @@ fn next_poll_interval(current: u64, minimum: u64, outcome: &DevicePoll) -> u64 {
         DevicePoll::SlowDown { retry_after } => current
             .saturating_add(5)
             .max(retry_after.unwrap_or_default()),
-        DevicePoll::Pending | DevicePoll::Granted(_) => current,
+        // An unavailable gateway is not the IdP saying this client polls too
+        // fast, so it must not lengthen the RFC 8628 cadence; its own wait is
+        // a one-off the driver applies instead.
+        DevicePoll::Pending | DevicePoll::Granted(_) | DevicePoll::Unavailable { .. } => current,
     };
     next.max(minimum)
 }
@@ -327,7 +403,9 @@ fn validate_device_start(start: &DeviceStart) -> Result<()> {
 /// the deadline is re-checked immediately before each call to `poll`, so no
 /// request ever goes out carrying a code that is already dead — a gateway
 /// advertising `expires_in = 1, interval = 60` gets zero polls, not one a
-/// minute late.
+/// minute late. That clipping is what bounds the back-off waits too: a
+/// `Retry-After` longer than the code's remaining life cannot outlive it, so
+/// no delay a gateway names can produce an unbounded or late poll.
 async fn poll_until_granted(
     start: &DeviceStart,
     mut poll: impl AsyncFnMut(&str) -> Result<DevicePoll>,
@@ -338,13 +416,20 @@ async fn poll_until_granted(
     // `0` or `1` would otherwise put this client on a once-a-second poll, well
     // past the gateway's per-client budget and straight into its lockout.
     let minimum = start.interval.max(default_poll_interval());
-    let mut interval = minimum;
+    // Two clocks, deliberately: `cadence` is the RFC 8628 poll interval, which
+    // only `slow_down` lengthens and which nothing else may inflate, while
+    // `wait` is what this iteration sleeps. A busy gateway stretches `wait`
+    // for one round without permanently slowing the flow the user is waiting
+    // on.
+    let mut cadence = minimum;
+    let mut wait = minimum;
+    let mut unanswered = 0u32;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             bail!("the device code expired before approval");
         }
-        tokio::time::sleep(Duration::from_secs(interval).min(remaining)).await;
+        tokio::time::sleep(Duration::from_secs(wait).min(remaining)).await;
         // A wait clipped to the remaining lifetime lands exactly on the
         // deadline, so re-check here rather than at the top of the loop: the
         // code is dead by now and the request must not be sent.
@@ -355,7 +440,31 @@ async fn poll_until_granted(
         if let DevicePoll::Granted(token) = outcome {
             return Ok(token);
         }
-        interval = next_poll_interval(interval, minimum, &outcome);
+        if let DevicePoll::Unavailable {
+            retry_after,
+            reason,
+        } = &outcome
+        {
+            unanswered += 1;
+            // The deadline alone would bound this, but it would spend the
+            // user's whole approval window waiting on a gateway that is gone
+            // and then blame the device code for expiring. Give up while the
+            // reason is still the true one.
+            if unanswered >= MAX_CONSECUTIVE_UNAVAILABLE {
+                bail!(
+                    "the gateway did not answer {MAX_CONSECUTIVE_UNAVAILABLE} enrollment polls \
+                     in a row, most recently: {reason}"
+                );
+            }
+            // Never sooner than the cadence: a gateway that names a shorter
+            // delay than the grant allows cannot talk this client into
+            // polling faster than RFC 8628 permits.
+            wait = retry_after.unwrap_or_default().max(cadence);
+            continue;
+        }
+        unanswered = 0;
+        cadence = next_poll_interval(cadence, minimum, &outcome);
+        wait = cadence;
     }
 }
 
@@ -529,6 +638,13 @@ mod tests {
         assert_eq!(next_poll_interval(60, 60, &DevicePoll::Pending), 60);
         // The advertised minimum is a floor the interval never drops below.
         assert_eq!(next_poll_interval(1, 5, &DevicePoll::Pending), 5);
+        // An unavailable gateway is not a slow_down: it must not lengthen the
+        // cadence the flow returns to once the gateway answers again.
+        let unavailable = DevicePoll::Unavailable {
+            retry_after: Some(300),
+            reason: "busy".into(),
+        };
+        assert_eq!(next_poll_interval(10, 5, &unavailable), 10);
     }
 
     /// A gateway `Retry-After` outranks the RFC increment when it is longer,
@@ -549,12 +665,15 @@ mod tests {
         assert_eq!(next_poll_interval(5, 60, &retry_after(20)), 60);
     }
 
+    /// A refusal of the grant itself ends the flow and says why. The gateway
+    /// answers it with 403, distinct from the 502 it uses when its own relay
+    /// failed, so a retry cannot be mistaken for a rejection or the reverse.
     #[tokio::test]
     async fn gateway_denials_surface_the_error_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/oidc/corp/device/poll"))
-            .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
                 "error": "device grant failed: access_denied (user rejected the request)",
             })))
             .mount(&server)
@@ -562,6 +681,87 @@ mod tests {
         let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
         let err = gateway.device_poll("corp", "dev-1").await.unwrap_err();
         assert!(err.to_string().contains("access_denied"), "{err}");
+    }
+
+    /// The statuses that mean "the gateway could not answer" must not end an
+    /// enrollment the user may be seconds from approving: 503 is the gateway
+    /// refusing for outbound capacity, 502 its relay to the IdP failing, 504 a
+    /// proxy in front of it timing out. A `Retry-After` on any of them is the
+    /// gateway naming when to come back, so it has to survive the mapping.
+    #[tokio::test]
+    async fn transient_gateway_statuses_back_off_instead_of_failing() {
+        let server = MockServer::start().await;
+        for (code, marker) in [(502u16, "relay"), (503, "busy"), (504, "timeout")] {
+            Mock::given(method("POST"))
+                .and(path("/api/oidc/corp/device/poll"))
+                .and(body_string_contains(marker))
+                .respond_with(
+                    ResponseTemplate::new(code)
+                        .insert_header("Retry-After", "7")
+                        .set_body_json(serde_json::json!({ "error": "not now" })),
+                )
+                .mount(&server)
+                .await;
+        }
+        // No `Retry-After` leaves the driver on the cadence it already has.
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/device/poll"))
+            .and(body_string_contains("bare"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "enrollment relay is busy; retry shortly",
+            })))
+            .mount(&server)
+            .await;
+        let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
+        for marker in ["relay", "busy", "timeout"] {
+            let outcome = gateway.device_poll("corp", marker).await.unwrap();
+            let DevicePoll::Unavailable { retry_after, .. } = outcome else {
+                panic!("{marker} should be a back-off, not an outcome: {outcome:?}");
+            };
+            assert_eq!(retry_after, Some(7), "{marker}");
+        }
+        let outcome = gateway.device_poll("corp", "bare").await.unwrap();
+        let DevicePoll::Unavailable {
+            retry_after,
+            reason,
+        } = outcome
+        else {
+            panic!("a bare 503 should be a back-off: {outcome:?}");
+        };
+        assert_eq!(retry_after, None);
+        assert!(reason.contains("busy"), "{reason}");
+    }
+
+    /// 500 is the gateway saying a configured alias cannot be built into an
+    /// enrollment client. Retrying that waits out the device code for a fault
+    /// that will never clear, so it stays fatal.
+    #[tokio::test]
+    async fn a_misconfigured_alias_is_still_fatal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/device/poll"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "oidc provider is misconfigured",
+            })))
+            .mount(&server)
+            .await;
+        let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
+        let err = gateway.device_poll("corp", "dev-1").await.unwrap_err();
+        assert!(err.to_string().contains("misconfigured"), "{err}");
+    }
+
+    /// A gateway that does not answer at all — restarting, or a connection
+    /// dropped mid-approval — is a back-off too, not a verdict on the grant.
+    #[tokio::test]
+    async fn a_transport_failure_backs_off_instead_of_failing() {
+        // Port 1 on loopback: nothing listens, so the connection is refused
+        // before any request is written.
+        let gateway = GatewayEnrollment::new("http://127.0.0.1:1", &ClientTls::default()).unwrap();
+        let outcome = gateway.device_poll("corp", "dev-1").await.unwrap();
+        let DevicePoll::Unavailable { retry_after, .. } = outcome else {
+            panic!("an unreachable gateway should be a back-off: {outcome:?}");
+        };
+        assert_eq!(retry_after, None, "there is no header to read");
     }
 
     #[tokio::test]
@@ -778,6 +978,157 @@ mod tests {
                 "interval {advertised} should be floored at the RFC 8628 default"
             );
         }
+    }
+
+    fn unavailable(retry_after: Option<u64>) -> DevicePoll {
+        DevicePoll::Unavailable {
+            retry_after,
+            reason: "enrollment relay is busy; retry shortly".into(),
+        }
+    }
+
+    /// The defect this pins: a gateway refusing for capacity while the user is
+    /// mid-approval used to end the enrollment. It must back off and still
+    /// collect the token.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_gateway_backs_off_and_the_grant_still_lands() {
+        let start = device_start_fixture(600, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let token = poll_until_granted(&start, async |_code: &str| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(if n < 2 {
+                unavailable(Some(5))
+            } else {
+                DevicePoll::Granted("tok".into())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(calls.get(), 3);
+        // 5s to each of the two refusals and 5s to the grant.
+        assert_eq!(began.elapsed(), Duration::from_secs(15));
+    }
+
+    /// A gateway `Retry-After` is honored for that one round only. Letting it
+    /// become the cadence would let a single busy moment slow every remaining
+    /// poll, delaying the token long after the gateway recovered.
+    #[tokio::test(start_paused = true)]
+    async fn an_unavailable_wait_does_not_become_the_cadence() {
+        let start = device_start_fixture(600, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let token = poll_until_granted(&start, async |_code: &str| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(match n {
+                // The IdP's slow_down does move the cadence: 5 -> 10.
+                0 => DevicePoll::SlowDown { retry_after: None },
+                1 => unavailable(Some(30)),
+                2 => DevicePoll::Pending,
+                _ => DevicePoll::Granted("tok".into()),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(calls.get(), 4);
+        // 5 to the slow_down, 10 to the refusal, the gateway's own 30 to the
+        // pending poll, then back to the 10s cadence rather than 30.
+        assert_eq!(began.elapsed(), Duration::from_secs(55));
+    }
+
+    /// A `Retry-After` shorter than the cadence cannot speed this client up:
+    /// the grant's own interval is the floor either way.
+    #[tokio::test(start_paused = true)]
+    async fn an_unavailable_wait_never_undercuts_the_cadence() {
+        let start = device_start_fixture(600, 30);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let token = poll_until_granted(&start, async |_code: &str| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(if n == 0 {
+                unavailable(Some(1))
+            } else {
+                DevicePoll::Granted("tok".into())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(began.elapsed(), Duration::from_secs(60));
+    }
+
+    /// A gateway that never comes back has to end the enrollment while the
+    /// reason is still the true one, rather than sitting out the whole
+    /// device-code lifetime and reporting an expiry.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_that_never_answers_ends_the_enrollment() {
+        let start = device_start_fixture(600, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let err = poll_until_granted(&start, async |_code: &str| {
+            calls.set(calls.get() + 1);
+            Ok(unavailable(None))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(err.contains("relay is busy"), "{err}");
+        assert_eq!(calls.get(), MAX_CONSECUTIVE_UNAVAILABLE);
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_secs(5 * u64::from(MAX_CONSECUTIVE_UNAVAILABLE)),
+            "the run must end long before the 600s device code does"
+        );
+    }
+
+    /// The bound counts polls in a row, not polls in total: a gateway that
+    /// stumbles and recovers must not use up the allowance over a long flow.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_poll_resets_the_unavailable_bound() {
+        let start = device_start_fixture(600, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let token = poll_until_granted(&start, async |_code: &str| {
+            let n = calls.get();
+            calls.set(n + 1);
+            // Refuse just under the bound, answer once, then refuse again:
+            // a client counting totals would give up on the second run.
+            Ok(match n {
+                _ if n < MAX_CONSECUTIVE_UNAVAILABLE - 1 => unavailable(None),
+                _ if n == MAX_CONSECUTIVE_UNAVAILABLE - 1 => DevicePoll::Pending,
+                _ if n < 2 * MAX_CONSECUTIVE_UNAVAILABLE - 2 => unavailable(None),
+                _ => DevicePoll::Granted("tok".into()),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "tok");
+        assert_eq!(calls.get(), 2 * MAX_CONSECUTIVE_UNAVAILABLE - 1);
+    }
+
+    /// The back-off stays inside the device code's lifetime: a `Retry-After`
+    /// longer than the code outlives it, and the driver fails at the deadline
+    /// rather than sleeping past it or polling with a dead code.
+    #[tokio::test(start_paused = true)]
+    async fn an_unavailable_wait_is_clipped_to_the_remaining_lifetime() {
+        let start = device_start_fixture(100, 5);
+        let calls = std::cell::Cell::new(0u32);
+        let began = tokio::time::Instant::now();
+        let err = poll_until_granted(&start, async |_code: &str| {
+            calls.set(calls.get() + 1);
+            Ok(unavailable(Some(300)))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expired before approval"), "{err}");
+        assert_eq!(calls.get(), 1, "expected exactly one in-lifetime poll");
+        assert_eq!(began.elapsed(), Duration::from_secs(100));
     }
 
     // ── Secret redaction ─────────────────────────────────────────
