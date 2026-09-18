@@ -2325,9 +2325,8 @@ mod tests {
         // caller nothing: billing them would let a user who retries a busy
         // surface lock themselves out of enrollment entirely.
         for _ in 0..PER_CLIENT_FLOW_CAP {
-            assert_eq!(
-                start_login_as(&router, remote()).await.is_empty(),
-                false,
+            assert!(
+                !start_login_as(&router, remote()).await.is_empty(),
                 "a login within the share is served"
             );
         }
