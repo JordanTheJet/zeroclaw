@@ -204,7 +204,10 @@ an attempt when it finds no live flow state, names a mismatched issuer, carries
 an IdP error, carries no authorization code, finds its alias removed, or fails
 its code exchange, while a callback that completes a sign-in, or one the
 gateway turns away because its relay capacity is in use, is booked as nothing
-at all. Provider listings and device polls get a
+at all. That capacity refusal also hands the pending flow back to the store,
+with the deadline it started with rather than a fresh TTL, so the retry its
+`Retry-After` invites can finish the sign-in instead of finding the state
+already consumed. Provider listings and device polls get a
 per-client budget of 20 requests per minute, which sits comfortably above RFC
 8628's five-second minimum polling interval (12 polls per minute) but still
 stops a client from spinning. A poll is booked as an attempt when the IdP

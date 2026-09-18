@@ -135,6 +135,31 @@ impl OidcFlowStore {
         flows.retain(|_, p| p.created.elapsed() < self.ttl);
         flows.remove(state_key)
     }
+
+    /// Put a consumed flow back when the callback holding it was turned
+    /// away for the gateway's own capacity, so the retry its `Retry-After`
+    /// invites still has a flow to finish. Nothing about the flow was
+    /// spent: no code reached the IdP.
+    ///
+    /// The cap is not re-checked. This entry held a slot moments earlier
+    /// and the path that returns it here has no await between the consume
+    /// and this call, so the only way to land above [`FLOW_CAP`] is a login
+    /// that took the freed slot on another worker thread in that window:
+    /// bounded, transient, and still swept by the TTL pass above. Refusing
+    /// the restore instead would drop a live sign-in to keep a soft bound
+    /// exact.
+    ///
+    /// `created` rides back untouched, so a retry inherits what is left of
+    /// the original deadline rather than a fresh TTL; a flow that expired
+    /// while the callback was in the handler is dropped, not revived.
+    fn restore(&self, pending: PendingPkce) {
+        let mut flows = self.flows.lock();
+        flows.retain(|_, p| p.created.elapsed() < self.ttl);
+        if pending.created.elapsed() >= self.ttl {
+            return;
+        }
+        flows.insert(pending.flow.state.clone(), pending);
+    }
 }
 
 /// Everything the enrollment routes need beyond [`AppState`]: the pending
@@ -558,7 +583,8 @@ struct CallbackQuery {
 /// while the callback that completes an enrollment costs nothing. A
 /// callback turned away because every outbound relay slot is taken is not
 /// routed here either: the refusal is the gateway's capacity limit, not a
-/// failure on the caller's side, so it answers with the busy page unbilled.
+/// failure on the caller's side, so it answers with the busy page unbilled
+/// and puts the untouched flow back for the retry it asks for.
 fn unproductive_callback(
     enrollment_state: &OidcEnrollmentState,
     key: &str,
@@ -683,6 +709,13 @@ async fn handle_pkce_callback(
         Err(_) => return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST),
     };
     let Some(_permit) = outbound_permit(&relay) else {
+        // The busy page carries a short `Retry-After`. That invitation is
+        // only honest if the retry can still finish the sign-in: the state
+        // is single-use and this attempt used none of it, so hand the flow
+        // back. Without this the retry finds nothing pending, is billed as
+        // an unproductive callback, and walks the caller toward a lockout
+        // for a refusal the gateway itself issued.
+        relay.flows.restore(pending);
         return relay_busy_page();
     };
     match enrollment.pkce_exchange(&pending.flow, &code).await {
@@ -2095,5 +2128,91 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(body_text(response).await.contains("Sign-in not completed"));
         assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_callback_refused_for_relay_capacity_can_still_be_retried() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-after-retry",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        let flow_state = start_login(&router).await;
+
+        // The browser comes back while every outbound slot is taken.
+        let permits = relay
+            .outbound
+            .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .unwrap();
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert_eq!(requests_to(&server, "/token").await, 0);
+        drop(permits);
+
+        // The retry that `Retry-After` invited finishes the sign-in: the
+        // refusal spent nothing, so it must not have spent the flow.
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_text(response).await;
+        assert!(page.contains("\"at-after-retry\""), "{page}");
+        assert_eq!(requests_to(&server, "/token").await, 1);
+
+        // Single use survives the round trip: the flow is spent now.
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(requests_to(&server, "/token").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_restore_is_not_a_second_chance_at_the_ttl() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+        let flow_state = start_login(&router).await;
+        let pending = relay.flows.consume(&flow_state).expect("flow is pending");
+
+        // A store whose entries are stale on arrival: handing a flow back
+        // is subject to the same deadline as inserting one, so a callback
+        // that waited out the TTL before the relay refused it leaves
+        // nothing behind for a retry to find.
+        let store = OidcFlowStore {
+            flows: parking_lot::Mutex::new(HashMap::new()),
+            ttl: Duration::ZERO,
+        };
+        store.restore(pending);
+        assert!(store.consume(&flow_state).is_none());
     }
 }
