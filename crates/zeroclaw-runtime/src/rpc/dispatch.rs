@@ -14884,7 +14884,7 @@ mod tests {
         let rehydrated = dispatcher
             .rehydrate_reaped_session(current, dispatcher.stamped_grants())
             .await
-            .expect("an unbound dispatcher's rehydration is never refused")
+            .expect("an operator's rehydration is never refused")
             .expect("real RPC rehydration should rebuild the ACP agent");
         let rehydrated_list =
             execute_session_tool_as(&rehydrated, current, "sessions_list", json!({})).await;
