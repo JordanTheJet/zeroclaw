@@ -1166,6 +1166,11 @@ mod tests {
             ("channel-runtime-stop-sent", &[][..], [].as_slice()),
             ("channel-runtime-stop-no-task", &[][..], [].as_slice()),
             (
+                "channel-runtime-stop-folded-followup",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
                 "channel-runtime-model-empty",
                 &[][..],
                 ["/model <model-id>"].as_slice(),

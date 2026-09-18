@@ -893,6 +893,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ 此行太大，无法放
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-stop-folded-followup = 这里没有可停止的内容：这条回复已合并到仍在处理的上一条消息中。请在该会话中发送 /stop 取消。
 channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。

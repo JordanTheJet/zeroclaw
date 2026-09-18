@@ -892,6 +892,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ この行は 1 件の Ma
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
+channel-runtime-stop-folded-followup = ここで停止できるものはありません。この返信は、返信先のまだ処理中のメッセージに統合されました。その会話で /stop を送ってください。
 channel-runtime-conversation-busy = この会話には保留中のメッセージが多すぎるため、このメッセージは破棄されました。返信を待つか、/stop を送信して待機中のリクエストを消去してください。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。

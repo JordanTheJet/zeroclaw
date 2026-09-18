@@ -894,6 +894,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ Esta línea es demasiado
 channel-runtime-new-session = Historial de conversación borrado. Empezando de nuevo.
 channel-runtime-stop-sent = Señal de detención enviada.
 channel-runtime-stop-no-task = No hay una tarea en curso para este ámbito de remitente.
+channel-runtime-stop-folded-followup = Aquí no hay nada que detener: esta respuesta se fusionó con el mensaje anterior al que responde, que aún se está procesando. Envía /stop en esa conversación para cancelarlo.
 channel-runtime-conversation-busy = Esta conversación tiene demasiados mensajes pendientes; este se ha descartado. Espera una respuesta o envía /stop para vaciar tus solicitudes en cola.
 channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/model <model-id>`.
 channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.

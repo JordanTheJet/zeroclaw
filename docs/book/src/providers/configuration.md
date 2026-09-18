@@ -14,7 +14,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `uri`: full endpoint override. Leave unset to use the family's endpoint resolver.
 - `model`: model identifier sent to the provider.
 - `temperature`: optional sampling temperature.
-- `timeout_secs`: HTTP request timeout in seconds.
+- `timeout_secs`: HTTP request timeout in seconds. Setting it above 300 also raises the provider's streaming idle bound (the default 300-second cap on the gap between stream reads) for OpenAI Responses and OpenAI-compatible providers.
 - `max_tokens`: optional response length cap.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
@@ -310,21 +310,7 @@ because Hailo may still be generating after the client disconnects. Confirm the
 backend is idle (restart it if necessary), then restart ZeroClaw to clear the
 quarantine. A connection-establishment failure does not quarantine the endpoint.
 
-For native-backend compatibility, ZeroClaw omits unsupported `think` and
-`num_ctx` wire fields rather than claiming to control them. The native service
-parses each decoded message as structured-prompt JSON a second time, so ZeroClaw
-escapes both literal backslashes and CR/LF/tab controls in the API value to
-preserve their original meaning through that parse. `context_window`
-controls ZeroClaw's best-effort local history budgeting; it is deliberately not
-sent to Hailo-Ollama. Call-level native thinking requests are rejected before
-any backend request. Responses must be a completed non-streaming response
-(`done=true`), and an empty completed response is treated as an error. A low
-`context_window` drops complete older user-anchored turns; the 12-message cap
-uses the same boundary. System instructions are folded into the first retained
-user message before the aggregate context check. If the newest complete turn
-alone then exceeds either budget, the request fails locally before transport
-instead of dropping that turn or substituting a synthetic prompt. Each
-normalized message is bounded to 2,000 Unicode characters.
+For native-backend compatibility, ZeroClaw omits unsupported `think` and `num_ctx` wire fields rather than claiming to control them. The native service parses each decoded message as structured-prompt JSON a second time, so ZeroClaw escapes both literal backslashes and CR/LF/tab controls in the API value to preserve their original meaning through that parse. `context_window` controls ZeroClaw's best-effort local history budgeting. Omit it to avoid a provider-wide context assumption; configure a positive value to enable local budgeting. Explicit zero is rejected by the shared configuration doctor. It is deliberately not sent to Hailo-Ollama. Call-level native thinking requests are rejected before any backend request. Responses must be a completed non-streaming response (`done=true`), and an empty completed response is treated as an error. A low `context_window` drops complete older user-anchored turns using the configured best-effort aggregate budget. System instructions are folded into the first retained user message before that check. When a nonzero `context_window` is configured, if the newest complete turn alone then exceeds the configured budget, the request fails locally before transport instead of dropping that turn or substituting a synthetic prompt. When `context_window` is omitted, no provider-wide local budget is applied. There is no provider-wide character or message-count cap; the native HEF/runtime remains the authority for the actual supported context capacity.
 
 If the native response has no visible content but does contain non-empty
 internal reasoning, the provider uses that field as a last-resort ordinary-text

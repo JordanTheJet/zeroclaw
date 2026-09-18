@@ -21,8 +21,6 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::ToolResultImagePolicy;
 
-/// Maximum silence between body reads for OpenAI-compatible SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
@@ -221,36 +219,76 @@ fn base64url_no_pad(data: &[u8]) -> String {
 /// Apply auth to a request builder (usable from spawned tasks without `&self`).
 /// When `credential` is `None` (e.g. local LLM servers that require no API key),
 /// the request is returned unchanged -- no auth header is added.
-fn apply_auth_to_request(
+///
+/// Within the OpenAI-compatible family builder this is where a stored
+/// credential becomes an outbound header, and the requests built here --
+/// chat, model listing, and context-window discovery
+/// ([`crate::fetch_context_window`]) -- share it. That is what keeps a family
+/// whose credential must be transformed before it is usable
+/// (`AuthStyle::ZhipuJwt` mints a short-lived JWT from the stored `id.secret`)
+/// from having one of those paths transform it while another sends it raw.
+///
+/// Scoped deliberately: providers implemented outside this module (Anthropic,
+/// Gemini, Bedrock, …) authenticate their own way and make no claim here.
+///
+/// Fails closed. `AuthStyle::ZhipuJwt` mints a short-lived JWT from a stored
+/// `id.secret`; when that minting fails the request is *not* built. The
+/// alternative — attaching no `Authorization` header and sending anyway —
+/// produces a request that can only ever be rejected upstream, and reports
+/// the refusal as whatever status the provider happens to return rather than
+/// as the local credential problem it is.
+///
+/// `provider` names the caller for the refusal record. Both the request path
+/// and context-window discovery pass it explicitly rather than relying on an
+/// ambient span, because discovery builds its probe outside any per-provider
+/// span.
+pub(crate) fn apply_auth_to_request(
     req: reqwest::RequestBuilder,
     style: &AuthStyle,
     credential: Option<&str>,
-) -> reqwest::RequestBuilder {
+    provider: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
     let credential = match credential {
         Some(c) => c,
-        None => return req,
+        None => return Ok(req),
     };
-    match style {
+    Ok(match style {
         AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
         AuthStyle::XApiKey => req.header("x-api-key", credential),
         AuthStyle::Custom(header) => req.header(header, credential),
-        AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
-            Ok(val) => req.header("Authorization", val),
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "zhipu_jwt_generation_failed",
-                            "reason": error,
-                        })),
-                    "Zhipu JWT generation failed; omitting authorization header"
-                );
-                req
-            }
-        },
-    }
+        AuthStyle::ZhipuJwt => req.header(
+            "Authorization",
+            zhipu_jwt_bearer_or_refuse(credential, provider)?,
+        ),
+    })
+}
+
+/// Mint the `Authorization` value for [`AuthStyle::ZhipuJwt`], or refuse.
+///
+/// Split out so the refusal is one place: the reason is logged against the
+/// provider that owns the credential and turned into an operator-readable
+/// error whose text is built only from the static failure reason, never from
+/// the credential itself.
+fn zhipu_jwt_bearer_or_refuse(credential: &str, provider: &str) -> anyhow::Result<String> {
+    zhipu_jwt_bearer(credential).map_err(|reason| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": provider,
+                    "auth_style": "zhipu_jwt",
+                    "reason": &reason,
+                    "error_key": "provider_credential_unusable",
+                })),
+            "compatible: stored credential could not be converted into a request token; \
+             refusing to send the request"
+        );
+        anyhow::Error::msg(format!(
+            "{provider}: stored credential cannot be converted into a request token \
+             ({reason}); no request was sent"
+        ))
+    })
 }
 
 fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
@@ -916,8 +954,11 @@ impl OpenAiCompatibleModelProvider {
 
     /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
     /// total timeout kills long-running streams mid-response), but a `read_timeout`
-    /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
-    /// of hanging forever. Streaming paths must use this client instead of http_client().
+    /// idle bound so a silent connection fails fast instead of hanging forever.
+    /// The bound is derived as `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: the 300 s
+    /// floor applies when `timeout_secs` is unset or lower, and a higher
+    /// `timeout_secs` raises the bound to match. Streaming paths must use this
+    /// client instead of http_client().
     fn streaming_http_client(&self) -> Client {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
@@ -955,7 +996,7 @@ impl OpenAiCompatibleModelProvider {
 
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
+                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
                 .default_headers(headers);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
@@ -978,7 +1019,7 @@ impl OpenAiCompatibleModelProvider {
 
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -2082,9 +2123,13 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
 }
 
 /// Convert SSE byte stream to text chunks.
+/// Convert an SSE byte stream into structured chunks. `idle_timeout` is the
+/// streaming client's read-idle bound; it names the bound that fired in
+/// body-read timeout errors, including whether `timeout_secs` can raise it.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -2163,7 +2208,10 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -2185,13 +2233,19 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(response, count_tokens, false)
+    sse_bytes_to_events_for_contract(
+        response,
+        count_tokens,
+        false,
+        super::StreamIdleBound::Fixed(super::STREAM_IDLE_TIMEOUT),
+    )
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2342,7 +2396,10 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -2395,12 +2452,15 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
 }
 
 impl OpenAiCompatibleModelProvider {
+    /// `Err` when the stored credential cannot be turned into a header for
+    /// this provider's [`AuthStyle`]. Callers propagate it rather than send:
+    /// the request would carry no credential at all and be rejected upstream.
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
         credential: Option<&str>,
-    ) -> reqwest::RequestBuilder {
-        apply_auth_to_request(req, &self.auth_header, credential)
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        apply_auth_to_request(req, &self.auth_header, credential, &self.name)
     }
 
     /// OpenCode affinity header value for the calling conversation, or `None`
@@ -3124,7 +3184,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if list_credential.is_some() || self.public_model_listing {
             let url = self.models_url();
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -3215,7 +3275,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if list_credential.is_some() || self.public_model_listing {
             let url = self.models_url();
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -3375,7 +3435,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            ))
+            )?)
             .send()
             .await
         {
@@ -3472,7 +3532,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            ))
+            )?)
             .send()
             .await
         {
@@ -3553,7 +3613,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                ))
+                )?)
                 .send()
                 .await
             {
@@ -3693,7 +3753,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                ))
+                )?)
                 .send()
                 .await
             {
@@ -3915,6 +3975,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3929,8 +3990,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let response = loop {
                 let mut req_builder = client.post(&url).json(&payload);
-                req_builder =
-                    apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+                req_builder = match apply_auth_to_request(
+                    req_builder,
+                    &auth_header,
+                    credential.as_deref(),
+                    &provider.name,
+                ) {
+                    Ok(req_builder) => req_builder,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(error.to_string())))
+                            .await;
+                        return;
+                    }
+                };
                 req_builder = req_builder.header("Accept", "text/event-stream");
                 if let Some(session) = opencode_session.as_deref() {
                     req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
@@ -3940,7 +4013,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                            .send(Err(StreamError::Http(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))))
                             .await;
                         return;
                     }
@@ -3987,6 +4063,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
+                idle_timeout,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -4094,6 +4171,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4108,8 +4186,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
-            // Apply auth header
-            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+            // Apply auth header, or refuse locally if the credential cannot be
+            // turned into one.
+            req_builder = match apply_auth_to_request(
+                req_builder,
+                &auth_header,
+                credential.as_deref(),
+                &provider.name,
+            ) {
+                Ok(req_builder) => req_builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -4122,7 +4214,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -4140,7 +4235,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -4225,6 +4320,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4237,7 +4333,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let mut req_builder = client.post(&url).json(&request);
-            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+            req_builder = match apply_auth_to_request(
+                req_builder,
+                &auth_header,
+                credential.as_deref(),
+                &provider.name,
+            ) {
+                Ok(req_builder) => req_builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             req_builder = req_builder.header("Accept", "text/event-stream");
             if let Some(session) = opencode_session.as_deref() {
                 req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
@@ -4247,7 +4356,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -4263,7 +4375,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -4284,7 +4396,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())
+            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -6344,7 +6456,11 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        let mut stream = sse_bytes_to_chunks(response, false);
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+        );
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -6966,22 +7082,281 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
+    /// Every request that reached the test server, as `(method, path)`.
+    type WireLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// A server that records anything that arrives, on any method and path,
+    /// and answers a well-formed chat completion. Recording everything is the
+    /// point: a test asserting the log is empty then fails if a request
+    /// escapes by a route the test did not anticipate, instead of passing
+    /// because the request 404'd.
+    async fn recording_server() -> (String, WireLog, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let log: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_route = std::sync::Arc::clone(&log);
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let log = std::sync::Arc::clone(&log_for_route);
+                async move {
+                    log.lock()
+                        .expect("wire log poisoned")
+                        .push((method.to_string(), uri.path().to_string()));
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}],
+                        "data": []
+                    }))
+                }
+            });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), log, server)
+    }
+
+    /// A `ZhipuJwt` credential that is not `id.secret` cannot be minted into a
+    /// per-request token, and this provider fails closed rather than falling
+    /// back to sending the stored value as a plain bearer token.
+    ///
+    /// Driven through every entry point on this provider that carries a
+    /// credential, because the fallback lived in the helper they all share.
+    /// Two properties per entry point: the operator gets a local error naming
+    /// the provider, and — the security property — nothing reaches the server,
+    /// so the stored value cannot have left the client in any form.
+    ///
+    /// The local error is also the behaviour change. These paths previously
+    /// sent `Authorization: Bearer <stored value>` and surfaced whatever
+    /// rejection the provider chose to return, which reads as a credential
+    /// problem at the far end rather than a malformed credential here.
+    #[tokio::test]
+    async fn malformed_zhipu_credential_fails_closed_on_every_credential_bearing_path() {
+        const MALFORMED: &str = "no-dot-separator-here";
+
+        let (base_url, wire, server) = recording_server().await;
+        let provider = OpenAiCompatibleModelProvider::builder("zai")
+            .display_name("Z.AI")
+            .base_url(&base_url)
+            .credential(Some(MALFORMED))
+            .auth_style(AuthStyle::ZhipuJwt)
+            .build();
+
+        let history = [ChatMessage::user("hi")];
+        let stream_options = StreamOptions {
+            enabled: true,
+            count_tokens: false,
+        };
+
+        let mut refusals: Vec<(&str, String)> = Vec::new();
+        let mut push = |entry_point: &'static str, err: String| refusals.push((entry_point, err));
+
+        push(
+            "list_models",
+            provider.list_models().await.unwrap_err().to_string(),
+        );
+        push(
+            "list_models_with_pricing",
+            provider
+                .list_models_with_pricing()
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_system",
+            provider
+                .chat_with_system(None, "hi", "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_history",
+            provider
+                .chat_with_history(&history, "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_tools",
+            provider
+                .chat_with_tools(&history, &[], "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat",
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &history,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "m",
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push("warmup", provider.warmup().await.unwrap_err().to_string());
+
+        // The streaming paths build their request inside a spawned task, so the
+        // refusal arrives as the stream's first item rather than as a return
+        // value. It must still be the first item — not an empty stream that
+        // looks like a successful, contentless response.
+        let mut events = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &history,
+                tools: None,
+                thinking: None,
+            },
+            "m",
+            None,
+            stream_options,
+        );
+        push(
+            "stream_chat",
+            match events.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => panic!("stream_chat must yield a refusal first, got {other:?}"),
+            },
+        );
+        drop(events);
+
+        let mut chunks = provider.stream_chat_with_system(None, "hi", "m", None, stream_options);
+        push(
+            "stream_chat_with_system",
+            match chunks.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => {
+                    panic!("stream_chat_with_system must yield a refusal first, got {other:?}")
+                }
+            },
+        );
+        drop(chunks);
+
+        let mut chunks = provider.stream_chat_with_history(&history, "m", None, stream_options);
+        push(
+            "stream_chat_with_history",
+            match chunks.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => {
+                    panic!("stream_chat_with_history must yield a refusal first, got {other:?}")
+                }
+            },
+        );
+        drop(chunks);
+
+        for (entry_point, err) in &refusals {
+            assert!(
+                err.contains("Z.AI"),
+                "{entry_point}: the error must name the provider: {err}"
+            );
+            assert!(
+                err.contains("no request was sent"),
+                "{entry_point}: the error must say the request was refused locally: {err}"
+            );
+            assert!(
+                !err.contains(MALFORMED),
+                "{entry_point}: the error must not quote the stored credential: {err}"
+            );
+        }
+
+        let seen = wire.lock().expect("wire log poisoned").clone();
+        assert!(
+            seen.is_empty(),
+            "no request may leave the client for a credential that cannot be minted: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// The counterpart: a well-formed `id.secret` still reaches the provider,
+    /// so failing closed did not disable Zhipu-auth families outright.
+    #[tokio::test]
+    async fn a_well_formed_zhipu_credential_still_reaches_the_provider() {
+        let (base_url, wire, server) = recording_server().await;
+        let provider = OpenAiCompatibleModelProvider::builder("zai")
+            .display_name("Z.AI")
+            .base_url(&base_url)
+            .credential(Some("keyid.longlivedsecret"))
+            .auth_style(AuthStyle::ZhipuJwt)
+            .build();
+
+        provider
+            .chat_with_system(None, "hi", "m", None)
+            .await
+            .expect("a well-formed id.secret must still be usable");
+
+        let seen = wire.lock().expect("wire log poisoned").clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the well-formed case must still issue its request: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// A credential that cannot be minted refuses the request rather than
+    /// building one. Sending it unauthenticated would leave the operator
+    /// reading whatever 401 the provider returns instead of the local
+    /// credential fault that actually happened.
     #[test]
-    fn invalid_zhipu_credential_is_not_sent_as_raw_bearer_token() {
-        let request = apply_auth_to_request(
+    fn an_unmintable_zhipu_credential_refuses_the_request_instead_of_building_one() {
+        const STORED: &str = "raw-secret-without-required-separator";
+
+        let error = apply_auth_to_request(
             reqwest::Client::new().get("https://example.com"),
             &AuthStyle::ZhipuJwt,
-            Some("raw-secret-without-required-separator"),
+            Some(STORED),
+            "GLM",
         )
-        .build()
-        .unwrap();
+        .expect_err("an unmintable credential must not produce a request builder");
 
+        let message = error.to_string();
         assert!(
-            request
-                .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .is_none()
+            !message.contains(STORED),
+            "the refusal must not quote the credential: {message}"
         );
+        assert!(
+            message.contains("GLM"),
+            "the refusal must name the provider it belongs to: {message}"
+        );
+    }
+
+    /// The three auth styles that pass a credential through untransformed keep
+    /// doing so — fail-closed is scoped to the style that mints.
+    #[test]
+    fn untransformed_auth_styles_still_build_their_request() {
+        for style in [
+            AuthStyle::Bearer,
+            AuthStyle::XApiKey,
+            AuthStyle::Custom("X-Token".to_string()),
+        ] {
+            let request = apply_auth_to_request(
+                reqwest::Client::new().get("https://example.com"),
+                &style,
+                Some("plain-key"),
+                "test",
+            )
+            .expect("a credential needing no transformation always builds")
+            .build()
+            .expect("request should build");
+
+            assert!(
+                request
+                    .headers()
+                    .iter()
+                    .any(|(_, v)| v.to_str().is_ok_and(|v| v.contains("plain-key"))),
+                "expected the credential on the wire for {style:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10513,6 +10888,172 @@ mod tests {
     fn default_timeout_is_120s() {
         let p = make_model_provider("test", "https://example.com", None);
         assert_eq!(p.timeout_secs, 120);
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_names_bound_on_read_timeout() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get(format!("http://{addr}/stream")).send(),
+        )
+        .await
+        .expect("stalled headers must hit the read-idle bound")
+        .unwrap_err();
+        server.abort();
+        assert!(
+            err.is_timeout(),
+            "stalled headers must surface as a timeout: {err}"
+        );
+        assert!(!err.is_connect(), "the connection itself succeeded: {err}");
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
+        );
+        assert!(
+            message.contains(&crate::format_error_chain(&err)),
+            "the underlying reqwest error must stay in the chain: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_leaves_connect_errors_unchanged() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/stream")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect(),
+            "a refused local port is a connect error: {err}"
+        );
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert_eq!(
+            message,
+            crate::format_error_chain(&err),
+            "connect errors must keep the plain error chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_chunk_stream_names_idle_bound_when_body_goes_silent() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // A 1 s read-idle bound gives the header exchange and first chunk a
+        // comfortable window on a slow runner; the silent body still trips it
+        // in about a second, keeping the whole test under ~2 s.
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(std::time::Duration::from_secs(300)),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("first chunk must arrive before the stall")
+            .expect("chunk stream must yield a chunk")
+            .expect("first chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stall must hit the read-idle bound")
+            .expect("stalled chunk stream must yield an item");
+        server.abort();
+        let message = match item {
+            Err(StreamError::Http(message)) => message,
+            Err(other) => panic!("expected an HTTP stream error, got {other:?}"),
+            Ok(_) => panic!("expected an error after the stalled body"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            !message.contains("timeout_secs"),
+            "a fixed idle bound has no knob advice: {message}"
+        );
     }
 
     #[test]
