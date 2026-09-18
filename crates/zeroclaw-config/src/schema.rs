@@ -13727,11 +13727,12 @@ impl OidcConfig {
 #[serde(default)]
 pub struct UserConfig {
     /// Durable principal identifier for this entry; defaults to the entry
-    /// name. Ownership of sessions, memory, approvals, and audit trails
-    /// keys on this id, NOT on the entry name. To rename the entry
-    /// without orphaning its data, set `principal_id` to the original id
-    /// in the same edit. Changing an entry's effective principal id
-    /// creates a new principal that owns nothing.
+    /// name. Audit records key on this id, NOT on the entry name, and
+    /// ownership of sessions, memory, and approvals will key on it once
+    /// principal-owned storage lands. To rename the entry without
+    /// orphaning its data, set `principal_id` to the original id in the
+    /// same edit. Changing an entry's effective principal id creates a
+    /// new principal.
     pub principal_id: Option<String>,
     /// Unix uid accepted for this user over the local socket (peer
     /// credential). Required today: it is the only roster credential the

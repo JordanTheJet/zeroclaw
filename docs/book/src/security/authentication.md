@@ -18,8 +18,11 @@ importantly, what changes for existing remote connections.
    principal id and the permission profiles the configuration assigns it.
    OIDC identities are keyed by validated issuer + subject, local roster
    identities by their durable `[users.<name>]` principal id.
-3. Every RPC method is classified to a required resource-verb grant and
-   refused without it. Fine-grained selectors compose on top:
+3. Every RPC method except the two handshake methods is classified to a
+   required resource-verb grant and refused without it. `initialize`
+   carries the credential itself, and `cert/renew` is authenticated by the
+   mutual-TLS client certificate that presents it, not by a principal.
+   Fine-grained selectors compose on top:
    - config writes check `config_write_paths`;
    - `session/new` and `session/prompt` check the agent selector and hold
      the session's workspace to a directory that agent's policy lets it both
@@ -90,9 +93,10 @@ without a `[users]` roster, so an install with no roster behaves as before
 for the account that runs the daemon.
 
 The operator who runs the daemon owns its config file, and local-only
-lockout recovery depends on that authority. Set `security.trust_daemon_uid`
-to `false` to require every local peer, including the daemon's own uid, to
-map through the roster or present a token.
+lockout recovery depends on that authority. On a Unix socket, set
+`security.trust_daemon_uid` to `false` to require every local peer,
+including the daemon's own uid, to map through the roster or present a
+token. The setting has no effect on a Windows named pipe, described below.
 
 Any **other** uid must be mapped by an explicit `[users.<name>].uid`
 entry. An unmapped uid (root included) that presents no token is denied,
@@ -122,10 +126,13 @@ environment instead.
 
 #### Recovery
 
-There is no remote recovery path. A remote authentication bypass is never
-offered, so every route back from a lockout runs on the host that runs the
-daemon. Which route applies depends on whether the authorization policy
-still compiles.
+A remote authentication bypass is never offered: a remote connection always
+has to present a valid credential. While the authorization policy still
+compiles, a client holding a paired gateway token or an operator-level
+principal can repair a lockout from anywhere. Without such a credential,
+and always in the deny-all state, the route back runs on the host that runs
+the daemon. Which local route applies depends on whether the policy still
+compiles.
 
 **Locked out of a policy that compiles.** Authorization is live and the
 local trusted path is intact on a Unix socket; on Windows, see the named
@@ -157,8 +164,10 @@ its owner and restart. Turn the setting off only where that is acceptable.
 {{#config-fields users}}
 
 The entry name doubles as the durable principal id unless `principal_id`
-pins one explicitly. Ownership of sessions, memory, and audit trails keys
-on that id. To rename an entry without orphaning its data, set
+pins one explicitly. Audit records key on that id today. Sessions, memory,
+and approvals are not keyed on it yet (see
+[What this layer does not do (yet)](#what-this-layer-does-not-do-yet)), but
+they will be, so to rename an entry without orphaning its data later, set
 `principal_id` to the original id in the same edit.
 
 ### OIDC
@@ -238,8 +247,10 @@ Migration for existing remote zerocode users:
    ```
 
    Precedence is `ZEROCLAW_AUTH_TOKEN`, then `auth_token_file`, then
-   `auth_token`. A referenced file that any other account can read is
-   refused rather than used.
+   `auth_token`. On platforms with Unix permission bits, a referenced file
+   that any other account can read is skipped with a warning rather than
+   used, and the next source in that order applies. Elsewhere the file's ACL
+   is the only guard.
 
    The environment variable is the recommended path. When the token is
    kept in the config file instead, zerocode writes that file owner-only
@@ -281,9 +292,12 @@ session belongs to. `session/close`, `session/kill`, `session/configure`,
 and `session/git_branch` act on any session id or pending approval that a
 principal holding the method's grant names, and `session/list` and
 `session/list-acp` list every session. `session/cancel` also compares the
-caller's TUI registration with the session's. Gateway HTTP routes keep
-their existing pairing checks, and channel identities do not resolve into
-this principal model.
+caller's TUI registration with the session's. Memory methods are not
+scoped by principal or agent either. `sops/runs` and `sops/run-detail`
+return the run history of every procedure to a principal holding
+`Sops:Read`, whichever agents it ran as, unlike cron history. Gateway HTTP
+routes keep their existing pairing checks, and channel identities do not
+resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a
