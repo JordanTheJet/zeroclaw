@@ -186,7 +186,8 @@ Client-to-surface mapping:
 Security posture of the API: every route is rate limited through the gateway's
 brute-force limiter, in an instance reserved for enrollment; the PKCE flow
 store follows the `PairingStore` precedent (in-memory, keyed by `state`,
-single-use consume-on-arrival, short TTL, capped size); the device proxy is
+single-use consume-on-arrival, short TTL, capped size, with a per-client
+share of that size so one caller cannot park the whole store); the device proxy is
 stateless (the IdP's `device_code` is the flow handle); the `redirect_uri` used
 at exchange is the one stored at flow start, always derived from the request
 `Host` (there is no configured redirect base; a forwarded proto is honored only
@@ -209,7 +210,9 @@ gateway turns away because its relay capacity is in use, is booked as nothing
 at all. That capacity refusal also hands the pending flow back to the store,
 with the deadline it started with rather than a fresh TTL, so the retry its
 `Retry-After` invites can finish the sign-in instead of finding the state
-already consumed. Provider listings and device polls get a
+already consumed, and a sign-in refused because the store is full or
+because the caller already holds its share of eight flows is booked as
+nothing at all. Provider listings, device polls and sign-in starts get a
 per-client budget of 20 requests per minute, which sits comfortably above RFC
 8628's five-second minimum polling interval (12 polls per minute) but still
 stops a client from spinning. A poll is booked as an attempt when the IdP

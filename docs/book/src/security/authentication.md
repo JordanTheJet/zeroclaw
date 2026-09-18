@@ -154,7 +154,9 @@ authorization code, an alias removed while the flow was in flight, or a
 code exchange that fails. A callback that completes a sign-in costs
 nothing, and neither does one the gateway itself turns away because its
 relay capacity is in use, so a crowd of people signing in at once cannot
-lock their shared address out. Provider listings and device polls carry a
+lock their shared address out. A browser sign-in that is refused because
+the pending-flow store is full costs the caller nothing either, for the
+same reason. Provider listings, device polls and sign-in starts carry a
 per-client budget of 20 requests per minute, which leaves headroom over
 RFC 8628's five-second minimum polling interval (12 polls per minute)
 without letting a client spin. A poll counts as an attempt when the
@@ -169,7 +171,10 @@ five-second increment, before its next poll (still clipped to the device
 code's remaining lifetime), and never polls faster than once every five
 seconds in any case. At most 16 outbound relays to the identity
 provider are in flight at once across all clients, which bounds what the
-gateway will do to the IdP on everyone's behalf. Loopback clients are
+gateway will do to the IdP on everyone's behalf. The pending-flow store
+holds 32 browser sign-ins at once, and one remote client may hold eight of
+them, so a caller that starts sign-ins and never finishes them cannot take
+the store away from everyone else for the ten minutes those flows live. Loopback clients are
 exempt from the per-client budgets, as they are from every other gateway
 auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real

@@ -20,11 +20,12 @@
 //!   authenticating per request with the route-layer headers.
 //!
 //! Because nothing here is authenticated, every route is bounded *before*
-//! it can cause outbound work, by three independent limits held in
+//! it can cause outbound work, by four independent limits held in
 //! `OidcEnrollmentState`: an attempt limiter refuses clients that are
 //! already locked out, a per-client sliding-window budget caps relay
-//! requests per minute, and a process-wide semaphore caps how many IdP
-//! round trips can be in flight at once. Every response from these routes
+//! requests per minute, a process-wide semaphore caps how many IdP round
+//! trips can be in flight at once, and the pending-flow store bounds both
+//! its own size and how much of it one client can hold. Every response from these routes
 //! is `Cache-Control: no-store`: each one carries, or is one step from, a
 //! device code or an access token.
 //!
@@ -57,10 +58,25 @@ use crate::{AppState, SlidingWindowRateLimiter};
 const FLOW_TTL: Duration = Duration::from_secs(600);
 const FLOW_CAP: usize = 32;
 
-/// Refusal when the pending-flow store is full. Raised twice: once before
-/// the IdP round trip that starts a flow, and once on the insert that
-/// follows it, so a burst that passes the first check still cannot push
-/// the store past its cap.
+/// Pending flows one remote client may hold at once. The store is shared,
+/// so a process-wide cap alone lets one caller park every slot for the
+/// whole TTL and refuse browser sign-ins to everyone else, at a request
+/// rate low enough that the attempt limiter never locks it out. A browser
+/// needs one flow, or a few across tabs and retries, so a quarter of the
+/// store bounds one caller while leaving the rest available.
+///
+/// Loopback is exempt on the same terms as the other per-client limits:
+/// those callers are the host's own dashboard and zerocode, they share one
+/// key, and a share would throttle the local surface rather than protect
+/// it. A deployment behind a reverse proxy wants `trust_forwarded_headers`
+/// so its callers are told apart here as well.
+const PER_CLIENT_FLOW_CAP: usize = 8;
+
+/// Refusal when the pending-flow store cannot take another flow, either
+/// because the shared store is full or because this client already holds
+/// its share. Raised twice: once before the IdP round trip that starts a
+/// flow, and once on the insert that follows it, so a burst that passes
+/// the first check still cannot push the store past its caps.
 const FLOW_STORE_FULL: &str = "too many in-flight sign-ins; retry shortly";
 
 /// Relay requests one client may spend per minute across the enrollment
@@ -94,6 +110,9 @@ struct PendingPkce {
     alias: String,
     flow: PkceFlow,
     created: Instant,
+    /// The client this flow was started for, under the same key the
+    /// limiters bill, so one caller's share can be counted.
+    client: String,
 }
 
 /// In-flight PKCE flows keyed by `state`, following the pairing-store
@@ -113,21 +132,31 @@ impl Default for OidcFlowStore {
 }
 
 impl OidcFlowStore {
-    /// Whether a flow started now would have somewhere to land, counting
-    /// only entries still inside the TTL. Checked *before* the IdP round
-    /// trip so a full store refuses without spending an outbound request;
-    /// [`Self::insert`] repeats the check for the flows that start between
-    /// this answer and their own insert.
-    fn has_capacity(&self) -> bool {
+    /// Whether a flow started now by `client` would have somewhere to land,
+    /// counting only entries still inside the TTL. Both the shared cap and
+    /// this client's share are checked *before* the IdP round trip so a
+    /// refusal costs no outbound request; [`Self::insert`] repeats them for
+    /// the flows that start between this answer and their own insert.
+    fn has_capacity(&self, client: &str) -> bool {
         let mut flows = self.flows.lock();
         flows.retain(|_, p| p.created.elapsed() < self.ttl);
-        flows.len() < FLOW_CAP
+        Self::has_room(&flows, client)
+    }
+
+    fn has_room(flows: &HashMap<String, PendingPkce>, client: &str) -> bool {
+        if flows.len() >= FLOW_CAP {
+            return false;
+        }
+        if crate::auth_rate_limit::is_loopback_key(client) {
+            return true;
+        }
+        flows.values().filter(|p| p.client == client).count() < PER_CLIENT_FLOW_CAP
     }
 
     fn insert(&self, pending: PendingPkce) -> Result<(), &'static str> {
         let mut flows = self.flows.lock();
         flows.retain(|_, p| p.created.elapsed() < self.ttl);
-        if flows.len() >= FLOW_CAP {
+        if !Self::has_room(&flows, &pending.client) {
             return Err(FLOW_STORE_FULL);
         }
         flows.insert(pending.flow.state.clone(), pending);
@@ -145,10 +174,11 @@ impl OidcFlowStore {
     /// invites still has a flow to finish. Nothing about the flow was
     /// spent: no code reached the IdP.
     ///
-    /// The cap is not re-checked. This entry held a slot moments earlier
+    /// Neither cap is re-checked. This entry held a slot moments earlier
     /// and the path that returns it here has no await between the consume
-    /// and this call, so the only way to land above [`FLOW_CAP`] is a login
-    /// that took the freed slot on another worker thread in that window:
+    /// and this call, so the only way to land above [`FLOW_CAP`] or a
+    /// client's share is a login that took the freed slot on another worker
+    /// thread in that window:
     /// bounded, transient, and still swept by the TTL pass above. Refusing
     /// the restore instead would drop a live sign-in to keep a soft bound
     /// exact.
@@ -531,7 +561,13 @@ async fn handle_pkce_login(
     headers: HeaderMap,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
-    if let Err(denied) = auth_gate(&relay, &key, true) {
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    // The budget is what bounds this route's request rate now that a
+    // capacity refusal is free: without it a client parked at its share
+    // could ask forever at no cost.
+    if let Err(denied) = budget_gate(&relay, &key) {
         return *denied;
     }
     let enrollment = match enrollment_for(&state, &alias) {
@@ -542,12 +578,16 @@ async fn handle_pkce_login(
         Ok(uri) => uri,
         Err(response) => return *response,
     };
-    // Refuse a full store before the discovery round trip, not after it:
-    // otherwise every login past the cap still costs the gateway an
-    // outbound request to the IdP to produce a flow with nowhere to go.
-    if !relay.flows.has_capacity() {
+    // Refuse before the discovery round trip, not after it: otherwise every
+    // login past a cap still costs the gateway an outbound request to the
+    // IdP to produce a flow with nowhere to go. The refusal is the
+    // gateway's capacity, not a failed authentication, so it is not billed
+    // as an attempt; the login that goes on to commit an outbound round
+    // trip is.
+    if !relay.flows.has_capacity(&key) {
         return too_many_requests(FLOW_STORE_FULL, CAPACITY_RETRY_AFTER_SECS);
     }
+    relay.attempts.record_attempt(&key);
     let flow = {
         let Some(_permit) = outbound_permit(&relay) else {
             return relay_busy();
@@ -562,6 +602,7 @@ async fn handle_pkce_login(
         alias,
         flow,
         created: Instant::now(),
+        client: key,
     }) {
         return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
     }
@@ -811,6 +852,12 @@ mod tests {
     /// A remote caller, which every per-client limit applies to.
     fn remote() -> SocketAddr {
         SocketAddr::from(([203, 0, 113, 7], 40000))
+    }
+
+    /// A second remote caller, for the limits that have to keep one client
+    /// from spending what another one needs.
+    fn other_remote() -> SocketAddr {
+        SocketAddr::from(([198, 51, 100, 9], 40001))
     }
 
     /// The key every limiter bills [`remote`] under: the peer IP, no port.
@@ -2203,6 +2250,105 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(requests_to(&server, "/token").await, 1);
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_park_the_shared_flow_store() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // One caller starts sign-ins and never finishes them. Its share of
+        // the store is all it gets: the flows live for the whole TTL, and
+        // the request rate that parks them is far below the lockout.
+        for round in 0..PER_CLIENT_FLOW_CAP {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/login/corp",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT,
+                "login {round}"
+            );
+        }
+        let response = send_as(
+            &router,
+            remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header_value(&response, "retry-after"), "5");
+        assert!(body_text(response).await.contains("in-flight sign-ins"));
+
+        // Everyone else still gets to sign in, which is the point.
+        let response = send_as(
+            &router,
+            other_remote(),
+            "GET",
+            "/oidc/login/corp",
+            "gw.local",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "another client must not pay for the first one's parked flows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flow_store_refusal_is_not_billed_to_the_caller() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+
+        // Fill this client's share, then keep asking. The refusals are the
+        // gateway's capacity, not failed authentications, so they cost the
+        // caller nothing: billing them would let a user who retries a busy
+        // surface lock themselves out of enrollment entirely.
+        for _ in 0..PER_CLIENT_FLOW_CAP {
+            assert_eq!(
+                start_login_as(&router, remote()).await.is_empty(),
+                false,
+                "a login within the share is served"
+            );
+        }
+        for round in 0..5 {
+            let response = send_as(
+                &router,
+                remote(),
+                "GET",
+                "/oidc/login/corp",
+                "gw.local",
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{round}");
+            assert!(
+                body_text(response).await.contains("in-flight sign-ins"),
+                "refusal {round} must be the capacity one, not a lockout"
+            );
+        }
+        assert!(!relay.attempts.is_locked_out(&remote_key()));
     }
 
     #[tokio::test]
