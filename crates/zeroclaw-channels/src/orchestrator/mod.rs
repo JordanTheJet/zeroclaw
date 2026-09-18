@@ -505,34 +505,92 @@ impl InterruptOnNewMessageConfig {
     }
 }
 
+/// Snapshot whether any alias enables `interrupt_on_new_message` for each
+/// channel type. This preserves the legacy fallback for inbound messages that
+/// do not carry an alias; aliased messages resolve their own live config.
 fn interrupt_on_new_message_config(
     channels: &zeroclaw_config::schema::ChannelsConfig,
 ) -> InterruptOnNewMessageConfig {
     InterruptOnNewMessageConfig {
         telegram: channels
             .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message),
+            .values()
+            .any(|tg| tg.interrupt_on_new_message),
         slack: channels
             .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message),
+            .values()
+            .any(|sl| sl.interrupt_on_new_message),
         discord: channels
             .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message),
+            .values()
+            .any(|dc| dc.interrupt_on_new_message),
         mattermost: channels
             .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message),
+            .values()
+            .any(|mm| mm.interrupt_on_new_message),
         matrix: channels
             .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message),
+            .values()
+            .any(|mx| mx.interrupt_on_new_message),
         whatsapp: channels
             .whatsapp
-            .get("default")
-            .is_some_and(|wa| wa.interrupt_on_new_message),
+            .values()
+            .any(|wa| wa.interrupt_on_new_message),
+    }
+}
+
+fn interrupt_on_new_message_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(alias) = msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    else {
+        return ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
+    };
+
+    match msg.channel.as_str() {
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "slack" => ctx
+            .prompt_config
+            .channels
+            .slack
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "discord" => ctx
+            .prompt_config
+            .channels
+            .discord
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "mattermost" => ctx
+            .prompt_config
+            .channels
+            .mattermost
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "whatsapp" => ctx
+            .prompt_config
+            .channels
+            .whatsapp
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        _ => false,
     }
 }
 
@@ -1530,7 +1588,11 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 /// zeroclaw alias when present, so two bots on the same platform (e.g.
 /// `discord.clamps` + `discord.glados`) never share a keyspace.
 fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    match &msg.channel_alias {
+    match msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    {
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
     }
@@ -9291,9 +9353,7 @@ async fn register_inbound_turn(
         return None;
     }
 
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    let interrupt_enabled = interrupt_on_new_message_enabled(ctx, msg);
     let scope_key = interruption_scope_key(msg);
     // The payload this turn is waiting with lives in its debounce bucket until
     // the window fires. Recording the key here is what lets `/stop` reach that
@@ -26860,12 +26920,38 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
+    async fn message_dispatch_preserves_interrupt_on_new_message_policy_per_whatsapp_alias() {
+        async fn wait_for_provider_call(
+            provider: &DelayedHistoryCaptureModelProvider,
+            marker: &str,
+        ) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let observed = provider
+                        .calls
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .iter()
+                        .any(|call| {
+                            call.iter()
+                                .any(|(role, content)| role == "user" && content.contains(marker))
+                        });
+                    if observed {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for provider call: {marker}"));
+        }
+
         let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
+        channels_by_name.insert("whatsapp.enabled".to_string(), Arc::clone(&channel));
+        channels_by_name.insert("whatsapp.disabled".to_string(), channel);
 
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
@@ -26874,13 +26960,25 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
         channel_config.whatsapp.insert(
-            "default".to_string(),
+            "enabled".to_string(),
             zeroclaw_config::schema::WhatsAppConfig {
                 session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
                 interrupt_on_new_message: true,
                 ..Default::default()
             },
         );
+        channel_config.whatsapp.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-disabled-session.db".into()),
+                interrupt_on_new_message: false,
+                ..Default::default()
+            },
+        );
+        let prompt_config = Arc::new(zeroclaw_config::schema::Config {
+            channels: channel_config.clone(),
+            ..Default::default()
+        });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -26917,7 +27015,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -26954,14 +27052,15 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_provider = Arc::clone(&provider_impl);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
-                content: "first WhatsApp question".to_string(),
+                content: "enabled first".to_string(),
                 channel: "whatsapp".into(),
-                channel_alias: Some("default".to_string()),
+                channel_alias: Some("enabled".to_string()),
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
@@ -26972,14 +27071,14 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            wait_for_provider_call(&send_provider, "enabled first").await;
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
-                content: "second WhatsApp question".to_string(),
+                content: "disabled first".to_string(),
                 channel: "whatsapp".into(),
-                channel_alias: Some("default".to_string()),
+                channel_alias: Some("disabled".to_string()),
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
@@ -26990,33 +27089,110 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
+            wait_for_provider_call(&send_provider, "disabled first").await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-3".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "enabled second".to_string(),
+                channel: "whatsapp".into(),
+                channel_alias: Some("enabled".to_string()),
+                timestamp: 3,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            wait_for_provider_call(&send_provider, "enabled second").await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-4".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "disabled second".to_string(),
+                channel: "whatsapp".into(),
+                channel_alias: Some("disabled".to_string()),
+                timestamp: 4,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            wait_for_provider_call(&send_provider, "disabled second").await;
         });
 
         run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("15555550123:"));
-        assert!(sent_messages[0].contains("response-2"));
-        drop(sent_messages);
+        assert_eq!(sent_messages.len(), 3);
+        assert!(
+            sent_messages
+                .iter()
+                .all(|sent| sent.starts_with("15555550123:"))
+        );
 
         let calls = provider_impl
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        let second_call = &calls[1];
-        assert!(second_call.iter().any(|(role, content)| {
-            role == "user" && content.contains("first WhatsApp question")
-        }));
-        assert!(second_call.iter().any(|(role, content)| {
-            role == "user" && content.contains("second WhatsApp question")
-        }));
+        assert_eq!(calls.len(), 4);
+        let response_for = |marker: &str| {
+            let index = calls
+                .iter()
+                .position(|call| {
+                    call.iter()
+                        .any(|(role, content)| role == "user" && content.contains(marker))
+                })
+                .unwrap_or_else(|| panic!("missing provider call for {marker}"));
+            format!("response-{}", index + 1)
+        };
+        let enabled_first_response = response_for("enabled first");
         assert!(
-            !second_call.iter().any(|(role, _)| role == "assistant"),
+            sent_messages
+                .iter()
+                .all(|sent| !sent.contains(&enabled_first_response)),
+            "the enabled alias's first turn must be cancelled"
+        );
+        for marker in ["disabled first", "enabled second", "disabled second"] {
+            let response = response_for(marker);
+            assert!(
+                sent_messages.iter().any(|sent| sent.contains(&response)),
+                "the {marker} turn must complete"
+            );
+        }
+        let enabled_second_call = calls
+            .iter()
+            .find(|call| {
+                call.iter()
+                    .any(|(role, content)| role == "user" && content.contains("enabled second"))
+            })
+            .expect("enabled alias's second call must be recorded");
+        assert!(
+            enabled_second_call
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("enabled first"))
+        );
+        assert!(
+            enabled_second_call
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("enabled second"))
+        );
+        assert!(
+            !enabled_second_call
+                .iter()
+                .any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
         );
+        drop(calls);
+        drop(sent_messages);
     }
 
     #[tokio::test]
@@ -30087,6 +30263,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(SlowModelProvider {
@@ -30124,7 +30309,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -31844,10 +32029,18 @@ BTC is currently around $65,000 based on latest tool output."#
     ) -> Arc<ChannelRuntimeContext> {
         let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
         hooks.register(Box::new(hook));
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
         let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
-            zeroclaw_config::schema::Config::default(),
+            prompt_config,
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
             Some(Arc::new(hooks)),
@@ -32238,12 +32431,20 @@ BTC is currently around $65,000 based on latest tool output."#
         hooks.register(Box::new(PanicOnceRoomMergeHook {
             panicked: Arc::clone(&panicked),
         }));
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
         let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(10),
             }),
-            zeroclaw_config::schema::Config::default(),
+            prompt_config,
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
             Some(Arc::new(hooks)),
@@ -41652,6 +41853,45 @@ This is an example JSON object for profile settings."#;
         assert!(!cfg.enabled_for_channel("telegram"));
     }
 
+    /// Regression: the alias map is keyed by the operator-chosen section name,
+    /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
+    /// This previously resolved to `false` because the lookup hardcoded the
+    /// literal key `"default"`.
+    #[test]
+    fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    /// A configured alias that leaves the flag off must not opt the channel in.
+    #[test]
+    fn interrupt_on_new_message_config_ignores_non_default_alias_with_flag_off() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: false,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(!cfg.enabled_for_channel("whatsapp"));
+    }
+
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {
@@ -41685,6 +41925,15 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+
+        let empty_alias_msg = zeroclaw_api::channel::ChannelMessage {
+            channel_alias: Some(String::new()),
+            ..msg
+        };
+        assert_eq!(
+            interruption_scope_key(&empty_alias_msg),
+            "matrix_room_alice"
+        );
     }
 
     #[test]
