@@ -474,13 +474,34 @@ async fn poll_until_granted(
 ///
 /// `tls` is the WSS connection's own TLS material, reused for the enrollment
 /// origin so a private-CA or mutual-TLS installation needs no second setting.
+/// Whether this enrollment leg presents a certificate nobody checks.
+///
+/// `validate_enroll_url` has already reduced the origin to `https`, or
+/// `http` on loopback where no certificate is involved at all, so the only
+/// unverified case left is an https origin reached with verification
+/// switched off.
+fn verification_is_disabled(base: &str, tls: &crate::client::ClientTls) -> bool {
+    tls.skip_verify && base.starts_with("https://")
+}
+
 pub(crate) async fn run_device_flow(
     base: &str,
     tls: &crate::client::ClientTls,
     alias: &str,
     on_prompt: impl Fn(&DeviceStart),
+    consent: impl FnOnce(&str) -> Result<()>,
 ) -> Result<String> {
     let gateway = GatewayEnrollment::new(base, tls)?;
+    // The device code goes out on this leg and the access token comes back
+    // on it. If nothing checks the certificate, the operator decides that
+    // before either of them moves, not after the token has already arrived:
+    // the gate lives here rather than at the call site so no caller can
+    // enroll without passing it. `consent` is asked only about an origin
+    // that survived validation, and it is given the normalized origin that
+    // an acknowledgement is recorded under.
+    if verification_is_disabled(&gateway.base, tls) {
+        consent(&gateway.base)?;
+    }
     let start = gateway.device_start(alias).await?;
     // Bounds first: an unusable lifetime or interval must not reach the user
     // as a prompt they would wait on for nothing.
@@ -508,6 +529,124 @@ mod tests {
             expires_in,
             interval,
         }
+    }
+
+    /// A gateway whose certificate nobody checks gets the device code and
+    /// hands back the access token, so the operator is asked first. The
+    /// mock speaks plain HTTP on an `https` origin, so any request that
+    /// escapes the gate dies in the handshake with a transport error
+    /// instead of the refusal this asserts.
+    #[tokio::test]
+    async fn enrollment_asks_before_anything_leaves_on_an_unverified_leg() {
+        let server = MockServer::start().await;
+        let unverified = server.uri().replace("http://", "https://");
+        let tls = ClientTls {
+            skip_verify: true,
+            ..ClientTls::default()
+        };
+        let mut asked_about = None;
+
+        let err = run_device_flow(
+            &unverified,
+            &tls,
+            "corp",
+            |_| panic!("no prompt before consent"),
+            |origin| {
+                asked_about = Some(origin.to_string());
+                bail!("aborted: insecure TLS connection not confirmed")
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not confirmed"), "{err}");
+        assert_eq!(asked_about.as_deref(), Some(unverified.as_str()));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the device code must not leave before the operator answers"
+        );
+    }
+
+    /// The question is about a certificate nobody checks, so a verified
+    /// leg is never asked about one: the enrollment just runs.
+    #[tokio::test]
+    async fn a_verified_enrollment_is_not_asked_about_certificates() {
+        let server = granted_gateway().await;
+        let mut asked = false;
+
+        let token = run_device_flow(
+            &server.uri(),
+            &ClientTls::default(),
+            "corp",
+            |_| {},
+            |_| {
+                asked = true;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(token, "at-enrolled");
+        assert!(!asked, "a verified leg presents nothing to confirm");
+    }
+
+    /// Same for a loopback gateway on plain http, which `skip_verify`
+    /// cannot make less verified than it already is: there is no
+    /// certificate on that leg to warn about.
+    #[tokio::test]
+    async fn a_loopback_enrollment_is_not_asked_about_certificates() {
+        let server = granted_gateway().await;
+        let tls = ClientTls {
+            skip_verify: true,
+            ..ClientTls::default()
+        };
+        let mut asked = false;
+
+        let token = run_device_flow(
+            &server.uri(),
+            &tls,
+            "corp",
+            |_| {},
+            |_| {
+                asked = true;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(token, "at-enrolled");
+        assert!(!asked, "plain http on loopback carries no certificate");
+    }
+
+    /// A gateway that starts a device flow and grants it on the first poll.
+    async fn granted_gateway() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/device/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dev-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://sso.example.com/activate",
+                "expires_in": 600,
+                "interval": 5,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/device/poll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "granted",
+                "token": { "access_token": "at-enrolled", "expires_in": 3600 },
+            })))
+            .mount(&server)
+            .await;
+        server
     }
 
     #[tokio::test]
