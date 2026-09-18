@@ -622,11 +622,14 @@ enum CallbackParse {
 /// dribbles bytes cannot extend its hold on the listener either.
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many connections a single wait services before giving up. A browser
-/// needs one, plus a few if it speculatively preconnects; past this many the
-/// port is being held by something else, and a named failure tells the
-/// operator more than a silent wait until the flow deadline.
-const MAX_CALLBACK_CONNECTIONS: usize = 32;
+/// How many connections may burn that deadline before the wait gives up.
+/// Only a connection that goes silent holds the port; one that answers
+/// promptly costs the wait nothing and must not be able to fail an
+/// enrollment, because localhost port probes are ordinary background noise
+/// on a developer machine. Past this many stalls the port is being held by
+/// something else, and a named failure tells the operator more than a
+/// silent wait until the flow deadline.
+const MAX_STALLED_CALLBACK_CONNECTIONS: usize = 32;
 
 /// The one-shot loopback callback listener (RFC 8252): binds an
 /// ephemeral 127.0.0.1 port, answers exactly one matching callback, and
@@ -660,8 +663,9 @@ impl LoopbackListener {
     /// whose `iss` names another issuer (RFC 9207); everything else (wrong
     /// path, wrong state, unparsable, or never sent) is answered or dropped
     /// and skipped. `timeout` is the outer bound on the whole wait; within
-    /// it each connection gets `CALLBACK_READ_TIMEOUT` and at most
-    /// `MAX_CALLBACK_CONNECTIONS` are served.
+    /// it each connection gets `CALLBACK_READ_TIMEOUT`, and at most
+    /// `MAX_STALLED_CALLBACK_CONNECTIONS` may expire it. A request answered
+    /// promptly never counts against that bound.
     pub async fn wait_for_code(self, flow: &PkceFlow, timeout: Duration) -> Result<String> {
         match tokio::time::timeout(timeout, self.accept_loop(flow)).await {
             Ok(result) => result,
@@ -670,7 +674,8 @@ impl LoopbackListener {
     }
 
     async fn accept_loop(&self, flow: &PkceFlow) -> Result<String> {
-        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+        let mut stalled = 0usize;
+        loop {
             let (mut stream, _) = self.listener.accept().await?;
             // A connection that does not complete a request line in time is
             // closed and costs nothing but its turn: it is not the callback,
@@ -680,8 +685,22 @@ impl LoopbackListener {
                 Self::read_request_target(&mut stream),
             )
             .await;
-            let Ok(Ok(target)) = target else {
-                continue;
+            let target = match target {
+                Ok(Ok(target)) => target,
+                // Only a stall costs the wait real time, so only a stall is
+                // counted. A client that says something and is answered
+                // leaves the listener free for the browser however many of
+                // them arrive, which is what a port probe does.
+                Err(_) => {
+                    stalled += 1;
+                    if stalled >= MAX_STALLED_CALLBACK_CONNECTIONS {
+                        bail!(
+                            "the sign-in callback port was busy with other connections before the browser reached it"
+                        );
+                    }
+                    continue;
+                }
+                Ok(Err(_)) => continue,
             };
             match Self::parse_callback(&target, flow) {
                 CallbackParse::Code(code) => {
@@ -701,9 +720,6 @@ impl LoopbackListener {
                 }
             }
         }
-        bail!(
-            "the sign-in callback port was busy with other connections before the browser reached it"
-        )
     }
 
     async fn read_request_target(stream: &mut tokio::net::TcpStream) -> Result<String> {
@@ -1664,7 +1680,7 @@ mod tests {
         let addr = format!("127.0.0.1:{}", listener.port);
         let flow = flow_for("good-state", "https://idp.example.com");
         let mut held = Vec::new();
-        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+        for _ in 0..MAX_STALLED_CALLBACK_CONNECTIONS {
             held.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
         }
 
@@ -1673,6 +1689,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("callback port was busy"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loopback_listener_serves_the_callback_after_many_ignored_requests() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // A request that is answered promptly never holds the port, so any
+        // number of them may arrive before the browser does: a localhost
+        // port probe is ordinary background noise and must not be able to
+        // fail an enrollment. Every request is queued in full before the
+        // wait starts, so no read blocks and the clock never advances.
+        let listener = LoopbackListener::bind().await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.port);
+        let flow = flow_for("good-state", "https://idp.example.com");
+        let mut probes = Vec::new();
+        for _ in 0..MAX_STALLED_CALLBACK_CONNECTIONS + 8 {
+            let mut probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            probe
+                .write_all(&callback_request("code=evil&state=bad-state"))
+                .await
+                .unwrap();
+            probes.push(probe);
+        }
+        let mut browser = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        browser
+            .write_all(&callback_request(
+                "code=real-code&state=good-state&iss=https%3A%2F%2Fidp.example.com",
+            ))
+            .await
+            .unwrap();
+
+        let code = listener
+            .wait_for_code(&flow, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(code, "real-code");
     }
 
     #[tokio::test]
