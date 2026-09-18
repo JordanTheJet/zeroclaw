@@ -191,7 +191,12 @@ device code and then the access token travel over it, and redirects are
 not followed, so a plaintext hop cannot be introduced after the fact.
 The enrollment connection uses the same `[connection.wss.tls]` trust
 material as the WSS leg: the configured CA, `skip_verify`, and the
-mutual-TLS client certificate. zerocode clips every polling wait to the
+mutual-TLS client certificate. When that material leaves the certificate
+unchecked, zerocode asks before the device code goes out rather than
+after the token has arrived, and it asks about the enrollment origin
+itself, which may not be the daemon the session connects to afterwards.
+Answering `always` records that origin in `skip_verify_routes`; a
+non-interactive run has nobody to ask, so enrollment stops there. zerocode clips every polling wait to the
 device code's remaining lifetime and never polls after it expires, and
 it refuses an advertised lifetime above one hour or a polling interval
 above five minutes rather than sleeping on a hostile answer. An
