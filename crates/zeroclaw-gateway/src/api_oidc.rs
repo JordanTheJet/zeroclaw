@@ -2206,24 +2206,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restore_is_not_a_second_chance_at_the_ttl() {
+    async fn a_restored_flow_keeps_the_deadline_it_started_with() {
         let server = idp().await;
         let relay = Arc::new(OidcEnrollmentState::default());
         let router = routes_with(Arc::clone(&relay)).with_state(crate::api::tests::test_state(
             config_with_alias(&server.uri(), "corp"),
         ));
-        let flow_state = start_login(&router).await;
-        let pending = relay.flows.consume(&flow_state).expect("flow is pending");
 
-        // A store whose entries are stale on arrival: handing a flow back
-        // is subject to the same deadline as inserting one, so a callback
-        // that waited out the TTL before the relay refused it leaves
-        // nothing behind for a retry to find.
-        let store = OidcFlowStore {
-            flows: parking_lot::Mutex::new(HashMap::new()),
-            ttl: Duration::ZERO,
-        };
-        store.restore(pending);
-        assert!(store.consume(&flow_state).is_none());
+        // A flow that has spent almost all of its TTL, handed back the way
+        // a capacity refusal hands one back. The retry inherits what is
+        // left of the original deadline: stamping a fresh `created` here
+        // would let a caller hold a slot indefinitely by bouncing off the
+        // relay cap once per TTL.
+        let nearly_spent = start_login(&router).await;
+        let pending = relay.flows.consume(&nearly_spent).expect("flow pending");
+        let aged = FLOW_TTL - Duration::from_secs(1);
+        relay.flows.restore(PendingPkce {
+            created: Instant::now() - aged,
+            ..pending
+        });
+        let back = relay.flows.consume(&nearly_spent).expect("still live");
+        assert!(
+            back.created.elapsed() >= aged,
+            "the restore must not restart the TTL"
+        );
+
+        // And a flow whose deadline passed while the callback was in the
+        // handler is dropped rather than revived.
+        let expired = start_login(&router).await;
+        let pending = relay.flows.consume(&expired).expect("flow pending");
+        relay.flows.restore(PendingPkce {
+            created: Instant::now() - FLOW_TTL - Duration::from_secs(1),
+            ..pending
+        });
+        assert!(relay.flows.consume(&expired).is_none());
     }
 }
