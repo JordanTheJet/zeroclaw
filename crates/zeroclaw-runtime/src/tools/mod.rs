@@ -36,6 +36,9 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+pub use zeroclaw_tools::a2a_client::{
+    A2aCancelTool, A2aDiscoverTool, A2aGetTaskTool, A2aHttpClient, A2aSendTool,
+};
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -109,8 +112,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
+    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -218,6 +221,20 @@ impl Tool for ArcToolRef {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
+}
+
+/// Serply credential override state for `WebSearchTool`.
+///
+/// `Some(_)` when the config loader applied `ZEROCLAW_web_search__serply_api_key`
+/// (the inner value is the in-memory credential, `None` for a blank override),
+/// so the schema-mirror value wins for this process. `None` when no override is
+/// active, in which case the tool keeps resolving `[web_search] serply_api_key`
+/// from `config.toml` at use time so rotation and removal take effect without a
+/// restart.
+fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
+    root_config
+        .prop_is_env_overridden("web_search.serply_api_key")
+        .then(|| root_config.web_search.serply_api_key.clone())
 }
 
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
@@ -431,6 +448,19 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
                     "Skill tool '{}' shadows built-in tool, skipping",
+                    tool.name()
+                )
+            );
+        } else if policy
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|list| list.is_empty())
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
                     tool.name()
                 )
             );
@@ -735,7 +765,7 @@ fn plugin_egress_policy(
 /// miss the row `zeroclaw plugin install` seeds and deny every destination the
 /// operator granted.
 #[cfg(feature = "plugins-wasm")]
-fn plugin_egress_service(
+pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
@@ -805,7 +835,7 @@ pub(crate) fn plugin_host_services(
     zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
-/// Create full tool registry including memory tools and optional Composio.
+/// Create the full tool registry without an ACP session read view.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -832,10 +862,66 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+) -> AllToolsResult {
+    all_tools_with_runtime_and_acp_sessions(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+    )
+}
+
+/// Create the full tool registry with an optional ACP session read view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_acp_sessions(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1166,6 +1252,80 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
+    // The four a2a_* tools share one client holding the live config handle, so
+    // peer/credential/security resolution happens at call time (no stored peer Vec).
+    if root_config.a2a.client.enabled {
+        let live = live_config
+            .clone()
+            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        // The zeroclaw dir (config file parent) + secrets.encrypt enable
+        // decrypting encrypted peer tokens via the canonical SecretStore,
+        // the same path http_request uses for its auth_secret values.
+        let a2a_zeroclaw_dir = root_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from);
+        // Route cache shared across all a2a_* tools and across tool-set
+        // reassembly: every `process_message` turn and `agent::run` invocation
+        // constructs a fresh A2aHttpClient, but the process-wide shared route
+        // cache survives so a send→poll/cancel lifecycle stays on the endpoint
+        // that created the task. Daemon restart (process exit) naturally
+        // clears it (orphaned routes are stale after a restart).
+        let a2a_route_cache = zeroclaw_tools::a2a_client::shared_a2a_route_cache();
+        match A2aHttpClient::new(
+            live,
+            root_config.a2a.client.request_timeout_secs,
+            a2a_zeroclaw_dir,
+            root_config.secrets.encrypt,
+            a2a_route_cache,
+        ) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                // Read tools (discover/get_task) are NOT wrapped in
+                // RateLimitedTool: ToolOperation::Read is free by policy —
+                // enforce_tool_operation(Read) is a no-op that never records
+                // an action. Wrapping them would charge the Act budget on
+                // every successful network call (RateLimitedTool.record_action
+                // after success), and a post-I/O rate-limit failure could hide
+                // a successful remote result from the agent.
+                tool_arcs.push(Arc::new(A2aDiscoverTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                // Act tools (send/cancel) are NOT wrapped in RateLimitedTool:
+                // they pre-charge the action budget via enforce_tool_operation(Act)
+                // before network I/O. RateLimitedTool would post-charge again,
+                // double-counting — and worse, a budget-exhausted post-charge
+                // returns failure after the remote mutation already succeeded,
+                // which can cause the agent to retry an already-created/canceled
+                // task. The pre-charge in execute() covers both autonomy gating
+                // and rate limiting (record_action fails on budget exhaustion).
+                tool_arcs.push(Arc::new(A2aSendTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(A2aGetTaskTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(A2aCancelTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "a2a_client: failed to construct client, skipping registration of a2a_* tools"
+                );
+            }
+        }
+    }
+
     if web_fetch_config.enabled {
         match WebFetchTool::new(
             security.clone(),
@@ -1238,7 +1398,15 @@ pub fn all_tools_with_runtime(
                 root_config.web_search.timeout_secs,
                 root_config.config_path.clone(),
                 root_config.secrets.encrypt,
-            ),
+            )
+            .with_serply_api_key_override(serply_api_key_override(root_config))
+            // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
+            // memory only. Without handing it over, the tool would reread
+            // `config.toml` and miss an env-only key, or send a stored key
+            // that a blank override was meant to suppress.
+            .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            )),
             security.clone(),
         )));
     }
@@ -1459,13 +1627,34 @@ pub fn all_tools_with_runtime(
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
-        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-            backend.clone(),
-            security.clone(),
-        )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        if let Some(acp_sessions) = acp_sessions {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsListTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::with_acp_sessions(
+                backend.clone(),
+                security.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::with_acp_sessions(
+                backend,
+                security.clone(),
+                acp_sessions,
+            )));
+        } else {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::new(
+                backend.clone(),
+                security.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        }
     }
 
     // LinkedIn integration (config-gated)
@@ -1605,18 +1794,15 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(git_forge_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
-    let channel_room_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    let channel_room_tool = ChannelRoomTool::new(
-        security.clone(),
-        channel_room_handle.as_ref().cloned().unwrap(),
-    );
+    let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
+    let channel_room_tool = ChannelRoomTool::new(security.clone(), channel_room_tool_handle);
     tool_arcs.push(Arc::new(channel_room_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+    let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
+    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
     tool_arcs.push(Arc::new(ask_user_tool));
 
     {
@@ -1629,17 +1815,18 @@ pub fn all_tools_with_runtime(
         };
         tool_arcs.push(Arc::new(SendViaTool::new(
             security.clone(),
-            ask_user_handle.as_ref().cloned().unwrap(),
+            ask_user_tool_handle,
             agent_peer_groups,
         )));
     }
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_tool_handle,
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
@@ -2082,6 +2269,36 @@ mod tests {
         let names: Vec<_> = one.iter().map(|t| t.name().to_string()).collect();
         assert!(names.contains(&"mcp_resources".to_string()));
         assert!(!names.contains(&"mcp_prompts".to_string()));
+    }
+
+    /// The Serply resolver only honours `ZEROCLAW_web_search__serply_api_key`
+    /// if the runtime hands it the loader's override state. Pin the mapping for
+    /// the three states the loader can produce (no override, non-empty
+    /// override, blank override) using the same `set_prop` path the loader
+    /// uses, so a schema-mirror value wins for the process while on-disk
+    /// rotation stays in force when no override is active.
+    #[test]
+    fn serply_api_key_override_mirrors_env_override_state() {
+        let mut cfg = Config::default();
+
+        // No override: the tool keeps resolving the key from config.toml.
+        cfg.web_search.serply_api_key = Some("stored-key".to_string());
+        assert_eq!(serply_api_key_override(&cfg), None);
+
+        // `ZEROCLAW_web_search__serply_api_key=env-key` applied by the loader.
+        cfg.set_prop("web_search.serply_api_key", "env-key")
+            .unwrap();
+        cfg.env_overridden_paths
+            .insert("web_search.serply_api_key".to_string());
+        assert_eq!(
+            serply_api_key_override(&cfg),
+            Some(Some("env-key".to_string()))
+        );
+
+        // A blank override clears the in-memory value but stays overridden, so
+        // the tool must report "not configured" rather than read the disk key.
+        cfg.set_prop("web_search.serply_api_key", "").unwrap();
+        assert_eq!(serply_api_key_override(&cfg), Some(None));
     }
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -4273,6 +4490,64 @@ permissions = ["http_client"]
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
         );
+    }
+
+    #[test]
+    fn a2a_tools_registered_only_when_client_enabled() {
+        // The four a2a_* tools must register ONLY when `[a2a.client] enabled`
+        // is true (default-closed), and be absent otherwise.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let build = |enabled: bool| {
+            let mut cfg = test_config(&tmp);
+            cfg.a2a.client.enabled = enabled;
+            all_tools(
+                Arc::new(cfg.clone()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::clone(&mem),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+            )
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect::<Vec<_>>()
+        };
+
+        let a2a_names = ["a2a_discover", "a2a_send", "a2a_get_task", "a2a_cancel"];
+        let on = build(true);
+        for n in a2a_names {
+            assert!(
+                on.iter().any(|x| x == n),
+                "a2a tool {n} must register when enabled"
+            );
+        }
+        let off = build(false);
+        for n in a2a_names {
+            assert!(
+                !off.iter().any(|x| x == n),
+                "a2a tool {n} must NOT register when [a2a.client] disabled"
+            );
+        }
     }
 
     #[test]

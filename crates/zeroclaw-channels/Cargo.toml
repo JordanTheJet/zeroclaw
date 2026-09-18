@@ -96,8 +96,8 @@ rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
   "tls12",
-] }
-rustls-pki-types = "1.14.0"
+], optional = true }
+rustls-pki-types = { version = "1.14.0", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
@@ -116,11 +116,11 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
   "logging",
   "ring",
   "tls12",
-] }
+], optional = true }
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "connect",
   "rustls-tls-webpki-roots",
-] }
+], optional = true }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
@@ -129,7 +129,7 @@ uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
 hex = "0.4"
 nanohtml2text = "0.2"
 rand = "0.10"
-webpki-roots = "1.0.6"
+webpki-roots = { version = "1.0.6", optional = true }
 
 # WhatsApp Web (optional). Registry releases from oxidezap/whatsapp-rust.
 # Moving from the old fork pin to 0.7.0 includes the upstream protobuf-codegen
@@ -215,10 +215,15 @@ channel-email = [
   "dep:async-imap",
   "dep:lettre",
   "dep:mail-parser",
+  "dep:rustls",
+  "dep:rustls-pki-types",
+  "tls-client",
 ]
+tls-client = ["dep:tokio-rustls", "dep:webpki-roots"]
+ws-transport = ["zeroclaw-config/ws-transport", "dep:tokio-tungstenite"]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:aes", "dep:axum", "dep:cbc", "dep:prost"]
+channel-lark = ["dep:aes", "dep:axum", "dep:cbc", "dep:prost", "ws-transport"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
@@ -240,15 +245,15 @@ whatsapp-web = [
   "image-normalization",
 ]
 # Channels with no optional deps (cfg gate only)
-channel-discord = []
-channel-slack = []
+channel-discord = ["ws-transport"]
+channel-slack = ["ws-transport"]
 channel-signal = []
-channel-mattermost = []
-channel-irc = []
+channel-mattermost = ["ws-transport"]
+channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]
-channel-dingtalk = []
-channel-qq = []
+channel-dingtalk = ["ws-transport"]
+channel-qq = ["ws-transport"]
 channel-bluesky = []
 channel-twitter = []
 channel-reddit = []
@@ -267,7 +272,7 @@ channel-wechat = [
   "dep:qrcode",
 ]
 channel-wecom = []
-channel-wecom-ws = ["dep:aes", "dep:cbc"]
+channel-wecom-ws = ["dep:aes", "dep:cbc", "ws-transport"]
 channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []

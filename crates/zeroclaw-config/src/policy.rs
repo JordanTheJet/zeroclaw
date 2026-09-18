@@ -376,6 +376,10 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Container image for the docker sandbox backend. `None` inherits the
+    /// built-in default; carried here so status surfaces report the image the
+    /// sandbox will actually run rather than assuming the default.
+    pub sandbox_image: Option<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -774,6 +778,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            sandbox_image: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -4545,11 +4550,7 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
-            allowed_tools: if risk_profile.allowed_tools.is_empty() {
-                None
-            } else {
-                Some(risk_profile.allowed_tools.clone())
-            },
+            allowed_tools: risk_profile.effective_allowed_tools(),
             excluded_tools: if risk_profile.excluded_tools.is_empty() {
                 None
             } else {
@@ -4559,6 +4560,7 @@ impl SecurityPolicy {
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
+            sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
@@ -4920,10 +4922,12 @@ mod tests {
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            deny_all_tools: false,
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            sandbox_image: None,
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
@@ -4994,12 +4998,16 @@ mod tests {
     }
 
     #[test]
-    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+    fn from_profiles_legacy_empty_allowed_tools_means_unrestricted() {
         use crate::schema::RiskProfileConfig;
         use std::path::Path;
 
+        // Both an omitted field (Default → empty) and an explicit
+        // `allowed_tools = []` deserialize to the same legacy state and must
+        // map to unrestricted — an empty list is NOT deny-all.
         let risk = RiskProfileConfig {
-            allowed_tools: Vec::new(),
+            allowed_tools: vec![],
+            deny_all_tools: false,
             ..RiskProfileConfig::default()
         };
 
@@ -5007,13 +5015,81 @@ mod tests {
 
         assert!(
             policy.allowed_tools.is_none(),
-            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
-             from allowed_tools = []; both map to no authorization constraint"
+            "legacy empty allowed_tools must map to unrestricted (None)"
         );
         assert!(
             policy.is_tool_allowed("filesystem__write_file"),
-            "empty risk-profile allowed_tools is unrestricted, not deny-all"
+            "legacy empty allowed_tools is unrestricted, not deny-all"
         );
+    }
+
+    #[test]
+    fn from_profiles_deny_all_tools_flag_means_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec![],
+            deny_all_tools: true, // explicit deny-all gate
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools,
+            Some(vec![]),
+            "deny_all_tools = true must map to Some(vec![]) (deny-all), not None (unrestricted)"
+        );
+        assert!(
+            !policy.is_tool_allowed("shell"),
+            "deny_all_tools denies built-in tools"
+        );
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "deny_all_tools also denies MCP-discovered tools — no auto-admit under deny-all"
+        );
+    }
+
+    #[test]
+    fn from_profiles_legacy_none_sentinel_means_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec![
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            ],
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("filesystem__write_file"));
+    }
+
+    #[test]
+    fn from_profiles_nonempty_allowed_tools_preserves_closed_set() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools.as_deref(),
+            Some(&["shell".to_string(), "memory_recall".to_string()][..]),
+            "nonempty allowed_tools preserves the explicit closed set"
+        );
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("memory_recall"));
+        assert!(!policy.is_tool_allowed("file_write"));
     }
 
     #[test]
@@ -7664,15 +7740,21 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -7703,68 +7785,113 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
-        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("ls missing 2>/dev/null"), None);
+        assert_eq!(posix("ls missing 2> /dev/null"), None);
+        assert_eq!(posix("echo hi >/dev/stdout"), None);
+        assert_eq!(posix("echo hi > /dev/stdout"), None);
+        assert_eq!(posix("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix("cat </dev/zero"), None);
+        assert_eq!(posix("cat < /dev/zero"), None);
+        // Bare-argument device classification is host-gated BENEATH the
+        // dialect: the harmless-device carve-out for a bare `/dev/null`
+        // argument exists only on Unix hosts, so pinning Posix does not
+        // unify this case. Assert both arms so the split stays visible.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+        assert_eq!(posix("cat /dev/null"), None);
+        #[cfg(target_os = "windows")]
+        assert_eq!(posix("cat /dev/null"), Some("/dev/null".into()));
+        assert_eq!(posix("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix("cat> /dev/null"), None);
+        assert_eq!(posix("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("echo hi >/etc/passwd"), Some("/etc/passwd".into()));
+        assert_eq!(posix("echo hi > /etc/passwd"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi > /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            posix("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            posix("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            posix("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            posix("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            posix("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            posix("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            posix("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
         );
+        assert_eq!(posix("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>&2"),
+            posix("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// The dialect divergence that broke the host-defaulting tests on Windows,
+    /// pinned as intended behavior: under `cmd.exe` the safe null device is
+    /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
+    /// bare leading-slash redirect target is rooted on the current drive
+    /// rather than being workspace-relative.
+    #[test]
+    fn forbidden_path_argument_windows_cmd_classifies_devices_by_dialect() {
+        let p = unix_forbidden_path_policy();
+        let windows_cmd =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::WindowsCmd);
+
+        // Host-independent dialect facts: the cmd.exe null device is safe,
+        // and a drive-relative form fails closed on every host because it
+        // resolves against a per-drive current directory.
+        assert_eq!(windows_cmd("dir missing 2>nul"), None);
+        assert_eq!(windows_cmd("dir missing 2> nul"), None);
         assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
-            Some("/etc/passwd".into())
+            windows_cmd("type C:relative.txt"),
+            Some("C:relative.txt".into())
         );
+
+        // The `/dev/null` classification under the Windows dialect is
+        // host-gated, not dialect-gated: on a Windows host a bare leading
+        // slash is rooted on the current drive and fails closed, while on
+        // POSIX hosts the Unix device path remains acceptable. Assert both
+        // arms so the split stays visible instead of surprising the next
+        // host-defaulting caller.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            windows_cmd("dir missing 2>/dev/null"),
+            Some("/dev/null".into())
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(windows_cmd("dir missing 2>/dev/null"), None);
     }
 
     // ── Edge cases: path traversal ──────────────────────────
