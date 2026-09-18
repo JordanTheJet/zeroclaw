@@ -836,8 +836,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
+///
+/// Any other read failure is an error, not an empty table: every persist
+/// rebuilds the whole file from this document and publishes it by rename, so
+/// treating an unreadable file as empty would replace the user's config,
+/// its `[connection.wss]` bearer included, with whatever is being saved.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -1493,6 +1502,24 @@ mod tests {
 
     fn read(dir: &Path) -> String {
         std::fs::read_to_string(config_path(dir)).unwrap()
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8, so the read fails for a reason other than absence.
+        let bytes: &[u8] = b"[connection.wss]\nauth_token = \"keep-me\"\n\xff\xfe\n";
+        std::fs::write(config_path(dir.path()), bytes).unwrap();
+
+        assert!(
+            persist_theme(dir.path(), "gruvbox").is_err(),
+            "a persist must not treat an unreadable config as empty"
+        );
+        assert_eq!(
+            std::fs::read(config_path(dir.path())).unwrap(),
+            bytes,
+            "the unreadable config must be left as it was"
+        );
     }
 
     #[test]
