@@ -127,6 +127,8 @@ keychain design lands; re-enroll on expiry.
 | Discovery lacks S256 support | Hard error naming the requirement; no `plain` downgrade |
 | Code exchange non-2xx / unparseable | Abort with the OAuth error body; verifier is single-use, never resent |
 | Listener receives a second request | Ignored; the listener answers one matching request then shuts down |
+| A local process connects and sends nothing (or a partial request line) | Dropped at a short per-connection read deadline; the next connection is served, so the callback is not parked behind it |
+| Connections keep arriving without a callback | Bounded: after a fixed number of connections the wait fails with a named error instead of hanging until the flow deadline |
 | Browser cannot be opened | Print the authorize URL for manual opening; the loopback wait continues (bounded by the flow timeout) |
 | Flow timeout (default: authorize request `expires_in`-equivalent, minutes not hours) | Listener shuts down; nonzero exit |
 

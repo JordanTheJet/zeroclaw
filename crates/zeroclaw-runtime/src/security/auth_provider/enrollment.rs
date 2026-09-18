@@ -617,10 +617,25 @@ enum CallbackParse {
     Ignore,
 }
 
+/// How long one connection has to deliver its request line. The deadline
+/// covers the whole read rather than each `read` call, so a client that
+/// dribbles bytes cannot extend its hold on the listener either.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many connections a single wait services before giving up. A browser
+/// needs one, plus a few if it speculatively preconnects; past this many the
+/// port is being held by something else, and a named failure tells the
+/// operator more than a silent wait until the flow deadline.
+const MAX_CALLBACK_CONNECTIONS: usize = 32;
+
 /// The one-shot loopback callback listener (RFC 8252): binds an
 /// ephemeral 127.0.0.1 port, answers exactly one matching callback, and
 /// shuts down. Requests that do not carry this flow's state get a fixed
 /// page and the wait continues; nothing from any request is echoed back.
+/// Connections are served one at a time, so each gets a short read
+/// deadline: a local process that connects and stays silent is dropped and
+/// the next connection is taken, instead of parking the browser's callback
+/// behind it until the whole flow times out.
 pub struct LoopbackListener {
     listener: tokio::net::TcpListener,
     port: u16,
@@ -643,8 +658,10 @@ impl LoopbackListener {
     /// Wait for the callback carrying `flow`'s state. An IdP `error`
     /// response for the matching state fails the flow, as does a response
     /// whose `iss` names another issuer (RFC 9207); everything else (wrong
-    /// path, wrong state, unparsable) is answered and ignored, bounded by
-    /// `timeout`.
+    /// path, wrong state, unparsable, or never sent) is answered or dropped
+    /// and skipped. `timeout` is the outer bound on the whole wait; within
+    /// it each connection gets `CALLBACK_READ_TIMEOUT` and at most
+    /// `MAX_CALLBACK_CONNECTIONS` are served.
     pub async fn wait_for_code(self, flow: &PkceFlow, timeout: Duration) -> Result<String> {
         match tokio::time::timeout(timeout, self.accept_loop(flow)).await {
             Ok(result) => result,
@@ -653,9 +670,17 @@ impl LoopbackListener {
     }
 
     async fn accept_loop(&self, flow: &PkceFlow) -> Result<String> {
-        loop {
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
             let (mut stream, _) = self.listener.accept().await?;
-            let Ok(target) = Self::read_request_target(&mut stream).await else {
+            // A connection that does not complete a request line in time is
+            // closed and costs nothing but its turn: it is not the callback,
+            // so it does not consume the one-shot and the wait goes on.
+            let target = tokio::time::timeout(
+                CALLBACK_READ_TIMEOUT,
+                Self::read_request_target(&mut stream),
+            )
+            .await;
+            let Ok(Ok(target)) = target else {
                 continue;
             };
             match Self::parse_callback(&target, flow) {
@@ -676,6 +701,9 @@ impl LoopbackListener {
                 }
             }
         }
+        bail!(
+            "the sign-in callback port was busy with other connections before the browser reached it"
+        )
     }
 
     async fn read_request_target(stream: &mut tokio::net::TcpStream) -> Result<String> {
@@ -1588,6 +1616,63 @@ mod tests {
         };
         let (code, ()) = tokio::join!(wait, drive);
         assert_eq!(code.unwrap(), "real-code");
+    }
+
+    /// A raw callback request, so a test can queue one without a client that
+    /// keeps its own connection pool and timers.
+    fn callback_request(query: &str) -> Vec<u8> {
+        format!("GET /callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").into_bytes()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loopback_listener_skips_a_connection_that_never_sends_a_request() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // The stalled connections are queued before the listener starts
+        // accepting, so they are served first: each must be dropped at the
+        // read deadline instead of holding the browser's callback behind it
+        // for the whole flow timeout. One says nothing at all, the other
+        // dribbles a partial request line and stops. The clock is paused, so
+        // the skips cost the test no wall time.
+        let listener = LoopbackListener::bind().await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.port);
+        let flow = flow_for("good-state", "https://idp.example.com");
+        let _silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut partial = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        partial.write_all(b"GET /callb").await.unwrap();
+        let mut browser = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        browser
+            .write_all(&callback_request(
+                "code=real-code&state=good-state&iss=https%3A%2F%2Fidp.example.com",
+            ))
+            .await
+            .unwrap();
+
+        let code = listener
+            .wait_for_code(&flow, Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert_eq!(code, "real-code");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loopback_listener_gives_up_after_too_many_silent_connections() {
+        // The skip is bounded: a local process that keeps the port busy ends
+        // the wait with a named failure rather than an unexplained one at the
+        // flow deadline.
+        let listener = LoopbackListener::bind().await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.port);
+        let flow = flow_for("good-state", "https://idp.example.com");
+        let mut held = Vec::new();
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+        }
+
+        let err = listener
+            .wait_for_code(&flow, Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("callback port was busy"), "{err}");
     }
 
     #[tokio::test]
