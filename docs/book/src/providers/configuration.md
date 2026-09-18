@@ -14,7 +14,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `uri`: full endpoint override. Leave unset to use the family's endpoint resolver.
 - `model`: model identifier sent to the provider.
 - `temperature`: optional sampling temperature.
-- `timeout_secs`: HTTP request timeout in seconds.
+- `timeout_secs`: HTTP request timeout in seconds. Setting it above 300 also raises the provider's streaming idle bound (the default 300-second cap on the gap between stream reads) for OpenAI Responses and OpenAI-compatible providers.
 - `max_tokens`: optional response length cap.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
@@ -22,6 +22,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
+- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -138,6 +139,90 @@ The setting requires an Anthropic account enrolled in the
 request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior.
 
+## Prompt cache passthrough (chat-completions gateways)
+
+`cache_passthrough = true` on a chat-completions provider alias opts its
+requests into Anthropic prompt caching. Use it on gateways that translate
+Chat Completions into the Anthropic Messages API (LiteLLM, TrueFoundry,
+and similar); the native Anthropic family already caches by default and
+ignores this field.
+
+Before reaching for this flag, check whether the gateway also exposes an
+Anthropic Messages endpoint. If it does, point a
+`[providers.models.anthropic.<alias>]` entry at it with `uri` and skip the
+passthrough entirely; the native provider places its own breakpoints.
+`cache_passthrough` is for gateways that offer only the Chat Completions
+surface.
+
+With the flag on, requests gain at most two `cache_control` breakpoints:
+one on the system prompt, and one rolling breakpoint on the last message
+once the conversation has more than one non-system message, the same gate
+the native Anthropic provider applies. On a message that ends with an
+image, the rolling breakpoint sits on the message's last text block; the
+image is covered by the following turn. With
+`merge_system_into_user` the system role never reaches the wire, so the
+merged first user message (or the synthetic user carrying the system text)
+carries the system-equivalent breakpoint instead. Only breakpoint-carrying
+messages change serialization.
+
+The flag also scopes to the structured request paths: agent turns, tool
+calls, and structured streaming. The text-only helpers (`chat_with_system`,
+`chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
+breakpoints even with the flag on, because their responses drop token usage
+entirely; a premium cache write they triggered could never show up in
+accounting. On those helpers the flag is inert, which also means fallback
+re-entries that route through them send unmarked requests. With the flag
+off (the default), request bodies are byte-identical to previous versions.
+
+```toml
+[providers.models.custom.claude-via-gateway]
+uri = "https://<gateway-host>/v1"
+model = "<anthropic-routed model>"
+api_key = "op://platform/gateway/api-key"
+cache_passthrough = true
+```
+
+Requirements and caveats:
+
+- **Gateway support is required.** The breakpoint reaches Anthropic only
+  when the gateway forwards block-form content with `cache_control` into
+  the native Messages API. Routes that proxy the OpenAI API proper ignore
+  the field. A non-Anthropic-routed model behind the same gateway does not
+  fail loudly: the field is accepted and dropped, and the gateway may still
+  meter cache-write tokens on that route in its own usage accounting. Give
+  Anthropic-routed models a dedicated alias instead of enabling the flag on
+  a mixed entry.
+- **Size and TTL.** Anthropic caches only prefixes of at least 1024 tokens
+  (2048 on some smaller models), and entries expire after roughly five
+  minutes, refreshed on each read. Short or infrequent conversations see
+  no benefit.
+- **Writes bill at a premium.** Tokens written to the cache are billed at
+  a premium (1.25x on the observed route) and reads come back at a large
+  discount. A route that writes the cache on every request without ever
+  reading it costs more than no caching at all.
+- **Qualify the exact route first.** A gateway exposes many model aliases
+  to the same upstream account, and an alias that accepts and bills cache
+  writes can still never serve cache reads. Before relying on the flag in
+  production, send one flagged request and check the usage reports
+  `cache_creation_input_tokens > 0`; then immediately repeat the
+  byte-identical request and check for `cache_read_input_tokens > 0`.
+  Cache creation alone is not evidence that caching works. Re-run the pair
+  after any model-alias or gateway-route change.
+- **Usage reporting.** When the gateway forwards the Anthropic-shaped
+  usage counters, `cache_read_input_tokens` fills the cached-input figure
+  in token usage and cost reporting, and `cache_creation_input_tokens` is
+  written to the debug log with counts only. A response that reports zero
+  cache reads keeps the cached figure at zero rather than substituting the
+  OpenAI-shaped counter. This accounting covers the structured paths only,
+  which is exactly why the helpers without usage capture stay inert above.
+- **Tool definitions are not separately marked.** The native Anthropic
+  provider additionally marks the last tool definition, which covers
+  tool-schema tokens when no system prompt exists. This flag does not mark
+  tool definitions; requests with tools but no system prompt cache only the
+  rolling message breakpoint. The live gateway qualification showed that
+  with a system prompt present, tool-schema tokens sit inside the cached
+  prefix anyway.
+
 ## Image input limits
 
 `[multimodal]` bounds every image that enters the request pipeline, whatever its
@@ -225,21 +310,7 @@ because Hailo may still be generating after the client disconnects. Confirm the
 backend is idle (restart it if necessary), then restart ZeroClaw to clear the
 quarantine. A connection-establishment failure does not quarantine the endpoint.
 
-For native-backend compatibility, ZeroClaw omits unsupported `think` and
-`num_ctx` wire fields rather than claiming to control them. The native service
-parses each decoded message as structured-prompt JSON a second time, so ZeroClaw
-escapes both literal backslashes and CR/LF/tab controls in the API value to
-preserve their original meaning through that parse. `context_window`
-controls ZeroClaw's best-effort local history budgeting; it is deliberately not
-sent to Hailo-Ollama. Call-level native thinking requests are rejected before
-any backend request. Responses must be a completed non-streaming response
-(`done=true`), and an empty completed response is treated as an error. A low
-`context_window` drops complete older user-anchored turns; the 12-message cap
-uses the same boundary. System instructions are folded into the first retained
-user message before the aggregate context check. If the newest complete turn
-alone then exceeds either budget, the request fails locally before transport
-instead of dropping that turn or substituting a synthetic prompt. Each
-normalized message is bounded to 2,000 Unicode characters.
+For native-backend compatibility, ZeroClaw omits unsupported `think` and `num_ctx` wire fields rather than claiming to control them. The native service parses each decoded message as structured-prompt JSON a second time, so ZeroClaw escapes both literal backslashes and CR/LF/tab controls in the API value to preserve their original meaning through that parse. `context_window` controls ZeroClaw's best-effort local history budgeting. Omit it to avoid a provider-wide context assumption; configure a positive value to enable local budgeting. Explicit zero is rejected by the shared configuration doctor. It is deliberately not sent to Hailo-Ollama. Call-level native thinking requests are rejected before any backend request. Responses must be a completed non-streaming response (`done=true`), and an empty completed response is treated as an error. A low `context_window` drops complete older user-anchored turns using the configured best-effort aggregate budget. System instructions are folded into the first retained user message before that check. When a nonzero `context_window` is configured, if the newest complete turn alone then exceeds the configured budget, the request fails locally before transport instead of dropping that turn or substituting a synthetic prompt. When `context_window` is omitted, no provider-wide local budget is applied. There is no provider-wide character or message-count cap; the native HEF/runtime remains the authority for the actual supported context capacity.
 
 If the native response has no visible content but does contain non-empty
 internal reasoning, the provider uses that field as a last-resort ordinary-text
