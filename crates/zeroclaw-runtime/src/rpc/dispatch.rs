@@ -3595,9 +3595,18 @@ impl RpcDispatcher {
     ///
     /// Holds `config_write_lock` from the first staged entry through the
     /// swap, so no concurrent config writer can interleave with the batch.
-    /// `config/set` has no per-path write check today; if one is added, it
-    /// must run here for every entry before the first is staged, so a batch
-    /// never permits a write the caller could not make one entry at a time.
+    ///
+    /// `config/set` has no per-path write check today. When one is added it
+    /// must run here for every entry, so a batch never permits a write the
+    /// caller could not make one entry at a time. Two properties matter and
+    /// only the first is obvious:
+    ///
+    /// 1. Every entry is checked before the first is staged, so a refused
+    ///    path cannot ride along with permitted ones.
+    /// 2. The check runs (or is repeated) *after* `config_write_lock` is
+    ///    acquired. A batch can wait arbitrarily long on that lock, and a
+    ///    grant narrowed or revoked while it waits must refuse it; a check
+    ///    performed only before the wait decides on stale authority.
     ///
     /// The batch is capped at [`Self::CONFIG_SET_MANY_MAX_ENTRIES`]: every
     /// entry re-walks `prop_fields()` on the working copy (it must, because
