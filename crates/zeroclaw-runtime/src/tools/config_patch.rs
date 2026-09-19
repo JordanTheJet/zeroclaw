@@ -19,28 +19,75 @@
 //!   approval prompt. What the operator sees is computed by the host from
 //!   the ops themselves.
 
-use std::path::PathBuf;
-
-use async_trait::async_trait;
-
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use async_trait::async_trait;
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+use zeroclaw_api::tool::{
+    APPROVAL_EXECUTION_BINDING_ARG, Tool, ToolApprovalSummary, ToolOutput, ToolResult,
+};
 use zeroclaw_config::api_error::ConfigApiError;
 use zeroclaw_config::patch::{
     PatchOp, apply_patch_ops, json_pointer_to_dotted, lookup_prop_field, parse_patch_ops,
 };
-use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_config::schema::Config;
+
+const PREVIEW_BINDING_VERSION: u8 = 1;
+const PREVIEW_BINDING_PAYLOAD_LEN: usize = 1 + 16 + 32 + 32;
+const PREVIEW_BINDING_LEN: usize = PREVIEW_BINDING_PAYLOAD_LEN + 32;
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+struct ApprovalPreview {
+    text: String,
+    ops_digest: [u8; 32],
+    base_digest: [u8; 32],
+}
+
+enum PreviewBindingError {
+    Invalid,
+    OperationsChanged,
+    ConfigChanged,
+}
 
 pub struct ConfigPatchTool {
     config_path: PathBuf,
+    security: Arc<SecurityPolicy>,
+    /// Per-tool random key authenticating opaque preview bindings. The key is
+    /// process-local and never leaves the tool; each binding also carries a
+    /// fresh random nonce, exact ops digest, and exact base-config digest.
+    preview_binding_key: [u8; 32],
 }
 
 impl ConfigPatchTool {
-    pub fn new(config_path: PathBuf) -> Self {
-        Self { config_path }
+    pub fn new(config_path: PathBuf, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            config_path,
+            security,
+            preview_binding_key: rand::random(),
+        }
+    }
+
+    fn valid_argument_fields(args: &serde_json::Value) -> bool {
+        args.as_object().is_some_and(|args| {
+            args.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "ops" | "approved" | APPROVAL_EXECUTION_BINDING_ARG
+                )
+            })
+        })
     }
 
     /// One human-readable line for a structured patch error. Same rendering
@@ -84,6 +131,21 @@ impl ConfigPatchTool {
     /// against both the current and the patched config so a value written
     /// to a *newly created* secret path (dynamic per-alias credentials)
     /// is masked too.
+    /// Render a value for the operator prompt: bounded, but with the
+    /// truncation made explicit (character count) rather than a silent `...`
+    /// that could hide a security-relevant suffix. `s` is expected to already
+    /// be in a display-safe form (JSON text or a `{:?}`-escaped string).
+    fn bounded_display(s: &str) -> String {
+        const CAP: usize = 160;
+        let count = s.chars().count();
+        if count > CAP {
+            let head: String = s.chars().take(CAP).collect();
+            format!("{head} … ({count} chars total, truncated)")
+        } else {
+            s.to_string()
+        }
+    }
+
     fn render_op(op: &PatchOp, before: &Config, after: &Config) -> String {
         let dotted = json_pointer_to_dotted(&op.path);
         let sensitive = [before, after].iter().any(|cfg| {
@@ -91,26 +153,178 @@ impl ConfigPatchTool {
                 .map(|info| info.is_secret || info.derived_from_secret)
                 .unwrap_or(false)
         });
-        match op.op.as_str() {
+        let dotted = Self::bounded_display(&format!("{dotted:?}"));
+        let mut line = match op.op.as_str() {
             "add" | "replace" | "test" => {
                 let value = if sensitive {
                     "[redacted]".to_string()
                 } else {
+                    // JSON form is already escaped and unambiguous (strings
+                    // quoted, control chars encoded); bound it with an explicit
+                    // truncation marker.
                     let raw = op
                         .value
                         .as_ref()
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "null".to_string());
-                    if raw.chars().count() > 80 {
-                        let head: String = raw.chars().take(77).collect();
-                        format!("{head}...")
-                    } else {
-                        raw
-                    }
+                    Self::bounded_display(&raw)
                 };
                 format!("  {:<8} {dotted} = {value}", op.op)
             }
             _ => format!("  {:<8} {dotted}", op.op),
+        };
+        // Comments are model-authored bytes that get written to `config.toml`.
+        // The operator must see them or the "no self-narration" guarantee is
+        // hollow. Escape via `{:?}` so a newline or control char cannot forge
+        // additional prompt lines.
+        if let Some(comment) = &op.comment {
+            let _ = write!(
+                line,
+                "  # comment: {}",
+                Self::bounded_display(&format!("{comment:?}"))
+            );
+        }
+        line
+    }
+
+    fn build_approval_preview(&self, args: &serde_json::Value) -> Option<ApprovalPreview> {
+        if !Self::valid_argument_fields(args) {
+            return None;
+        }
+        let ops_value = args.get("ops")?;
+        let ops = parse_patch_ops(ops_value.clone()).ok()?;
+        let raw = std::fs::read_to_string(&self.config_path).ok()?;
+        let mut before: Config = toml::from_str(&raw).ok()?;
+        before.config_path = self.config_path.clone();
+        let mut after = before.clone();
+        apply_patch_ops(&mut after, &ops).ok()?;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "apply {} change(s) to config.toml:", ops.len());
+        for op in &ops {
+            let _ = writeln!(out, "{}", Self::render_op(op, &before, &after));
+        }
+
+        // Per-agent resolved-policy delta. Resolving per agent (not per
+        // edited path) catches indirect changes too: editing a shared
+        // `risk-profiles.*` entry re-renders every agent that references it.
+        let aliases: BTreeSet<&String> = before.agents.keys().chain(after.agents.keys()).collect();
+        let mut delta = String::new();
+        for alias in aliases {
+            let was = before
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&before, alias));
+            let now = after
+                .agents
+                .contains_key(alias.as_str())
+                .then(|| Self::policy_summary_for(&after, alias));
+            if was == now {
+                continue;
+            }
+            let _ = writeln!(
+                delta,
+                "  agent {}:",
+                Self::bounded_display(&format!("{alias:?}"))
+            );
+            let _ = writeln!(
+                delta,
+                "    before: {:?}",
+                was.as_deref()
+                    .unwrap_or("(agent does not exist)")
+                    .trim_end()
+            );
+            let _ = writeln!(
+                delta,
+                "    after: {:?}",
+                now.as_deref().unwrap_or("(agent is removed)").trim_end()
+            );
+        }
+        if !delta.is_empty() {
+            let _ = writeln!(out, "\npermission changes if approved:");
+            out.push_str(&delta);
+        }
+        out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
+
+        // Refuse a preview that cannot be displayed as a bounded operator prompt.
+        if out.len() > 32 * 1024 {
+            return None;
+        }
+        Some(ApprovalPreview {
+            text: out,
+            ops_digest: sha256(&serde_json::to_vec(ops_value).ok()?),
+            base_digest: sha256(raw.as_bytes()),
+        })
+    }
+
+    fn sign_preview_binding(&self, preview: &ApprovalPreview) -> String {
+        let mut payload = Vec::with_capacity(PREVIEW_BINDING_LEN);
+        payload.push(PREVIEW_BINDING_VERSION);
+        payload.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        payload.extend_from_slice(&preview.ops_digest);
+        payload.extend_from_slice(&preview.base_digest);
+
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.preview_binding_key)
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(&payload);
+        payload.extend_from_slice(&mac.finalize().into_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    }
+
+    fn verify_preview_binding(
+        &self,
+        args: &serde_json::Value,
+        raw_config: &str,
+    ) -> Result<(), PreviewBindingError> {
+        let encoded = args
+            .get(APPROVAL_EXECUTION_BINDING_ARG)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PreviewBindingError::Invalid)?;
+        let binding = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| PreviewBindingError::Invalid)?;
+        if binding.len() != PREVIEW_BINDING_LEN || binding.first() != Some(&PREVIEW_BINDING_VERSION)
+        {
+            return Err(PreviewBindingError::Invalid);
+        }
+        let (payload, tag) = binding.split_at(PREVIEW_BINDING_PAYLOAD_LEN);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.preview_binding_key)
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| PreviewBindingError::Invalid)?;
+
+        let ops = serde_json::to_vec(
+            args.get("ops")
+                .ok_or(PreviewBindingError::OperationsChanged)?,
+        )
+        .map_err(|_| PreviewBindingError::OperationsChanged)?;
+        if payload[17..49] != sha256(&ops) {
+            return Err(PreviewBindingError::OperationsChanged);
+        }
+        if payload[49..81] != sha256(raw_config.as_bytes()) {
+            return Err(PreviewBindingError::ConfigChanged);
+        }
+        Ok(())
+    }
+
+    fn preview_binding_refusal(error: PreviewBindingError) -> ToolResult {
+        let message = match error {
+            PreviewBindingError::ConfigChanged => {
+                "configuration changed since the approval preview was shown; the \
+                 requested change was not applied. Re-run so the operator can review \
+                 it against the current configuration."
+            }
+            PreviewBindingError::Invalid | PreviewBindingError::OperationsChanged => {
+                "the host approval preview binding is missing, invalid, or belongs to \
+                 different operations; the requested change was not applied. Re-run so \
+                 the operator can review it again."
+            }
+        };
+        ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(message.to_string()),
         }
     }
 }
@@ -134,12 +348,14 @@ impl Tool for ConfigPatchTool {
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "ops": {
                     "type": "array",
                     "description": "JSON Patch operations over config properties",
                     "items": {
                         "type": "object",
+                        "additionalProperties": false,
                         "properties": {
                             "op": {
                                 "type": "string",
@@ -172,71 +388,76 @@ impl Tool for ConfigPatchTool {
         true
     }
 
+    /// The operator prompt is the secret-aware per-call approval summary, and
+    /// there is no safe fallback: the raw arguments carry secret values that
+    /// the generic summary would leak. If the summary cannot be produced the
+    /// gate refuses instead of showing the arguments verbatim.
+    fn requires_host_approval_summary(&self) -> bool {
+        true
+    }
+
+    /// Mask every op `value` (and `comment`) before the arguments reach any
+    /// log, audit, observer, or client sink. A patch value may be a bare
+    /// secret written to a config secret path — the generic scrubber does not
+    /// recognize it because it sits under the innocuous `value` key — so this
+    /// redacts at the source. Pure and infallible: it never reads config, so
+    /// no sink is left to fall back to the raw arguments. `path` and `op` are
+    /// preserved so audit records stay useful; a config path names a setting,
+    /// not a secret.
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        let ops = args
+            .get("ops")
+            .and_then(serde_json::Value::as_array)
+            .map(|ops| {
+                ops.iter()
+                    .map(|op| {
+                        let mut safe = serde_json::Map::new();
+                        for key in ["op", "path"] {
+                            if let Some(value) = op.get(key).and_then(serde_json::Value::as_str) {
+                                safe.insert(key.into(), serde_json::json!(value));
+                            }
+                        }
+                        for key in ["value", "comment"] {
+                            if op.get(key).is_some() {
+                                safe.insert(key.into(), serde_json::json!("[redacted]"));
+                            }
+                        }
+                        serde_json::Value::Object(safe)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(serde_json::json!({"ops": ops}))
+    }
+
     /// The operator's approval prompt: what the ops are, and — the part the
     /// raw JSON never shows — what they do to each agent's resolved
     /// permissions. Everything here is computed from the ops against the
     /// on-disk config; none of it is model text. Returns `None` when the
     /// patch can't be previewed (unreadable config, ops that don't apply);
-    /// the generic argument summary shows instead, and execution will
-    /// refuse with the precise error.
+    /// because [`Self::requires_host_approval_summary`] is `true`, the gate
+    /// then refuses rather than showing the raw arguments, and execution would
+    /// refuse with the precise error regardless.
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
-        let ops = parse_patch_ops(args.get("ops")?.clone()).ok()?;
-        let raw = std::fs::read_to_string(&self.config_path).ok()?;
-        let mut before: Config = toml::from_str(&raw).ok()?;
-        before.config_path = self.config_path.clone();
-        let mut after = before.clone();
-        apply_patch_ops(&mut after, &ops).ok()?;
+        self.build_approval_preview(args)
+            .map(|preview| preview.text)
+    }
 
-        let mut out = String::new();
-        let _ = writeln!(out, "apply {} change(s) to config.toml:", ops.len());
-        for op in &ops {
-            let _ = writeln!(out, "{}", Self::render_op(op, &before, &after));
-        }
-
-        // Per-agent resolved-policy delta. Resolving per agent (not per
-        // edited path) catches indirect changes too: editing a shared
-        // `risk-profiles.*` entry re-renders every agent that references it.
-        let aliases: BTreeSet<&String> = before.agents.keys().chain(after.agents.keys()).collect();
-        let mut delta = String::new();
-        for alias in aliases {
-            let was = before
-                .agents
-                .contains_key(alias.as_str())
-                .then(|| Self::policy_summary_for(&before, alias));
-            let now = after
-                .agents
-                .contains_key(alias.as_str())
-                .then(|| Self::policy_summary_for(&after, alias));
-            if was == now {
-                continue;
-            }
-            let _ = writeln!(delta, "  agent `{alias}`:");
-            let _ = writeln!(
-                delta,
-                "    before:\n      {}",
-                was.as_deref()
-                    .unwrap_or("(agent does not exist)")
-                    .trim_end()
-                    .replace('\n', "\n      ")
-            );
-            let _ = writeln!(
-                delta,
-                "    after:\n      {}",
-                now.as_deref()
-                    .unwrap_or("(agent is removed)")
-                    .trim_end()
-                    .replace('\n', "\n      ")
-            );
-        }
-        if !delta.is_empty() {
-            let _ = writeln!(out, "\npermission changes if approved:");
-            out.push_str(&delta);
-        }
-        out.push_str("\nwritten to disk only — live after the daemon reloads or restarts");
-        Some(out)
+    fn approval_summary_for_call(&self, args: &serde_json::Value) -> Option<ToolApprovalSummary> {
+        let preview = self.build_approval_preview(args)?;
+        let binding = self.sign_preview_binding(&preview);
+        Some(ToolApprovalSummary::with_execution_binding(
+            preview.text,
+            serde_json::Value::String(binding),
+        ))
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if !Self::valid_argument_fields(&args) {
+            return Ok(ToolResult::err(crate::i18n::get_required_cli_string(
+                "cli-config-patch-unsupported-fields",
+            )));
+        }
         let Some(ops_value) = args.get("ops").cloned() else {
             return Ok(ToolResult {
                 success: false,
@@ -249,6 +470,18 @@ impl Tool for ConfigPatchTool {
             Ok(ops) => ops,
             Err(err) => return Ok(Self::refuse(&err)),
         };
+
+        // Approval and operation policy are separate boundaries. In
+        // particular, ReadOnly approval managers intentionally do not prompt
+        // because mutating tools must refuse at execution. Keep that refusal
+        // inside the tool as well as in registry policy so direct and nested
+        // dispatch cannot turn config authoring into an unmetered write.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, self.name())
+        {
+            return Ok(ToolResult::err(error));
+        }
 
         // Fresh read of the on-disk state, not the boot-time snapshot: the
         // operator may have edited config since this process started, and a
@@ -268,6 +501,16 @@ impl Tool for ConfigPatchTool {
                 });
             }
         };
+        let base_digest = sha256(raw.as_bytes());
+        // Prompted calls carry a host-injected, tool-authenticated binding to
+        // the exact ops and config bytes shown to the operator. It is
+        // self-contained rather than stored in a shared ops-keyed cache, so
+        // identical concurrent calls cannot overwrite each other and pending
+        // previews cannot be evicted. Every execution requires a binding, including
+        // Full/auto-approve profiles and direct invocations.
+        if let Err(error) = self.verify_preview_binding(&args, &raw) {
+            return Ok(Self::preview_binding_refusal(error));
+        }
         let mut working: Config = match toml::from_str(&raw) {
             Ok(config) => config,
             Err(err) => {
@@ -299,41 +542,89 @@ impl Tool for ConfigPatchTool {
             });
         }
 
-        working.save_dirty().await?;
-
-        // Comments go on after save so the comment-preserving sync_table
-        // pass doesn't strip them — same order as the gateway and CLI.
-        let annotations: Vec<(String, String)> = ops
-            .iter()
-            .zip(results.iter())
-            .filter_map(|(op, res)| op.comment.as_ref().map(|c| (res.path.clone(), c.clone())))
-            .collect();
-        if !annotations.is_empty()
-            && let Err(err) =
-                zeroclaw_config::comment_writer::apply_comments(&self.config_path, &annotations)
-                    .await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "config_patch: failed to apply op comments to config.toml"
-            );
+        // Version-check against writers outside this lock (the CLI, the
+        // gateway, an editor). The write lock blocks other `config_patch`
+        // calls; this re-read catches anyone else who changed the file since
+        // the base read, so a concurrent update is failed explicitly rather
+        // than silently clobbered by `save_dirty` rewriting from our base.
+        match tokio::fs::read_to_string(&self.config_path).await {
+            Ok(current) if sha256(current.as_bytes()) == base_digest => {}
+            Ok(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "configuration changed on disk while this patch was being applied; \
+                         nothing was saved. Re-run to apply against the current configuration."
+                            .to_string(),
+                    ),
+                });
+            }
+            Err(err) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "failed to re-read {} before saving: {err}",
+                        self.config_path.display()
+                    )),
+                });
+            }
         }
 
-        Ok(ToolResult::ok(ToolOutput::json(serde_json::json!({
+        let annotations: Vec<(String, String)> = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .comment
+                    .as_ref()
+                    .map(|c| (result.path.clone(), c.clone()))
+            })
+            .collect();
+        match working
+            .save_patch_if_source_unchanged(&raw, &annotations)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Self::preview_binding_refusal(
+                    PreviewBindingError::ConfigChanged,
+                ));
+            }
+            Err(error) => {
+                return Ok(ToolResult::err(
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-config-patch-not-saved",
+                        &[("error", &error.to_string())],
+                    ),
+                ));
+            }
+        }
+        let out = serde_json::json!({
             "saved": true,
+            "comments_applied": true,
             "results": results,
-            "note": "written to config.toml; the running daemon keeps its current \
-                     configuration until the operator reloads or restarts it"
-        }))))
+            "note": "written to config.toml; the running daemon keeps its current configuration until the operator reloads or restarts it"
+        });
+        Ok(ToolResult::ok(ToolOutput::json(out)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ConfigPatchTool {
+        async fn execute_reviewed(
+            &self,
+            mut args: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            if let Some(summary) = self.approval_summary_for_call(&args) {
+                args[APPROVAL_EXECUTION_BINDING_ARG] = summary.execution_binding.expect("binding");
+            }
+            self.execute(args).await
+        }
+    }
 
     async fn saved_config(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("config.toml");
@@ -350,14 +641,107 @@ mod tests {
         toml::from_str(&raw).expect("saved config parses")
     }
 
+    fn config_patch_tool(path: PathBuf) -> ConfigPatchTool {
+        ConfigPatchTool::new(path, Arc::new(SecurityPolicy::default()))
+    }
+
+    fn bind_preview(tool: &ConfigPatchTool, args: &mut serde_json::Value) -> String {
+        let summary = tool
+            .approval_summary_for_call(args)
+            .expect("previewable call gets a per-call binding");
+        let binding = summary
+            .execution_binding
+            .expect("config patch previews bind execution");
+        args.as_object_mut()
+            .expect("tool args are an object")
+            .insert(APPROVAL_EXECUTION_BINDING_ARG.to_string(), binding);
+        summary.text
+    }
+
+    #[tokio::test]
+    async fn policy_preview_escapes_controls_and_refuses_an_oversized_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_balanced_agent(dir.path()).await;
+        let tool = config_patch_tool(path);
+        let payload = "echo hello\nFORGED-APPROVAL\u{1b}[31m";
+        let args = serde_json::json!({"ops":[{"op":"replace","path":"/risk_profiles/balanced/allowed_commands","value":[payload]}]});
+        let summary = tool.approval_summary(&args).unwrap();
+        assert!(!summary.contains(payload));
+        assert!(!summary.contains('\u{1b}'));
+        assert!(summary.contains("FORGED-APPROVAL"));
+        let ops = vec![
+            serde_json::json!({"op":"replace","path":"/gateway/host","value":"127.0.0.2"});
+            2000
+        ];
+        assert!(
+            tool.approval_summary(&serde_json::json!({"ops":ops}))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unapproved_direct_call_cannot_write_even_with_full_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read(&path).unwrap();
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(SecurityPolicy {
+                autonomy: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                ..SecurityPolicy::default()
+            }),
+        );
+        let result = tool.execute(serde_json::json!({"approved":true,"ops":[{"op":"replace","path":"/gateway/port","value":4343}]})).await.unwrap();
+        assert!(!result.success);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_are_rejected_and_dropped_from_every_argument_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let before = std::fs::read(&path).unwrap();
+        let secret = "unknown-field-sentinel";
+        for args in [
+            serde_json::json!({"extra":secret,"ops":[{"op":"replace","path":"/gateway/port","value":4343}]}),
+            serde_json::json!({"ops":[{"op":"replace","path":"/gateway/port","value":4343,"extra":secret}]}),
+            serde_json::json!({"ops":[secret]}),
+        ] {
+            assert!(
+                !tool
+                    .redact_args_for_log(&args)
+                    .unwrap()
+                    .to_string()
+                    .contains(secret)
+            );
+            assert!(tool.approval_summary_for_call(&args).is_none());
+            assert!(!tool.execute(args).await.unwrap().success);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_values_and_comments_are_saved_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let result = tool.execute_reviewed(serde_json::json!({"ops":[{"op":"replace","path":"/gateway/port","value":4343,"comment":"reviewed port"}]})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("# reviewed port"));
+        assert!(saved.contains("4343"));
+        assert_eq!(result.output.data().unwrap()["comments_applied"], true);
+    }
+
     #[tokio::test]
     async fn applies_a_replace_and_persists_it_to_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
-            .execute(serde_json::json!({
+            .execute_reviewed(serde_json::json!({
                 "ops": [{"op": "replace", "path": "/gateway/host", "value": "127.0.0.2"}]
             }))
             .await
@@ -374,15 +758,357 @@ mod tests {
         );
     }
 
+    /// The required TOCTOU regression: if the configuration changes between the
+    /// operator's preview and the apply, the approved ops must NOT be written —
+    /// the effect the operator saw no longer matches the current base.
     #[tokio::test]
-    async fn an_invalid_op_is_refused_and_the_file_does_not_move() {
+    async fn drift_between_preview_and_execute_is_refused_and_nothing_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.99"}]
+        });
+
+        // Operator previews the change against the current base.
+        bind_preview(&tool, &mut args);
+
+        // The config changes underneath — a different writer edits an unrelated
+        // field. A separate tool instance has no preview binding of its own.
+        config_patch_tool(path.clone())
+            .execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4242"}]
+            }))
+            .await
+            .expect("the concurrent edit applies");
+
+        // Applying the previewed ops now must refuse: the base drifted.
+        let result = tool.execute(args).await.expect("execute");
+        assert!(!result.success, "a drifted apply must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed since the approval preview"),
+            "the refusal names the drift: {:?}",
+            result.error
+        );
+
+        let saved = read_config(&path);
+        assert_ne!(
+            saved.gateway.host, "10.0.0.99",
+            "the unapproved effect must never be written"
+        );
+        assert_eq!(
+            saved.gateway.port, 4242,
+            "the concurrent writer's change is preserved"
+        );
+    }
+
+    /// Two turns may preview byte-identical operations on different config
+    /// revisions. Each approval must remain bound to its own base instead of a
+    /// shared ops-keyed slot that the later preview can overwrite.
+    #[tokio::test]
+    async fn concurrent_identical_previews_keep_distinct_config_bindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let original_args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.77"}]
+        });
+        let mut first = original_args.clone();
+        bind_preview(&tool, &mut first);
+
+        config_patch_tool(path.clone())
+            .execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4242"}]
+            }))
+            .await
+            .expect("intervening config write");
+
+        let mut second = original_args;
+        bind_preview(&tool, &mut second);
+        assert_ne!(
+            first[APPROVAL_EXECUTION_BINDING_ARG], second[APPROVAL_EXECUTION_BINDING_ARG],
+            "each approval call receives a fresh opaque binding"
+        );
+
+        let stale = tool.execute(first).await.expect("first execute");
+        assert!(!stale.success, "the first preview is stale and must refuse");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed since the approval preview")),
+            "the refusal names config drift: {:?}",
+            stale.error
+        );
+        assert_ne!(read_config(&path).gateway.host, "10.0.0.77");
+
+        let current = tool.execute(second).await.expect("second execute");
+        assert!(
+            current.success,
+            "the independently previewed current-base call may apply: {:?}",
+            current.error
+        );
+        assert_eq!(read_config(&path).gateway.host, "10.0.0.77");
+    }
+
+    /// More than the old 64-entry map bound must not evict an outstanding
+    /// approval. After config drift, the oldest call still has enough binding
+    /// information to refuse instead of silently applying an unreviewed effect.
+    #[tokio::test]
+    async fn oldest_preview_still_refuses_after_more_than_sixty_four_new_previews() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let mut oldest = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.88"}]
+        });
+        bind_preview(&tool, &mut oldest);
+
+        for index in 0..65 {
+            let mut filler = serde_json::json!({
+                "ops": [{
+                    "op": "comment",
+                    "path": "/gateway/host",
+                    "comment": format!("pending preview {index}")
+                }]
+            });
+            bind_preview(&tool, &mut filler);
+        }
+
+        config_patch_tool(path.clone())
+            .execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4343"}]
+            }))
+            .await
+            .expect("intervening config write");
+
+        let result = tool.execute(oldest).await.expect("oldest execute");
+        assert!(
+            !result.success,
+            "an old approved call must not lose its binding and apply after drift"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed since the approval preview")),
+            "the surviving binding detects drift: {:?}",
+            result.error
+        );
+        let saved = read_config(&path);
+        assert_ne!(saved.gateway.host, "10.0.0.88");
+        assert_eq!(saved.gateway.port, 4343);
+    }
+
+    /// The operator prompt must show model-authored comment text (it is
+    /// written to config.toml) and must not silently truncate a value; a
+    /// truncated value states its full length.
+    #[tokio::test]
+    async fn prompt_shows_comment_text_and_marks_truncation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path);
+
+        let long = "x".repeat(300);
+        let summary = tool
+            .approval_summary(&serde_json::json!({
+                "ops": [{
+                    "op": "replace", "path": "/gateway/host",
+                    "value": long, "comment": "set by the assistant"
+                }]
+            }))
+            .expect("summary");
+
+        assert!(
+            summary.contains("comment: ") && summary.contains("set by the assistant"),
+            "the operator must see the persisted comment: {summary}"
+        );
+        assert!(
+            summary.contains("chars total, truncated"),
+            "a truncated value must state its full length, not a silent ellipsis: {summary}"
+        );
+    }
+
+    /// Two concurrent, disjoint patches must not lose an update: the per-path
+    /// write lock serializes the read-modify-write, so the second call reads
+    /// the first's result as its base. Both changes survive (or, had one raced
+    /// past the base check, it would fail explicitly — never silently clobber).
+    #[tokio::test]
+    async fn concurrent_disjoint_previews_cannot_overwrite_a_new_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+
+        let host_tool = config_patch_tool(path.clone());
+        let port_tool = config_patch_tool(path.clone());
+        let (a, b) = tokio::join!(
+            host_tool.execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.1.1.1"}]
+            })),
+            port_tool.execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/port", "value": "4343"}]
+            })),
+        );
+        let a = a.expect("execute a");
+        let b = b.expect("execute b");
+
+        // Neither may silently clobber: any non-success must be an explicit
+        // drift refusal, not a lost update.
+        for r in [&a, &b] {
+            if !r.success {
+                assert!(
+                    r.error.as_deref().unwrap_or_default().contains("changed"),
+                    "a non-success must be an explicit drift refusal: {:?}",
+                    r.error
+                );
+            }
+        }
+        assert!(a.success || b.success, "one reviewed patch must apply");
+        let saved = read_config(&path);
+        if a.success {
+            assert_eq!(saved.gateway.host, "10.1.1.1");
+        }
+        if b.success {
+            assert_eq!(saved.gateway.port, 4343);
+        }
+    }
+
+    /// Binding must not break the normal path: preview then apply with no drift
+    /// still succeeds.
+    #[tokio::test]
+    async fn preview_then_execute_without_drift_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.42"}]
+        });
+
+        bind_preview(&tool, &mut args);
+        let result = tool.execute(args).await.expect("execute");
+
+        assert!(
+            result.success,
+            "an undrifted apply succeeds: {:?}",
+            result.error
+        );
+        assert_eq!(read_config(&path).gateway.host, "10.0.0.42");
+    }
+
+    #[tokio::test]
+    async fn model_supplied_preview_binding_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let before = std::fs::read_to_string(&path).expect("read before");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.66"}]
+        });
+        args.as_object_mut().expect("object args").insert(
+            APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+            serde_json::json!("model-forged-binding"),
+        );
+
+        let result = tool.execute(args).await.expect("execute");
+        assert!(
+            !result.success,
+            "an unauthenticated binding must fail closed"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("binding is missing, invalid")),
+            "the refusal names the binding failure: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read after"),
+            before,
+            "a forged binding must not change config"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_binding_rejects_operations_changed_after_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read_to_string(&path).expect("read before");
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.42"}]
+        });
+        bind_preview(&tool, &mut args);
+        args["ops"][0]["value"] = serde_json::json!("10.0.0.43");
+
+        let result = tool.execute(args).await.expect("execute");
+        assert!(
+            !result.success,
+            "post-preview operation changes fail closed"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("different operations")),
+            "the refusal names the operation mismatch: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read after"),
+            before,
+            "operations not shown to the operator must never be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_policy_refuses_a_valid_patch_without_touching_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read(&path).expect("read before");
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(SecurityPolicy {
+                autonomy: zeroclaw_config::autonomy::AutonomyLevel::ReadOnly,
+                ..SecurityPolicy::default()
+            }),
+        );
 
         let result = tool
-            .execute(serde_json::json!({
+            .execute_reviewed(serde_json::json!({
+                "ops": [{"op": "replace", "path": "/gateway/host", "value": "127.0.0.2"}]
+            }))
+            .await
+            .expect("execute");
+
+        assert!(!result.success, "read-only config patch must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("read-only mode")),
+            "the refusal must name the active operation boundary: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read after"),
+            before,
+            "read-only execution must leave config.toml byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpreviewable_op_is_refused_and_the_file_does_not_move() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let before = std::fs::read_to_string(&path).expect("read before");
+        let tool = config_patch_tool(path.clone());
+
+        let result = tool
+            .execute_reviewed(serde_json::json!({
                 "ops": [{"op": "frobnicate", "path": "/gateway/host", "value": "x"}]
             }))
             .await
@@ -391,8 +1117,8 @@ mod tests {
         assert!(!result.success);
         let error = result.error.expect("error text");
         assert!(
-            error.contains("nothing was saved") && error.contains("op[0]"),
-            "refusal should carry the op context: {error}"
+            error.contains("preview binding is missing") && error.contains("not applied"),
+            "an unpreviewable operation cannot acquire an execution binding: {error}"
         );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read after"),
@@ -406,10 +1132,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
         let before = std::fs::read_to_string(&path).expect("read before");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
-            .execute(serde_json::json!({
+            .execute_reviewed(serde_json::json!({
                 "ops": [{"op": "replace", "path": "/gateway/host", "value": ""}]
             }))
             .await
@@ -431,9 +1157,12 @@ mod tests {
     async fn missing_ops_parameter_is_a_clean_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
-        let result = tool.execute(serde_json::json!({})).await.expect("execute");
+        let result = tool
+            .execute_reviewed(serde_json::json!({}))
+            .await
+            .expect("execute");
 
         assert!(!result.success);
         assert!(result.error.expect("error").contains("`ops`"));
@@ -443,10 +1172,10 @@ mod tests {
     async fn a_missing_config_file_is_reported_not_created() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let tool = ConfigPatchTool::new(path.clone());
+        let tool = config_patch_tool(path.clone());
 
         let result = tool
-            .execute(serde_json::json!({
+            .execute_reviewed(serde_json::json!({
                 "ops": [{"op": "replace", "path": "/gateway/host", "value": "127.0.0.2"}]
             }))
             .await
@@ -488,7 +1217,7 @@ mod tests {
     async fn approval_summary_renders_the_permission_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_with_balanced_agent(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -501,7 +1230,7 @@ mod tests {
             "the op itself is listed: {summary}"
         );
         assert!(
-            summary.contains("agent `helper`"),
+            summary.contains("agent \"helper\""),
             "the affected agent is named: {summary}"
         );
         assert!(
@@ -519,7 +1248,7 @@ mod tests {
     async fn approval_summary_is_quiet_about_unaffected_policies() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_with_balanced_agent(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -537,7 +1266,7 @@ mod tests {
     async fn approval_summary_masks_secret_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool
             .approval_summary(&serde_json::json!({
@@ -562,10 +1291,10 @@ mod tests {
     async fn setting_a_secret_reports_populated_not_the_value() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let result = tool
-            .execute(serde_json::json!({
+            .execute_reviewed(serde_json::json!({
                 "ops": [{"op": "add", "path": "/http_request/secrets/api_token", "value": "tok-456"}]
             }))
             .await
@@ -590,7 +1319,7 @@ mod tests {
     async fn an_unpreviewable_patch_yields_no_summary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = saved_config(dir.path()).await;
-        let tool = ConfigPatchTool::new(path);
+        let tool = config_patch_tool(path);
 
         let summary = tool.approval_summary(&serde_json::json!({
             "ops": [{"op": "frobnicate", "path": "/gateway/host", "value": "x"}]
@@ -602,10 +1331,55 @@ mod tests {
         );
     }
 
+    /// Log-facing redaction masks every op value and comment at the source,
+    /// independent of config readability (it never reads config), so no audit,
+    /// log, observer, or client sink can receive a raw secret — including the
+    /// failed-preview path where `approval_summary` returns `None`.
+    #[test]
+    fn redact_args_for_log_masks_every_value_and_comment() {
+        let tool = config_patch_tool(std::env::temp_dir().join("config.toml"));
+        let mut args = serde_json::json!({
+            "ops": [
+                {"op": "add", "path": "/http_request/secrets/api_token",
+                 "value": "sentinel-token-never-logged-0123", "comment": "sentinel-comment"},
+                {"op": "replace", "path": "/gateway/host", "value": "10.0.0.1"},
+                {"op": "remove", "path": "/gateway/tls"}
+            ]
+        });
+        args.as_object_mut().expect("object args").insert(
+            APPROVAL_EXECUTION_BINDING_ARG.to_string(),
+            serde_json::json!("opaque-host-binding"),
+        );
+        let redacted = tool
+            .redact_args_for_log(&args)
+            .expect("config_patch redacts");
+        let text = redacted.to_string();
+
+        assert!(
+            !text.contains("sentinel-token-never-logged") && !text.contains("sentinel-comment"),
+            "no op value or comment may survive redaction: {text}"
+        );
+        // Even a non-secret value is masked for logs — the operator saw the
+        // real values in the host-computed prompt; sinks do not need them.
+        assert!(
+            !text.contains("10.0.0.1"),
+            "non-secret values are masked too: {text}"
+        );
+        // Paths and ops stay, so audit records remain useful.
+        assert!(text.contains("http_request/secrets/api_token"));
+        assert!(text.contains("gateway.host") || text.contains("/gateway/host"));
+        assert_eq!(redacted["ops"][0]["value"], "[redacted]");
+        assert_eq!(redacted["ops"][0]["comment"], "[redacted]");
+        assert!(
+            redacted.get(APPROVAL_EXECUTION_BINDING_ARG).is_none(),
+            "the opaque binding is runtime-internal and must not reach sinks"
+        );
+    }
+
     #[test]
     fn schema_offers_no_free_text_narration_field() {
         let dir = std::env::temp_dir();
-        let tool = ConfigPatchTool::new(dir.join("config.toml"));
+        let tool = config_patch_tool(dir.join("config.toml"));
         let schema = tool.parameters_schema();
         let props = schema["properties"].as_object().expect("properties");
         assert_eq!(

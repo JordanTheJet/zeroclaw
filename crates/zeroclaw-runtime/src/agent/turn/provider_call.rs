@@ -1568,6 +1568,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {

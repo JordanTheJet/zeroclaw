@@ -123,6 +123,16 @@ pub fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigA
             )
             .with_op_index(idx)
         })?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "op" | "path" | "value" | "comment"))
+        {
+            return Err(ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                "JSON Patch operation contains unsupported fields",
+            )
+            .with_op_index(idx));
+        }
         let op_name = object.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
             ConfigApiError::new(
                 ConfigApiCode::ValueTypeMismatch,
@@ -163,6 +173,24 @@ pub fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigA
     }
 
     Ok(parsed)
+}
+
+/// Reject display sentinels and empty replacements for secret properties.
+pub fn reject_masked_secret_value(
+    path: &str,
+    is_sensitive: bool,
+    value: &str,
+) -> Result<(), ConfigApiError> {
+    if is_sensitive
+        && (value == crate::traits::MASKED_SECRET || value == "****" || value.is_empty())
+    {
+        return Err(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("Refusing to overwrite secret `{path}` with a masked or empty value"),
+        )
+        .with_path(path));
+    }
+    Ok(())
 }
 
 /// Apply ops to `config` **in memory**. Nothing is written to disk.
@@ -242,6 +270,8 @@ pub fn apply_patch_ops(
                 })?;
                 let value_str = coerce_for_set_prop(value, info.as_ref().map(|i| i.kind))
                     .map_err(|e| e.with_path(&path).with_op_index(idx))?;
+                reject_masked_secret_value(&path, is_sensitive, &value_str)
+                    .map_err(|error| error.with_op_index(idx))?;
                 config
                     .set_prop_persistent(&path, &value_str)
                     .map_err(|e| map_prop_error(e, &path).with_op_index(idx))?;

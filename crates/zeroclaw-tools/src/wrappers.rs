@@ -64,8 +64,22 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -173,8 +187,22 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         self.inner.approval_requires_operator()
     }
 
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
     fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
         self.inner.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -269,6 +297,17 @@ mod tests {
         fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
             Some(format!("host summary for {args}"))
         }
+        fn approval_summary_for_call(
+            &self,
+            args: &serde_json::Value,
+        ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+            Some(
+                zeroclaw_api::tool::ToolApprovalSummary::with_execution_binding(
+                    format!("host summary for {args}"),
+                    serde_json::json!("opaque-binding"),
+                ),
+            )
+        }
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult {
@@ -290,8 +329,12 @@ mod tests {
         let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
 
         let summary = tool.approval_summary(&serde_json::json!({"x": 1}));
+        let binding = tool
+            .approval_summary_for_call(&serde_json::json!({"x": 1}))
+            .and_then(|summary| summary.execution_binding);
 
         assert_eq!(summary.as_deref(), Some("host summary for {\"x\":1}"));
+        assert_eq!(binding, Some(serde_json::json!("opaque-binding")));
     }
 
     // ── RateLimitedTool tests ─────────────────────────────────────────────────

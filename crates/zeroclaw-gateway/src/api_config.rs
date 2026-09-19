@@ -281,16 +281,12 @@ pub(crate) async fn persist_and_swap(
     );
     let config_path = new_config.config_path.clone();
 
-    // Snapshot pre-write disk state (used for revert on save failure). Only
-    // NotFound means the file was absent. Any other read failure must stop
-    // before the save because treating an unreadable file as absent would
-    // let the rollback path delete an existing canonical config.
-    let snapshot = read_config_snapshot(&config_path).await?;
+    // Keep the unreadable-file admission check. Persistence itself owns
+    // rollback while holding the canonical disk lock; restoring an earlier
+    // transport snapshot here could clobber a concurrent agent/RPC write.
+    verify_readable_config(&config_path).await?;
 
     if let Err(e) = new_config.save_dirty().await {
-        if let Some(prev) = snapshot {
-            let _ = tokio::fs::write(&config_path, prev).await;
-        }
         // When the path was absent, the atomic writer either leaves it absent
         // on failure or reports a visible rename as success. Do not remove a
         // path here: an external writer may have created it after admission.
@@ -307,12 +303,10 @@ pub(crate) async fn persist_and_swap(
     Ok(())
 }
 
-async fn read_config_snapshot(
-    config_path: &std::path::Path,
-) -> Result<Option<Vec<u8>>, ConfigApiError> {
+async fn verify_readable_config(config_path: &std::path::Path) -> Result<(), ConfigApiError> {
     match tokio::fs::read(config_path).await {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("failed to snapshot existing config before save: {error}"),
@@ -320,25 +314,7 @@ async fn read_config_snapshot(
     }
 }
 
-/// Reject masked or empty values from writes to secret-bearing properties.
-/// Dashboard surfaces may send the masked display sentinel when no real edit
-/// was made; accepting it would replace the live secret with that sentinel.
-fn reject_masked_secret_value(
-    path: &str,
-    is_sensitive: bool,
-    value: &str,
-) -> Result<(), ConfigApiError> {
-    if is_sensitive
-        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
-    {
-        return Err(ConfigApiError::new(
-            ConfigApiCode::ValidationFailed,
-            format!("Refusing to overwrite secret `{path}` with a masked or empty value"),
-        )
-        .with_path(path));
-    }
-    Ok(())
-}
+use zeroclaw_config::patch::reject_masked_secret_value;
 
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
 /// `zeroclaw channel bind-<type> <identity> --alias <alias>`: authorize an
@@ -2040,6 +2016,16 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
         (live.config_path.clone(), live.data_dir.clone())
     };
 
+    let _disk_guard = match zeroclaw_config::write_lock::acquire(&config_path).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to acquire config write lock: {error}"),
+            ));
+        }
+    };
+
     let raw = match tokio::fs::read_to_string(&config_path).await {
         Ok(s) => s,
         Err(e) => {
@@ -2785,6 +2771,51 @@ mod tests {
             live.channels.telegram.contains_key("newbot"),
             "handle_prop_put's own change must also land"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_and_gateway_patches_preserve_the_gateway_write() {
+        use zeroclaw_api::tool::{APPROVAL_EXECUTION_BINDING_ARG, Tool};
+        use zeroclaw_runtime::tools::config_patch::ConfigPatchTool;
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(&dir);
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        let mut args = serde_json::json!({"ops":[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]});
+        args[APPROVAL_EXECUTION_BINDING_ARG] = tool
+            .approval_summary_for_call(&args)
+            .unwrap()
+            .execution_binding
+            .unwrap();
+        let state = test_state(config);
+        let (agent, http) = tokio::join!(
+            tool.execute(args),
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {"op":"replace","path":"/gateway/port","value":4343}
+                ]))
+            ),
+        );
+        let agent = agent.unwrap();
+        let (status, body) = response_json(http).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.gateway.port, 4343,
+            "agent writer must not clobber gateway persistence"
+        );
+        if agent.success {
+            assert_eq!(saved.gateway.host, "127.0.0.2");
+        } else {
+            assert!(agent.error.unwrap().contains("changed"));
+        }
     }
 
     #[tokio::test]

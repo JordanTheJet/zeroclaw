@@ -718,6 +718,7 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(err)?);
     std::process::exit(1);
@@ -727,6 +728,7 @@ fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
 /// The structured envelope (`--json`) carries `code`/`path`/`op_index` as
 /// fields; here they become prose prefixes, and the envelope-only field
 /// names never appear.
+#[cfg(feature = "agent-runtime")]
 fn config_patch_human_message(err: &ConfigApiError) -> String {
     match (err.op_index, err.path.as_deref()) {
         (Some(idx), Some(path)) => format!("op[{idx}] on `{path}`: {}", err.message),

@@ -1,6 +1,21 @@
-//! The process-wide mutex that serializes config read-modify-save-publish.
+//! Config-file write serialization: two locks with distinct scopes and one
+//! fixed order.
+//!
+//! - [`shared_config_write_lock`] is the process-wide *transaction* lock. A
+//!   writer takes it before its first read-for-modify and holds it through the
+//!   save and any publish, so interleaved transactions cannot write each other's
+//!   stale state back.
+//! - [`acquire`] is the per-path *disk* lock. `Config` save methods take it
+//!   internally around the final read-compare-replace of the config file, which
+//!   also covers writers that never enter a transaction.
+//!
+//! Lock order is transaction lock first, disk lock second, always. The disk
+//! lock is only ever held inside a save method, and save methods never acquire
+//! the transaction lock, so the order cannot invert. Neither lock is reentrant.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 /// The one mutex every config writer in this process serializes on.
 ///
@@ -38,6 +53,42 @@ pub fn shared_config_write_lock() -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
+static LOCKS: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Serialize a direct config-file transaction, such as schema migration.
+/// `Config` save methods acquire this internally: never call them while
+/// holding this non-reentrant guard.
+pub async fn acquire(path: &Path) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
+    // Normalize the parent rather than the file: atomic replacement changes
+    // the inode, and first-time writers may not have a file to canonicalize.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tokio::fs::create_dir_all(parent).await?;
+    let canonical_parent = tokio::fs::canonicalize(parent).await?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no file name",
+        )
+    })?;
+    let key = canonical_parent.join(name);
+    let lock = {
+        let mut locks = LOCKS.lock();
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Ok(lock.lock_owned().await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +110,21 @@ mod tests {
         assert!(shared_config_write_lock().try_lock().is_err());
         drop(held);
         assert!(shared_config_write_lock().try_lock().is_ok());
+    }
+
+    /// The ordering the module relies on: a writer holding the transaction
+    /// lock can always take the disk lock beneath it, as every transaction
+    /// writer does when it calls a `Config` save method.
+    #[tokio::test]
+    async fn disk_lock_is_acquirable_under_the_transaction_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let transaction = shared_config_write_lock().lock_owned().await;
+        let disk = tokio::time::timeout(std::time::Duration::from_secs(5), acquire(&path))
+            .await
+            .expect("disk lock must not wait on the transaction lock")
+            .expect("disk lock");
+        drop(disk);
+        drop(transaction);
     }
 }

@@ -1305,3 +1305,7 @@ channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+cli-config-patch-unsupported-fields = Config patch contains unsupported fields.
+cli-config-patch-not-saved = Config patch was not saved: { $error }
+cli-operator-tool-approval-required = Operator-only tool requires an interactive operator approval surface.
