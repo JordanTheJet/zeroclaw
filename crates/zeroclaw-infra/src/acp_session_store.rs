@@ -35,6 +35,7 @@ pub struct AcpSessionData {
     pub session_uuid: String,
     pub agent_alias: String,
     pub workspace_dir: String,
+    pub interaction_surface: Option<String>,
     pub token_count: u64,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -45,6 +46,13 @@ pub enum AcpSessionRestore {
     Missing,
     Killed,
     Restorable(AcpSessionData),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionAccess {
+    Owned,
+    Foreign,
+    Missing,
 }
 
 /// Lightweight summary for the ACP session picker. Avoids loading the full
@@ -85,6 +93,7 @@ impl AcpSessionStore {
                  session_uuid  TEXT NOT NULL UNIQUE,
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
                  token_count   INTEGER NOT NULL DEFAULT 0,
                  killed_at     TEXT,
                  created_at    TEXT NOT NULL,
@@ -133,6 +142,9 @@ impl AcpSessionStore {
 
         Self::ensure_plan_json_column(&conn)
             .context("Failed to migrate ACP session plan column")?;
+
+        Self::ensure_interaction_surface_column(&conn)
+            .context("Failed to migrate ACP session interaction surface")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -207,6 +219,44 @@ impl AcpSessionStore {
         }
     }
 
+    /// Idempotent migration for the host-validated interaction surface bound
+    /// to the session. NULL identifies sessions created before the field was
+    /// introduced or by ACP entry points that do not declare a UI surface.
+    fn ensure_interaction_surface_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "interaction_surface" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN interaction_surface TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session interaction surface"),
+        }
+    }
+
     /// Record a new session. Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
@@ -214,16 +264,57 @@ impl AcpSessionStore {
         agent_alias: &str,
         workspace_dir: &str,
     ) -> Result<i64> {
+        self.create_session_with_interaction_surface(session_uuid, agent_alias, workspace_dir, None)
+    }
+
+    /// Record a session with an optional host-validated interaction surface.
+    pub fn create_session_with_interaction_surface(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+        workspace_dir: &str,
+        interaction_surface: Option<&str>,
+    ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![session_uuid, agent_alias, workspace_dir, now],
+               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+            params![
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                interaction_surface,
+                now
+            ],
         )
         .context("Failed to create ACP session")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Bind an unlabelled legacy session to a validated surface exactly once.
+    /// Returns the durable value after the update so the caller can reject a
+    /// concurrent or pre-existing mismatch.
+    pub fn bind_interaction_surface_if_unset(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+    ) -> Result<String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions
+             SET interaction_surface = ?1
+             WHERE session_uuid = ?2 AND interaction_surface IS NULL",
+            params![interaction_surface, session_uuid],
+        )
+        .context("Failed to bind ACP session interaction surface")?;
+        conn.query_row(
+            "SELECT interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
     }
 
     /// Load session metadata and full message history for restore.
@@ -232,7 +323,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -240,19 +331,27 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         );
 
-        let (session_id, agent_alias, workspace_dir, token_count, created_at_s, last_activity_s) =
-            match row {
-                Ok(r) => r,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e).context("Failed to query ACP session"),
-            };
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
@@ -263,11 +362,126 @@ impl AcpSessionStore {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
         }))
+    }
+
+    /// Load a durable ACP transcript only when both its UUID and owning agent
+    /// match. Keeping the alias predicate in SQL makes an unknown UUID and a
+    /// UUID owned by another agent indistinguishable to callers.
+    /// Killed sessions remain readable as history; killing prevents runtime
+    /// rehydration, not access to retained transcripts by their owner.
+    pub fn load_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<Option<AcpSessionData>> {
+        let conn = self.conn.lock();
+
+        let row = conn
+            .query_row(
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
+                 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2",
+                params![session_uuid, agent_alias],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to query ACP session for agent")?;
+
+        let Some((
+            session_id,
+            owner_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+
+        Ok(Some(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias: owner_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+        }))
+    }
+
+    /// Classify an exact ACP session key without exposing the foreign owner.
+    /// Callers use `Foreign` and `Missing` to make the same fail-closed response
+    /// while still avoiding an unsafe fallback to another session backend.
+    pub fn classify_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<AcpSessionAccess> {
+        let conn = self.conn.lock();
+        let owner = conn
+            .query_row(
+                "SELECT agent_alias FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("Failed to classify ACP session owner")?;
+        Ok(match owner {
+            Some(owner) if owner == agent_alias => AcpSessionAccess::Owned,
+            Some(_) => AcpSessionAccess::Foreign,
+            None => AcpSessionAccess::Missing,
+        })
+    }
+
+    /// Whether `session_uuid` is a live ACP session owned by `agent_alias`.
+    pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2 AND killed_at IS NULL
+             )",
+            params![session_uuid, agent_alias],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("Failed to check live ACP session ownership")
+    }
+
+    /// Every durable ACP session key, used only to fail closed when a Chat key
+    /// collides with the separate ACP namespace.
+    pub fn list_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT session_uuid FROM acp_sessions")
+            .context("Failed to prepare ACP session key query")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to query ACP session keys")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP session keys")
     }
 
     /// Load only durable ACP rows that are allowed to become live sessions.
@@ -277,7 +491,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -285,10 +499,11 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         );
@@ -297,6 +512,7 @@ impl AcpSessionStore {
             session_id,
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count,
             created_at_s,
             last_activity_s,
@@ -319,6 +535,7 @@ impl AcpSessionStore {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
@@ -377,6 +594,65 @@ impl AcpSessionStore {
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
                 agent_alias,
+                workspace_dir,
+                token_count: token_count.max(0) as u64,
+                message_count: msg_count.max(0) as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    /// List live ACP sessions owned by `agent_alias`, ordered by most recent
+    /// activity. Killed rows are omitted from live discovery, but their retained
+    /// transcripts remain readable through `load_session_for_agent` and they
+    /// remain available to export through `list_sessions_by_agent`.
+    pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_uuid,
+                        s.agent_alias,
+                        s.workspace_dir,
+                        s.token_count,
+                        s.created_at,
+                        s.last_activity,
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                 FROM acp_sessions s
+                 WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
+                 ORDER BY s.last_activity DESC",
+            )
+            .context("Failed to prepare live ACP session query for agent")?;
+
+        let rows = stmt
+            .query_map(params![agent_alias], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .context("Failed to query live ACP sessions for agent")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                session_uuid,
+                owner_alias,
+                workspace_dir,
+                token_count,
+                created_s,
+                activity_s,
+                msg_count,
+            ) = row.context("Failed to read live ACP session row")?;
+            out.push(AcpSessionSummary {
+                created_at: parse_ts(&created_s, "created_at", &session_uuid),
+                last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
+                session_uuid,
+                agent_alias: owner_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
@@ -651,6 +927,47 @@ impl AcpSessionStore {
             )));
         }
         Ok(())
+    }
+
+    /// Clear the durable token snapshot back to the schema's unknown
+    /// representation (0). Used when an accepted turn attempt serves a route
+    /// without token usage: the prior snapshot must not survive, mirroring
+    /// the client-side meter which clears on accepted usage-less events.
+    pub fn clear_token_count(&self, session_uuid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET token_count = 0 WHERE session_uuid = ?1",
+                params![session_uuid],
+            )
+            .context("Failed to clear token_count")?;
+        if rows == 0 {
+            return Err(anyhow::Error::msg(format!(
+                "clear_token_count: no session with uuid {session_uuid}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply a `TurnEvent::Usage` to the durable token snapshot. Accepted
+    /// events with usage overwrite it; accepted usage-less events clear it
+    /// back to unknown (0) so a resumed session never replays a stale
+    /// route's count; rejected billing telemetry never touches the store.
+    /// Both durable consumers (ACP server, RPC dispatch) route through here
+    /// so the accepted-gate cannot drift between paths.
+    pub fn persist_usage_snapshot(
+        &self,
+        session_uuid: &str,
+        input_tokens: Option<u64>,
+        accepted: bool,
+    ) -> Result<()> {
+        if !accepted {
+            return Ok(());
+        }
+        match input_tokens {
+            Some(v) => self.set_token_count(session_uuid, v),
+            None => self.clear_token_count(session_uuid),
+        }
     }
 
     /// Persist the session's latest TodoWrite plan as a JSON array of
@@ -958,8 +1275,48 @@ mod tests {
         assert_eq!(data.session_uuid, "sess-abc");
         assert_eq!(data.agent_alias, "personal_code");
         assert_eq!(data.workspace_dir, "/home/user/project");
+        assert_eq!(data.interaction_surface, None);
         assert_eq!(data.token_count, 0);
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn interaction_surface_round_trips_and_legacy_binding_is_one_way() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "sess-surface",
+                "alpha",
+                "/tmp/proj",
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session("sess-surface")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+
+        store
+            .create_session("sess-legacy", "alpha", "/tmp/proj")
+            .unwrap();
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "zerocode_code")
+                .unwrap(),
+            "zerocode_code"
+        );
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "different_surface")
+                .unwrap(),
+            "zerocode_code",
+            "a later caller must not relabel an already-bound session"
+        );
     }
 
     #[test]
@@ -1342,6 +1699,78 @@ mod tests {
     }
 
     #[test]
+    fn clear_token_count_resets_snapshot_to_unknown() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-clr", "alpha", "/tmp/proj")
+            .unwrap();
+        store.set_token_count("sess-clr", 152_306).unwrap();
+        store.clear_token_count("sess-clr").unwrap();
+        assert_eq!(
+            store.load_session("sess-clr").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn clear_token_count_errors_on_unknown_session() {
+        let (_tmp, store) = open_store();
+        let err = store.clear_token_count("nonexistent").unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "error must name the missing session_uuid; got: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_accepted_sequence_clears_on_missing() {
+        // Accepted A with usage, then accepted B without: the durable
+        // snapshot must clear, not retain A's count.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-seq", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-seq", Some(1000), true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            1000
+        );
+        store
+            .persist_usage_snapshot("sess-seq", None, true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_rejected_never_touches_store() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-rej", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(1000), true)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(5000), false)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", None, false)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-rej").unwrap().unwrap().token_count,
+            1000,
+            "rejected billing telemetry is billing-only"
+        );
+    }
+
+    #[test]
     fn append_event_writes_action_outcome_payload() {
         let (_tmp, store) = open_store();
         store
@@ -1417,6 +1846,143 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_uuid, "sess-live");
+    }
+
+    #[test]
+    fn list_live_sessions_by_agent_filters_owner_and_killed_rows() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("alpha-old", "alpha", "/ws/old")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("alpha-new", "alpha", "/ws/new")
+            .unwrap();
+        store
+            .append_turn(
+                "alpha-new",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        store
+            .create_session("alpha-killed", "alpha", "/ws/killed")
+            .unwrap();
+        store.mark_session_killed("alpha-killed").unwrap();
+        store
+            .create_session("beta-live", "beta", "/ws/beta")
+            .unwrap();
+
+        let list = store.list_live_sessions_by_agent("alpha").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].session_uuid, "alpha-new");
+        assert_eq!(list[0].message_count, 1);
+        assert_eq!(list[1].session_uuid, "alpha-old");
+        assert!(list.iter().all(|summary| summary.agent_alias == "alpha"));
+        assert!(
+            store
+                .list_live_sessions_by_agent("missing")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn load_session_for_agent_authorizes_uuid_and_preserves_projection() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "owned",
+                "alpha",
+                "/ws/alpha",
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "owned",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("hello")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("calling".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: Some("thinking".into()),
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "done".into(),
+                        tool_name: String::new(),
+                    }]),
+                ],
+            )
+            .unwrap();
+
+        let data = store
+            .load_session_for_agent("owned", "alpha")
+            .unwrap()
+            .expect("matching owner should load");
+        assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.interaction_surface.as_deref(), Some("zerocode_code"));
+        assert_eq!(data.messages.len(), 3);
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(message)
+                if message.role == "user" && message.content == "hello"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::AssistantToolCalls {
+                text: Some(text),
+                tool_calls,
+                reasoning_content: Some(reasoning),
+            }
+                if text == "calling"
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "tc-1"
+                    && reasoning == "thinking"
+        ));
+        assert!(matches!(
+            &data.messages[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "tc-1"
+                    && results[0].content == "done"
+        ));
+
+        // SQL-level authorization deliberately gives the same result for a
+        // foreign owner and a UUID that does not exist.
+        assert!(
+            store
+                .load_session_for_agent("owned", "beta")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_session_for_agent("unknown", "alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "alpha").unwrap(),
+            AcpSessionAccess::Owned
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "beta").unwrap(),
+            AcpSessionAccess::Foreign
+        );
+        assert_eq!(
+            store
+                .classify_session_for_agent("unknown", "alpha")
+                .unwrap(),
+            AcpSessionAccess::Missing
+        );
+        assert!(store.is_live_session_for_agent("owned", "alpha").unwrap());
+        assert_eq!(store.list_session_ids().unwrap(), vec!["owned"]);
     }
 
     #[test]

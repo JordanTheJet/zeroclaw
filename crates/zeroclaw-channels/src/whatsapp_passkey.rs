@@ -57,6 +57,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::prelude::*;
+use tokio_util::sync::CancellationToken;
 use whatsapp_rust::passkey::{Assertion, AssertionRequest, PasskeyAuthenticator, PasskeyError};
 
 /// How long to wait for each operator-mediated ceremony step.
@@ -95,6 +96,31 @@ pub fn confirmation_ack_path(session_path: &str) -> String {
     format!("{session_path}.passkey-confirmed.json")
 }
 
+/// All passkey artifacts, including interrupted atomic publications.
+/// Session invalidation derives its cleanup list from the broker's path helpers.
+pub(crate) fn artifact_paths(session_path: &str) -> [String; 6] {
+    [
+        request_path(session_path),
+        assertion_path(session_path),
+        confirmation_path(session_path),
+        confirmation_ack_path(session_path),
+        publication_path(&request_path(session_path)),
+        publication_path(&confirmation_path(session_path)),
+    ]
+}
+
+fn publication_path(path: &str) -> String {
+    format!("{path}.tmp")
+}
+
+async fn remove_if_present(path: &str) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// The fresh-link verification state published for the operator.
 ///
 /// `attempt_id` binds the acknowledgement to this exact ceremony. The display
@@ -129,7 +155,7 @@ struct PasskeyConfirmationAck {
 async fn publish_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
-    let tmp = format!("{path}.tmp");
+    let tmp = publication_path(path);
     // A previous run that died between create and rename would otherwise make
     // `create_new` fail forever.
     let _ = tokio::fs::remove_file(&tmp).await;
@@ -171,10 +197,53 @@ pub fn pending_confirmation(
     }
 }
 
-/// File-backed operator acknowledgement for the fresh-link verification code.
+/// File-backed operator acknowledgement shared by every event in one client session.
 pub struct FilePasskeyConfirmation {
     session_path: String,
     wait: Duration,
+    closed: CancellationToken,
+    // This is the authority for the current attempt, not a copy of client state.
+    // The mutex covers only publication, acceptance, and cleanup; never a human
+    // wait or the network confirmation.
+    current: tokio::sync::Mutex<Option<Arc<ConfirmationAttempt>>>,
+}
+
+struct ConfirmationAttempt {
+    id: String,
+    cancelled: CancellationToken,
+    // Invalidation first cancels, then drains this operation. A replacement
+    // cannot reach upstream while an old confirmation future is still polling.
+    in_flight: tokio::sync::Mutex<()>,
+}
+
+impl ConfirmationAttempt {
+    async fn cancel_and_drain(&self) {
+        self.cancelled.cancel();
+        let _drained = self.in_flight.lock().await;
+    }
+}
+
+/// One-shot authority to confirm the acknowledged ceremony. Replacement and
+/// session shutdown revoke this even after the acknowledgement was consumed.
+pub struct PasskeyConfirmationPermit {
+    attempt: Arc<ConfirmationAttempt>,
+}
+
+impl PasskeyConfirmationPermit {
+    pub async fn confirm<F, Fut>(self, confirm: F) -> Result<(), PasskeyError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), PasskeyError>>,
+    {
+        let _in_flight = self.attempt.in_flight.lock().await;
+        tokio::select! {
+            biased;
+            _ = self.attempt.cancelled.cancelled() => Err(PasskeyError::Cancelled),
+            // Keep construction inside the selected future: a revoked permit
+            // must not invoke the callback, even if it has synchronous effects.
+            result = async { confirm().await } => result,
+        }
+    }
 }
 
 impl FilePasskeyConfirmation {
@@ -183,7 +252,15 @@ impl FilePasskeyConfirmation {
         Self {
             session_path: session_path.into(),
             wait: DEFAULT_WAIT,
+            closed: CancellationToken::new(),
+            current: tokio::sync::Mutex::new(None),
         }
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, closed: CancellationToken) -> Self {
+        self.closed = closed;
+        self
     }
 
     /// Override the operator wait. Tests use a short deadline.
@@ -193,8 +270,49 @@ impl FilePasskeyConfirmation {
         self
     }
 
-    /// Publish `code` and wait for an acknowledgement bound to this attempt.
-    pub async fn wait_for_acknowledgement(&self, code: &str) -> Result<(), PasskeyError> {
+    /// Revoke outstanding permits when the protocol advances. Late callbacks
+    /// from a closed client must not touch a replacement client's files.
+    pub async fn invalidate(&self) -> std::io::Result<()> {
+        let mut current = self.current.lock().await;
+        if self.closed.is_cancelled() {
+            return Ok(());
+        }
+        self.clear_current(&mut current).await
+    }
+
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        self.closed.cancel();
+        let mut current = self.current.lock().await;
+        self.clear_current(&mut current).await
+    }
+
+    async fn clear_current(
+        &self,
+        current: &mut Option<Arc<ConfirmationAttempt>>,
+    ) -> std::io::Result<()> {
+        if let Some(attempt) = current.take() {
+            attempt.cancel_and_drain().await;
+        }
+        self.remove_artifacts().await
+    }
+
+    async fn remove_artifacts(&self) -> std::io::Result<()> {
+        let prompt = confirmation_path(&self.session_path);
+        for path in [
+            confirmation_ack_path(&self.session_path),
+            publication_path(&prompt),
+            prompt,
+        ] {
+            remove_if_present(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish `code`, accepting only an acknowledgement of the current prompt.
+    pub async fn wait_for_acknowledgement(
+        &self,
+        code: &str,
+    ) -> Result<PasskeyConfirmationPermit, PasskeyError> {
         let prompt_file = confirmation_path(&self.session_path);
         let ack_file = confirmation_ack_path(&self.session_path);
         let attempt_id = uuid::Uuid::new_v4().to_string();
@@ -202,17 +320,34 @@ impl FilePasskeyConfirmation {
             attempt_id: attempt_id.clone(),
             code: code.to_string(),
         };
-        let prompt_bytes = serde_json::to_vec(&prompt).map_err(|e| {
-            PasskeyError::Backend(format!("could not serialize passkey confirmation: {e}"))
-        })?;
+        let prompt_bytes =
+            serde_json::to_vec(&prompt).map_err(|e| PasskeyError::Backend(e.to_string()))?;
+        let attempt = Arc::new(ConfirmationAttempt {
+            id: attempt_id.clone(),
+            cancelled: self.closed.child_token(),
+            in_flight: tokio::sync::Mutex::new(()),
+        });
+        let cancelled = &attempt.cancelled;
 
-        // Any acknowledgement predating this prompt belongs to an earlier
-        // ceremony. Clear both names before publishing the new attempt.
-        let _ = tokio::fs::remove_file(&ack_file).await;
-        let _ = tokio::fs::remove_file(&prompt_file).await;
-        publish_private(&prompt_file, &prompt_bytes)
-            .await
-            .map_err(|e| PasskeyError::Backend(format!("could not write {prompt_file}: {e}")))?;
+        {
+            let mut current = self.current.lock().await;
+            if self.closed.is_cancelled() {
+                return Err(PasskeyError::Cancelled);
+            }
+            if let Some(previous) = current.take() {
+                previous.cancel_and_drain().await;
+            }
+            self.remove_artifacts()
+                .await
+                .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+            *current = Some(Arc::clone(&attempt));
+            if let Err(error) = publish_private(&prompt_file, &prompt_bytes).await {
+                cancelled.cancel();
+                return Err(PasskeyError::Backend(format!(
+                    "could not write {prompt_file}: {error}"
+                )));
+            }
+        }
 
         ::zeroclaw_log::record!(
             WARN,
@@ -229,40 +364,49 @@ impl FilePasskeyConfirmation {
 
         let deadline = tokio::time::Instant::now() + self.wait;
         loop {
-            match tokio::fs::read(&ack_file).await {
-                Ok(bytes)
-                    if !bytes.is_empty()
-                        && serde_json::from_slice::<PasskeyConfirmationAck>(&bytes)
-                            .is_ok_and(|ack| ack.attempt_id == attempt_id) =>
+            {
+                let current = self.current.lock().await;
+                if cancelled.is_cancelled()
+                    || current
+                        .as_ref()
+                        .is_none_or(|attempt| attempt.id != attempt_id)
                 {
-                    self.cleanup_attempt(&prompt_file, &ack_file, &attempt_id)
-                        .await;
-                    return Ok(());
+                    return Err(PasskeyError::Cancelled);
                 }
-                _ => {}
+                let owns_prompt = pending_confirmation(&self.session_path)
+                    .map_err(|e| PasskeyError::Backend(e.to_string()))?
+                    .is_some_and(|prompt| prompt.attempt_id == attempt_id);
+                if !owns_prompt {
+                    // A disk-only relink can remove the prompt while this client
+                    // still runs. Its acknowledgement must then fail closed.
+                    cancelled.cancel();
+                    return Err(PasskeyError::Cancelled);
+                }
+                let acknowledged = match tokio::fs::read(&ack_file).await {
+                    Ok(bytes) => serde_json::from_slice::<PasskeyConfirmationAck>(&bytes)
+                        .is_ok_and(|ack| ack.attempt_id == attempt_id),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(PasskeyError::Backend(error.to_string())),
+                };
+                if acknowledged {
+                    self.remove_artifacts()
+                        .await
+                        .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+                    return Ok(PasskeyConfirmationPermit { attempt });
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    cancelled.cancel();
+                    self.remove_artifacts()
+                        .await
+                        .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+                    return Err(PasskeyError::Cancelled);
+                }
             }
-
-            if tokio::time::Instant::now() >= deadline {
-                self.cleanup_attempt(&prompt_file, &ack_file, &attempt_id)
-                    .await;
-                return Err(PasskeyError::Cancelled);
+            tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return Err(PasskeyError::Cancelled),
+                _ = tokio::time::sleep_until(std::cmp::min(deadline, tokio::time::Instant::now() + POLL_INTERVAL)) => {},
             }
-
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
-    /// Remove only the state owned by this attempt. A later ceremony may have
-    /// replaced it while an older waiter was winding down.
-    async fn cleanup_attempt(&self, prompt_file: &str, ack_file: &str, attempt_id: &str) {
-        let owns_prompt = tokio::fs::read(prompt_file)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PendingPasskeyConfirmation>(&bytes).ok())
-            .is_some_and(|prompt| prompt.attempt_id == attempt_id);
-        if owns_prompt {
-            let _ = tokio::fs::remove_file(prompt_file).await;
-            let _ = tokio::fs::remove_file(ack_file).await;
         }
     }
 }
@@ -273,7 +417,9 @@ pub struct FilePasskeyAuthenticator {
     session_path: String,
     wait: Duration,
     generation: AtomicU64,
+    closed: CancellationToken,
     file_ops: tokio::sync::Mutex<()>,
+    confirmation: Option<Arc<FilePasskeyConfirmation>>,
 }
 
 impl FilePasskeyAuthenticator {
@@ -283,7 +429,9 @@ impl FilePasskeyAuthenticator {
             session_path: session_path.into(),
             wait: DEFAULT_WAIT,
             generation: AtomicU64::new(0),
+            closed: CancellationToken::new(),
             file_ops: tokio::sync::Mutex::new(()),
+            confirmation: None,
         }
     }
 
@@ -296,8 +444,33 @@ impl FilePasskeyAuthenticator {
     }
 
     #[must_use]
-    pub fn into_arc(self) -> Arc<dyn PasskeyAuthenticator> {
-        Arc::new(self)
+    pub fn with_cancellation(mut self, closed: CancellationToken) -> Self {
+        self.closed = closed;
+        self
+    }
+
+    /// Tie new assertions to the session's confirmation authority. Upstream can
+    /// open a replacement protocol session only after this authenticator returns,
+    /// so revoking here fences an old confirmation before that replacement exists.
+    #[must_use]
+    pub fn with_confirmation(mut self, confirmation: Arc<FilePasskeyConfirmation>) -> Self {
+        self.confirmation = Some(confirmation);
+        self
+    }
+
+    /// Drain pending publication/consumption before the next client starts.
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        self.closed.cancel();
+        let _file_guard = self.file_ops.lock().await;
+        self.begin_attempt();
+        for path in [
+            request_path(&self.session_path),
+            assertion_path(&self.session_path),
+            publication_path(&request_path(&self.session_path)),
+        ] {
+            remove_if_present(&path).await?;
+        }
+        Ok(())
     }
 
     fn begin_attempt(&self) -> u64 {
@@ -307,7 +480,7 @@ impl FilePasskeyAuthenticator {
     }
 
     fn owns_attempt(&self, generation: u64) -> bool {
-        self.generation.load(Ordering::Acquire) == generation
+        !self.closed.is_cancelled() && self.generation.load(Ordering::Acquire) == generation
     }
 
     async fn cleanup_attempt(&self, generation: u64, request_file: &str, assertion_file: &str) {
@@ -417,6 +590,12 @@ fn parse_assertion_for_request(
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PasskeyAuthenticator for FilePasskeyAuthenticator {
     async fn get_assertion(&self, request: &AssertionRequest) -> Result<Assertion, PasskeyError> {
+        if let Some(confirmation) = &self.confirmation {
+            confirmation
+                .invalidate()
+                .await
+                .map_err(|e| PasskeyError::Backend(e.to_string()))?;
+        }
         let request_file = request_path(&self.session_path);
         let assertion_file = assertion_path(&self.session_path);
         let generation;
@@ -426,6 +605,9 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
             // operator wait, so a reissued request supersedes the old one
             // instead of queuing behind its five-minute deadline.
             let _file_guard = self.file_ops.lock().await;
+            if self.closed.is_cancelled() {
+                return Err(PasskeyError::Cancelled);
+            }
             generation = self.begin_attempt();
 
             // Clear any assertion left by a previous attempt before
@@ -502,7 +684,11 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
                 return Err(last_invalid.unwrap_or(PasskeyError::Cancelled));
             }
 
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => return Err(PasskeyError::Cancelled),
+                _ = tokio::time::sleep(POLL_INTERVAL) => {},
+            }
         }
     }
 }
@@ -852,6 +1038,287 @@ mod tests {
         publish_private(&target, b"fresh").await.unwrap();
 
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"fresh".to_vec());
+    }
+
+    async fn wait_for_confirmation(session: &str, code: &str) -> PendingPasskeyConfirmation {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(prompt) = pending_confirmation(session).unwrap()
+                    && prompt.code == code
+                {
+                    return prompt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confirmation prompt must be published")
+    }
+
+    async fn acknowledge(session: &str, prompt: &PendingPasskeyConfirmation) {
+        tokio::fs::write(
+            confirmation_ack_path(session),
+            serde_json::json!({"attempt_id": prompt.attempt_id}).to_string(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn confirmation_waiter(
+        broker: &Arc<FilePasskeyConfirmation>,
+        code: &'static str,
+    ) -> tokio::task::JoinHandle<Result<PasskeyConfirmationPermit, PasskeyError>> {
+        let broker = Arc::clone(broker);
+        zeroclaw_spawn::spawn!(async move { broker.wait_for_acknowledgement(code).await })
+    }
+
+    #[tokio::test]
+    async fn overlapping_confirmation_cannot_accept_old_ack_or_remove_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let broker =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let old = confirmation_waiter(&broker, "OLD-CODE");
+        let old_prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        let replacement = confirmation_waiter(&broker, "NEW-CODE");
+        let new_prompt = wait_for_confirmation(&session, "NEW-CODE").await;
+        acknowledge(&session, &old_prompt).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), old)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(PasskeyError::Cancelled)));
+        assert_eq!(
+            pending_confirmation(&session).unwrap(),
+            Some(new_prompt.clone())
+        );
+        assert!(!replacement.is_finished());
+        acknowledge(&session, &new_prompt).await;
+        let permit = replacement.await.unwrap().unwrap();
+        let mut confirmed = false;
+        permit
+            .confirm(|| {
+                confirmed = true;
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+        assert!(confirmed);
+        assert!(pending_confirmation(&session).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn supersession_after_acknowledgement_revokes_final_confirmation_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let broker =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let old = confirmation_waiter(&broker, "OLD-CODE");
+        let prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        acknowledge(&session, &prompt).await;
+        let old_permit = old.await.unwrap().unwrap();
+        let replacement = confirmation_waiter(&broker, "NEW-CODE");
+        let new_prompt = wait_for_confirmation(&session, "NEW-CODE").await;
+        let called = std::cell::Cell::new(false);
+        let result = old_permit
+            .confirm(|| {
+                called.set(true);
+                async { Ok(()) }
+            })
+            .await;
+        assert!(!called.get(), "a revoked permit must not call the client");
+        assert!(matches!(result, Err(PasskeyError::Cancelled)));
+        assert_eq!(pending_confirmation(&session).unwrap(), Some(new_prompt));
+        broker.shutdown().await.unwrap();
+        assert!(matches!(
+            replacement.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn supersession_cancels_inflight_confirmation_without_blocking_new_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let broker =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let old = confirmation_waiter(&broker, "OLD-CODE");
+        let prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        acknowledge(&session, &prompt).await;
+        let permit = old.await.unwrap().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let confirming = zeroclaw_spawn::spawn!(async move {
+            permit
+                .confirm(|| async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    panic!("supersession must drop the pending client operation");
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        let replacement = confirmation_waiter(&broker, "NEW-CODE");
+        wait_for_confirmation(&session, "NEW-CODE").await;
+        assert!(matches!(
+            confirming.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+        assert!(finish_tx.send(()).is_err());
+        broker.shutdown().await.unwrap();
+        assert!(matches!(
+            replacement.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_assertion_revokes_confirmation_before_upstream_can_replace_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let confirmation =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let old = confirmation_waiter(&confirmation, "OLD-CODE");
+        let prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        acknowledge(&session, &prompt).await;
+        let old_permit = old.await.unwrap().unwrap();
+        let auth = Arc::new(
+            FilePasskeyAuthenticator::new(&session).with_confirmation(Arc::clone(&confirmation)),
+        );
+        let request = assertion_request(&[9]);
+        let waiter = {
+            let auth = Arc::clone(&auth);
+            let request = request.clone();
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&request).await })
+        };
+        wait_for_contents(&request_path(&session), &request.raw_options_json).await;
+        assert!(matches!(
+            old_permit
+                .confirm(|| async {
+                    panic!("new assertion must revoke the old confirmation before upstream sees it")
+                })
+                .await,
+            Err(PasskeyError::Cancelled)
+        ));
+        assert!(!waiter.is_finished());
+        tokio::fs::write(
+            assertion_path(&session),
+            credential_json_for_challenge(&BASE64_URL_SAFE_NO_PAD.encode(b"current"), "c2ln", &[9]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap().credential_id, b"current");
+    }
+
+    #[tokio::test]
+    async fn reconnect_fences_old_waiters_permits_and_late_callbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let closed = CancellationToken::new();
+        let guard = closed.clone().drop_guard();
+        let old_broker = Arc::new(FilePasskeyConfirmation::new(&session).with_cancellation(closed));
+        let old = confirmation_waiter(&old_broker, "OLD-CODE");
+        let old_prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        acknowledge(&session, &old_prompt).await;
+        let permit = old.await.unwrap().unwrap();
+        // Mirrors listener cancellation, including a dropped listen future.
+        drop(guard);
+        old_broker.shutdown().await.unwrap();
+        let new_broker =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let replacement = confirmation_waiter(&new_broker, "NEW-CODE");
+        let new_prompt = wait_for_confirmation(&session, "NEW-CODE").await;
+        acknowledge(&session, &old_prompt).await;
+        assert!(matches!(
+            permit
+                .confirm(|| async { panic!("closed client must never confirm") })
+                .await,
+            Err(PasskeyError::Cancelled)
+        ));
+        assert!(matches!(
+            old_broker.wait_for_acknowledgement("LATE-CODE").await,
+            Err(PasskeyError::Cancelled)
+        ));
+        old_broker.invalidate().await.unwrap();
+        assert_eq!(
+            pending_confirmation(&session).unwrap(),
+            Some(new_prompt.clone())
+        );
+        assert!(!replacement.is_finished());
+        acknowledge(&session, &new_prompt).await;
+        replacement
+            .await
+            .unwrap()
+            .unwrap()
+            .confirm(|| async { Ok(()) })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_waiters_before_reconnecting_on_the_same_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let closed = CancellationToken::new();
+        let auth =
+            Arc::new(FilePasskeyAuthenticator::new(&session).with_cancellation(closed.clone()));
+        let confirmation =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_cancellation(closed.clone()));
+        let request = assertion_request(&[1]);
+        let auth_waiter = {
+            let auth = Arc::clone(&auth);
+            let request = request.clone();
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&request).await })
+        };
+        wait_for_contents(&request_path(&session), &request.raw_options_json).await;
+        let confirmation_waiter = confirmation_waiter(&confirmation, "OLD-CODE");
+        wait_for_confirmation(&session, "OLD-CODE").await;
+        closed.cancel();
+        confirmation.shutdown().await.unwrap();
+        auth.shutdown().await.unwrap();
+        assert!(matches!(
+            auth_waiter.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+        assert!(matches!(
+            confirmation_waiter.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
+        for path in artifact_paths(&session) {
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} survived shutdown"
+            );
+        }
+        tokio::fs::write(request_path(&session), b"replacement request")
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.get_assertion(&request).await,
+            Err(PasskeyError::Cancelled)
+        ));
+        assert_eq!(
+            tokio::fs::read(request_path(&session)).await.unwrap(),
+            b"replacement request"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_confirmation_prompt_cannot_be_acknowledged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let broker =
+            Arc::new(FilePasskeyConfirmation::new(&session).with_wait(Duration::from_secs(5)));
+        let waiter = confirmation_waiter(&broker, "OLD-CODE");
+        let prompt = wait_for_confirmation(&session, "OLD-CODE").await;
+        tokio::fs::remove_file(confirmation_path(&session))
+            .await
+            .unwrap();
+        acknowledge(&session, &prompt).await;
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(PasskeyError::Cancelled)
+        ));
     }
 
     #[tokio::test]
