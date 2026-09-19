@@ -48,7 +48,10 @@ impl AdmittedComponent {
         &self.bytes
     }
 
-    #[cfg(test)]
+    // Gated exactly like its callers: every use lives in a `tests` module
+    // inside a `plugins-wasmtime` module, so under default features the
+    // helper would otherwise be dead code and fail the deny-warnings check.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
     pub(crate) fn test_component(bytes: &[u8]) -> Self {
         Self::new(bytes.to_vec())
     }
