@@ -2,7 +2,8 @@
 //! default.
 //!
 //! One documented exception, off unless an operator turns it on: the browser
-//! enrollment frontdoor ([`frontdoor`], [`enroll_proxy`]). While enabled the
+//! enrollment frontdoor (the private `frontdoor` and `enroll_proxy` modules -
+//! named, not linked, because they are crate-internal). While enabled the
 //! relay serves an enrollment page and performs the CA-pinned enrollment
 //! exchange on a browser's behalf, so for those browsers it is a trusted code
 //! origin and an enrollment principal - **relay-terminated, not blind**. It
