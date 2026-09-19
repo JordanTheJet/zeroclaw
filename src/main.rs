@@ -8234,7 +8234,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         ta(
                             "cli-config-patch-comment-write-failed",
                             &[("error", &err.to_string())],
-                            &format!("warning: failed to write op comments to config.toml: {err}"),
+                            format!("warning: failed to write op comments to config.toml: {err}"),
                         )
                     );
                 }
