@@ -57,6 +57,38 @@ impl ChannelSopTopic {
     }
 }
 
+// ── Channel-supplied room context ───────────────────────────────
+
+/// Context a chat channel supplies about one specific room.
+///
+/// Rooms in the same channel can serve different purposes — one for package
+/// maintenance, another for incident response — and the operator already
+/// describes that in the chat product's own metadata (Mattermost's channel
+/// purpose, Slack's topic, Matrix's room topic). This carries that description
+/// to prompt assembly so a room can specialise the agent without a separate
+/// config entry per room.
+///
+/// **Channel-supplied, not operator-supplied.** The text originates from
+/// whoever can edit the room's metadata, which on default permission schemes is
+/// usually every member — a wider set than whoever controls the agent's config.
+/// It is therefore rendered as context about the room, explicitly labelled as
+/// such, and never as operating rules. Adapters must return `None` unless the
+/// operator opted the alias in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelRoomContext {
+    /// Free-text description of what this room is for.
+    pub purpose: Option<String>,
+}
+
+impl ChannelRoomContext {
+    /// True when there is nothing to inject, so callers can skip the section
+    /// rather than render an empty one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.purpose.as_ref().is_none_or(|p| p.trim().is_empty())
+    }
+}
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Where a tool call sits in the batch the model issued for one turn.
@@ -1131,6 +1163,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Invite a user to an existing platform room/conversation.
     async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("channel does not support room invites")
+    }
+
+    /// Context this channel supplies about `room_id`, when the adapter can
+    /// provide it and the operator has opted the alias in.
+    ///
+    /// Returns `None` by default: a channel that does not implement this, or a
+    /// room the operator has not opted in, contributes nothing to the prompt.
+    /// Absence is the safe state, so the default is the safe one.
+    fn room_context(&self, _room_id: &str) -> Option<ChannelRoomContext> {
+        None
     }
 
     /// Request interactive tool-call approval from the channel operator.

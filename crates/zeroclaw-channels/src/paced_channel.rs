@@ -497,6 +497,14 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
+    /// Must be forwarded explicitly: the trait default returns `None`, so
+    /// without this every channel wrapped here would report that it supplies no
+    /// room context, no matter what the inner channel knows. Pacing concerns
+    /// outbound sends only and has no opinion about a room's description.
+    fn room_context(&self, room_id: &str) -> Option<zeroclaw_api::channel::ChannelRoomContext> {
+        self.inner.room_context(room_id)
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -554,9 +562,9 @@ mod tests {
     /// Minimal `HasReplyPacing` for tests so we can construct pacing
     /// configs without dragging a full `*Config` literal into every
     /// case. Mirrors the production trait shape exactly.
-    struct PacingFixture {
-        interval_secs: u64,
-        depth: u16,
+    pub(super) struct PacingFixture {
+        pub(super) interval_secs: u64,
+        pub(super) depth: u16,
     }
     impl HasReplyPacing for PacingFixture {
         fn reply_min_interval_secs(&self) -> u64 {
@@ -1145,5 +1153,80 @@ mod tests {
             2,
             "both sends eventually dispatch exactly once each",
         );
+    }
+}
+
+/// The wrapper must not swallow capabilities the inner channel implements.
+///
+/// `PacedChannel` wraps every registered channel, so any `Channel` method it
+/// forgets to forward silently falls back to the trait default for the whole
+/// deployment. That is how `room_context` shipped broken: Mattermost
+/// implemented it, the wrapper did not forward it, and the runtime saw the
+/// default `None` with nothing logged and nothing failing.
+#[cfg(test)]
+mod forwarding_tests {
+    use super::tests::PacingFixture;
+    use super::*;
+    use zeroclaw_api::channel::ChannelRoomContext;
+
+    struct ContextChannel;
+
+    impl Attributable for ContextChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "context"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ContextChannel {
+        fn name(&self) -> &str {
+            "context"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn room_context(&self, room_id: &str) -> Option<ChannelRoomContext> {
+            (room_id == "room1").then(|| ChannelRoomContext {
+                purpose: Some("Arch packaging".to_string()),
+            })
+        }
+    }
+
+    /// A non-zero interval is required: `wrap` deliberately returns the inner
+    /// `Arc` unchanged when pacing is off, so a zero-interval fixture would
+    /// test the inner channel directly and prove nothing about forwarding.
+    fn paced(inner: ContextChannel) -> Arc<dyn Channel> {
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 4,
+        };
+        PacedChannel::wrap(Arc::new(inner), &cfg)
+    }
+
+    /// The inner channel's answer must survive the wrapper.
+    #[test]
+    fn room_context_is_forwarded_to_the_inner_channel() {
+        let wrapped = paced(ContextChannel);
+        assert_eq!(
+            wrapped
+                .room_context("room1")
+                .and_then(|context| context.purpose)
+                .as_deref(),
+            Some("Arch packaging"),
+            "the wrapper must not answer for the inner channel"
+        );
+    }
+
+    /// And a genuine `None` must still be a `None`, so the test above cannot
+    /// pass by the wrapper inventing context of its own.
+    #[test]
+    fn unknown_room_still_reports_no_context() {
+        assert!(paced(ContextChannel).room_context("other").is_none());
     }
 }

@@ -882,7 +882,7 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
+    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise. When set above 300 it also raises the provider's streaming idle bound (default 300 s, the maximum gap between stream reads) on OpenAI-compatible and OpenAI Responses providers.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
@@ -937,6 +937,29 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through this OpenAI-compatible
+    /// provider. When true, request bodies on the structured paths (agent
+    /// turns, tool calls, structured streaming) gain an Anthropic-shaped
+    /// `cache_control` breakpoint on the system prompt and on the last
+    /// message once the conversation has more than one non-system message,
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage populates the cached-token counters.
+    /// With `merge_system_into_user`, the merged first user message carries
+    /// the system breakpoint instead. The text-only helpers (`chat_with_system`,
+    /// `chat_with_history`, the legacy chunk-stream APIs) deliberately emit
+    /// no breakpoints: their responses drop usage, so a premium cache write
+    /// they triggered could never be accounted for.
+    /// Only gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic Messages API forward these breakpoints (e.g. LiteLLM).
+    /// Default `false`: request bodies and response handling are unchanged.
+    ///
+    /// Before relying on it, verify the configured route serves cache reads:
+    /// an immediate repeat of a cache-creating request must report
+    /// `cache_read_input_tokens > 0`. Some gateway routes accept and bill
+    /// cache writes without ever serving reads.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -4378,6 +4401,42 @@ impl Config {
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
         self.configured_model_context_window(agent_alias)
             .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+    }
+
+    /// Provider's explicit `context_window` for the served model, or `None`.
+    /// Use on wire boundaries: emitting the 32k stub from
+    /// `effective_model_context_window()` would freeze the client
+    /// meter at 32k instead of the profile budget. Use this instead
+    /// of the agent-alias variant when the live provider identity is
+    /// known (e.g., from `Agent.attribution_fields().1` or
+    /// `SessionOverrides.model_provider`). Returns `None` when the
+    /// ref is unparseable, the entry has no `context_window`, or the
+    /// served model does not match the entry's configured primary
+    /// `model`, so the wire omission path preserves absence (no 32k
+    /// stub leak) and fallback/vision/override models never borrow
+    /// another model's capacity.
+    #[must_use]
+    pub fn model_provider_context_window_opt(
+        &self,
+        provider_ref: &str,
+        model: &str,
+    ) -> Option<usize> {
+        let (type_key, alias_key) = provider_ref.split_once('.')?;
+        let (_, _, cfg) = self
+            .providers
+            .models
+            .iter_entries()
+            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
+        let configured = cfg
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let served = model.trim();
+        if served.is_empty() || configured != served {
+            return None;
+        }
+        cfg.context_window
     }
 
     #[must_use]
@@ -8494,7 +8553,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), or "serply" (Google web results, requires API key)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8533,6 +8592,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub serply_api_key: Option<String>,
+    /// Keenable Search API key (optional even when search_provider is `"keenable"`: without a key the tool uses the public endpoint, which is rate-limited per client IP; a key lifts those limits). Obtain at <https://keenable.ai>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub keenable_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8567,6 +8632,7 @@ impl Default for WebSearchConfig {
             bocha_api_key: None,
             anysearch_api_key: None,
             serply_api_key: None,
+            keenable_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -16155,7 +16221,14 @@ pub enum MattermostListenMode {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived, for the same reason as
+/// [`DiscordConfig`]: a derived `Default` zeroes every field, which disagrees
+/// with the serde defaults, and for `approval_timeout_secs` that disagreement
+/// is load-bearing. `0` is an already-elapsed deadline, so an alias built in
+/// Rust would deny every approval while an alias parsed from a file waits the
+/// documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
@@ -16259,6 +16332,55 @@ pub struct MattermostConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+    /// Seconds to wait for operator approval on `always_ask` tools before
+    /// auto-denying. Mattermost prompts by posting a token-prefixed message and
+    /// reading the operator's reply, so this budget covers a human noticing the
+    /// post and typing back.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Inject each room's Mattermost channel purpose into the system prompt as
+    /// channel-supplied context, letting one room specialise the agent.
+    ///
+    /// Off by default, because enabling it is a trust decision: the purpose is
+    /// editable by anyone holding `manage_*_channel_properties`, which on
+    /// default permission schemes is every channel member, and the text reaches
+    /// the system prompt. Those editors can therefore steer the agent in that
+    /// room, including with text that reads as an instruction, and they need
+    /// not be authorized ZeroClaw peers.
+    ///
+    /// What that steering cannot do is exceed the agent's existing permissions:
+    /// prompt text grants no tool, widens no peer group, and changes no
+    /// autonomy level. Enable this only where the room's editors are trusted
+    /// with the agent's configured capabilities.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub purpose_as_instructions: bool,
+}
+
+impl Default for MattermostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bot_token: None,
+            login_id: None,
+            password: None,
+            channel_ids: Vec::new(),
+            team_ids: Vec::new(),
+            discover_dms: None,
+            thread_replies: None,
+            mention_only: None,
+            interrupt_on_new_message: false,
+            proxy_url: None,
+            listen_mode: MattermostListenMode::default(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+            purpose_as_instructions: false,
+        }
+    }
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -26087,6 +26209,18 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn cache_passthrough_deserializes_and_defaults_to_omitted() {
+        let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
+        assert!(enabled.cache_passthrough);
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_passthrough"),
+            "default cache_passthrough must be omitted from serialized config"
+        );
+    }
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //

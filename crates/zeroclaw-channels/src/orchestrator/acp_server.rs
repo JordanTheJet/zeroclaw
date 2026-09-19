@@ -315,8 +315,37 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
     ) -> Result<Agent> {
+        let Some(store) = self.store.as_ref() else {
+            return if let ConfigSource::Live(live_config) = &self.config_source {
+                Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+                    Arc::clone(live_config),
+                    agent_alias,
+                    Some(workspace_dir),
+                    enable_mcp,
+                    true,
+                    true,
+                    self.sop_engine.clone(),
+                    self.sop_audit.clone(),
+                    self.canvas_store.clone(),
+                )
+                .await
+            } else {
+                Agent::from_config_with_session_cwd_and_mcp_backchannel(
+                    config,
+                    agent_alias,
+                    Some(workspace_dir),
+                    enable_mcp,
+                    true,
+                    true,
+                    self.sop_engine.clone(),
+                    self.sop_audit.clone(),
+                    self.canvas_store.clone(),
+                )
+                .await
+            };
+        };
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
                 Arc::clone(live_config),
                 agent_alias,
                 Some(workspace_dir),
@@ -327,10 +356,11 @@ impl AcpServer {
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
+                Arc::clone(store),
             )
             .await
         } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
                 config,
                 agent_alias,
                 Some(workspace_dir),
@@ -341,6 +371,7 @@ impl AcpServer {
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
+                Arc::clone(store),
             )
             .await
         }
@@ -1922,34 +1953,16 @@ impl AcpServer {
         // resume/restart replay the daemon RPC bridge already provides.
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
-            if let TurnEvent::Usage { input_tokens, .. } = &event {
-                if let (Some(store), Some(it)) = (&self.store, input_tokens) {
-                    let store = store.clone();
-                    let sid = session_id.clone();
-                    let it = *it;
-                    zeroclaw_spawn::spawn!(async move {
-                        let persisted =
-                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
-                                .await;
-                        let error = match persisted {
-                            Ok(Ok(())) => return,
-                            Ok(Err(e)) => e.to_string(),
-                            Err(join) => join.to_string(),
-                        };
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Write,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "input_tokens": it,
-                                "error": error,
-                            })),
-                            "Failed to persist ACP session token_count"
-                        );
-                    });
+            if let TurnEvent::Usage {
+                input_tokens,
+                accepted,
+                ..
+            } = &event
+            {
+                if let Some(store) = &self.store {
+                    let (tokens, is_accepted) = (*input_tokens, *accepted);
+                    persist_acp_usage_snapshot_ordered(store, &session_id, tokens, is_accepted)
+                        .await;
                 }
                 continue;
             }
@@ -3102,6 +3115,44 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
+/// Ordered, awaited durable write for one `TurnEvent::Usage`.
+///
+/// The ACP drain loop is sequential, so awaiting here preserves event order
+/// (accepted `Some` followed by accepted `None` clears) and guarantees
+/// completion before the prompt result. Rejected billing telemetry never
+/// touches the store; failures are best-effort WARN logs.
+async fn persist_acp_usage_snapshot_ordered(
+    store: &Arc<AcpSessionStore>,
+    session_id: &str,
+    input_tokens: Option<u64>,
+    accepted: bool,
+) {
+    let store = Arc::clone(store);
+    let sid = session_id.to_string();
+    let persisted = tokio::task::spawn_blocking(move || {
+        store.persist_usage_snapshot(&sid, input_tokens, accepted)
+    })
+    .await;
+    let error = match persisted {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(join) => Some(join.to_string()),
+    };
+    if let Some(error) = error {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write,)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "accepted": accepted,
+                    "error": error,
+                })),
+            "Failed to persist ACP session token_count"
+        );
+    }
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<JsonRpcNotification> {
     Some(match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -3249,6 +3300,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // it out-of-band. Keep this helper total even if a caller omits its
         // fast-path filter.
         TurnEvent::Usage { .. } => return None,
+        _ => return None,
     })
 }
 
@@ -3561,9 +3613,44 @@ mod tests {
             cached_input_tokens: Some(2),
             output_tokens: Some(3),
             cost_usd: Some(0.01),
+            provider_ref: "stub".into(),
+            model: "stub-model".into(),
+            accepted: true,
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_usage_snapshots_persist_in_event_order_before_result() {
+        // Accepted Some followed by accepted None must clear, not resurrect.
+        // The ordered drain awaits each write, so the clear is durable before
+        // the prompt result is returned and an immediate load/resume sees it.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-acp-usage-order";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        persist_acp_usage_snapshot_ordered(&store, session_id, None, true).await;
+
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less event must clear stale count immediately"
+        );
+
+        // Rejected billing telemetry must not touch the accepted snapshot.
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(5000), false).await;
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            1000,
+            "rejected usage is billing-only"
+        );
     }
 
     struct EmptyTerminalProvider;
@@ -4998,90 +5085,345 @@ mod tests {
         assert!(json.contains(r#""text":"hello""#));
     }
 
-    #[test]
-    fn acp_smoke_transcript_initialize_inbound_blob_outbound_delivery() {
-        // Scripted end-to-end smoke against the real in-process handlers:
-        // initialize -> inbound resource blob -> outbound deliver_file. Proves no
-        // base64 enters the prompt or the model output and that bytes stay in the
-        // workspace, keyed by content hash.
-        let ws = tempfile::tempdir().unwrap();
+    #[tokio::test]
+    async fn acp_smoke_transcript_initialize_inbound_blob_outbound_delivery() {
+        struct ScriptedDeliverFileProvider {
+            requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+            calls: std::sync::atomic::AtomicUsize,
+            forbidden_blobs: [String; 2],
+        }
 
-        // Phase 1 — initialize: ACP v1 shape, embeddedContext advertised.
-        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
-        let init = server
-            .handle_initialize(&serde_json::json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {},
-                "clientInfo": { "name": "smoke-client", "version": "1.0.0" }
-            }))
-            .unwrap();
-        assert_eq!(init["protocolVersion"], 1);
+        impl zeroclaw_api::attribution::Attributable for ScriptedDeliverFileProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "ScriptedDeliverFileProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ScriptedDeliverFileProvider {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("the ACP smoke must use structured native tool calling")
+            }
+
+            async fn chat(
+                &self,
+                request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+                self.requests.lock().push(request.messages.to_vec());
+                match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => {
+                        let deliver_file = request
+                            .tools
+                            .and_then(|tools| tools.iter().find(|tool| tool.name == "deliver_file"))
+                            .ok_or_else(|| anyhow::Error::msg("deliver_file was not offered"))?;
+                        anyhow::ensure!(
+                            deliver_file.parameters["required"].as_array().is_some_and(
+                                |required| required.iter().any(|value| value == "path")
+                            ),
+                            "deliver_file path requirement was not exposed"
+                        );
+                        Ok(zeroclaw_api::model_provider::ChatResponse {
+                            text: None,
+                            tool_calls: vec![ToolCall {
+                                id: "tc-deliver".to_string(),
+                                name: "deliver_file".to_string(),
+                                arguments: serde_json::json!({
+                                    "path": "out.pdf",
+                                    "mimeType": "application/pdf"
+                                })
+                                .to_string(),
+                                extra_content: None,
+                            }],
+                            usage: None,
+                            reasoning_content: None,
+                        })
+                    }
+                    1 => {
+                        let correlated_result = request.messages.iter().find(|message| {
+                            if message.role != "tool" {
+                                return false;
+                            }
+                            let Ok(value) = serde_json::from_str::<Value>(&message.content) else {
+                                return false;
+                            };
+                            value["tool_call_id"] == "tc-deliver"
+                                && value["content"].as_str().is_some_and(|content| {
+                                    content.contains("Delivered out.pdf")
+                                        && content.contains("attachment://deliver/")
+                                })
+                        });
+                        anyhow::ensure!(
+                            correlated_result.is_some(),
+                            "the correlated deliver_file result was not returned to the provider"
+                        );
+                        anyhow::ensure!(
+                            request.messages.iter().all(|message| self
+                                .forbidden_blobs
+                                .iter()
+                                .all(|blob| !message.content.contains(blob))),
+                            "base64 leaked into the provider-visible tool round"
+                        );
+                        Ok(zeroclaw_api::model_provider::ChatResponse {
+                            text: Some("Delivered the requested file.".to_string()),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        })
+                    }
+                    _ => anyhow::bail!("unexpected extra provider request"),
+                }
+            }
+        }
+
+        async fn response_for_id(
+            writer_rx: &mut tokio::sync::mpsc::Receiver<String>,
+            id: i64,
+        ) -> Value {
+            tokio::time::timeout(DEADLOCK_GUARD, async {
+                loop {
+                    let wire = writer_rx.recv().await.expect("ACP writer must remain open");
+                    let value: Value = serde_json::from_str(&wire).expect("valid JSON-RPC frame");
+                    if value.get("id").and_then(Value::as_i64) == Some(id) {
+                        return value;
+                    }
+                }
+            })
+            .await
+            .expect("ACP response deadline")
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let mut config = make_test_config(workspace.path());
+        config
+            .risk_profiles
+            .get_mut("default")
+            .expect("default risk profile")
+            .auto_approve
+            .push("deliver_file".to_string());
+        let server = Arc::new(AcpServer::new_with_writer(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+
+        server
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {},
+                        "clientInfo": { "name": "smoke-client", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let init = response_for_id(&mut writer_rx, 1).await;
+        assert_eq!(init["result"]["protocolVersion"], 1);
         assert_eq!(
-            init["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            init["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
             true
         );
 
-        // Phase 2 — inbound blob: client sends a resource+blob prompt; it is
-        // materialized under the workspace and the prompt text carries only a marker.
+        server
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": workspace.path().to_string_lossy(),
+                        "agentAlias": "test-agent"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let new_session = response_for_id(&mut writer_rx, 2).await;
+        let session_id = new_session["result"]["sessionId"]
+            .as_str()
+            .expect("session/new response must contain a session id")
+            .to_string();
+
+        let outbound = b"%PDF-outbound-doc";
+        let outbound_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, outbound);
         let inbound = b"%PDF-inbound-doc";
         let inbound_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, inbound);
-        let prompt_params = serde_json::json!({
-            "prompt": [{
-                "type": "resource",
-                "resource": {
-                    "uri": "file:///docs/in.pdf",
-                    "mimeType": "application/pdf",
-                    "blob": inbound_b64,
-                }
-            }]
-        });
-        let materialized = AcpServer::materialize_prompt(&prompt_params, Some(ws.path())).unwrap();
-        assert!(materialized.contains("[Document: in.pdf]"));
-        assert!(
-            !materialized.contains(&inbound_b64),
-            "base64 must not appear in the prompt text"
-        );
-        let inbound_files: Vec<_> = std::fs::read_dir(ws.path().join("uploads"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(inbound_files.len(), 1);
-        assert_eq!(std::fs::read(inbound_files[0].path()).unwrap(), inbound);
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session/new must register the session");
+        {
+            let mut session = session.lock().await;
+            session
+                .agent
+                .set_model_provider(Box::new(ScriptedDeliverFileProvider {
+                    requests: Arc::clone(&requests),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    forbidden_blobs: [inbound_b64.clone(), outbound_b64.clone()],
+                }));
+        }
 
-        // Phase 3 — outbound delivery: deliver_file yields a typed artifact; the ACP
-        // notification embeds the file as a resource blob keyed by its content hash.
-        let out_path = ws.path().join("out.pdf");
-        std::fs::write(&out_path, b"%PDF-outbound-doc").unwrap();
-        let event = TurnEvent::ToolResult {
-            id: "tc-deliver".into(),
-            name: "deliver_file".into(),
-            output: "Delivered out.pdf".into(),
-            artifact: Some(deliver_artifact(&out_path, "application/pdf", "", "")),
-        };
-        let n = notification_for_turn_event("smoke-session", &event).unwrap();
-        let content = n.params["update"]["content"].as_array().unwrap();
-        let resource = content
+        std::fs::write(workspace.path().join("out.pdf"), outbound).unwrap();
+        assert!(
+            !workspace.path().join("uploads").exists(),
+            "the smoke must not preload the inbound resource"
+        );
+
+        server
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": [{
+                            "type": "resource",
+                            "resource": {
+                                "uri": "file:///docs/in.pdf",
+                                "mimeType": "application/pdf",
+                                "blob": inbound_b64
+                            }
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let frames = tokio::time::timeout(DEADLOCK_GUARD, async {
+            let mut frames = Vec::new();
+            loop {
+                let wire = writer_rx.recv().await.expect("ACP writer must remain open");
+                let value: Value = serde_json::from_str(&wire).expect("valid JSON-RPC frame");
+                let is_prompt_response = value.get("id").and_then(Value::as_i64) == Some(3);
+                frames.push(value);
+                if is_prompt_response {
+                    return frames;
+                }
+            }
+        })
+        .await
+        .expect("session/prompt response deadline");
+
+        let prompt_response = frames
             .iter()
-            .find_map(|c| c.pointer("/content/resource"))
-            .expect("outbound resource");
+            .find(|frame| frame.get("id").and_then(Value::as_i64) == Some(3))
+            .expect("session/prompt response");
+        assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+        assert_eq!(
+            prompt_response["result"]["content"],
+            "Delivered the requested file."
+        );
+
+        let tool_call = frames
+            .iter()
+            .find(|frame| {
+                frame
+                    .pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("tool_call")
+            })
+            .expect("wire-visible tool_call notification");
+        let tool_update = frames
+            .iter()
+            .find(|frame| {
+                frame
+                    .pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("tool_call_update")
+            })
+            .expect("wire-visible tool_call_update notification");
+        assert_eq!(tool_call["params"]["update"]["toolCallId"], "tc-deliver");
+        assert_eq!(tool_update["params"]["update"]["toolCallId"], "tc-deliver");
+
+        let resource = tool_update["params"]["update"]["content"]
+            .as_array()
+            .expect("tool update content")
+            .iter()
+            .find_map(|content| content.pointer("/content/resource"))
+            .expect("outbound resource blob");
         let expected_uri = zeroclaw_runtime::tools::attachment_deliver_uri(
-            &acp_embedded::content_hash_name(b"%PDF-outbound-doc", "pdf"),
+            &acp_embedded::content_hash_name(outbound, "pdf"),
         );
         assert_eq!(resource["uri"], expected_uri);
-        let blob = resource["blob"].as_str().unwrap();
-        assert!(!blob.is_empty());
+        let wire_outbound_b64 = resource["blob"].as_str().expect("outbound blob");
         assert_eq!(
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob).unwrap(),
-            b"%PDF-outbound-doc"
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                wire_outbound_b64
+            )
+            .unwrap(),
+            outbound
         );
-        // The model-facing rawOutput never carries the base64 payload.
         assert!(
-            !n.params["update"]["rawOutput"]
+            !tool_update["params"]["update"]["rawOutput"]
                 .as_str()
-                .unwrap()
-                .contains(blob)
+                .expect("model-facing rawOutput")
+                .contains(wire_outbound_b64),
+            "rawOutput must not contain the delivered base64"
         );
+
+        let uploads: Vec<Vec<u8>> = std::fs::read_dir(workspace.path().join("uploads"))
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(
+            uploads.iter().any(|bytes| bytes == inbound),
+            "session/prompt must materialize the inbound resource"
+        );
+        assert!(
+            uploads.iter().any(|bytes| bytes == outbound),
+            "deliver_file must materialize the outbound resource"
+        );
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2, "one tool round plus one terminal round");
+        assert!(
+            requests[0]
+                .iter()
+                .any(|message| message.content.contains("[Document: in.pdf]"))
+        );
+        for request in requests.iter() {
+            for message in request {
+                assert!(!message.content.contains(&inbound_b64));
+                assert!(!message.content.contains(&outbound_b64));
+            }
+        }
     }
 
     #[test]
