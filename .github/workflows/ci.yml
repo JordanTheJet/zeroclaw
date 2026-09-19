@@ -24,30 +24,63 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
-# ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
-# The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
-# Linux `build` matrix entry pick their runner
-# from a single boolean Actions variable, mapped here to two pinned choices only:
-#   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
-#   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
-# The label is hard-coded in this reviewed workflow, so a mutable repo variable can only
-# flip between these two vetted runners — it can never redirect a required check to an
-# arbitrary runner without a `.github/**` review. An unexpected value fails safe to
-# ubuntu-latest. Only the boolean toggle is operator-controlled.
+# ── Runner selection: a checked-in label on each compile-heavy job ──────────
+# The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
+# installer-drift) and the Linux `build` matrix entry name their runner label
+# directly, so they start as soon as the run does.
+# `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
+# labels or their cache-provider inputs drift apart, so moving the fleet stays
+# one reviewed edit even though the constant is written more than once.
 #
-# PRECONDITION before setting CI_USE_BLACKSMITH=true: an org admin must DISABLE Blacksmith
-# triggerer SSH (Blacksmith → Settings → Features → SSH Access) so a green required check
-# attests only the reviewed commit, and that control must be attested in review. Requires
-# the Blacksmith GitHub App installed on the org; never set the toggle while the App is
-# uninstalled or these jobs queue with no runner (~24h) instead of failing fast.
+# WHY NOT read the label from a `fmt` output: `runs-on` resolves before a job is
+# created, so every compile job had to declare `needs: [fmt]` and wait for a
+# GitHub-hosted runner to pick up a 24-second formatting check first. On run
+# 34948990064 that put an 8.6-minute hosted queue wait in front of the whole
+# Blacksmith fan-out. `CI Required Gate` still needs `fmt`, so a formatting
+# error still blocks merge; it no longer delays compilation.
+#
+# WHY NOT the former `vars.CI_USE_BLACKSMITH` toggle: `vars` is unreadable in
+# fork-origin `pull_request` runs, and 90% of this repo's PRs are fork-origin.
+# The fail-closed expression therefore sent essentially every contributor PR to
+# ubuntu-latest, and handed the same unresolved value to the rust-cache
+# composite, which fell back to a GitHub Actions cache that master — now
+# building on Blacksmith — no longer writes. Fork PRs logged "No cache found."
+# while master logged "full match: true". Canary run 33809504331 confirmed both
+# halves directly: on a fork PR it printed CI_USE_BLACKSMITH='' yet still ran on
+# a blacksmith-8vcpu runner, so Blacksmith serves fork PRs and only the
+# expression was blocking. See #7108.
+#
+# TRADE-OFF, deliberate: no `vars`-based switch can govern fork PRs, so there is
+# no longer a runtime kill switch for that path — rolling back is a one-line
+# commit here rather than flipping a repo variable.
+#
+# UNCHANGED SAFETY PROPERTY: every rust-cache call still passes
+# `save-if: github.ref == 'refs/heads/master'`, so fork PRs remain cache READERS
+# only and cannot poison the cache master seeds.
+#
+# PRECONDITIONS: the Blacksmith GitHub App must stay installed on the org, or
+# these jobs queue with no runner (~24h) instead of failing fast. Blacksmith
+# triggerer SSH must remain DISABLED (Blacksmith → Settings → Features → SSH
+# Access) so a green required check attests only the reviewed commit; the
+# endpoint line in job logs is image-default with no authorized keys installed
+# and is not an exposure.
 
 jobs:
-  # ── Fast serial gate: fail formatting errors before burning compute ───────
+  # ── Required formatting check ────────────────────────────────────────────
+  # Ordering note: neither GitHub-hosted nor compile jobs wait on `fmt`.
+  # Path-detector and other job dependencies still apply. Compile jobs pin
+  # their runner and cache-provider inputs directly, without fmt outputs.
+  # `CI Required Gate` needs `fmt` directly, so formatting still blocks merge.
+  #
+  # TRADE-OFF, deliberate: a PR with a formatting error no longer skips the
+  # GitHub-hosted or compile jobs; they spend runner minutes before the gate
+  # reports red. In exchange, a slow `fmt` queue no longer delays their
+  # scheduling during a GitHub-hosted runner shortage.
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -60,8 +93,7 @@ jobs:
 
   history-guard:
     name: Common Ancestor
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -76,8 +108,7 @@ jobs:
 
   repo-structure:
     name: Repository Structure
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -129,11 +160,19 @@ jobs:
 
       - name: Test CLI and hardware path-label ownership
         run: bash scripts/ci/path_labeler_matrix.test.sh
+      - name: Test hardware feature test-lane contract
+        run: bash scripts/ci/hardware_feature_test_lane.test.sh
+
+      - name: Test release announcement composer
+        run: bash scripts/ci/release_post_text.test.sh
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # See the ordering note above `fmt` for which dependents still wait on it.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -173,7 +212,7 @@ jobs:
     name: Relay Container Fresh-Volume Smoke
     needs: [relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -190,12 +229,11 @@ jobs:
         shell: bash
         run: ZERORELAY_SMOKE_IMAGE=zerorelay:smoke bash scripts/ci/smoke_relay_fresh_volume.sh
 
-  # ── Post-format required quality gate ─────────────────────────────────────
+  # ── Required quality gate ─────────────────────────────────────────────────
 
   lint:
     name: Lint
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
@@ -210,7 +248,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -241,8 +279,11 @@ jobs:
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # See the ordering note above `fmt` for which dependents still wait on it.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -310,18 +351,17 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
-  # ── Post-format build + check fan-out ─────────────────────────────────────
+  # ── Build + check fan-out ─────────────────────────────────────────────────
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
-    needs: [fmt]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+          - os: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -342,7 +382,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+          use-blacksmith: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Linux system dependencies
@@ -409,8 +449,7 @@ jobs:
 
   check:
     name: Check (${{ matrix.name }})
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -418,10 +457,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: all features
-            args: --features ci-all
-            sys_deps: libudev-dev
-            rustflags: ""
           - name: no default features
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
@@ -443,7 +478,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -456,8 +491,7 @@ jobs:
 
   check-plugin-backends:
     name: Check (${{ matrix.name }})
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -465,10 +499,16 @@ jobs:
         include:
           - name: plugins cranelift backend
             features: plugins-wasm-cranelift
+            suite: components
+          - name: plugins cranelift runtime
+            features: plugins-wasm-cranelift
+            suite: runtime
           - name: plugins pulley backend
             features: plugins-wasm-pulley
+            suite: check
           - name: plugins runtime-only backend
             features: plugins-wasmtime
+            suite: check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -492,20 +532,22 @@ jobs:
       - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
+          # Keep the new runtime build separate from the existing backend caches.
+          shared-key: ${{ matrix.suite == 'runtime' && 'plugins-cranelift-runtime' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
-        if: steps.changed.outputs.run == 'true'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
       - name: Run plugins lib unit tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
       - name: Run runtime live-config plugin regressions
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         # Module filter, not a single test name: agent::plugin_live_config holds
         # every production-constructor live-config regression (direct Agent and
         # independently delegated registries today), and a filter pinned to one
@@ -518,19 +560,27 @@ jobs:
       # pre-construction collision refusal. Filters are passed after `--` because
       # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
       - name: Run runtime plugin admission regressions
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
       # Cross-crate activation proof. This lives in the root `zeroclaw` package
       # rather than the line above because it drives `zeroclaw-runtime`, which
       # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
       - name: Run channel plugin activation e2e
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: cargo test --locked --features plugins-wasm-cranelift --test plugin_channel_runtime_e2e
+      # Channel egress boundary proof (ADR-014 G2). A root target for the same
+      # crate-graph reason: it drives the production configured-channel path
+      # and asserts on real loopback socket hits, so this is the step that
+      # proves a granted destination is reached and an ungranted or wrong-host
+      # destination never sees a packet.
+      - name: Run channel egress boundary e2e
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
 
   msrv:
     name: MSRV (declared floor)
-    needs: [fmt, installer-drift]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    needs: [installer-drift]
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -553,7 +603,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -571,8 +621,7 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -583,7 +632,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
@@ -595,8 +644,14 @@ jobs:
 
   bench:
     name: Benchmarks Compile
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
+    # without running it. Zero failures across 22 red runs and no bench-fix
+    # commit in 6 months, and its narrow form was introduced by #8896 as a
+    # measurement slice for #7108 rather than as coverage. Master, merge-queue
+    # and manual runs still execute it, so benches cannot rot undetected before
+    # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
+    if: github.event_name != 'pull_request'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -606,7 +661,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -646,12 +701,11 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
-  # ── Post-format tests ─────────────────────────────────────────────────────
+  # ── Tests ─────────────────────────────────────────────────────────────────
 
   test:
     name: Test
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -662,7 +716,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check firmware protocol crate
@@ -678,45 +732,61 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-wechat` is outside `default-channels` and `channels-full`, so
-      # the workspace run above compiles neither the module nor its unit tests.
-      # Adding it to `ci-all` gives Lint and Check compile coverage; this step
-      # is what actually executes the tests.
-      - name: Run WeChat channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+      # The crate's default feature set excludes the host-side hardware
+      # modules. Compile-only `ci-all` coverage cannot exercise their process,
+      # timeout, cleanup, and validation regressions.
+      - name: Run hardware feature lib unit tests
+        run: cargo nextest run --locked --no-fail-fast -p zeroclaw-hardware --features hardware --lib
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-lark` is outside `default-channels`, so the workspace run above
-      # does not execute Lark's feature-gated library regressions. This step
-      # exercises the URL-verification handler coverage added by PR #9110.
-      - name: Run Lark channel URL-verification tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-matrix` is outside `default-channels`, so the workspace run
-      # above does not execute Matrix's feature-gated library regressions. This
-      # step is what actually executes them.
-      - name: Run Matrix channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-qq` is outside `default-channels`, so the workspace run above
-      # does not execute QQ's feature-gated library regressions. This step is
-      # what actually executes the health probe's tests.
-      - name: Run QQ channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check"
+
+  # Feature configurations keep their original defaults and test filters.
+  # In particular, Lark runs without defaults and QQ excludes live-auth tests.
+  test-channel-features:
+    name: Test (channel ${{ matrix.name }})
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: WeChat
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+          - name: Lark
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+          - name: Matrix
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+          - name: QQ
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'true'
+          shared-key: channel-feature-${{ matrix.name }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run channel feature tests
+        run: ${{ matrix.command }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   windows-test-scope:
     name: Advisory Windows test selection
-    needs: [fmt]
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}
@@ -838,6 +908,7 @@ jobs:
           plugin_gateway_log="$RUNNER_TEMP/windows-plugin-gateway-nextest.log"
           plugin_cli_log="$RUNNER_TEMP/windows-plugin-cli-nextest.log"
           plugin_root_log="$RUNNER_TEMP/windows-plugin-root-nextest.log"
+          hardware_log="$RUNNER_TEMP/windows-hardware-nextest.log"
           case "$MODE" in
             scoped)
               package_args_file="$RUNNER_TEMP/windows-package-args"
@@ -870,6 +941,12 @@ jobs:
           esac
 
           baseline_duration=$((SECONDS - started_at))
+          hardware_started_at=$SECONDS
+          set +e
+          cargo nextest run --locked --no-fail-fast -p zeroclaw-hardware --features hardware --lib 2>&1 | tee "$hardware_log"
+          hardware_status=${PIPESTATUS[0]}
+          set -e
+          hardware_duration=$((SECONDS - hardware_started_at))
           plugin_host_status=0
           plugin_host_duration=0
           plugin_components_status=not-run
@@ -925,7 +1002,8 @@ jobs:
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
-              --test plugin_channel_runtime_e2e 2>&1 | tee "$plugin_root_log"
+              --test plugin_channel_runtime_e2e \
+              --test channel_egress_e2e 2>&1 | tee "$plugin_root_log"
             plugin_root_status=${PIPESTATUS[0]}
             set -e
             plugin_host_duration=$((SECONDS - plugin_started_at))
@@ -935,12 +1013,18 @@ jobs:
           fi
 
           overall_status=$baseline_status
+          if (( hardware_status != 0 )); then
+            overall_status=1
+          fi
           if (( plugin_host_status != 0 )); then
             overall_status=1
           fi
           failure_inventory=""
           if (( baseline_status != 0 )); then
             failure_inventory="baseline"
+          fi
+          if (( hardware_status != 0 )); then
+            failure_inventory="${failure_inventory:+$failure_inventory,}hardware"
           fi
           if [[ "$plugin_components_status" != "not-run" && "$plugin_components_status" != "0" ]]; then
             failure_inventory="${failure_inventory:+$failure_inventory,}plugin-components"
@@ -977,6 +1061,7 @@ jobs:
             printf "| Reason | %s |\n" "$REASON"
             printf "| Plugin host required | %s |\n" "$NEEDS_PLUGIN_HOST"
             printf "| Baseline status | %s |\n" "$baseline_status"
+            printf "| Hardware feature status | %s |\n" "$hardware_status"
             printf "| Plugin-host component status | %s |\n" "$plugin_components_status"
             printf "| Plugin-host library status | %s |\n" "$plugin_lib_status"
             printf "| Plugin-host runtime config status | %s |\n" "$plugin_runtime_config_status"
@@ -986,16 +1071,67 @@ jobs:
             printf "| Plugin-host root status | %s |\n" "$plugin_root_status"
             printf "| Failure inventory | %s |\n" "$failure_inventory"
             printf "| Baseline duration | %ss |\n" "$baseline_duration"
+            printf "| Hardware feature duration | %ss |\n" "$hardware_duration"
             printf "| Plugin-host duration | %ss |\n" "$plugin_host_duration"
             printf "| Total duration | %ss |\n" "$total_duration"
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit "$overall_status"
 
+  memory-postgres-test:
+    name: Test (PostgreSQL Memory)
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73 # 17.11-alpine3.24
+        env:
+          POSTGRES_USER: zeroclaw_test
+          POSTGRES_PASSWORD: zeroclaw_test
+          POSTGRES_DB: zeroclaw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zeroclaw_test -d zeroclaw_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        id: rust-cache
+        with:
+          use-blacksmith: 'true'
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install mold linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run memory-postgres feature tests
+        run: cargo nextest run --locked -p zeroclaw-memory --features memory-postgres
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Run PostgreSQL acceptance tests
+        run: cargo test --locked -p zeroclaw-memory --features memory-postgres -- --ignored --test-threads=1
+        env:
+          ZEROCLAW_TEST_POSTGRES_URL: postgres://zeroclaw_test:zeroclaw_test@127.0.0.1:5432/zeroclaw_test
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # See the ordering note above `fmt` for which dependents still wait on it.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -1039,7 +1175,7 @@ jobs:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1049,7 +1185,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           shared-key: test
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -1066,7 +1202,6 @@ jobs:
 
   test-landlock:
     name: Test (Landlock)
-    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1091,12 +1226,11 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # ── Post-format security checks ───────────────────────────────────────────
+  # ── Security checks ───────────────────────────────────────────────────────
 
   security:
     name: Security
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1151,8 +1285,11 @@ jobs:
   # skipped, so a job that should run never is.
   path-changes:
     name: Detect changed paths
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # See the ordering note above `fmt` for which dependents still wait on it.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
@@ -1198,9 +1335,9 @@ jobs:
 
           # Any change to this workflow re-runs all gated families.
           wf='^\.github/workflows/ci\.yml$'
-          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/(check_internal_docs_links(_test)?\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
-          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
+          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys(_test)?\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
           # config, runtime, and SOP graph crates and is rendered by the xtask generator.
           # Keep this trigger aligned with every source that can change it.
@@ -1210,7 +1347,7 @@ jobs:
     name: Nix Module Eval
     needs: [path-changes]
     if: needs.path-changes.outputs.nix == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1225,49 +1362,20 @@ jobs:
     name: Nix Hash Drift
     needs: [path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test Nix hash drift detection
+        run: python3 scripts/ci/list_git_dep_keys_test.py
       - name: Validate nix/hashes.json matches Cargo.lock git deps
-        run: |
-          set -euo pipefail
-          if [[ ! -f Cargo.lock ]]; then
-            echo "Cargo.lock not found; nothing to check."
-            exit 0
-          fi
-          # Extract git-dep keys from Cargo.lock using the same Python
-          # logic as refresh-nix-hashes.sh.
-          python3 scripts/ci/list_git_dep_keys.py > /tmp/lock_keys.json
-          LOCK_COUNT=$(jq length /tmp/lock_keys.json)
-          echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
-          if [[ "$LOCK_COUNT" -eq 0 ]]; then
-            echo "No git deps; nothing to check."
-            exit 0
-          fi
-          if [[ ! -f nix/hashes.json ]]; then
-            echo "error: nix/hashes.json not found — git deps present but no hashes file."
-            exit 1
-          fi
-          HASH_KEYS=$(jq 'keys' nix/hashes.json)
-          MISSING=$(jq -n --argjson lock "$(cat /tmp/lock_keys.json)" \
-            --argjson hash "$HASH_KEYS" \
-            '$lock - $hash')
-          MISSING_COUNT=$(echo "$MISSING" | jq length)
-          if [[ "$MISSING_COUNT" -gt 0 ]]; then
-            echo "error: $MISSING_COUNT git-dep hash(es) missing from nix/hashes.json:"
-            echo "$MISSING" | jq -r '.[]'
-            echo ""
-            echo "Run scripts/dev/refresh-nix-hashes.sh and commit the result."
-            exit 1
-          fi
-          echo "All git deps have hashes in nix/hashes.json."
+        run: python3 scripts/ci/list_git_dep_keys.py --check-hashes nix/hashes.json
 
   docs-style:
     name: Docs Style
     needs: [path-changes]
     if: needs.path-changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1284,11 +1392,14 @@ jobs:
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_links_gate.sh
+      - name: Docs link gate (all internal links)
+        run: python3 scripts/ci/check_internal_docs_links.py
+      - name: Docs link checker unit tests
+        run: python3 scripts/ci/check_internal_docs_links_test.py
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1313,8 +1424,7 @@ jobs:
 
   installer-drift:
     name: Installer Drift
-    needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
@@ -1328,7 +1438,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: 'true'
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
@@ -1350,7 +1460,7 @@ jobs:
     name: Web Permission Tests
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1386,8 +1496,8 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
-    runs-on: ubuntu-latest
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
         run: |

@@ -1162,11 +1162,7 @@ impl DelegateTool {
 
         let profile = self.risk_profiles.get(risk_profile)?;
         Some(SecurityPolicy {
-            allowed_tools: if profile.allowed_tools.is_empty() {
-                None
-            } else {
-                Some(profile.allowed_tools.clone())
-            },
+            allowed_tools: profile.effective_allowed_tools(),
             excluded_tools: if profile.excluded_tools.is_empty() {
                 None
             } else {
@@ -3972,7 +3968,9 @@ mod tests {
     use crate::control_plane::{
         ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     };
-    use crate::platform::{NativeRuntime, RuntimeAdapter};
+    #[cfg(unix)]
+    use crate::platform::NativeRuntime;
+    use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
@@ -5313,17 +5311,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct IndependentRiskPolicyModelProvider {
         tool_messages: std::sync::Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl IndependentRiskPolicyModelProvider {
         fn tool_messages(&self) -> Vec<String> {
             self.tool_messages.lock().unwrap().clone()
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ModelProvider for IndependentRiskPolicyModelProvider {
         async fn chat_with_system(
@@ -5382,6 +5383,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl ::zeroclaw_api::attribution::Attributable for IndependentRiskPolicyModelProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -5616,6 +5618,25 @@ mod tests {
 
     fn agentic_risk_profiles(allowed_tools: Vec<String>) -> HashMap<String, RiskProfileConfig> {
         agentic_risk_profiles_with_excluded(allowed_tools, Vec::new())
+    }
+
+    fn agentic_risk_profiles_deny_all() -> HashMap<String, RiskProfileConfig> {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        profiles
+    }
+
+    fn agentic_risk_profiles_legacy_deny_all() -> HashMap<String, RiskProfileConfig> {
+        agentic_risk_profiles(vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+        ])
     }
 
     fn agentic_risk_profiles_with_excluded(
@@ -6721,6 +6742,62 @@ mod tests {
 
         assert!(result.success, "got: {:?}", result.error);
         assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_deny_all_tools_flag_is_deny_all() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_deny_all())
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+            ])));
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "echo_tool"),
+            "deny_all_tools must deny built-ins"
+        );
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "server__tool"),
+            "deny_all_tools must deny MCP names; the __ auto-admit is nonempty-allowlist only"
+        );
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_legacy_none_sentinel_is_deny_all() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_legacy_deny_all());
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "echo_tool"
+        ));
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "server__tool"
+        ));
     }
 
     #[tokio::test]

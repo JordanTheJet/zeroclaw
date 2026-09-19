@@ -5,7 +5,11 @@ use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
-const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
+/// Prefix the tool loop puts on the user-role message that carries prompt-mode
+/// tool results (see `history_append::append_tool_round_to_history`). Typed
+/// replay preserves that carrier as an ordinary user chat, so span selectors
+/// must not mistake it for the user prompt that opened a turn.
+pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
@@ -975,5 +979,120 @@ mod tests {
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+    }
+
+    #[test]
+    fn five_image_tool_results_in_one_round_are_budgeted_as_images() {
+        use crate::agent::history::IMAGE_TOKEN_ESTIMATE;
+
+        let assistant_tool_calls = serde_json::json!({
+            "content": "",
+            "tool_calls": (0..5)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": format!("call_{index}"),
+                        "name": "image_info",
+                        "arguments": "{}",
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+
+        let image_history = |tool_contents: Vec<String>| {
+            vec![
+                sys("system"),
+                user(&format!("old turn {}", "x".repeat(8_000))),
+                asst("old answer"),
+                user("new turn"),
+                asst(&assistant_tool_calls),
+            ]
+            .into_iter()
+            .chain(tool_contents.into_iter().map(|content| tool(&content)))
+            .collect::<Vec<ChatMessage>>()
+        };
+
+        // Path markers: five images coming back in one native-tool round.
+        let history = image_history(
+            (0..5)
+                .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+                .collect(),
+        );
+        assert!(
+            estimate_history_tokens(&history) >= 5 * IMAGE_TOKEN_ESTIMATE,
+            "five image tool results must be budgeted as five images"
+        );
+
+        let result = trim_to_recent_turns(history, 5 * IMAGE_TOKEN_ESTIMATE + 1_000);
+        assert!(result.trimmed, "the old text turn must be dropped to fit");
+        assert_eq!(result.dropped_turns, 1);
+        assert!(
+            !result
+                .history
+                .iter()
+                .any(|m| m.content.contains("old turn")),
+            "the old turn should be dropped"
+        );
+        assert!(
+            result
+                .history
+                .iter()
+                .any(|m| m.content.contains("new turn")),
+            "the newest turn head must survive"
+        );
+        assert_eq!(
+            result.history.iter().filter(|m| m.role == "tool").count(),
+            5,
+            "the newest round must keep all five image results whole"
+        );
+
+        // The same round as ~600 KB data URIs: per-image pricing keeps the
+        // history under a 20k budget, where per-byte pricing would see ~150k
+        // tokens per result and throw the old turn away.
+        let history = image_history(
+            (0..5)
+                .map(|_| format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(600_000)))
+                .collect(),
+        );
+        let before = history.len();
+        let result = trim_to_recent_turns(history, 20_000);
+        assert!(
+            !result.trimmed,
+            "data-URI markers must price like the path form, not like bytes/4"
+        );
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.history.len(), before);
+        assert!(
+            result
+                .history
+                .iter()
+                .any(|m| m.content.contains("old turn")),
+            "nothing should be dropped when the estimate fits the budget"
+        );
+    }
+
+    #[test]
+    fn stale_tool_images_do_not_force_a_trim() {
+        let markers: Vec<String> = (0..30)
+            .map(|index| format!("[IMAGE:/tmp/stale-{index}.png]"))
+            .collect();
+        // The latest message is a genuine user turn, so the whole tool run is
+        // stale and preparation strips every marker before dispatch.
+        let history = vec![
+            sys("s"),
+            user("u"),
+            asst("a"),
+            tool(&markers.join("\n")),
+            user("v"),
+        ];
+
+        let result = trim_to_recent_turns(history, 32_000);
+
+        assert!(
+            !result.trimmed,
+            "stale tool images are stripped before dispatch and must not force a trim"
+        );
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.history.len(), 5);
     }
 }

@@ -15,6 +15,18 @@ cli-models-about = Gérer les catalogues de modèles des fournisseurs
 cli-providers-about = Lister les fournisseurs d'IA pris en charge
 cli-channel-about = Gérer les canaux de communication
 cli-integrations-about = Parcourir plus de 50 intégrations
+cli-integrations-unknown = Intégration inconnue : {$name}. Consultez le README pour connaître les intégrations prises en charge ou exécutez {$quickstart} pour configurer un fournisseur de modèles, puis utilisez {$channel_config} pour les canaux.
+cli-integrations-category-heading = Catégorie
+cli-integrations-category-chat = Fournisseurs de chat
+cli-integrations-category-ai-model = Modèles d’IA
+cli-integrations-category-tools-automation = Outils et automatisation
+cli-integrations-category-platform = Plateformes
+cli-integrations-status-heading = Statut
+cli-integrations-status-active = Actif
+cli-integrations-status-available = Disponible
+cli-integrations-setup-heading = Configuration
+cli-integrations-setup-macos-heading = Configuration (macOS uniquement)
+cli-integrations-builtin-heading = Intégrée
 cli-skills-about = Gérer les compétences (capacités définies par l'utilisateur)
 cli-sop-about = Gérer les procédures opérationnelles standard (SOP)
 cli-migrate-about = Migrer les données depuis d'autres runtimes d'agents
@@ -189,6 +201,7 @@ cli-acp-long-about =
 
     Exemples :
     zeroclaw acp                        # démarrer le serveur ACP
+    zeroclaw acp --agent fable         # utiliser fable comme agent par défaut pour les nouvelles sessions
     zeroclaw acp --max-sessions 5       # limiter les sessions concurrently
 cli-daemon-long-about =
     Démarrer le daemon autonome longue durée.
@@ -854,6 +867,8 @@ cli-models-status-none = Aucun modèle par défaut configuré.
 turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
+turn-failed = [échec du tour]
+turn-failed-attachment-omitted = [pièce jointe omise : le fournisseur l'a rejetée lors du tour en échec]
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) était indisponible ; cette réponse a été générée par { $actual_model } ({ $actual_provider }).
 turn-max-iterations-reached = *Tour arrêté : nombre maximal d’itérations d’outils atteint ({ $max_iterations }).*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -873,6 +888,8 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ Cette ligne est trop vol
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
+channel-runtime-stop-folded-followup = Rien à arrêter ici : cette réponse a été fusionnée avec le message précédent auquel elle répond, toujours en cours de traitement. Envoyez /stop dans cette conversation pour l'annuler.
+channel-runtime-conversation-busy = Cette conversation compte trop de messages en attente ; celui-ci a été ignoré. Attendez une réponse ou envoyez /stop pour vider vos demandes en file.
 channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.

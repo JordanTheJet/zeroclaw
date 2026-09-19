@@ -1404,17 +1404,18 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, format!("{e:#}"));
+                    let error_chain = format!("{e:#}");
+                    crate::health::mark_component_error(name, &error_chain);
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{e:#}"),
+                                "error": &error_chain,
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e:#}")
+                        &format!("Daemon component '{name}' failed: {error_chain}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -2736,6 +2737,17 @@ mod tests {
         config.agents.insert(agent_alias.to_string(), agent);
     }
 
+    /// Hold the process-global log broadcast still for a daemon lifecycle test.
+    ///
+    /// `run` calls `set_broadcast_hook`, replacing the sender every
+    /// log-assertion test subscribed to, and those tests only serialize
+    /// against each other. A lifecycle test that calls `run` without this lock
+    /// closes their receiver mid-read, which surfaces as a missing log event.
+    #[must_use]
+    fn hold_log_broadcast() -> impl Drop {
+        zeroclaw_log::__private_test_hook_lock()
+    }
+
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
@@ -2754,7 +2766,12 @@ mod tests {
                     return value;
                 }
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                // A closed channel means the global broadcast hook was replaced
+                // or cleared, not that the record was slow; keep that distinct
+                // from a deadline miss so the failure names the real cause.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before event arrived: {message}");
+                }
                 Err(_elapsed) => {}
             }
         }
@@ -3156,6 +3173,37 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_preserves_component_error_chain() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
+                Err(anyhow::Error::msg("provider entry has no model")
+                    .context("agents.ox.model_provider"))
+            });
+
+        let expected_chain = "agents.ox.model_provider: provider entry has no model";
+        let expected_message =
+            format!("Daemon component 'daemon-test-error-chain' failed: {expected_chain}");
+        let value = recv_log_event(&mut rx, &expected_message).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(value["attributes"]["error"], expected_chain);
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(
+            snapshot["components"]["daemon-test-error-chain"]["last_error"],
+            expected_chain
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -3338,6 +3386,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3388,6 +3437,8 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
+                purpose_as_instructions: false,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -3639,6 +3690,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3668,6 +3720,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3747,8 +3800,10 @@ mod tests {
         assert_eq!(result, DaemonExit::Reload);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3819,10 +3874,12 @@ mod tests {
         assert!(has_tui_registry);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
+        let _broadcast_guard = hold_log_broadcast();
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -3899,12 +3956,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_invalid_input_fails_daemon_startup() {
         use std::io;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -3946,6 +4005,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn socket_addr_in_use_after_readiness_stays_supervised() {
         use std::io;
@@ -3953,6 +4013,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -4002,12 +4063,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -4079,10 +4142,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;
