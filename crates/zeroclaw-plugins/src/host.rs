@@ -548,6 +548,15 @@ fn resolve_confined_wasm_path(
     })
 }
 
+/// Largest executable payload admission will read into memory.
+///
+/// Discovery and install read a whole payload before its digest is verified or
+/// it is compiled, so without a bound an oversized file is fully retained
+/// before anything has a chance to reject it. 64 MiB clears real WASM
+/// components — including debug-info builds — by a wide margin while keeping
+/// a single malformed or hostile package from exhausting memory.
+const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Read a payload anchored to the package root that admitted it. This keeps
 /// the checked admission read tied to that root; it does not claim to close
 /// every filesystem namespace race.
@@ -580,11 +589,20 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
         )));
     }
 
-    let mut file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let file = std::fs::File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
         return Err(PluginError::InvalidManifest(format!(
             "WASM payload is not a regular file: {}",
             path.display()
+        )));
+    }
+
+    if opened_metadata.len() > MAX_COMPONENT_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload exceeds the {MAX_COMPONENT_BYTES}-byte admission limit: {} is {} bytes",
+            path.display(),
+            opened_metadata.len()
         )));
     }
 
@@ -611,8 +629,19 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
         return Err(swapped());
     }
 
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    // Bound the read, not just the stat above: the payload can grow between the
+    // size check and this read. Taking one byte past the limit makes an
+    // oversized payload detectable without retaining more than that.
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened_metadata.len().min(MAX_COMPONENT_BYTES)).unwrap_or(0),
+    );
+    file.take(MAX_COMPONENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_COMPONENT_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload grew past the {MAX_COMPONENT_BYTES}-byte admission limit while being read: {}",
+            path.display()
+        )));
+    }
     Ok(bytes)
 }
 
@@ -1742,6 +1771,47 @@ capabilities = ["tool"]
             read_stable_file(&confined),
             Err(PluginError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn stable_payload_read_rejects_a_payload_over_the_admission_limit() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // Sparse: reports an oversized length without writing the bytes, so the
+        // stat-side rejection is exercised without allocating 64 MiB in a test.
+        let payload = package.join("plugin.wasm");
+        let file = std::fs::File::create(&payload).unwrap();
+        file.set_len(MAX_COMPONENT_BYTES + 1).unwrap();
+        drop(file);
+
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+        let read = read_stable_file(&confined);
+
+        let Err(PluginError::InvalidManifest(message)) = read else {
+            panic!("oversized payload was admitted: {read:?}");
+        };
+        assert!(
+            message.contains("admission limit"),
+            "rejection should name the limit, got: {message}"
+        );
+    }
+
+    #[test]
+    fn stable_payload_read_admits_a_payload_at_the_admission_limit() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // The boundary itself is allowed: the limit rejects what exceeds it, not
+        // what reaches it. Kept small-but-real so the read path is exercised.
+        let payload = package.join("plugin.wasm");
+        let contents = vec![7u8; 4096];
+        std::fs::write(&payload, &contents).unwrap();
+
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+        assert_eq!(read_stable_file(&confined).unwrap(), contents);
     }
 
     #[cfg(unix)]
