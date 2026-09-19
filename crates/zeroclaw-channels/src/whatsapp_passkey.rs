@@ -145,8 +145,11 @@ struct PasskeyConfirmationAck {
 ///
 /// * **Atomic.** A plain write leaves a window where a reader sees a truncated
 ///   JSON document. Writing to a sibling temp file and renaming is atomic
-///   within a directory on POSIX, so a reader observes either the previous
-///   contents or the complete new ones, never a partial document.
+///   within a directory, so a reader observes either the previous contents or
+///   the complete new ones, never a partial document. Tokio delegates to
+///   `std::fs::rename`, which replaces an existing file on Windows too (using
+///   `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`). Do not unlink the request
+///   first: that would introduce a gap in which no request is visible.
 /// * **Owner-only.** The mode is applied at creation rather than after the
 ///   write, so the file is never briefly readable at the prevailing umask. The
 ///   temp file is created with `create_new`, so a pre-existing path (a stale
@@ -934,6 +937,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_waiter_request_is_replaced_on_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session.db").to_string_lossy().into_owned();
+        let request_file = request_path(&session);
+        let assertion_file = assertion_path(&session);
+        let auth = Arc::new(FilePasskeyAuthenticator::new(&session));
+        let first_request = assertion_request(&[1]);
+        let first_options = first_request.raw_options_json.clone();
+        let first = {
+            let auth = Arc::clone(&auth);
+            zeroclaw_spawn::spawn!(async move { auth.get_assertion(&first_request).await })
+        };
+        wait_for_contents(&request_file, &first_options).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        drop(auth);
+        assert_eq!(
+            tokio::fs::read_to_string(&request_file).await.unwrap(),
+            first_options
+        );
+
+        // A new process can encounter both the last published request and an
+        // incomplete publication. Neither may prevent the next handoff.
+        tokio::fs::write(publication_path(&request_file), b"partial request")
+            .await
+            .unwrap();
+        let request = assertion_request(&[2]);
+        let options = request.raw_options_json.clone();
+        let replacement = zeroclaw_spawn::spawn!({
+            let session = session.clone();
+            async move {
+                FilePasskeyAuthenticator::new(session)
+                    .with_wait(Duration::from_secs(5))
+                    .get_assertion(&request)
+                    .await
+            }
+        });
+        wait_for_contents(&request_file, &options).await;
+        assert!(
+            !tokio::fs::try_exists(publication_path(&request_file))
+                .await
+                .unwrap()
+        );
+
+        let raw_id = BASE64_URL_SAFE_NO_PAD.encode(b"replacement-credential");
+        tokio::fs::write(
+            &assertion_file,
+            credential_json_for_challenge(&raw_id, "c2ln", &[2]),
+        )
+        .await
+        .unwrap();
+        let assertion = tokio::time::timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("the restarted broker must accept its assertion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(assertion.credential_id, b"replacement-credential");
+        assert!(!tokio::fs::try_exists(&request_file).await.unwrap());
+        assert!(!tokio::fs::try_exists(&assertion_file).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn partial_manual_assertion_is_not_consumed_before_write_finishes() {
         use tokio::io::AsyncWriteExt as _;
 
@@ -982,13 +1047,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_published_request_is_owner_only_and_leaves_no_temp_behind() {
+    async fn publishing_replaces_existing_request_with_private_complete_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir
             .path()
             .join("session.db.passkey-request.json")
             .to_string_lossy()
             .into_owned();
+
+        tokio::fs::write(&target, br#"{"challenge":"old"}"#)
+            .await
+            .unwrap();
 
         publish_private(&target, br#"{"challenge":"AQID"}"#)
             .await
