@@ -141,21 +141,27 @@ where
         mut pending,
     } = session;
     loop {
-        let (mut response, request_failed) =
-            match route(&head, &mut stream, &mut pending, &inner).await {
-                Ok(bytes) => (bytes, false),
-                // An error response may leave the request body unconsumed (an oversized
-                // or truncated body, or a body on a route that never reads one), so the
-                // stream is no longer at a request boundary. Answer if we still can,
-                // then CLOSE - never keep-alive into unsynchronized bytes and parse
-                // them as the next request head.
-                Err(status) => (status, true),
+        // Whether this request's declared body has been consumed - i.e. whether the
+        // stream is still at a request boundary. A route that reads the body sets
+        // it; routes that do not (the asset arms, the catch-all 404) leave it, and
+        // the drain below decides. `Err` from `route` is NOT the same question: a
+        // 404 to a bodyless GET is an error response on a perfectly synchronized
+        // stream, while an Ok asset response to a GET carrying `content-length` is
+        // a success on a desynchronized one.
+        let mut body_consumed = content_length(&head).unwrap_or(0) == 0;
+        let mut response =
+            match route(&head, &mut stream, &mut pending, &inner, &mut body_consumed).await {
+                Ok(bytes) | Err(bytes) => bytes,
             };
-        // Keep-alive only after a clean, fully-consumed request; a failed request
-        // or an explicit close ends the connection. Tell the client so, rather
-        // than leaving the shared builder's `keep-alive` on a response we then
-        // close underneath.
-        let close = request_failed || should_close_after_response(&head);
+        // If the route never read the declared body, drain it so the next read
+        // starts on a request head rather than on body bytes. Unbounded or
+        // unreadable => the stream cannot be resynchronized, so close.
+        let synchronized =
+            body_consumed || drain_request_body(&head, &mut stream, &mut pending).await;
+        // Keep-alive only while the stream is genuinely at a request boundary.
+        // Tell the client when it is not, rather than leaving the shared builder's
+        // `keep-alive` on a response we then close underneath.
+        let close = !synchronized || should_close_after_response(&head);
         if close {
             response = mark_connection_close(response);
         }
@@ -184,11 +190,16 @@ where
 }
 
 /// Dispatch one request. `Err` carries an already-rendered error response.
+///
+/// `body_consumed` is set when an arm reads the declared request body to
+/// completion, so the caller can tell a synchronized stream from a
+/// desynchronized one - a question independent of whether this returns `Err`.
 async fn route<S>(
     head: &[u8],
     stream: &mut S,
     pending: &mut Vec<u8>,
     inner: &Arc<Inner>,
+    body_consumed: &mut bool,
 ) -> std::result::Result<Vec<u8>, Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -212,7 +223,7 @@ where
             APP_JS,
         )),
         ("POST", "/enroll/ca") => {
-            let body = read_body(head, stream, pending).await?;
+            let body = read_body(head, stream, pending, body_consumed).await?;
             let parsed: enroll_proxy::TrustBody = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return Err(json_error(400, "malformed request body")),
@@ -223,7 +234,7 @@ where
             }
         }
         ("POST", "/enroll") => {
-            let body = read_body(head, stream, pending).await?;
+            let body = read_body(head, stream, pending, body_consumed).await?;
             let parsed: enroll_proxy::EnrollBody = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return Err(json_error(400, "malformed request body")),
@@ -278,6 +289,7 @@ async fn read_body<S>(
     head: &[u8],
     stream: &mut S,
     pending: &mut Vec<u8>,
+    body_consumed: &mut bool,
 ) -> std::result::Result<Vec<u8>, Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -298,7 +310,41 @@ where
         pending.extend_from_slice(&chunk[..n]);
     }
     let rest = pending.split_off(len);
+    // The declared body is now fully in hand, so the stream sits on the next
+    // request head - whatever this route does with the bytes.
+    *body_consumed = true;
     Ok(std::mem::replace(pending, rest))
+}
+
+/// Swallow a declared body that the route never read, so keep-alive resumes on a
+/// request head rather than on body bytes.
+///
+/// Returns whether the stream ended up at a request boundary. A body over the
+/// cap is NOT drained - draining it is exactly the unbounded read the cap
+/// exists to prevent - so an oversized declaration closes the connection
+/// instead. This is what keeps `GET /app.js` carrying a `content-length`, or a
+/// 404 to a bodied request, from desynchronizing the session.
+async fn drain_request_body<S>(head: &[u8], stream: &mut S, pending: &mut Vec<u8>) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let len = content_length(head).unwrap_or(0);
+    if len == 0 {
+        return true;
+    }
+    if len > MAX_FRONTDOOR_REQUEST_BYTES {
+        return false;
+    }
+    let mut chunk = [0u8; 4096];
+    while pending.len() < len {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let rest = pending.split_off(len);
+    *pending = rest;
+    true
 }
 
 fn content_length(head: &[u8]) -> Option<usize> {
@@ -551,6 +597,95 @@ mod tests {
     fn websocket_upgrade_is_detected() {
         let head = b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_websocket_upgrade(head));
+    }
+
+    /// The mirror of the test below, and the case an `Err`-based predicate misses:
+    /// an asset route answers `Ok` WITHOUT reading a declared body, so those body
+    /// bytes must be drained rather than parsed as the next request head.
+    ///
+    /// Here the body IS a request (`GET /`), which a desynchronized session would
+    /// answer with the enrollment page. Regression for Aarlington's finding that
+    /// `request_failed` meant "route returned Err", not "stream is at a boundary".
+    #[tokio::test]
+    async fn a_body_on_an_asset_route_is_drained_not_parsed_as_a_request() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // A smuggled request, carried as the BODY of a GET that never reads one.
+        let smuggled = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let first = format!(
+            "GET /app.js HTTP/1.1\r\nHost: x\r\ncontent-length: {}\r\n\r\n{smuggled}",
+            smuggled.len()
+        );
+        // A genuine pipelined request behind it, which must still be answered.
+        let second = "GET /app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        client.write_all(first.as_bytes()).await.unwrap();
+        client.write_all(second.as_bytes()).await.unwrap();
+
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+
+        // The smuggled body must never have been routed: the enrollment page is
+        // what `GET /` would have returned.
+        assert!(
+            !text.contains("ZeroClaw browser enrollment"),
+            "desync: the smuggled body was answered as a request: {text}"
+        );
+        // Both REAL requests were answered, so the body was drained and the
+        // connection stayed synchronized rather than being closed defensively.
+        assert_eq!(
+            text.matches("application/javascript").count(),
+            2,
+            "both genuine /app.js requests must be answered: {text}"
+        );
+    }
+
+    /// A 404 leaves a bodyless request perfectly synchronized, so it must NOT end
+    /// the connection - `Err` is not a synonym for "desynchronized".
+    #[tokio::test]
+    async fn a_routing_miss_keeps_a_synchronized_connection_alive() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+
+        assert!(text.contains("404 Not Found"), "expected the 404: {text}");
+        assert!(
+            text.contains("application/javascript"),
+            "the connection must survive a 404 and answer the next request: {text}"
+        );
     }
 
     /// An error response must close the connection rather than keep-alive into an

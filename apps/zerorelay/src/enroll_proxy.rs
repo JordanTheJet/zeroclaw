@@ -71,13 +71,34 @@ pub(crate) struct TrustReply {
 /// confirmed by SAS in step 3; the relay pins leg 2 to it rather than to
 /// whatever the daemon offers, so a daemon that answers the second connection
 /// with a different identity is refused.
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnrollBody {
     pub(crate) node_id: String,
     pub(crate) pairing_code: String,
     pub(crate) csr_pem: String,
     pub(crate) ca_chain_pem: String,
+}
+
+/// Redacting `Debug`, written by hand rather than derived.
+///
+/// The relay's disclosed bound is that its sight of the pairing code is
+/// transient and UNLOGGED. A derived `Debug` leaves that property resting on
+/// every future author remembering not to format this struct: one
+/// `tracing::debug!(?body)`, or a `.context(format!("{body:?}"))` added while
+/// chasing an exchange failure, would put a live pairing code and the CSR into
+/// relay logs - on the surface whose whole disclosure is that the relay's sight
+/// of the code is bounded. Redacting here makes that structural rather than
+/// conventional. `TrustBody`/`TrustReply` carry nothing secret and still derive.
+impl std::fmt::Debug for EnrollBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollBody")
+            .field("node_id", &self.node_id)
+            .field("pairing_code", &"<redacted>")
+            .field("csr_pem", &"<redacted>")
+            .field("ca_chain_pem", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A node-id request for the trust preflight.
