@@ -1,4 +1,13 @@
-//! The ZeroClaw nominated relay: a standalone **blind forwarder**.
+//! The ZeroClaw nominated relay: a standalone **blind forwarder**, blind by
+//! default.
+//!
+//! One documented exception, off unless an operator turns it on: the browser
+//! enrollment frontdoor ([`frontdoor`], [`enroll_proxy`]). While enabled the
+//! relay serves an enrollment page and performs the CA-pinned enrollment
+//! exchange on a browser's behalf, so for those browsers it is a trusted code
+//! origin and an enrollment principal - **relay-terminated, not blind**. It
+//! never gains that role for the RPC data plane or for `zerocode`/native
+//! enrollment, which stay blind in every mode.
 //!
 //! Each party reaches the relay over an **outer** TLS + WebSocket session
 //! (`zeroclaw.relay.v1`). A daemon opens one persistent WS and registers a

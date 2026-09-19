@@ -141,13 +141,31 @@ where
         mut pending,
     } = session;
     loop {
-        // Whether this request's declared body has been consumed - i.e. whether the
-        // stream is still at a request boundary. A route that reads the body sets
-        // it; routes that do not (the asset arms, the catch-all 404) leave it, and
-        // the drain below decides. `Err` from `route` is NOT the same question: a
-        // 404 to a bodyless GET is an error response on a perfectly synchronized
-        // stream, while an Ok asset response to a GET carrying `content-length` is
-        // a success on a desynchronized one.
+        // Ambiguous framing has no derivable boundary, so nothing after this
+        // request can be trusted to be a request. Refuse it and close instead of
+        // routing it - the alternative is interpreting a smuggled body as the
+        // next request head.
+        if framing(&head) == Framing::Ambiguous {
+            let refusal = mark_connection_close(json_error(
+                400,
+                "ambiguous request framing (conflicting content-length, or an \
+                 unsupported transfer-encoding)",
+            ));
+            let refusal = if request_is_head(&head) {
+                head_only(refusal)
+            } else {
+                refusal
+            };
+            let _ = stream.write_all(&refusal).await;
+            break;
+        }
+        // Whether this request's declared body has been consumed - i.e. whether
+        // the stream is still at a request boundary. A route that reads the body
+        // sets it; routes that do not (the asset arms, the catch-all 404) leave
+        // it, and the drain below decides. `Err` from `route` is NOT the same
+        // question: a 404 to a bodyless GET is an error response on a perfectly
+        // synchronized stream, while an Ok asset response to a GET carrying
+        // `content-length` is a success on a desynchronized one.
         let mut body_consumed = content_length(&head).unwrap_or(0) == 0;
         let mut response =
             match route(&head, &mut stream, &mut pending, &inner, &mut body_consumed).await {
@@ -347,17 +365,66 @@ where
     true
 }
 
-fn content_length(head: &[u8]) -> Option<usize> {
+/// How long this request's body is - or that the question has no trustworthy
+/// answer.
+///
+/// The distinction matters because the session decides keep-alive from it: if
+/// the framing is ambiguous, "where does this request end" is unanswerable and
+/// anything after it cannot be treated as the next request. Collapsing that into
+/// "no body" is the request-smuggling shape (RFC 9112 6.3).
+#[derive(Debug, PartialEq, Eq)]
+enum Framing {
+    /// No body, and the headers say so unambiguously.
+    Empty,
+    /// Exactly one well-formed `content-length`.
+    Length(usize),
+    /// Conflicting or unparsable `content-length`, or a transfer coding this
+    /// server does not implement. No boundary can be derived.
+    Ambiguous,
+}
+
+/// Classify a request's body framing.
+///
+/// Strict on purpose, because this is an unauthenticated surface:
+/// - more than one `content-length` (even repeated with the same value) is
+///   refused rather than reconciled;
+/// - a value that does not parse is `Ambiguous`, never `Empty`;
+/// - any `transfer-encoding` is refused - the frontdoor implements no chunked
+///   decoder, so pretending the body is empty would leave the coded body on the
+///   stream to be read as the next request.
+fn framing(head: &[u8]) -> Framing {
     let text = String::from_utf8_lossy(head);
-    text.lines()
-        .skip(1)
-        .find_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .map(|v| v.trim().to_string())
-        })
-        .and_then(|v| v.parse::<usize>().ok())
+    let mut length: Option<usize> = None;
+    let mut seen_length = 0usize;
+    for line in text.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("transfer-encoding:") {
+            return Framing::Ambiguous;
+        }
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            seen_length += 1;
+            if seen_length > 1 {
+                return Framing::Ambiguous;
+            }
+            match value.trim().parse::<usize>() {
+                Ok(n) => length = Some(n),
+                Err(_) => return Framing::Ambiguous,
+            }
+        }
+    }
+    match length {
+        None | Some(0) => Framing::Empty,
+        Some(n) => Framing::Length(n),
+    }
+}
+
+/// The declared body length, for the paths that have already established the
+/// framing is unambiguous.
+fn content_length(head: &[u8]) -> Option<usize> {
+    match framing(head) {
+        Framing::Length(n) => Some(n),
+        Framing::Empty | Framing::Ambiguous => None,
+    }
 }
 
 fn request_line(head: &[u8]) -> Option<(&str, &str)> {
@@ -419,6 +486,13 @@ where
 {
     let mut chunk = [0u8; 1024];
     loop {
+        // Enforce the cap BEFORE extracting, so an over-cap head is refused even
+        // when its terminator already arrived in the same read - otherwise the
+        // cap only catches a head that is still incomplete, and one oversized
+        // read slips a full head past it.
+        if header_end(pending).unwrap_or(pending.len()) > MAX_HTTP_HEAD {
+            anyhow::bail!("request headers too large");
+        }
         if let Some(head) = take_http_head(pending) {
             return Ok(head);
         }
@@ -597,6 +671,81 @@ mod tests {
     fn websocket_upgrade_is_detected() {
         let head = b"GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_websocket_upgrade(head));
+    }
+
+    /// Framing classification: the distinction the boundary predicate rests on.
+    #[test]
+    fn ambiguous_framing_is_never_mistaken_for_an_empty_body() {
+        let empty = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(framing(empty), Framing::Empty);
+        let sized = b"POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: 12\r\n\r\n";
+        assert_eq!(framing(sized), Framing::Length(12));
+        // Zero-length is a real, unambiguous "no body".
+        let zero = b"POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(framing(zero), Framing::Empty);
+        // Conflicting lengths: the classic smuggling pair.
+        let conflicting =
+            b"POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\ncontent-length: 80\r\n\r\n";
+        assert_eq!(framing(conflicting), Framing::Ambiguous);
+        // Repeated even when they agree - reconciling is not this server's job.
+        let repeated =
+            b"POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\ncontent-length: 5\r\n\r\n";
+        assert_eq!(framing(repeated), Framing::Ambiguous);
+        // Unparsable must not degrade to "empty".
+        let junk = b"POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: banana\r\n\r\n";
+        assert_eq!(framing(junk), Framing::Ambiguous);
+        // No chunked decoder here, so a coded body is not an empty one.
+        let chunked = b"POST /enroll HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n";
+        assert_eq!(framing(chunked), Framing::Ambiguous);
+    }
+
+    /// Ambiguous framing must be refused and closed, never routed - otherwise the
+    /// bytes behind it are read as the next request. The smuggling shape tidux
+    /// and Aarlington both flagged as the remaining parser gap.
+    #[tokio::test]
+    async fn ambiguous_framing_is_refused_and_the_connection_closed() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // Conflicting lengths, with a smuggled request positioned to be read as
+        // the next head if the shorter length were honored.
+        let smuggled = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let first = format!(
+            "POST /enroll HTTP/1.1\r\nHost: x\r\ncontent-length: 0\r\ncontent-length: {}\r\n\r\n{smuggled}",
+            smuggled.len()
+        );
+        client.write_all(first.as_bytes()).await.unwrap();
+
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let lower = text.to_ascii_lowercase();
+
+        assert!(text.starts_with("HTTP/1.1 400"), "expected a 400: {text}");
+        assert!(
+            lower.contains("ambiguous request framing"),
+            "expected the framing refusal: {text}"
+        );
+        assert!(lower.contains("connection: close"), "must close: {text}");
+        assert!(
+            !text.contains("ZeroClaw browser enrollment"),
+            "the smuggled request must never be answered: {text}"
+        );
+        assert_eq!(
+            text.matches("HTTP/1.1").count(),
+            1,
+            "exactly one response: {text}"
+        );
     }
 
     /// The mirror of the test below, and the case an `Err`-based predicate misses:

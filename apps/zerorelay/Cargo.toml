@@ -5,7 +5,7 @@ homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ZeroClaw nominated relay: a standalone blind forwarder that tunnels the inner client<->daemon mTLS without decrypting it."
+description = "ZeroClaw nominated relay: a standalone blind forwarder that tunnels the inner client<->daemon mTLS without decrypting it. Blind by default; the opt-in browser enrollment frontdoor is relay-terminated for the browsers that use it."
 publish = true
 
 [[bin]]

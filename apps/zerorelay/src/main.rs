@@ -1,8 +1,15 @@
-//! `zerorelay` - the ZeroClaw nominated relay (blind forwarder).
+//! `zerorelay` - the ZeroClaw nominated relay (blind forwarder, blind by
+//! default).
 //!
 //! Runs a public rendezvous: daemons behind NAT register over an outer TLS +
 //! WebSocket session and clients reach them by an opaque `node_id`. The relay
 //! pipes the inner client<->daemon mTLS as ciphertext and never terminates it.
+//!
+//! `--frontdoor` (default off) opts into the browser enrollment path, which is
+//! **relay-terminated**: the relay serves the page and performs the enrollment
+//! exchange for browsers, so it sees their pairing code and issued certificate.
+//! It announces that with a startup warning. The data plane stays blind in
+//! every mode.
 //!
 //! `zerorelay` is a standalone networking app (not daemon-path code), so bare
 //! `tokio::spawn` is the right primitive here; the `zeroclaw_spawn::spawn!` rule
