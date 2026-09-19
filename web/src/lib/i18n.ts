@@ -1478,7 +1478,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.start_conversation': 'Send a message to start the conversation',
     'agent.type_message': 'Type a message...',
     'agent.attach_file': 'Attach file',
-    'agent.cmd_help_upload': 'Attach an image via the file picker',
+    'agent.cmd_help_upload': 'Attach a file via the file picker',
     'agent.drop_to_attach': 'Drop files to attach',
     'agent.upload_failed': 'Upload failed: {error}',
     'agent.connecting': 'Connecting...',
