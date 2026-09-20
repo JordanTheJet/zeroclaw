@@ -269,6 +269,39 @@ fn ensure_control_is_secure(control: &str) -> Result<String> {
 /// key under a different directory would allowlist a fingerprint the daemon then
 /// never presents. (`config.data_dir` still honors `ZEROCLAW_DATA_DIR` /
 /// `--config-dir`, which move the CLI and the daemon together.)
+/// The config paths `relay claim` persists. An env override on any of them
+/// would be silently discarded at save time, so the claim must not proceed.
+const CLAIM_MANAGED_PATHS: &[&str] = &[
+    "relay.enabled",
+    "relay.url",
+    "relay.node_id",
+    "relay.relay_host",
+];
+
+/// Fail closed when the environment owns a field this command writes.
+fn refuse_claim_field_env_overrides(config: &Config) -> Result<()> {
+    let overridden: Vec<&str> = CLAIM_MANAGED_PATHS
+        .iter()
+        .copied()
+        .filter(|path| config.prop_is_env_overridden(path))
+        .collect();
+    if overridden.is_empty() {
+        return Ok(());
+    }
+    let vars: Vec<String> = overridden
+        .iter()
+        .map(|p| format!("ZEROCLAW_{}", p.replace('.', "__").to_uppercase()))
+        .collect();
+    anyhow::bail!(
+        "these claim-managed settings are currently set by environment overrides: {}. \
+         Environment overrides are never written to the config file, so claiming now would \
+         spend your one-time token and then discard the [relay] profile it promised to save. \
+         Unset {} and run the claim again. No request was sent and no config was written.",
+        overridden.join(", "),
+        vars.join(", ")
+    );
+}
+
 pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str) -> Result<()> {
     let token = claim_token.trim();
     if token.is_empty() {
@@ -281,6 +314,17 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
     if control.is_empty() {
         anyhow::bail!("--control <URL> is required (the ZeroRelay control-plane base URL)");
     }
+    // Refuse BEFORE the request if the environment already owns a field this
+    // command is about to persist.
+    //
+    // Env overrides are deliberately not saved (see
+    // docs/book/src/architecture/config-lifecycle.md), so a claim under an
+    // override would spend the one-time token, report success, and then discard
+    // the very write it promised - leaving the daemon pointed at the old relay.
+    // Failing early keeps the token unspent and the disk config untouched, and
+    // it reuses the existing override tracking rather than changing the masking
+    // contract.
+    refuse_claim_field_env_overrides(config)?;
     // The claim token is a one-time bearer secret; refuse to send it over a
     // channel that would carry it in the clear or to an origin other than the one
     // it names. `control` is the validated destination.
@@ -371,6 +415,17 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
             "Daemon claimed. Start (or restart) the daemon to register against the relay.",
         )
     );
+    // The binding is saved either way, but registration additionally requires the
+    // WSS listener, which is OFF by default - the relay bridges to it. Promising
+    // registration unconditionally would be wrong for most fresh installs, so say
+    // what is still needed instead of silently enabling a listener.
+    if !config.wss.enabled {
+        println!(
+            "Note: [wss] is disabled, and the relay refuses registration until it is enabled. \
+             The claim above is saved and stays valid - enable the WSS listener (see the \
+             secure-transport guide) and the binding takes effect on the next start."
+        );
+    }
     Ok(())
 }
 
@@ -812,6 +867,61 @@ mod tests {
             "got:\n{written}"
         );
         assert!(written.contains("enabled = true"), "got:\n{written}");
+    }
+
+    #[tokio::test]
+    /// A claim-managed field owned by the environment must stop the command
+    /// BEFORE the request: the one-time token stays unspent and the config file
+    /// is untouched.
+    ///
+    /// Without this, the claim would succeed remotely, spend the token, and then
+    /// have its promised `[relay]` write discarded by env masking at save time -
+    /// leaving the daemon pointed at the old relay while reporting the new one.
+    async fn handle_claim_refuses_when_a_claim_field_is_env_overridden() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config(tmp.path());
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        // A server that FAILS the test if it is ever called: the refusal must
+        // happen before any network request.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "node_id": "n", "relay_addr": "relay.example:8443",
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        for overridden in CLAIM_MANAGED_PATHS {
+            config.env_overridden_paths.clear();
+            config
+                .env_overridden_paths
+                .insert((*overridden).to_string());
+
+            let err = handle_claim(&mut config, "tok-live", &server.uri())
+                .await
+                .expect_err("an env-overridden claim field must refuse the claim");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(overridden),
+                "the refusal must name the offending setting ({overridden}): {msg}"
+            );
+            assert!(
+                msg.contains("No request was sent"),
+                "the refusal must state that nothing was sent: {msg}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config.config_path).unwrap(),
+                before,
+                "{overridden}: the config file must be untouched"
+            );
+        }
+        // Mock `.expect(0)` is asserted on drop: no POST ever happened.
     }
 
     #[tokio::test]
