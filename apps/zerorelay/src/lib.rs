@@ -3533,4 +3533,126 @@ mod enroll_route_reclaim_tests {
 
         daemon.abort();
     }
+
+    /// CANCELLED BEFORE `Open` IS EVEN SENT.
+    ///
+    /// `open_enroll_route` reserves the conn slot and only then awaits
+    /// `to_daemon.send(Open)`. With the daemon's bounded queue full that send
+    /// parks, and the production path runs the whole HTTP session under one
+    /// deadline (`serve_http`'s `HTTP_SESSION_BUDGET`), so the future can be
+    /// dropped right there - with no branch of the function running. The
+    /// reserved slot must still be reclaimed, because it counts against
+    /// `max_conns_per_node`, which is shared with native relay clients.
+    ///
+    /// The outer `timeout` here is the same cancellation shape as that session
+    /// deadline, at a length a test can wait for.
+    #[tokio::test]
+    async fn a_route_cancelled_before_the_daemon_send_reclaims_its_slot() {
+        let server = RelayServer::new(RelayConfig {
+            max_conns_per_node: 4,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node").await;
+
+        // Fill the daemon's bounded queue so the `Open` send cannot complete.
+        let to_daemon = server
+            .inner
+            .daemons
+            .lock()
+            .await
+            .get("node")
+            .expect("stub daemon")
+            .to_daemon
+            .clone();
+        while to_daemon.try_send(Message::text("filler")).is_ok() {}
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            open_enroll_route(&server.inner, "node"),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the open must still be parked on the full daemon queue"
+        );
+
+        wait_until_empty(&conns).await;
+        assert!(
+            conns.lock().await.is_empty(),
+            "a slot reserved before the daemon send must not survive cancellation"
+        );
+
+        // Recover the queue and prove the node is still usable afterwards.
+        while daemon_rx.try_recv().is_ok() {}
+        let daemon = spawn_pairing_daemon(daemon_rx, conns.clone());
+        let route = open_enroll_route(&server.inner, "node")
+            .await
+            .expect("a fresh route must open once the queue drains");
+        drop(route);
+        wait_until_empty(&conns).await;
+        daemon.abort();
+    }
+
+    /// CANCELLED WHILE AWAITING `Opened`.
+    ///
+    /// The second cancellable await: the daemon accepted the `Open` but never
+    /// answers, and the session deadline fires while `open_enroll_route` is
+    /// still waiting to be paired. Same requirement - the slot is reclaimed.
+    #[tokio::test]
+    async fn a_route_cancelled_while_awaiting_pairing_reclaims_its_slot() {
+        let server = RelayServer::new(RelayConfig {
+            max_conns_per_node: 4,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node").await;
+        // A daemon that consumes `Open` and never pairs.
+        let silent = tokio::spawn(async move { while daemon_rx.recv().await.is_some() {} });
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            open_enroll_route(&server.inner, "node"),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the open must still be waiting to be paired"
+        );
+
+        wait_until_empty(&conns).await;
+        assert!(
+            conns.lock().await.is_empty(),
+            "a slot awaiting pairing must not survive cancellation"
+        );
+        silent.abort();
+    }
+
+    /// Repeated cancellation must not exhaust the node.
+    ///
+    /// The leak this guards is cumulative: each abandoned attempt used to keep
+    /// its slot, so enough of them would refuse every later enrollment - and
+    /// every native relay client on the same node - with `Busy`.
+    #[tokio::test]
+    async fn repeated_cancelled_opens_do_not_exhaust_the_node() {
+        const CAP: usize = 3;
+        let server = RelayServer::new(RelayConfig {
+            max_conns_per_node: CAP,
+            ..RelayConfig::default()
+        });
+        let (mut daemon_rx, conns) = register_stub_daemon(&server, "node").await;
+        let silent = tokio::spawn(async move { while daemon_rx.recv().await.is_some() {} });
+
+        for attempt in 0..(CAP * 3) {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                open_enroll_route(&server.inner, "node"),
+            )
+            .await;
+            wait_until_empty(&conns).await;
+            assert!(
+                conns.lock().await.is_empty(),
+                "attempt {attempt}: cancelled opens must not accumulate"
+            );
+        }
+        silent.abort();
+    }
 }

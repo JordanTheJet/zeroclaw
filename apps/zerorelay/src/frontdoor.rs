@@ -318,13 +318,17 @@ where
     }
     let mut chunk = [0u8; 4096];
     while pending.len() < len {
-        let n = match stream.read(&mut chunk).await {
+        // Read AT MOST the bytes this body still owes. Reading a full chunk
+        // could pull in pipelined bytes belonging to the next request, and the
+        // over-cap check that used to follow discarded the whole chunk when it
+        // tripped - losing already-read body bytes while leaving the body
+        // unconsumed, so the drain then ate the next request instead. `len` is
+        // bounded above, so a read capped at the remainder can never exceed it.
+        let want = (len - pending.len()).min(chunk.len());
+        let n = match stream.read(&mut chunk[..want]).await {
             Ok(0) | Err(_) => return Err(json_error(400, "request body truncated")),
             Ok(n) => n,
         };
-        if pending.len() + n > MAX_FRONTDOOR_REQUEST_BYTES {
-            return Err(json_error(400, "request body too large"));
-        }
         pending.extend_from_slice(&chunk[..n]);
     }
     let rest = pending.split_off(len);
@@ -355,7 +359,10 @@ where
     }
     let mut chunk = [0u8; 4096];
     while pending.len() < len {
-        match stream.read(&mut chunk).await {
+        // Same bound as `read_body`: never read past this body, so whatever is
+        // pipelined behind it stays on the stream to be parsed as a request.
+        let want = (len - pending.len()).min(chunk.len());
+        match stream.read(&mut chunk[..want]).await {
             Ok(0) | Err(_) => return false,
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
         }

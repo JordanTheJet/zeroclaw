@@ -105,6 +105,47 @@ impl Drop for PumpGuard {
     }
 }
 
+/// Owns a reserved `conns` entry between the moment it is inserted and the
+/// moment the pump takes over.
+///
+/// `open_enroll_route` reserves the slot BEFORE it awaits the daemon send and
+/// the pairing reply, and both of those awaits are cancellable - the production
+/// path runs the whole HTTP session under a single deadline
+/// ([`crate::frontdoor::serve_http`]), so the future can be dropped between the
+/// insert and the pump's creation without any branch running. Cleanup therefore
+/// cannot live only in the return paths; it has to be driven by `Drop`.
+///
+/// `Drop` cannot await, so it spawns a bounded reclaim that reuses the canonical
+/// [`release_conn`] (map removal + a daemon `Close`) rather than keeping a
+/// parallel registry. Reclaim is therefore asynchronous: tests assert the map
+/// drains rather than that it is already drained.
+struct RouteSlotGuard {
+    conn_id: u64,
+    conns: Option<Arc<tokio::sync::Mutex<crate::ConnRoutes>>>,
+    to_daemon: Option<mpsc::Sender<Message>>,
+}
+
+impl RouteSlotGuard {
+    /// Hand ownership to the pump after a successful handoff, so the guard stops
+    /// being responsible for the entry.
+    fn disarm(&mut self) {
+        self.conns = None;
+        self.to_daemon = None;
+    }
+}
+
+impl Drop for RouteSlotGuard {
+    fn drop(&mut self) {
+        let (Some(conns), Some(to_daemon)) = (self.conns.take(), self.to_daemon.take()) else {
+            return; // disarmed: the pump owns this entry now
+        };
+        let conn_id = self.conn_id;
+        tokio::spawn(async move {
+            let _ = release_conn(&to_daemon, &conns, conn_id).await;
+        });
+    }
+}
+
 /// One relay-originated enrollment route: a byte stream to the daemon's
 /// enrollment endpoint, plus the pump that keeps it alive.
 pub(crate) struct EnrollRoute {
@@ -171,6 +212,18 @@ pub(crate) async fn open_enroll_route(
             },
         );
     }
+    // From here the slot exists in the shared map, so it needs an owner for
+    // EVERY exit - including the ones that are not returns. The awaits below
+    // (daemon send, pairing) can be cancelled by `serve_http`'s whole-session
+    // deadline, which drops this future without running any branch; without a
+    // drop-driven owner the entry would survive as a phantom connection
+    // counting against `max_conns_per_node`, which is shared with native relay
+    // clients. Ownership transfers to the pump once pairing succeeds.
+    let mut slot = RouteSlotGuard {
+        conn_id,
+        conns: Some(conns.clone()),
+        to_daemon: Some(to_daemon.clone()),
+    };
     let live = LiveConnGuard::new(metrics);
 
     if !matches!(
@@ -187,7 +240,7 @@ pub(crate) async fn open_enroll_route(
         .await,
         Ok(Ok(()))
     ) {
-        conns.lock().await.remove(&conn_id);
+        // `slot` drops here and reclaims the entry.
         return Err(OpenError::NoSuchNode);
     }
 
@@ -205,9 +258,13 @@ pub(crate) async fn open_enroll_route(
     .unwrap_or(false);
 
     if !paired {
-        let _ = release_conn(&to_daemon, &conns, conn_id).await;
+        // `slot` drops here and reclaims the entry.
         return Err(OpenError::NotAccepted);
     }
+
+    // Handoff succeeded: the pump owns the slot from now on and reclaims it via
+    // `release_conn` on every one of its exits, so the guard must not also fire.
+    slot.disarm();
 
     let (proxy_io, relay_io) = tokio::io::duplex(ROUTE_BUFFER_BYTES);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
