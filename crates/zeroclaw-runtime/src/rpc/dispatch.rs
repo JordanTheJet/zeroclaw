@@ -4760,6 +4760,16 @@ impl RpcDispatcher {
         // write cannot open a window. An operator-level principal patches
         // any row, including the ownerless legacy ones.
         let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        // Validate a replacement command under the owning agent's policy before
+        // it is persisted. `cron/add` validates on the way in; without the same
+        // check here an invalid command can replace a working job through the
+        // patch path, and the job only fails later, at execution.
+        if let Some(command) = patch.command.as_deref()
+            && !command.trim().is_empty()
+        {
+            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        }
         let job = if self.has_admin_grants() {
             crate::cron::update_job(&config, &req.id, patch)
         } else {
@@ -8727,6 +8737,43 @@ mod tests {
         let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
         assert_eq!(reread.name.as_deref(), Some("beta-job"));
         assert_eq!(reread.prompt.as_deref(), beta.prompt.as_deref());
+    }
+
+    /// A patch carrying a command the owning agent's policy refuses must be
+    /// rejected before persistence, leaving the working job as it was. Without
+    /// the check the row is replaced and only fails later, at execution.
+    #[tokio::test]
+    async fn cron_patch_rejects_a_command_the_owner_policy_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({
+                "id": job.id,
+                "agent": "alpha",
+                "command": "rm -rf / --no-preserve-root",
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "a refused command must not patch the job: {response}"
+        );
+
+        let reread = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(
+            reread.command, job.command,
+            "a rejected patch must leave the stored command unchanged"
+        );
+        assert_eq!(reread.name.as_deref(), job.name.as_deref());
     }
 
     #[tokio::test]
