@@ -850,6 +850,7 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
+    passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Outcome of the most recent `getUpdates` exchange and when it completed,
@@ -2468,6 +2469,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             per_user_session: true,
+            passive_group_context: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             poll_health: Mutex::new(None),
@@ -2516,6 +2518,20 @@ impl TelegramChannel {
         self
     }
 
+    /// Record unaddressed group messages as passive context instead of dropping them.
+    pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
+        self.passive_group_context = enabled;
+        self
+    }
+
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
+    }
+
     /// Configure whether Telegram-native acknowledgement reactions are sent.
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
@@ -2536,21 +2552,60 @@ impl TelegramChannel {
     /// group/supergroup chats when `per_user_session = false`, sender-scoped
     /// otherwise. `reply_target` already carries `chat_id:message_thread_id`
     /// for forum topics, so room scope still isolates topics from each other.
+    ///
+    /// `passive_group_context` selects room scope too: an observation filed
+    /// in the observed member's own session could answer nobody.
     fn conversation_scope_for(
         &self,
         message: &serde_json::Value,
     ) -> zeroclaw_api::channel::ChannelConversationScope {
-        if !self.per_user_session && Self::is_group_message(message) {
+        if (!self.per_user_session || self.passive_group_context) && Self::is_group_message(message)
+        {
             zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
         } else {
             zeroclaw_api::channel::ChannelConversationScope::Sender
         }
     }
 
-    /// Returns `true` if `recipient` is in a peer group configured with
+    /// Returns `true` if `identity` belongs to a peer group configured with
     /// `output_modality = "voice"` for this channel. Resolved live from config
     /// via `voice_peer_resolver` so it stays correct across hot-reloads.
-    pub(crate) fn is_voice_peer(&self, recipient: &str) -> bool {
+    ///
+    /// `identity` is a sender identity. A peer group names senders, and a
+    /// group's chat id does not identify the member who asked for the reply;
+    /// only a private chat's address is the peer's own id.
+    pub(crate) fn is_voice_peer(&self, identity: &str) -> bool {
+        Self::voice_peer_identity_matches(&(self.voice_peer_resolver)(), identity)
+    }
+
+    /// Canonical voice-peer match for a resolved peer list: an optional leading
+    /// `@` and ASCII case are ignored, and `"*"` matches anyone. Mirrors the
+    /// shape inbound admission uses, so a configured peer matches the sender
+    /// identity it was written for.
+    fn voice_peer_identity_matches(peers: &[String], identity: &str) -> bool {
+        let identity = Self::normalize_identity(identity);
+        if identity.is_empty() {
+            return false;
+        }
+        let peers: Vec<String> = peers
+            .iter()
+            .map(|peer| Self::normalize_identity(peer))
+            .collect();
+        crate::allowlist::is_user_allowed(
+            &peers,
+            &identity,
+            crate::allowlist::Match::CaseInsensitive,
+        )
+    }
+
+    /// Senderless voice-peer check for a destination chat address, used where
+    /// no inbound sender exists (proactive delivery) or where a voice note
+    /// accompanies a text reply. Kept as the literal destination comparison
+    /// this channel has always used: a peer group names senders, so a
+    /// destination only stands in for one by coincidence, and widening the
+    /// match here would change proactive modality that sender-side resolution
+    /// does not cover.
+    fn destination_is_voice_peer(&self, recipient: &str) -> bool {
         (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
@@ -3281,12 +3336,15 @@ impl TelegramChannel {
         }
     }
 
+    /// Whether a destination should receive a TTS voice reply: the session is
+    /// in input-driven voice mode, or — where the runtime has no inbound sender
+    /// to consult — the target chat address is itself a configured voice peer.
     fn is_voice_chat(&self, recipient: &str) -> bool {
         self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
             .unwrap_or(false)
-            || (self.voice_peer_resolver)().iter().any(|p| p == recipient)
+            || self.destination_is_voice_peer(recipient)
     }
 
     fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
@@ -5062,14 +5120,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
+        let mut passive_context = false;
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            // If the user is replying directly to the bot's message, bypass
-            // the mention check — replies are an unambiguous signal of intent.
-            if !Self::contains_bot_mention(text, bot_username) {
+            // A direct reply to the bot's message is an unambiguous signal
+            // of intent, so it counts as addressed alongside an @-mention.
+            let addressed = Self::contains_bot_mention(text, bot_username) || {
                 let bot_id = *self.bot_id.lock();
-                if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+            };
+            if !addressed {
+                if Self::should_record_passive_group_context(
+                    self.passive_group_context,
+                    is_group,
+                    addressed,
+                ) {
+                    passive_context = true;
+                } else {
                     return None;
                 }
             }
@@ -5096,7 +5164,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let content = if self.mention_only && is_group && !passive_context {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
@@ -5117,10 +5185,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
-        // Exit input-driven voice mode when user switches back to typing.
-        // Config-mandated voice peers (output_modality = "voice") stay in
-        // voice mode regardless of whether they send text or voice.
-        if !self.is_voice_peer(&reply_target)
+        // Exit input-driven voice mode when a sender switches back to typing.
+        // A sender configured for voice output (output_modality = "voice") keeps
+        // the conversation in voice mode regardless of whether they send text or
+        // voice. The peer group names their identity, not this chat's address.
+        // A passive observation is not that participant, so it leaves the room's
+        // voice mode alone.
+        let sender_is_voice_peer = self.is_voice_peer(&sender_identity)
+            || sender_id
+                .as_deref()
+                .is_some_and(|id| self.is_voice_peer(id));
+        if !passive_context
+            && !sender_is_voice_peer
             && let Ok(mut vc) = self.voice_chats.lock()
         {
             vc.remove(&reply_target);
@@ -5142,6 +5218,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            passive_context,
             conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
@@ -6314,25 +6391,29 @@ impl TelegramChannel {
         update: &serde_json::Value,
         msg: ChannelMessage,
     ) -> bool {
-        if self.ack_reactions
-            && let Some((reaction_chat_id, reaction_message_id)) =
-                Self::extract_update_message_target(update)
-        {
-            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
-        }
+        // Silent observation: a passive message must not tell the room the
+        // bot saw it, so it gets neither an ack reaction nor a typing hint.
+        if !msg.passive_context {
+            if self.ack_reactions
+                && let Some((reaction_chat_id, reaction_message_id)) =
+                    Self::extract_update_message_target(update)
+            {
+                self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+            }
 
-        // Send one typing indicator for the logical inbound message. A media
-        // group reaches this helper only after all members are materialized.
-        let typing_body = serde_json::json!({
-            "chat_id": &msg.reply_target,
-            "action": "typing"
-        });
-        let _ = self
-            .http_client()
-            .post(self.api_url("sendChatAction"))
-            .json(&typing_body)
-            .send()
-            .await;
+            // Send one typing indicator for the logical inbound message. A media
+            // group reaches this helper only after all members are materialized.
+            let typing_body = serde_json::json!({
+                "chat_id": &msg.reply_target,
+                "action": "typing"
+            });
+            let _ = self
+                .http_client()
+                .post(self.api_url("sendChatAction"))
+                .json(&typing_body)
+                .send()
+                .await;
+        }
 
         tx.send(msg).await.is_ok()
     }
@@ -6958,7 +7039,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers: delete the draft placeholder and let the voice
         // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.is_voice_peer(recipient) {
+        if !suppress_voice && self.destination_is_voice_peer(recipient) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
                     .http_client()
@@ -7203,7 +7284,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers (or explicit force_voice): the voice note is the sole reply — skip text.
         if !message.suppress_voice
-            && (self.is_voice_peer(&message.recipient) || message.force_voice)
+            && (self.destination_is_voice_peer(&message.recipient) || message.force_voice)
         {
             return Ok(());
         }
@@ -7809,6 +7890,165 @@ mod tests {
     }
 
     #[test]
+    fn should_record_passive_group_context_matches_predicate() {
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(TelegramChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    fn passive_group_context_shares_group_history_whatever_per_user_session_says() {
+        use zeroclaw_api::channel::ChannelConversationScope;
+
+        let mention_only = true;
+        let group_msg = || {
+            serde_json::json!({
+                "message": {
+                    "message_id": 11,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "text": "just chatting with bob"
+                }
+            })
+        };
+
+        let shared = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true)
+        .with_per_user_session(false);
+        *shared.bot_username.lock() = Some("testbot".to_string());
+        let passive = shared
+            .parse_update_message(&group_msg())
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(passive.passive_context);
+        assert_eq!(
+            passive.conversation_scope,
+            ChannelConversationScope::ReplyTarget
+        );
+
+        let per_user = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true)
+        .with_per_user_session(true);
+        *per_user.bot_username.lock() = Some("testbot".to_string());
+        let passive = per_user
+            .parse_update_message(&group_msg())
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(passive.passive_context);
+        assert_eq!(
+            passive.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "the opt-in must share group history even under the per_user_session default"
+        );
+
+        let dm = serde_json::json!({
+            "message": {
+                "message_id": 12,
+                "chat": { "id": 4242, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "hello"
+            }
+        });
+        let addressed = per_user
+            .parse_update_message(&dm)
+            .expect("direct message must be delivered");
+        assert!(!addressed.passive_context);
+        assert_eq!(
+            addressed.conversation_scope,
+            ChannelConversationScope::Sender
+        );
+
+        // Without mention gating nothing is left unaddressed to record, but
+        // the group still moves to shared history, which is what the schema
+        // help has to state.
+        let answer_all = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_passive_group_context(true)
+        .with_per_user_session(true);
+        *answer_all.bot_username.lock() = Some("testbot".to_string());
+        let active = answer_all
+            .parse_update_message(&group_msg())
+            .expect("without mention gating every authorized group message is delivered");
+        assert!(!active.passive_context);
+        assert_eq!(
+            active.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "the opt-in shares group history even with mention gating off"
+        );
+    }
+
+    #[test]
+    fn passive_group_text_preserves_input_driven_voice_mode() {
+        let channel = || {
+            let ch = TelegramChannel::new(
+                "token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                true,
+            )
+            .with_passive_group_context(true)
+            .with_per_user_session(false);
+            *ch.bot_username.lock() = Some("testbot".to_string());
+            ch.voice_chats
+                .lock()
+                .unwrap()
+                .insert("-100200300".to_string());
+            ch
+        };
+        let group_text = |text: &str| {
+            serde_json::json!({
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "bob", "id": 77 },
+                    "text": text
+                }
+            })
+        };
+
+        let passive = channel();
+        let observed = passive
+            .parse_update_message(&group_text("just chatting with the others"))
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(observed.passive_context);
+        assert!(
+            passive.is_voice_chat("-100200300"),
+            "passive observation must leave input-driven voice mode intact"
+        );
+
+        let addressed = channel();
+        let answered = addressed
+            .parse_update_message(&group_text("@testbot answer in text please"))
+            .expect("addressed group message must be delivered");
+        assert!(!answered.passive_context);
+        assert!(
+            !addressed.is_voice_chat("-100200300"),
+            "an addressed text message must still exit input-driven voice mode"
+        );
+    }
+
+    #[test]
     fn scrub_masks_poll_error_url() {
         let raw = "error sending request for url (https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates)";
         let redacted = zeroclaw_runtime::security::scrub(raw);
@@ -7869,18 +8109,18 @@ mod tests {
             move || cfg.channel_voice_peers("telegram", "default")
         }));
 
-        // is_voice_chat resolves live via voice_peer_resolver — no cache.
+        // is_voice_peer resolves live via voice_peer_resolver — no cache.
         assert!(
-            ch.is_voice_chat("@alice"),
+            ch.is_voice_peer("@alice"),
             "voice peer should be recognized"
         );
-        assert!(ch.is_voice_chat("@bob"), "voice peer should be recognized");
+        assert!(ch.is_voice_peer("@bob"), "voice peer should be recognized");
         assert!(
-            !ch.is_voice_chat("@carol"),
+            !ch.is_voice_peer("@carol"),
             "peers on another channel must not be recognized"
         );
         assert!(
-            !ch.is_voice_chat("@dave"),
+            !ch.is_voice_peer("@dave"),
             "mirror-modality peers must not be recognized"
         );
 
@@ -7922,10 +8162,95 @@ mod tests {
         // she was never in it — this proves live-resolved peers are separate).
         ch.voice_chats.lock().unwrap().remove("@alice");
 
-        // is_voice_chat must still return true via voice_peer_resolver.
+        // is_voice_peer must still return true via voice_peer_resolver.
         assert!(
-            ch.is_voice_chat("@alice"),
+            ch.is_voice_peer("@alice"),
             "live-resolved voice peer must remain active after voice_chats removal"
+        );
+    }
+
+    #[test]
+    fn voice_peers_match_sender_identities_not_group_addresses() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("111")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
+
+        assert!(
+            ch.is_voice_peer("111"),
+            "the configured sender identity matches its own numeric id"
+        );
+        assert!(
+            !ch.is_voice_peer("-1001234567890"),
+            "a group's chat address is not a sender identity"
+        );
+        assert!(
+            !ch.is_voice_chat("-1001234567890"),
+            "a group address does not voice on the senderless fallback either"
+        );
+        assert!(
+            ch.is_voice_chat("111"),
+            "a private chat's address is the peer's own identity"
+        );
+    }
+
+    #[test]
+    fn wildcard_voice_peer_does_not_change_a_senderless_destination() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("*")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
+
+        // Inbound senders are matched by identity, where the wildcard applies.
+        assert!(ch.is_voice_peer("anyone"));
+        // Proactive delivery has no sender to consult, so its destination
+        // comparison keeps the literal behaviour it had before sender-side
+        // resolution existed: a wildcard entry does not voice a chat address.
+        assert!(
+            !ch.is_voice_chat("-1001234567890"),
+            "a wildcard peer entry must not voice a senderless group destination"
+        );
+        assert!(
+            !ch.is_voice_chat("111"),
+            "a wildcard peer entry must not voice a senderless private-chat destination"
         );
     }
 
@@ -11578,6 +11903,73 @@ mod tests {
             .expect_parsed("reply-thread photo should parse");
         assert_eq!(reply.reply_target, "-100200300");
         assert_eq!(reply.thread_ts, None);
+    }
+
+    #[tokio::test]
+    async fn opted_in_group_media_shares_the_text_conversation_scope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelConversationScope;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes = tiny_jpeg();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes.clone()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        // The shared room session is what puts media and text in one history.
+        .with_per_user_session(false)
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // The media mention gate reads the cached bot username synchronously,
+        // so prime it the way the live listener does before the first update.
+        ch.get_bot_username().await;
+
+        let photo = ch
+            .try_parse_attachment_message(&serde_json::json!({
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "photo": [ { "file_id": "best", "file_size": 20 } ],
+                    "caption": "@testbot look at this"
+                }
+            }))
+            .await
+            .expect_parsed("group photo should parse");
+
+        assert_eq!(
+            photo.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "admitted group media must share the opted-in group history, not fall back to sender scope"
+        );
     }
 
     #[tokio::test]
@@ -19620,6 +20012,80 @@ mod tests {
         assert_eq!(
             edit_body["reply_markup"],
             serde_json::json!({ "inline_keyboard": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_group_message_reaches_history_without_any_side_effect() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/bot[^/]+/(sendChatAction|setMessageReaction)$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_ack_reactions(true)
+        .with_api_base(mock_server.uri());
+        ch.get_bot_username().await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 11,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "just chatting with bob"
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+
+        let recorded = rx
+            .try_recv()
+            .expect("passive message must still be recorded");
+        assert!(recorded.passive_context, "message should be passive");
+
+        // The ack reaction is fired from a spawned task, so give it a chance to
+        // reach the mock before asserting that it never happened.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let side_effects: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/sendChatAction") || p.ends_with("/setMessageReaction"))
+            .collect();
+        assert!(
+            side_effects.is_empty(),
+            "passive observation must stay silent, but the bot called: {side_effects:?}"
         );
     }
 

@@ -327,6 +327,18 @@ struct ChannelRouteSelection {
     api_key: Option<String>,
 }
 
+fn resolve_channel_context_limits(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    route: &ChannelRouteSelection,
+    legacy_budget: usize,
+) -> zeroclaw_config::schema::ResolvedContextLimits {
+    if agent_alias.is_empty() {
+        return zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(legacy_budget);
+    }
+    config.resolved_context_limits_for_route(agent_alias, &route.model_provider, &route.model)
+}
+
 /// Selectable scope for a session-only `/model` override. The absence of any
 /// stored entry is the implicit "default" (config) tier, so it is not a variant.
 /// Precedence at resolution time is `User > Agent` (above the per-sender
@@ -3140,11 +3152,10 @@ fn normalize_peer_username(raw: &str) -> String {
 /// Returns a tri-state, not a bool, because "no opinion" and "no" must stay
 /// distinguishable:
 ///
-/// - `None` — no opinion: the channel isn't Matrix, or no voice-peer groups
-///   are configured for it. The caller must keep falling through to
-///   room-membership lookup (`room_has_voice_peer`), which itself understands
-///   an empty/wildcard peer list via `allowlist::voice_peers_verdict`.
-///   Collapsing this case into `Some(false)` would bypass that handling.
+/// - `None` — no opinion: the channel resolves modality for itself, no
+///   voice-peer groups are configured for it, or a miss on Telegram must leave
+///   the channel's input-driven voice mode in charge. The caller keeps the
+///   channel's own fallback intact.
 /// - `Some(true)` — the sender matches a configured voice peer.
 /// - `Some(false)` — voice peers ARE configured for this channel and the
 ///   sender is not among them. This is the authoritative negative: callers
@@ -3157,27 +3168,31 @@ fn normalize_peer_username(raw: &str) -> String {
 /// Matrix a reply is addressed to a room (`!room:server`) while peer groups
 /// name senders (`@user:server`), so comparing the recipient against
 /// `external_peers` never matches, and `["*"]` fails a literal comparison too.
+/// Telegram has the same split — a group reply is addressed to the group's
+/// chat id while a peer group names a sender — and only its private chats have
+/// an address that is the peer's own id.
 ///
 /// Matching mirrors [`is_agent_scope_authorized`]: both the configured peers
 /// and the sender are normalized through [`normalize_peer_username`], then
 /// compared with `crate::allowlist::is_user_allowed` so the wildcard and the
 /// leading-`@` / case semantics every inbound path already uses apply here as
-/// well.
+/// well. Telegram reports a display username in `sender` and the immutable
+/// numeric user id in `platform_sender_id`; a peer group may name either.
 ///
 /// Only replies pass through here. Proactive delivery (cron announces) has no
-/// inbound sender to consult and is decided by the channel from the target
-/// room instead.
+/// inbound sender to consult and is decided by the channel from its target
+/// address instead.
 ///
-/// Scoped to Matrix. Telegram and WhatsApp Web already decide reply modality
-/// from channel-local session state, so answering here as well would give one
-/// peer group two competing owners. Unifying the two mechanisms is separate
-/// work.
+/// A miss is the authoritative negative only for Matrix. Telegram also voices
+/// input-driven conversations from session state, so a config miss there must
+/// stay "no opinion" rather than suppress that.
 fn sender_prefers_voice(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> Option<bool> {
     let channel_type = msg.channel.as_str();
-    if !channel_type.starts_with("matrix") {
+    let matrix = channel_type.starts_with("matrix");
+    if !(matrix || channel_type.starts_with("telegram")) {
         return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
@@ -3190,12 +3205,21 @@ fn sender_prefers_voice(
     if voice_peers.is_empty() {
         return None;
     }
-    let sender = normalize_peer_username(msg.sender.as_str());
-    Some(crate::allowlist::is_user_allowed(
-        &voice_peers,
-        &sender,
-        crate::allowlist::Match::Sensitive,
-    ))
+    let identities = std::iter::once(normalize_peer_username(msg.sender.as_str())).chain(
+        msg.platform_sender_id
+            .as_deref()
+            .map(normalize_peer_username),
+    );
+    if identities.into_iter().any(|identity| {
+        crate::allowlist::is_user_allowed(
+            &voice_peers,
+            &identity,
+            crate::allowlist::Match::Sensitive,
+        )
+    }) {
+        return Some(true);
+    }
+    matrix.then_some(false)
 }
 
 /// Maps a [`sender_prefers_voice`] verdict to the
@@ -7676,7 +7700,8 @@ async fn process_channel_message_body(
         }
     }
 
-    if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
+    // Dispatch executes steps even though its result is discarded here.
+    if !msg.passive_context && (ctx.sop_engine.is_some() || ctx.sop_audit.is_some()) {
         let topic = match &msg.channel_alias {
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
             _ => msg.channel.clone(),
@@ -7875,6 +7900,13 @@ async fn process_channel_message_body(
             api_key: matched_route.api_key.clone(),
         };
     }
+
+    let mut context_limits = resolve_channel_context_limits(
+        runtime_defaults.config.as_ref(),
+        ctx.agent_alias.as_str(),
+        &route,
+        ctx.context_token_budget,
+    );
 
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
@@ -8617,6 +8649,7 @@ async fn process_channel_message_body(
                         model_provider: active_model_provider.as_ref(),
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
+                        dispatch_model: route.model.as_str(),
                         temperature: thinking.effective_temperature,
                     },
                     ResolvedIo {
@@ -8643,7 +8676,8 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
+                        context_limits,
+                        context_limits_resolver: None,
                         knobs: &loop_knobs,
                     },
                 ),
@@ -8688,6 +8722,7 @@ async fn process_channel_message_body(
                 // agent when it delegates to a different agent, so the step runs
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
+                served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),
@@ -8771,6 +8806,12 @@ async fn process_channel_message_body(
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         route.api_key = resolved_api_key;
+                        context_limits = resolve_channel_context_limits(
+                            runtime_defaults.config.as_ref(),
+                            ctx.agent_alias.as_str(),
+                            &route,
+                            ctx.context_token_budget,
+                        );
                         // Persist the route override so subsequent messages
                         // from this sender continue using the switched model.
                         set_route_selection(
@@ -10266,12 +10307,16 @@ async fn run_message_dispatch_loop(
         // intentionally unowned by an agent; it can present gate prompts but
         // must never receive ordinary agent traffic. All live contexts share
         // this global channel registry and prompt config.
+        // Guarded here, not in the worker: these paths answer and cancel before
+        // the worker runs. The worker still records the passive turn.
         let gate_ctx = router
             .single_ctx
             .as_ref()
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
-        if let Some(gate_ctx) = gate_ctx {
+        if !msg.passive_context
+            && let Some(gate_ctx) = gate_ctx
+        {
             let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
             let gate_channel_route_keys = gate_channel
                 .as_ref()
@@ -10313,7 +10358,7 @@ async fn run_message_dispatch_loop(
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
         // ordinary messages to an agent-owned runtime.
-        if dispatch_channel_sop_event(&router, &msg).await {
+        if !msg.passive_context && dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
         // Fast path: /stop cancels every live turn of this sender scope — the
@@ -10321,7 +10366,9 @@ async fn run_message_dispatch_loop(
         // spawning a worker or registering a new task. Handled here in the
         // dispatch loop so the target registrations are still in the store;
         // each cancelled turn removes its own entry when it releases.
-        if msg.channel != "cli" && is_stop_command(&msg.content) {
+        // A passive observation carries no turn of its own and must not cancel
+        // the sender's live turns or answer in the room.
+        if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
             let scope_key = interruption_scope_key(&msg);
             let states = {
                 let active = in_flight_by_sender
@@ -10483,7 +10530,10 @@ async fn run_message_dispatch_loop(
         // ordinary text) and silently drop the control action after the
         // channel already confirmed it. Ordinary messages keep their
         // existing debounce semantics, including any already pending.
+        // A passive observation starts no turn, so letting it into the
+        // debouncer would let it merge into or replace a waiting batch.
         let msg = if msg.channel != "cli"
+            && !msg.passive_context
             && parse_runtime_command(&msg.channel, &msg.content).is_none()
         {
             let debounce_key =
@@ -10985,6 +11035,7 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_passive_group_context(tg.passive_group_context)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -12412,6 +12463,7 @@ fn collect_configured_channels(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_passive_group_context(tg.passive_group_context)
                     .with_transcription_manager(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -14554,7 +14606,7 @@ pub async fn start_channels_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
-        );
+        )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
@@ -15025,7 +15077,7 @@ pub async fn start_channels_with_plugin_webhooks(
             }),
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.resolved.max_tool_result_chars,
-            context_token_budget: agent.resolved.max_context_tokens,
+            context_token_budget: agent.resolved.effective_context_budget(),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::from_millis(config.channels.debounce_ms),
             )),
@@ -15686,6 +15738,22 @@ fn concurrent_persist_lock_serialization() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn shared_room_history_keeps_the_speaker_for_any_channel() {
+        let msg = ChannelMessage {
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..ChannelMessage::new("1", "alice", "-100200300", "I'll deploy", "telegram", 0)
+        };
+
+        let rendered = timestamped_channel_user_history_content(&msg, "Observed group message");
+
+        assert!(
+            rendered.contains("alice"),
+            "shared Telegram history must name the speaker, got: {rendered}"
+        );
+    }
+
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
     // pin the built-in filter's own behavior.
@@ -16304,7 +16372,8 @@ pub(crate) mod tests {
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
         let schemas: HashMap<String, Arc<serde_json::Value>> = registry
             .tools
             .iter()
@@ -19529,10 +19598,37 @@ api_key = "anthropic-key"
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
     /// delivery flags (`suppress_voice`, `force_voice`) and not only on
-    /// recipient and text.
-    #[derive(Default)]
+    /// recipient and text. `telegram(drafts)` names it `telegram` and, when
+    /// asked, advertises draft support so a test can drive the streaming
+    /// finalization arm as well as the plain send.
     struct SendMessageRecordingChannel {
+        channel_name: &'static str,
+        drafts: bool,
         sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+        finalized: tokio::sync::Mutex<Vec<(String, String, String, bool)>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl Default for SendMessageRecordingChannel {
+        fn default() -> Self {
+            Self {
+                channel_name: "test-channel",
+                drafts: false,
+                sent_messages: tokio::sync::Mutex::new(Vec::new()),
+                finalized: tokio::sync::Mutex::new(Vec::new()),
+                cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SendMessageRecordingChannel {
+        fn telegram(drafts: bool) -> Self {
+            Self {
+                channel_name: "telegram",
+                drafts,
+                ..Self::default()
+            }
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for SendMessageRecordingChannel {
@@ -19549,11 +19645,43 @@ api_key = "anthropic-key"
     #[async_trait::async_trait]
     impl Channel for SendMessageRecordingChannel {
         fn name(&self) -> &str {
-            "test-channel"
+            self.channel_name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            self.drafts
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+            suppress_voice: bool,
+        ) -> anyhow::Result<()> {
+            self.finalized.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+                suppress_voice,
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}"));
             Ok(())
         }
 
@@ -21871,6 +21999,108 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             user_history.contains("[Current WhatsApp group message from alice]"),
             "active group turn should preserve current sender attribution, got: {user_history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_context_does_not_reach_the_worker_sop_dispatch() {
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+
+        let sop = Sop {
+            name: "telegram-ingress".into(),
+            description: "Starts on any telegram channel message".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: None,
+                condition: None,
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                ..Default::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            sop_engine: Some(Arc::clone(&engine)),
+            sop_audit: Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
+                Arc::new(NoopMemory),
+            ))),
+            ..(*base).clone()
+        });
+
+        let passive_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "passive-1".into(),
+            sender: "bob".into(),
+            reply_target: "-1001234567890".into(),
+            content: "the release codename is quartz".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            passive_context: true,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..Default::default()
+        };
+        process_channel_message(
+            runtime_ctx.clone(),
+            passive_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_runs()
+                .is_empty(),
+            "passive observation must not start an SOP run"
+        );
+
+        let active_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "active-1".into(),
+            sender: "alice".into(),
+            content: "what is the release codename?".into(),
+            timestamp: 2,
+            passive_context: false,
+            ..passive_msg
+        };
+        process_channel_message(runtime_ctx, active_msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_runs()
+                .len(),
+            1,
+            "the addressed turn must still dispatch"
         );
     }
 
@@ -26989,6 +27219,319 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn passive_stop_command_does_not_cancel_another_participants_turn() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "forwarded content".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/stop".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                passive_context: true,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "the addressed turn must still answer: a passive /stop is not this bot's stop"
+        );
+        assert!(sent_messages[0].contains("response-1"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "a passive message must not start a turn of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_batch_is_not_swallowed_by_later_passive_chatter() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new({
+                let mut cfg = zeroclaw_config::schema::Config::default();
+                cfg.channels.debounce_ms = 120;
+                cfg
+            }),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::from_millis(120),
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "what is the deploy status?".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "lol".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 2,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                passive_context: true,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "alice asked a question: passive chatter from bob must not swallow the batch"
+        );
+        assert!(
+            calls[0]
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("deploy status")),
+            "the answered turn must be alice's question"
+        );
+    }
+
+    #[tokio::test]
     async fn message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
         let channel_impl = Arc::new(SlackRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -29733,7 +30276,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(
-            prompt.contains("execute it directly instead of asking the user for extra approval"),
+            prompt.contains("Execute those directly instead of asking the user for extra approval"),
             "full autonomy should instruct direct execution for allowed tools"
         );
         assert!(
@@ -33052,6 +33595,77 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_route_switch_re_resolves_context_limits() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut cfg = Config::default();
+        for (alias, model, context_window) in [
+            ("large", "large-model", 200_000),
+            ("small", "small-model", 8_000),
+        ] {
+            cfg.providers.models.custom.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+        cfg.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "router".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.large"),
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let large = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.large".to_string(),
+                model: "large-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+        let small = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.small".to_string(),
+                model: "small-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+
+        assert_eq!(
+            (large.model_context_window, large.context_token_budget),
+            (200_000, 180_000)
+        );
+        assert_eq!(
+            (small.model_context_window, small.context_token_budget),
+            (8_000, 7_200)
+        );
+    }
+
+    #[test]
     fn set_scope_override_clears_when_equal_to_default() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = channel_runtime_context_for_defaults_test(
@@ -33208,13 +33822,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Telegram addresses replies by chat id and names peers by username, so it
-    /// has the same recipient-versus-identity mismatch Matrix had, and resolving
-    /// modality here would fix both at once. It is deliberately not done:
-    /// Telegram's `send` treats `force_voice` as voice-*only* and drops the text
-    /// reply, where Matrix posts the voice note alongside its text. Turning a
-    /// Telegram user's replies voice-only is a behaviour change that belongs to
-    /// Telegram, so `sender_prefers_voice` stays scoped to Matrix.
+    /// A Telegram group reply is addressed to the group's chat id while the
+    /// peer group names a sender, so the two have to be reconciled here where
+    /// the sender is still in hand. Telegram's `send` treats `force_voice` as
+    /// voice-*only* and drops the text reply, which is the channel's existing
+    /// behaviour for a configured voice peer.
     fn telegram_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
             sender: sender.into(),
@@ -33247,11 +33859,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn sender_prefers_voice_is_matrix_only() {
-        // A voice group whose member matches by every rule this function applies,
-        // on a channel it does not serve. Telegram decides modality for itself
-        // from session state; answering here too would give the group a second
-        // owner and silently turn the user's replies voice-only.
+    fn telegram_voice_group_member_in_a_group_gets_force_voice() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
@@ -33260,10 +33868,342 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
+        let mut msg = telegram_msg("@alice");
+        msg.reply_target = "-1001234567890".into();
+
         assert_eq!(
-            sender_prefers_voice(&ctx, &telegram_msg("@alice")),
+            voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg)),
+            (None, true),
+            "the sender's group membership, not the group chat address, picks the modality"
+        );
+    }
+
+    #[test]
+    fn telegram_voice_group_matches_a_numeric_platform_id() {
+        // The channel prefers the display username in `sender`, so a group that
+        // names the numeric user id has to match platform_sender_id.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("telegram.default", &["111"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("@alice");
+        msg.platform_sender_id = Some("111".into());
+        msg.reply_target = "-1001234567890".into();
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &msg),
+            Some(true),
+            "a peer group may name the numeric user id the channel reports separately"
+        );
+    }
+
+    #[test]
+    fn telegram_voice_group_wildcard_voices_every_sender() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("telegram.default", &["*"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("@mallory");
+        msg.reply_target = "-1001234567890".into();
+
+        assert_eq!(sender_prefers_voice(&ctx, &msg), Some(true));
+    }
+
+    #[test]
+    fn a_non_member_telegram_sender_stays_no_opinion() {
+        // Telegram also voices input-driven conversations from session state, so
+        // a config miss must not be reported as an authoritative suppression.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("telegram.default", &["@alice"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("@bob");
+        msg.reply_target = "-1001234567890".into();
+
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg)),
+            (None, false),
+            "one member's voice preference must not reach a non-member, and must \
+             not silence the non-member's input-driven voice mode either"
+        );
+    }
+
+    #[test]
+    fn a_private_telegram_chat_matches_the_numeric_peer_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("telegram.default", &["111"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("111");
+        msg.reply_target = "111".into();
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &msg),
+            Some(true),
+            "a private chat's address is the peer's own id, so the numeric case stays compatible"
+        );
+    }
+
+    /// A Telegram group reply whose chat id differs from the sender's own id, so
+    /// a destination comparison cannot stand in for the sender identity.
+    fn telegram_group_message(
+        sender: &str,
+        platform_sender_id: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: sender.to_string(),
+            platform_sender_id: Some(platform_sender_id.to_string()),
+            reply_target: "-1001234567890".to_string(),
+            content: "hello".to_string(),
+            channel: "telegram".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Drives the real dispatch and reply-delivery path with a voice group that
+    /// names the numeric sender id.
+    fn telegram_voice_delivery_ctx(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "family".to_string(),
+            voice_peer_group("telegram.default", &["111"]),
+        );
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            zeroclaw_config::schema::Config {
+                peer_groups,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
             None,
-            "a matching Telegram voice group must not be answered here"
+            Arc::new(NoopObserver),
+            tools,
+        )
+    }
+
+    fn delivered_reply<'a>(sent: &'a [SendMessage], recipient: &str) -> &'a SendMessage {
+        sent.iter()
+            .find(|message| message.recipient == recipient)
+            .unwrap_or_else(|| panic!("no reply delivered to {recipient}; got {sent:?}"))
+    }
+
+    #[tokio::test]
+    async fn telegram_voice_peer_is_force_voiced_on_ordinary_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.force_voice,
+            "the configured sender's reply must be voiced, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a voice peer's reply must not be suppressed, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_voice_peer_is_force_voiced_on_streaming_final_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(true));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a forced voice reply must replace the draft placeholder rather than finalize it"
+        );
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.force_voice,
+            "the streaming final delivery must carry force_voice, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_non_member_reply_stays_text_on_ordinary_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@bob", "222"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            !reply.force_voice,
+            "a non-member must not borrow another member's voice preference, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a non-member's reply is ordinary text, not an explicit suppression, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_non_member_reply_stays_text_on_streaming_final_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(true));
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@bob", "222"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let finalized = channel_impl.finalized.lock().await;
+        let entry = finalized
+            .iter()
+            .find(|(recipient, _, _, _)| recipient == "-1001234567890")
+            .unwrap_or_else(|| panic!("no draft finalization; got {finalized:?}"));
+        assert!(
+            !entry.3,
+            "a non-member's streaming finalization must stay text, got {entry:?}"
+        );
+    }
+
+    struct SendViaTextRoutingProvider;
+
+    fn send_via_text_tool_call() -> String {
+        "<tool_call>\n{\"name\":\"send_via\",\"arguments\":{\"modality\":\"text\"}}\n</tool_call>"
+            .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SendViaTextRoutingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(send_via_text_tool_call())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            {
+                Ok("the reply".to_string())
+            } else {
+                Ok(send_via_text_tool_call())
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SendViaTextRoutingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SendViaTextRoutingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_explicit_text_override_stays_text_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
+        let send_via = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            Arc::new(parking_lot::RwLock::new(
+                HashMap::<String, Arc<dyn Channel>>::new(),
+            )),
+            Arc::new(HashMap::<String, zeroclaw_config::multi_agent::PeerGroupConfig>::new),
+        );
+        let ctx = telegram_voice_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(SendViaTextRoutingProvider),
+            vec![Box::new(send_via)],
+        );
+
+        process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "-1001234567890");
+        assert!(
+            reply.suppress_voice,
+            "the explicit text override must win over the sender's voice preference, got {reply:?}"
+        );
+        assert!(
+            !reply.force_voice,
+            "the explicit text override must not force voice, got {reply:?}"
         );
     }
 
@@ -33425,36 +34365,22 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn telegram_voice_group_accidentally_silences_text() {
-        // This test documents the current (broken) behavior and will need updating when
-        // Telegram's sender-side voice-group resolution is implemented as a follow-up.
-        // Today: `sender_prefers_voice` is gated to Matrix only, so Telegram voice groups
-        // are ignored at the routing layer (the function returns `None`). This is correct
-        // by accident — the real bug is Telegram's own `is_voice_chat` path, which compares
-        // chat IDs against user-peer lists. When fixed, both Telegram and Matrix will use
-        // the same sender-side resolution, and this test should then assert `Some(true)`.
-        // For now it confirms the gate works: Telegram voice groups do not leak into
-        // `sender_prefers_voice` output.
+    fn a_voice_group_on_another_telegram_alias_does_not_leak() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
-            "telegram_voice".into(),
-            voice_peer_group("telegram.default", &["@alice:server"]),
+            "work_voice".into(),
+            voice_peer_group("telegram.work", &["@alice"]),
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        let msg = zeroclaw_api::channel::ChannelMessage {
-            sender: "@alice:server".into(),
-            reply_target: "123456789".into(),
-            channel: "telegram.default".into(),
-            channel_alias: Some("default".into()),
-            content: "hello".into(),
-            ..Default::default()
-        };
+        let mut msg = telegram_msg("@alice");
+        msg.reply_target = "-1001234567890".into();
+
         assert_eq!(
             sender_prefers_voice(&ctx, &msg),
             None,
-            "Telegram is gated out; the voice-group config is ignored (safe, but not the intended design)"
+            "the default alias has no voice peers, so this is 'no opinion'"
         );
     }
 
@@ -41756,6 +42682,7 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -41786,6 +42713,7 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
