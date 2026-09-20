@@ -1066,6 +1066,178 @@ mod tests {
         );
     }
 
+    /// A roster uid changed by a save must take effect on both sides: the old
+    /// uid stops authenticating and the new one starts. Asserting only that the
+    /// generation moved would pass even if the accepted roster never changed.
+    #[tokio::test]
+    async fn publishing_a_uid_swap_moves_authorization_to_the_new_uid() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4242 },
+            None,
+            None,
+        )
+        .await
+        .expect("the rostered uid authenticates before the swap");
+
+        let mut swapped = config;
+        swapped.users.get_mut("alice").unwrap().uid = Some(4343);
+        auth.publish_accepted(&swapped, 1)
+            .expect("a roster uid swap publishes");
+
+        let denied = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect_err("the superseded uid must stop authenticating");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4343 },
+            None,
+            None,
+        )
+        .await
+        .expect("the newly rostered uid authenticates after the swap");
+    }
+
+    /// Two writers publishing concurrently: the one that persisted an older
+    /// revision must not reinstall its superseded policy over the newer one.
+    /// The accepted roster, not just the revision counter, has to hold.
+    #[tokio::test]
+    async fn a_stale_concurrent_publication_cannot_reinstall_superseded_policy() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+
+        let mut newer = config.clone();
+        newer.users.get_mut("alice").unwrap().uid = Some(4343);
+        auth.publish_accepted(&newer, 2)
+            .expect("the newer revision publishes");
+
+        // The slow writer's candidate still carries the old uid at revision 1.
+        auth.publish_accepted(&config, 1)
+            .expect("a stale publication is a no-op, not an error");
+        assert_eq!(
+            auth.accepted_revision(),
+            2,
+            "a stale publication must not move the accepted revision back"
+        );
+
+        let denied = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect_err("the superseded uid must not be reinstated by a stale publish");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        auth.authenticate(
+            TransportKind::Local,
+            Credential::Peercred { uid: 4343 },
+            None,
+            None,
+        )
+        .await
+        .expect("the newer roster still governs after the stale publish");
+    }
+
+    /// Removing daemon-uid trust must reach connections already established on
+    /// it, not only new ones: the established binding has to revalidate and
+    /// lose its authorization at the next resolve.
+    #[tokio::test]
+    async fn removing_daemon_uid_trust_denies_an_established_connection() {
+        let mut trusting = config_with_roster(4242);
+        trusting.security.trust_daemon_uid = true;
+        let auth = auth_for(&trusting, &[]);
+        let daemon_uid = PeercredAuthProvider::current_process_uid();
+        let established = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: daemon_uid },
+                None,
+                None,
+            )
+            .await
+            .expect("the daemon uid is trusted before the change");
+        auth.resolve_current(&established)
+            .expect("the established connection resolves while the trust stands");
+
+        let mut untrusting = trusting;
+        untrusting.security.trust_daemon_uid = false;
+        auth.publish_accepted(&untrusting, 1)
+            .expect("removing daemon uid trust publishes");
+
+        assert!(
+            auth.resolve_current(&established).is_err(),
+            "an established daemon-uid connection must lose authorization once the trust is removed"
+        );
+    }
+
+    /// A connection established through the no-roster compatibility path must
+    /// be re-evaluated once a roster exists: compatibility is the migration
+    /// state, and adding a roster ends it for connections already open.
+    #[tokio::test]
+    async fn adding_a_roster_denies_an_established_compatibility_connection() {
+        let compat = base_config();
+        let auth = auth_for(&compat, &[]);
+        // With no roster the socket mode is the credential: a local connection
+        // presenting none is admitted as the shared operator.
+        let established = auth
+            .authenticate(TransportKind::Local, Credential::None, None, None)
+            .await
+            .expect("the compatibility path admits a local connection with no roster");
+        auth.resolve_current(&established)
+            .expect("the compatibility connection resolves while no roster exists");
+
+        auth.publish_accepted(&config_with_roster(4343), 1)
+            .expect("adding a roster publishes");
+
+        assert!(
+            auth.resolve_current(&established).is_err(),
+            "adding a roster must end the compatibility admission for an open connection"
+        );
+    }
+
+    /// Tightening `required_acr` through a save must reach connections already
+    /// established on the old requirement, not only fresh tokens: the OIDC
+    /// binding has to initialize again rather than keep resolving. Rejection of
+    /// a fresh token that lacks the acr is covered by the provider's own tests
+    /// in `security::auth_provider::oidc`.
+    #[test]
+    fn tightening_required_acr_forces_an_established_oidc_binding_to_reinitialize() {
+        let config = oidc_config();
+        let auth = auth_for(&config, &[]);
+        let binding = oidc_binding(&auth);
+        auth.resolve_current(&binding)
+            .expect("the OIDC binding resolves under the accepted requirement");
+
+        let mut tightened = config;
+        tightened
+            .oidc
+            .get_mut("corp")
+            .expect("the fixture provider exists")
+            .required_acr = vec!["urn:example:assurance:mfa".into()];
+        let moved = auth
+            .publish_accepted(&tightened, 1)
+            .expect("an ACR tightening publishes");
+        assert!(
+            moved > binding.generation,
+            "tightening the acr requirement must move the generation"
+        );
+        assert!(
+            auth.resolve_current(&binding).is_err(),
+            "an established OIDC binding must initialize again after the acr tightens"
+        );
+    }
+
     #[test]
     fn publish_accepted_moves_the_generation_for_every_authorization_input() {
         type Mutation = fn(&mut Config);

@@ -9171,6 +9171,60 @@ mod tests {
         )
     }
 
+    /// Narrow alice the way `config/set` does: persist the edit into the shared
+    /// config and publish it as an accepted revision. `refresh_from_config` is
+    /// the direct path; this is the chain a real mutation travels, so a prompt
+    /// admitted before it must still see the narrowing.
+    fn narrow_alice_to_no_agents_via_publication(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        *ctx.config.write() = narrowed.clone();
+        let revision = ctx.auth.accepted_revision().saturating_add(1);
+        ctx.auth
+            .publish_accepted(&narrowed, revision)
+            .expect("the narrowed policy publishes as an accepted revision");
+    }
+
+    /// The mutation-to-prompt chain: a config mutation published while a
+    /// session is parked on admission must refuse it, not only a direct
+    /// `refresh_from_config`.
+    #[test]
+    fn session_new_narrowed_by_a_published_mutation_while_parked_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = rpc_result_after_midwait_session_admission(
+                Arc::clone(&ctx),
+                "s-parked-published",
+                async move {
+                    alice
+                        .handle_session_new_for_test(&json!({
+                            "agent_alias": "test-agent",
+                            "session_id": "s-parked-published",
+                        }))
+                        .await
+                },
+                narrow_alice_to_no_agents_via_publication,
+            )
+            .await;
+
+            let err = result
+                .expect_err("a principal narrowed by a published mutation must not get a session");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(
+                ctx.sessions.get_agent("s-parked-published").await.is_none(),
+                "a refused session/new must not leave a session behind"
+            );
+        });
+    }
+
     #[test]
     fn session_new_narrowed_while_parked_on_session_admission_is_refused() {
         run_on_a_large_stack(|| async move {
