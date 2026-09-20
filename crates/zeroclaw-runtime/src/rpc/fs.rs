@@ -7,7 +7,7 @@
 //! Windows network and device prefixes, that an enabled agent it is entitled
 //! to use may read under that agent's resolved policy.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroclaw_api::grants::ResolvedGrants;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{FsEntry, FsListDirRequest, FsListDirResponse};
@@ -44,22 +44,62 @@ pub fn resolves_locally(path: &Path) -> bool {
 /// Resolving an agent's policy creates its workspace directory if it is
 /// missing, as every other use of that policy does.
 pub fn listing_is_authorized(config: &Config, grants: &ResolvedGrants, requested: &Path) -> bool {
+    authorize_listing(config, grants, requested).is_some()
+}
+
+/// What a listing is confined to once authorized.
+pub enum ListingAuthorization {
+    /// Operator-level principal, or a policy that bounds no root for the path:
+    /// the daemon account's own access governs, as it did before confinement.
+    Unconfined,
+    /// Scoped principal: enumeration must stay beneath this approved root.
+    Confined(PathBuf),
+}
+
+/// Authorize a listing and report the boundary enumeration must be bound to.
+///
+/// `None` refuses. Returning the boundary rather than a bare `bool` is what
+/// lets the handler enumerate through a directory handle opened beneath the
+/// approved root: re-walking the pathname after this check would let a writable
+/// component be swapped for a link to another directory in between, exposing
+/// names the principal may not read.
+pub fn authorize_listing(
+    config: &Config,
+    grants: &ResolvedGrants,
+    requested: &Path,
+) -> Option<ListingAuthorization> {
     if grants.admin {
-        return true;
+        return Some(ListingAuthorization::Unconfined);
     }
     config
         .agents
         .iter()
         .filter(|(alias, agent)| agent.enabled && grants.may_use_agent(alias))
-        .any(|(alias, _)| {
-            SecurityPolicy::for_agent(config, alias)
-                .is_ok_and(|policy| policy.is_resolved_path_readable(requested))
+        .find_map(|(alias, _)| {
+            let policy = SecurityPolicy::for_agent(config, alias).ok()?;
+            if !policy.is_resolved_path_readable(requested) {
+                return None;
+            }
+            Some(match policy.approved_read_root(requested) {
+                Some(root) => ListingAuthorization::Confined(root),
+                None => ListingAuthorization::Unconfined,
+            })
         })
 }
 
-/// Handle `fs/list_dir`.
+/// One directory entry, reduced to what the response needs, so a confined
+/// (cap-std) and an unconfined (std) enumeration can share the shaping below.
+struct RawEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// Handle `fs/list_dir`, bound to what `authorize_listing` allowed.
 pub async fn handle_fs_list_dir(
     params: &serde_json::Value,
+    auth: &ListingAuthorization,
 ) -> Result<serde_json::Value, zeroclaw_api::jsonrpc::JsonRpcError> {
     let req: FsListDirRequest = serde_json::from_value(params.clone())
         .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
@@ -71,47 +111,77 @@ pub async fn handle_fs_list_dir(
         return Err(rpc_err(FS_INVALID_PATH, "Path traversal not allowed"));
     }
 
-    if !path.is_dir() {
-        return Err(rpc_err(
-            FS_NOT_FOUND,
-            format!("Not a directory: {}", req.path),
-        ));
-    }
+    let unreadable =
+        |e: std::io::Error| rpc_err(FS_NOT_FOUND, format!("Cannot read {}: {e}", req.path));
 
-    let mut entries = Vec::new();
-    let read_dir = match std::fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(e) => {
-            return Err(rpc_err(
-                FS_NOT_FOUND,
-                format!("Cannot read {}: {e}", req.path),
-            ));
+    let raw: Vec<RawEntry> = match auth {
+        // Enumerate through a handle opened beneath the approved root. cap-std
+        // refuses any component that escapes it, so a directory swapped in
+        // after authorization cannot redirect this listing.
+        ListingAuthorization::Confined(root) => {
+            use cap_std::ambient_authority;
+            use cap_std::fs::Dir;
+
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| rpc_err(FS_INVALID_PATH, "Path escapes its approved root"))?;
+            let dir = Dir::open_ambient_dir(root, ambient_authority()).map_err(unreadable)?;
+            let dir = if rel.as_os_str().is_empty() {
+                dir
+            } else {
+                dir.open_dir(rel).map_err(unreadable)?
+            };
+            dir.entries()
+                .map_err(unreadable)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let meta = entry.metadata().ok()?;
+                    Some(RawEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir: meta.is_dir(),
+                        size: meta.len(),
+                        mtime: meta.modified().ok().map(|t| t.into_std()),
+                    })
+                })
+                .collect()
+        }
+        ListingAuthorization::Unconfined => {
+            if !path.is_dir() {
+                return Err(rpc_err(
+                    FS_NOT_FOUND,
+                    format!("Not a directory: {}", req.path),
+                ));
+            }
+            std::fs::read_dir(path)
+                .map_err(unreadable)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let meta = entry.metadata().ok()?;
+                    Some(RawEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir: meta.is_dir(),
+                        size: meta.len(),
+                        mtime: meta.modified().ok(),
+                    })
+                })
+                .collect()
         }
     };
 
-    for entry in read_dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_hidden = name.starts_with('.');
+    let mut entries = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let is_hidden = entry.name.starts_with('.');
         if is_hidden && !req.show_hidden {
             continue;
         }
-
-        let full_path = entry.path().to_string_lossy().to_string();
+        let full_path = path.join(&entry.name).to_string_lossy().to_string();
         entries.push(FsEntry {
-            name,
-            is_dir: meta.is_dir(),
-            size: meta.len(),
+            name: entry.name,
+            is_dir: entry.is_dir,
+            size: entry.size,
             is_hidden,
             full_path,
-            mtime: meta.modified().ok().and_then(|t| {
+            mtime: entry.mtime.and_then(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .map(|d| d.as_secs())
@@ -163,5 +233,52 @@ mod tests {
             r"\\?\UNC\attacker.example\share"
         )));
         assert!(!resolves_locally(Path::new(r"\\.\pipe\zeroclaw")));
+    }
+
+    /// Authorization judges one pathname; enumeration must then run through a
+    /// handle bound to the approved root, so a directory swapped in for a
+    /// writable entry cannot expose another directory's names.
+    #[tokio::test]
+    async fn confined_listing_refuses_an_entry_swapped_outside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real").join("inside.txt"), b"x").unwrap();
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        let swapped = root.join("swapped");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &swapped).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, &swapped).unwrap();
+
+        let auth = super::ListingAuthorization::Confined(root.clone());
+        let escaping = serde_json::json!({
+            "path": swapped.to_string_lossy(),
+            "show_hidden": false,
+        });
+        let err = super::handle_fs_list_dir(&escaping, &auth)
+            .await
+            .expect_err("a directory escaping the approved root must not be listed");
+        assert!(
+            !format!("{err:?}").contains("secret.txt"),
+            "refusal must not leak the other directory's names: {err:?}"
+        );
+
+        // Control: a real directory beneath the root still lists.
+        let allowed = serde_json::json!({
+            "path": root.join("real").to_string_lossy(),
+            "show_hidden": false,
+        });
+        let listed = super::handle_fs_list_dir(&allowed, &auth)
+            .await
+            .expect("a directory inside the approved root must still list");
+        assert!(
+            listed.to_string().contains("inside.txt"),
+            "expected the real entry: {listed}"
+        );
     }
 }

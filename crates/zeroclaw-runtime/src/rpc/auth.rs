@@ -421,7 +421,7 @@ impl RpcInboundAuth {
     /// reinstalling superseded policy over a newer one.
     ///
     /// A persistence that leaves every authorization input as it was (see
-    /// [`auth_inputs`]) records its revision without moving the generation.
+    /// `auth_inputs`) records its revision without moving the generation.
     /// Nothing the accepted state is compiled from changed, and moving the
     /// generation would make every established binding re-resolve over an
     /// unrelated edit, which an OIDC binding cannot survive.

@@ -661,6 +661,68 @@ pub struct RpcDispatcher {
     peer_cert_fingerprint: Option<String>,
 }
 
+/// Read an allowlisted personality file through a handle on `workspace`, with
+/// symlinks refused rather than followed.
+///
+/// cap-std resolves `filename` beneath the opened workspace handle, and the
+/// explicit no-follow option refuses a final component that is a link at all.
+/// An allowlisted `SOUL.md` planted as a symlink therefore cannot redirect the
+/// read outside the entitled agent's workspace.
+fn read_personality_file(
+    workspace: &std::path::Path,
+    filename: &str,
+) -> std::io::Result<(String, Option<i64>)> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use std::io::Read;
+
+    let dir = Dir::open_ambient_dir(workspace, ambient_authority())?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = dir.open_with(filename, &options)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let mtime_ms = file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    Ok((content, mtime_ms))
+}
+
+/// Write an allowlisted personality file through a handle on `workspace`, with
+/// symlinks refused rather than followed, and report the resulting mtime.
+fn write_personality_file(
+    workspace: &std::path::Path,
+    filename: &str,
+    content: &str,
+) -> std::io::Result<Option<i64>> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use std::io::Write;
+
+    std::fs::create_dir_all(workspace)?;
+    let dir = Dir::open_ambient_dir(workspace, ambient_authority())?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .follow(FollowSymlinks::No);
+    let mut file = dir.open_with(filename, &options)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64))
+}
+
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
         Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
@@ -1327,7 +1389,10 @@ impl RpcDispatcher {
     /// handler probes the path, so a refusal does not reveal whether the path
     /// exists. The coarse `Files:Read` grant has already passed the gate; see
     /// [`super::fs::listing_is_authorized`] for the root policy.
-    fn authorize_fs_listing(&self, params: &Value) -> Result<(), JsonRpcError> {
+    fn authorize_fs_listing(
+        &self,
+        params: &Value,
+    ) -> Result<super::fs::ListingAuthorization, JsonRpcError> {
         let Some(grants) = self.stamped_grants() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
@@ -1339,13 +1404,16 @@ impl RpcDispatcher {
         // open it. Refuse relative, parent-component, and network or device
         // paths outright, with the same answer as any other refusal.
         let plain = requested.is_absolute() && super::fs::resolves_locally(requested);
-        let allowed = grants.admin
-            || (plain && {
-                let config = self.ctx.config.read();
-                super::fs::listing_is_authorized(&config, grants, requested)
-            });
-        if allowed {
-            return Ok(());
+        let allowed = if grants.admin {
+            Some(super::fs::ListingAuthorization::Unconfined)
+        } else if plain {
+            let config = self.ctx.config.read();
+            super::fs::authorize_listing(&config, grants, requested)
+        } else {
+            None
+        };
+        if let Some(auth) = allowed {
+            return Ok(auth);
         }
         let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
             "Principal is not granted a listing of {:?}: only absolute local paths that an \
@@ -1405,6 +1473,21 @@ impl RpcDispatcher {
             }
         }
         Ok(())
+    }
+
+    /// The approved read root for an attachment source, resolved through the
+    /// same agent policy `authorize_attachment_sources` judged it with. `None`
+    /// when the entry carries inline bytes or the policy bounds no root for it,
+    /// in which case the read falls back to a parent-handle open.
+    fn attachment_source_root(&self, alias: &str, entry: &FileEntry) -> Option<std::path::PathBuf> {
+        if entry.data_b64.is_some() {
+            return None;
+        }
+        let path = entry.path.as_deref()?;
+        let config = self.ctx.config.read();
+        zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias)
+            .ok()?
+            .approved_read_root(std::path::Path::new(path))
     }
 
     /// Whether this connection holds operator-level (admin) grants. An
@@ -1976,7 +2059,7 @@ impl RpcDispatcher {
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
             Method::FsListDir => match self.authorize_fs_listing(&req.params) {
-                Ok(()) => super::fs::handle_fs_list_dir(&req.params).await,
+                Ok(auth) => super::fs::handle_fs_list_dir(&req.params, &auth).await,
                 Err(denied) => Err(denied),
             },
 
@@ -3564,6 +3647,7 @@ impl RpcDispatcher {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
+                let source_root = self.attachment_source_root(&agent_alias, entry);
                 let result = tokio::select! {
                     biased;
                     _ = self.connection_cancel.cancelled() => {
@@ -3577,6 +3661,7 @@ impl RpcDispatcher {
                         sid,
                         &upload_root,
                         is_wss,
+                        source_root.as_deref(),
                         &self.ctx.sessions,
                     ) => result?,
                 };
@@ -5766,14 +5851,12 @@ impl RpcDispatcher {
             ));
         }
         let workspace = config.agent_workspace_dir(&req.agent);
-        let path = workspace.join(&req.filename);
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let mtime_ms = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64);
+        // Read beneath a handle on the entitled agent's workspace, without
+        // following a link out of it. Joining the pathname and reading it would
+        // let an allowlisted name that is a symlink redirect the read outside
+        // the workspace; the allowlist constrains the name, not its target.
+        match read_personality_file(&workspace, &req.filename) {
+            Ok((content, mtime_ms)) => {
                 let truncated = content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
                 to_result(PersonalityGetResult {
                     filename: req.filename,
@@ -5815,18 +5898,11 @@ impl RpcDispatcher {
             ));
         }
         let workspace = config.agent_workspace_dir(&req.agent);
-        let path = workspace.join(&req.filename);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&path, &req.content)
+        // Write beneath a handle on the entitled agent's workspace, without
+        // following a link out of it, for the same reason the read side does.
+        let mtime_ms = write_personality_file(&workspace, &req.filename, &req.content)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Write failed: {e}")))?;
         let bytes_written = req.content.len() as u64;
-        let mtime_ms = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64);
         to_result(PersonalityPutResult {
             bytes_written,
             mtime_ms,
@@ -6221,8 +6297,16 @@ impl RpcDispatcher {
         let mut results = Vec::with_capacity(req.files.len());
 
         for entry in &req.files {
-            let result =
-                process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions).await?;
+            let source_root = self.attachment_source_root(&agent_alias, entry);
+            let result = process_file_entry(
+                entry,
+                sid,
+                &upload_root,
+                is_wss,
+                source_root.as_deref(),
+                &self.ctx.sessions,
+            )
+            .await?;
             total_bytes += result.size_bytes;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -7537,6 +7621,48 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    /// The personality filename allowlist constrains the name, not its target.
+    /// Both sides must therefore refuse an allowlisted name planted as a link
+    /// out of the entitled agent's workspace, rather than following it.
+    #[test]
+    fn personality_read_and_write_refuse_a_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "original outside content").unwrap();
+
+        let planted = workspace.join("SOUL.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &planted).unwrap();
+
+        let read = super::read_personality_file(&workspace, "SOUL.md");
+        assert!(
+            read.is_err(),
+            "reading through a planted link must be refused, got {:?}",
+            read.map(|(content, _)| content)
+        );
+
+        let written = super::write_personality_file(&workspace, "SOUL.md", "overwritten");
+        assert!(
+            written.is_err(),
+            "writing through a planted link must be refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "original outside content",
+            "the file outside the workspace must be untouched"
+        );
+
+        // Control: a regular allowlisted file round-trips.
+        std::fs::remove_file(&planted).unwrap();
+        super::write_personality_file(&workspace, "SOUL.md", "hello").unwrap();
+        let (content, _) = super::read_personality_file(&workspace, "SOUL.md").unwrap();
+        assert_eq!(content, "hello");
+    }
+
     /// `sops/run-detail` must serialize the explicit projection, never the
     /// persisted run: seeded credentials in the step output, tool arguments,
     /// tool output, and trigger topic are scrubbed at the response boundary;
