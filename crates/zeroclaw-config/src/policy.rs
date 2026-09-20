@@ -1479,6 +1479,15 @@ fn is_git_write_verb(verb: &str) -> bool {
             | "checkout"
             | "switch"
             | "tag"
+            // Index and working-tree mutations. These are conservatively gated
+            // to medium risk; read-only subcommands such as `git stash list` are
+            // over-approved in the safe direction rather than parsed further.
+            | "add"
+            | "rm"
+            | "mv"
+            | "restore"
+            | "apply"
+            | "stash"
     )
 }
 
@@ -1506,9 +1515,19 @@ fn git_command_is_write(args: &[String]) -> bool {
                 return true;
             }
         }
-        "diff" | "log" | "show" => {
+        "diff" | "diff-tree" | "diff-files" | "diff-index" | "log" | "show" | "whatchanged" => {
             if git_args_before_pathspec(args, subcommand_idx + 1)
                 .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "fsck" => {
+            // `git fsck --lost-found` writes recovered objects into
+            // `.git/lost-found/`, so it mutates the repository despite `fsck`
+            // being a read by default.
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--lost-found"))
             {
                 return true;
             }
@@ -1879,7 +1898,27 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
-    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
+    if git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager") {
+        return true;
+    }
+    // `git grep -O[<pager>]` opens matches in a pager (external command), even
+    // when clustered behind other short flags (e.g. `-nO`). The scan is
+    // case-sensitive: `-o` is `--only-matching`, a read. Stop at the first
+    // value-consuming short option so its argument is not misread as flags.
+    let Some(short_run) = arg.strip_prefix('-').filter(|run| !run.starts_with('-')) else {
+        return false;
+    };
+    for ch in short_run.chars() {
+        match ch {
+            'O' => return true,
+            // Options whose value consumes the remainder of the run (or the
+            // next argument): `-A`/`-B`/`-C` (context), `-e`/`-f` (patterns),
+            // `-m` (max-count), and any glued `=value`.
+            'A' | 'B' | 'C' | 'e' | 'f' | 'm' | '=' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -6166,6 +6205,118 @@ mod tests {
         assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
     }
 
+    #[test]
+    fn git_read_verb_mutating_args_are_gated_at_the_enforcement_boundary() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Read-by-default verbs that mutate via an argument must require
+        // approval instead of staying Low.
+        for command in [
+            "git fsck --lost-found",
+            "git fsck --lost",
+            "git fsck --l",
+            "git diff --output=/tmp/out",
+            "git diff --output /tmp/out",
+            "git -C . log --output=/tmp/out",
+            "git show --output=/tmp/out",
+            "git whatchanged --output=/tmp/out",
+            "git diff-tree --output=/tmp/out HEAD",
+            "git diff-index --output=/tmp/out HEAD",
+            "git diff-files --output=/tmp/out",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git read verbs that mutate via arguments must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutating Git read verb should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+
+        // Plain reads and look-alike options stay Low.
+        for command in [
+            "git fsck",
+            "git diff --output-indicator-new=+ HEAD",
+            "git diff -O/tmp/order HEAD",
+            "git whatchanged --stat",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("plain Git reads should remain allowed without approval");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        // `git grep -O` / `--open-files-in-pager` runs a pager (external
+        // command), even clustered behind other short flags; it must be
+        // rejected outright, not merely gated.
+        for command in [
+            "git grep -O foo",
+            "git grep -Ovim foo",
+            "git grep -nO foo",
+            "git grep --open-files-in-pager=sh foo",
+        ] {
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("Git grep pager execution must be rejected even with approval");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        // `-o` is `--only-matching` (a read) and stays allowed and Low; the
+        // pager scan is case-sensitive and stops at value-consuming flags.
+        for command in ["git grep -o needle", "git grep -no needle"] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("git grep --only-matching should remain a read");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn git_index_and_worktree_mutations_require_approval() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Verbs that mutate the index or working tree. These stay command-
+        // allowed but must require approval rather than classifying Low.
+        for command in [
+            "git add .",
+            "git add -A",
+            "git rm --cached secret",
+            "git mv a b",
+            "git restore src/main.rs",
+            "git restore --staged src/main.rs",
+            "git apply patch.diff",
+            "git stash",
+            "git stash push -m wip",
+            "git -C . add .",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("index/working-tree mutations must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutation should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn unix_literal_backslash_executable_is_not_allowlist_match() {
@@ -7740,15 +7891,21 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -7779,68 +7936,113 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
-        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("ls missing 2>/dev/null"), None);
+        assert_eq!(posix("ls missing 2> /dev/null"), None);
+        assert_eq!(posix("echo hi >/dev/stdout"), None);
+        assert_eq!(posix("echo hi > /dev/stdout"), None);
+        assert_eq!(posix("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix("cat </dev/zero"), None);
+        assert_eq!(posix("cat < /dev/zero"), None);
+        // Bare-argument device classification is host-gated BENEATH the
+        // dialect: the harmless-device carve-out for a bare `/dev/null`
+        // argument exists only on Unix hosts, so pinning Posix does not
+        // unify this case. Assert both arms so the split stays visible.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+        assert_eq!(posix("cat /dev/null"), None);
+        #[cfg(target_os = "windows")]
+        assert_eq!(posix("cat /dev/null"), Some("/dev/null".into()));
+        assert_eq!(posix("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix("cat> /dev/null"), None);
+        assert_eq!(posix("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("echo hi >/etc/passwd"), Some("/etc/passwd".into()));
+        assert_eq!(posix("echo hi > /etc/passwd"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi > /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            posix("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            posix("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            posix("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            posix("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            posix("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            posix("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            posix("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
         );
+        assert_eq!(posix("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>&2"),
+            posix("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// The dialect divergence that broke the host-defaulting tests on Windows,
+    /// pinned as intended behavior: under `cmd.exe` the safe null device is
+    /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
+    /// bare leading-slash redirect target is rooted on the current drive
+    /// rather than being workspace-relative.
+    #[test]
+    fn forbidden_path_argument_windows_cmd_classifies_devices_by_dialect() {
+        let p = unix_forbidden_path_policy();
+        let windows_cmd =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::WindowsCmd);
+
+        // Host-independent dialect facts: the cmd.exe null device is safe,
+        // and a drive-relative form fails closed on every host because it
+        // resolves against a per-drive current directory.
+        assert_eq!(windows_cmd("dir missing 2>nul"), None);
+        assert_eq!(windows_cmd("dir missing 2> nul"), None);
         assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
-            Some("/etc/passwd".into())
+            windows_cmd("type C:relative.txt"),
+            Some("C:relative.txt".into())
         );
+
+        // The `/dev/null` classification under the Windows dialect is
+        // host-gated, not dialect-gated: on a Windows host a bare leading
+        // slash is rooted on the current drive and fails closed, while on
+        // POSIX hosts the Unix device path remains acceptable. Assert both
+        // arms so the split stays visible instead of surprising the next
+        // host-defaulting caller.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            windows_cmd("dir missing 2>/dev/null"),
+            Some("/dev/null".into())
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(windows_cmd("dir missing 2>/dev/null"), None);
     }
 
     // ── Edge cases: path traversal ──────────────────────────

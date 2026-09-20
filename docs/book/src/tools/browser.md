@@ -49,10 +49,9 @@ The `[browser]` section gates two separate tools:
 | `browser.enabled` | `true` | `browser_open`: hand a URL to the system browser. No scraping, no page interaction |
 | `browser.automation_enabled` | `false` | `browser`: the full Chrome/Chromium automation tool documented on this page (navigate, click, type, read page content) |
 
-Automation drives a browser that may already be logged into your accounts, so it is
-**opt-in**: turn it on explicitly, and only for agents that need it. It is also not on
-the default `auto_approve` list, so each `browser` call goes through the normal approval
-gate unless you add `"browser"` to a risk profile's `auto_approve`.
+Automation drives a browser that may already be logged into your accounts, so it is **opt-in**: turn it on explicitly, and only for agents that need it. It is also not on the default `auto_approve` list, so each `browser` call goes through the normal approval gate unless a risk profile's `auto_approve` contains `"browser"`.
+
+When upgrading, an existing risk profile may retain `"browser"` in `auto_approve` from the previous forced merge into that list. Automation remains disabled until you set `automation_enabled = true`, but once enabled, that retained entry can suppress approval prompts. Remove `"browser"` from the profile's `auto_approve` list when prompting is required.
 
 Both tools share `allowed_domains`, which defaults to `["*"]`. Enable automation, restrict
 domains, or turn `browser_open` off via `zeroclaw config set`:

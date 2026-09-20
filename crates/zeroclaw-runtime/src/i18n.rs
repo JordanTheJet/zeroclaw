@@ -1166,6 +1166,11 @@ mod tests {
             ("channel-runtime-stop-sent", &[][..], [].as_slice()),
             ("channel-runtime-stop-no-task", &[][..], [].as_slice()),
             (
+                "channel-runtime-stop-folded-followup",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
                 "channel-runtime-model-empty",
                 &[][..],
                 ["/model <model-id>"].as_slice(),
@@ -1717,6 +1722,69 @@ mod tests {
                 !bar_formatted.contains("{pct}"),
                 "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
             );
+        }
+    }
+
+    #[test]
+    fn integration_info_chrome_strings_format_in_all_locales() {
+        let argless_keys = [
+            "cli-integrations-category-heading",
+            "cli-integrations-category-chat",
+            "cli-integrations-category-ai-model",
+            "cli-integrations-category-tools-automation",
+            "cli-integrations-category-platform",
+            "cli-integrations-status-heading",
+            "cli-integrations-status-active",
+            "cli-integrations-status-available",
+            "cli-integrations-setup-heading",
+            "cli-integrations-setup-macos-heading",
+            "cli-integrations-builtin-heading",
+        ];
+        let args = [
+            ("name", "definitely-not-a-real-integration"),
+            ("quickstart", "`zeroclaw quickstart`"),
+            (
+                "channel_config",
+                "`zeroclaw config set channels.<name>.<field>=<value>`",
+            ),
+        ];
+
+        for (source, locale) in committed_locale_sources() {
+            for key in argless_keys {
+                let formatted = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+                assert!(
+                    !formatted.contains('{') && !formatted.contains('}'),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+
+            let unknown = format_ftl_message(source, locale, "cli-integrations-unknown", &args)
+                .unwrap_or_else(|| panic!("{locale}: cli-integrations-unknown should format"));
+            for protected in [
+                "definitely-not-a-real-integration",
+                "`zeroclaw quickstart`",
+                "`zeroclaw config set channels.<name>.<field>=<value>`",
+            ] {
+                assert!(
+                    unknown.contains(protected),
+                    "{locale}: cli-integrations-unknown must preserve {protected:?}: {unknown}"
+                );
+            }
+            assert!(
+                !unknown.contains('{') && !unknown.contains('}'),
+                "{locale}: cli-integrations-unknown left an unformatted placeholder: {unknown}"
+            );
+
+            match locale {
+                "es" => assert!(unknown.contains("Integración desconocida")),
+                "fr" => assert!(unknown.contains("Intégration inconnue")),
+                "ja" => assert!(unknown.contains("不明なインテグレーション")),
+                "zh-CN" => assert!(unknown.contains("未知的集成")),
+                "en" => assert!(unknown.contains("Unknown integration")),
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            }
         }
     }
 

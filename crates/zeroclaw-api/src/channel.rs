@@ -57,6 +57,38 @@ impl ChannelSopTopic {
     }
 }
 
+// ── Channel-supplied room context ───────────────────────────────
+
+/// Context a chat channel supplies about one specific room.
+///
+/// Rooms in the same channel can serve different purposes — one for package
+/// maintenance, another for incident response — and the operator already
+/// describes that in the chat product's own metadata (Mattermost's channel
+/// purpose, Slack's topic, Matrix's room topic). This carries that description
+/// to prompt assembly so a room can specialise the agent without a separate
+/// config entry per room.
+///
+/// **Channel-supplied, not operator-supplied.** The text originates from
+/// whoever can edit the room's metadata, which on default permission schemes is
+/// usually every member — a wider set than whoever controls the agent's config.
+/// It is therefore rendered as context about the room, explicitly labelled as
+/// such, and never as operating rules. Adapters must return `None` unless the
+/// operator opted the alias in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelRoomContext {
+    /// Free-text description of what this room is for.
+    pub purpose: Option<String>,
+}
+
+impl ChannelRoomContext {
+    /// True when there is nothing to inject, so callers can skip the section
+    /// rather than render an empty one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.purpose.as_ref().is_none_or(|p| p.trim().is_empty())
+    }
+}
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Where a tool call sits in the batch the model issued for one turn.
@@ -764,6 +796,31 @@ pub enum ListenerHealth {
     Unhealthy,
 }
 
+/// Error a [`Channel::finalize_draft`] implementation returns when it posted
+/// part of a chunked final answer and could not deliver the remainder. The
+/// accepted prefix is already on the wire, so a caller that falls back to
+/// resending the whole answer would duplicate the delivered chunks. Callers must
+/// treat this as degraded-but-committed delivery: do NOT resend the full answer;
+/// the undelivered suffix is lost. `delivered` is the number of physical chunks
+/// accepted before the failure, for logging only.
+#[derive(Debug)]
+pub struct FinalizePartialDelivery {
+    pub delivered: usize,
+}
+
+impl fmt::Display for FinalizePartialDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer partially delivered ({} chunk(s) accepted); \
+             remainder undelivered and must not be resent",
+            self.delivered
+        )
+    }
+}
+
+impl std::error::Error for FinalizePartialDelivery {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -989,7 +1046,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Whether this channel implements the turn-flush narration contract:
+    /// `flush_draft_turn` delivers each completed agent text turn as a permanent
+    /// outbound message, and the orchestrator therefore routes that narration
+    /// through the outbound hook + leak-detection boundary and orders it ahead of
+    /// the approval prompt via a flush barrier.
+    ///
+    /// Distinct from [`Self::supports_multi_message_streaming`]: a channel can stream
+    /// multiple messages another way (e.g. paragraph edits via `update_draft`)
+    /// without implementing `flush_draft_turn`. Only channels that override
+    /// `flush_draft_turn` may return `true` here, otherwise the orchestrator runs
+    /// outbound policy on phantom flushes that deliver nothing. Default `false`.
+    fn supports_turn_flush_narration(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between successive messages in multi-message mode.
+    /// The message boundary is channel-specific (for example, Telegram uses
+    /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
     }
@@ -1066,8 +1140,42 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Discard a completed agent text turn WITHOUT sending it, marking that
+    /// narration consumed for this draft. Called when the outbound hook cancels a
+    /// narration flush: the cancelled turn must never be re-offered (no
+    /// resurrection), but narration produced by a *later* turn must still be
+    /// deliverable. Advancing the channel's delivered-prefix bookkeeping over the
+    /// cancelled text achieves both. Default: no-op.
+    async fn discard_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     /// `suppress_voice` forces text delivery even on voice-only peers.
+    ///
+    /// If finalization must chunk a long answer and a later chunk fails after an
+    /// earlier one was accepted, return [`FinalizePartialDelivery`] rather than a
+    /// generic error: it tells the caller the accepted prefix is already posted
+    /// so it must not resend the whole answer (which would duplicate the
+    /// delivered chunks). A generic `Err` still means nothing was committed and a
+    /// full-message fallback is safe.
     async fn finalize_draft(
         &self,
         _recipient: &str,
@@ -1131,6 +1239,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Invite a user to an existing platform room/conversation.
     async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("channel does not support room invites")
+    }
+
+    /// Context this channel supplies about `room_id`, when the adapter can
+    /// provide it and the operator has opted the alias in.
+    ///
+    /// Returns `None` by default: a channel that does not implement this, or a
+    /// room the operator has not opted in, contributes nothing to the prompt.
+    /// Absence is the safe state, so the default is the safe one.
+    fn room_context(&self, _room_id: &str) -> Option<ChannelRoomContext> {
+        None
     }
 
     /// Request interactive tool-call approval from the channel operator.

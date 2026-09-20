@@ -22,6 +22,7 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub(crate) mod shell_env;
+pub(crate) mod shell_output;
 pub mod skill_http;
 pub mod skill_manage;
 pub mod skill_tool;
@@ -112,8 +113,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
+    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -633,7 +634,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime(
         config,
         security,
@@ -765,7 +766,7 @@ fn plugin_egress_policy(
 /// miss the row `zeroclaw plugin install` seeds and deny every destination the
 /// operator granted.
 #[cfg(feature = "plugins-wasm")]
-fn plugin_egress_service(
+pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
@@ -835,7 +836,46 @@ pub(crate) fn plugin_host_services(
     zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
-/// Create full tool registry including memory tools and optional Composio.
+/// Stack reserved for the dedicated registry-builder thread. The registry
+/// build is a deep synchronous subtree — ~100 tool constructors plus 18
+/// full-`Config` clones — measured at ~1.5–1.7 MiB of stack on x86_64 Linux
+/// debug builds, with Windows frames some 10–25% larger. Reserving roughly
+/// twice the measured worst case keeps the builder off every caller's stack
+/// budget without itself becoming a new cliff.
+const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Force-compile the process-global lazy regexes used on the turn path.
+///
+/// A cold `regex` compile descends through ~40 `regex_automata` NFA compiler
+/// frames. `scrub_credentials` reaches `SENSITIVE_KV_REGEX` from deep inside
+/// the turn loop (`make_query_summary` → memory rendering), so a first-turn
+/// compile lands that recursion on the turn's stack. Every turn path builds
+/// a tool registry first, so warming them here — on the registry-builder
+/// thread, before any turn stack exists — keeps the recursion off every
+/// caller. Runs at most once per process.
+fn warm_lazy_regexes() {
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
+    std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
+    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
+    zeroclaw_providers::multimodal::warm_lazy_regexes();
+}
+
+/// Create the full tool registry on a dedicated builder thread.
+///
+/// The registry build is the deepest synchronous subtree reachable from
+/// `session/new` and from every turn path. Built inline it consumed the RPC
+/// caller's stack down to a few KiB of the 2 MiB `session/new` regression
+/// budget, so any change deepening it overflowed Windows debug builds. The
+/// build now runs on a thread with its own explicit stack; the caller's
+/// stack pays only the cheap per-call prep below.
+///
+/// Ordering and panic semantics are unchanged: the caller blocks until the
+/// registry is built (as the inline build did), and a builder panic is
+/// resumed on the caller's thread. A scoped thread keeps the borrowed
+/// parameters (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
+/// `root_config`) semantically independent at the API boundary while avoiding
+/// deep clones on the caller's limited stack.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -862,10 +902,154 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+) -> anyhow::Result<AllToolsResult> {
+    all_tools_with_runtime_and_acp_sessions(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+    )
+}
+
+/// Create the full tool registry with an optional ACP session read view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_acp_sessions(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
+) -> anyhow::Result<AllToolsResult> {
+    let builder = move || {
+        // Warm the lazy regexes BEFORE the registry build and BEFORE any
+        // turn can start: LazyLock runs the initializer on whichever thread
+        // reaches it first, so a turn racing an un-joined warmup would
+        // compile the regex (a ~40-frame regex_automata recursion) on the
+        // turn's own stack. Doing this first on the builder thread also
+        // means the compile never lands on a turn stack; it costs one
+        // cold-process delay of a few hundred milliseconds, once.
+        warm_lazy_regexes();
+        all_tools_with_runtime_on_thread(
+            config,
+            security,
+            risk_profile,
+            agent_alias,
+            runtime,
+            memory,
+            composio_key,
+            composio_entity_id,
+            browser_config,
+            http_config,
+            web_fetch_config,
+            workspace_dir,
+            agents,
+            fallback_api_key,
+            root_config,
+            canvas_store,
+            is_subagent_caller,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            live_config,
+            acp_sessions,
+        )
+    };
+    std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-tool-registry".into())
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn_scoped(scope, builder)
+            .map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "failed to spawn tool-registry builder thread: {error}"
+                ))
+            })?;
+        Ok(match handle.join() {
+            Ok(result) => result,
+            // Preserve the inline build's panic semantics: a builder panic is
+            // resumed on the caller's thread exactly as if it had unwound
+            // through the caller's frames.
+            Err(panic) => std::panic::resume_unwind(panic),
+        })
+    })
+}
+
+/// Registry build body; runs on the dedicated builder thread spawned by
+/// [`all_tools_with_runtime`].
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+fn all_tools_with_runtime_on_thread(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1348,7 +1532,14 @@ pub fn all_tools_with_runtime(
                 root_config.config_path.clone(),
                 root_config.secrets.encrypt,
             )
-            .with_serply_api_key_override(serply_api_key_override(root_config)),
+            .with_serply_api_key_override(serply_api_key_override(root_config))
+            // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
+            // memory only. Without handing it over, the tool would reread
+            // `config.toml` and miss an env-only key, or send a stored key
+            // that a blank override was meant to suppress.
+            .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            )),
             security.clone(),
         )));
     }
@@ -1569,13 +1760,34 @@ pub fn all_tools_with_runtime(
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
-        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-            backend.clone(),
-            security.clone(),
-        )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        if let Some(acp_sessions) = acp_sessions {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsListTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::with_acp_sessions(
+                backend.clone(),
+                security.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::with_acp_sessions(
+                backend,
+                security.clone(),
+                acp_sessions,
+            )));
+        } else {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::new(
+                backend.clone(),
+                security.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        }
     }
 
     // LinkedIn integration (config-gated)
@@ -1715,18 +1927,15 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(git_forge_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
-    let channel_room_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    let channel_room_tool = ChannelRoomTool::new(
-        security.clone(),
-        channel_room_handle.as_ref().cloned().unwrap(),
-    );
+    let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
+    let channel_room_tool = ChannelRoomTool::new(security.clone(), channel_room_tool_handle);
     tool_arcs.push(Arc::new(channel_room_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+    let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
+    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
     tool_arcs.push(Arc::new(ask_user_tool));
 
     {
@@ -1739,17 +1948,18 @@ pub fn all_tools_with_runtime(
         };
         tool_arcs.push(Arc::new(SendViaTool::new(
             security.clone(),
-            ask_user_handle.as_ref().cloned().unwrap(),
+            ask_user_tool_handle,
             agent_peer_groups,
         )));
     }
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_tool_handle,
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
@@ -2849,6 +3059,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         assert!(
@@ -2918,6 +3129,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let web_search = tools
@@ -2983,6 +3195,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3048,6 +3261,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let send_via = tools
@@ -3109,6 +3323,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3256,6 +3471,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools;
             let tool = tools
                 .iter()
@@ -3345,6 +3561,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
@@ -3408,6 +3625,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3464,7 +3682,8 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
-        );
+        )
+        .expect("first tool registry builds");
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
             &security,
@@ -3487,7 +3706,8 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
-        );
+        )
+        .expect("second tool registry builds");
 
         for tools in [&session_a.tools, &session_b.tools] {
             assert!(tools.iter().any(|t| t.name() == "sop_status"));
@@ -3614,6 +3834,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
         let unauthorized_tools = build("ZeroClawAgent", mem.clone());
@@ -3710,6 +3931,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -3916,6 +4138,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -3971,6 +4194,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"knowledge"));
@@ -4018,6 +4242,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -4074,6 +4299,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("browser automation tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -4123,6 +4349,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("automation-only tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -4185,6 +4412,7 @@ permissions = ["http_client"]
                 Some(sop_audit),
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
 
@@ -4343,6 +4571,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -4382,6 +4611,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -4423,6 +4653,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
@@ -4463,6 +4694,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
@@ -4497,6 +4729,7 @@ permissions = ["http_client"]
             is_subagent_caller,
             None,
         )
+        .expect("tool registry builds")
         .tools
         .iter()
         .map(|t| t.name().to_string())
@@ -4553,6 +4786,7 @@ permissions = ["http_client"]
                 false,
                 None,
             )
+            .expect("tool registry builds")
             .tools
             .iter()
             .map(|t| t.name().to_string())
@@ -4629,6 +4863,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4692,6 +4927,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4737,6 +4973,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -4837,6 +5074,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let llm_task = tools

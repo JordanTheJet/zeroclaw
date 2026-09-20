@@ -496,7 +496,7 @@ async fn handle_socket(
     }
 
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
             Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
@@ -1017,6 +1017,239 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, Option<u64>) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
+    )
+}
+
+/// Terminal-frame budget/window for the `done` event.
+///
+/// `final_limits` is the route that actually served the LAST call, carried out
+/// of the turn loop. When present it is AUTHORITATIVE and overrides the
+/// usage-derived values, which can be stale: an earlier usage-bearing route
+/// before a final no-usage call (e.g. a vision reply without token usage) would
+/// otherwise leave the frame on the earlier route's numbers. Only when no call
+/// was served this turn (a cache hit) does `final_limits` become `None`, and the
+/// frame falls back to the usage values, then to `fallback_limits`.
+fn done_frame_context_limits(
+    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+) -> (u64, Option<u64>) {
+    match final_limits {
+        Some(limits) => (
+            limits.context_token_budget as u64,
+            limits.configured_model_context_window().map(|t| t as u64),
+        ),
+        None => resolve_done_context_limits(
+            usage_budget,
+            usage_model_window,
+            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                context_token_budget: 0,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            }),
+        ),
+    }
+}
+
+/// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
+/// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
+/// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
+/// making the breakdown the single source of truth for both token counts and cost.
+#[derive(Debug, Clone, Default)]
+struct ProviderUsageEntry {
+    provider_ref: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    cost_usd: f64,
+}
+
+/// Fold state for `TurnEvent::Usage` inside the WS chat loop.
+///
+/// `process_chat_message` owns one per turn and feeds it every Usage event
+/// verbatim; the done/cancel frame paths then read the accumulated state.
+/// Billing aggregation (turn-wide totals plus the per-(provider, model)
+/// breakdown) accumulates every billable attempt, including rejected ones.
+/// The accepted-serving snapshot (`last_provider_ref` / `last_model` /
+/// `last_input_tokens`) advances only on `accepted: true` events, so a later
+/// billed rejected attempt cannot re-point the terminal identity or the
+/// context-meter ceiling (see the `TurnEvent::Usage` contract).
+#[derive(Debug, Default)]
+struct UsageFold {
+    total_input_tokens: Option<u64>,
+    total_output_tokens: Option<u64>,
+    last_provider_ref: Option<String>,
+    last_model: Option<String>,
+    last_input_tokens: Option<u64>,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
+    usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
+}
+
+impl UsageFold {
+    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
+        let zeroclaw_api::agent::TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cost_usd,
+            context_token_budget,
+            model_context_window,
+            provider_ref,
+            model: served_model,
+            accepted,
+        } = event
+        else {
+            return;
+        };
+        // Turn-wide billing totals accumulate every billable attempt,
+        // including rejected ones (`accepted: false` is billing-only
+        // telemetry per the TurnEvent::Usage contract). Only the
+        // accepted-serving snapshot below is gated on `accepted`.
+        if let Some(it) = input_tokens {
+            self.total_input_tokens = Some(self.total_input_tokens.unwrap_or(0) + it);
+        }
+        if let Some(ot) = output_tokens {
+            self.total_output_tokens = Some(self.total_output_tokens.unwrap_or(0) + ot);
+        }
+        if accepted {
+            self.last_provider_ref = Some(provider_ref.clone());
+            self.last_model = Some(served_model.clone());
+            self.last_context_token_budget = context_token_budget;
+            self.last_model_context_window = model_context_window;
+            if let Some(it) = input_tokens {
+                self.last_input_tokens = Some(it);
+            } else {
+                // Accepted call returned no usage data; clear the previous
+                // route's input snapshot to prevent stale values from a
+                // different route being rendered against this route's
+                // context window.
+                self.last_input_tokens = None;
+            }
+        }
+        // Per-(provider, model) breakdown accumulation.
+        // The event-owned strings move into the map key; entry
+        // fields clone from the key only on insert, so repeat
+        // events for a known pair cost no extra clones.
+        let entry = self
+            .usage_by_provider
+            .entry((provider_ref, served_model))
+            .or_insert_with_key(|(provider_ref, model)| ProviderUsageEntry {
+                provider_ref: provider_ref.clone(),
+                model: model.clone(),
+                ..Default::default()
+            });
+        if let Some(it) = input_tokens {
+            entry.input_tokens = entry.input_tokens.saturating_add(it);
+        }
+        if let Some(ot) = output_tokens {
+            entry.output_tokens = entry.output_tokens.saturating_add(ot);
+        }
+        if let Some(ct) = cached_input_tokens {
+            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(ct);
+        }
+        if let Some(cu) = cost_usd {
+            entry.cost_usd += cu;
+        }
+    }
+
+    /// Sorted per-(provider, model) breakdown in wire order; drains the map.
+    /// `total_cost_usd` sums over this vector — never over the HashMap
+    /// directly — so float accumulation order (and the emitted total) is
+    /// deterministic.
+    fn take_sorted_entries(&mut self) -> Vec<ProviderUsageEntry> {
+        let mut entries: Vec<_> = std::mem::take(&mut self.usage_by_provider)
+            .into_values()
+            .collect();
+        entries.sort_by(|a, b| {
+            a.provider_ref
+                .cmp(&b.provider_ref)
+                .then(a.model.cmp(&b.model))
+        });
+        entries
+    }
+
+    /// Turn-wide cost total over the sorted breakdown; `None` when nothing
+    /// billable was recorded.
+    fn total_cost_usd(entries: &[ProviderUsageEntry]) -> Option<f64> {
+        let sum: f64 = entries.iter().map(|e| e.cost_usd).sum();
+        if sum > 0.0 { Some(sum) } else { None }
+    }
+}
+
+/// Scalar inputs to build a done-frame JSON.
+/// `usage_by_provider` is kept as a separate arg (different concern).
+/// `cost_usd` is derived as the sum of `usage_by_provider[*].cost_usd`,
+/// which includes ALL billable attempts (accepted + rejected).
+#[derive(Debug, Clone)]
+struct DoneFrameMeta<'a> {
+    full_response: &'a str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    tokens_used: Option<u64>,
+    cost_usd: Option<f64>,
+    model: &'a str,
+    provider: &'a str,
+    provider_ref: &'a str,
+    max_context_tokens: u64,
+    model_context_window: Option<u64>,
+    last_input_tokens: Option<u64>,
+    last_serving_provider_ref: Option<&'a str>,
+    last_serving_model: Option<&'a str>,
+}
+
+/// Build the `done`-frame JSON.
+/// `provider` carries the full configured `<type>.<alias>` ref, matching the
+/// long-standing wire semantic; `provider_ref` carries the serving identity
+/// resolved from usage events (falling back to the turn-start provider).
+fn build_done_frame_json(
+    meta: &DoneFrameMeta,
+    usage_by_provider: &[ProviderUsageEntry],
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "done",
+        "full_response": meta.full_response,
+        "input_tokens": meta.input_tokens,
+        "output_tokens": meta.output_tokens,
+        "tokens_used": meta.tokens_used,
+        "cost_usd": meta.cost_usd,
+        "model": meta.model,
+        "provider": meta.provider,
+        "provider_ref": meta.provider_ref,
+        "max_context_tokens": meta.max_context_tokens,
+        "last_input_tokens": meta.last_input_tokens,
+        "last_serving_provider_ref": meta.last_serving_provider_ref,
+        "last_serving_model": meta.last_serving_model,
+        "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
+            "provider_ref": e.provider_ref,
+            "model": e.model,
+            "input_tokens": e.input_tokens,
+            "output_tokens": e.output_tokens,
+            "cached_input_tokens": e.cached_input_tokens,
+            "cost_usd": e.cost_usd,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(window) = meta.model_context_window {
+        done["model_context_window"] = serde_json::Value::from(window);
+    }
+    done
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1056,15 +1289,6 @@ async fn process_chat_message(
             zeroclaw_runtime::agent::cost::TurnUsage::default(),
         ))
     });
-
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
-    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -1140,202 +1364,195 @@ async fn process_chat_message(
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
     // surfaces usage; we sum to produce a single done-frame total.
-    let mut total_input_tokens: Option<u64> = None;
-    let mut total_output_tokens: Option<u64> = None;
+    // `UsageFold` holds both the billing aggregation (every billable attempt,
+    // including rejected ones) and the accepted-serving snapshot (accepted
+    // events only) that the done/cancel frames render.
+    let mut usage_fold = UsageFold::default();
 
-    // Track the most recent absolute provider-reported prompt size
-    // (replaces on each TurnEvent::Usage; not accumulated).
-    // Used for accurate context-bar rendering on the client.
-    let mut last_input_tokens: Option<u64> = None;
     let forward_fut = async {
         let mut cancel_drained = false;
         loop {
             tokio::select! {
-                biased;
-                _ = cancel_token.cancelled(), if !cancel_drained => {
-                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
-                    drop(drained);
-                    cancel_drained = true;
-                    // Fall through; the agent loop will now wake from the
-                    // approval await, see the cancel token, and propagate
-                    // a ToolLoopCancelled error which closes event_rx and
-                    // breaks this loop on the `event_rx.recv()` arm below.
-                }
-                client_msg = receiver.next() => {
-                    let text = match client_msg {
-                        Some(Ok(Message::Text(text))) => text,
-                        Some(Ok(Message::Ping(payload))) => {
-                            if sender.send(Message::Pong(payload)).await.is_err() {
-                                cancel_token.cancel();
-                                break;
+                            biased;
+                            _ = cancel_token.cancelled(), if !cancel_drained => {
+                                let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                                drop(drained);
+                                cancel_drained = true;
+                                // Fall through; the agent loop will now wake from the
+                                // approval await, see the cancel token, and propagate
+                                // a ToolLoopCancelled error which closes event_rx and
+                                // breaks this loop on the `event_rx.recv()` arm below.
                             }
-                            continue;
-                        }
-                        Some(Ok(Message::Pong(_))) => continue,
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
-                        }
-                        _ => continue,
-                    };
-                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
-                            "code": "INVALID_JSON"
-                        });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
-                        continue;
-                    };
-                    match parsed["type"].as_str() {
-                        Some("approval_response") => {
-                            // A SOP-kind frame is a gate resolution (keyed by run_id),
-                            // not a tool-prompt response (keyed by request_id). Resolve
-                            // it here too so it is answered mid-turn instead of being
-                            // silently dropped on the request_id path below.
-                            if handle_ws_sop_frame(
-                                &parsed,
-                                state,
-                                session_id,
-                                auth_subject,
-                                &mut *sender,
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                            let request_id = parsed["request_id"].as_str().unwrap_or("");
-                            let decision = match parsed["decision"].as_str().unwrap_or("") {
-                                "approve" => Some(ChannelApprovalResponse::Approve),
-                                "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                                "deny" => Some(ChannelApprovalResponse::Deny),
-                                _ => None,
-                            };
-                            if request_id.is_empty() || decision.is_none() {
-                                continue;
-                            }
-                            if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                let _ = tx.send(decision.expect("checked above"));
-                            } else {
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
-                            }
-                        }
-                        Some("message") => {
-                            let content = parsed["content"].as_str().unwrap_or("").to_string();
-                            if content.is_empty() {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": "Message content cannot be empty",
-                                    "code": "EMPTY_CONTENT"
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                continue;
-                            }
-                            match steering_tx.try_send(content) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            client_msg = receiver.next() => {
+                                let text = match client_msg {
+                                    Some(Ok(Message::Text(text))) => text,
+                                    Some(Ok(Message::Ping(payload))) => {
+                                        if sender.send(Message::Pong(payload)).await.is_err() {
+                                            cancel_token.cancel();
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Some(Ok(Message::Pong(_))) => continue,
+                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                        cancel_token.cancel();
+                                        break;
+                                    }
+                                    _ => continue,
+                                };
+                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                                     let err = serde_json::json!({
                                         "type": "error",
-                                        "message": "Steering queue is full for the running turn",
-                                        "code": "STEERING_QUEUE_FULL"
+                                        "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
+                                        "code": "INVALID_JSON"
                                     });
                                     let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    continue;
+                                };
+                                match parsed["type"].as_str() {
+                                    Some("approval_response") => {
+                                        // A SOP-kind frame is a gate resolution (keyed by run_id),
+                                        // not a tool-prompt response (keyed by request_id). Resolve
+                                        // it here too so it is answered mid-turn instead of being
+                                        // silently dropped on the request_id path below.
+                                        if handle_ws_sop_frame(
+                                            &parsed,
+                                            state,
+                                            session_id,
+                                            auth_subject,
+                                            &mut *sender,
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
+                                        let request_id = parsed["request_id"].as_str().unwrap_or("");
+                                        let decision = match parsed["decision"].as_str().unwrap_or("") {
+                                            "approve" => Some(ChannelApprovalResponse::Approve),
+                                            "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                                            "deny" => Some(ChannelApprovalResponse::Deny),
+                                            _ => None,
+                                        };
+                                        if request_id.is_empty() || decision.is_none() {
+                                            continue;
+                                        }
+                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                                            let _ = tx.send(decision.expect("checked above"));
+                                        } else {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                        }
+                                    }
+                                    Some("message") => {
+                                        let content = parsed["content"].as_str().unwrap_or("").to_string();
+                                        if content.is_empty() {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Message content cannot be empty",
+                                                "code": "EMPTY_CONTENT"
+                                            });
+                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            continue;
+                                        }
+                                        match steering_tx.try_send(content) {
+                                            Ok(()) => {}
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Steering queue is full for the running turn",
+                                                    "code": "STEERING_QUEUE_FULL"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Running turn is no longer accepting steering messages",
+                                                    "code": "STEERING_CLOSED"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let err = serde_json::json!({
-                                        "type": "error",
-                                        "message": "Running turn is no longer accepting steering messages",
-                                        "code": "STEERING_CLOSED"
+                            }
+                            approval = approval_event_rx.recv() => {
+                                let Some(event) = approval else { continue };
+                                if let TurnEvent::ApprovalRequest {
+                                    request_id,
+                                    tool_name,
+                                    arguments_summary,
+                                    timeout_secs,
+                                } = event {
+                                    let frame = serde_json::json!({
+                                        "type": "approval_request",
+                                        "request_id": request_id,
+                                        "tool": tool_name,
+                                        "arguments_summary": arguments_summary,
+                                        "timeout_secs": timeout_secs,
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
                                 }
                             }
-                        }
-                        _ => {}
-                    }
-                }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
-                    if let TurnEvent::ApprovalRequest {
-                        request_id,
-                        tool_name,
-                        arguments_summary,
-                        timeout_secs,
-                    } = event {
-                        let frame = serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
-                    }
-                }
-                _ = tick_websocket_ping(ping_interval) => {
-                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
-                    }
-                }
-                    event_opt = event_rx.recv() => {
-                    let Some(event) = event_opt else { break };
-                    let ws_msg = match event {
-                        TurnEvent::Usage {
-                            input_tokens,
-                            cached_input_tokens: _,
-                            output_tokens,
-                            cost_usd: _,
-                        } => {
-                            if let Some(it) = input_tokens {
-                                total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
-                                last_input_tokens = Some(it);
+                            _ = tick_websocket_ping(ping_interval) => {
+                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                    cancel_token.cancel();
+                                    break;
+                                }
                             }
-                            if let Some(ot) = output_tokens {
-                                total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                                event_opt = event_rx.recv() => {
+                                let Some(event) = event_opt else { break };
+                                let ws_msg = match event {
+            usage_event @ TurnEvent::Usage { .. } => {
+                                        // The fold below is the production event path under
+                                        // test (see UsageFold regression tests): billing
+                                        // aggregates every billable attempt while the
+                                        // accepted-serving snapshot advances on accepted
+                                        // events only.
+                                        usage_fold.apply(usage_event);
+                                        continue;
+                                    }
+                                    TurnEvent::Chunk { ref delta } => {
+                                        accumulated_text.push_str(delta);
+                                        serde_json::json!({ "type": "chunk", "content": delta })
+                                    }
+                                    TurnEvent::Thinking { delta } => {
+                                        serde_json::json!({ "type": "thinking", "content": delta })
+                                    }
+                                    TurnEvent::ToolCall { id, name, args } => {
+                                        serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                                    }
+                                    TurnEvent::ToolResult {
+                                        id, name, output, ..
+                                    } => {
+                                        serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                                    }
+                                    TurnEvent::ApprovalRequest {
+                                        request_id,
+                                        tool_name,
+                                        arguments_summary,
+                                        timeout_secs,
+                                    } => serde_json::json!({
+                                        "type": "approval_request",
+                                        "request_id": request_id,
+                                        "tool": tool_name,
+                                        "arguments_summary": arguments_summary,
+                                        "timeout_secs": timeout_secs,
+                                    }),
+                                    TurnEvent::HistoryTrimmed {
+                                        dropped_messages,
+                                        kept_turns,
+                                        reason,
+                                    } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                                    TurnEvent::Plan { entries } => serde_json::json!({
+                                        "type": "plan",
+                                        "entries": entries,
+                                    }),
+                                    _ => continue,
+                                };
+                                let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                             }
-                            continue;
                         }
-                        TurnEvent::Chunk { ref delta } => {
-                            accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
-                        }
-                        TurnEvent::Thinking { delta } => {
-                            serde_json::json!({ "type": "thinking", "content": delta })
-                        }
-                        TurnEvent::ToolCall { id, name, args } => {
-                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
-                        }
-                        TurnEvent::ToolResult {
-                            id, name, output, ..
-                        } => {
-                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                        }
-                        TurnEvent::ApprovalRequest {
-                            request_id,
-                            tool_name,
-                            arguments_summary,
-                            timeout_secs,
-                        } => serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        }),
-                        TurnEvent::HistoryTrimmed {
-                            dropped_messages,
-                            kept_turns,
-                            reason,
-                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
-                        TurnEvent::Plan { entries } => serde_json::json!({
-                            "type": "plan",
-                            "entries": entries,
-                        }),
-                    };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
-                }
-            }
         }
     };
 
@@ -1417,10 +1634,16 @@ async fn process_chat_message(
         }
 
         // Broadcast agent_end event
+        let cancel_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
+        let cancel_provider_ref = usage_fold
+            .last_provider_ref
+            .as_deref()
+            .unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
+            "model_provider": &provider_label,
+            "model": cancel_model,
+            "provider_ref": cancel_provider_ref,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1430,8 +1653,9 @@ async fn process_chat_message(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model_provider": provider_label,
-                    "model": turn_model,
+                    "model_provider": &provider_label,
+                    "model": cancel_model,
+                    "provider_ref": cancel_provider_ref,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1491,18 +1715,60 @@ async fn process_chat_message(
                 }
             }
 
-            let total_tokens = match (total_input_tokens, total_output_tokens) {
+            let total_tokens = match (
+                usage_fold.total_input_tokens,
+                usage_fold.total_output_tokens,
+            ) {
                 (Some(i), Some(o)) => Some(i.saturating_add(o)),
                 (Some(i), None) => Some(i),
                 (None, Some(o)) => Some(o),
                 (None, None) => None,
             };
-            let cost_usd = turn_usage
-                .as_ref()
-                .map(|usage| *usage.lock())
-                .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
-                .map(|usage| usage.cost_usd);
+            // Deterministic ordering: sort by (provider_ref, model) so the wire
+            // format is stable (avoids flaky assertions in tests). cost_usd is
+            // summed over this sorted vector — never over the HashMap directly —
+            // so float accumulation order (and the emitted total) is stable.
+            let usage_by_provider_vec = usage_fold.take_sorted_entries();
+            // cost_usd is the sum of all billable attempts' cost_usd from
+            // usage_by_provider (which now includes rejected attempts). This makes
+            // the breakdown the single source of truth.
+            let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            // The route that actually served the FINAL call is authoritative for
+            // the terminal frame (see `done_frame_context_limits`). Resolve from
+            // the final route only when no call was served (e.g. a cache hit).
+            let fallback_limits = outcome
+                .final_context_limits
+                .is_none()
+                .then(|| agent.context_limits_for_route(&active_provider, &active_model));
+            let (max_context_tokens, model_context_window) = done_frame_context_limits(
+                outcome.final_context_limits,
+                usage_fold.last_context_token_budget,
+                usage_fold.last_model_context_window,
+                fallback_limits,
+            );
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
+            let provider_ref_full = usage_fold
+                .last_provider_ref
+                .as_deref()
+                .unwrap_or(&active_provider);
+            let meta = DoneFrameMeta {
+                full_response: &outcome.response,
+                input_tokens: usage_fold.total_input_tokens,
+                output_tokens: usage_fold.total_output_tokens,
+                tokens_used: total_tokens,
+                cost_usd,
+                model: effective_model,
+                provider: &provider_label,
+                provider_ref: provider_ref_full,
+                max_context_tokens,
+                model_context_window,
+                last_input_tokens: usage_fold.last_input_tokens,
+                last_serving_provider_ref: usage_fold.last_provider_ref.as_deref(),
+                last_serving_model: usage_fold.last_model.as_deref(),
+            };
             // Surface an at-most-one safety-safeguard downgrade notice just
             // before the terminal `done` frame, so the web chat shows the
             // silent model switch the same way the messaging channels append a
@@ -1511,18 +1777,7 @@ async fn process_chat_message(
             // transcript. Privacy: only the model names cross the wire — the
             // classifier `category` (and any refusal explanation) never do.
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
-            let done = serde_json::json!({
-                "type": "done",
-                "full_response": outcome.response,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tokens_used": total_tokens,
-                "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
-                "max_context_tokens": max_context_tokens,
-                "last_input_tokens": last_input_tokens,
-            });
+            let done = build_done_frame_json(&meta, &usage_by_provider_vec);
             for frame in success_terminal_ws_frames(safeguard_notice, done) {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
@@ -1535,8 +1790,9 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "model_provider": provider_label,
-                "model": turn_model,
+                "model_provider": &provider_label,
+                "model": effective_model,
+                "provider_ref": provider_ref_full,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1547,14 +1803,15 @@ async fn process_chat_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
-                        "model": turn_model,
+                        "model_provider": &provider_label,
+                        "model": effective_model,
+                        "provider_ref": provider_ref_full,
                         "session_key": session_key,
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
+                        "input_tokens": usage_fold.total_input_tokens,
+                        "output_tokens": usage_fold.total_output_tokens,
                         "tokens_used": total_tokens,
                         "cost_usd": cost_usd,
-                        "last_input_tokens": last_input_tokens,
+                        "last_input_tokens": usage_fold.last_input_tokens,
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"
@@ -1680,6 +1937,117 @@ mod tests {
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
         );
+    }
+
+    #[test]
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, Some(8_000)),
+            "the done frame must report the route that produced the usage event"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
+        );
+    }
+
+    // B4: the final served route overrides stale usage values in the terminal
+    // frame. A route switch after an earlier usage-bearing call (a no-usage
+    // vision reply) must report the FINAL route, not the earlier one.
+    #[test]
+    fn done_frame_prefers_final_served_route_over_stale_usage() {
+        let final_vision = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 7_200,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // Earlier usage-bearing text route left 180k/200k on the wire trackers.
+        assert_eq!(
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
+            (7_200, Some(8_000)),
+            "a final no-usage vision route must override the earlier text route's usage numbers"
+        );
+    }
+
+    // B4: with no served call (cache hit), the frame falls back to usage values,
+    // then to the resolved fallback route — preserving legacy behavior.
+    #[test]
+    fn done_frame_falls_back_when_no_call_served() {
+        let fallback = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // No final route, no usage: fall back to the resolved route.
+        assert_eq!(
+            done_frame_context_limits(None, None, None, Some(fallback)),
+            (180_000, Some(200_000)),
+        );
+        // No final route but usage present: usage wins (legacy path).
+        assert_eq!(
+            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
+            (7_200, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn usage_less_final_route_clears_the_previous_context_fill() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(1_024),
+            None,
+            Some(64),
+            None,
+            true,
+        ));
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            None,
+            None,
+            Some(32),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(1_024));
+        assert_eq!(fold.total_output_tokens, Some(96));
+        assert_eq!(fold.last_input_tokens, None);
     }
 
     #[test]
@@ -2753,6 +3121,614 @@ data: {\"type\":\"message_stop\"}\n\n",
             run_status(&state).as_deref(),
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
+        );
+    }
+
+    /// done-frame model_context_window: present when the provider has an
+    /// explicit `context_window`, absent when it does not.
+    #[test]
+    fn done_frame_model_context_window_presence_tracks_provider_config() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // (provider_alias, context_window, expected_model_window,
+        // expected_max_context_tokens)
+        let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
+            // Provider has no context_window — field must be absent.
+            ("openrouter.default", None, None, 32_000),
+            // Provider sets context_window — field must appear on the wire.
+            (
+                "openrouter.glm-5.2",
+                Some(1_000_000),
+                Some(1_000_000),
+                800_000,
+            ),
+        ];
+
+        for &(provider_alias, context_window, expected_window, expected_max_ctx) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(expected_max_ctx as usize),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+
+            let (vendor, model_alias) = provider_alias.split_once('.').unwrap();
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: provider_alias.into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            let entry = providers
+                .models
+                .ensure(vendor, model_alias)
+                .expect("ensure creates entry");
+            entry.model = Some("glm-5.2".to_string());
+            if let Some(w) = context_window {
+                entry.context_window = Some(w);
+            }
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
+            let max_ctx = limits.context_token_budget as u64;
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
+            assert_eq!(
+                model_ctx_window, expected_window,
+                "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
+            );
+
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: provider_alias,
+                provider_ref: provider_alias,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(provider_alias),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["max_context_tokens"], expected_max_ctx,
+                "profile budget must be emitted"
+            );
+            // Provider field carries the full configured reference (e.g., "openai.vendor"),
+            // matching pre-change gateway behavior. provider_ref carries the serving identity.
+            assert_eq!(v["provider"], provider_alias);
+            assert_eq!(v["provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
+            assert!(
+                v["usage_by_provider"].as_array().unwrap().is_empty(),
+                "usage_by_provider must be empty when no Usage events accumulated"
+            );
+            if let Some(window) = expected_window {
+                assert_eq!(
+                    v["model_context_window"], window,
+                    "done-frame must carry the provider's explicit context_window"
+                );
+            } else {
+                assert!(
+                    v.get("model_context_window").is_none(),
+                    "model_context_window must be absent when provider has no context_window"
+                );
+            }
+        }
+    }
+
+    /// Regression: done-frame model_context_window follows the live provider
+    /// after either a session/configure A→B switch or an in-turn model switch,
+    /// not the static agent alias. Both paths use the same shared resolver.
+    #[test]
+    fn done_frame_model_window_follows_live_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // (switched_provider_alias, scenario_label)
+        let cases: &[(&str, &str)] = &[
+            ("ollama.provider-b", "session/configure switch"),
+            ("ollama.llama3", "in-turn model_switch"),
+        ];
+
+        for &(live_provider_ref, label) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(800_000),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: "openrouter.glm-5.2".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            // Provider A (static binding) — no context_window.
+            providers
+                .models
+                .ensure("openrouter", "glm-5.2")
+                .expect("ensure A");
+            // Provider B (switched-to) — has context_window.
+            let (b_vendor, b_alias) = live_provider_ref.split_once('.').unwrap();
+            let entry_b = providers
+                .models
+                .ensure(b_vendor, b_alias)
+                .expect("ensure B");
+            entry_b.context_window = Some(1_000_000);
+            entry_b.model = Some("glm-5.2".to_string());
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            let limits =
+                cfg.resolved_context_limits_for_route("coder", live_provider_ref, "glm-5.2");
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
+            assert_eq!(
+                model_ctx_window,
+                Some(1_000_000),
+                "resolver must return B's window for {label}, not A's"
+            );
+
+            let max_ctx = limits.context_token_budget as u64;
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: live_provider_ref,
+                provider_ref: live_provider_ref,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(live_provider_ref),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["model_context_window"], 1_000_000,
+                "done-frame must carry B's live window after {label}, not A's static alias window"
+            );
+            // Provider field carries the full configured reference (e.g., "openrouter.b"),
+            // matching pre-change gateway behavior. provider_ref carries the serving identity.
+            assert_eq!(v["provider"], live_provider_ref);
+            assert_eq!(v["provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
+        }
+    }
+
+    /// Blocking (note12): same-profile fallback to a different model must not
+    /// borrow the primary model's capacity. Configures `openai.default` for
+    /// model-a with a 200k window and fallback_models=[model-b]. Serving
+    /// model-b under the same provider_ref must omit `model_context_window`
+    /// so clients fall back to the trim budget.
+    #[test]
+    fn done_frame_model_window_omitted_on_same_profile_model_fallback() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openai.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        let entry = providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure entry");
+        entry.model = Some("model-a".to_string());
+        entry.fallback_models = vec!["model-b".to_string()];
+        entry.context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        // Shared resolution: primary matches, fallback does not.
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-a"),
+            Some(200_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-b"),
+            None,
+            "fallback model must not borrow the primary's capacity"
+        );
+
+        // Gateway projection: drive the production fold with a model-b Usage
+        // event, then resolve exactly as the WS handler does.
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-b",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openai.default"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-b"));
+
+        let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
+        let provider_ref = fold.last_provider_ref.as_deref().unwrap();
+        let limits = cfg.resolved_context_limits_for_route("coder", provider_ref, effective_model);
+        let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
+        assert!(
+            model_ctx_window.is_none(),
+            "gateway must omit window when served model differs from configured primary"
+        );
+
+        let max_ctx = limits.context_token_budget as u64;
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            tokens_used: Some(1500),
+            cost_usd: Some(0.01),
+            model: effective_model,
+            provider: "openai.default",
+            provider_ref,
+            max_context_tokens: max_ctx,
+            model_context_window: model_ctx_window,
+            last_input_tokens: Some(1000),
+            last_serving_provider_ref: Some(provider_ref),
+            last_serving_model: Some(effective_model),
+        };
+        let done = build_done_frame_json(&meta, &[]);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert!(
+            v.get("model_context_window").is_none(),
+            "done-frame must omit model_context_window on same-profile fallback"
+        );
+        assert_eq!(v["max_context_tokens"], 32_000);
+        assert_eq!(v["last_serving_model"], "model-b");
+    }
+
+    /// Regression: two models served under one provider_ref produce two
+    /// distinct breakdown entries keyed by (provider_ref, model). Drives the
+    /// production fold so a regression in `UsageFold::apply` is caught
+    /// (a hand-rolled map would pass even if the fold broke).
+    #[test]
+    fn usage_by_provider_same_provider_two_models() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.vertex",
+            "model-a",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.vertex",
+            "model-b",
+            Some(2000),
+            Some(100),
+            Some(1000),
+            Some(0.02),
+            true,
+        ));
+
+        // Same provider_ref but different models: exactly 2 entries, sorted
+        // by model name, with per-model tokens/cost (including cached).
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].provider_ref, "openrouter.vertex");
+        assert_eq!(entries[0].model, "model-a");
+        assert_eq!(entries[0].input_tokens, 1000);
+        assert_eq!(entries[0].output_tokens, 500);
+        assert_eq!(entries[0].cached_input_tokens, 0);
+        assert_eq!(entries[0].cost_usd, 0.01);
+        assert_eq!(entries[1].provider_ref, "openrouter.vertex");
+        assert_eq!(entries[1].model, "model-b");
+        assert_eq!(entries[1].input_tokens, 2000);
+        assert_eq!(entries[1].output_tokens, 1000);
+        assert_eq!(entries[1].cached_input_tokens, 100);
+        assert_eq!(entries[1].cost_usd, 0.02);
+        assert_eq!(UsageFold::total_cost_usd(&entries), Some(0.03));
+    }
+
+    /// Build a `TurnEvent::Usage` for fold tests.
+    fn usage_event(
+        provider_ref: &str,
+        model: &str,
+        input_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cost_usd: Option<f64>,
+        accepted: bool,
+    ) -> zeroclaw_api::agent::TurnEvent {
+        zeroclaw_api::agent::TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cost_usd,
+            context_token_budget: None,
+            model_context_window: None,
+            provider_ref: provider_ref.to_string(),
+            model: model.to_string(),
+            accepted,
+        }
+    }
+
+    /// Blocking regression (note9 blocker 1): an accepted Usage event followed
+    /// by a rejected billed Usage event must keep the accepted-serving
+    /// snapshot while billing both attempts. Drives `UsageFold::apply` — the
+    /// exact function the WS handler invokes per event — then renders the
+    /// done frame from the fold state with the same field mapping the handler
+    /// uses, asserting the wire-observable contract.
+    #[test]
+    fn usage_fold_accepted_then_rejected_billed_keeps_accepted_snapshot() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.b",
+            "model-b",
+            Some(2000),
+            None,
+            Some(1000),
+            Some(0.02),
+            false,
+        ));
+
+        // Snapshot stays accepted-sourced: the rejected attempt must not
+        // re-point identity or the meter ceiling.
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openrouter.a"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-a"));
+        assert_eq!(fold.last_input_tokens, Some(1000));
+        // Billing aggregates both attempts.
+        assert_eq!(fold.total_input_tokens, Some(3000));
+        assert_eq!(fold.total_output_tokens, Some(1500));
+
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].model, "model-a");
+        assert_eq!(entries[0].cost_usd, 0.01);
+        assert_eq!(entries[1].model, "model-b");
+        assert_eq!(entries[1].cost_usd, 0.02);
+        let cost_usd = UsageFold::total_cost_usd(&entries);
+        assert_eq!(cost_usd, Some(0.03));
+
+        // Wire contract: done frame carries both attempts in the ledger and
+        // cost total, but the serving identity and meter snapshot come from
+        // the accepted event.
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(3000),
+            output_tokens: Some(1500),
+            tokens_used: Some(4500),
+            cost_usd,
+            model: "model-a",
+            provider: "openrouter.a",
+            provider_ref: "openrouter.a",
+            max_context_tokens: 800_000,
+            model_context_window: Some(1_000_000),
+            last_input_tokens: Some(1000),
+            last_serving_provider_ref: Some("openrouter.a"),
+            last_serving_model: Some("model-a"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert_eq!(v["cost_usd"], 0.03);
+        assert_eq!(v["last_serving_provider_ref"], "openrouter.a");
+        assert_eq!(v["last_serving_model"], "model-a");
+        assert_eq!(v["last_input_tokens"], 1000);
+        assert_eq!(v["model_context_window"], 1_000_000);
+        let ubp = v["usage_by_provider"].as_array().unwrap();
+        assert_eq!(ubp.len(), 2);
+
+        // Negative control: a rejected event with input_tokens: None must
+        // neither move the snapshot nor clear the accepted prompt size.
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.b",
+            "model-b",
+            None,
+            None,
+            None,
+            Some(0.005),
+            false,
+        ));
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openrouter.a"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-a"));
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(1000),
+            "rejected usage-less event must not clear the accepted snapshot"
+        );
+        assert_eq!(fold.total_input_tokens, Some(1000));
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2, "rejected attempt is still billed");
+        assert_eq!(UsageFold::total_cost_usd(&entries), Some(0.015));
+    }
+
+    /// Boundary regression (note9 warning 2, via the production fold):
+    /// provider A reports usage, then accepted provider B succeeds usage-less
+    /// (`input_tokens: None`). Identity and the null meter snapshot must
+    /// follow B while the billing ledger retains A's tokens.
+    #[test]
+    fn usage_fold_cross_provider_accepted_usageless_moves_snapshot_not_ledger() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            None,
+            Some(100),
+            Some(0.02),
+            true,
+        ));
+        fold.apply(usage_event(
+            "ollama.b",
+            "model-b",
+            None,
+            None,
+            Some(50),
+            None,
+            true,
+        ));
+
+        // Identity follows the accepted usage-less B; the prompt-size snapshot
+        // is cleared rather than going stale.
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("ollama.b"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-b"));
+        assert_eq!(fold.last_input_tokens, None);
+        // Billing keeps A's tokens plus B's output.
+        assert_eq!(fold.total_input_tokens, Some(1000));
+        assert_eq!(fold.total_output_tokens, Some(150));
+
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2);
+        let a = entries.iter().find(|e| e.model == "model-a").unwrap();
+        assert_eq!(
+            (a.input_tokens, a.output_tokens, a.cost_usd),
+            (1000, 100, 0.02)
+        );
+
+        // Wire contract with B's explicit window: meter ceiling resolves from
+        // B, usage snapshot is null, ledger carries A's entry.
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(150),
+            tokens_used: Some(1150),
+            cost_usd: UsageFold::total_cost_usd(&entries),
+            model: "model-b",
+            provider: "ollama.b",
+            provider_ref: "ollama.b",
+            max_context_tokens: 800_000,
+            model_context_window: Some(1_000_000),
+            last_input_tokens: None,
+            last_serving_provider_ref: Some("ollama.b"),
+            last_serving_model: Some("model-b"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert_eq!(v["model"], "model-b");
+        assert_eq!(v["last_serving_model"], "model-b");
+        assert_eq!(v["model_context_window"], 1_000_000);
+        assert!(
+            v["last_input_tokens"].is_null(),
+            "last_input_tokens must be null when the accepted final call is usage-less"
+        );
+    }
+
+    #[test]
+    fn done_frame_accepted_usageless_route_serializes_null_snapshot() {
+        // Standalone wire-boundary pin for the accepted usage-less route,
+        // independent of UsageFold: identity follows the serving route, the
+        // snapshot serializes as explicit null, and the window stays omitted
+        // when the provider configures none.
+        let entries = vec![ProviderUsageEntry {
+            provider_ref: "openrouter.a".to_string(),
+            model: "model-a".to_string(),
+            input_tokens: 1000,
+            output_tokens: 100,
+            cached_input_tokens: 0,
+            cost_usd: 0.02,
+        }];
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(100),
+            tokens_used: Some(1100),
+            cost_usd: UsageFold::total_cost_usd(&entries),
+            model: "model-a",
+            provider: "openrouter.a",
+            provider_ref: "openrouter.a",
+            max_context_tokens: 800_000,
+            model_context_window: None,
+            last_input_tokens: None,
+            last_serving_provider_ref: Some("openrouter.a"),
+            last_serving_model: Some("model-a"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert!(v["last_input_tokens"].is_null());
+        assert_eq!(v["last_serving_provider_ref"], "openrouter.a");
+        assert_eq!(v["usage_by_provider"][0]["input_tokens"], 1000);
+        assert!(
+            v.get("model_context_window").is_none(),
+            "model_context_window is additive and omitted when unset"
         );
     }
 }

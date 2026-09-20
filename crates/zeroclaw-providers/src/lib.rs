@@ -126,6 +126,7 @@ pub use traits::{
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -711,6 +712,11 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through OpenAI-compatible providers:
+    /// inject `cache_control` breakpoints (system prompt; rolling last
+    /// message) into request bodies and capture gateway-reported cache
+    /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
+    pub cache_passthrough: bool,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -765,6 +771,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            cache_passthrough: false,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -830,6 +837,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -1208,6 +1216,68 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         current = source.source();
     }
     sanitize_api_error(&formatted)
+}
+
+/// Maximum silence between body reads on provider SSE streams. A provider's
+/// effective bound is derived from this floor by [`stream_idle_timeout`].
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The streaming read-idle bound in effect on a provider connection, and
+/// whether a configuration knob can raise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamIdleBound {
+    /// `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: `timeout_secs` governs the
+    /// bound, so idle-timeout errors also name the knob that raises it.
+    Configurable(std::time::Duration),
+    /// A fixed client constant: no configuration knob moves it, so
+    /// idle-timeout errors name the bound without knob advice.
+    Fixed(std::time::Duration),
+}
+
+impl StreamIdleBound {
+    /// The bound's duration, regardless of whether it is configurable.
+    pub(crate) fn duration(self) -> std::time::Duration {
+        match self {
+            StreamIdleBound::Configurable(duration) | StreamIdleBound::Fixed(duration) => duration,
+        }
+    }
+}
+
+/// Effective streaming idle bound for a provider configured with
+/// `timeout_secs`: the 300 s [`STREAM_IDLE_TIMEOUT`] floor, or `timeout_secs`
+/// when set higher, as a [`StreamIdleBound::Configurable`] bound. An unset or
+/// lower `timeout_secs` keeps the 300 s default, so the bound is never
+/// tightened below the floor.
+pub(crate) fn stream_idle_timeout(timeout_secs: u64) -> StreamIdleBound {
+    StreamIdleBound::Configurable(
+        STREAM_IDLE_TIMEOUT.max(std::time::Duration::from_secs(timeout_secs)),
+    )
+}
+
+/// Error text for a failed streaming read. A read/idle timeout names the bound
+/// that fired instead of reqwest's bare "operation timed out"; when
+/// `timeout_secs` governs the bound the message also says that raising it
+/// waits longer. Every other error, including connect failures, keeps the
+/// sanitized reqwest chain unchanged.
+pub(crate) fn stream_idle_error_message(
+    error: &reqwest::Error,
+    idle_timeout: StreamIdleBound,
+) -> String {
+    if error.is_timeout() && !error.is_connect() {
+        let secs = idle_timeout.duration().as_secs();
+        let advice = match idle_timeout {
+            StreamIdleBound::Configurable(_) => {
+                format!("; raise timeout_secs above {secs}s to wait longer")
+            }
+            StreamIdleBound::Fixed(_) => String::new(),
+        };
+        format!(
+            "no data from provider for {secs}s (stream idle timeout{advice}): {}",
+            format_error_chain(error)
+        )
+    } else {
+        format_error_chain(error)
+    }
 }
 
 /// Build a sanitized model_provider error from a failed HTTP response.
@@ -1951,8 +2021,48 @@ pub fn create_routed_model_provider_with_options(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref_with_model_override(
+    create_routed_model_provider_with_options_and_resolver(
+        config,
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+    )
+    .map(|(provider, _)| provider)
+}
+
+/// Build the routed provider together with the exact immutable route resolver
+/// it uses. Agent turn metadata can therefore resolve the serving profile and
+/// model without maintaining a second hint table.
+pub fn create_routed_model_provider_with_options_and_resolver(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
+    // Config map editing creates a default route entry and then fills its
+    // required fields through separate writes. Such a staged entry is not yet
+    // a routing fact: omit it from the materialized provider/resolver until all
+    // three identity fields are present. `Config::validate` remains the
+    // canonical persisted-config gate and still rejects incomplete routes.
+    let materialized_routes: Vec<_> = model_routes
+        .iter()
+        .filter(|route| {
+            !route.hint.trim().is_empty()
+                && !route.model_provider.trim().is_empty()
+                && !route.model.trim().is_empty()
+        })
+        .collect();
+
+    if materialized_routes.is_empty() {
+        let provider = create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
@@ -1960,12 +2070,18 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             options,
             Some(default_model),
-        );
+        )?;
+        let resolver = Arc::new(router::ModelRouteResolver::new(
+            Vec::new(),
+            primary_name.to_string(),
+            default_model.to_string(),
+        ));
+        return Ok((provider, resolver));
     }
 
     // Collect unique model_provider names needed
     let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
+    for route in &materialized_routes {
         if !needed.iter().any(|n| n == &route.model_provider) {
             needed.push(route.model_provider.clone());
         }
@@ -1978,7 +2094,7 @@ pub fn create_routed_model_provider_with_options(
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let is_primary = name == primary_name;
-        let routed_credential = model_routes
+        let routed_credential = materialized_routes
             .iter()
             .find(|r| &r.model_provider == name)
             .and_then(|r| {
@@ -2027,7 +2143,7 @@ pub fn create_routed_model_provider_with_options(
     }
 
     // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
+    let routes: Vec<(String, router::Route)> = materialized_routes
         .iter()
         .map(|r| {
             (
@@ -2040,12 +2156,14 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    let router = router::RouterModelProvider::new(
         primary_name,
         model_providers,
         routes,
         default_model.to_string(),
-    )))
+    );
+    let resolver = router.route_resolver();
+    Ok((Box::new(router), resolver))
 }
 
 /// Information about a supported model model_provider for display purposes.
@@ -2872,6 +2990,23 @@ mod tests {
             Some(&entry),
         );
         assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
+    fn cache_passthrough_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_passthrough: true,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert!(opts.cache_passthrough);
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert!(!defaults.cache_passthrough);
     }
 
     #[test]
@@ -4612,6 +4747,41 @@ mod tests {
     }
 
     #[test]
+    fn routed_model_provider_omits_incomplete_staged_routes() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "staged".into(),
+                model_provider: String::new(),
+                model: String::new(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "ready".into(),
+                model_provider: "openai.alias".into(),
+                model: "gpt-4o".into(),
+                api_key: None,
+            },
+        ];
+
+        let (_, resolver) = create_routed_model_provider_with_options_and_resolver(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("an incomplete staged route must not poison ready routes");
+
+        assert!(!resolver.has_hint("staged"));
+        assert!(resolver.has_hint("ready"));
+    }
+
+    #[test]
     fn routed_model_provider_credential_precedence_uses_route_key_first() {
         let config = config_with_openai_alias();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
@@ -5688,18 +5858,35 @@ mod tests {
 
 /// Attempt to fetch context window from provider's /models endpoint.
 /// Returns `None` on any failure (network, parsing, missing field) — caller uses fallback.
+///
+/// Which families are asked, and how each authenticates, is [derived from the
+/// family registry](crate::factory::family_model_context_catalog_auth), not
+/// listed here. It used to be listed here, and that was the defect:
+/// `together | groq | fireworks | deepinfra | hyperbolic | anyscale | novita
+/// | nebius` was eight names maintained by hand, so a family that also serves
+/// this catalog silently fell through to `None` and its operators kept the
+/// unconfigured 32,000-token fallback with nothing failing to say so. A
+/// family now declares the fact beside its own spec, where the person adding
+/// the family is looking.
+///
+/// Eligibility is per-family and opt-in, never inferred from chat-wire
+/// compatibility: speaking the OpenAI-compatible chat protocol says nothing
+/// about whether `GET {base}/models` exists, what shape it returns, or
+/// whether the stored credential can be presented to it as-is.
+///
+/// `None` means *unknown*: the caller must leave the setting unset rather
+/// than substitute a value. An unset context window and a fabricated default
+/// are different states and must stay distinguishable downstream.
 pub async fn fetch_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
-    match provider_type {
-        "openrouter" => fetch_openrouter_context_window(config).await,
-        "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
-        | "nebius" | "crusoe" => {
-            fetch_openai_compatible_context_window(provider_type, config).await
-        }
-        _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
+    // OpenRouter keeps a dedicated path: it publishes a different catalog at a
+    // different shape, so it is not the OpenAI-compatible `/models` reader.
+    if provider_type == "openrouter" {
+        return fetch_openrouter_context_window(config).await;
     }
+    fetch_openai_compatible_context_window(provider_type, config).await
 }
 
 async fn fetch_openrouter_context_window(
@@ -5737,10 +5924,50 @@ fn openrouter_context_window_url(
         )
 }
 
+/// Build the `GET {base}/models` request context-window discovery issues.
+///
+/// The only place discovery attaches a credential. `auth` comes from the
+/// family registry and is applied by
+/// [`crate::compatible::apply_auth_to_request`] — the same function this
+/// family's chat requests use — so discovery presents the stored value the
+/// way the rest of the family already does, rather than inventing a second
+/// convention. A plain `bearer_auth()` here would send a `ZhipuJwt` family's
+/// long-lived `id.secret` verbatim.
+///
+/// `Err` when the stored credential cannot be turned into a header, in which
+/// case no probe is built. `provider_type` names the family in that refusal
+/// record: discovery runs outside any per-provider span, so it has to carry
+/// its own attribution.
+fn context_catalog_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &crate::compatible::AuthStyle,
+    api_key: Option<&str>,
+    provider_type: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    crate::compatible::apply_auth_to_request(
+        client.get(&url),
+        auth,
+        api_key.filter(|s| !s.is_empty() && *s != "<unset>"),
+        provider_type,
+    )
+}
+
+/// Read a per-model context window from a family's OpenAI-compatible
+/// `GET {base}/models` catalog.
+///
+/// Answers `None` immediately — before resolving a URL or touching the
+/// network — for any family that has not declared a catalog auth policy in
+/// the registry. That declaration is the family's statement both that this
+/// endpoint exists in this shape and that the stored credential can be
+/// presented to it, so an undeclared family is never probed and its
+/// credential is never read.
 async fn fetch_openai_compatible_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
+    let auth = crate::factory::family_model_context_catalog_auth(provider_type)?;
     let client = reqwest::Client::new();
     let default_uri = default_model_provider_url(provider_type);
     let base_url = config
@@ -5749,18 +5976,20 @@ async fn fetch_openai_compatible_context_window(
         .filter(|s| !s.is_empty() && *s != "<unset>")
         .or(default_uri)
         .unwrap_or("");
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut req = client.get(&url);
-    if let Some(key) = config.api_key.as_deref() {
-        req = req.bearer_auth(key);
-    }
-    let resp = req
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
+    let resp = context_catalog_request(
+        &client,
+        base_url,
+        &auth,
+        config.api_key.as_deref(),
+        provider_type,
+    )
+    .ok()?
+    .send()
+    .await
+    .ok()?
+    .json::<serde_json::Value>()
+    .await
+    .ok()?;
     let model = config.model.as_deref().unwrap_or("");
     let model_entry = resp["data"]
         .as_array()?
@@ -5771,4 +6000,300 @@ async fn fetch_openai_compatible_context_window(
         .or_else(|| model_entry.get("context_window"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
+}
+
+#[cfg(test)]
+mod context_window_discovery_tests {
+    use super::*;
+    use axum::{Router, extract::State, http::HeaderMap, routing::get};
+    use std::sync::{Arc, Mutex};
+    use zeroclaw_config::schema::ModelProviderConfig;
+
+    /// Every `GET /models` request the discovery path made, as
+    /// `(path, Authorization header or "<none>")`.
+    type Capture = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A live-shaped OpenAI-compatible catalog: `data[]` of `{id, context_length}`
+    /// alongside entries this reader must skip. Modelled on what the families in
+    /// the historical probe list return, including the sibling `context_window`
+    /// spelling and an entry that publishes no window at all.
+    fn catalog_body() -> serde_json::Value {
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "other/model-a", "object": "model", "context_length": 8_192},
+                {"id": "target/model", "object": "model", "context_length": 131_072},
+                {"id": "spelled/context-window", "object": "model", "context_window": 65_536},
+                {"id": "windowless/model", "object": "model"},
+            ]
+        })
+    }
+
+    async fn serve_catalog(capture: Capture) -> (String, tokio::task::JoinHandle<()>) {
+        async fn handler(
+            State(capture): State<Capture>,
+            uri: axum::http::Uri,
+            headers: HeaderMap,
+        ) -> axum::Json<serde_json::Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push((uri.path().to_string(), auth));
+            axum::Json(catalog_body())
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test catalog server");
+        let addr = listener.local_addr().expect("test catalog server addr");
+        let app = Router::new()
+            .route("/models", get(handler))
+            .with_state(capture);
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test catalog");
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    fn alias_config(base_url: &str, model: &str, api_key: Option<&str>) -> ModelProviderConfig {
+        ModelProviderConfig {
+            model: Some(model.to_string()),
+            uri: Some(base_url.to_string()),
+            api_key: api_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The families the hand-written probe list named. Discovery must keep
+    /// working for every one of them, end to end: request `GET {uri}/models`,
+    /// match `data[].id` against the configured model, read `context_length`.
+    const HISTORICALLY_PROBED_FAMILIES: [&str; 8] = [
+        "together",
+        "groq",
+        "fireworks",
+        "deepinfra",
+        "hyperbolic",
+        "anyscale",
+        "novita",
+        "nebius",
+    ];
+
+    #[tokio::test]
+    async fn historically_probed_families_read_a_live_shaped_catalog() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+
+        for family in HISTORICALLY_PROBED_FAMILIES {
+            let config = alias_config(&base_url, "target/model", Some("sk-live-key"));
+            assert_eq!(
+                fetch_context_window(family, &config).await,
+                Some(131_072),
+                "{family} must still read its context window from a live-shaped catalog"
+            );
+        }
+
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(
+            seen.len(),
+            HISTORICALLY_PROBED_FAMILIES.len(),
+            "each family must issue exactly one catalog request: {seen:?}"
+        );
+        for (path, auth) in &seen {
+            assert_eq!(path, "/models", "catalog is read from GET {{base}}/models");
+            assert_eq!(
+                auth, "Bearer sk-live-key",
+                "a bearer-auth family sends its key unchanged"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_reader_accepts_the_context_window_spelling_and_stays_none_without_one() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+
+        assert_eq!(
+            fetch_context_window(
+                "together",
+                &alias_config(&base_url, "spelled/context-window", Some("sk-live-key"))
+            )
+            .await,
+            Some(65_536),
+            "the sibling `context_window` spelling is read too"
+        );
+        assert_eq!(
+            fetch_context_window(
+                "together",
+                &alias_config(&base_url, "windowless/model", Some("sk-live-key"))
+            )
+            .await,
+            None,
+            "a catalog entry with no window stays unknown, never a fabricated default"
+        );
+        assert_eq!(
+            fetch_context_window(
+                "together",
+                &alias_config(&base_url, "absent/model", Some("sk-live-key"))
+            )
+            .await,
+            None,
+            "a model the catalog does not list stays unknown"
+        );
+        server.abort();
+    }
+
+    /// Z.AI and GLM store their credential as `id.secret` and mint a
+    /// short-lived HMAC JWT from it per request. A catalog probe that attached
+    /// the stored value with plain bearer auth would put the long-lived secret
+    /// on the wire, so neither family is declared probeable and discovery must
+    /// return before it builds a request at all.
+    ///
+    /// What this asserts is that exclusion: no request reaches the server. It
+    /// is not a claim about every route those providers take elsewhere.
+    #[tokio::test]
+    async fn zhipu_jwt_families_are_excluded_before_a_catalog_request_is_built() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+
+        for family in ["zai", "glm"] {
+            let config = alias_config(&base_url, "target/model", Some("keyid.longlivedsecret"));
+            assert_eq!(
+                fetch_context_window(family, &config).await,
+                None,
+                "{family} must not be probed by the generic catalog reader"
+            );
+        }
+
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert!(
+            seen.is_empty(),
+            "no catalog request may be made for a JWT-auth family: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// The defence behind the exclusion above. Should a JWT-auth family ever
+    /// be opted in, the discovery request must still carry a minted JWT and
+    /// not the stored secret — because discovery builds its request with the
+    /// family's own declared auth style rather than a hard-coded bearer.
+    ///
+    /// This drives the real request builder,
+    /// [`super::context_catalog_request`], with Z.AI's and GLM's actual
+    /// declared [`CompatFamilySpec::AUTH`], and reads what arrived on the
+    /// wire.
+    #[tokio::test]
+    async fn a_zhipu_jwt_probe_would_send_a_minted_jwt_not_the_stored_secret() {
+        use crate::factory::CompatFamilySpec;
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        use zeroclaw_config::schema::{GlmModelProviderConfig, ZaiModelProviderConfig};
+
+        const STORED: &str = "keyid.longlivedsecret";
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+        let client = reqwest::Client::new();
+
+        for (family, auth) in [
+            ("zai", <ZaiModelProviderConfig as CompatFamilySpec>::AUTH),
+            ("glm", <GlmModelProviderConfig as CompatFamilySpec>::AUTH),
+        ] {
+            assert!(
+                matches!(auth, crate::compatible::AuthStyle::ZhipuJwt),
+                "{family} is expected to use credential-transforming auth"
+            );
+            super::context_catalog_request(&client, &base_url, &auth, Some(STORED), family)
+                .expect("a well-formed stored credential mints and builds a probe")
+                .send()
+                .await
+                .expect("catalog probe should reach the test server");
+        }
+
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(seen.len(), 2, "one probe per family: {seen:?}");
+        for (path, auth_header) in &seen {
+            assert_eq!(path, "/models");
+            let token = auth_header
+                .strip_prefix("Bearer ")
+                .unwrap_or_else(|| panic!("expected a bearer-carried JWT, got {auth_header:?}"));
+            assert_ne!(
+                token, STORED,
+                "the long-lived stored secret must never be the token"
+            );
+            assert!(
+                !auth_header.contains("longlivedsecret"),
+                "the stored secret must not appear anywhere in the header: {auth_header:?}"
+            );
+            let segments: Vec<&str> = token.split('.').collect();
+            assert_eq!(
+                segments.len(),
+                3,
+                "a JWT has header.payload.signature: {token:?}"
+            );
+            let payload = URL_SAFE_NO_PAD
+                .decode(segments[1])
+                .expect("JWT payload should be base64url");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&payload).expect("JWT payload should be JSON");
+            assert_eq!(
+                payload["api_key"].as_str(),
+                Some("keyid"),
+                "the JWT carries only the key id, never the secret half"
+            );
+            assert!(
+                payload.get("exp").is_some(),
+                "the minted token is short-lived: {payload}"
+            );
+        }
+        server.abort();
+    }
+
+    /// A `ZhipuJwt` credential that is not `id.secret` cannot be minted into a
+    /// token. Refusing is the security property: the alternative — sending the
+    /// stored value as a plain bearer token — is exactly the leak the
+    /// exclusion above exists to prevent, and it would also be a request that
+    /// could only ever be rejected upstream.
+    ///
+    /// Wire-level: nothing at all reaches the server, so the stored value
+    /// cannot have left the client in any form.
+    #[tokio::test]
+    async fn a_malformed_zhipu_credential_builds_no_probe_at_all() {
+        const MALFORMED: &str = "no-dot-separator-here";
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+        let client = reqwest::Client::new();
+
+        let refusal = super::context_catalog_request(
+            &client,
+            &base_url,
+            &crate::compatible::AuthStyle::ZhipuJwt,
+            Some(MALFORMED),
+            "zai",
+        )
+        .expect_err("a credential that cannot be minted must not produce a request");
+
+        assert!(
+            !refusal.to_string().contains(MALFORMED),
+            "the refusal must not quote the stored credential: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("zai"),
+            "the refusal must name the family discovery was probing: {refusal}"
+        );
+
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert!(
+            seen.is_empty(),
+            "no request may leave the client for a credential that cannot be minted: {seen:?}"
+        );
+        server.abort();
+    }
 }
