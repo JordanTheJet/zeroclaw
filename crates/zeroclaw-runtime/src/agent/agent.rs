@@ -638,6 +638,12 @@ impl Default for AgentBuilder {
     }
 }
 
+/// Key given to a pinned section supplied through the deprecated
+/// [`AgentBuilder::mcp_pinned_section`]. It is deliberately not a legal
+/// `<server>__<uri>` tool name, so a principal's allowed-tool list can never
+/// contain it and `Agent::narrow_to_principal_tools` always prunes the block.
+const UNATTRIBUTED_PINNED_KEY: &str = "\0unattributed-pinned-section";
+
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
@@ -904,6 +910,38 @@ impl AgentBuilder {
         blocks: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     ) -> Self {
         self.mcp_pinned = blocks;
+        self
+    }
+
+    /// Compatibility setter for callers built against the pre-attribution
+    /// signature, which took the rendered section as one string.
+    ///
+    /// The string carries no `<server>__<uri>` attribution, so it cannot be
+    /// matched against a principal's allowed tool names. Restoring it as plain
+    /// text would let construction-time content outlive a narrowing that no
+    /// longer grants it, which is the leak the attributed blocks exist to
+    /// close. It is therefore wrapped in a block keyed with
+    /// [`UNATTRIBUTED_PINNED_KEY`], a name no allowed-tool list can contain,
+    /// so `narrow_to_principal_tools` prunes it on the first narrowing. A
+    /// caller that never narrows (the unscoped constructions this setter
+    /// exists for) sees the section exactly as before.
+    ///
+    /// Prefer [`Self::mcp_pinned_blocks`]: it keeps content revocable per
+    /// resource instead of dropping all of it at the first narrowing.
+    #[deprecated(
+        note = "pass attributed blocks via mcp_pinned_blocks; an unattributed section is pruned whenever a principal selector narrows the session"
+    )]
+    pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
+        self.mcp_pinned = section
+            .filter(|rendered| !rendered.trim().is_empty())
+            .map(
+                |rendered| zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                    key: UNATTRIBUTED_PINNED_KEY.to_string(),
+                    rendered,
+                },
+            )
+            .into_iter()
+            .collect();
         self
     }
 
@@ -7109,6 +7147,96 @@ mod tests {
             "revoked tool must not execute again"
         );
         assert!(format!("{:?}", agent.history).contains("Unknown tool: echo"));
+    }
+
+    /// The deprecated `mcp_pinned_section` keeps pre-attribution callers
+    /// compiling, so it must still render their section. It carries no
+    /// `<server>__<uri>` attribution, so it cannot be matched against a
+    /// principal's allowed names: the first narrowing withdraws it instead of
+    /// letting construction-time text outlive the grant it was built under.
+    #[tokio::test]
+    async fn a_compatibility_pinned_section_renders_then_is_pruned_by_any_narrowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[allow(deprecated)]
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_section(Some("LEGACY-PINNED-CONTENT".to_string()))
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("LEGACY-PINNED-CONTENT"),
+            "the compatibility setter must still render its section: {prompt}"
+        );
+
+        // Narrow with a list that also names every plausible attribution this
+        // section could be given. The block survives only if its key is one a
+        // grant can name, so this fails if the shim keys it like a real
+        // resource instead of with the unnameable sentinel.
+        agent.narrow_to_principal_tools(Some(&[
+            "keep".into(),
+            "docs__legacy".into(),
+            "legacy".into(),
+            "pinned".into(),
+            "mcp__pinned".into(),
+            "LEGACY-PINNED-CONTENT".into(),
+        ]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            !prompt.contains("LEGACY-PINNED-CONTENT"),
+            "an unattributed section must not survive a principal narrowing: {prompt}"
+        );
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert_eq!(agent.tool_names(), vec!["keep"]);
+
+        // The sentinel is unnameable by construction: a tool name reaches the
+        // allowed list from config and can never carry a NUL, so no grant can
+        // spell this key and retain the block.
+        assert!(
+            UNATTRIBUTED_PINNED_KEY.contains('\0'),
+            "the compatibility key must not be a legal tool name"
+        );
+    }
+
+    /// An empty or whitespace-only compatibility section adds no block, so it
+    /// cannot render an empty pinned heading.
+    #[tokio::test]
+    async fn a_blank_compatibility_pinned_section_adds_no_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        for blank in [None, Some(String::new()), Some("   \n".to_string())] {
+            #[allow(deprecated)]
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("keep"))],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .mcp_pinned_section(blank.clone())
+                .build()
+                .unwrap();
+            assert!(
+                !agent
+                    .system_prompt_for_test()
+                    .unwrap()
+                    .contains("## Pinned MCP Resources"),
+                "blank section {blank:?} must not render a pinned heading"
+            );
+        }
     }
 
     /// Pinned MCP resource text is admitted under the resource's
