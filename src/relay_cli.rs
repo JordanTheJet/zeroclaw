@@ -75,6 +75,24 @@ fn validate_relay_addr(addr: &str) -> Result<()> {
             "the control plane returned a `relay_addr` with an empty host; no config was written"
         );
     }
+    // Refuse IPv6 rather than persist a profile that cannot connect.
+    //
+    // The two consumers of `relay_host` disagree about form: the TLS server-name
+    // parser wants a BARE address (`2001:db8::1`) and rejects the bracketed URI
+    // form, while the adjacent `wss://{relay_host}/` builder REQUIRES brackets.
+    // Storing either one therefore breaks the other, and the failure surfaces
+    // later as `invalid relay host` at registration - long after this command
+    // has reported a successful claim. Stripping brackets is not a fix for the
+    // same reason. IPv6 relay transport is simply not supported yet, so say so
+    // here, before anything is written.
+    if host.starts_with('[') || host.contains(':') {
+        anyhow::bail!(
+            "the control plane returned an IPv6 `relay_addr` ({addr}); IPv6 relay addresses are \
+             not supported yet, because the TLS name and WebSocket URI consumers require \
+             different forms. No config was written - ask the control plane for a hostname or \
+             IPv4 address."
+        );
+    }
     match port.parse::<u16>() {
         Ok(p) if p != 0 => Ok(()),
         _ => anyhow::bail!(
@@ -304,10 +322,15 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
     // cannot make the CLI buffer an unbounded response into memory. A real claim
     // result is a tiny JSON object; an oversized body is refused, not truncated
     // into a misparse.
+    // Propagate a read failure rather than defaulting to an empty body: an empty
+    // body would be reported as a JSON parse error, hiding the real cause (a
+    // dropped connection mid-response, a TLS error) behind a misleading message.
     let (text, overflowed) =
         zeroclaw_tools::helpers::read_response_text(response, Some(MAX_CLAIM_RESPONSE_BYTES))
             .await
-            .unwrap_or_default();
+            .context(
+                "could not read the ZeroRelay control plane's response body; no config was written",
+            )?;
     if overflowed {
         anyhow::bail!(
             "the ZeroRelay control plane returned an oversized response (> {MAX_CLAIM_RESPONSE_BYTES} bytes); \
@@ -321,10 +344,19 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
         .with_context(|| {
             format!(
                 "the claim succeeded (node-id {}, relay {}) but writing [relay] to {} failed; \
-                 set [relay] enabled=true, url, and node-id manually",
+                 set it manually: enabled = true, url = \"{}\", node_id = \"{}\", \
+                 relay_host = \"{}\"",
                 claimed.node_id,
                 claimed.relay_addr,
-                config.config_path.display()
+                config.config_path.display(),
+                claimed.relay_addr,
+                claimed.node_id,
+                // The host the profile would have pinned for TLS - omitting it
+                // is how an operator ends up with a mismatched profile.
+                claimed
+                    .relay_addr
+                    .rsplit_once(':')
+                    .map_or(claimed.relay_addr.as_str(), |(h, _)| h)
             )
         })?;
 
@@ -409,9 +441,36 @@ mod tests {
         // Whitespace / control characters would corrupt the persisted value.
         assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"ho st:8443"}"#).is_err());
         assert!(claim_outcome(200, "{\"node_id\":\"n\",\"relay_addr\":\"h:8443\\n\"}").is_err());
-        // A valid host:port — including a bracketed IPv6 literal — is accepted.
+        // A valid hostname / IPv4 host:port is accepted.
         assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"relay.example:8443"}"#).is_ok());
-        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"[2001:db8::1]:8443"}"#).is_ok());
+        assert!(claim_outcome(200, r#"{"node_id":"n","relay_addr":"192.0.2.10:8443"}"#).is_ok());
+    }
+
+    /// An IPv6 `relay_addr` must be refused HERE, before anything is persisted.
+    ///
+    /// This test previously asserted the opposite - that a bracketed literal was
+    /// accepted - which is what let the defect through. Accepting it writes
+    /// `relay_host = "[2001:db8::1]"`, and the two consumers of that value want
+    /// different forms: the TLS server-name parser rejects the bracketed form,
+    /// while the neighbouring `wss://{relay_host}/` builder requires it. The
+    /// claim would report success and registration would then fail with
+    /// `invalid relay host`, with the bad profile already on disk.
+    #[test]
+    fn claim_outcome_rejects_ipv6_relay_addr_before_writing_config() {
+        for addr in [
+            "[2001:db8::1]:8443", // bracketed URI form
+            "[::1]:8443",
+            "2001:db8::1:8443", // bare form: rsplit_once(':') still leaves colons in the host
+        ] {
+            let body = format!(r#"{{"node_id":"n","relay_addr":"{addr}"}}"#);
+            let err = claim_outcome(200, &body)
+                .expect_err("an IPv6 relay_addr must not produce a claim outcome");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("IPv6") && msg.contains("No config was written"),
+                "the refusal must name IPv6 and say nothing was written: {msg}"
+            );
+        }
     }
 
     #[test]
