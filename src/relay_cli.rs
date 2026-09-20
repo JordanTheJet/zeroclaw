@@ -421,9 +421,14 @@ pub async fn handle_claim(config: &mut Config, claim_token: &str, control: &str)
     // what is still needed instead of silently enabling a listener.
     if !config.wss.enabled {
         println!(
-            "Note: [wss] is disabled, and the relay refuses registration until it is enabled. \
-             The claim above is saved and stays valid - enable the WSS listener (see the \
-             secure-transport guide) and the binding takes effect on the next start."
+            "{}",
+            crate::ta(
+                "cli-relay-claim-wss-disabled",
+                &[],
+                "Note: [wss] is disabled, and the relay refuses registration until it is \
+                 enabled. The claim above is saved and stays valid - enable the WSS listener \
+                 (see the secure-transport guide) and the binding takes effect on the next start.",
+            )
         );
     }
     Ok(())
