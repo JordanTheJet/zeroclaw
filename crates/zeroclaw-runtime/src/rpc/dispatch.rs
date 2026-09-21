@@ -3519,7 +3519,7 @@ impl RpcDispatcher {
         // principal, for a caller without operator reach.
         if let Some(grants) = grants.as_ref() {
             self.apply_principal_grants_to_agent(grants, &mut agent);
-            }
+        }
 
         // The session's memory follows its OWNER: an owned session works on
         // the owner's private plane for its whole life, whoever prompts it
@@ -4352,7 +4352,7 @@ impl RpcDispatcher {
                     })),
                 "session/prompt: refusing to rehydrate a session whose memory cannot be scoped to its owner"
             );
-            return None;
+            return Ok(None);
         }
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
@@ -15105,7 +15105,7 @@ mod tests {
         // Rehydration by an administrator keeps the durable owner's plane.
         assert!(sessions.remove("a-mem").await);
         carol
-            .rehydrate_reaped_session("a-mem")
+            .rehydrate_reaped_session("a-mem", carol.stamped_grants())
             .await
             .expect("the administrator restores alice's session");
         let agent = sessions.get_agent("a-mem").await.expect("restored");
