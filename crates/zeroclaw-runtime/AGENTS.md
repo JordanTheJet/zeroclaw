@@ -20,6 +20,6 @@ An exception permits continued work on a subsystem already held here. It never p
 
 | Scope | Destination | Approved by | Expires or reviewed |
 | --- | --- | --- | --- |
-| _(none)_ | | | |
+| Provider-image recovery in `src/agent/agent.rs`, `src/agent/loop_.rs`, `src/agent/turn/{mod,provider_call,stream_consume}.rs`, and `src/tools/send_message_to_peer.rs`, limited to the bounded recovery and live-state wiring proposed in #10480 | Agent-loop owner in the planned `zeroclaw-kernel` extraction | @JordanTheJet, [approved in #10949 on 2026-09-18](https://github.com/zeroclaw-labs/zeroclaw/pull/10949#pullrequestreview-5253299366) | Review at the agent-loop extraction design review, or before expanding recovery eligibility or retained state |
 
 **Stability tier:** Experimental — no stability guarantee. Decomposition begins at v0.8.0.

@@ -1529,6 +1529,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chardetng"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
+dependencies = [
+ "cfg-if",
+ "encoding_rs",
+ "memchr",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14374,6 +14385,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-native-certs 0.8.4",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
@@ -14453,6 +14465,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chacha20poly1305",
+ "chardetng",
  "chrono",
  "chrono-tz",
  "console",
@@ -14478,8 +14491,8 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "portable-atomic",
- "prometheus",
  "process-wrap",
+ "prometheus",
  "rand 0.10.2",
  "rcgen",
  "regex",
@@ -14801,9 +14814,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.29.0",
+ "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "zeroclaw-config",
  "zeroclaw-relay-proto",
+ "zeroclaw-runtime",
  "zeroclaw-tls",
+ "zeroize",
 ]
 
 [[package]]

@@ -64,6 +64,86 @@ Several providers accept OAuth or subscription-style tokens instead of raw API k
 - **Grok Build CLI**: `[providers.models.grok_cli.<alias>]` shells out through the documented `grok agent stdio` ACP surface. The assembled prompt is JSON-RPC on stdin, never argv or a prompt file. Auth uses the CLI login cache by default. For API-key auth, export `XAI_API_KEY` into the daemon environment and explicitly add `env_passthrough = ["XAI_API_KEY"]` to the alias; the typed alias `api_key` remains unsupported. An existing absolute `working_directory` is required and defines both the child cwd and ACP session boundary. The child environment is cleared before spawn, and `env_passthrough` defaults to empty. Other provider-owned `XAI_*` names and all `GROK_*` names are rejected. ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`, an empty built-in tool set, and fail-closed ACP permission responses. `extra_args` is the explicit per-alias opt-in for relaxing those controls. The bypass flags `--always-approve`, `--dangerously-skip-permissions`, `--yolo`, and `--permission-mode=bypassPermissions` make the headless ACP client select `allow_once`; other permission modes continue to select `reject_once`. ACP transport/model/session/cwd flags plus positional and short arguments are reserved; unknown value-taking long options use `--flag=value`. Alias `vision = true` only opts ZeroClaw into sending ACP image blocks; Grok still advertises `promptCapabilities.image = false` through 0.2.118 and does not reliably use the image content - leave unset for production; see [ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
 - **Qwen / MiniMax**: set `auth_mode = "o_auth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
 
+## OpenAI Astra setup
+
+OpenAI's public API model ID is `gpt-6-astra`. The
+[model guide](https://developers.openai.com/api/docs/guides/latest-model#gpt-6-astra)
+requires the Responses API for tool calling and lists `temperature` among the
+unsupported parameters. Configure the public API route on an `openai` alias
+with an API key and an explicit Responses wire:
+
+```toml
+[providers.models.openai.astra_api]
+api_key        = "op://platform/openai/api-key"
+model          = "gpt-6-astra"
+wire_api       = "responses"
+vision         = true
+context_window = 1050000
+max_tokens     = 32000
+
+[runtime]
+reasoning_effort = "high"
+
+[runtime_profiles.astra]
+agentic             = true
+max_tool_iterations = 12
+max_history_messages = 80
+max_context_tokens  = 200000
+
+[agents.astra]
+model_provider  = "openai.astra_api"
+runtime_profile = "astra"
+risk_profile    = "supervised"
+```
+
+The numeric values above are an intentional local budget, not a recommendation
+to fill the model's advertised window. The provider entry records the endpoint
+capability and output cap, while the runtime profile keeps a smaller estimated
+input budget and bounds the tool loop. Adjust them for the workload and leave
+output headroom. The fields have separate owners:
+
+- `providers.models.openai.astra_api.context_window` records the model input
+  window used by provider-aware budgeting.
+- `providers.models.openai.astra_api.max_tokens` caps generated output; it is
+  not an input-history limit.
+- `runtime_profiles.astra.max_context_tokens` is ZeroClaw's estimated local
+  trimming threshold. It may be smaller than `context_window`.
+- `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop,
+  while `max_history_messages` separately bounds retained message count.
+- `runtime.reasoning_effort` is the global provider-facing reasoning level.
+  ZeroClaw currently accepts `minimal`, `low`, `medium`, `high`, and `xhigh`.
+  Astra's public API accepts `low`, `medium`, `high`, `xhigh`, and `max`, so use
+  a shared value until [max reasoning support](https://github.com/zeroclaw-labs/zeroclaw/issues/10705)
+  lands.
+
+Do not set provider `temperature` for Astra. The Responses adapter forwards a
+configured value and does not repair unsupported sampling parameters. Keep API
+validation errors distinct from account, usage-tier, region, or backend access
+restrictions.
+
+`vision = true` is the operator's assertion that this exact model and endpoint
+accept image input. The public
+[Astra model specification](https://developers.openai.com/api/docs/models/gpt-6-astra)
+currently lists image input, but verify the configured account and endpoint
+before enabling it. Tool-result image serialization is a separate adapter boundary tracked in
+[#9599](https://github.com/zeroclaw-labs/zeroclaw/issues/9599).
+
+The Codex subscription route uses `requires_openai_auth = true` instead of an
+API key and must use an exact model ID served by that backend. Public API
+availability does not prove Codex-backend availability; follow the
+[Codex subscription guide](./openai-codex-subscription.md#astra-on-the-codex-subscription-backend)
+and test the account before routing production traffic.
+
+The public API may support capabilities that ZeroClaw does not yet expose for
+this adapter. Track reasoning-state continuity in
+[#10706](https://github.com/zeroclaw-labs/zeroclaw/issues/10706), async function
+tools in [#10704](https://github.com/zeroclaw-labs/zeroclaw/issues/10704),
+active-response steering in
+[#10708](https://github.com/zeroclaw-labs/zeroclaw/issues/10708), and
+programmatic tool calling in
+[#10707](https://github.com/zeroclaw-labs/zeroclaw/issues/10707). These are
+proposals until their ZeroClaw implementations and provider routes are verified.
+
 ## Container-friendly overrides
 
 When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama), set `uri` to a host-reachable address. The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing config:
