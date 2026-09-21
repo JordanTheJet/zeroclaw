@@ -1852,7 +1852,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "providers.models".to_string(),
                 key: "anthropic".to_string(),
@@ -1910,7 +1910,7 @@ mod tests {
 
         let memory_response = handle_section_select(
             State(memory_state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -1961,7 +1961,7 @@ mod tests {
 
         let tunnel_response = handle_section_select(
             State(tunnel_state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -2024,7 +2024,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -2085,7 +2085,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "tailscale".to_string(),
@@ -2152,7 +2152,7 @@ mod tests {
                 let live_before = state.config.read().clone();
                 let response = handle_section_select(
                     State(state.clone()),
-                    axum::http::HeaderMap::new(),
+                    None,
                     axum::extract::Path(SectionItemPath {
                         section: section.to_string(),
                         key: key.to_string(),
@@ -2213,7 +2213,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),

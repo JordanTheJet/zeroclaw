@@ -751,6 +751,10 @@ mod tests {
                 validation: OidcValidation::Introspection,
                 claim_path: "groups".into(),
                 profile_map: HashMap::from([("ops".to_string(), "config-reader".to_string())]),
+                // The provider classifies the actor from an operator
+                // declaration; without one a verified token has no declared
+                // kind and is refused. This fixture's client is interactive.
+                interactive_clients: vec!["gw".into()],
                 ..OidcConfig::default()
             },
         );
@@ -1191,10 +1195,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        // A later, unrelated persist moves the revision forward again and
-        // leaves C1's tightening in force: nothing rolls policy back.
+        // A later persist that touches no authorization input publishes no
+        // new generation, and crucially does not roll C1's tightening back.
         create_agent(&router, "alpha").await;
-        assert_eq!(authority.generation(), generation + 2);
+        assert_eq!(
+            authority.generation(),
+            generation + 1,
+            "an unrelated persist republishes without moving the generation"
+        );
         let (status, _) = send(
             &router,
             "GET",

@@ -425,7 +425,9 @@ pub(crate) async fn persist_and_swap(
     // NotFound means the file was absent. Any other read failure must stop
     // before the save because treating an unreadable file as absent would
     // let the rollback path delete an existing canonical config.
-    let snapshot = read_config_snapshot(&config_path).await?;
+    let snapshot = read_config_snapshot(&config_path)
+        .await
+        .map_err(error_response)?;
 
     if let Err(e) = new_config.save_dirty().await {
         if let Some(prev) = snapshot {
@@ -3133,8 +3135,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (status, json) =
-            response_json(handle_migrate(State(state.clone()), HeaderMap::new()).await).await;
+        let (status, json) = response_json(handle_migrate(State(state.clone()), None).await).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["migrated"], true);
@@ -4757,7 +4758,7 @@ mod tests {
         let (status, json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -4808,7 +4809,7 @@ mod tests {
         let (status, json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -4854,7 +4855,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -4906,7 +4907,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -4954,7 +4955,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state.clone()),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -5005,7 +5006,7 @@ mod tests {
             response_json(
                 handle_api_channel_bind(
                     axum::extract::State(state),
-                    axum::http::HeaderMap::new(),
+                    None,
                     axum::Json(ChannelBindBody {
                         channel_type: "telegram".to_string(),
                         alias: "alerts".to_string(),
