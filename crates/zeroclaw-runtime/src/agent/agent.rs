@@ -921,7 +921,7 @@ impl AgentBuilder {
     /// text would let construction-time content outlive a narrowing that no
     /// longer grants it, which is the leak the attributed blocks exist to
     /// close. It is therefore wrapped in a block keyed with
-    /// [`UNATTRIBUTED_PINNED_KEY`], a name no allowed-tool list can contain,
+    /// `UNATTRIBUTED_PINNED_KEY`, a name no allowed-tool list can contain,
     /// so `narrow_to_principal_tools` prunes it on the first narrowing. A
     /// caller that never narrows (the unscoped constructions this setter
     /// exists for) sees the section exactly as before.
