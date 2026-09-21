@@ -3856,7 +3856,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-acp-usage-order";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
@@ -6941,7 +6946,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-crumb-replay";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let crumb = ConversationMessage::Chat(ChatMessage::user(
             zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
@@ -7460,7 +7470,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "same-shape-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let before = vec![
             ConversationMessage::Chat(ChatMessage::user(
@@ -7532,7 +7547,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-load-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7597,7 +7617,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-resume-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7672,7 +7697,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-replace-not-append";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let old_turn = vec![
