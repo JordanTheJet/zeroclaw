@@ -1405,6 +1405,10 @@ mod tests {
                 group.to_string(),
                 profile.to_string(),
             )]),
+            // The provider classifies the actor from an operator declaration;
+            // an undeclared client is refused however well the token verifies.
+            // These fixtures stand in for interactive human sign-ins.
+            interactive_clients: vec!["daemon-client".into()],
             ..zeroclaw_config::schema::OidcConfig::default()
         }
     }
