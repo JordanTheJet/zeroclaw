@@ -3632,10 +3632,13 @@ impl RpcDispatcher {
             super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                 .with_owner(self.tui_id.clone())
                 .with_owner_principal(self.owner_principal_id());
-        if resuming {
-            // A client-supplied id may replace its live entry: the resume
-            // ownership check above already authorized this caller for the
-            // session, so this is reattachment, not a takeover.
+        let candidate_agent = Arc::clone(&candidate.agent);
+        // Fresh sessions must claim capacity before creating durable rows.
+        // Only a replacement can keep its existing slot throughout preparation.
+        // A client-supplied id may replace its live entry: the resume
+        // ownership check above already authorized this caller for the
+        // session, so that is reattachment, not a takeover.
+        let unpublished = if expected_generation.is_none() {
             self.ctx
                 .sessions
                 .insert_admitted_if_absent(&_admission, session_id.clone(), candidate)
@@ -3683,6 +3686,13 @@ impl RpcDispatcher {
                         let sid = session_id.clone();
                         let alias = req.agent_alias.clone();
                         let cwd_owned = cwd.clone();
+                        // The durable row is stamped at creation so the session
+                        // survives a restart under the same isolation. The
+                        // stamp is the creator's DURABLE identity, not the
+                        // authorization scope: a named administrator's own
+                        // session carries her identity, and only the admin
+                        // bypass is scope-free.
+                        let owner = self.owner_principal_id();
                         tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                             match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
@@ -3694,6 +3704,7 @@ impl RpcDispatcher {
                                     &alias,
                                     &cwd_owned,
                                     resolved_interaction_surface.map(|surface| surface.as_str()),
+                                    owner.as_deref(),
                                 )?;
                                 Ok(AcpSessionNewLoad::Created)
                             }
@@ -3914,7 +3925,6 @@ impl RpcDispatcher {
             forward_turn_event(&self.rpc, &session_id, &event).await;
         }
         drop(config_generation_guard);
-        }
 
         // Stamp the persisted chat row with the owning principal so the
         // session survives a daemon restart under the same isolation. ACP
@@ -11987,8 +11997,12 @@ mod tests {
         let (ctx, _chat_backend, _acp_store) =
             persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
         let sid = "s-durable-root";
-        let (mut operator, mut op_rx) = local_operator(&ctx).await;
-        durable_acp_session_at(&ctx, &mut operator, &mut op_rx, sid, &root).await;
+        // The durable row is created by the principal that later resumes it:
+        // session records are principal-owned, so a row an unscoped operator
+        // created is not hers to reopen. The check under test is the
+        // workspace root, which is unaffected by who created the row.
+        let (mut creator, mut creator_rx) = roster_peer(&ctx, 4242).await;
+        durable_acp_session_at(&ctx, &mut creator, &mut creator_rx, sid, &root).await;
 
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let resumed = rpc(
@@ -12104,12 +12118,15 @@ mod tests {
             persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, None));
         let (provider, mut started_rx, _release_tx) = gated_provider();
         let sid = "s-prompt-outside";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            // Alice's own session: the check under test is the workspace, not
+            // ownership, so the record has to be hers.
+            Some("user:alice"),
             outside.path(),
         )
         .await;
@@ -13339,12 +13356,17 @@ mod tests {
 
         let (provider, mut started_rx, release_tx) = gated_provider();
         let sid = "s-oidc-prompt";
-        install_state_test_session_at(
+        // Session records are principal-owned, so this fixture has to belong
+        // to the connection that prompts it; the check under test is the
+        // authorization generation, not ownership.
+        let owner = oidc.scoped_principal_id();
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            owner.as_deref(),
             &agent_workspace,
         )
         .await;
@@ -14962,6 +14984,7 @@ mod tests {
                 &ChatMode::Acp,
                 None,
                 Some("user:alice"),
+                |_, _| Ok::<(), JsonRpcError>(()),
             )
             .await;
         assert!(
@@ -14978,7 +15001,8 @@ mod tests {
                     "test-agent",
                     &ChatMode::Acp,
                     None,
-                    Some("user:bob")
+                    Some("user:bob"),
+                    |_, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
                 .unwrap()
@@ -14987,7 +15011,14 @@ mod tests {
         );
         assert!(
             sessions
-                .resume_existing("shared-id", "test-agent", &ChatMode::Acp, None, None)
+                .resume_existing(
+                    "shared-id",
+                    "test-agent",
+                    &ChatMode::Acp,
+                    None,
+                    None,
+                    |_, _| Ok::<(), JsonRpcError>(()),
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -15120,7 +15151,7 @@ mod tests {
         // Reap the live incarnation; the durable row stays alice's.
         assert!(sessions.remove("a1").await);
         carol
-            .rehydrate_reaped_session("a1")
+            .rehydrate_reaped_session("a1", carol.stamped_grants())
             .await
             .expect("the administrator restores alice's reaped session");
         assert_eq!(
@@ -20107,7 +20138,7 @@ mod tests {
         let foreign = "33333333-3333-4333-8333-333333333333";
         let unknown = "44444444-4444-4444-8444-444444444444";
         acp_store
-            .create_session(previous, "test-agent", "/previous")
+            .create_session(previous, "test-agent", "/previous", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -20118,7 +20149,7 @@ mod tests {
             )
             .unwrap();
         acp_store
-            .create_session(foreign, "other-agent", "/foreign")
+            .create_session(foreign, "other-agent", "/foreign", None)
             .unwrap();
 
         dispatcher
@@ -20338,7 +20369,7 @@ mod tests {
                 .unwrap();
             if original_mode == "chat" {
                 acp_store
-                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
                     .unwrap();
             }
             acp_store
@@ -20547,7 +20578,7 @@ mod tests {
             make_persistence_test_dispatcher(config, tmp.path());
         let sid = "successful-mode-replacement";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         acp_store
             .append_turn(
@@ -21044,7 +21075,7 @@ mod tests {
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
         let sid = "trim-drops-old-turns";
-        store.create_session(sid, "agent", "/tmp").unwrap();
+        store.create_session(sid, "agent", "/tmp", None).unwrap();
         let existing = (0..10)
             .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
             .collect::<Vec<_>>();
@@ -26340,12 +26371,19 @@ mod tests {
 
     /// [`install_state_test_session_with_owner`] with an explicit session
     /// workspace, for callers whose principal is held to the agent's roots.
-    async fn install_state_test_session_at(
+    /// Install a live session for a state test, stamped with `owner_principal`.
+    /// Session records are principal-owned, so a fixture a SCOPED caller is
+    /// meant to reach has to carry that caller's id: an unstamped session is
+    /// invisible to it, and the test would exercise the ownership denial
+    /// instead of whatever it meant to check.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
+        owner_principal: Option<&str>,
         workspace: &std::path::Path,
     ) -> String {
         let agent = crate::agent::agent::Agent::builder()
@@ -26367,14 +26405,44 @@ mod tests {
             workspace.to_str().unwrap(),
             crate::rpc::types::ChatMode::Chat,
         )
-        .with_owner(owner_tui_id.map(str::to_string));
+        .with_owner(owner_tui_id.map(str::to_string))
+        .with_owner_principal(owner_principal.map(str::to_string));
         sessions.insert(sid.to_string(), rpc_session).await.unwrap();
 
         let session_key = format!("rpc_{sid}");
         chat_backend
             .set_session_agent_alias(&session_key, "test-agent")
             .unwrap();
+        // The durable row has to carry the same owner as the live record, or
+        // resolution sees the two disagree and refuses the id as ambiguous.
+        if let Some(owner) = owner_principal {
+            chat_backend
+                .set_session_principal(&session_key, owner)
+                .unwrap();
+        }
         session_key
+    }
+
+    /// [`install_state_test_session_owned_at`] for a session with no principal
+    /// owner, which is what an unscoped connection creates.
+    async fn install_state_test_session_at(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+        workspace: &std::path::Path,
+    ) -> String {
+        install_state_test_session_owned_at(
+            sessions,
+            chat_backend,
+            sid,
+            provider,
+            owner_tui_id,
+            None,
+            workspace,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -27024,7 +27092,7 @@ mod tests {
 
         let sid = "acp-resume-transcript";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
 
         // The predecessor session runs a hand-built provider that gates its
@@ -27187,7 +27255,7 @@ mod tests {
 
         let sid = "rehydrate-unseeded-window";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         // The durable conversation a rehydration must restore.
         acp_store
@@ -27317,7 +27385,7 @@ mod tests {
 
         let sid = "rehydrate-plan-restore";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         let plan = vec![
             PlanEntry {
@@ -28036,7 +28104,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace)
+            .create_session(&session_id, "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
@@ -28148,7 +28216,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace)
+            .create_session(&session_id, "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
@@ -28235,7 +28303,7 @@ mod tests {
         // prompt path takes the rehydration branch.
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace)
+            .create_session(&session_id, "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
         assert!(
@@ -28327,7 +28395,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace)
+            .create_session(&session_id, "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 

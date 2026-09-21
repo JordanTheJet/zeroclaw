@@ -8772,10 +8772,10 @@ mod tests {
         let current = "11111111-1111-4111-8111-111111111111";
         let previous = "22222222-2222-4222-8222-222222222222";
         store
-            .create_session(current, "test-agent", "/current")
+            .create_session(current, "test-agent", "/current", None)
             .unwrap();
         store
-            .create_session(previous, "test-agent", "/previous")
+            .create_session(previous, "test-agent", "/previous", None)
             .unwrap();
         store
             .append_turn(

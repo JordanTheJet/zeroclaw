@@ -534,7 +534,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -547,6 +547,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         );
@@ -560,6 +561,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             trim_breadcrumb_raw,
+            principal_id,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -589,6 +591,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            principal_id,
         }))
     }
 
@@ -606,7 +609,7 @@ impl AcpSessionStore {
 
         let row = conn
             .query_row(
-                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id
                  FROM acp_sessions
                  WHERE session_uuid = ?1 AND agent_alias = ?2",
                 params![session_uuid, agent_alias],
@@ -620,6 +623,7 @@ impl AcpSessionStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -635,6 +639,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             trim_breadcrumb_raw,
+            principal_id,
         )) = row
         else {
             return Ok(None);
@@ -662,6 +667,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            principal_id,
         }))
     }
 
@@ -724,7 +730,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb, principal_id
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -738,64 +744,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<i64>>(8)?,
-                ))
-            },
-        );
-
-        let (
-            session_id,
-            agent_alias,
-            workspace_dir,
-            interaction_surface,
-            token_count,
-            created_at_s,
-            last_activity_s,
-            principal_id,
-        ) = match row {
-            Ok(r) => r,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(e).context("Failed to query ACP session"),
-        };
-
-        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
-        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
-
-        let messages = Self::load_messages(&conn, session_id)?;
-
-        Ok(Some(AcpSessionData {
-            session_uuid: session_uuid.to_string(),
-            principal_id,
-            agent_alias,
-            workspace_dir,
-            interaction_surface,
-            token_count: token_count.max(0) as u64,
-            created_at,
-            last_activity,
-            messages,
-        }))
-    }
-
-    /// Load only durable ACP rows that are allowed to become live sessions.
-    /// Killed rows keep their transcript for history/export but are terminal
-    /// for runtime restore paths.
-    pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
-        let conn = self.conn.lock();
-
-        let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, principal_id
-             FROM acp_sessions WHERE session_uuid = ?1",
-            params![session_uuid],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         );
@@ -924,7 +873,8 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -941,6 +891,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .context("Failed to query live ACP sessions for agent")?;
@@ -955,11 +906,13 @@ impl AcpSessionStore {
                 created_s,
                 activity_s,
                 msg_count,
+                principal_id,
             ) = row.context("Failed to read live ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
+                principal_id,
                 agent_alias: owner_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
@@ -1960,7 +1913,7 @@ mod tests {
     fn replace_messages_drops_prior_rows_and_cascades_to_tool_calls() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-replace", "alpha", "/tmp/proj")
+            .create_session("sess-replace", "alpha", "/tmp/proj", None)
             .unwrap();
 
         // An existing turn with a tool call, to prove the old row (and its
@@ -2051,7 +2004,7 @@ mod tests {
     fn insert_messages_never_persists_a_system_row() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-system", "alpha", "/tmp/proj")
+            .create_session("sess-system", "alpha", "/tmp/proj", None)
             .unwrap();
 
         // An agent's authoritative `history()` always leads with the system
@@ -2099,7 +2052,7 @@ mod tests {
     fn load_session_filters_a_legacy_system_row_written_before_the_write_path_fix() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-legacy-system", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-system", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2496,7 +2449,7 @@ mod tests {
     fn clear_token_count_resets_snapshot_to_unknown() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-clr", "alpha", "/tmp/proj")
+            .create_session("sess-clr", "alpha", "/tmp/proj", None)
             .unwrap();
         store.set_token_count("sess-clr", 152_306).unwrap();
         store.clear_token_count("sess-clr").unwrap();
@@ -2523,7 +2476,7 @@ mod tests {
         // snapshot must clear, not retain A's count.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-seq", "alpha", "/tmp/proj")
+            .create_session("sess-seq", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .persist_usage_snapshot("sess-seq", Some(1000), true)
@@ -2546,7 +2499,7 @@ mod tests {
     fn persist_usage_snapshot_rejected_never_touches_store() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-rej", "alpha", "/tmp/proj")
+            .create_session("sess-rej", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .persist_usage_snapshot("sess-rej", Some(1000), true)
@@ -2650,11 +2603,11 @@ mod tests {
     fn list_live_sessions_by_agent_filters_owner_and_killed_rows() {
         let (_tmp, store) = open_store();
         store
-            .create_session("alpha-old", "alpha", "/ws/old")
+            .create_session("alpha-old", "alpha", "/ws/old", None)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .create_session("alpha-new", "alpha", "/ws/new")
+            .create_session("alpha-new", "alpha", "/ws/new", None)
             .unwrap();
         store
             .append_turn(
@@ -2663,11 +2616,11 @@ mod tests {
             )
             .unwrap();
         store
-            .create_session("alpha-killed", "alpha", "/ws/killed")
+            .create_session("alpha-killed", "alpha", "/ws/killed", None)
             .unwrap();
         store.mark_session_killed("alpha-killed").unwrap();
         store
-            .create_session("beta-live", "beta", "/ws/beta")
+            .create_session("beta-live", "beta", "/ws/beta", None)
             .unwrap();
 
         let list = store.list_live_sessions_by_agent("alpha").unwrap();
@@ -2693,6 +2646,7 @@ mod tests {
                 "alpha",
                 "/ws/alpha",
                 Some("zerocode_code"),
+                None,
             )
             .unwrap();
         store
@@ -2848,7 +2802,7 @@ mod tests {
         // false` regardless of message content.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-genuine-text", "alpha", "/tmp/proj")
+            .create_session("sess-genuine-text", "alpha", "/tmp/proj", None)
             .unwrap();
         // A real user message that happens to equal a breadcrumb-shaped string.
         store
@@ -2881,7 +2835,7 @@ mod tests {
         // breadcrumb" and drop/miscount the marker.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-legacy-marker", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-marker", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2925,7 +2879,7 @@ mod tests {
         // A genuine colliding user turn (no synthetic marker at all) must
         // NOT be misclassified when the column is legacy-NULL either.
         store
-            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2965,7 +2919,7 @@ mod tests {
     fn trim_breadcrumb_survives_restore_and_a_second_trim() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-trimmed", "alpha", "/tmp/proj")
+            .create_session("sess-trimmed", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
