@@ -7460,6 +7460,9 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Ok(());
         };
+        if executes {
+            self.refuse_constrained_tool_selector_for_sop(method)?;
+        }
         let agents = {
             let config = self.ctx.config.read();
             Self::sop_executing_agents(sop, &config)
@@ -7472,6 +7475,48 @@ impl RpcDispatcher {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a procedure run by a principal whose tool selector names a
+    /// subset of the tools rather than the wildcard.
+    ///
+    /// A session composes [`Self::principal_tool_narrowing`] into the agent it
+    /// assembles, so a principal with a named tool list gets a narrowed
+    /// session rather than a refusal. A procedure is dispatched through the
+    /// SOP engine, which builds its own agents from the procedure's own policy
+    /// and never sees that narrowing, so the same principal would run with the
+    /// agent's full tool set. Until the narrowing is plumbed through the
+    /// engine, this path keeps the fail-closed posture the session selector
+    /// used to carry.
+    ///
+    /// A wildcard selector passes: the principal may already name any tool, so
+    /// the engine assembling the agent's own set is not an escalation past it.
+    fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        if auth.grants.admin
+            || auth
+                .grants
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
+        {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            "Principal has a constrained tool selector; procedures run outside per-session tool \
+             narrowing and are refused to it",
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
