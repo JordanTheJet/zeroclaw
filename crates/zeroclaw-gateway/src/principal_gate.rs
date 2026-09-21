@@ -63,7 +63,7 @@ pub const AUTH_PROVIDER_HEADER: &str = "x-zeroclaw-auth-provider";
 ///
 /// The accepted policy (providers, their verification settings, profile
 /// mappings, grants) is compiled at construction and thereafter only by
-/// [`Self::publish_persisted`], which the persist boundary calls for the
+/// `publish_persisted`, which the persist boundary calls for the
 /// configuration it has just written. The daemon's RPC surface holds its
 /// own live configuration and reaches the same state through the reload
 /// every gateway mutation flags.
