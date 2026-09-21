@@ -1806,6 +1806,7 @@ impl WhatsAppWebChannel {
                 explicitly_addressed: false,
                 conversation_scope,
                 references: Vec::new(),
+                voice_origin: false,
             })
             .await
         {
