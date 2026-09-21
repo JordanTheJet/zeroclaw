@@ -1894,6 +1894,7 @@ impl Agent {
             Some(acp_session_store),
             None,
             None,
+            None,
         )
         .await
     }
@@ -1927,6 +1928,7 @@ impl Agent {
             canvas_store,
             None,
             Some(live_config),
+            None,
             None,
         )
         .await

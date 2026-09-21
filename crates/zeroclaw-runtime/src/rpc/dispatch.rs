@@ -1695,22 +1695,47 @@ impl RpcDispatcher {
         std::collections::HashMap::new()
     }
 
-    fn apply_principal_to_agent(&self, agent: &mut crate::agent::agent::Agent) {
-        agent.narrow_to_principal_tools(self.principal_tool_narrowing().as_deref());
-        if self.auth.as_ref().is_some_and(|auth| {
-            !auth.grants.admin
-                && !auth
-                    .grants
-                    .allowed_agents
-                    .iter()
-                    .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
-        }) {
+    /// Apply a principal's posture to an agent: narrow its tool surface to the
+    /// selector, and, for a principal without operator reach, disable nested
+    /// tools that cannot carry the principal through. A handler that
+    /// re-resolved its principal after waiting for admission passes the fresh
+    /// grants here: the stamped copy is only as current as the last gate, and
+    /// a prompt that queued before its principal was narrowed must execute
+    /// under the narrowed ceiling, not the one it was admitted with.
+    fn apply_principal_grants_to_agent(
+        &self,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        agent: &mut crate::agent::agent::Agent,
+    ) {
+        let narrowing = if grants.admin
+            || grants
+                .allowed_tools
+                .iter()
+                .any(|t| t == zeroclaw_api::grants::WILDCARD)
+        {
+            None
+        } else {
+            Some(grants.allowed_tools.clone())
+        };
+        agent.narrow_to_principal_tools(narrowing.as_deref());
+        if !grants.admin
+            && !grants
+                .allowed_agents
+                .iter()
+                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
+        {
             agent.disable_principal_unaware_nested_tools();
         }
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
     /// Reuse the connection's canonical resolver and expiry/revocation checks.
+    ///
+    /// The prompt path itself now re-resolves through
+    /// [`Self::recheck_authority_after_admission`], which is the production
+    /// route; this remains the way a test obtains a handle carrying freshly
+    /// resolved grants.
+    #[cfg(test)]
     fn current_prompt_authority(&self) -> Result<Self, JsonRpcError> {
         let mut current = self.spawn_handle();
         if current.auth.is_some() {
@@ -3092,7 +3117,7 @@ impl RpcDispatcher {
                 )
                 .await
             } else {
-                crate::agent::agent::Agent::from_live_config_with_tui_env(
+                crate::agent::agent::Agent::from_live_config_with_tui_env_and_principal_tools(
                     Arc::clone(&self.ctx.config),
                     &req.agent_alias,
                     cwd_path,
@@ -3108,6 +3133,12 @@ impl RpcDispatcher {
         })
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+        // The constructor already intersected the tool surface with the
+        // selector; this also closes the nested tools that cannot carry a
+        // principal, for a caller without operator reach.
+        if let Some(grants) = grants.as_ref() {
+            self.apply_principal_grants_to_agent(grants, &mut agent);
+        }
         agent.set_interaction_context(
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
@@ -3822,6 +3853,12 @@ impl RpcDispatcher {
         else {
             return Ok(None);
         };
+        // A rehydrated session is rebuilt for the principal that asked for it,
+        // so its posture comes from the grants this call was given, not from
+        // whatever the connection was stamped with.
+        if let Some(grants) = grants {
+            self.apply_principal_grants_to_agent(grants, &mut agent);
+        }
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
                 Some(surface) => Some(surface.resolve()),
@@ -4386,17 +4423,18 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // The grants were re-resolved after admission, so apply that same
-        // selector to this session's static and already-activated deferred
-        // tools. It runs on the canonical handle, not the pre-reconciliation
-        // one, so a replaced incarnation cannot carry a stale ceiling, and it
-        // runs before any prompt-side effect. Direct unit handlers bind no
-        // connection and keep their fixture semantics.
-        if self.auth.is_some() {
-            agent
-                .lock()
-                .await
-                .narrow_to_principal_tools(self.principal_tool_narrowing().as_deref());
+        // The grants were re-resolved after admission, so apply that posture
+        // to this session's static and already-activated deferred tools. It is
+        // judged by those fresh grants rather than the connection's stamped
+        // copy, so a prompt that queued before its principal was narrowed
+        // executes under the narrowed ceiling. It runs on the canonical
+        // handle, not the pre-reconciliation one, so a replaced incarnation
+        // cannot carry a stale ceiling, and it runs before any prompt-side
+        // effect. Direct unit handlers bind no connection and keep their
+        // fixture semantics.
+        if let Some(grants) = grants.as_ref() {
+            let mut guard = agent.lock().await;
+            self.apply_principal_grants_to_agent(grants, &mut guard);
         }
 
         // Mark the durable row running only after every preflight wait has
@@ -12953,7 +12991,11 @@ mod tests {
         assert!(sessions.remove(sid).await);
         refresh_test_principal(&dispatcher, &["file_read"], &["*"]);
         let current = dispatcher.current_prompt_authority().unwrap();
-        let rebuilt = current.rehydrate_reaped_session(sid).await.unwrap();
+        let rebuilt = current
+            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .await
+            .expect("an entitled principal's rehydration is never refused")
+            .expect("the reaped session rehydrates");
         assert!(!Arc::ptr_eq(&before, &rebuilt));
         assert_eq!(rebuilt.lock().await.tool_names(), vec!["file_read"]);
         let denied = rebuilt
@@ -12970,7 +13012,16 @@ mod tests {
         assert_eq!(denied.code, FORBIDDEN);
         assert!(sessions.remove(sid).await);
         let current = dispatcher.current_prompt_authority().unwrap();
-        assert!(current.rehydrate_reaped_session(sid).await.is_none());
+        // Entitlement is gone, so the rehydration must not produce a session.
+        // It may be refused outright or report no restorable row; neither
+        // hands the caller a live agent.
+        let refused = current
+            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .await;
+        assert!(
+            refused.as_ref().map(Option::is_none).unwrap_or(true),
+            "a principal no longer entitled to the agent must not get a rehydrated session"
+        );
         assert!(sessions.get_agent(sid).await.is_none());
     }
 
@@ -13069,7 +13120,11 @@ mod tests {
                 }
                 let current = dispatcher.current_prompt_authority().unwrap();
                 let mut agent = handle.lock().await;
-                current.apply_principal_to_agent(&mut agent);
+                let grants = current
+                    .stamped_grants()
+                    .expect("the refreshed handle carries grants")
+                    .clone();
+                current.apply_principal_grants_to_agent(&grants, &mut agent);
                 assert!(
                     agent.tool_names().contains(&"calculator"),
                     "parent turn stays usable"
@@ -13157,10 +13212,12 @@ mod tests {
                 assert!(outcome.output.contains("principal-mcp-executed"));
             }
             refresh_test_principal(&dispatcher, &["tool_search"], &["*"]);
-            dispatcher
-                .current_prompt_authority()
-                .unwrap()
-                .apply_principal_to_agent(&mut agent);
+            let current = dispatcher.current_prompt_authority().unwrap();
+            let grants = current
+                .stamped_grants()
+                .expect("the refreshed handle carries grants")
+                .clone();
+            current.apply_principal_grants_to_agent(&grants, &mut agent);
             assert!(
                 !agent
                     .system_prompt_for_test()
