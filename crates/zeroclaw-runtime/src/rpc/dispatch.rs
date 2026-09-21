@@ -3373,9 +3373,12 @@ impl RpcDispatcher {
                 .await;
         }
         if admitted_mode.is_some() {
-            // A cross-mode replacement removes the live incarnation under this
+            // A cross-mode replacement swaps the live incarnation under this
             // id. A scoped caller may only replace its own: re-check the exact
-            // record under the permit before it is dropped.
+            // record under the permit, before preparation begins. The original
+            // stays published until `publish_prepared` swaps it under the
+            // generation read above, so a replacement that fails to build
+            // leaves the original session usable.
             if let Some(mine) = resume_scope.as_deref()
                 && self
                     .ctx
@@ -3389,7 +3392,6 @@ impl RpcDispatcher {
                     "Session not found or not owned by this principal",
                 ));
             }
-            self.ctx.sessions.remove(&session_id).await;
         }
 
         // Load resumed ACP metadata once, before constructing the live Agent.
@@ -11702,12 +11704,13 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, _release_tx) = gated_provider();
         let sid = "s-prompt-narrowed";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -11840,12 +11843,13 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, release_tx) = gated_provider();
         let sid = "s-prompt-republished";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -12565,12 +12569,13 @@ mod tests {
         std::fs::write(&secret, "outside every agent root").unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, started_rx, _release_tx) = gated_provider();
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             "s-sources",
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -13510,12 +13515,13 @@ mod tests {
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, _release_tx) = gated_provider();
         let sid = "s-prompt-expired";
-        install_state_test_session_at(
+        install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
             sid,
             provider,
             None,
+            Some("user:alice"),
             &agent_workspace,
         )
         .await;
@@ -14813,15 +14819,12 @@ mod tests {
         assert_eq!(err.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
     }
 
-    /// Install a live incarnation under `sid` directly in the store, stamped
-    /// with `owner`, bypassing `session/new` (which would contend for the same
-    /// admission permit the race tests hold). Returns its generation.
-    async fn install_live_session_owned_by(
-        sessions: &Arc<crate::rpc::session::SessionStore>,
-        sid: &str,
+    /// Build a live session stamped with `owner`, ready to publish under
+    /// whichever insertion path the caller's permit state allows.
+    fn owned_test_session(
         owner: Option<&str>,
         chat_mode: crate::rpc::types::ChatMode,
-    ) -> u64 {
+    ) -> crate::rpc::session::RpcSession {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -14834,14 +14837,48 @@ mod tests {
             .agent_alias("test-agent".to_string())
             .build()
             .expect("test agent should build");
-        let session = crate::rpc::session::RpcSession::new(
+        crate::rpc::session::RpcSession::new(
             agent,
             "test-agent",
             std::env::temp_dir().to_str().unwrap(),
             chat_mode,
         )
-        .with_owner_principal(owner.map(str::to_string));
+        .with_owner_principal(owner.map(str::to_string))
+    }
+
+    /// Install a live incarnation under `sid` directly in the store, stamped
+    /// with `owner`, bypassing `session/new` (which would contend for the same
+    /// admission permit the race tests hold). Returns its generation.
+    ///
+    /// This takes the per-session permit itself, so a caller already holding
+    /// it wants
+    /// [`install_live_session_owned_by_admitted`](install_live_session_owned_by_admitted).
+    async fn install_live_session_owned_by(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        sid: &str,
+        owner: Option<&str>,
+        chat_mode: crate::rpc::types::ChatMode,
+    ) -> u64 {
+        let session = owned_test_session(owner, chat_mode);
         sessions.insert(sid.to_string(), session).await.unwrap();
+        sessions.get_generation(sid).await.unwrap()
+    }
+
+    /// [`install_live_session_owned_by`] for a caller that already holds the
+    /// admission permit for `sid`: publishing through `insert` would wait on
+    /// the permit the caller is holding and fail the session as busy.
+    async fn install_live_session_owned_by_admitted(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        admission: &zeroclaw_infra::session_queue::SessionGuard,
+        sid: &str,
+        owner: Option<&str>,
+        chat_mode: crate::rpc::types::ChatMode,
+    ) -> u64 {
+        let session = owned_test_session(owner, chat_mode);
+        sessions
+            .insert_admitted(admission, sid.to_string(), session)
+            .await
+            .unwrap();
         sessions.get_generation(sid).await.unwrap()
     }
 
@@ -14892,8 +14929,9 @@ mod tests {
                     sessions.remove("race").await,
                     "{method}: alice's entry was live"
                 );
-                let successor = install_live_session_owned_by(
+                let successor = install_live_session_owned_by_admitted(
                     &sessions,
+                    &permit,
                     "race",
                     Some("user:bob"),
                     ChatMode::Acp,
