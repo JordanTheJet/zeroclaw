@@ -4076,50 +4076,57 @@ impl RpcDispatcher {
                 "RPC connection closed before prompt admission",
             ));
         }
-        // The lookup below can rehydrate a reaped session, and the durable row
-        // it rebuilds from names an agent and a workspace that must be held to
-        // this connection's authority. Resolve against the accepted policy
-        // before that decision is made. The lookup has to stay on the near
-        // side of admission (rehydration takes the same permit), so this
-        // resolution is taken again after admission below, and everything
-        // from there on uses the post-admission value.
-        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
-            Ok(grants) => grants,
-            Err(denied) => {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
-        };
         let _initial_agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => match self.rehydrate_reaped_session(sid, grants.as_ref()).await {
-                Ok(Some(a)) => a,
-                Err(denied) => {
-                    return Err(self
-                        .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                        .await);
-                }
-                Ok(None) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
+            None => {
+                // Rehydrating a reaped session rebuilds it from a durable row
+                // that names an agent and a workspace, and that decision has to
+                // be held to this connection's authority. Rehydration stays on
+                // the near side of admission (its insert takes the same
+                // permit), so the accepted policy is resolved here, for this
+                // decision alone. A live session deliberately skips it: its
+                // turn is gated by the post-admission resolution below, which
+                // is the boundary a credential that expires while the prompt
+                // waits for admission has to be refused at.
+                let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+                    Ok(grants) => grants,
+                    Err(denied) => {
+                        return Err(self
+                            .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                            .await);
+                    }
+                };
+                match self.rehydrate_reaped_session(sid, grants.as_ref()).await {
+                    Ok(Some(a)) => a,
+                    Err(denied) => {
+                        return Err(self
+                            .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                            .await);
+                    }
+                    Ok(None) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({ "session_id": sid })),
-                        "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
-                    );
-                    self.emit_turn_complete(
-                        sid,
-                        crate::rpc::types::TurnCompletionOutcome::Failed,
-                        "turn cancelled by daemon: session_not_found".to_string(),
-                        req.client_turn_generation,
-                        None,
-                    )
-                    .await;
-                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                            "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
+                        );
+                        self.emit_turn_complete(
+                            sid,
+                            crate::rpc::types::TurnCompletionOutcome::Failed,
+                            "turn cancelled by daemon: session_not_found".to_string(),
+                            req.client_turn_generation,
+                            None,
+                        )
+                        .await;
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
                 }
-            },
+            }
         };
 
         // Admit before reading mutable session metadata. Session replacement
@@ -16969,7 +16976,9 @@ mod tests {
         let config = make_acp_test_config(&tmp);
         let (dispatcher, sessions) = make_acp_test_dispatcher(config);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "test-peer".into());
+        let mut dispatcher =
+            RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
         let sid = "late-failed-mode-replacement";
         let mut agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
@@ -17059,7 +17068,8 @@ mod tests {
             Some(Arc::clone(&acp_store)),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
         dispatcher
             .handle_session_new(&json!({
                 "agent_alias": "test-agent", "session_id": "occupant", "chat_mode": "chat",
