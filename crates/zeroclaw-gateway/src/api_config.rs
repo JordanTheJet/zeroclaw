@@ -400,6 +400,11 @@ fn scoped_validate(
 /// holds the guard, so re-locking here would deadlock. The `debug_assert!`
 /// below catches a caller that passed a look-alike guard from the wrong
 /// mutex instead of the one actually held.
+///
+/// The error variant is an already-rendered `Response`, which is large by
+/// nature; every caller forwards it to axum unchanged, so boxing it here
+/// would only move the allocation without removing it.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn persist_and_swap(
     state: &AppState,
     authorization: &ConfigWriteAuthorization,
