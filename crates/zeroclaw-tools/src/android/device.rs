@@ -80,7 +80,7 @@ pub(crate) fn render(what: &str, data: &Value) -> anyhow::Result<ToolResult> {
     text.push('\n');
     let mut rendered = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
     if rendered.len() > MAX_OUTPUT_BYTES {
-        let boundary = crate::util_helpers::floor_char_boundary(&rendered, MAX_OUTPUT_BYTES);
+        let boundary = rendered.floor_char_boundary(MAX_OUTPUT_BYTES);
         rendered.truncate(boundary);
         rendered.push_str("\n… truncated");
     }
