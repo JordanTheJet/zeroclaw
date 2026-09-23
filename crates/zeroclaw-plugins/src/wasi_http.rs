@@ -58,7 +58,7 @@ use wasmtime_wasi_http::p2::{
 use zeroclaw_infra::net_guard::NetworkGuardError;
 
 use crate::egress::{
-    AuthorizedEgress, EgressError, EgressHostService, EgressRequest, EgressTransport,
+    AuthorizedEgress, EgressError, EgressHostService, EgressRequest, EgressTransport, GrantLists,
 };
 use crate::instance::{PluginInstanceId, PluginInstanceScope};
 
@@ -107,29 +107,63 @@ fn dns_failure() -> ErrorCode {
 /// instance. The destination host and the boundary's reason are recorded
 /// host-side — the operator needs both to seed a grant — while only the guest's
 /// error is masked.
+/// `existing` with `host` appended when it is not already there, rendered as
+/// the single-quoted JSON list `config set` takes. `config set` replaces the
+/// whole list, so a remedy has to carry every entry the operator already has.
+fn list_with(existing: &[String], host: &str) -> String {
+    let mut list: Vec<&str> = existing.iter().map(String::as_str).collect();
+    if !list.contains(&host) {
+        list.push(host);
+    }
+    format!("'{}'", serde_json::Value::from(list))
+}
+
 /// The operator-facing next step for a missing grant: the exact command that
-/// grants this instance reach to the refused host. `config set` replaces the
-/// whole `egress_hosts` list, so an operator with existing grants should add
-/// this host to them rather than run this verbatim — but naming the key, the
-/// field, and the host turns a bare deny into an actionable fix. Kept separate
+/// grants this instance reach to the refused host while keeping every host it
+/// already has. Without the current list in hand, it says what to do in words
+/// rather than print a replacement that would revoke the others. Kept separate
 /// from [`record_denial`] so its format is unit-testable without a log capture.
 /// Returns `None` only if the instance identity cannot be encoded (it always
 /// can for an admitted instance).
-fn egress_grant_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
+fn egress_grant_remedy(
+    id: &PluginInstanceId,
+    host: &str,
+    existing: Option<&[String]>,
+) -> Option<String> {
     let key = id.config_entry_key().ok()?;
-    Some(format!(
-        "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"{host}\"]'"
-    ))
+    let field = format!("plugins.entries.{key}.egress_hosts");
+    Some(match existing {
+        Some(existing) => format!(
+            "grant reach with: zeroclaw config set {field} {}",
+            list_with(existing, host)
+        ),
+        None => format!(
+            "grant reach by adding \"{host}\" to {field} alongside its existing entries; `config set` replaces the whole list"
+        ),
+    })
 }
 
 /// The remedy for a granted host that resolved to a private, loopback or
 /// link-local address: the grant is in place, what is missing is the
-/// per-host `egress_allow_private` carveout.
-fn egress_private_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
+/// per-host `egress_allow_private` carveout, added to the carveouts already
+/// there.
+fn egress_private_remedy(
+    id: &PluginInstanceId,
+    host: &str,
+    existing: Option<&[String]>,
+) -> Option<String> {
     let key = id.config_entry_key().ok()?;
-    Some(format!(
-        "the host is granted but resolves to a private, loopback or link-local address; allow that address class for it with: zeroclaw config set plugins.entries.{key}.egress_allow_private '[\"{host}\"]'"
-    ))
+    let field = format!("plugins.entries.{key}.egress_allow_private");
+    let preface = "the host is granted but resolves to a private, loopback or link-local address;";
+    Some(match existing {
+        Some(existing) => format!(
+            "{preface} allow that address class for it with: zeroclaw config set {field} {}",
+            list_with(existing, host)
+        ),
+        None => format!(
+            "{preface} allow that address class for it by adding \"{host}\" to {field} alongside its existing entries; `config set` replaces the whole list"
+        ),
+    })
 }
 
 /// The remedy that matches what the policy refused, or `None` when no
@@ -140,14 +174,22 @@ fn egress_private_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
 /// and telling the operator to add the grant again would leave the request
 /// denied. A missing manifest permission, a cloud-metadata address, a
 /// malformed destination or a DNS failure have no config-set fix, so those
-/// carry no command at all rather than a misleading one.
-fn egress_remedy(id: &PluginInstanceId, host: &str, error: &EgressError) -> Option<String> {
+/// carry no command at all rather than a misleading one. `current` is the
+/// instance's grant as it resolves now, so a printed command keeps it intact.
+fn egress_remedy(
+    id: &PluginInstanceId,
+    host: &str,
+    error: &EgressError,
+    current: Option<&GrantLists>,
+) -> Option<String> {
     match error {
-        EgressError::DestinationNotGranted { .. } => egress_grant_remedy(id, host),
+        EgressError::DestinationNotGranted { .. } => {
+            egress_grant_remedy(id, host, current.map(|c| c.hosts.as_slice()))
+        }
         EgressError::Network(
             NetworkGuardError::PrivateHostDenied(_)
             | NetworkGuardError::PrivateNetworkDenied { .. },
-        ) => egress_private_remedy(id, host),
+        ) => egress_private_remedy(id, host, current.map(|c| c.allow_private.as_slice())),
         _ => None,
     }
 }
@@ -720,6 +762,7 @@ async fn send(
     // time.
     let authorized = {
         let host = egress_request.host().to_string();
+        let scope = egress_request.scope().clone();
         match timeout_at(deadline, service.authorize(egress_request)).await {
             Ok(Ok(authorized)) => authorized,
             Ok(Err(error)) => {
@@ -738,7 +781,8 @@ async fn send(
                         connection_limit_reached()
                     }
                     _ => {
-                        let remedy = egress_remedy(&id, &host, &error);
+                        let current = service.current_grant(&scope);
+                        let remedy = egress_remedy(&id, &host, &error, current.as_ref());
                         record_denial(&id, &host, &error.to_string(), remedy);
                         denied()
                     }
@@ -934,8 +978,13 @@ mod tests {
         let key = id
             .config_entry_key()
             .expect("an admitted instance has a config-entry key");
-        let remedy = egress_grant_remedy(id, "api.example.com")
+        let existing = vec!["docs.example.com".to_string()];
+        let remedy = egress_grant_remedy(id, "api.example.com", Some(&existing))
             .expect("an admitted instance always yields a remedy");
+        assert!(
+            remedy.contains("docs.example.com"),
+            "remedy must keep the host already granted: {remedy}"
+        );
         assert!(
             remedy.contains(&key),
             "remedy must name the exact config-entry key: {remedy}"
@@ -971,12 +1020,17 @@ mod tests {
         );
         let id = scope.id();
         let host = "gitea.internal.example";
+        let current = GrantLists {
+            hosts: vec![host.to_string()],
+            allow_private: Vec::new(),
+        };
 
         let not_granted = EgressError::DestinationNotGranted {
             instance: "main".to_string(),
             host: host.to_string(),
         };
-        let remedy = egress_remedy(id, host, &not_granted).expect("a missing grant has a fix");
+        let remedy = egress_remedy(id, host, &not_granted, Some(&current))
+            .expect("a missing grant has a fix");
         assert!(
             remedy.contains("egress_hosts") && !remedy.contains("egress_allow_private"),
             "{remedy}"
@@ -986,14 +1040,16 @@ mod tests {
             host: host.to_string(),
             reason: "resolved to 10.0.0.5".to_string(),
         });
-        let remedy = egress_remedy(id, host, &private).expect("a private address has a fix");
+        let remedy =
+            egress_remedy(id, host, &private, Some(&current)).expect("a private address has a fix");
         assert!(
             remedy.contains(&format!(".egress_allow_private '[\"{host}\"]'")),
             "the private case must name the carveout field and the host: {remedy}"
         );
         let literal = EgressError::Network(NetworkGuardError::PrivateHostDenied(host.to_string()));
         assert!(
-            egress_remedy(id, host, &literal).is_some_and(|r| r.contains("egress_allow_private"))
+            egress_remedy(id, host, &literal, Some(&current))
+                .is_some_and(|r| r.contains("egress_allow_private"))
         );
 
         for no_fix in [
@@ -1016,7 +1072,7 @@ mod tests {
             },
         ] {
             assert!(
-                egress_remedy(id, host, &no_fix).is_none(),
+                egress_remedy(id, host, &no_fix, Some(&current)).is_none(),
                 "no config-set command repairs {no_fix}"
             );
         }
@@ -1061,8 +1117,138 @@ mod tests {
             ),
             "{error}"
         );
-        let remedy = egress_remedy(scope.id(), "127.0.0.1", &error).expect("has a fix");
+        let current = service.current_grant(&scope);
+        let remedy =
+            egress_remedy(scope.id(), "127.0.0.1", &error, current.as_ref()).expect("has a fix");
         assert!(remedy.contains("egress_allow_private"), "{remedy}");
+    }
+
+    /// The list a remedy command would write, parsed back out of it.
+    fn remedy_list(remedy: &str) -> Vec<String> {
+        let start = remedy.rfind(" '").expect("remedy ends in a quoted list") + 2;
+        let end = remedy.rfind('\'').expect("the list is single-quoted");
+        serde_json::from_str(&remedy[start..end]).expect("the list is JSON")
+    }
+
+    /// `config set` replaces a whole list, so a remedy that printed only the
+    /// denied host would revoke every other grant, and replacing
+    /// `egress_hosts` alone can also strand an existing private carveout
+    /// outside the host list and leave the policy invalid. Starting from an
+    /// instance with several hosts and a carveout, both remedies must keep
+    /// every existing entry, and the lists they would write must still build
+    /// a valid policy. The singleton form is shown to fail that check, so the
+    /// test would catch a regression to it.
+    #[tokio::test]
+    async fn a_remedy_keeps_every_existing_grant_and_leaves_a_valid_policy() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let hosts = vec![
+            "api.example.com".to_string(),
+            "*.cdn.example.com".to_string(),
+            "nas.internal.example".to_string(),
+            "127.0.0.1".to_string(),
+        ];
+        let allow_private = vec!["nas.internal.example".to_string()];
+        let policy = EgressPolicy::new(&hosts, &allow_private, &[], 16)
+            .expect("the starting grant is a valid policy");
+        let service = EgressHostService::with_private_connection_accounting(
+            EgressPolicyResolver::new(move |_| Ok(policy.clone())),
+        );
+        let current = service
+            .current_grant(&scope)
+            .expect("the current grant resolves");
+        // The policy holds its lists normalized, so compare them as sets.
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&current.hosts), sorted(&hosts));
+        assert_eq!(sorted(&current.allow_private), sorted(&allow_private));
+
+        // A host outside the grant: refused before any resolution.
+        let request = crate::egress::EgressRequest::new(
+            scope.clone(),
+            crate::egress::EgressTransport::Http { encrypted: true },
+            "new.example.com",
+            443,
+        )
+        .expect("a valid destination");
+        let error = service
+            .authorize(request)
+            .await
+            .expect_err("an ungranted host is refused");
+        assert!(
+            matches!(error, EgressError::DestinationNotGranted { .. }),
+            "{error}"
+        );
+        let remedy = egress_remedy(scope.id(), "new.example.com", &error, Some(&current))
+            .expect("a missing grant has a fix");
+        let written = remedy_list(&remedy);
+        for kept in &hosts {
+            assert!(written.contains(kept), "{kept} must survive: {remedy}");
+        }
+        assert!(written.contains(&"new.example.com".to_string()), "{remedy}");
+        EgressPolicy::new(&written, &allow_private, &[], 16)
+            .expect("the remedied host list keeps the policy valid");
+        assert!(
+            EgressPolicy::new(&["new.example.com".to_string()], &allow_private, &[], 16).is_err(),
+            "the singleton replacement strands the existing carveout"
+        );
+
+        // A granted host in private space: the carveout list keeps its entry.
+        let request = crate::egress::EgressRequest::new(
+            scope.clone(),
+            crate::egress::EgressTransport::Http { encrypted: false },
+            "127.0.0.1",
+            80,
+        )
+        .expect("a loopback destination is a valid request");
+        let error = service
+            .authorize(request)
+            .await
+            .expect_err("granted but not carved out is refused");
+        let remedy = egress_remedy(scope.id(), "127.0.0.1", &error, Some(&current))
+            .expect("a private address has a fix");
+        let written = remedy_list(&remedy);
+        assert_eq!(
+            sorted(&written),
+            sorted(&["nas.internal.example".to_string(), "127.0.0.1".to_string()]),
+            "{remedy}"
+        );
+        EgressPolicy::new(&hosts, &written, &[], 16)
+            .expect("the remedied carveout list keeps the policy valid");
+    }
+
+    /// Without the current grant in hand there is no safe list to print, so
+    /// the remedy says what to do in words and prints no replacement.
+    #[test]
+    fn without_the_current_grant_the_remedy_prints_no_replacement() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let not_granted = EgressError::DestinationNotGranted {
+            instance: "main".to_string(),
+            host: "new.example.com".to_string(),
+        };
+        let private = EgressError::Network(NetworkGuardError::PrivateHostDenied(
+            "127.0.0.1".to_string(),
+        ));
+        for (host, error) in [("new.example.com", not_granted), ("127.0.0.1", private)] {
+            let remedy = egress_remedy(id, host, &error, None).expect("still has a fix");
+            assert!(!remedy.contains("zeroclaw config set"), "{remedy}");
+            assert!(
+                remedy.contains("alongside its existing entries"),
+                "{remedy}"
+            );
+            assert!(remedy.contains(host), "{remedy}");
+        }
     }
 
     fn request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
