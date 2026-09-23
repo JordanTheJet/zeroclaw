@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -89,6 +89,17 @@ pub(crate) fn take_stream_refusal_recovery() -> Option<AnthropicRefusalError> {
 struct ReliableEntryId {
     model_slot: usize,
     entry_index: usize,
+}
+
+/// Explicit outcome of the retry policy for one entry. Returned by the pure
+/// [`ReliableModelProvider::stream_recovery_decision`]; callers must not infer
+/// precedence from branch order — read the `match` arms instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// Attempt the entry with the given retry budget.
+    Admit(u32),
+    /// Skip the entry entirely (avoids replaying a failed stream entry).
+    Skip,
 }
 
 /// Call-scoped outcome retained independently of the provider result.
@@ -302,6 +313,7 @@ pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Ou
 }
 
 /// Record a model_provider fallback event.
+/// No-ops when called outside a `scope_provider_fallback` scope.
 fn record_provider_fallback(
     requested_provider: &str,
     requested_model: &str,
@@ -523,8 +535,54 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
+/// Provider-declared terminal failures override retry/message heuristics.
+fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
+}
+
+/// First status-shaped HTTP client error code embedded in an error message:
+/// a run of exactly three ASCII digits, not adjacent (either side) to an
+/// ASCII alphanumeric character, whose value is in 400..500. Numbers glued to
+/// units or words ("480s"), longer digit runs ("0409", "4800"), and values
+/// outside the client range are not status codes. This keeps timing and
+/// sizing numbers in provider messages (for example a stream-idle bound of
+/// 480 s) from being misread as a 4xx client error.
+fn embedded_client_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let status_shaped = end - start == 3
+            && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if status_shaped
+            && let Ok(code) = message[start..end].parse::<u16>()
+            && (400..500).contains(&code)
+        {
+            return Some(code);
+        }
+        start = end;
+    }
+    None
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // A provider's typed classification is definitive. Check the full chain
+    // before text or status heuristics so recoverable-looking wording cannot
+    // override an explicit provider safety decision.
+    if has_typed_non_retryable_marker(err) {
+        return true;
+    }
+
     // A typed model refusal cannot be repaired by replaying the same request
     // against the same candidate. Advance directly to the next configured
     // provider/model entry.
@@ -555,13 +613,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    // Only status-shaped numbers count (see `embedded_client_status`), so
+    // elapsed times and other digit noise in a message never look like an
+    // HTTP client error.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>()
-            && (400..500).contains(&code)
-        {
-            return code != 429 && code != 408;
-        }
+    if let Some(code) = embedded_client_status(&msg) {
+        return code != 429 && code != 408;
     }
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
@@ -1807,6 +1864,35 @@ impl ReliableModelProvider {
             rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Build a provider whose entries mirror `push_pinned_entries`: every entry
+    /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
+    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    ///
+    /// Exposed for cross-crate regressions that need the same-alias
+    /// pinned-model failover shape; the production builder reaches
+    /// `new_pinned` directly.
+    #[doc(hidden)]
+    pub fn new_pinned_for_test(
+        alias: &str,
+        entries: Vec<(&str, &str, &str, std::sync::Arc<dyn ModelProvider>)>,
+        max_retries: u32,
+        base_backoff_ms: u64,
+    ) -> Self {
+        let model_providers = entries
+            .into_iter()
+            .map(|(cooldown_key, provider_alias, pinned_model, inner)| {
+                ReliableModelProviderEntry::new_pinned(
+                    cooldown_key,
+                    cooldown_key,
+                    provider_alias,
+                    pinned_model,
+                    Box::new(inner),
+                )
+            })
+            .collect();
+        Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
+    }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
@@ -1880,9 +1966,19 @@ impl ReliableModelProvider {
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// semantic-empty stream entry, which receives one atomic non-stream
-    /// recovery attempt when the configured budget permits it.
-    fn effective_retry_limit(&self, model_slot: usize, entry_index: usize) -> Option<u32> {
+    /// stream-failed entry, which is skipped to avoid replaying it — with two
+    /// one-shot exceptions, each granting a single atomic non-stream attempt:
+    /// the semantic-empty entry (when the budget permits it), and the
+    /// single-candidate case (no other candidate exists, so a non-stream retry
+    /// of the same entry is recovery, not replay). When both exceptions apply
+    /// to the same entry, semantic-empty wins and the grants merge into one
+    /// single attempt — never two.
+    fn effective_retry_limit(
+        &self,
+        model_slot: usize,
+        entry_index: usize,
+        has_other_candidate: bool,
+    ) -> Option<u32> {
         let max_retries = self.max_retries;
         RELIABLE_CALL_ACCOUNTING
             .try_with(|accounting| {
@@ -1890,16 +1986,56 @@ impl ReliableModelProvider {
                 let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
                     model_slot == failed.model_slot && entry_index == failed.entry_index
                 });
-                if !exact_failed_entry {
-                    return Some(max_retries);
+                let decision = Self::stream_recovery_decision(
+                    max_retries,
+                    exact_failed_entry,
+                    accounting.stream_recovery_semantic_empty_permission,
+                    has_other_candidate,
+                );
+                match decision {
+                    RetryDecision::Admit(limit) => {
+                        if exact_failed_entry {
+                            // Consume one-shot recovery grants so each fires at
+                            // most once. Clearing the resume marker merges the
+                            // single-candidate grant into the semantic-empty
+                            // attempt when both apply.
+                            accounting.stream_recovery_semantic_empty_permission = false;
+                            if !has_other_candidate {
+                                accounting.stream_resume_after = None;
+                            }
+                        }
+                        Some(limit)
+                    }
+                    RetryDecision::Skip => None,
                 }
-                if max_retries == 0 || !accounting.stream_recovery_semantic_empty_permission {
-                    return None;
-                }
-                accounting.stream_recovery_semantic_empty_permission = false;
-                Some(0)
             })
             .unwrap_or(Some(max_retries))
+    }
+
+    /// Pure retry policy for a single entry: precedence is encoded in this
+    /// `match` so each recovery mode is an explicit, independently testable
+    /// decision rather than a branch in an if-chain. Stateful one-shot
+    /// consumption lives in [`Self::effective_retry_limit`], not here.
+    fn stream_recovery_decision(
+        max_retries: u32,
+        exact_failed_entry: bool,
+        semantic_empty_permission: bool,
+        has_other_candidate: bool,
+    ) -> RetryDecision {
+        if !exact_failed_entry {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Semantic-empty wins when both exceptions apply (see
+        // `effective_retry_limit` for the merged single-attempt consumption).
+        if max_retries > 0 && semantic_empty_permission {
+            return RetryDecision::Admit(0);
+        }
+        // Single-candidate stream failure: no alternative entry exists, so one
+        // non-stream attempt of the same entry is the only recovery path.
+        if !has_other_candidate {
+            return RetryDecision::Admit(0);
+        }
+        RetryDecision::Skip
     }
 
     fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
@@ -2077,6 +2213,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -2084,6 +2221,9 @@ impl ModelProvider for ReliableModelProvider {
         // retryable error, sleep with exponential backoff and retry.
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2205,7 +2345,7 @@ impl ModelProvider for ReliableModelProvider {
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
-                            if is_context_window_exceeded(&e) {
+                            if is_context_window_exceeded(&e) && !is_non_retryable(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2274,6 +2414,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -2361,11 +2504,15 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2488,7 +2635,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2570,6 +2720,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -2746,18 +2899,26 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut refusal_seen = None;
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2889,7 +3050,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2971,6 +3135,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3052,6 +3219,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut streamed_refusal = take_stream_refusal_recovery();
         let mut refusal_seen = streamed_refusal.clone();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = streamed_refusal
@@ -3065,6 +3233,8 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_provider = streamed_refusal
             .as_ref()
             .and_then(|refusal| refusal.attempted_candidate.clone());
+
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
@@ -3088,10 +3258,15 @@ impl ModelProvider for ReliableModelProvider {
                     streamed_refusal = None;
                     continue;
                 }
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -3227,7 +3402,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -3309,6 +3487,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3788,6 +3969,18 @@ mod tests {
         }
     }
 
+    struct MarkerErrorProvider {
+        calls: Arc<AtomicUsize>,
+        error: &'static str,
+    }
+
+    impl MarkerErrorProvider {
+        fn failure(&self) -> anyhow::Error {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::Error::new(crate::traits::NonRetryableProviderError::new(self.error))
+        }
+    }
+
     enum RefusalThenFailureMode {
         Refusal,
         Failure,
@@ -3816,6 +4009,42 @@ mod tests {
                     anyhow::bail!("500 later provider failure")
                 }
             }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MarkerErrorProvider"
         }
     }
 
@@ -6844,6 +7073,83 @@ mod tests {
     }
 
     #[test]
+    fn typed_non_retryable_marker_takes_precedence_over_retryable_heuristics() {
+        let error = anyhow::Error::new(crate::traits::NonRetryableProviderError::new(
+            "provider explicitly rejected retry",
+        ))
+        .context("429 Too Many Requests");
+        assert!(is_non_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn reliable_provider_does_not_retry_a_typed_marker_with_retryable_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MarkerErrorProvider {
+                    calls: Arc::clone(&calls),
+                    error: "429 Too Many Requests",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("typed provider failure should be terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_context_marker_skips_other_pins_on_the_same_provider() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let primary: Arc<dyn ModelProvider> = Arc::new(MarkerErrorProvider {
+            calls: Arc::clone(&primary_calls),
+            error: "Your input exceeds the context window of this model",
+        });
+        let entries = vec![
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "primary-model",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "fallback-model-on-primary",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new(
+                "fallback",
+                "fallback.physical",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&fallback_calls),
+                    fail_until_attempt: 0,
+                    response: "fallback success",
+                    error: "unused",
+                }),
+            ),
+        ];
+        let provider = ReliableModelProvider::new_with_entries("test", entries, 3, 1);
+
+        let response = provider
+            .simple_chat("hello", "requested-model", Some(0.0))
+            .await
+            .expect("typed rejection should skip sibling pins and reach a distinct provider");
+        assert_eq!(response, "fallback success");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn auth_error_detects_common_patterns() {
         assert!(is_auth_error(&anyhow::Error::msg("401 Unauthorized")));
         assert!(is_auth_error(&anyhow::Error::msg("403 Forbidden")));
@@ -7729,6 +8035,51 @@ mod tests {
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
         );
+    }
+
+    #[test]
+    fn non_retryable_ignores_stream_idle_timeout_messages() {
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "a stream idle timeout must stay retryable so the user's turn is preserved"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 3600s (stream idle timeout; raise timeout_secs above 3600s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "an hour-long idle bound is still not a client error"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "the fixed-bound idle rendering must also stay retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_status_shaped_numbers_only() {
+        assert!(is_non_retryable(&anyhow::Error::msg("HTTP 401")));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "upstream rejected the call: \"code\":404, model missing"
+        )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "status=403 forbidden"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "waited 480s for first byte"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "code 0409 from gateway"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "spent 4800 ms connecting"
+        )));
     }
 
     // ── §2.2 Rate limit Retry-After edge cases ───────────────
@@ -10310,7 +10661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_candidate_reliable_recovery_skip_creates_no_second_leaf() {
+    async fn single_entry_stream_recovery_retries_same_candidate() {
         let chat_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableModelProvider::new(
             "test",
@@ -10339,27 +10690,118 @@ mod tests {
                     StreamOptions::new(true),
                 );
                 assert!(stream.next().await.expect("stream error event").is_err());
-                assert!(
-                    ProviderDispatch::from_ref(&provider)
-                        .chat(
-                            ChatRequest {
-                                messages: &messages,
-                                tools: None,
-                                thinking: None,
-                            },
-                            "served-model",
-                            None,
-                        )
-                        .await
-                        .is_err()
-                );
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("chat should succeed after stream recovery");
+                assert_eq!(resp.text.as_deref(), Some("must not replay"));
             })
             .await;
 
         let report = scope.take();
-        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.attempts().len(), 2);
         assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
+    }
+
+    #[test]
+    fn single_candidate_recovery_decision_boundaries() {
+        // Non-failed entries always admit the configured budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // Semantic-empty wins with budget; without budget it stays skipped
+        // when another candidate exists.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, true),
+            RetryDecision::Skip
+        );
+        // Single-candidate stream failure: one non-stream recovery attempt
+        // even with zero retries (recovery, not replay). Merges with
+        // semantic-empty into the same single attempt.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false),
+            RetryDecision::Admit(0)
+        );
+        // Multi-candidate without permission: skip the failed entry.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true),
+            RetryDecision::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn single_entry_stream_recovery_failure_errors_after_one_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamThenChatErrorMock) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("failed recovery must surface, not loop");
+                assert!(
+                    format!("{err:?}").contains("expected recovery failure"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        // Stream + exactly one recovery attempt are both ledger-visible.
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
     }
 
     #[tokio::test]
@@ -10702,15 +11144,35 @@ mod tests {
             activate_stream_recovery_after_first_poll(3, 4);
             mark_stream_recovery_semantic_empty();
 
-            assert_eq!(provider.effective_retry_limit(3, 3), Some(2));
-            assert_eq!(provider.effective_retry_limit(2, 4), Some(2));
-            assert_eq!(provider.effective_retry_limit(3, 4), Some(0));
-            assert_eq!(provider.effective_retry_limit(3, 4), None);
+            assert_eq!(provider.effective_retry_limit(3, 3, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(2, 4, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), Some(0));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), None);
 
             activate_stream_recovery_after_first_poll(5, 6);
             mark_stream_recovery_semantic_empty();
-            assert_eq!(zero_budget.effective_retry_limit(5, 6), None);
+            assert_eq!(zero_budget.effective_retry_limit(5, 6, true), None);
             assert!(stream_recovery_was_semantic_empty());
+
+            // Single-candidate stream failure grants one non-stream recovery
+            // attempt even with zero budget; the marker is consumed one-shot.
+            // Uses a budgeted provider so consumption is observable: granted
+            // once as Some(0), then normal budget Some(2) afterwards.
+            activate_stream_recovery_after_first_poll(7, 8);
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(2));
+
+            // Single-candidate + semantic-empty on the same entry merges into
+            // one single attempt (semantic-empty wins): granted once, then
+            // normal budget — never two recovery attempts.
+            activate_stream_recovery_after_first_poll(9, 10);
+            mark_stream_recovery_semantic_empty();
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(2));
+            // Both grants are consumed: re-arming the same marker without a
+            // fresh permission must skip when another candidate exists.
+            activate_stream_recovery_after_first_poll(9, 10);
+            assert_eq!(provider.effective_retry_limit(9, 10, true), None);
         })
         .await;
     }

@@ -26,6 +26,18 @@ OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "resp
 
 Local inference via Ollama's native `/api/chat`. Schema-based structured output via `format`. No API key.
 
+### Hailo-Ollama: slot `hailo_ollama`
+
+Local Hailo-accelerated inference through Hailo-Ollama's native `/api/chat` and
+`/api/tags` endpoints. The explicit compatibility mode normalizes and bounds
+history, disables streaming and thinking, and serializes access through a shared
+per-endpoint hardware gate. Ambiguous post-connect transport failures, including
+request timeouts, quarantine that endpoint until ZeroClaw restarts. The native
+Hailo-Ollama service has no authentication contract; an alias may nevertheless
+attach a Bearer `api_key` or `extra_headers` when the operator places a trusted
+authenticating proxy or bridge in front of it. Native tool calling and vision
+remain unsupported.
+
 ### Bedrock: slot `bedrock`
 
 ### Gemini: slot `gemini`
@@ -156,10 +168,7 @@ this is an intentional process-env bridge rather than a second Config secret
 field. Values are not written to provider TOML; a future typed Config bridge
 may load the same name at config time without changing the operator surface.
 
-An existing absolute `working_directory` is required. It is canonicalized and
-used for both the child cwd and ACP session boundary, so the provider never
-falls back to the daemon cwd. Optional `binary_path` selects a non-`PATH`
-binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
+An existing absolute `working_directory` is required. It is canonicalized and used for both the child cwd and ACP session boundary, so the provider never falls back to the daemon cwd. Optional `binary_path` accepts an absolute path or a bare executable name (default `grok`); relative paths with separators are rejected. Bare names resolve against absolute host `PATH` directories before the child cwd is set, ignoring empty and relative entries. The selected file is canonicalized and checked for executability before spawn. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
 The child environment is cleared before spawn. Process-runtime, locale, proxy,
 and CA variables on the built-in allowlist remain available; all other names

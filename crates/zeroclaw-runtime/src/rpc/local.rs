@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -966,14 +966,28 @@ mod tests {
         let ctx = test_ctx(tmp.path());
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let readiness = crate::daemon::SocketReadinessReporter::new(move || {
+            let _ = ready_tx.send(true);
+        });
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
+            let _ = run_local_listener(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                Some(readiness),
+            )
+            .await;
         });
 
-        wait_for_socket(&sock_path).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(|ready| *ready).await.unwrap();
+        })
+        .await
+        .expect("local IPC should report its secured bind");
 
         use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(&sock_path).unwrap();
