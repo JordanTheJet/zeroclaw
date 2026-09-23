@@ -3610,7 +3610,7 @@ permissions = ["http_client"]
             always_ask: vec!["android_action".into()],
             ..Default::default()
         };
-        // always_ask survives Full autonomy (#9724), so an operator who pins
+        // always_ask survives Full autonomy, so an operator who pins
         // android_action to always_ask keeps the prompt even at Full.
         assert!(
             !android_tool_would_be_auto_approved(&full, "android_action"),
