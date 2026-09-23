@@ -293,12 +293,6 @@ impl Tool for ShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
-        // Unconditional, unlike the session key above: the `zeroclaw` CLI runs
-        // with the operator's authority and no agent policy anywhere in the
-        // process, so it has to be able to recognise a model caller on every
-        // path, scoped turn or not.
-        cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1");
-
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
@@ -307,6 +301,19 @@ impl Tool for ShellTool {
                 cmd.env(k, v);
             }
         }
+
+        // Unconditional, unlike the session key above: the `zeroclaw` CLI runs
+        // with the operator's authority and no agent policy anywhere in the
+        // process, so it has to be able to recognise a model caller on every
+        // path, scoped turn or not.
+        //
+        // This assignment is deliberately the LAST word on this variable, after
+        // the TUI overlay above. The registry stores the client's whole shell
+        // environment, so a TUI started with `ZEROCLAW_AGENT_SHELL=` would
+        // otherwise overwrite the marker with an empty value — and the CLI's
+        // refusal treats empty as absent, which would hand an agent shell the
+        // operator authority this marker exists to deny.
+        cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1");
 
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
@@ -2008,6 +2015,43 @@ mod tests {
     }
 
     // ── TUI env overlay tests ─────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_env_cannot_erase_the_agent_shell_marker() {
+        // The escalation this closes: the TUI registry stores the client's
+        // whole shell environment, so an operator whose terminal exported
+        // `ZEROCLAW_AGENT_SHELL=` (or any other value) used to have that
+        // overlay land after the trusted assignment. The CLI refusal reads an
+        // empty marker as absent, so the agent's own shell would have been
+        // handed operator authority.
+        for hostile in ["", "0"] {
+            let tool =
+                ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        zeroclaw_api::AGENT_SHELL_ENV_VAR.to_string(),
+                        hostile.to_string(),
+                    );
+                    m
+                }));
+
+            let result = tool
+                .execute(json!({"command": env_print_command()}))
+                .await
+                .expect("environment print command should succeed");
+
+            assert!(result.success);
+            assert!(
+                env_output_contains_assignment(
+                    &result.output,
+                    zeroclaw_api::AGENT_SHELL_ENV_VAR,
+                    "1"
+                ),
+                "a TUI value of {hostile:?} must not replace the agent marker, got:\n{}",
+                result.output
+            );
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {
