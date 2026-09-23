@@ -149,7 +149,7 @@ pub async fn probe_configured_model(
         Ok(provider) => provider,
         Err(err) => {
             return LivenessOutcome::NotProbed {
-                reason: format_error_chain(&err),
+                reason: sanitized_error_chain(&err),
             };
         }
     };
@@ -169,13 +169,25 @@ pub async fn probe_configured_model(
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
         },
-        Ok(Err(err)) => outcome_for_probe_error(provider_ref, model, &format_error_chain(&err)),
+        Ok(Err(err)) => outcome_for_probe_error(provider_ref, model, &sanitized_error_chain(&err)),
         Err(_) => LivenessOutcome::Unreachable {
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             detail: format!("no answer within {}s", timeout.as_secs()),
         },
     }
+}
+
+/// Format an error chain for display with credentials scrubbed.
+///
+/// `doctor::format_error_chain` concatenates raw causes, and a custom
+/// endpoint may carry its credential in the URL query
+/// (`https://gateway.example/v1/chat/completions?api_key=...`), which reqwest
+/// repeats in connection and DNS errors. Every probe detail reaches stderr, so
+/// the whole chain is scrubbed before it can be displayed, recorded, or pasted
+/// into a diagnostic.
+fn sanitized_error_chain(err: &anyhow::Error) -> String {
+    zeroclaw_providers::sanitize_api_error(&format_error_chain(err))
 }
 
 /// Map a chat probe failure onto the outcome contract. Separated so the
@@ -233,6 +245,51 @@ mod tests {
             matches!(outcome, LivenessOutcome::NotProbed { .. }),
             "expected NotProbed, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_probe_failure_never_displays_an_endpoint_credential() {
+        // The disclosure this guards: an existing custom alias can hold its
+        // credential in the endpoint query string, and reqwest repeats the
+        // full URL in connection and DNS errors. The probe detail is printed
+        // to stderr, so the credential must not survive the chain.
+        let transport = std::io::Error::other(
+            "error sending request for url \
+             (https://gateway.example/v1/chat/completions?api_key=super-secret-value)",
+        );
+        let err = anyhow::Error::new(transport).context("probe request failed");
+
+        // Proves the fixture still reproduces the disclosure, so this test
+        // cannot pass vacuously if the scrubbing is removed.
+        let raw = format_error_chain(&err);
+        assert!(
+            raw.contains("super-secret-value"),
+            "fixture no longer reaches the unscrubbed path: {raw}"
+        );
+
+        let detail = sanitized_error_chain(&err);
+        assert!(
+            !detail.contains("super-secret-value"),
+            "probe detail leaked the endpoint credential: {detail}"
+        );
+
+        // The failure still has to be legible, and it still has to classify:
+        // scrubbing must not turn a transport failure into an auth verdict.
+        assert!(
+            detail.contains("probe request failed"),
+            "probe detail lost its context: {detail}"
+        );
+        let outcome = outcome_for_probe_error("custom.gateway", "m", &detail);
+        assert!(
+            matches!(outcome, LivenessOutcome::Unreachable { .. }),
+            "got {outcome:?}"
+        );
+        if let LivenessOutcome::Unreachable { detail, .. } = outcome {
+            assert!(
+                !detail.contains("super-secret-value"),
+                "outcome detail leaked the endpoint credential: {detail}"
+            );
+        }
     }
 
     #[test]
