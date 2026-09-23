@@ -2586,6 +2586,133 @@ fn rm_targets_filesystem_root(args: &[String]) -> bool {
     })
 }
 
+/// One shell word as the destructive-command matcher sees it.
+struct MatcherShellWord {
+    /// The word as written, quotes and escapes included. Assignment detection
+    /// reads this: a shell only treats `NAME=value` as an assignment when the
+    /// name itself is unquoted.
+    raw: String,
+    /// The word after the shell removes its quoting and escapes.
+    value: String,
+}
+
+/// Split one command segment into shell words, removing quoting the way the
+/// shell does before it runs the command.
+///
+/// Follows the same dialect rules as `split_unquoted_segments`: backslash is a
+/// literal path character for Windows shells, and single quotes are syntax only
+/// where the shell treats them so. Returns `None` when a quote or a trailing
+/// escape never closes.
+///
+/// Deliberately limited to quoting and escapes. It does not expand variables,
+/// command substitution, globs, or aliases; that remains outside what a lexical
+/// matcher can model, as `is_irreversible_destructive_command` documents.
+fn shell_words_for_destructive_match(
+    segment: &str,
+    dialect: ShellDialect,
+) -> Option<Vec<MatcherShellWord>> {
+    let backslash_escapes = !shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let mut words = Vec::new();
+    let mut raw = String::new();
+    let mut value = String::new();
+    let mut in_word = false;
+    let mut chars = segment.chars();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(MatcherShellWord {
+                        raw: std::mem::take(&mut raw),
+                        value: std::mem::take(&mut value),
+                    });
+                    in_word = false;
+                }
+            }
+            '\\' if backslash_escapes => {
+                in_word = true;
+                raw.push(ch);
+                let escaped = chars.next()?;
+                raw.push(escaped);
+                value.push(escaped);
+            }
+            '\'' if single_quotes_are_syntax => {
+                in_word = true;
+                raw.push(ch);
+                loop {
+                    let inner = chars.next()?;
+                    raw.push(inner);
+                    if inner == '\'' {
+                        break;
+                    }
+                    value.push(inner);
+                }
+            }
+            '"' => {
+                in_word = true;
+                raw.push(ch);
+                loop {
+                    let inner = chars.next()?;
+                    raw.push(inner);
+                    match inner {
+                        '"' => break,
+                        '\\' if backslash_escapes => {
+                            // Inside double quotes a backslash only escapes
+                            // these; before anything else it stays literal.
+                            let next = chars.next()?;
+                            raw.push(next);
+                            if !matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                                value.push('\\');
+                            }
+                            value.push(next);
+                        }
+                        other => value.push(other),
+                    }
+                }
+            }
+            other => {
+                in_word = true;
+                raw.push(other);
+                value.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(MatcherShellWord { raw, value });
+    }
+    Some(words)
+}
+
+/// Words for a segment whose quoting never closes, which
+/// `shell_words_for_destructive_match` cannot split.
+///
+/// The shell rejects such a segment without running anything, so the only
+/// question is whether it still spells a covered operation. Removing the quote
+/// and escape characters and splitting on whitespace is the most inclusive
+/// reading of what it names. A covered spelling under that reading is refused;
+/// anything else is left to the shell's own syntax error rather than being
+/// reported as destructive, which is what the refusal message would claim.
+fn unclosed_quoting_fallback_words(segment: &str, dialect: ShellDialect) -> Vec<MatcherShellWord> {
+    let backslash_escapes = !shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let unquoted: String = segment
+        .chars()
+        .filter(|&c| {
+            !(c == '"'
+                || (c == '\'' && single_quotes_are_syntax)
+                || (c == '\\' && backslash_escapes))
+        })
+        .collect();
+    unquoted
+        .split_whitespace()
+        .map(|word| MatcherShellWord {
+            raw: word.to_string(),
+            value: word.to_string(),
+        })
+        .collect()
+}
+
 /// Whether a command is a **direct spelling** of an operation whose effect is
 /// immediate and irreversible: formatting a filesystem, overwriting a raw
 /// block device, exhausting the process table, or deleting the filesystem
@@ -2633,15 +2760,23 @@ fn is_irreversible_destructive_command(command: &str, dialect: ShellDialect) -> 
     }
 
     for segment in split_unquoted_segments(command, dialect) {
-        let cmd_part = skip_env_assignments(&segment);
-        let mut words = cmd_part.split_whitespace();
-        let Some(base_raw) = words.next() else {
+        // Read the segment the way the shell will, not by whitespace. A quoted
+        // assignment value (`FOO='a b' rm -rf /`) is one word to the shell, and
+        // an escaped or partly quoted name (`r\m`, `"r"m`) is the plain name
+        // after the shell removes its quoting. Splitting on whitespace instead
+        // mistakes a fragment of the assignment for the command and never
+        // looks at the command the shell actually runs.
+        let words = shell_words_for_destructive_match(&segment, dialect)
+            .unwrap_or_else(|| unclosed_quoting_fallback_words(&segment, dialect));
+        let mut words = words
+            .into_iter()
+            .skip_while(|word| is_env_assignment_word(&word.raw));
+        let Some(base_word) = words.next() else {
             continue;
         };
-        let base_owned = command_basename_for_shell(strip_wrapping_quotes(base_raw), dialect)
-            .to_ascii_lowercase();
+        let base_owned = command_basename_for_shell(&base_word.value, dialect).to_ascii_lowercase();
         let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
-        let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+        let args: Vec<String> = words.map(|w| w.value.to_ascii_lowercase()).collect();
 
         // `mkfs` and every `mkfs.<fstype>` variant format a device.
         if base == "mkfs" || base.starts_with("mkfs.") {
@@ -6799,6 +6934,71 @@ mod tests {
             assert!(
                 err.contains("irreversible"),
                 "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    /// Quoting and escapes that the shell removes before it runs the command
+    /// must not hide a covered direct spelling. A quoted assignment value is a
+    /// single shell word, and an escaped or partly quoted name is the plain
+    /// name once the shell strips the quoting.
+    #[test]
+    fn shell_quoting_does_not_hide_a_direct_spelling() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "FOO='bar baz' rm -rf /",
+            "FOO=\"bar baz\" mkfs.ext4 /dev/sda1",
+            "A='x y' B=\"p q\" dd if=/dev/zero of=/dev/sda",
+            "r\\m -rf /",
+            "m\\kfs.ext4 /dev/sda1",
+            "'rm' -rf /",
+            "\"r\"m -rf /",
+            "mk'fs'.ext4 /dev/sda1",
+            "rm -rf '/'",
+            "dd if=/dev/zero of='/dev/sda'",
+            // Quoting that never closes cannot be split exactly. It is still
+            // refused when it visibly spells a covered operation.
+            "rm -rf \"/",
+            "mkfs.ext4 '/dev/sda1",
+        ] {
+            assert!(
+                !p.is_command_allowed(command),
+                "{command:?} must stay denied: the shell runs a covered command"
+            );
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("a quoted or escaped direct spelling must not validate");
+            assert!(
+                err.contains("irreversible"),
+                "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    /// The quoting-aware reader must not start denying ordinary commands. A
+    /// covered name that the shell sees only as an argument or inside a quoted
+    /// string is not a direct spelling.
+    #[test]
+    fn shell_quoting_awareness_leaves_ordinary_commands_allowed() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "FOO='bar baz' ls /",
+            "FOO=\"a b\" echo hello",
+            "echo 'rm -rf /'",
+            "echo \"mkfs.ext4 /dev/sda1\"",
+            "printf '%s\\n' r\\m",
+            "rm -rf '/tmp/scratch dir'",
+            "\"FOO=x\" ls",
+            // Unclosed quoting the shell will reject on its own. It names no
+            // covered operation, so it must not be reported as destructive.
+            "echo \"unterminated",
+            "echo 'rm -rf /",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is not a direct destructive spelling and must stay allowed"
             );
         }
     }
