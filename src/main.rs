@@ -3325,7 +3325,7 @@ enum PluginCommands {
 /// the install may proceed. A plugin that does not instantiate against this
 /// host's WIT world would install cleanly and then be silently skipped at
 /// daemon startup; this surfaces that failure at the CLI with its full
-/// diagnostic. The check runs against the bytes the host staged at admission,
+/// diagnostic. The check runs against the exact bytes admission read,
 /// which are the bytes [`PluginHost::install_admitted`] then installs, so what
 /// was verified is what gets installed. With `--no-verify` the check is not
 /// run at all (nothing is compiled or instantiated) and a note says so; a
@@ -3337,7 +3337,7 @@ async fn verify_plugin_loads_or_bail(
     no_verify: bool,
 ) -> Result<()> {
     let manifest = admitted.manifest();
-    let Some(staged) = admitted.staged_component() else {
+    let Some(component) = admitted.component() else {
         return Ok(());
     };
     if no_verify {
@@ -3354,7 +3354,7 @@ async fn verify_plugin_loads_or_bail(
         );
         return Ok(());
     }
-    match zeroclaw::plugins::validate::verify_component_loads(staged, manifest, limits).await {
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let detail = format!("{error:#}");
@@ -3407,13 +3407,15 @@ async fn installed_plugin_load_status(
     info: &zeroclaw::plugins::PluginInfo,
     limits: zeroclaw::plugins::component::PluginLimits,
 ) -> Result<PluginLoadStatus> {
-    let Some(wasm_path) = info.wasm_path.as_deref() else {
+    // The host's admitted bytes, not a reread of `wasm_path`: these are what
+    // the daemon compiles, so the verdict describes what will actually run.
+    let Some(component) = host.admitted_component(&info.name) else {
         return Ok(PluginLoadStatus::NoComponent);
     };
     let manifest = host
         .manifest(&info.name)
         .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    match zeroclaw::plugins::validate::verify_component_loads(wasm_path, manifest, limits).await {
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
         Ok(()) => Ok(PluginLoadStatus::Loads),
         Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
     }
@@ -14522,21 +14524,24 @@ type = "string"
         #[tokio::test]
         async fn plugin_info_and_list_verify_expose_a_plugin_that_no_longer_loads() {
             let workspace = tempfile::tempdir().unwrap();
-            let host = install_fixture(workspace.path());
-            let info = host
+            let installed = install_fixture(workspace.path());
+            let wasm = installed
                 .get_plugin("tool-fixture")
-                .expect("the installed fixture is discovered");
-            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
+                .and_then(|info| info.wasm_path)
+                .expect("the fixture ships a component");
 
             // Replace the installed component with an artifact this host cannot
             // instantiate. Discovery is unaffected: the manifest is intact and
             // the file exists, which is the whole reported state a plain
-            // listing has to go on.
-            let wasm = info
-                .wasm_path
-                .clone()
-                .expect("the fixture ships a component");
+            // listing has to go on. Each CLI invocation builds a fresh host
+            // that admits the installed bytes from disk, so the check below
+            // uses one too rather than the host that did the install.
             std::fs::write(&wasm, b"not a wasm component").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("rediscover the installed plugin");
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the replaced component is still discovered");
+            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
             assert!(
                 info.loaded,
                 "discovery still calls the package loaded, which is why the check is needed"

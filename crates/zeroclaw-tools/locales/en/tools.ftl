@@ -94,8 +94,11 @@ tool-file-read = Read file contents with line numbers. Supports partial reading 
 
 tool-file-write = Write contents to a file in the workspace
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -151,6 +154,10 @@ tool-proxy-config = Manage ZeroClaw proxy settings (scope: environment | zerocla
 tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
+
+tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
+tool-sessions-current-channel = Channel: { $channel }
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
