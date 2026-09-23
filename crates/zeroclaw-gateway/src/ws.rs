@@ -4,7 +4,10 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::AppState;
+use super::{
+    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -197,9 +200,6 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
-
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -242,6 +242,42 @@ async fn resolve_ws_memory_handle(
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
+}
+
+/// Provider, model, and temperature for the turn-end WS memory
+/// consolidation, resolved from the live provider reference the agent
+/// reports after the turn. A mid-session model switch replaces the agent's
+/// active provider and model together without touching the agent's
+/// configured default, so the consolidation must be built from that live
+/// pair — resolving from the configured default and overriding only the
+/// model would pair one entry's provider with another entry's model. The
+/// live model wins when non-empty; otherwise the entry's configured model
+/// is used. Returns `None` when the reference no longer resolves (e.g. the
+/// entry was removed by a config reload, or the reference is not a dotted
+/// `<family>.<alias>`), in which case consolidation is skipped rather than
+/// silently rerouted to an unrelated entry.
+fn ws_consolidation_model(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    model: &str,
+) -> Option<(
+    Box<dyn zeroclaw_api::model_provider::ModelProvider>,
+    String,
+    Option<f64>,
+)> {
+    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
+    let entry = config
+        .providers
+        .models
+        .find(provider_type, provider_alias)?;
+    let (provider, _, resolved_model, _) =
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            config,
+            provider_ref,
+            Some(model),
+        )
+        .ok()?;
+    Some((provider, resolved_model, entry.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -349,6 +385,9 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
+    // existing persisted histories and metadata rows stay resumable across
+    // reconnects.
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
@@ -378,7 +417,31 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
+        // Fail closed: an unreadable transcript must not become an empty
+        // history that a later turn authoritatively persists over the
+        // existing durable session. Terminate this connection instead.
+        let messages = match backend.try_load(&session_key) {
+            Ok(messages) => messages,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to load WS session transcript; refusing to open with unverified history"
+                );
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "session restore unavailable; retry the connection",
+                    "code": "SESSION_RESTORE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
         if !messages.is_empty() {
             message_count = messages.len();
             stored_messages = messages;
@@ -496,7 +559,7 @@ async fn handle_socket(
     }
 
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
             Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
@@ -546,8 +609,73 @@ async fn handle_socket(
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
-        agent.seed_history_with_event(&stored_messages)
+        // Breadcrumb provenance is the backend's own canonical record
+        // alongside the transcript, never inferred from message text: a
+        // genuine first user turn that happens to equal the localized
+        // breadcrumb string must keep its turn-boundary role, and a crumb
+        // persisted under another locale must stay classified as synthetic.
+        // Sessions from before this was tracked (`None`) restore as `false`,
+        // matching the pre-existing fallback for backends that don't
+        // support it. Ownership must be set BEFORE seeding: seeding trims
+        // immediately if the restored transcript is over the structured cap,
+        // and that seed-time trim reads the agent's current breadcrumb flag
+        // to decide whether a leading synthetic marker counts as a real
+        // turn. Setting it after would let that first trim mistreat it.
+        let crumb_res = state
+            .session_backend
+            .as_ref()
+            .map(|backend| backend.get_session_trim_breadcrumb(&session_key));
+        match crumb_res {
+            Some(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to read trim breadcrumb provenance for WS restore; refusing to open with unverified history"
+                );
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "session restore unavailable; retry the connection",
+                    "code": "SESSION_RESTORE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+            Some(Ok(opt)) => {
+                agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
+                agent.seed_history_with_event(&stored_messages)
+            }
+            None => {
+                agent.set_history_has_trim_breadcrumb(false);
+                agent.seed_history_with_event(&stored_messages)
+            }
+        }
     };
+
+    // Seed-time trim only fires when the restored history exceeded the
+    // structured cap, so it dropped rows, not just relabeled them. Mirror the
+    // ACP restore contract (`replace_transcript` in `handle_session_load` /
+    // `handle_session_resume`): persist the retained projection and corrected
+    // breadcrumb before the session goes live, or a reconnect/restart before
+    // the next prompt reloads the untrimmed durable prefix and repeats the
+    // trim, leaving the live agent and the durable session disagreeing.
+    if restore_trim_event.is_some()
+        && let Some(ref backend) = state.session_backend
+        && backend.session_exists(&session_key)
+        && !persist_agent_conversation_state(backend.as_ref(), &session_key, &agent)
+    {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "session restore unavailable; retry the connection",
+            "code": "SESSION_RESTORE_UNAVAILABLE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
@@ -587,9 +715,25 @@ async fn handle_socket(
         dropped_messages,
         kept_turns,
         reason,
+        token_budget,
+        tokens_before,
+        tokens_after,
+        tokens_before_source,
+        tokens_after_source,
+        unsatisfiable_floor,
     }) = restore_trim_event
     {
-        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let frame = history_trimmed_ws_frame(
+            dropped_messages,
+            kept_turns,
+            &reason,
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source.map(|s| s.as_str()),
+            tokens_after_source.map(|s| s.as_str()),
+            unsatisfiable_floor,
+        );
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
@@ -897,27 +1041,64 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-fn persist_conversation_messages(
+/// Replace the session's durable transcript and breadcrumb flag with
+/// `durable`/`breadcrumb_present`, unless the session was deleted between the
+/// turn starting and this post-turn persistence — in which case the
+/// `aborted` / `done` / `error` frames are still sent to the client, but the
+/// row `DELETE /api/sessions/{id}` just wiped is not re-created.
+///
+/// The existence probe and the replacement run inside the backend's guarded
+/// `replace_conversation_state_if_exists`, not as two separate operations: a
+/// bare `session_exists` check followed by a replace is a check-then-act
+/// race, and a delete committing between the two would be silently undone by
+/// the replace recreating the session row/files.
+///
+/// Returns `false` when the durable write itself failed (logged with session
+/// context), so the caller does not report the turn as durably persisted
+/// when the store disagrees. A skipped write (session already gone) returns
+/// `true`: there is nothing left to persist.
+fn replace_conversation_state_unless_deleted(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-    messages: &[zeroclaw_providers::ConversationMessage],
-) {
-    // if the user deleted the session between the turn starting and
-    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
-    // / `error` frames are still sent to the client; we just refuse to
-    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
-    if !backend.session_exists(session_key) {
-        return;
-    }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
-        if message.role == "system" {
-            continue;
+    durable: &[zeroclaw_providers::ChatMessage],
+    breadcrumb_present: bool,
+) -> bool {
+    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
+        Ok(_) => true,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to persist authoritative post-turn conversation state"
+            );
+            false
         }
-        let _ = backend.append(session_key, message);
     }
+}
+
+/// Replace the session's durable transcript and breadcrumb flag with the
+/// agent's own authoritative post-turn history, as one state. Appending only
+/// the turn's delta on top of a transcript the agent's loop already trimmed
+/// underneath it can resurrect turns the live agent dropped; replacing with
+/// `agent.history()` keeps the store in sync with what the agent actually
+/// retains.
+fn persist_agent_conversation_state(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    agent: &zeroclaw_runtime::agent::Agent,
+) -> bool {
+    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    replace_conversation_state_unless_deleted(
+        backend,
+        session_key,
+        &durable,
+        agent.history_has_trim_breadcrumb(),
+    )
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -934,13 +1115,38 @@ fn history_trimmed_ws_frame(
     dropped_messages: usize,
     kept_turns: usize,
     reason: &str,
+    token_budget: Option<u64>,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    tokens_before_source: Option<&str>,
+    tokens_after_source: Option<&str>,
+    unsatisfiable_floor: Option<bool>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "type": "history_trimmed",
         "dropped_messages": dropped_messages,
         "kept_turns": kept_turns,
         "reason": reason,
-    })
+    });
+    if let Some(token_budget) = token_budget {
+        frame["token_budget"] = token_budget.into();
+    }
+    if let Some(tokens_before) = tokens_before {
+        frame["tokens_before"] = tokens_before.into();
+    }
+    if let Some(tokens_after) = tokens_after {
+        frame["tokens_after"] = tokens_after.into();
+    }
+    if let Some(tokens_before_source) = tokens_before_source {
+        frame["tokens_before_source"] = tokens_before_source.into();
+    }
+    if let Some(tokens_after_source) = tokens_after_source {
+        frame["tokens_after_source"] = tokens_after_source.into();
+    }
+    if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+        frame["unsatisfiable_floor"] = unsatisfiable_floor.into();
+    }
+    frame
 }
 
 /// Build the display-only `safeguard_fallback` WS frame from a drained
@@ -1017,6 +1223,54 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, Option<u64>) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
+    )
+}
+
+/// Terminal-frame budget/window for the `done` event.
+///
+/// `final_limits` is the route that actually served the LAST call, carried out
+/// of the turn loop. When present it is AUTHORITATIVE and overrides the
+/// usage-derived values, which can be stale: an earlier usage-bearing route
+/// before a final no-usage call (e.g. a vision reply without token usage) would
+/// otherwise leave the frame on the earlier route's numbers. Only when no call
+/// was served this turn (a cache hit) does `final_limits` become `None`, and the
+/// frame falls back to the usage values, then to `fallback_limits`.
+fn done_frame_context_limits(
+    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+) -> (u64, Option<u64>) {
+    match final_limits {
+        Some(limits) => (
+            limits.context_token_budget as u64,
+            limits.configured_model_context_window().map(|t| t as u64),
+        ),
+        None => resolve_done_context_limits(
+            usage_budget,
+            usage_model_window,
+            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                context_token_budget: 0,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            }),
+        ),
+    }
+}
+
 /// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
 /// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
 /// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
@@ -1048,6 +1302,8 @@ struct UsageFold {
     last_provider_ref: Option<String>,
     last_model: Option<String>,
     last_input_tokens: Option<u64>,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
     usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
 }
 
@@ -1058,6 +1314,8 @@ impl UsageFold {
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget,
+            model_context_window,
             provider_ref,
             model: served_model,
             accepted,
@@ -1078,6 +1336,8 @@ impl UsageFold {
         if accepted {
             self.last_provider_ref = Some(provider_ref.clone());
             self.last_model = Some(served_model.clone());
+            self.last_context_token_budget = context_token_budget;
+            self.last_model_context_window = model_context_window;
             if let Some(it) = input_tokens {
                 self.last_input_tokens = Some(it);
             } else {
@@ -1236,11 +1496,6 @@ async fn process_chat_message(
         ))
     });
 
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
-    };
-
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
@@ -1257,15 +1512,15 @@ async fn process_chat_message(
     // ── Cancellation token lifecycle ─────────────────────────────
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
+    // of outcome (normal, error, or cancelled). Registration uses the
+    // process-local cancellation key shared with the webhook SSE transport,
+    // while persistence stays on the raw transcript key.
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    register_cancel_token(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        Arc::clone(&cancel_token),
+    );
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1297,7 +1552,7 @@ async fn process_chat_message(
                         .turn_streamed_with_steering_state(
                             &content_owned,
                             event_tx,
-                            Some(cancel_token.clone()),
+                            Some(cancel_token.as_ref().clone()),
                             Some(&mut steering_rx),
                         )
                         .instrument(span),
@@ -1494,7 +1749,23 @@ async fn process_chat_message(
                                         dropped_messages,
                                         kept_turns,
                                         reason,
-                                    } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                                        token_budget,
+                                        tokens_before,
+                                        tokens_after,
+                                        tokens_before_source,
+                                        tokens_after_source,
+                                        unsatisfiable_floor,
+                                    } => history_trimmed_ws_frame(
+                                        dropped_messages,
+                                        kept_turns,
+                                        &reason,
+                                        token_budget,
+                                        tokens_before,
+                                        tokens_after,
+                                        tokens_before_source.map(|s| s.as_str()),
+                                        tokens_after_source.map(|s| s.as_str()),
+                                        unsatisfiable_floor,
+                                    ),
                                     TurnEvent::Plan { entries } => serde_json::json!({
                                         "type": "plan",
                                         "entries": entries,
@@ -1510,13 +1781,11 @@ async fn process_chat_message(
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
+    remove_cancel_token_if_current(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        &cancel_token,
+    );
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
@@ -1526,52 +1795,40 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
-                            }
-                        }
-                    }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
-                        }
-                    }
-                }
-            }
+        if let Some(ref backend) = state.session_backend
+            && backend.session_exists(session_key)
+        {
+            // Persist the agent's authoritative post-turn history as one state,
+            // even when the turn produced noDelta or was hard-cancelled. The
+            // live agent may have already trimmed older turns before the
+            // cancellation was observed; persisting only a delta marker would
+            // leave the durable store with the pre-trim transcript that the
+            // next restore would resurrect.
+            let needs_marker = match &result {
+                Err(error) => !has_assistant_chat_message(&error.new_messages),
+                Ok(_) => false,
+            };
+            let durable = if needs_marker {
+                let marker =
+                    zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+                let truncated = if accumulated_text.is_empty() {
+                    marker
+                } else {
+                    format!("{accumulated_text}\n\n{marker}")
+                };
+                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
+                d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
+                d
+            } else {
+                zeroclaw_providers::durable_chat_messages(agent.history())
+            };
+            let crumb = agent.history_has_trim_breadcrumb();
+            replace_conversation_state_unless_deleted(
+                backend.as_ref(),
+                session_key,
+                &durable,
+                crumb,
+            );
         }
 
         // Inform the client the turn was aborted
@@ -1621,20 +1878,44 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
-                    let model_provider = state.model_provider.clone();
-                    let model = state.model.clone();
-                    let temperature = state.temperature;
+                    // Read the live provider/model AFTER the turn: a
+                    // mid-session model switch replaces the agent's active
+                    // provider and model together (without touching the
+                    // agent's configured default), and consolidation must
+                    // follow the pair that actually finished the turn — the
+                    // same pairing the channel orchestrator hands to its
+                    // consolidation, instead of the gateway-wide boot
+                    // default.
+                    let (live_provider_ref, live_model) = {
+                        let (_, provider_ref, model) = agent.attribution_fields();
+                        (provider_ref, model)
+                    };
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
+                    let live_config = Arc::clone(&state.config);
                     zeroclaw_spawn::spawn!(async move {
+                        let config = live_config.read().clone();
+                        let Some((model_provider, model, temperature)) =
+                            ws_consolidation_model(&config, &live_provider_ref, &live_model)
+                        else {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                "WS memory consolidation skipped"
+                            );
+                            return;
+                        };
                         if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                             model_provider.as_ref(),
                             &model,
@@ -1685,38 +1966,26 @@ async fn process_chat_message(
             // the breakdown the single source of truth.
             let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
-            // Resolve context_window from the last-served provider's config.
-            // The served model must match the entry's configured primary model;
-            // fallback/vision/override models omit the window so clients fall
-            // back to the trim budget instead of understating fullness.
-            // Use the last served model from usage events when available so
-            // the terminal metadata is one coherent tuple with the provider.
-            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
-            let model_context_window = if let Some(ref provider_ref) = usage_fold.last_provider_ref
-            {
-                state
-                    .config
-                    .read()
-                    .model_provider_context_window_opt(provider_ref, effective_model)
-                    .map(|v| v as u64)
-            } else {
-                let (_, live_provider, live_model) = agent.attribution_fields();
-                if live_provider.is_empty() {
-                    None
-                } else {
-                    state
-                        .config
-                        .read()
-                        .model_provider_context_window_opt(&live_provider, &live_model)
-                        .map(|v| v as u64)
-                }
-            };
-            // Full provider_ref for the done frame: last served ref when
-            // available, otherwise fall back to the turn-start provider label.
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            // The route that actually served the FINAL call is authoritative for
+            // the terminal frame (see `done_frame_context_limits`). Resolve from
+            // the final route only when no call was served (e.g. a cache hit).
+            let fallback_limits = outcome
+                .final_context_limits
+                .is_none()
+                .then(|| agent.context_limits_for_route(&active_provider, &active_model));
+            let (max_context_tokens, model_context_window) = done_frame_context_limits(
+                outcome.final_context_limits,
+                usage_fold.last_context_token_budget,
+                usage_fold.last_model_context_window,
+                fallback_limits,
+            );
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
             let provider_ref_full = usage_fold
                 .last_provider_ref
                 .as_deref()
-                .unwrap_or(&provider_label);
+                .unwrap_or(&active_provider);
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
                 input_tokens: usage_fold.total_input_tokens,
@@ -1781,10 +2050,8 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+            if let Some(ref backend) = state.session_backend {
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
             }
 
             // Set session state to error
@@ -1900,6 +2167,117 @@ mod tests {
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
         );
+    }
+
+    #[test]
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, Some(8_000)),
+            "the done frame must report the route that produced the usage event"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
+        );
+    }
+
+    // B4: the final served route overrides stale usage values in the terminal
+    // frame. A route switch after an earlier usage-bearing call (a no-usage
+    // vision reply) must report the FINAL route, not the earlier one.
+    #[test]
+    fn done_frame_prefers_final_served_route_over_stale_usage() {
+        let final_vision = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 7_200,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // Earlier usage-bearing text route left 180k/200k on the wire trackers.
+        assert_eq!(
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
+            (7_200, Some(8_000)),
+            "a final no-usage vision route must override the earlier text route's usage numbers"
+        );
+    }
+
+    // B4: with no served call (cache hit), the frame falls back to usage values,
+    // then to the resolved fallback route — preserving legacy behavior.
+    #[test]
+    fn done_frame_falls_back_when_no_call_served() {
+        let fallback = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // No final route, no usage: fall back to the resolved route.
+        assert_eq!(
+            done_frame_context_limits(None, None, None, Some(fallback)),
+            (180_000, Some(200_000)),
+        );
+        // No final route but usage present: usage wins (legacy path).
+        assert_eq!(
+            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
+            (7_200, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn usage_less_final_route_clears_the_previous_context_fill() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(1_024),
+            None,
+            Some(64),
+            None,
+            true,
+        ));
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            None,
+            None,
+            Some(32),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(1_024));
+        assert_eq!(fold.total_output_tokens, Some(96));
+        assert_eq!(fold.last_input_tokens, None);
     }
 
     #[test]
@@ -2088,6 +2466,183 @@ data: {\"type\":\"message_stop\"}\n\n",
         mock_server.abort();
     }
 
+    #[test]
+    fn websocket_connect_persists_a_restore_time_trim_before_going_live() {
+        // Same contract as the ACP/RPC restore-persistence regressions: an
+        // over-cap restored transcript trims in memory as soon as the socket
+        // upgrade seeds it, before the session ever goes live. That retained
+        // projection and its corrected breadcrumb must already be durable at
+        // that point, so a reconnect that never sends a `message` frame does
+        // not reload the untrimmed prefix and repeat the trim. Runs on a
+        // larger-stack thread for the same reason as the sibling WebSocket
+        // regression above: real agent construction exceeds the default test
+        // harness stack.
+        std::thread::Builder::new()
+            .name("ws-restore-trim-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(
+                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(),
+                    );
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        // A deliberately unreachable provider: no chat turn is ever issued
+        // by this test, so agent construction must succeed without a live
+        // network round trip.
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(2),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let session_id = "restore-trim-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let over_cap = vec![
+            zeroclaw_providers::ChatMessage::user("turn one request"),
+            zeroclaw_providers::ChatMessage::assistant("turn one answer"),
+            zeroclaw_providers::ChatMessage::user("turn two request"),
+            zeroclaw_providers::ChatMessage::assistant("turn two answer"),
+            zeroclaw_providers::ChatMessage::user("turn three request"),
+            zeroclaw_providers::ChatMessage::assistant("turn three answer"),
+        ];
+        backend
+            .replace_conversation_state(&session_key, &over_cap, false)
+            .unwrap();
+
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(backend.clone());
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+
+        let (mut client, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .expect("WebSocket upgrade");
+        let first = client
+            .next()
+            .await
+            .expect("session_start frame")
+            .expect("session_start");
+        assert!(
+            first
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start")
+        );
+
+        // The handler seeds and restore-trims the agent only after it
+        // receives its first frame (a `connect` control frame or the
+        // fallback path below), so send exactly that and nothing else: no
+        // `message` chat frame ever follows, mirroring a reconnect that
+        // never issues another prompt.
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("connect frame");
+        let connected = client
+            .next()
+            .await
+            .expect("connected frame")
+            .expect("connected");
+        assert!(
+            connected
+                .into_text()
+                .expect("text connected")
+                .contains("connected")
+        );
+        drop(client);
+
+        // Give the server task a moment to finish the restore-time
+        // persistence that runs before it starts waiting on the socket for
+        // more frames.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stored = backend.load(&session_key);
+        assert!(
+            stored.len() < over_cap.len(),
+            "restore-time trim must persist the retained (capped) transcript, not the \
+             untrimmed rows it was seeded from: {stored:?}"
+        );
+        assert!(
+            !stored
+                .iter()
+                .any(|message| message.content == "turn one request"),
+            "the oldest trimmed turn must not survive in the durable store: {stored:?}"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(&session_key).unwrap(),
+            Some(true),
+            "restore-time trim must persist the corrected breadcrumb"
+        );
+
+        gateway_server.abort();
+    }
+
     #[tokio::test]
     async fn websocket_ping_interval_skips_missed_ticks() {
         let mut config = zeroclaw_config::schema::Config::default();
@@ -2261,7 +2816,8 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+        let frame =
+            history_trimmed_ws_frame(12, 3, "message limit", None, None, None, None, None, None);
 
         assert_eq!(
             frame,
@@ -2374,6 +2930,28 @@ data: {\"type\":\"message_stop\"}\n\n",
     fn no_safeguard_notice_yields_no_frame() {
         // No notice drained this turn → no `safeguard_fallback` frame is sent.
         assert!(safeguard_fallback_ws_frame(None).is_none());
+    }
+
+    #[test]
+    fn history_trimmed_frame_carries_token_accounting_when_present() {
+        let frame = history_trimmed_ws_frame(
+            12,
+            3,
+            "context token budget exceeded",
+            Some(500_000),
+            Some(612_000),
+            Some(117_000),
+            Some("provider"),
+            Some("calibrated"),
+            None,
+        );
+
+        assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(frame["token_budget"], 500_000);
+        assert_eq!(frame["tokens_before"], 612_000);
+        assert_eq!(frame["tokens_after"], 117_000);
+        assert_eq!(frame["tokens_before_source"], "provider");
+        assert_eq!(frame["tokens_after_source"], "calibrated");
     }
 
     #[test]
@@ -2722,6 +3300,108 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn ws_consolidation_model_pairs_the_active_provider_with_its_model() {
+        use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // The install-wide first configured model (the openai slot precedes
+        // ollama in slot order) is also the agent's CONFIGURED default; a
+        // session can still switch to the ollama entry mid-conversation.
+        config.providers.models.openai.insert(
+            "install".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("install-wide-model".to_string()),
+                    temperature: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "agent".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("agent-entry-model".to_string()),
+                    temperature: Some(0.3),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.install".into(),
+                ..Default::default()
+            },
+        );
+
+        // After a mid-session switch to the ollama entry — on the switching
+        // turn and every following one — the post-turn live pair is
+        // ("ollama.agent", "llama3"). Consolidation must build the ollama
+        // entry's provider (NOT the agent's configured openai default) and
+        // carry the switched model plus the switched entry's temperature.
+        // The ollama family builds through the OpenAI-compatible provider,
+        // so its attribution kind is Plugin; the entry alias is what pins
+        // the provider to the live reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "ollama.agent", "llama3")
+                .expect("the switched reference must resolve");
+        assert_eq!(model, "llama3");
+        assert_eq!(
+            temperature,
+            Some(0.3),
+            "consolidation must use the switched entry's temperature"
+        );
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(
+            provider.as_ref().alias(),
+            "agent",
+            "the consolidation provider must follow the live reference, not the configured default"
+        );
+
+        // Without a live model (empty), the switched entry's own model is used.
+        let (provider, model, temperature) = ws_consolidation_model(&config, "ollama.agent", "")
+            .expect("the switched reference must resolve");
+        assert_eq!(model, "agent-entry-model");
+        assert_eq!(temperature, Some(0.3));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(provider.as_ref().alias(), "agent");
+
+        // The un-switched agent default resolves through the same path and
+        // stays paired with its own model and temperature. The openai family
+        // builds its dedicated provider, so the attribution kind differs
+        // from the switched ollama entry — both must follow their own
+        // reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "openai.install", "install-wide-model")
+                .expect("the configured reference must resolve");
+        assert_eq!(model, "install-wide-model");
+        assert_eq!(temperature, Some(0.9));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
+        ));
+        assert_eq!(provider.as_ref().alias(), "install");
+
+        // A reference that no longer resolves — or one that is not a dotted
+        // `<family>.<alias>` — skips consolidation instead of falling back
+        // to an unrelated entry.
+        assert!(ws_consolidation_model(&config, "ollama.gone", "m").is_none());
+        assert!(ws_consolidation_model(&config, "not-dotted", "m").is_none());
+    }
+
+    #[test]
     fn needs_onboarding_ws_error_points_to_onboard() {
         let config = zeroclaw_config::schema::Config::default();
         let frame = needs_onboarding_ws_error(&config)
@@ -2841,6 +3521,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     struct DeletedSessionBackend {
         append_calls: std::sync::Mutex<Vec<String>>,
+        rewrite_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
@@ -2858,6 +3539,17 @@ data: {\"type\":\"message_stop\"}\n\n",
             ));
             Ok(())
         }
+        fn rewrite_messages(
+            &self,
+            session_key: &str,
+            messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            self.rewrite_calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", session_key, messages.len()));
+            Ok(())
+        }
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
         }
@@ -2871,22 +3563,137 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn persist_conversation_messages_skips_deleted_session() {
-        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+    fn replace_conversation_state_skips_deleted_session() {
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
+            rewrite_calls: std::sync::Mutex::new(Vec::new()),
         };
-        let messages = vec![
-            ConversationMessage::Chat(ChatMessage::user("hi")),
-            ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+        let durable = vec![
+            zeroclaw_providers::ChatMessage::user("hi"),
+            zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
 
         assert!(
-            backend.append_calls.lock().unwrap().is_empty(),
-            "persist_conversation_messages must not resurrect a session whose \
-             session_exists() returned false (see #7126)"
+            backend.rewrite_calls.lock().unwrap().is_empty(),
+            "replacing durable state must not resurrect a session whose \
+             session_exists() returned false"
+        );
+    }
+
+    /// A backend that implements only the required `SessionBackend`
+    /// primitives (`load`/`append`/`remove_last`/`list_sessions`) and does
+    /// NOT override `rewrite_messages`, exercising the trait's default
+    /// replacement implementation built from those primitives.
+    struct AppendOnlyBackend {
+        messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for AppendOnlyBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn append_only_backend_durably_replaces_state_through_the_websocket_persistence_boundary() {
+        // A production `SessionBackend` that only implements the required
+        // append/remove_last primitives must still durably persist the
+        // agent's authoritative post-turn history through the WebSocket
+        // completion path — the default `rewrite_messages` must not
+        // silently no-op and drop the caller's replacement.
+        let backend = AppendOnlyBackend {
+            messages: std::sync::Mutex::new(vec![
+                zeroclaw_providers::ChatMessage::user("stale first turn"),
+                zeroclaw_providers::ChatMessage::assistant("stale reply"),
+            ]),
+        };
+        let authoritative = vec![
+            zeroclaw_providers::ChatMessage::user("trimmed second turn"),
+            zeroclaw_providers::ChatMessage::assistant("final reply"),
+        ];
+
+        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
+
+        let persisted = backend.messages.lock().unwrap().clone();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            authoritative
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            "replacement must durably overwrite the stale transcript, not silently no-op"
+        );
+    }
+
+    /// A backend whose durable replacement always fails, standing in for a
+    /// disk or other operational failure at the WebSocket persistence
+    /// boundary.
+    struct FailingReplaceBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            // Unlike `DeletedSessionBackend`, this session is still live;
+            // only the durable write itself fails.
+            true
+        }
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            _messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "simulated durable replacement failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn replace_conversation_state_unless_deleted_reports_durable_failure() {
+        // The WebSocket completion path must not claim the turn's history
+        // was durably persisted when the backend actually failed the write:
+        // the caller uses this to decide whether the authoritative-history
+        // guarantee held for this turn.
+        let backend = FailingReplaceBackend;
+        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
+
+        assert!(
+            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
+            "a failed durable replacement must be reported to the caller, not swallowed"
         );
     }
 
@@ -2987,7 +3794,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         // expected_max_context_tokens)
         let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
             // Provider has no context_window — field must be absent.
-            ("openrouter.default", None, None, 128_000),
+            ("openrouter.default", None, None, 32_000),
             // Provider sets context_window — field must appear on the wire.
             (
                 "openrouter.glm-5.2",
@@ -3036,10 +3843,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                 ..Config::default()
             };
 
-            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(provider_alias, "glm-5.2")
-                .map(|v| v as u64);
+            let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
+            let max_ctx = limits.context_token_budget as u64;
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window, expected_window,
                 "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
@@ -3149,16 +3955,16 @@ data: {\"type\":\"message_stop\"}\n\n",
                 ..Config::default()
             };
 
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(live_provider_ref, "glm-5.2")
-                .map(|v| v as u64);
+            let limits =
+                cfg.resolved_context_limits_for_route("coder", live_provider_ref, "glm-5.2");
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window,
                 Some(1_000_000),
                 "resolver must return B's window for {label}, not A's"
             );
 
-            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let max_ctx = limits.context_token_budget as u64;
             let meta = DoneFrameMeta {
                 full_response: "ok",
                 input_tokens: Some(100),
@@ -3265,15 +4071,14 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
         let provider_ref = fold.last_provider_ref.as_deref().unwrap();
-        let model_ctx_window = cfg
-            .model_provider_context_window_opt(provider_ref, effective_model)
-            .map(|v| v as u64);
+        let limits = cfg.resolved_context_limits_for_route("coder", provider_ref, effective_model);
+        let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
         assert!(
             model_ctx_window.is_none(),
             "gateway must omit window when served model differs from configured primary"
         );
 
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let max_ctx = limits.context_token_budget as u64;
         let meta = DoneFrameMeta {
             full_response: "ok",
             input_tokens: Some(1000),
@@ -3295,7 +4100,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        assert_eq!(v["max_context_tokens"], 800_000);
+        assert_eq!(v["max_context_tokens"], 32_000);
         assert_eq!(v["last_serving_model"], "model-b");
     }
 
@@ -3359,6 +4164,8 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget: None,
+            model_context_window: None,
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             accepted,

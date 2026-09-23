@@ -248,6 +248,12 @@ const WS_READ_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct TargetChannel {
     pub id: String,
     pub is_direct: bool,
+    /// The room's Mattermost `purpose`, as returned by discovery.
+    ///
+    /// Already present in the `/api/v4/users/me/channels` response this filter
+    /// parses, so retaining it costs no extra request. Empty purposes are
+    /// normalised to `None` so "unset" and "blank" are one state.
+    pub purpose: Option<String>,
 }
 
 /// Mattermost channel `type` is a single-character code: `O` = open/public,
@@ -284,6 +290,12 @@ pub(crate) fn filter_discovered_channels(
             Some(TargetChannel {
                 id: id.to_string(),
                 is_direct: direct,
+                purpose: c
+                    .get("purpose")
+                    .and_then(|purpose| purpose.as_str())
+                    .map(str::trim)
+                    .filter(|purpose| !purpose.is_empty())
+                    .map(str::to_string),
             })
         })
         .collect()
@@ -346,6 +358,16 @@ pub struct MattermostChannel {
     /// Seconds to wait for an operator reply before the runtime denies on its
     /// own authority. Mirrors `[channels.mattermost.<alias>].approval_timeout_secs`.
     approval_timeout_secs: u64,
+    /// Whether this alias injects room purposes into the prompt. Mirrors
+    /// `[channels.mattermost.<alias>].purpose_as_instructions`.
+    purpose_as_instructions: bool,
+    /// Room ID -> purpose, refreshed by discovery.
+    ///
+    /// Populated only when `purpose_as_instructions` is set, so an alias that
+    /// has not opted in never retains channel-supplied text at all. Discovery
+    /// re-runs on `DISCOVERY_REFRESH`, so an edited purpose reaches the prompt
+    /// within that window rather than needing a restart.
+    room_purposes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MattermostChannel {
@@ -387,6 +409,8 @@ impl MattermostChannel {
             // deadline that denies every approval.
             approval_timeout_secs: zeroclaw_config::schema::MattermostConfig::default()
                 .approval_timeout_secs,
+            purpose_as_instructions: false,
+            room_purposes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -396,6 +420,50 @@ impl MattermostChannel {
     pub fn with_approval_timeout_secs(mut self, approval_timeout_secs: u64) -> Self {
         self.approval_timeout_secs = approval_timeout_secs;
         self
+    }
+
+    /// Opt this alias into injecting each room's Mattermost purpose into the
+    /// system prompt as channel-supplied context.
+    #[must_use]
+    pub fn with_purpose_as_instructions(mut self, purpose_as_instructions: bool) -> Self {
+        self.purpose_as_instructions = purpose_as_instructions;
+        self
+    }
+
+    /// Record the purposes discovery just observed, replacing the previous set.
+    ///
+    /// Replacing rather than merging is deliberate: a purpose cleared in
+    /// Mattermost must stop being injected, and a room the bot has left must
+    /// stop contributing at all.
+    fn refresh_room_purposes(&self, targets: &[TargetChannel]) {
+        if !self.purpose_as_instructions {
+            return;
+        }
+        let refreshed: HashMap<String, String> = targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .purpose
+                    .as_ref()
+                    .map(|purpose| (target.id.clone(), purpose.clone()))
+            })
+            .collect();
+        // The whole feature is silent when it does not work: a missing purpose
+        // looks exactly like a room that has none. Report what discovery
+        // actually found so an operator can tell "no purpose set" from "the
+        // purpose never reached us".
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "rooms_discovered": targets.len(),
+                    "rooms_with_purpose": refreshed.len(),
+                })
+            ),
+            "Refreshed Mattermost room purposes"
+        );
+        *self.room_purposes.lock() = refreshed;
     }
 
     /// Restrict auto-discovery to the given team IDs. Empty = all teams the
@@ -461,6 +529,13 @@ impl MattermostChannel {
                 out.push(TargetChannel {
                     id,
                     is_direct: is_direct_channel(ty),
+                    // Same object shape as discovery, so the purpose is here too.
+                    purpose: body
+                        .get("purpose")
+                        .and_then(|purpose| purpose.as_str())
+                        .map(str::trim)
+                        .filter(|purpose| !purpose.is_empty())
+                        .map(str::to_string),
                 });
             }
             return Ok(out);
@@ -1145,6 +1220,21 @@ impl Channel for MattermostChannel {
         Ok(())
     }
 
+    fn room_context(&self, room_id: &str) -> Option<zeroclaw_api::channel::ChannelRoomContext> {
+        if !self.purpose_as_instructions {
+            return None;
+        }
+        // The caller passes this channel's own addressing string, which for a
+        // threaded reply is `channel_id:root_id`. Purposes are per room, not
+        // per thread, so strip the thread half before looking one up.
+        let room_id = recipient_channel_id(room_id);
+        let purpose = self.room_purposes.lock().get(room_id).cloned()?;
+        let context = zeroclaw_api::channel::ChannelRoomContext {
+            purpose: Some(purpose),
+        };
+        (!context.is_empty()).then_some(context)
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -1271,6 +1361,7 @@ impl MattermostChannel {
 
         let auto_discover = self.scoped_channel_ids().is_none();
         let mut target_channels = self.list_target_channels().await?;
+        self.refresh_room_purposes(&target_channels);
         let mut last_discovery = Instant::now();
         let mut last_create_at_by_channel: HashMap<String, i64> = HashMap::new();
 
@@ -1291,10 +1382,23 @@ impl MattermostChannel {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
 
-            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
+            // Runs for auto-discovery *or* purpose tracking. Gating this on
+            // `auto_discover` alone meant an alias with explicit `channel_ids`
+            // read each room's purpose once at startup and never again, so an
+            // edited purpose needed a daemon restart to take effect.
+            let refresh_due = (auto_discover || self.purpose_as_instructions)
+                && last_discovery.elapsed() >= DISCOVERY_REFRESH;
+            if refresh_due {
                 match self.list_target_channels().await {
                     Ok(refreshed) => {
-                        if refreshed != target_channels {
+                        // Refresh purposes on every successful discovery, not
+                        // only when the *set* of rooms changed: an edited
+                        // purpose leaves the set identical.
+                        self.refresh_room_purposes(&refreshed);
+                        // Only auto-discovery may replace the target set; an
+                        // explicit `channel_ids` scope is the operator's, not
+                        // ours to widen.
+                        if auto_discover && refreshed != target_channels {
                             ::zeroclaw_log::record!(
                                 INFO,
                                 ::zeroclaw_log::Event::new(
@@ -1364,6 +1468,7 @@ impl MattermostChannel {
         let (bot_user_id, bot_username) = self.require_bot_identity().await?;
         let auto_discover = self.scoped_channel_ids().is_none();
         let target_channels = self.list_target_channels().await?;
+        self.refresh_room_purposes(&target_channels);
         let mut channel_direct_map: HashMap<String, bool> = target_channels
             .into_iter()
             .map(|target| (target.id, target.is_direct))
@@ -1438,14 +1543,20 @@ impl MattermostChannel {
         loop {
             let read_deadline = last_frame + WS_READ_TIMEOUT;
             tokio::select! {
-                _ = discovery_interval.tick(), if auto_discover => {
+                _ = discovery_interval.tick(), if auto_discover || self.purpose_as_instructions => {
                     match self.list_target_channels().await {
                         Ok(refreshed) => {
+                            // Before the move below: an edited purpose leaves
+                            // the room set identical, so this cannot hang off
+                            // the set-changed branch.
+                            self.refresh_room_purposes(&refreshed);
                             let refreshed_map: HashMap<String, bool> = refreshed
                                 .into_iter()
                                 .map(|target| (target.id, target.is_direct))
                                 .collect();
-                            if refreshed_map != channel_direct_map {
+                            // As in the polling loop: only auto-discovery may
+                            // replace the operator's explicit scope.
+                            if auto_discover && refreshed_map != channel_direct_map {
                                 ::zeroclaw_log::record!(
                                     INFO,
                                     ::zeroclaw_log::Event::new(
@@ -1544,6 +1655,12 @@ impl MattermostChannel {
                         // model, so this arm is terminal either way.
                         Some("reaction_added") => {
                             self.try_resolve_approval_reaction(&event).await;
+                            continue;
+                        }
+                        // Channel metadata changed. Only the cached purpose is
+                        // touched; nothing here is routed to the model.
+                        Some("channel_updated") => {
+                            self.apply_ws_channel_purpose_update(&event);
                             continue;
                         }
                         _ => continue,
@@ -1684,6 +1801,50 @@ impl MattermostChannel {
     fn ws_reaction_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
         let reaction = event.get("data")?.get("reaction")?.as_str()?;
         serde_json::from_str(reaction).ok()
+    }
+
+    /// Decode a `channel_updated` event's payload. Mattermost sends the channel
+    /// as a JSON *string* under `data.channel`, the same shape as `data.post`
+    /// and `data.reaction`.
+    fn ws_channel_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+        let channel = event.get("data")?.get("channel")?.as_str()?;
+        serde_json::from_str(channel).ok()
+    }
+
+    /// Apply a `channel_updated` event to the cached purpose for that one room.
+    ///
+    /// This is the only signal that arrives when the purpose is *edited*.
+    /// Discovery compares the set of rooms, and a purpose edit leaves that set
+    /// identical, so without this the change waits out the full refresh
+    /// interval. Handling the event makes the edit effective almost
+    /// immediately in WebSocket mode; polling keeps the interval as its ceiling.
+    fn apply_ws_channel_purpose_update(&self, event: &serde_json::Value) {
+        if !self.purpose_as_instructions {
+            return;
+        }
+        let Some(channel) = Self::ws_channel_from_event(event) else {
+            return;
+        };
+        let Some(id) = channel.get("id").and_then(|id| id.as_str()) else {
+            return;
+        };
+        let purpose = channel
+            .get("purpose")
+            .and_then(|purpose| purpose.as_str())
+            .map(str::trim)
+            .filter(|purpose| !purpose.is_empty());
+
+        let mut purposes = self.room_purposes.lock();
+        match purpose {
+            Some(purpose) => {
+                purposes.insert(id.to_string(), purpose.to_string());
+            }
+            // Cleared in Mattermost: stop injecting it rather than leaving the
+            // last value cached until the next discovery pass.
+            None => {
+                purposes.remove(id);
+            }
+        }
     }
 
     /// Resolve a pending approval from a reaction on its prompt post.
@@ -6021,5 +6182,271 @@ mod bot_identity_admission_tests {
             format!("{error}").contains("identity unavailable"),
             "the error must name the cause; got: {error}"
         );
+    }
+}
+
+/// Channel-purpose plumbing: discovery retains it, the opt-in gates it.
+#[cfg(test)]
+mod channel_purpose_plumbing_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn channel(purpose_as_instructions: bool) -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "purpose_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_purpose_as_instructions(purpose_as_instructions)
+    }
+
+    fn discovered(purpose: &str) -> Vec<serde_json::Value> {
+        vec![json!({"id": "room1", "type": "O", "team_id": "t1", "purpose": purpose})]
+    }
+
+    /// The purpose rides along on the discovery response already being parsed,
+    /// so retaining it costs no additional request.
+    #[test]
+    fn discovery_retains_the_purpose() {
+        let targets = filter_discovered_channels(&discovered("Arch packaging"), &[], true);
+        assert_eq!(targets[0].purpose.as_deref(), Some("Arch packaging"));
+    }
+
+    /// "Unset" and "blank" are one state.
+    #[test]
+    fn blank_purpose_is_normalised_to_none() {
+        let targets = filter_discovered_channels(&discovered("   "), &[], true);
+        assert_eq!(targets[0].purpose, None);
+    }
+
+    /// Opting in surfaces the purpose to prompt assembly.
+    #[test]
+    fn opted_in_channel_exposes_the_room_purpose() {
+        let ch = channel(true);
+        ch.refresh_room_purposes(&filter_discovered_channels(
+            &discovered("Arch packaging"),
+            &[],
+            true,
+        ));
+        assert_eq!(
+            ch.room_context("room1").and_then(|c| c.purpose).as_deref(),
+            Some("Arch packaging")
+        );
+        assert!(
+            ch.room_context("other").is_none(),
+            "unknown rooms contribute nothing"
+        );
+    }
+
+    /// Without the opt-in the channel retains no purpose at all — absence is
+    /// the default, and the text never reaches the prompt.
+    #[test]
+    fn opt_out_channel_never_retains_or_exposes_a_purpose() {
+        let ch = channel(false);
+        ch.refresh_room_purposes(&filter_discovered_channels(
+            &discovered("Arch packaging"),
+            &[],
+            true,
+        ));
+        assert!(ch.room_purposes.lock().is_empty(), "nothing may be cached");
+        assert!(ch.room_context("room1").is_none());
+    }
+
+    /// The lookup key is this channel's own addressing string, not a bare room
+    /// ID, and for a threaded reply that string is `channel_id:root_id`.
+    ///
+    /// The first version of this feature looked the purpose up by
+    /// `ChannelMessage::channel`, which for Mattermost is the constant
+    /// `"mattermost"` rather than a room, so no room ever matched and the
+    /// purpose silently never reached the prompt. Every test then passed a bare
+    /// room ID directly, so none of them noticed.
+    #[test]
+    fn room_context_accepts_the_channels_own_addressing_string() {
+        let ch = channel(true);
+        ch.refresh_room_purposes(&filter_discovered_channels(
+            &discovered("Arch packaging"),
+            &[],
+            true,
+        ));
+
+        // Plain room, exactly as `reply_target` carries it for a top-level post.
+        assert_eq!(
+            ch.room_context("room1").and_then(|c| c.purpose).as_deref(),
+            Some("Arch packaging")
+        );
+        // Threaded reply: purposes are per room, so the thread half is stripped.
+        assert_eq!(
+            ch.room_context("room1:root_post_id")
+                .and_then(|c| c.purpose)
+                .as_deref(),
+            Some("Arch packaging"),
+            "a threaded reply is still in the room the prompt belongs to"
+        );
+        // The channel *type* is not a room and must never resolve.
+        assert!(
+            ch.room_context("mattermost").is_none(),
+            "the channel type is not a room identifier"
+        );
+    }
+
+    /// A purpose cleared in Mattermost must stop being injected: the refresh
+    /// replaces rather than merges.
+    #[test]
+    fn refresh_drops_a_cleared_purpose() {
+        let ch = channel(true);
+        ch.refresh_room_purposes(&filter_discovered_channels(
+            &discovered("Arch packaging"),
+            &[],
+            true,
+        ));
+        ch.refresh_room_purposes(&filter_discovered_channels(&discovered(""), &[], true));
+        assert!(
+            ch.room_context("room1").is_none(),
+            "a cleared purpose must stop being injected"
+        );
+    }
+}
+
+/// Keeping the cached purpose fresh: the `channel_updated` fast path, and the
+/// refresh cadence for aliases that do not auto-discover.
+#[cfg(test)]
+mod channel_purpose_freshness_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn channel(purpose_as_instructions: bool) -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "purpose_freshness_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_purpose_as_instructions(purpose_as_instructions)
+    }
+
+    fn channel_updated_event(id: &str, purpose: &str) -> serde_json::Value {
+        json!({
+            "event": "channel_updated",
+            "data": {
+                "channel": json!({"id": id, "type": "O", "purpose": purpose}).to_string(),
+            }
+        })
+    }
+
+    /// The edit signal: discovery compares the *set* of rooms, which a purpose
+    /// edit leaves identical, so without this the change waits out the whole
+    /// refresh interval.
+    #[test]
+    fn channel_updated_applies_a_new_purpose_immediately() {
+        let ch = channel(true);
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room1", "Arch packaging"));
+        assert_eq!(
+            ch.room_context("room1").and_then(|c| c.purpose).as_deref(),
+            Some("Arch packaging")
+        );
+    }
+
+    /// Clearing the purpose in Mattermost must stop the injection at once, not
+    /// leave the previous value cached until the next discovery pass.
+    #[test]
+    fn channel_updated_clears_a_removed_purpose() {
+        let ch = channel(true);
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room1", "Arch packaging"));
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room1", "   "));
+        assert!(
+            ch.room_context("room1").is_none(),
+            "a cleared purpose must stop being injected immediately"
+        );
+    }
+
+    /// One room's edit must not disturb another's cached purpose.
+    #[test]
+    fn channel_updated_touches_only_the_named_room() {
+        let ch = channel(true);
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room1", "first"));
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room2", "second"));
+        assert_eq!(
+            ch.room_context("room1").and_then(|c| c.purpose).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            ch.room_context("room2").and_then(|c| c.purpose).as_deref(),
+            Some("second")
+        );
+    }
+
+    /// An alias that has not opted in must retain nothing, even when the event
+    /// arrives — the opt-in gates storage, not just exposure.
+    #[test]
+    fn channel_updated_is_ignored_without_the_opt_in() {
+        let ch = channel(false);
+        ch.apply_ws_channel_purpose_update(&channel_updated_event("room1", "Arch packaging"));
+        assert!(ch.room_purposes.lock().is_empty());
+    }
+
+    /// A real `channel_updated` payload, kept verbatim.
+    ///
+    /// The other tests in this module build their events from a fixture helper,
+    /// so they would pass even if this code assumed the wrong wire shape. This
+    /// one pins the shape itself: `data.channel` is a JSON *string* holding the
+    /// channel object, and the purpose is read from that object's `purpose`
+    /// field. If Mattermost ever changes that encoding, this fails while the
+    /// helper-built tests would not.
+    #[test]
+    fn real_channel_updated_payload_updates_the_purpose() {
+        let event: serde_json::Value = serde_json::from_str(
+            r#"{
+  "event": "channel_updated",
+  "data": {
+    "channel": "{\"id\":\"nq83j71sebdfh58ktrce5ijtcwy\",\"create_at\":1609459200000,\"update_at\":1712649608411,\"delete_at\":0,\"team_id\":\"b7ysq51sebfh58ktrce5ijtcwy\",\"type\":\"P\",\"display_name\":\"Updated Channel Name\",\"name\":\"updated-channel-name\",\"header\":\"New channel header text\",\"purpose\":\"Updated channel purpose\",\"last_post_at\":1712649608426,\"total_msg_count\":142,\"extra_update_at\":0,\"creator_id\":\"ay5sq51sebfh58ktrce5ijtcwy\"}"
+  },
+  "broadcast": {
+    "omit_users": null,
+    "user_id": "",
+    "channel_id": "nq83j71sebdfh58ktrce5ijtcwy",
+    "team_id": "b7ysq51sebfh58ktrce5ijtcwy"
+  },
+  "seq": 42
+}"#,
+        )
+        .expect("the sample payload must parse");
+
+        let ch = channel(true);
+        ch.apply_ws_channel_purpose_update(&event);
+
+        assert_eq!(
+            ch.room_context("nq83j71sebdfh58ktrce5ijtcwy")
+                .and_then(|c| c.purpose)
+                .as_deref(),
+            Some("Updated channel purpose"),
+            "the purpose must be read from the embedded channel object"
+        );
+    }
+
+    /// A malformed event must not panic or corrupt the cache.
+    #[test]
+    fn malformed_channel_updated_events_are_ignored() {
+        let ch = channel(true);
+        ch.apply_ws_channel_purpose_update(&json!({"event": "channel_updated"}));
+        ch.apply_ws_channel_purpose_update(&json!({
+            "event": "channel_updated",
+            "data": {"channel": "not json"}
+        }));
+        ch.apply_ws_channel_purpose_update(&json!({
+            "event": "channel_updated",
+            "data": {"channel": json!({"purpose": "no id"}).to_string()}
+        }));
+        assert!(ch.room_purposes.lock().is_empty());
     }
 }

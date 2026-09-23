@@ -141,14 +141,21 @@ where
         DrainOutcome::ExplicitCancel => {
             let graced = {
                 let handle = turn_handle_guard.handle()?;
-                tokio::time::timeout(CANCEL_GRACE, &mut *handle).await
+                join_with_draining_grace(
+                    handle,
+                    &mut event_rx,
+                    &mut accumulated_text,
+                    &on_event,
+                    CANCEL_GRACE,
+                )
+                .await
             };
             match graced {
-                Ok(joined) => outcome_from_task_result(
+                Some(joined) => outcome_from_task_result(
                     joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
-                Err(_) => {
+                None => {
                     let handle = turn_handle_guard.handle()?;
                     handle.abort();
                     // Joined through the guard rather than a moved-out handle:
@@ -199,6 +206,81 @@ impl Drop for TurnHandleGuard {
     }
 }
 
+/// After `drain_until_done_or_cancelled` returns `ExplicitCancel`, keep
+/// draining `event_rx` for up to `grace` while racing the turn task instead
+/// of only awaiting it: the cooperative unwind can synthesize one event per
+/// still-pending tool call, and a batch larger than the channel capacity
+/// blocks the task's send once nobody is reading. An un-drained queue
+/// therefore starves the task of the very grace period meant to let it
+/// commit its trimmed history, and every grace window times out into a hard
+/// abort that loses the writeback this repair depends on.
+///
+/// Returns the joined task result if it finishes within `grace`, or `None`
+/// if the grace period elapsed (the caller must abort the handle).
+///
+/// `on_event` delivery is bounded by the *remaining* grace, not left to run
+/// unbounded: `select!` only polls its `sleep` branch between chosen-branch
+/// polls, so an `on_event` call that itself awaits (e.g. an RPC callback
+/// blocked on a full outbound queue with no reader) would otherwise keep the
+/// timer from ever firing and defeat the grace deadline entirely.
+async fn join_with_draining_grace<T, F, Fut>(
+    turn_handle: &mut tokio::task::JoinHandle<T>,
+    event_rx: &mut mpsc::Receiver<TurnEvent>,
+    accumulated: &mut String,
+    on_event: &F,
+    grace: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: Fn(TurnEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + grace;
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    let mut event_rx_closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            joined = &mut *turn_handle => {
+                // The task can finish while events it already sent are
+                // still sitting in the channel buffer (a bounded send only
+                // needs buffer space, not a live reader). `biased` gives the
+                // join priority over drain on a tied poll, so without this
+                // the last few buffered events would never reach `on_event`
+                // even though the task committed successfully. The task has
+                // already finished here, so a stuck callback must not block
+                // this return: bound each delivery and stop draining (but
+                // still report the join) once the deadline is reached.
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Chunk { ref delta } = event {
+                        accumulated.push_str(delta);
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                        break;
+                    }
+                }
+                return Some(joined);
+            }
+            maybe_event = event_rx.recv(), if !event_rx_closed => {
+                match maybe_event {
+                    Some(event) => {
+                        if let TurnEvent::Chunk { ref delta } = event {
+                            accumulated.push_str(delta);
+                        }
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                            return None;
+                        }
+                    }
+                    None => event_rx_closed = true,
+                }
+            }
+            () = &mut sleep => return None,
+        }
+    }
+}
+
 /// Grace window allowing a cancelled turn task to commit its cooperative
 /// unwind (synthesized tool results + `[interrupted]` message) into the agent
 /// history before the dispatch path falls back to a hard abort.
@@ -216,6 +298,7 @@ fn outcome_from_task_result(
             response,
             new_messages,
             safeguard_fallback,
+            ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
@@ -571,6 +654,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grace_drain_lets_a_backlog_larger_than_the_channel_finish_within_grace() {
+        // A cooperative unwind synthesizing more events than the channel
+        // capacity blocks on the (capacity+1)th send once nobody is
+        // draining. If the grace window only awaits the task without also
+        // draining, the task can never finish and always times out into a
+        // hard abort. This reproduces that backlog against an 8-slot
+        // channel with 20 events and asserts the task still completes well
+        // inside a generous grace window.
+        const CAPACITY: usize = 8;
+        const EVENTS: usize = CAPACITY * 3;
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(CAPACITY);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            for i in 0..EVENTS {
+                // Blocks once the channel fills, exactly like a real
+                // cooperative unwind synthesizing one event per pending
+                // tool call after cancellation is observed.
+                let _ = tx
+                    .send(TurnEvent::Chunk {
+                        delta: i.to_string(),
+                    })
+                    .await;
+            }
+            "task-finished"
+        });
+
+        let mut acc = String::new();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            join_with_draining_grace(
+                &mut handle,
+                &mut rx,
+                &mut acc,
+                &noop,
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the grace drain itself must not hang");
+
+        assert_eq!(
+            joined
+                .expect("the task must finish within the grace window")
+                .unwrap(),
+            "task-finished",
+            "an un-drained backlog must not starve the task of the grace \
+             period meant to let it commit its cooperative unwind"
+        );
+        assert_eq!(
+            acc.len(),
+            (0..EVENTS).map(|i| i.to_string().len()).sum::<usize>(),
+            "every backlogged event must still be drained and accumulated"
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_drain_returns_within_grace_despite_a_callback_that_never_resolves() {
+        // A callback that permanently blocks (e.g. the outbound RPC queue
+        // is full and nobody is reading) must not be able to keep
+        // join_with_draining_grace parked past its deadline: without a
+        // per-delivery timeout, select! never gets to re-poll the sleep
+        // branch while the chosen branch's on_event().await is still
+        // running, so the grace bound would be defeated entirely.
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            let _ = tx
+                .send(TurnEvent::Chunk {
+                    delta: "x".to_string(),
+                })
+                .await;
+            // Task itself never finishes on its own within the grace
+            // window; only the deadline should end this test.
+            std::future::pending::<()>().await;
+            "unreachable"
+        });
+
+        fn never_resolves(_e: TurnEvent) -> std::future::Pending<()> {
+            std::future::pending()
+        }
+
+        let mut acc = String::new();
+        let grace = std::time::Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let joined = tokio::time::timeout(
+            grace + std::time::Duration::from_secs(5),
+            join_with_draining_grace(&mut handle, &mut rx, &mut acc, &never_resolves, grace),
+        )
+        .await
+        .expect("a stuck callback must not hang join_with_draining_grace past its own timeout");
+
+        assert!(
+            joined.is_none(),
+            "the task never finishes on its own here, so the grace window \
+             elapsing must report timeout, not a spurious join"
+        );
+        assert!(
+            started.elapsed() < grace + std::time::Duration::from_secs(2),
+            "a callback stuck in on_event().await must not extend the grace \
+             deadline; the caller (execute_turn) depends on this bound to \
+             reach its persistence path"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
         let msgs = vec![ConversationMessage::Chat(
@@ -622,6 +811,9 @@ mod tests {
             Ok(StreamedTurnSuccess {
                 response: "accepted response".into(),
                 new_messages: messages.clone(),
+                provider_name: "requested-provider".into(),
+                model: "requested-model".into(),
+                final_context_limits: None,
                 safeguard_fallback: Some(safeguard),
             }),
             "accepted response".into(),
@@ -1323,7 +1515,7 @@ mod tests {
         use crate::rpc::dispatch::forward_turn_event;
         use tokio::sync::mpsc;
         use zeroclaw_api::jsonrpc::RpcOutbound;
-        use zeroclaw_config::schema::{Config, MemoryConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, MemoryConfig};
 
         // Build a config with a known context_window for the provider.
         let mut config = Config::default();
@@ -1334,6 +1526,16 @@ mod tests {
             .expect("ensure provider entry");
         provider_entry.context_window = Some(128_000);
         provider_entry.model = Some("w1-model".to_string());
+        config.agents.insert(
+            "rpc-w1".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.default"),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("rpc-w1")
+            .expect("test agent config should resolve");
 
         let memory_cfg = MemoryConfig {
             backend: "none".into(),
@@ -1401,18 +1603,9 @@ mod tests {
             .model_name("w1-model".into())
             .model_provider_name("openai.default".into())
             .agent_alias("rpc-w1".into())
+            .config(agent_config)
             .build()
             .expect("agent builder should succeed");
-
-        // Use parking_lot::RwLock for config so that .read() returns the
-        // guard directly (no Result wrapping), matching the existing
-        // drain-callback pattern in the matrix test.
-        let cfg_arc: Arc<parking_lot::RwLock<Config>> = Arc::new(parking_lot::RwLock::new(config));
-        let cfg_for_cb = Arc::clone(&cfg_arc);
-
-        // Resolve max_context_tokens from the config using the public
-        // Config method (context_usage_max_tokens is private to dispatch).
-        let max_ctx = cfg_arc.read().effective_max_context_tokens("rpc-w1") as u64;
 
         // Drive the turn through execute_turn, forwarding each event
         // through the real RPC boundary using forward_turn_event.
@@ -1432,26 +1625,9 @@ mod tests {
             None,
             move |event| {
                 let rpc = Arc::clone(&rpc);
-                let cfg = Arc::clone(&cfg_for_cb);
                 async move {
-                    // Resolve model_context_window per event from the embedded
-                    // provider_ref (only Usage events carry it).
-                    let model_ctx_window = if let TurnEvent::Usage {
-                        provider_ref,
-                        model,
-                        ..
-                    } = &event
-                    {
-                        let cfg = cfg.read();
-                        cfg.model_provider_context_window_opt(provider_ref, model)
-                            .map(|v| v as u64)
-                    } else {
-                        None
-                    };
-
                     // Forward through the real RPC boundary.
-                    forward_turn_event(&rpc, "w1-test", &event, Some(max_ctx), model_ctx_window)
-                        .await;
+                    forward_turn_event(&rpc, "w1-test", &event).await;
                 }
             },
         )

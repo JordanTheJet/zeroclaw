@@ -32,6 +32,11 @@ import {
   type TurnStreamFrame,
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
+import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
+import {
+  EMPTY_CONTEXT_LIMITS,
+  contextLimitsFromDoneFrame,
+} from '@/contexts/contextLimits.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -123,6 +128,7 @@ export interface AgentContextValue {
   respondToApproval: (decision: ApprovalDecision) => void;
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
+  contextModelWindow: number | null;
   contextInputTokens: number | null;
 }
 
@@ -246,7 +252,7 @@ export function AgentProvider({
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
-  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
@@ -437,14 +443,7 @@ export function AgentProvider({
         }
         // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
-          // Prefer model_context_window (actual model capacity) for display,
-          // fall back to max_context_tokens (trim budget) for backward compat.
-          const displayMax = typeof msg.model_context_window === 'number'
-            ? msg.model_context_window
-            : msg.max_context_tokens;
-          if (typeof displayMax === 'number') {
-            setContextMaxTokens(displayMax);
-          }
+          setContextLimits(contextLimitsFromDoneFrame(msg));
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
           // When last_input_tokens is explicitly null, the accepted route has no
@@ -565,11 +564,7 @@ export function AgentProvider({
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const content = t('agent.history_trimmed')
-          .replace('{reason}', reason)
-          .replace('{dropped}', String(msg.dropped_messages ?? 0))
-          .replace('{kept}', String(msg.kept_turns ?? 0));
+        const content = buildHistoryTrimmedNotice(msg, t);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -1267,7 +1262,8 @@ export function AgentProvider({
     pendingApproval,
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
-    contextMaxTokens,
+    contextMaxTokens: contextLimits.maxTokens,
+    contextModelWindow: contextLimits.modelWindow,
     contextInputTokens,
   };
 
