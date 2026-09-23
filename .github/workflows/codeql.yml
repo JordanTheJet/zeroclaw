@@ -44,8 +44,11 @@ jobs:
     # Results upload to this repo's Security tab; skip on forks.
     if: github.repository == 'zeroclaw-labs/zeroclaw'
     # Keep the fast interpreted-language scan on GitHub; give only Rust the
-    # existing closed Blacksmith toggle used by compile-heavy CI jobs.
-    runs-on: ${{ matrix.language == 'rust' && vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Blacksmith label the compile-heavy ci.yml jobs pin directly. The label
+    # is a checked-in constant rather than a repository variable, matching
+    # ci.yml, so moving the Rust scan back to GitHub-hosted is one reviewed
+    # edit here and no workflow depends on an Actions variable for runners.
+    runs-on: ${{ matrix.language == 'rust' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
