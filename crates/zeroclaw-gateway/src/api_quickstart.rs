@@ -4,8 +4,8 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
-    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface, record_dismissed,
-    validate_only_with_surface,
+    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface_checked,
+    record_dismissed, validate_only_with_surface,
 };
 
 use super::AppState;
@@ -88,18 +88,39 @@ pub async fn handle_dismiss(
 
 pub async fn handle_apply(
     State(state): State<AppState>,
+    principal: crate::principal_gate::RequestPrincipal,
     Json(submission): Json<BuilderSubmission>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Held through the swap below (and across `apply_with_surface`'s own
     // save, which runs while this guard is held) so a concurrent config
     // writer can't land between this read and the swap.
     let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
         .lock_owned()
         .await;
+    // Quickstart writes wherever the submission leads and saves on its
+    // own; the write set cannot be enumerated up front, so a scoped
+    // principal needs the wildcard selector.
+    let authorization = match crate::principal_gate::authorize_whole_config_write(
+        &principal,
+        &[
+            zeroclaw_api::grants::Verb::Create,
+            zeroclaw_api::grants::Verb::Update,
+        ],
+    ) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
     let mut working = state.config.read().clone();
-    let result = apply_with_surface(submission, &mut working, Surface::Web).await;
+    // The staged policy is compiled BEFORE Quickstart's first write, so a
+    // rejected one cannot reach disk and then be reported as not saved.
+    let result = apply_with_surface_checked(submission, &mut working, Surface::Web, &|staged| {
+        zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(staged)
+            .map_err(|e| e.to_string())
+    })
+    .await;
     let body = match result {
         Ok(agent) => {
+            authorization.publish_persisted(&working);
             *state.config.write() = working;
             state
                 .pending_reload

@@ -45,6 +45,7 @@ mod oidc_enroll;
 mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
+mod secure_file;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]
@@ -425,9 +426,10 @@ fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> b
     cli_skip_verify || cfg_wss.tls.skip_verify
 }
 
-/// The credential presented in the initialize handshake: `ZEROCLAW_AUTH_TOKEN`
-/// overrides `[wss].auth_token`; the provider selection comes from config.
-/// The mTLS client cert is transport/device admission; this is the principal.
+/// The credential presented in the initialize handshake, in precedence
+/// order: `ZEROCLAW_AUTH_TOKEN`, then `[wss].auth_token_file`, then
+/// `[wss].auth_token`. The provider selection comes from config. The mTLS
+/// client cert is transport/device admission; this is the principal.
 fn resolve_auth(cfg_wss: &config::WssSection) -> (Option<String>, Option<String>) {
     let env_token = std::env::var("ZEROCLAW_AUTH_TOKEN")
         .ok()
@@ -435,15 +437,58 @@ fn resolve_auth(cfg_wss: &config::WssSection) -> (Option<String>, Option<String>
     auth_from(cfg_wss, env_token)
 }
 
-/// Testable core of [`resolve_auth`]: env token overrides config; provider from
-/// config. Split so unit tests inject the env value rather than mutate process
-/// environment.
+/// Testable core of [`resolve_auth`]. Split so unit tests inject the env value
+/// rather than mutate process environment.
 fn auth_from(
     cfg_wss: &config::WssSection,
     env_token: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    let auth_token = env_token.or_else(|| cfg_wss.auth_token.clone());
+    let auth_token = env_token
+        .or_else(|| cfg_wss.auth_token_file.as_deref().and_then(read_token_file))
+        .or_else(|| cfg_wss.auth_token.clone());
     (auth_token, cfg_wss.auth_provider.clone())
+}
+
+/// Read a bearer from a referenced file, refusing one any other account can
+/// read. A referenced secret that is world-readable is worse than the inline
+/// value it replaces, so it is reported and ignored rather than used.
+fn read_token_file(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            return None;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "auth_token_file {} is readable beyond its owner; refusing to use it",
+                path.display()
+            );
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(body) => {
+            let token = body.trim().to_string();
+            (!token.is_empty()).then_some(token)
+        }
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
@@ -2310,6 +2355,42 @@ mod connection_tests {
         );
         // Neither: no token, provider still passes through if set.
         assert_eq!(auth_from(&WssSection::default(), None), (None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_token_file_wins_over_the_inline_token_and_loses_to_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("bearer");
+        std::fs::write(&token_path, "file_token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_token_file: Some(token_path.to_string_lossy().into_owned()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("file_token".to_string()),
+            "the referenced file beats the inline token"
+        );
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())).0,
+            Some("env_token".to_string()),
+            "the environment still wins"
+        );
+
+        // A file any other account can read is refused, not used.
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("cfg_token".to_string()),
+            "a group- or world-readable file must be ignored"
+        );
     }
 
     #[test]

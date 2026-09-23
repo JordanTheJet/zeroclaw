@@ -224,7 +224,7 @@ pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBu
 
 /// Resolve `<sops_dir>/<name>`, accepting only a single normal path
 /// component so caller-controlled names cannot escape the SOP root.
-fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
     let mut components = Path::new(name).components();
     let single_normal = matches!(
         (components.next(), components.next()),
@@ -335,9 +335,6 @@ pub fn run_overlay_for(
     Ok(RunOverlay::project(&graph, run))
 }
 
-/// Enumerate every run the engine holds (active + retained terminal),
-/// newest first, optionally scoped to one SOP. Errors only if the engine
-/// lock is poisoned. This is the Runs surface's data source.
 /// Full detail for one run — the step results, tool calls, timings, and
 /// failure output that [`SopRunSummary`] deliberately omits, plus whether the
 /// run is still live. `SopEngine::get_run` is the single lookup owner: it
@@ -357,6 +354,9 @@ pub fn run_detail_for(
         .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))
 }
 
+/// Enumerate every run the engine holds (active + retained terminal),
+/// newest first, optionally scoped to one SOP. Errors only if the engine
+/// lock is poisoned. This is the Runs surface's data source.
 pub fn run_summaries_for(
     engine: &Arc<Mutex<SopEngine>>,
     sop_name: Option<&str>,

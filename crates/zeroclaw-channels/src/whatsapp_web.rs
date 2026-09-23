@@ -702,44 +702,33 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        // This channel historically accepted a surrounding-whitespace wildcard
-        // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here.
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
-            match (
-                Self::normalize_phone_token(entry),
-                Self::normalize_phone_token(phone),
-            ) {
-                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-                _ => false,
-            }
-        })
+        Self::are_numbers_allowed_for_list(allowed_numbers, &[phone])
     }
 
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+    /// One sender reaches this channel under several numbers (its JID, the
+    /// alternate JID and the LID mapping), so they are evaluated as one
+    /// account: a deny naming any of them rejects the sender, whichever number
+    /// would otherwise have carried the grant.
+    #[cfg(feature = "whatsapp-web")]
+    fn are_numbers_allowed_for_list(allowed_numbers: &[String], phones: &[&str]) -> bool {
+        // The surrounding-whitespace wildcard this channel accepts is now what
+        // the shared helper accepts, so there is no broader local notion of the
+        // wildcard left to keep in step with the deny check.
+        crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, Self::phone_matches)
+    }
+
+    /// Both WhatsApp surfaces admit the same accounts, so the raw / `+E.164` /
+    /// JID identity rule lives once in [`crate::whatsapp`] and both call it.
+    /// Keeping a second copy here let the two drift, and the Cloud webhook was
+    /// left comparing exactly while this path canonicalized.
+    #[cfg(feature = "whatsapp-web")]
+    fn phone_matches(entry: &str, phone: &str) -> bool {
+        crate::whatsapp::phone_matches(entry, phone)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
+        crate::whatsapp::normalize_phone_token(value)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -817,10 +806,19 @@ impl WhatsAppWebChannel {
             None
         };
         let candidates = Self::sender_phone_candidates(sender, sender_alt, mapped_phone.as_deref());
-        let allowed_phone = candidates
-            .iter()
-            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
-            .cloned();
+        // Authorize the sender as one account first, so a deny naming any of
+        // its numbers is not sidestepped by another number of the same sender.
+        // Only then pick the number to report downstream.
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs)
+        {
+            candidates
+                .iter()
+                .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+                .cloned()
+        } else {
+            None
+        };
 
         SenderAllowlistResolution {
             mapped_phone,
@@ -894,6 +892,22 @@ impl WhatsAppWebChannel {
             &chat,
             info.source.is_from_me,
         );
+
+        // Business-mode `fromMe` events are delivery mirrors for messages sent
+        // by the linked account, not new user input. Reject them before either
+        // approval handling or `ChannelMessage` construction so their chat JID
+        // cannot grant the direct-message reply-intent bypass downstream.
+        if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Business
+            && info.source.is_from_me
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"chat": chat, "sender": sender})),
+                "ignoring fromMe delivery mirror in business mode"
+            );
+            return;
+        }
 
         // ── Approval-reply interception ──
         //
@@ -2174,6 +2188,27 @@ fn fromme_outside_self_chat_is_operator_trigger(
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
 }
 
+/// WhatsApp JID domains that identify a one-to-one chat.
+///
+/// This is an allow-list rather than "anything that is not `@g.us`". Broadcast
+/// lists, newsletters and call JIDs are not group chats either, yet they are
+/// not direct messages, and treating an unrecognised future domain as a DM
+/// would silently widen every `is_direct_message()` bypass downstream.
+#[cfg(feature = "whatsapp-web")]
+const DIRECT_MESSAGE_JID_DOMAINS: [&str; 2] = ["s.whatsapp.net", "lid"];
+
+/// Whether an originating chat JID denotes a one-to-one conversation.
+///
+/// `reply_target` carries the originating chat JID unchanged, so the domain is
+/// the authoritative signal: `@g.us` is a group, `@s.whatsapp.net` and `@lid`
+/// are individual chats (the latter is WhatsApp's hidden-identity addressing).
+#[cfg(feature = "whatsapp-web")]
+fn is_direct_message_jid(chat_jid: &str) -> bool {
+    chat_jid.rsplit_once('@').is_some_and(|(user, domain)| {
+        !user.is_empty() && DIRECT_MESSAGE_JID_DOMAINS.contains(&domain)
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 /// Whether a group chat may be processed.
 ///
@@ -2604,6 +2639,14 @@ impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
         "whatsapp"
+    }
+
+    /// Without this the trait default (`false`) applies, so every WhatsApp DM
+    /// is treated as a non-direct message. Callers that exist to spare direct
+    /// messages extra handling — notably the reply-intent precheck bypass in
+    /// the channel orchestrator — then never fire for WhatsApp at all.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        is_direct_message_jid(&msg.reply_target)
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -3082,6 +3125,7 @@ impl Channel for WhatsAppWebChannel {
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
+                                                Self::phone_matches,
                                             )
                                             .await
                                     {
@@ -3775,6 +3819,41 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_accepts_individual_chats() {
+        // Both individual addressing forms: the plain phone JID and the hidden
+        // identity (LID) form WhatsApp uses for privacy-preserving chats.
+        assert!(super::is_direct_message_jid("15550001111@s.whatsapp.net"));
+        assert!(super::is_direct_message_jid("100000000000001@lid"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_groups() {
+        assert!(!super::is_direct_message_jid("120363000000000001@g.us"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_non_conversational_domains() {
+        // Not groups, but not direct messages either. An allow-list keeps these
+        // out; a "not @g.us" check would wrongly admit all three.
+        assert!(!super::is_direct_message_jid("status@broadcast"));
+        assert!(!super::is_direct_message_jid(
+            "120363000000000000@newsletter"
+        ));
+        assert!(!super::is_direct_message_jid("15550001111@call"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_malformed_input() {
+        assert!(!super::is_direct_message_jid(""));
+        assert!(!super::is_direct_message_jid("15550001111"));
+        assert!(!super::is_direct_message_jid("@s.whatsapp.net"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn validate_marker_target_accepts_workspace_relative_file() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let file = workspace.path().join("photo.png");
@@ -4155,6 +4234,102 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
+    /// Resolve peers the way the daemon does, so these cover the
+    /// config-to-adapter boundary rather than a hand-built vector.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
+        // A wildcard written with surrounding whitespace, resolved from config.
+        // Gating deny emission on the exact string `"*"` emitted no deny here
+        // while this matcher still read the entry as a wildcard.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["+15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_an_equivalent_phone_spelling() {
+        // This matcher reads `+15551234567` and `15551234567` as one number.
+        // Resolving the deny by comparing raw strings kept the grant and
+        // dropped the `ignore`, and the sender was then admitted.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["+15551234567"]
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_a_jid_spelling_of_the_granted_number() {
+        // A sender arrives as a JID, which normalizes to the same number.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["*"]
+            ignore = ["15551234567@s.whatsapp.net"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_on_one_sender_number_covers_the_others() {
+        // A sender arrives as several numbers (JID, alternate JID, LID
+        // mapping). Denying one of them must reject the sender rather than
+        // letting the next number pick up the wildcard.
+        let peers = vec!["*".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15551234567"]
+        ));
+        assert!(WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15559999999"]
+        ));
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
@@ -4249,6 +4424,78 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_phone_token("+1 (555) 123-4567"),
             Some("+15551234567".to_string())
+        );
+    }
+
+    /// Config to writer to runtime, on the one identity WhatsApp spells three
+    /// ways. The writer runs on every reconnect, so a wrong answer here is the
+    /// operator's whole experience of pairing: told it worked, never able to
+    /// talk, and no conflict to act on.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_pairing_write_honors_a_deny_spelled_as_a_jid() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "whatsapp_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("15551234567@s.whatsapp.net".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            !WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "the runtime canonicalizes the JID deny and rejects the account"
+        );
+
+        let err = crate::identity_persist::merge_external_peer(
+            &mut config,
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            WhatsAppWebChannel::phone_matches,
+        )
+        .expect_err("the deny names this account, whichever spelling it uses");
+        assert!(
+            err.to_string().contains("ignore"),
+            "the operator is told which field to edit: {err}"
+        );
+
+        config
+            .peer_groups
+            .get_mut("whatsapp_admin")
+            .expect("group exists")
+            .ignore
+            .clear();
+        assert!(
+            crate::identity_persist::merge_external_peer(
+                &mut config,
+                "whatsapp",
+                "admin",
+                "+15551234567",
+                WhatsAppWebChannel::phone_matches,
+            )
+            .expect("merge succeeds once the deny is gone")
+            .is_none(),
+            "the existing grant is now effective, so nothing needs writing"
+        );
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "a no-op write leaves the identity admissible: the recovery path ends"
         );
     }
 
@@ -4988,6 +5235,105 @@ mod tests {
                 .is_err(),
             "business mode must not acquire the personal self-chat bypass"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_rejects_business_from_me_before_direct_message_bypass() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const OPERATOR: &str = "15557654321";
+        const CUSTOMER: &str = "15551234567";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let event = |sender: &str, from_me: bool, content: &str| {
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some(content.to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: Jid::pn(CUSTOMER),
+                        sender: Jid::pn(sender),
+                        is_from_me: from_me,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("business-from-me-{from_me}"),
+                    r#type: "text".to_string(),
+                    push_name: "Business DM Probe".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("business-dm-provenance".to_string()),
+            peer_resolver: Arc::new(Vec::new),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: Mode::Business,
+            dm_policy: Policy::All,
+            group_policy: Policy::All,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        let outbound_echo = event(OPERATOR, true, "outbound delivery mirror");
+        WhatsAppWebChannel::handle_inbound_message_event(&outbound_echo, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a business-mode fromMe mirror must not reach channel dispatch"
+        );
+
+        let customer_message = event(CUSTOMER, false, "genuine customer message");
+        WhatsAppWebChannel::handle_inbound_message_event(&customer_message, &client, &context)
+            .await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a genuine business DM must reach channel dispatch")
+            .expect("channel dispatch sender must remain open");
+        assert_eq!(dispatched.content, "genuine customer message");
+
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "business-dm-provenance",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        assert!(zeroclaw_api::channel::Channel::is_direct_message(
+            &channel,
+            &dispatched
+        ));
     }
 
     // ── Reconnect retry state machine tests (exercise production helpers) ──

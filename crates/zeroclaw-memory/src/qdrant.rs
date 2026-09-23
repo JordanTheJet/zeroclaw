@@ -299,7 +299,6 @@ impl QdrantMemory {
                 }
 
                 entries.push(MemoryEntry {
-                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -313,6 +312,7 @@ impl QdrantMemory {
                     kind: None,
                     pinned: false,
                     tenant_id: None,
+                    principal_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 });

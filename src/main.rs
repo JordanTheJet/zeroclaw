@@ -5328,6 +5328,18 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // Enrollment's contract is that stdout carries exactly the token and
+    // nothing else, so the `oidc` commands are dispatched before any
+    // startup prelude that may print: the OTP prelude below discloses a
+    // freshly minted seed's enrollment URI on stdout, which must never be
+    // captured alongside an access token by a command substitution.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::Oidc { .. }) {
+        let Commands::Oidc { oidc_command } = cli.command else {
+            unreachable!("matched the Oidc variant above")
+        };
+        return handle_oidc_command(oidc_command, &config).await;
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -6006,6 +6018,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
                     move |host,
                           port,
                           config,
@@ -9913,7 +9926,7 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
             format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
         ));
     };
-    let enrollment = Enrollment::new(entry.clone())?;
+    let enrollment = Enrollment::new(&alias, entry.clone())?;
 
     let token = match flow {
         OidcFlow::ClientCredentials => enrollment.client_credentials().await?,

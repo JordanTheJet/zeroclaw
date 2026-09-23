@@ -278,10 +278,14 @@ pub enum SessionUpdate {
         timeout_secs: u64,
     },
     /// Emitted once per LLM call with current context size and configured limit.
+    /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
+    /// `model_context_window` is the model's full capacity, used as the bar
+    /// denominator when present so the trim budget can be drawn as a marker.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
+        model_context_window: Option<u64>,
     },
     /// Older complete turns were removed from structured session history.
     HistoryTrimmed {
@@ -289,6 +293,21 @@ pub enum SessionUpdate {
         dropped_messages: u64,
         kept_turns: u64,
         reason: String,
+        /// Configured context token budget, when the trim was token-budget
+        /// driven. `None` for message-limit trims.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        tokens_before_source: Option<String>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        tokens_after_source: Option<String>,
+        /// The retained request cannot fit the configured budget (protected
+        /// newest turn plus schemas) even after trimming. Absent for ordinary
+        /// trims; authoritative floor signal — not `dropped_messages == 0`.
+        unsatisfiable_floor: Option<bool>,
     },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
@@ -381,12 +400,25 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+            model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
+            token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
+            tokens_before: params.get("tokens_before").and_then(|v| v.as_u64()),
+            tokens_after: params.get("tokens_after").and_then(|v| v.as_u64()),
+            tokens_before_source: params
+                .get("tokens_before_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tokens_after_source: params
+                .get("tokens_after_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -6222,6 +6254,27 @@ mod notification_tests {
     }
 
     #[test]
+    fn parse_context_usage_keeps_budget_and_model_window_distinct() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                session_id,
+                input_tokens: Some(100_000),
+                max_context_tokens: Some(180_000),
+                model_context_window: Some(200_000),
+            }) if session_id == "s-context"
+        ));
+    }
+
+    #[test]
     fn parse_turn_complete_carries_optional_client_generation() {
         let update = parse_session_update(&serde_json::json!({
             "type": "turn_complete",
@@ -6457,7 +6510,48 @@ mod plan_parse_tests {
                 dropped_messages: 12,
                 kept_turns: 3,
                 reason,
+                token_budget: None,
+                tokens_before: None,
+                tokens_after: None,
+                tokens_before_source: None,
+                tokens_after_source: None,
+                unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_history_trimmed_token_accounting() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-4",
+            "dropped_messages": 12,
+            "kept_turns": 33,
+            "reason": "context token budget exceeded",
+            "token_budget": 500000,
+            "tokens_before": 612000,
+            "tokens_after": 117000,
+            "tokens_before_source": "provider",
+            "tokens_after_source": "calibrated"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                kept_turns: 33,
+                reason,
+                token_budget: Some(500000),
+                tokens_before: Some(612000),
+                tokens_after: Some(117000),
+                tokens_before_source: Some(source),
+                tokens_after_source: Some(after_source),
+                unsatisfiable_floor: None,
+            }) if session_id == "sess-4"
+                && reason == "context token budget exceeded"
+                && source == "provider"
+                && after_source == "calibrated"
         ));
     }
 

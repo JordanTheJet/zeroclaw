@@ -822,6 +822,7 @@ pub struct SectionSelectBody {
 
 pub async fn handle_section_select(
     State(state): State<AppState>,
+    principal: crate::principal_gate::RequestPrincipal,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
     body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
@@ -1092,8 +1093,23 @@ pub async fn handle_section_select(
         .into_response();
     }
 
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
-        return error_response(e);
+    // Selecting an existing item writes nothing; creating one writes the
+    // new item's fields. Authorized before the save either way.
+    let before = state.config.read().clone();
+    let mut writes = crate::principal_gate::ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    if created {
+        writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
+    }
+    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    if let Err(e) = persist_and_swap(&state, &authorization, working, &_cfg_guard).await {
+        return e;
     }
 
     axum::Json(SelectItemResponse {
@@ -1780,6 +1796,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -1835,6 +1852,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "providers.models".to_string(),
                 key: "anthropic".to_string(),
@@ -1892,6 +1910,7 @@ mod tests {
 
         let memory_response = handle_section_select(
             State(memory_state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -1942,6 +1961,7 @@ mod tests {
 
         let tunnel_response = handle_section_select(
             State(tunnel_state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -2004,6 +2024,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -2064,6 +2085,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "tailscale".to_string(),
@@ -2130,6 +2152,7 @@ mod tests {
                 let live_before = state.config.read().clone();
                 let response = handle_section_select(
                     State(state.clone()),
+                    None,
                     axum::extract::Path(SectionItemPath {
                         section: section.to_string(),
                         key: key.to_string(),
@@ -2190,6 +2213,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),

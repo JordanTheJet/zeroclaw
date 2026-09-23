@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::{Context, Result};
@@ -13,12 +14,40 @@ use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
+/// Project a finished summary call's settled attempts as `TurnEvent::Usage`
+/// so the gateway ledger includes the final-summary billed work. Mirrors
+/// `emit_rejected_attempt_usage`, but carries each summary's own `accepted`
+/// flag (the accepted leaf is `true`).
+async fn emit_summary_attempt_usage(
+    event_tx: Option<&Sender<TurnEvent>>,
+    summaries: &[SettledAttemptSummary],
+) {
+    if let Some(tx) = event_tx {
+        for summary in summaries {
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: summary.input_tokens,
+                    cached_input_tokens: summary.cached_input_tokens,
+                    output_tokens: summary.output_tokens,
+                    cost_usd: summary.cost_usd,
+                    context_token_budget: None,
+                    model_context_window: None,
+                    provider_ref: summary.provider_ref.clone(),
+                    model: summary.model.clone(),
+                    accepted: summary.accepted,
+                })
+                .await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
     multimodal_config: &MultimodalConfig,
     pacing: &PacingConfig,
@@ -29,6 +58,10 @@ pub(crate) async fn finish_after_max_iterations(
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    context_token_budget: usize,
+    crumb_present: &mut bool,
+    token_counter: super::DispatchTokenCounter,
+    observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -95,25 +128,98 @@ pub(crate) async fn finish_after_max_iterations(
     // request failure.
     let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
         && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
-    let mut request_messages = match super::prepare_messages_for_iteration(
-        history,
-        multimodal_config,
-        degrade_strip_images,
-        None,
-    )
-    .await
-    {
-        Ok(prepared) => prepared.messages,
-        Err(error) => return Err(error),
+    let mut tokens_before = None;
+    let mut dropped_messages = 0;
+    let mut dropped_turns = 0;
+    let request_messages = loop {
+        let mut messages = super::prepare_messages_for_iteration(
+            history,
+            multimodal_config,
+            degrade_strip_images,
+            None,
+        )
+        .await?
+        .messages;
+        // Count the summary prompt, but keep it out of durable history until
+        // the request fits: it must not make the newest real turn droppable.
+        messages.push(summary_prompt_mirror.clone());
+        let tokens = token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+        let before = *tokens_before.get_or_insert(tokens);
+        let mut trim = super::surface_oversized_dispatch_if_needed(
+            history,
+            crumb_present,
+            tokens,
+            context_token_budget,
+        );
+        dropped_messages += trim.dropped_messages;
+        if trim.outcome == super::PreDispatchOutcome::Trimmed {
+            dropped_turns += 1;
+            continue;
+        }
+        trim.dropped_messages = dropped_messages;
+        super::record_dispatch_trim(
+            (provider_name, model),
+            &trim,
+            dropped_turns,
+            context_token_budget,
+            before,
+            tokens,
+            token_counter.source(),
+        );
+        let floor = trim.outcome == super::PreDispatchOutcome::Floor;
+        if dropped_messages > 0 || floor {
+            let source = token_counter.source();
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(TurnEvent::HistoryTrimmed {
+                        dropped_messages,
+                        kept_turns: trim.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(before),
+                        tokens_after: Some(tokens),
+                        tokens_before_source: Some(source),
+                        tokens_after_source: Some(source),
+                        unsatisfiable_floor: floor.then_some(true),
+                    })
+                    .await;
+            }
+            observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages,
+                    kept_turns: trim.kept_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(before),
+                    tokens_after: Some(tokens),
+                    tokens_before_source: Some(source),
+                    tokens_after_source: Some(source),
+                    unsatisfiable_floor: floor.then_some(true),
+                },
+            );
+        }
+        if floor {
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-context-budget-floor-error",
+            )));
+        }
+        break messages;
     };
     history.push(summary_prompt);
-    request_messages.push(summary_prompt_mirror.clone());
 
     enum SummaryCall {
         Cancelled,
         TimedOut(u64),
         Done(Result<zeroclaw_providers::ChatResponse>),
     }
+    // Collect the summary call's settled attempts so they can be projected
+    // as Usage events below: without this the gateway ledger omits the
+    // final-summary billed work. Declared outside the call block so the
+    // match arms below can read it after the future completes.
+    let mut summary_attempts = Vec::new();
     let summary_call = {
         let summary_request = zeroclaw_providers::ChatRequest {
             messages: &request_messages,
@@ -127,6 +233,7 @@ pub(crate) async fn finish_after_max_iterations(
             model_provider,
             provider_name,
             model,
+            dispatch_model,
             temperature,
         };
         // Route the graceful-summary call through the metered provider seam. This
@@ -134,7 +241,7 @@ pub(crate) async fn finish_after_max_iterations(
         // recorded no cost; through the seam it now fails closed when the turn's
         // budget is exhausted and its token usage is charged like any in-loop
         // call. Metering is a no-op when the turn is unscoped.
-        let summary_future = access.run_model_query(summary_request);
+        let summary_future = access.run_model_query(summary_request, &mut summary_attempts);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -190,12 +297,16 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             history.pop();
             return Err(e).context(format!(
                 "Agent exceeded maximum tool iterations ({max_iterations})"
             ));
         }
-        SummaryCall::Done(Ok(resp)) => resp,
+        SummaryCall::Done(Ok(resp)) => {
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            resp
+        }
     };
 
     let raw_text = resp.text.unwrap_or_default();
@@ -345,6 +456,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -355,6 +467,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             event_tx,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
     }
@@ -393,6 +509,43 @@ mod graceful_summary_metering_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
         assert_eq!(recorded.output_tokens, 20);
+    }
+
+    // The final-summary call's billed work must reach the event ledger, not
+    // just the accumulator: the gateway derives done.cost_usd from emitted
+    // Usage events, so an unprojected summary silently under-reports the turn.
+    #[tokio::test]
+    async fn graceful_summary_projects_usage_event_for_gateway_ledger() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+        };
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let out = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx)),
+            )
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        // Exactly the summary call's accepted attempt — no more, no less.
+        assert_eq!(usage_events, vec![(Some(100), Some(20), true)]);
     }
 
     // The graceful summary now fails closed on budget exhaustion: it was the one
@@ -561,6 +714,71 @@ mod graceful_summary_metering_tests {
         }
     }
 
+    #[tokio::test]
+    async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let mut history = vec![
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("work completed"),
+        ];
+        // The real turn fits exactly; only the synthetic prompt can exceed it.
+        let budget = crate::agent::history::estimate_history_tokens(&history);
+        let mut crumb_present = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let error = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &MultimodalConfig::default(),
+            &PacingConfig::default(),
+            None,
+            1,
+            String::new(),
+            "summary-prompt-floor",
+            &LoopKnobs::default(),
+            Some(&tx),
+            None,
+            budget,
+            &mut crumb_present,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect_err("summary prompt must be included in the floor decision");
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::i18n::get_required_cli_string(
+                    "turn-context-budget-floor-error",
+                ))
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no oversized summary dispatch"
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "current question");
+        assert_eq!(history[1].content, "work completed");
+        assert!(!crumb_present);
+        let TurnEvent::HistoryTrimmed {
+            tokens_after,
+            unsatisfiable_floor,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected summary floor event");
+        };
+        assert_eq!(unsatisfiable_floor, Some(true));
+        assert!(tokens_after.unwrap() > budget as u64);
+    }
+
     // The graceful-summary path now prepares the accumulated history through
     // the full multimodal normalizer before dispatch, and the dispatch seam
     // still strips loadable audio markers as a fail-closed backstop. A
@@ -595,6 +813,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -605,6 +824,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -661,6 +884,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -671,6 +895,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -731,6 +959,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -741,6 +970,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");

@@ -1,7 +1,8 @@
 //! Audit trail for memory operations.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
+    ProceduralMessage, StoreOptions,
 };
 use crate::sqlite_permissions::harden_sqlite_storage;
 use async_trait::async_trait;
@@ -79,6 +80,18 @@ impl<M: Memory> AuditedMemory<M> {
             inner,
             audit_conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// The audit detail for a private-plane scope: every dimension the
+    /// statement was predicated on, so an audit row names the exact plane.
+    fn scope_detail(scope: &PrincipalScope) -> String {
+        format!(
+            "principal_id={} agent={} namespace={} tenant={}",
+            scope.principal_id,
+            scope.agent_alias.as_deref().unwrap_or("default"),
+            scope.namespace.as_deref().unwrap_or("default"),
+            scope.tenant_id.as_deref().unwrap_or("-"),
+        )
     }
 
     fn log_audit(
@@ -243,7 +256,7 @@ impl<M: Memory> Memory for AuditedMemory<M> {
 
     async fn store_for_principal(
         &self,
-        principal_id: &str,
+        scope: &PrincipalScope,
         key: &str,
         content: &str,
         category: MemoryCategory,
@@ -254,16 +267,16 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             Some(key),
             None,
             session_id,
-            Some(&format!("principal_id={principal_id}")),
+            Some(&Self::scope_detail(scope)),
         );
         self.inner
-            .store_for_principal(principal_id, key, content, category, session_id)
+            .store_for_principal(scope, key, content, category, session_id)
             .await
     }
 
     async fn recall_for_principal(
         &self,
-        principal_id: &str,
+        scope: &PrincipalScope,
         query: &str,
         limit: usize,
         session_id: Option<&str>,
@@ -275,16 +288,16 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             None,
             None,
             session_id,
-            Some(&format!("principal_id={principal_id} query={query}")),
+            Some(&format!("{} query={query}", Self::scope_detail(scope))),
         );
         self.inner
-            .recall_for_principal(principal_id, query, limit, session_id, since, until)
+            .recall_for_principal(scope, query, limit, session_id, since, until)
             .await
     }
 
     async fn list_for_principal(
         &self,
-        principal_id: &str,
+        scope: &PrincipalScope,
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -293,16 +306,16 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             None,
             None,
             session_id,
-            Some(&format!("principal_id={principal_id}")),
+            Some(&Self::scope_detail(scope)),
         );
         self.inner
-            .list_for_principal(principal_id, category, session_id)
+            .list_for_principal(scope, category, session_id)
             .await
     }
 
     async fn get_for_principal(
         &self,
-        principal_id: &str,
+        scope: &PrincipalScope,
         key: &str,
     ) -> anyhow::Result<Option<MemoryEntry>> {
         self.log_audit(
@@ -310,20 +323,80 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             Some(key),
             None,
             None,
-            Some(&format!("principal_id={principal_id}")),
+            Some(&Self::scope_detail(scope)),
         );
-        self.inner.get_for_principal(principal_id, key).await
+        self.inner.get_for_principal(scope, key).await
     }
 
-    async fn forget_for_principal(&self, principal_id: &str, key: &str) -> anyhow::Result<bool> {
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
         self.log_audit(
             AuditOp::Forget,
             Some(key),
             None,
             None,
-            Some(&format!("principal_id={principal_id}")),
+            Some(&Self::scope_detail(scope)),
         );
-        self.inner.forget_for_principal(principal_id, key).await
+        self.inner.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        self.inner.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            filter.session_id.as_deref(),
+            Some(&format!("{} export", Self::scope_detail(scope))),
+        );
+        self.inner.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        self.log_audit(
+            AuditOp::Forget,
+            None,
+            None,
+            None,
+            Some(&format!(
+                "{} purge namespace={namespace}",
+                Self::scope_detail(scope)
+            )),
+        );
+        self.inner
+            .purge_namespace_for_principal(scope, namespace)
+            .await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.log_audit(
+            AuditOp::Forget,
+            None,
+            None,
+            Some(session_id),
+            Some(&format!("{} purge session", Self::scope_detail(scope))),
+        );
+        self.inner
+            .purge_session_for_principal(scope, session_id)
+            .await
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {

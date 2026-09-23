@@ -2175,7 +2175,6 @@ mod tests {
         let (_chat_tmp, inner) = test_backend();
         let old_chat = SessionMetadata {
             key: "telegram__old".into(),
-            principal_id: None,
             name: None,
             created_at: Utc::now() - chrono::Duration::days(2),
             last_activity: Utc::now() - chrono::Duration::days(1),
@@ -2184,6 +2183,7 @@ mod tests {
             channel_id: Some("telegram.default".into()),
             room_id: None,
             sender_id: None,
+            principal_id: None,
         };
         let backend: Arc<dyn SessionBackend> =
             Arc::new(MetadataBackend::new(inner, vec![old_chat]));

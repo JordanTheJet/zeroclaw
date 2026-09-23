@@ -97,6 +97,82 @@ Decisions are final: removing a reaction does not retract an answer, and the fir
 
 If the bot cannot place the emoji, most often a permissions problem, it logs `failed to seed Mattermost approval reaction` at `WARN` and the prompt still works by reply.
 
+## Channel purpose as instructions (`purpose_as_instructions`)
+
+Off by default. When enabled, each room's Mattermost **channel purpose** is
+injected into the agent's system prompt as channel-supplied context, so one
+room can specialise the agent without a config entry per room:
+
+```toml
+[channels.mattermost.default]
+purpose_as_instructions = true
+```
+
+Set a channel's purpose to describe what that room is for, such as "Arch Linux
+package maintenance for the AUR repos". The agent treats it as authoritative
+about the room's focus, tone, and which skills to reach for.
+
+It is **not** authoritative over the agent's rules. The injected text is
+labelled as channel-supplied and explicitly denied any power to grant
+capabilities, relax restrictions, or override operating rules; where it
+conflicts with them, the rules win. It cannot enable a tool, widen a peer
+group, or change an autonomy level.
+
+### What enabling this grants, and to whom
+
+Turning this on is a trust decision, and it is worth being blunt about its
+shape rather than leaving it to be inferred from the warning above.
+
+The purpose is governed by Mattermost's `manage_public_channel_properties` /
+`manage_private_channel_properties` permissions, which on default schemes are
+granted to **every channel member**. That is usually a wider group than whoever
+controls this config, and it need not overlap with the alias's `peer_groups` at
+all: a member who is not an authorized ZeroClaw peer, and so cannot get the
+agent to answer them directly, can still edit the room's purpose.
+
+The text reaches the system prompt. The framing around it tells the model the
+text is channel-supplied, describes the room rather than commanding the agent,
+and never overrides its rules. But framing is a strong prior, not a boundary.
+Text that reads as an instruction can influence what the agent does in that
+room, and no amount of escaping changes that; it is natural language, and the
+model reads it as such.
+
+**So the decision this feature makes, explicitly:** enabling
+`purpose_as_instructions` for an alias grants everyone who can edit those rooms'
+purposes the ability to steer the agent there, within the permissions the agent
+already has. Enable it only where that set of people is trusted with the agent's
+configured capabilities. If it is not, leave it off (off is the default), or
+restrict `manage_*_channel_properties` in your permission scheme to the people
+who should have it.
+
+What the purpose still cannot do is *widen* those capabilities. It cannot enable
+a tool, add a peer, change an autonomy level, or approve its own tool call:
+those are decided by config and by the approval path, neither of which reads
+prompt text.
+
+Structurally the text is contained. Before injection it is flattened to a single
+line with angle brackets and control characters removed, so it cannot close its
+own section, open another, or forge a Markdown heading that reads like a
+different part of the operator's prompt. It is also capped at 500 characters,
+above Mattermost's own **250-character** limit for the field (the channel header
+allows 1024), so no legitimate purpose is cut while a compromised server cannot
+paste a whole prompt.
+
+An edited purpose takes effect on the next message, with a delay that depends
+on `listen_mode`:
+
+| `listen_mode` | Purpose edit takes effect |
+|---|---|
+| `websocket` | Almost immediately, from the `channel_updated` event |
+| `polling` | On the next message after the 60-second discovery refresh |
+
+Clearing a channel's purpose stops the injection; it is not retained from a
+previous value. Rooms with no purpose contribute nothing.
+
+To roll back, set `purpose_as_instructions = false` (or remove the field; off is
+the default). No channel state needs cleaning up, because nothing is cached for
+an alias that has not opted in.
+
 ## Direct messages
 
 Mattermost classifies channels by `type`:

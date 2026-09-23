@@ -950,6 +950,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon's canonical live pairing authority, shared with the RPC
+    // inbound-auth layer so pairing and revocation reach both surfaces.
+    // Standalone runs pass `None` and build their own guard from config.
     shared_pairing: Option<PairingGuard>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
@@ -1189,7 +1192,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
-            );
+            )?;
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
@@ -1323,7 +1326,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
-        );
+        )?;
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel
@@ -1602,10 +1605,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
     // revocation reach RPC authentication too; standalone constructs its
-    // own from config exactly as before. The pairing-code policy is
-    // resolved from config here and nowhere else: startup pairing,
+    // own from config exactly as before. Either way the pairing-code policy
+    // is resolved from config in exactly one guard: startup pairing,
     // `gateway get-paircode --new`, the dashboard pairing flow, and
-    // rotate-device all issue through this guard.
+    // rotate-device all issue through it.
     let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
         PairingGuard::new(
             config.gateway.require_pairing,
@@ -1905,17 +1908,16 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // The gateway's inbound-auth authority: same registry/resolver stack
-    // as the RPC layer, same canonical pairing guard, plus the live
-    // config handle for scoped-principal policy freshness.
+    // as the RPC layer, same canonical pairing guard. Its accepted policy
+    // moves only when a config mutation persists (see `persist_and_swap`).
     let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
         &config,
         Arc::clone(&pairing),
-        Arc::clone(&config_state),
     )?);
 
     let state = AppState {
         config: config_state,
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
         model_provider,
         model,
         temperature,

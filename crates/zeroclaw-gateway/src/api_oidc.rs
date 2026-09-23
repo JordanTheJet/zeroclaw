@@ -366,7 +366,7 @@ fn enrollment_for(state: &AppState, alias: &str) -> Result<Enrollment, Box<Respo
             "unknown oidc provider alias",
         )));
     };
-    Enrollment::new(entry).map_err(|_| {
+    Enrollment::new(alias, entry).map_err(|_| {
         Box::new(error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "enrollment client construction failed",
@@ -1031,6 +1031,7 @@ mod tests {
             .and(body_string_contains("device_code=dev-9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-device",
+                "token_type": "Bearer",
                 "refresh_token": "rt-never-relayed",
                 "expires_in": 3600,
             })))
@@ -1251,6 +1252,7 @@ mod tests {
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-browser",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -1480,6 +1482,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-browser",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -1679,6 +1682,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "never-relayed",
+                "token_type": "Bearer",
             })))
             .mount(&server)
             .await;
@@ -1732,6 +1736,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "never-relayed",
+                "token_type": "Bearer",
             })))
             .mount(&server)
             .await;
@@ -1810,6 +1815,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-cacheable-never",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -1891,6 +1897,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-browser",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -1963,6 +1970,7 @@ mod tests {
             .and(http_path("/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at-browser",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })))
             .mount(&server)
@@ -1983,7 +1991,6 @@ mod tests {
             crate::principal_gate::GatewayInboundAuth::from_config(
                 &config,
                 Arc::clone(&state.pairing),
-                Arc::clone(&state.config),
             )
             .unwrap(),
         );
