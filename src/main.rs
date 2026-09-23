@@ -3318,7 +3318,7 @@ enum PluginCommands {
 /// the install may proceed. A plugin that does not instantiate against this
 /// host's WIT world would install cleanly and then be silently skipped at
 /// daemon startup; this surfaces that failure at the CLI with its full
-/// diagnostic. The check runs against the bytes the host staged at admission,
+/// diagnostic. The check runs against the exact bytes admission read,
 /// which are the bytes [`PluginHost::install_admitted`] then installs, so what
 /// was verified is what gets installed. With `--no-verify` the check is not
 /// run at all (nothing is compiled or instantiated) and a note says so; a
@@ -3329,7 +3329,7 @@ async fn verify_plugin_loads_or_bail(
     no_verify: bool,
 ) -> Result<()> {
     let manifest = admitted.manifest();
-    let Some(staged) = admitted.staged_component() else {
+    let Some(component) = admitted.component() else {
         return Ok(());
     };
     if no_verify {
@@ -3346,7 +3346,7 @@ async fn verify_plugin_loads_or_bail(
         );
         return Ok(());
     }
-    match zeroclaw::plugins::validate::verify_component_loads(staged, manifest).await {
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let detail = format!("{error:#}");

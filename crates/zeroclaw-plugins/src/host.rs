@@ -1,11 +1,13 @@
 //! Plugin host: discovery, loading, lifecycle management.
 
 use super::error::PluginError;
-use super::signature::{self, SignatureMode, VerificationResult};
+use super::signature::{self, SignatureMode};
 use super::{PluginCapability, PluginInfo, PluginManifest};
 use crate::config::validate_manifest_config;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Subdirectory inside a skill-capable plugin that holds individual skills.
 const SKILLS_SUBDIR: &str = "skills";
@@ -21,32 +23,61 @@ pub struct PluginHost {
 struct LoadedPlugin {
     manifest: PluginManifest,
     plugin_dir: PathBuf,
-    /// Resolved path to the WASM file. `None` for skill-only plugins.
-    wasm_path: Option<PathBuf>,
+    /// Exact executable bytes accepted with this manifest. `None` for
+    /// skill-only plugins.
+    component: Option<AdmittedComponent>,
 }
 
-/// The file name a staged component is held under while it is verified.
-const STAGED_COMPONENT_FILE: &str = "component.wasm";
+/// Exact executable bytes that passed package confinement and digest policy.
+///
+/// Runtime adapters consume this artifact instead of reopening a manifest
+/// path, so compilation uses the payload generation that admission retained.
+#[derive(Clone)]
+pub struct AdmittedComponent {
+    bytes: Arc<[u8]>,
+}
+
+impl AdmittedComponent {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::from(bytes),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    // Gated exactly like its callers: every use lives in a `tests` module
+    // inside a `plugins-wasmtime` module, so under default features the
+    // helper would otherwise be dead code and fail the deny-warnings check.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn test_component(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_vec())
+    }
+}
 
 /// A source that passed admission and is ready to install: see
-/// [`PluginHost::admit_source`]. Dropping it without installing removes the
-/// staged component.
-#[derive(Debug)]
+/// [`PluginHost::admit_source`]. It carries the exact manifest and component
+/// bytes admission read, so a caller can load-check them and
+/// [`PluginHost::install_admitted`] then persists those same bytes.
 pub struct AdmittedSource {
     manifest: PluginManifest,
     manifest_toml: String,
     source_dir: PathBuf,
-    staging_dir: PathBuf,
-    component: Option<StagedComponent>,
+    component: Option<AdmittedComponent>,
 }
 
-/// The single copy of a component read at admission.
-#[derive(Debug)]
-struct StagedComponent {
-    /// Where the manifest places it, relative to the plugin directory.
-    relative_path: PathBuf,
-    /// Where the admitted bytes sit until they are installed.
-    staged_path: PathBuf,
+impl std::fmt::Debug for AdmittedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedSource")
+            .field("plugin", &self.manifest.name)
+            .field(
+                "component_bytes",
+                &self.component.as_ref().map(|c| c.bytes().len()),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdmittedSource {
@@ -56,74 +87,13 @@ impl AdmittedSource {
         &self.manifest
     }
 
-    /// The staged component to load-check, or `None` for a package that ships
-    /// no WASM. This is the file [`PluginHost::install_admitted`] moves into
-    /// place, so a check against it is a check of what gets installed.
+    /// The admitted component to load-check, or `None` for a package that
+    /// ships no WASM. These are the bytes [`PluginHost::install_admitted`]
+    /// writes, so a check against them is a check of what gets installed.
     #[must_use]
-    pub fn staged_component(&self) -> Option<&Path> {
-        self.component.as_ref().map(|c| c.staged_path.as_path())
+    pub fn component(&self) -> Option<&AdmittedComponent> {
+        self.component.as_ref()
     }
-}
-
-impl Drop for AdmittedSource {
-    fn drop(&mut self) {
-        // Best effort: after `install_admitted` the component has already been
-        // renamed away, and an admission that was never installed leaves
-        // nothing behind either way.
-        let _ = std::fs::remove_dir_all(&self.staging_dir);
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const O_NOFOLLOW: i32 = 0x0100;
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-/// Read a component's bytes without following a symlink at the final path
-/// component, and refuse anything that is not a regular file.
-///
-/// The `symlink_metadata` check gives the clear error; the no-follow open
-/// flag is what makes a swap between the check and the open fail closed
-/// instead of reading through the link.
-fn read_component_no_follow(path: &Path) -> Result<Vec<u8>, PluginError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PluginError::NotFound(format!("WASM file not found: {}", path.display()))
-        } else {
-            PluginError::Io(error)
-        }
-    })?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(PluginError::InvalidManifest(format!(
-            "wasm_path {} must be a regular file inside the plugin source, not a symlink",
-            path.display()
-        )));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(path)?;
-    let opened = file.metadata()?;
-    if opened.file_type().is_symlink() || !opened.is_file() {
-        return Err(PluginError::InvalidManifest(format!(
-            "wasm_path {} must be a regular file inside the plugin source, not a symlink",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
-    std::io::Read::read_to_end(&mut file, &mut bytes)?;
-    Ok(bytes)
 }
 
 impl PluginHost {
@@ -222,7 +192,11 @@ impl PluginHost {
         let entries = std::fs::read_dir(&self.plugins_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // A package root is an admission boundary. Do not follow a
+            // directory symlink supplied at the discovery root: it would make
+            // an external package appear local before its manifest and payload
+            // confinement checks begin.
+            if entry.file_type()?.is_dir() {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
@@ -232,9 +206,10 @@ impl PluginHost {
                         continue;
                     }
 
-                    // Verify plugin signature
+                    // Verify the manifest, then retain the executable bytes that
+                    // match its declared package policy.
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
-                        Ok(_) => {
+                        Ok(()) => {
                             if let Err(e) = validate_manifest_config(&manifest) {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid config schema");
                                 continue;
@@ -260,13 +235,19 @@ impl PluginHost {
                                 );
                                 continue;
                             }
-                            let wasm_path = manifest.wasm_path.as_deref().map(|p| path.join(p));
+                            let component = match admit_component(&path, &manifest) {
+                                Ok(component) => component,
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to executable artifact admission failure");
+                                    continue;
+                                }
+                            };
                             self.loaded.insert(
                                 manifest.name.clone(),
                                 LoadedPlugin {
                                     manifest,
                                     plugin_dir: path.clone(),
-                                    wasm_path,
+                                    component,
                                 },
                             );
                         }
@@ -293,7 +274,7 @@ impl PluginHost {
         name: &str,
         manifest_toml: &str,
         manifest: &PluginManifest,
-    ) -> Result<VerificationResult, PluginError> {
+    ) -> Result<(), PluginError> {
         signature::enforce_signature_policy(
             name,
             manifest_toml,
@@ -301,7 +282,14 @@ impl PluginHost {
             manifest.publisher_key.as_deref(),
             &self.trusted_publisher_keys,
             self.signature_mode,
-        )
+        )?;
+        if self.signature_mode == SignatureMode::Strict
+            && manifest.wasm_path.is_some()
+            && manifest.wasm_sha256.is_none()
+        {
+            return Err(PluginError::PayloadDigestRequired(name.to_string()));
+        }
+        Ok(())
     }
 
     /// List all discovered plugins.
@@ -337,17 +325,14 @@ impl PluginHost {
     ///
     /// Parses and signature-checks the manifest, validates its shape and
     /// config, refuses a name the host has already loaded, and reads the
-    /// component **once** into a host-owned staging file. Everything
+    /// component once through the same confined, size-bounded, digest-checked
+    /// admission the host applies to installed plugins. Everything
     /// [`Self::install_admitted`] persists comes from the returned
     /// [`AdmittedSource`] and never from `source` again, so whatever a caller
-    /// verifies between the two calls is, byte for byte, what gets installed:
-    /// a source directory that is edited or symlink-swapped after admission
-    /// changes nothing. The component is opened without following symlinks,
-    /// and a source whose `wasm_path` is itself a symlink is refused.
+    /// verifies between the two calls is, byte for byte, what gets installed.
     ///
-    /// The duplicate-name check runs before a byte of the component is read,
-    /// so a package the host would refuse anyway never yields an executable
-    /// path. `Ok` with no staged component means the plugin ships no WASM.
+    /// The duplicate-name check runs before the component is read, so a
+    /// package the host would refuse anyway never reaches the loader.
     pub fn admit_source(&self, source: &str) -> Result<AdmittedSource, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
@@ -371,16 +356,6 @@ impl PluginHost {
 
         validate_manifest_shape(&manifest, &source_dir)?;
 
-        let wasm_source = manifest.wasm_path.as_deref().map(|p| source_dir.join(p));
-        if let Some(ref wasm_source) = wasm_source
-            && !wasm_source.exists()
-        {
-            return Err(PluginError::NotFound(format!(
-                "WASM file not found: {}",
-                wasm_source.display()
-            )));
-        }
-
         // Refuse a duplicate before the signature check and before the
         // component is read: nothing downstream may run for a package the host
         // has already decided not to install.
@@ -388,113 +363,76 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        // Verify plugin signature before anything is staged.
+        // Admit the exact manifest and payload generations before installation.
         self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
         validate_manifest_config(&manifest)?;
+        let component = admit_component(&source_dir, &manifest)?;
 
-        let staging_dir = self.fresh_staging_dir(&manifest.name)?;
-        // Built before the component is read so that a failed read drops the
-        // value and its staging directory together.
-        let mut admitted = AdmittedSource {
+        Ok(AdmittedSource {
             manifest,
             manifest_toml,
             source_dir,
-            staging_dir,
-            component: None,
-        };
-        if let Some(wasm_source) = wasm_source {
-            let relative_path = PathBuf::from(
-                admitted
-                    .manifest
-                    .wasm_path
-                    .as_deref()
-                    .expect("wasm_source exists only with a wasm_path"),
-            );
-            let bytes = read_component_no_follow(&wasm_source)?;
-            let staged_path = admitted.staging_dir.join(STAGED_COMPONENT_FILE);
-            std::fs::write(&staged_path, &bytes)?;
-            admitted.component = Some(StagedComponent {
-                relative_path,
-                staged_path,
-            });
-        }
-        Ok(admitted)
+            component,
+        })
     }
 
     /// Install a source admitted by [`Self::admit_source`].
     ///
     /// Persists the manifest bytes that were parsed and signature-checked and
-    /// moves the staged component into place (a rename inside the plugins
-    /// directory, so the file a verifier read is the file the daemon will
-    /// load). The `skills/` subtree of a skill-capable package is copied from
-    /// the source directory as before; it is data, not executable code.
+    /// the component bytes that were admitted, so the file a verifier checked
+    /// is the file the daemon will load. The `skills/` subtree of a
+    /// skill-capable package is copied from the source directory as before; it
+    /// is data, not executable code.
     pub fn install_admitted(&mut self, admitted: AdmittedSource) -> Result<String, PluginError> {
+        let AdmittedSource {
+            manifest,
+            manifest_toml,
+            source_dir,
+            component,
+        } = admitted;
+
         // Re-checked here as well: the host may have loaded the name between
         // admission and installation.
-        if self.loaded.contains_key(&admitted.manifest.name) {
-            return Err(PluginError::AlreadyLoaded(admitted.manifest.name.clone()));
+        if self.loaded.contains_key(&manifest.name) {
+            return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        let dest_dir = self.plugins_dir.join(&admitted.manifest.name);
+        let dest_dir = self.plugins_dir.join(&manifest.name);
+        if dest_dir.exists() {
+            return Err(PluginError::AlreadyLoaded(manifest.name));
+        }
         std::fs::create_dir_all(&dest_dir)?;
 
-        // Persist the exact manifest bytes parsed and signature-checked above.
-        std::fs::write(
-            dest_dir.join("manifest.toml"),
-            admitted.manifest_toml.as_bytes(),
-        )?;
-
-        let wasm_dest = match &admitted.component {
-            Some(staged) => {
-                let dest = dest_dir.join(&staged.relative_path);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::rename(&staged.staged_path, &dest)?;
-                Some(dest)
+        // Persist the exact manifest and payload generations admitted above.
+        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml.as_bytes())?;
+        if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component.as_ref()) {
+            let dest = dest_dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            None => None,
-        };
+            std::fs::write(&dest, component.bytes())?;
+        }
 
         // Copy skills/ subtree for skill-capable plugins.
-        if admitted
-            .manifest
-            .capabilities
-            .contains(&PluginCapability::Skill)
-        {
-            let src_skills = admitted.source_dir.join(SKILLS_SUBDIR);
+        if manifest.capabilities.contains(&PluginCapability::Skill) {
+            let src_skills = source_dir.join(SKILLS_SUBDIR);
             let dest_skills = dest_dir.join(SKILLS_SUBDIR);
             if src_skills.is_dir() {
                 copy_dir_recursive(&src_skills, &dest_skills)?;
             }
         }
 
-        let installed_name = admitted.manifest.name.clone();
+        let installed_name = manifest.name.clone();
         self.loaded.insert(
-            installed_name.clone(),
+            manifest.name.clone(),
             LoadedPlugin {
-                manifest: admitted.manifest.clone(),
+                manifest,
                 plugin_dir: dest_dir,
-                wasm_path: wasm_dest,
+                component,
             },
         );
 
         Ok(installed_name)
-    }
-
-    /// A fresh, host-owned directory under the plugins dir for one admission.
-    /// Discovery ignores it (no `manifest.toml` inside), and the owning
-    /// [`AdmittedSource`] removes it when dropped.
-    fn fresh_staging_dir(&self, name: &str) -> Result<PathBuf, PluginError> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = self
-            .plugins_dir
-            .join(format!(".staging-{name}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
     }
 
     /// Remove a plugin by name.
@@ -520,15 +458,9 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get tool-capable plugins with their resolved WASM file paths.
-    /// Returns `(manifest, resolved_wasm_path)` tuples for building `WasmTool`s.
-    /// Tool plugins without a `wasm_path` are skipped.
-    pub fn tool_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
-        self.loaded
-            .values()
-            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Tool))
-            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
-            .collect()
+    /// Get tool-capable plugins with their admitted executable bytes.
+    pub fn tool_plugin_details(&self) -> Vec<(&PluginManifest, &AdmittedComponent)> {
+        self.executable_plugin_details(PluginCapability::Tool)
     }
 
     /// Get channel-capable plugins.
@@ -540,11 +472,31 @@ impl PluginHost {
             .collect()
     }
 
-    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &AdmittedComponent)> {
         self.loaded
             .values()
             .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
-            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
+            .filter_map(|p| {
+                p.component
+                    .as_ref()
+                    .map(|component| (&p.manifest, component))
+            })
+            .collect()
+    }
+
+    fn executable_plugin_details(
+        &self,
+        capability: PluginCapability,
+    ) -> Vec<(&PluginManifest, &AdmittedComponent)> {
+        self.loaded
+            .values()
+            .filter(|plugin| plugin.manifest.capabilities.contains(&capability))
+            .filter_map(|plugin| {
+                plugin
+                    .component
+                    .as_ref()
+                    .map(|component| (&plugin.manifest, component))
+            })
             .collect()
     }
 
@@ -579,8 +531,8 @@ impl PluginHost {
 }
 
 fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
-    let loaded = match &p.wasm_path {
-        Some(path) => path.exists(),
+    let loaded = match &p.component {
+        Some(_) => true,
         // Skill-only plugins are "loaded" if their skills/ subtree exists.
         None => p.plugin_dir.join(SKILLS_SUBDIR).is_dir(),
     };
@@ -590,9 +542,201 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
         description: p.manifest.description.clone(),
         capabilities: p.manifest.capabilities.clone(),
         permissions: p.manifest.permissions.clone(),
-        wasm_path: p.wasm_path.clone(),
+        wasm_path: p
+            .manifest
+            .wasm_path
+            .as_deref()
+            .map(|relative| p.plugin_dir.join(relative)),
         loaded,
     }
+}
+
+fn admit_component(
+    plugin_dir: &Path,
+    manifest: &PluginManifest,
+) -> Result<Option<AdmittedComponent>, PluginError> {
+    manifest
+        .wasm_path
+        .as_deref()
+        .map(|relative| {
+            let confined = resolve_confined_wasm_path(plugin_dir, relative)?;
+            let bytes = read_stable_file(&confined)?;
+            if let Some(expected) = manifest.wasm_sha256.as_deref() {
+                signature::verify_payload_digest(&bytes, expected)?;
+            }
+            Ok(AdmittedComponent::new(bytes))
+        })
+        .transpose()
+}
+
+/// Resolve a manifest executable without allowing traversal or symlink
+/// indirection outside the package. This validates the pathname used for the
+/// one admission read; it does not make later namespace substitutions safe.
+/// A payload path that passed package confinement, carried with the canonical
+/// package root and its directory identity from admission time.
+pub(crate) struct ConfinedPayload {
+    root: PathBuf,
+    root_handle: same_file::Handle,
+    path: PathBuf,
+}
+
+fn resolve_confined_wasm_path(
+    plugin_dir: &Path,
+    relative: &str,
+) -> Result<ConfinedPayload, PluginError> {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PluginError::InvalidManifest(format!(
+            "wasm_path must be a confined relative path (got {})",
+            relative.display()
+        )));
+    }
+
+    let root = std::fs::canonicalize(plugin_dir)?;
+    let root_handle = same_file::Handle::from_path(&root)?;
+    let mut candidate = root.clone();
+    for component in relative.components() {
+        if let Component::Normal(segment) = component {
+            candidate.push(segment);
+            let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    PluginError::NotFound(format!("WASM file not found: {}", candidate.display()))
+                } else {
+                    PluginError::Io(error)
+                }
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "wasm_path contains a symlink: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+
+    if !std::fs::metadata(&candidate)?.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload is not a regular file: {}",
+            candidate.display()
+        )));
+    }
+    let resolved = std::fs::canonicalize(&candidate)?;
+    if !resolved.starts_with(&root) || resolved != candidate {
+        return Err(PluginError::InvalidManifest(format!(
+            "wasm_path escapes plugin directory: {}",
+            relative.display()
+        )));
+    }
+    Ok(ConfinedPayload {
+        root,
+        root_handle,
+        path: resolved,
+    })
+}
+
+/// Largest executable payload admission will read into memory.
+///
+/// Discovery and install read a whole payload before its digest is verified or
+/// it is compiled, so without a bound an oversized file is fully retained
+/// before anything has a chance to reject it. 64 MiB clears real WASM
+/// components — including debug-info builds — by a wide margin while keeping
+/// a single malformed or hostile package from exhausting memory.
+const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a payload anchored to the package root that admitted it. This keeps
+/// the checked admission read tied to that root; it does not claim to close
+/// every filesystem namespace race.
+pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, PluginError> {
+    let ConfinedPayload {
+        root,
+        root_handle,
+        path,
+    } = confined;
+
+    let swapped = || {
+        PluginError::InvalidManifest(format!(
+            "WASM payload path changed after confinement check: {}",
+            path.display()
+        ))
+    };
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        PluginError::InvalidManifest(format!(
+            "WASM payload escaped its package root {}: {}",
+            root.display(),
+            path.display()
+        ))
+    })?;
+
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload is not a regular file: {}",
+            path.display()
+        )));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload is not a regular file: {}",
+            path.display()
+        )));
+    }
+
+    if opened_metadata.len() > MAX_COMPONENT_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload exceeds the {MAX_COMPONENT_BYTES}-byte admission limit: {} is {} bytes",
+            path.display(),
+            opened_metadata.len()
+        )));
+    }
+
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    if same_file::Handle::from_path(root)? != *root_handle {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin package root changed after confinement check: {}",
+            root.display()
+        )));
+    }
+
+    let mut prefix = root.clone();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(swapped());
+        };
+        prefix.push(segment);
+        if std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+            return Err(swapped());
+        }
+    }
+
+    if opened != same_file::Handle::from_path(path)? {
+        return Err(swapped());
+    }
+
+    // Bound the read, not just the stat above: the payload can grow between the
+    // size check and this read. Taking one byte past the limit makes an
+    // oversized payload detectable without retaining more than that.
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened_metadata.len().min(MAX_COMPONENT_BYTES)).unwrap_or(0),
+    );
+    file.take(MAX_COMPONENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_COMPONENT_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload grew past the {MAX_COMPONENT_BYTES}-byte admission limit while being read: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Validate manifest shape: `wasm_path` is required unless the plugin's only
@@ -647,6 +791,17 @@ fn validate_manifest_shape(
             "plugin '{}' is missing required `wasm_path` for non-skill capabilities",
             manifest.name
         )));
+    }
+
+    match (&manifest.wasm_path, &manifest.wasm_sha256) {
+        (Some(_), Some(digest)) => signature::validate_sha256_hex(digest)?,
+        (None, Some(_)) => {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin '{}' declares wasm_sha256 without wasm_path",
+                manifest.name
+            )));
+        }
+        _ => {}
     }
 
     // The `[egress]` declaration is signature-covered content, so a malformed
@@ -837,11 +992,34 @@ permissions = []
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         let plugins = host.list_plugins();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_a_symlinked_package_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        std::fs::write(
+            external.path().join("manifest.toml"),
+            "name = \"external\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(external.path().join("plugin.wasm"), b"\0asm").unwrap();
+
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        symlink(external.path(), plugins_dir.join("linked-package")).unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
     }
 
     #[test]
@@ -891,6 +1069,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::from_plugins_dir(dir.path()).unwrap();
         let plugins = host.list_plugins();
@@ -920,6 +1099,7 @@ capabilities = ["tool"]
         let nested = dir.path().join("plugins").join("p");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("manifest.toml"), manifest).unwrap();
+        std::fs::write(nested.join("p.wasm"), b"\0asm").unwrap();
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
         assert_eq!(host.list_plugins()[0].name, "p");
@@ -1080,6 +1260,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(tool_dir.join("tool.wasm"), b"\0asm").unwrap();
 
         // Channel plugin
         let chan_dir = plugins_base.join("my-channel");
@@ -1094,6 +1275,7 @@ capabilities = ["channel"]
 "#,
         )
         .unwrap();
+        std::fs::write(chan_dir.join("channel.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 2);
@@ -1118,6 +1300,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert!(host.get_plugin("lookup-test").is_some());
@@ -1139,6 +1322,7 @@ capabilities = ["tool"]
 "#,
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let mut host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
@@ -1293,6 +1477,7 @@ capabilities = ["tool"]
             "name = \"declares\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n\n[egress]\nhosts = [\"api.example.com\", \"*.cdn.example.com\"]\n",
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         let plugins = host.list_plugins();
@@ -1326,6 +1511,7 @@ capabilities = ["tool"]
             "name = \"legacy\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"http_client\"]\n",
         )
         .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
 
         let host = PluginHost::new(dir.path()).unwrap();
         assert_eq!(host.list_plugins().len(), 1);
@@ -1486,7 +1672,7 @@ capabilities = ["tool"]
             "a channel manifest with no wasm_path is not registrable as a live channel"
         );
         assert_eq!(details[0].0.name, "with-wasm");
-        assert!(details[0].1.ends_with("plugin.wasm"));
+        assert_eq!(details[0].1.bytes(), b"\0asm");
     }
 
     #[test]
@@ -1561,20 +1747,11 @@ capabilities = ["tool"]
         std::fs::write(dir.join("plugin.wasm"), wasm).unwrap();
     }
 
-    fn staging_entries(plugins_dir: &Path) -> Vec<String> {
-        std::fs::read_dir(plugins_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".staging-"))
-            .collect()
-    }
-
-    /// A second source carrying an already-loaded name is refused at
-    /// admission. The proof that its component is never touched is
-    /// observable: the candidate's bytes are not a component at all, so any
-    /// load would have failed with a load error, yet the answer is
-    /// `AlreadyLoaded`, no staging directory was created for a verifier to
-    /// run against, and the installed component still holds the first
+    /// A second source carrying an already-loaded name is refused before its
+    /// component is read. The proof is observable: the candidate's component
+    /// is a sparse file past the admission size limit, so reading it would
+    /// have failed with the size-limit error, yet the answer is
+    /// `AlreadyLoaded`, and the installed component still holds the first
     /// source's bytes.
     #[test]
     fn admit_source_refuses_a_duplicate_name_before_touching_its_component() {
@@ -1586,7 +1763,13 @@ capabilities = ["tool"]
         host.install(first.path().to_str().unwrap()).unwrap();
 
         let second = tempdir().unwrap();
-        write_tool_source(second.path(), "dup", b"not a component at all");
+        write_tool_source(second.path(), "dup", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(second.path().join("plugin.wasm"))
+            .unwrap()
+            .set_len(MAX_COMPONENT_BYTES + 1)
+            .unwrap();
         let err = host
             .admit_source(second.path().to_str().unwrap())
             .expect_err("a loaded name must be refused at admission");
@@ -1594,15 +1777,40 @@ capabilities = ["tool"]
             matches!(err, PluginError::AlreadyLoaded(ref name) if name == "dup"),
             "{err}"
         );
-        assert!(
-            staging_entries(plugins.path()).is_empty(),
-            "no staged copy may exist for a refused duplicate"
-        );
         assert_eq!(
             std::fs::read(plugins.path().join("dup/plugin.wasm")).unwrap(),
             b"\0asm first",
             "the installed component is untouched"
         );
+    }
+
+    /// The local install path is bounded like every other admission: a
+    /// component whose length exceeds the limit is refused from its metadata,
+    /// before a byte is read or buffered. A sparse file makes the case cheap
+    /// and deterministic, since its logical length costs no disk.
+    #[test]
+    fn admit_source_refuses_an_oversized_component_before_reading_it() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "huge", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(source.path().join("plugin.wasm"))
+            .unwrap()
+            .set_len(MAX_COMPONENT_BYTES + 1)
+            .unwrap();
+
+        let err = host
+            .admit_source(source.path().to_str().unwrap())
+            .expect_err("an oversized local component must be refused");
+        assert!(err.to_string().contains("admission limit"), "{err}");
+        let err = host
+            .install(source.path().to_str().unwrap())
+            .expect_err("install goes through the same admission");
+        assert!(err.to_string().contains("admission limit"), "{err}");
+        assert!(host.get_plugin("huge").is_none(), "nothing was installed");
+        assert!(!plugins.path().join("huge").exists());
     }
 
     /// What was admitted is what gets installed: a source swapped after
@@ -1616,13 +1824,11 @@ capabilities = ["tool"]
         write_tool_source(source.path(), "swapped", b"\0asm admitted");
 
         let admitted = host.admit_source(source.path().to_str().unwrap()).unwrap();
-        let staged = admitted
-            .staged_component()
-            .expect("a tool ships a component");
-        assert_eq!(std::fs::read(staged).unwrap(), b"\0asm admitted");
+        let component = admitted.component().expect("a tool ships a component");
+        assert_eq!(component.bytes(), b"\0asm admitted");
 
-        // The source changes underneath: a different payload, then a symlink
-        // to yet another file, as an attacker racing the install would do.
+        // The source changes underneath, as an attacker racing the install
+        // would do.
         std::fs::write(source.path().join("plugin.wasm"), b"\0asm swapped in").unwrap();
 
         let name = host.install_admitted(admitted).unwrap();
@@ -1631,27 +1837,6 @@ capabilities = ["tool"]
             std::fs::read(plugins.path().join("swapped/plugin.wasm")).unwrap(),
             b"\0asm admitted",
             "the verified bytes are the installed bytes"
-        );
-        assert!(
-            staging_entries(plugins.path()).is_empty(),
-            "installing consumes the staging directory"
-        );
-    }
-
-    #[test]
-    fn dropping_an_admitted_source_removes_its_staging_directory() {
-        let plugins = tempdir().unwrap();
-        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
-        let source = tempdir().unwrap();
-        write_tool_source(source.path(), "dropped", b"\0asm");
-
-        let admitted = host.admit_source(source.path().to_str().unwrap()).unwrap();
-        assert_eq!(staging_entries(plugins.path()).len(), 1);
-        drop(admitted);
-        assert!(staging_entries(plugins.path()).is_empty());
-        assert!(
-            host.get_plugin("dropped").is_none(),
-            "nothing was installed"
         );
     }
 
@@ -1681,7 +1866,6 @@ capabilities = ["tool"]
             .admit_source(source.path().to_str().unwrap())
             .expect_err("a symlinked component must be refused");
         assert!(matches!(err, PluginError::InvalidManifest(_)), "{err}");
-        assert!(staging_entries(plugins.path()).is_empty());
     }
 
     #[test]
@@ -1690,9 +1874,11 @@ capabilities = ["tool"]
         let plugin_dir = dir.path().join("signed-schema");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
-        let unsigned = r#"name = "signed-schema"
+        let unsigned = format!(
+            r#"name = "signed-schema"
 version = "0.1.0"
 wasm_path = "plugin.wasm"
+wasm_sha256 = "{}"
 capabilities = ["tool"]
 permissions = ["config_read"]
 
@@ -1705,9 +1891,11 @@ additionalProperties = false
 [config_schema.properties.retries]
 type = "integer"
 minimum = 1
-"#;
+"#,
+            signature::sha256_hex(b"\0asm")
+        );
         let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
-        let signed_value = signature::sign_manifest(unsigned, &private_key).unwrap();
+        let signed_value = signature::sign_manifest(&unsigned, &private_key).unwrap();
         let signed = unsigned.replacen(
             "wasm_path = \"plugin.wasm\"",
             &format!(
@@ -1727,6 +1915,37 @@ minimum = 1
 
         let tampered = signed.replace("minimum = 1", "minimum = 2");
         std::fs::write(plugin_dir.join("manifest.toml"), tampered).unwrap();
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Strict,
+            vec![publisher_key],
+        )
+        .unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn strict_discovery_requires_a_digest_after_signature_verifies() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("signed-without-digest");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"component bytes").unwrap();
+        let unsigned = r#"name = "signed-without-digest"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+"#;
+        let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
+        let signed_value = signature::sign_manifest(unsigned, &private_key).unwrap();
+        let signed = unsigned.replacen(
+            "wasm_path = \"plugin.wasm\"",
+            &format!(
+                "signature = \"{signed_value}\"\npublisher_key = \"{publisher_key}\"\nwasm_path = \"plugin.wasm\""
+            ),
+            1,
+        );
+        std::fs::write(plugin_dir.join("manifest.toml"), signed).unwrap();
+
         let host = PluginHost::from_plugins_dir_with_security(
             dir.path(),
             SignatureMode::Strict,
@@ -1772,6 +1991,149 @@ minimum = 1
             1,
             "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
         );
+    }
+
+    #[test]
+    fn admitted_component_retains_the_exact_verified_bytes() {
+        let root = tempdir().unwrap();
+        let plugin_dir = root.path().join("exact-bytes");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let admitted_bytes = b"first component generation";
+        std::fs::write(plugin_dir.join("plugin.wasm"), admitted_bytes).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"exact-bytes\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+                signature::sha256_hex(admitted_bytes)
+            ),
+        )
+        .unwrap();
+
+        let host = PluginHost::from_plugins_dir(root.path()).unwrap();
+        let component = host.tool_plugin_details()[0].1.clone();
+        std::fs::write(
+            plugin_dir.join("plugin.wasm"),
+            b"second component generation",
+        )
+        .unwrap();
+
+        assert_eq!(component.bytes(), admitted_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let package = root.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let payload = package.join("plugin.wasm");
+        std::fs::write(&payload, b"inside").unwrap();
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+        let outside = root.path().join("outside.wasm");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(&payload).unwrap();
+        symlink(&outside, &payload).unwrap();
+
+        assert!(matches!(
+            read_stable_file(&confined),
+            Err(PluginError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn stable_payload_read_rejects_a_payload_over_the_admission_limit() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // Sparse: reports an oversized length without writing the bytes, so the
+        // stat-side rejection is exercised without allocating 64 MiB in a test.
+        let payload = package.join("plugin.wasm");
+        let file = std::fs::File::create(&payload).unwrap();
+        file.set_len(MAX_COMPONENT_BYTES + 1).unwrap();
+        drop(file);
+
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+        let read = read_stable_file(&confined);
+
+        let Err(PluginError::InvalidManifest(message)) = read else {
+            panic!("oversized payload was admitted: {read:?}");
+        };
+        assert!(
+            message.contains("admission limit"),
+            "rejection should name the limit, got: {message}"
+        );
+    }
+
+    #[test]
+    fn stable_payload_read_admits_a_payload_at_the_admission_limit() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // The boundary itself is allowed: the limit rejects what exceeds it, not
+        // what reaches it. Kept small-but-real so the read path is exercised.
+        let payload = package.join("plugin.wasm");
+        let contents = vec![7u8; 4096];
+        std::fs::write(&payload, &contents).unwrap();
+
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+        assert_eq!(read_stable_file(&confined).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_package_root_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let package = root.path().join("plugins").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.wasm"), b"admitted component").unwrap();
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir_all(&attacker).unwrap();
+        std::fs::write(attacker.join("plugin.wasm"), b"attacker component").unwrap();
+
+        std::fs::rename(&package, root.path().join("plugins").join("pkg-moved")).unwrap();
+        symlink(&attacker, &package).unwrap();
+
+        let read = read_stable_file(&confined);
+        assert!(
+            !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
+            "package-root swap admitted attacker bytes"
+        );
+        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_intermediate_directory_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        let nested = package.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("plugin.wasm"), b"admitted component").unwrap();
+        let confined = resolve_confined_wasm_path(&package, "nested/plugin.wasm").unwrap();
+
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir_all(&attacker).unwrap();
+        std::fs::write(attacker.join("plugin.wasm"), b"attacker component").unwrap();
+
+        std::fs::rename(&nested, package.join("nested-moved")).unwrap();
+        symlink(&attacker, &nested).unwrap();
+
+        let read = read_stable_file(&confined);
+        assert!(
+            !matches!(&read, Ok(bytes) if bytes.as_slice() == b"attacker component"),
+            "intermediate-directory swap admitted attacker bytes"
+        );
+        assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
     }
 
     #[test]

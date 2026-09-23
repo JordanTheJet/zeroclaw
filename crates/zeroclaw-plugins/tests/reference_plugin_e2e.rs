@@ -13,6 +13,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -284,13 +286,15 @@ async fn reference_plugin_from_config_subprocess() {
 async fn verify_component_loads_accepts_the_fixture_and_rejects_a_non_component() {
     let manifest: PluginManifest = toml::from_str(FIXTURE_MANIFEST).unwrap();
 
-    zeroclaw_plugins::validate::verify_component_loads(&fixture(), &manifest)
+    let admitted = support::admit_fixture(&fixture(), &manifest);
+    zeroclaw_plugins::validate::verify_component_loads(&admitted, &manifest)
         .await
         .expect("the in-tree tool fixture must load against this host");
 
     let tmp = tempfile::tempdir().unwrap();
     let garbage = tmp.path().join("not-a-component.wasm");
     fs::write(&garbage, b"not a wasm component").unwrap();
+    let garbage = support::admit_fixture(&garbage, &manifest);
     let err = zeroclaw_plugins::validate::verify_component_loads(&garbage, &manifest)
         .await
         .expect_err("a non-component artifact must be refused, not accepted");

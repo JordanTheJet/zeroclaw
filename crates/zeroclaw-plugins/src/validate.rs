@@ -12,18 +12,22 @@
 //! operator at the CLI with its full diagnostic instead of vanishing into a log.
 
 use crate::PluginManifest;
+use crate::host::AdmittedComponent;
 use anyhow::Result;
-use std::path::Path;
 
-/// Verify the component at `wasm_path` instantiates against this host's WIT
-/// world for every capability the manifest declares. Returns the full
+/// Verify the admitted `component` instantiates against this host's WIT
+/// world for every capability the manifest declares. These are the exact bytes
+/// admission read, so the check covers what will be installed. Returns the full
 /// instantiation diagnostic (wasmtime cause-chain plus the WIT-drift rebuild
 /// hint) on failure.
 ///
 /// When the host is built without a WASM execution backend there is nothing to
 /// instantiate against, so this is a no-op that returns `Ok(())`.
 #[cfg(feature = "plugins-wasmtime")]
-pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest) -> Result<()> {
+pub async fn verify_component_loads(
+    component: &AdmittedComponent,
+    manifest: &PluginManifest,
+) -> Result<()> {
     use crate::PluginCapability;
     use crate::instance::PluginInstanceScope;
 
@@ -31,7 +35,7 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
     // module or a `wasm32-wasip1` build), a truncated or corrupt artifact, and
     // a non-component wasm — uniformly, including for capabilities that have no
     // dedicated instantiate world below.
-    let _component = crate::component::load_component(wasm_path)?;
+    let _component = crate::component::load_component(component)?;
 
     let services = validation_services();
     let limits = validation_limits();
@@ -46,7 +50,7 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
                 )?;
                 // `create_plugin` compiles and instantiates, then returns —
                 // it never calls a guest export, so it is exactly the load-check.
-                crate::runtime::create_plugin(wasm_path, &scope, &services, limits)
+                crate::runtime::create_plugin(component, &scope, &services, limits)
                     .await
                     .map(|_plugin| ())?;
             }
@@ -56,7 +60,7 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
                     PluginCapability::Channel,
                     manifest.permissions.iter().copied(),
                 )?;
-                crate::wasm_channel::verify_channel_loads(wasm_path, &scope, &services, limits)
+                crate::wasm_channel::verify_channel_loads(component, &scope, &services, limits)
                     .await?;
             }
             // Memory and other capabilities are covered by the compile check
@@ -70,7 +74,10 @@ pub async fn verify_component_loads(wasm_path: &Path, manifest: &PluginManifest)
 
 /// No-backend build: nothing to instantiate against, so verification passes.
 #[cfg(not(feature = "plugins-wasmtime"))]
-pub async fn verify_component_loads(_wasm_path: &Path, _manifest: &PluginManifest) -> Result<()> {
+pub async fn verify_component_loads(
+    _component: &AdmittedComponent,
+    _manifest: &PluginManifest,
+) -> Result<()> {
     Ok(())
 }
 
