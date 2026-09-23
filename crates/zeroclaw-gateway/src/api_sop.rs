@@ -355,6 +355,7 @@ pub(crate) mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = SopEngine::new(SopConfig {
             approval,

@@ -5808,6 +5808,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![sop]);
@@ -6622,6 +6623,7 @@ mod sop_step_reassembly_tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         // A step is revisited every other iteration, so the per-step visit
         // bound must stay well above the drive budget for this test to prove

@@ -1271,6 +1271,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -1733,6 +1734,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let store_for_engine: Arc<dyn SopRunStore> = store.clone();
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store_for_engine);

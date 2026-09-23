@@ -935,6 +935,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                 admission_policy: SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: None,
+                decision: None,
             }]);
             // Fill the single exec slot with an in-flight run.
             eng.start_run(
@@ -986,6 +987,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                 admission_policy: SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: None,
+                decision: None,
             }]);
         }
         (engine, audit)
@@ -1025,6 +1027,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                 admission_policy: SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: None,
+                decision: None,
             }
         }
 

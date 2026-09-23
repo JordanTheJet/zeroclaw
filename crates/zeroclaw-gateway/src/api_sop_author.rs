@@ -64,6 +64,35 @@ pub async fn handle_sop_trigger_sources(
     Json(registry).into_response()
 }
 
+/// `GET /api/sops/decision-models`: the `[decision_models]` aliases an SOP's
+/// `[decision] model` can select, sorted by alias. Never includes the API key.
+pub async fn handle_sop_decision_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut models: Vec<_> = {
+        let config = state.config.read();
+        config
+            .decision_models
+            .iter()
+            .filter_map(|(alias, m)| {
+                let (base_url, model) = m.endpoint()?;
+                Some(serde_json::json!({
+                    "alias": alias,
+                    "provider": m.provider,
+                    "model": model,
+                    "base_url": base_url,
+                }))
+            })
+            .collect()
+    };
+    models.sort_by(|a, b| a["alias"].as_str().cmp(&b["alias"].as_str()));
+    Json(serde_json::json!({ "models": models })).into_response()
+}
+
 /// Body for `POST /api/tools/param-options`: resolve selectable values
 /// for a domain-typed tool parameter. `args` carries sibling arguments
 /// already chosen so cascading domains (e.g. peer targets narrowing on
@@ -1069,6 +1098,7 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -1096,6 +1126,7 @@ mod tests {
             agent: owner.map(str::to_string),
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -1222,6 +1253,7 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -1659,6 +1691,7 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 

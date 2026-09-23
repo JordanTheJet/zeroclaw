@@ -25864,6 +25864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine =
             zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -51814,6 +51815,7 @@ Done."#;
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 

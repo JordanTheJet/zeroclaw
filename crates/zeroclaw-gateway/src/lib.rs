@@ -1976,6 +1976,10 @@ pub async fn run_gateway_with_plugin_webhooks(
             get(api_sop_author::handle_sop_trigger_sources),
         )
         .route(
+            "/api/sops/decision-models",
+            get(api_sop_author::handle_sop_decision_models),
+        )
+        .route(
             "/api/sops/graph-legend",
             get(api_sop_author::handle_sop_graph_legend),
         )
@@ -5436,6 +5440,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),
@@ -5492,6 +5497,7 @@ path = "{trigger_path}"
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
+            &std::collections::HashMap::new(),
             &data_dir,
             &install_root,
             Arc::clone(&state.mem),

@@ -492,6 +492,14 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// Named typed-decision models (`[decision_models.<alias>]`): TypeSafe Jev,
+    /// a self-hosted Laya, or any custom System One endpoint. An SOP selects
+    /// one by alias in its `[decision] model` field; an alias that is not
+    /// configured makes that SOP dispatch fail-closed.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub decision_models: HashMap<String, SopDecisionModelConfig>,
+
     /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
     /// issuer whose identities this daemon accepts and how their verified
     /// claims map to permission profiles. Any standards-compliant IdP
@@ -20838,6 +20846,7 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            decision_models: HashMap::new(),
             oidc: HashMap::new(),
             users: HashMap::new(),
             permission_profiles: HashMap::new(),
@@ -26994,6 +27003,80 @@ pub struct SopConfig {
     pub procedural_memory_enabled: bool,
 }
 
+/// Which typed-decision service a `[decision_models.<alias>]` entry uses.
+/// All speak the "System One" API (`POST <base_url>/v1/systemone`); the
+/// provider only sets the defaults for `base_url` and `model`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SopDecisionProvider {
+    /// TypeSafe Jev, hosted. Defaults: `https://api.typesafe.ai`, `jev-latest`. Needs `api_key`.
+    #[default]
+    Jev,
+    /// Laya, self-hosted with `laya-serve`. Defaults: `http://127.0.0.1:8000`, `laya`. No key.
+    Laya,
+    /// Any other System One-compatible endpoint. `base_url` is required.
+    Custom,
+}
+
+impl SopDecisionProvider {
+    /// Default `(base_url, model)` for this provider; `None` for `custom`.
+    pub fn defaults(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Jev => Some(("https://api.typesafe.ai", "jev-latest")),
+            Self::Laya => Some(("http://127.0.0.1:8000", "laya")),
+            Self::Custom => None,
+        }
+    }
+}
+
+/// `[decision_models.<alias>]` - a typed-decision model an SOP can select
+/// by alias in its `[decision] model` field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sop_decision_model"]
+pub struct SopDecisionModelConfig {
+    /// Service: `jev` (TypeSafe, hosted), `laya` (self-hosted), or `custom`.
+    #[serde(default)]
+    pub provider: SopDecisionProvider,
+    /// Endpoint base URL. Defaults from `provider`; required for `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model id sent with each request. Defaults from `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Bearer token for the endpoint. Not needed for a local Laya server.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl SopDecisionModelConfig {
+    /// The `(base_url, model)` this entry calls, with provider defaults
+    /// applied. `None` when no base URL is known (`custom` without one).
+    pub fn endpoint(&self) -> Option<(String, String)> {
+        let defaults = self.provider.defaults();
+        let base_url = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .or(defaults.map(|(url, _)| url))?;
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .or(defaults.map(|(_, model)| model))
+            .unwrap_or("jev-latest");
+        Some((base_url.to_string(), model.to_string()))
+    }
+}
+
 impl SopConfig {
     /// Whether the SOP runtime (engine, tools, maintenance tick, run store) is
     /// active for this config. SOP loading is gated on a concrete definitions
@@ -31717,6 +31800,7 @@ auto_save = true
                 );
                 m
             },
+            decision_models: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -33077,6 +33161,7 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            decision_models: HashMap::new(),
             oidc: HashMap::new(),
             users: HashMap::new(),
             permission_profiles: HashMap::new(),

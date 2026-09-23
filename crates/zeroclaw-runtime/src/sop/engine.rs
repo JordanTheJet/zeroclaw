@@ -112,6 +112,9 @@ pub struct SopEngine {
     /// state again; maintenance consumes this map until the write lands. The
     /// durable run row stays the source of truth for status.
     pending_orphan_settlements: std::collections::HashMap<String, OrphanedRunSettlement>,
+    /// Decision models by alias, consulted by dispatch for SOPs with a
+    /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
+    decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -321,12 +324,19 @@ pub(crate) struct StartReservation {
     claim: ClaimToken,
     sop: Sop,
     deterministic: bool,
+    decided_mode: Option<SopExecutionMode>,
 }
 
 impl StartReservation {
     /// The SOP this reservation holds a slot for.
     pub(crate) fn sop_name(&self) -> &str {
         &self.sop.name
+    }
+
+    /// Run the reserved SOP in `mode` instead of its authored mode. Set before
+    /// activation, because activation already gates the first step.
+    pub(crate) fn set_decided_mode(&mut self, mode: Option<SopExecutionMode>) {
+        self.decided_mode = mode;
     }
 }
 
@@ -372,7 +382,22 @@ impl SopEngine {
             step_budget_finalization_ready: std::collections::HashSet::new(),
             headless_drivers: std::collections::HashSet::new(),
             pending_orphan_settlements: std::collections::HashMap::new(),
+            decision_models: HashMap::new(),
         }
+    }
+
+    /// Register decision models by alias (see [`super::decision`]).
+    pub fn with_decision_models(
+        mut self,
+        models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
+    ) -> Self {
+        self.decision_models.extend(models);
+        self
+    }
+
+    /// The decision model an SOP selected by `alias`, if configured.
+    pub fn decision_model(&self, alias: &str) -> Option<Arc<dyn super::decision::DecisionModel>> {
+        self.decision_models.get(alias).cloned()
     }
 
     /// Inject a durable run-state store (used by `build_sop_engine`). Default is
@@ -1046,7 +1071,8 @@ impl SopEngine {
                     .steps
                     .iter()
                     .find(|step| step.number == run.current_step)?;
-                pending_step_blocks_direct_advance(sop, step).then(|| (sop.clone(), step.clone()))
+                pending_step_blocks_direct_advance(&sop_for_run(sop, run.decided_mode), step)
+                    .then(|| (sop.clone(), step.clone()))
             }) else {
                 continue;
             };
@@ -1870,6 +1896,20 @@ impl SopEngine {
         self.activate_reserved_run(reservation, event, initiator)
     }
 
+    /// Start a headless-triggered run with a dispatch-decided execution mode.
+    /// Dispatch has no initiating agent turn, so the initiator is `None`, as it
+    /// is for every headless trigger in [`Self::start_run`].
+    pub fn start_run_with_mode(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+        decided_mode: Option<SopExecutionMode>,
+    ) -> Result<SopRunAction> {
+        let mut reservation = self.reserve_run_slot(sop_name)?;
+        reservation.set_decided_mode(decided_mode);
+        self.activate_reserved_run(reservation, event, None)
+    }
+
     /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
     /// store CAS WITHOUT creating an active run or dispatching any step — so no SOP
     /// side effect occurs yet. The returned `StartReservation` holds a live claim; the
@@ -1921,6 +1961,7 @@ impl SopEngine {
             claim,
             sop,
             deterministic,
+            decided_mode: None,
         })
     }
 
@@ -1946,6 +1987,7 @@ impl SopEngine {
             claim,
             sop,
             deterministic,
+            decided_mode,
         } = reservation;
 
         let run = SopRun {
@@ -1965,6 +2007,7 @@ impl SopEngine {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode,
         };
         let first_input = step_input_value(&run, 1);
         self.active_runs.insert(run_id.clone(), run);
@@ -2103,12 +2146,13 @@ impl SopEngine {
                 ))
             })?;
 
-        if self
-            .active_runs
-            .get(run_id)
-            .is_some_and(|run| run.status == SopRunStatus::Pending)
-            && pending_step_blocks_direct_advance(&sop, &current_step)
-        {
+        if self.active_runs.get(run_id).is_some_and(|run| {
+            run.status == SopRunStatus::Pending
+                && pending_step_blocks_direct_advance(
+                    &sop_for_run(&sop, run.decided_mode),
+                    &current_step,
+                )
+        }) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -2559,7 +2603,13 @@ impl SopEngine {
         // Upstream's resolve_step_action now forces approval whenever the
         // SOP-level mode needs it (strictly stronger than the old
         // approval_mode-conditional escalation), so the mode param is gone.
-        let action = resolve_step_action(sop, &step, run_id.to_string(), context);
+        let decided_mode = self.active_runs.get(run_id).and_then(|r| r.decided_mode);
+        let action = resolve_step_action(
+            &sop_for_run(sop, decided_mode),
+            &step,
+            run_id.to_string(),
+            context,
+        );
         let parked_for_approval = matches!(action, SopRunAction::WaitApproval { .. });
         let has_prior_gate_presentation = parked_for_approval
             && self.run_events(run_id).is_ok_and(|events| {
@@ -6266,6 +6316,20 @@ pub(crate) fn filesystem_event_listed(
 
 // ── Execution mode resolution ───────────────────────────────────
 
+/// The SOP as one run gates it: a mode decided at dispatch replaces the
+/// authored mode. Step-level `mode`, `requires_confirmation`, and checkpoints
+/// are untouched, so a decision can never remove a per-step gate.
+fn sop_for_run(sop: &Sop, decided_mode: Option<SopExecutionMode>) -> std::borrow::Cow<'_, Sop> {
+    match decided_mode {
+        Some(mode) if mode != sop.execution_mode => {
+            let mut sop = sop.clone();
+            sop.execution_mode = mode;
+            std::borrow::Cow::Owned(sop)
+        }
+        _ => std::borrow::Cow::Borrowed(sop),
+    }
+}
+
 fn execution_mode_needs_approval(mode: SopExecutionMode, sop: &Sop, step: &SopStep) -> bool {
     match mode {
         // Deterministic mode is handled via start_deterministic_run;
@@ -6659,6 +6723,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -8971,6 +9036,7 @@ mod tests {
                 llm_calls_saved: 0,
                 revision: 0,
                 revision_base: 0,
+                decided_mode: None,
             },
         );
         assert_eq!(
@@ -9023,6 +9089,7 @@ mod tests {
                     llm_calls_saved: 0,
                     revision: 0,
                     revision_base: 0,
+                    decided_mode: None,
                 },
             );
         }
@@ -9068,6 +9135,7 @@ mod tests {
                 llm_calls_saved: 0,
                 revision: 0,
                 revision_base: 0,
+                decided_mode: None,
             },
         );
         let step = SopStep {
@@ -9750,6 +9818,7 @@ mod tests {
                 llm_calls_saved: 0,
                 revision: 0,
                 revision_base: 0,
+                decided_mode: None,
             };
             store
                 .save_run(&PersistedRun::new(
@@ -10283,6 +10352,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
         assert!(ctx.contains("pump-shutdown"));
@@ -11169,6 +11239,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         store
             .save_run(&PersistedRun::new(
@@ -11224,6 +11295,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         store
             .save_run(&PersistedRun::new(parked, now, SopTriggerSource::Manual))
@@ -11294,6 +11366,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         store
             .save_run(&PersistedRun::new(
@@ -13060,6 +13133,7 @@ mod tests {
                 llm_calls_saved: 0,
                 revision: 0,
                 revision_base: 0,
+                decided_mode: None,
             },
         );
         let out = engine
@@ -13356,6 +13430,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -13684,6 +13759,7 @@ type = "manual"
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -14080,6 +14156,7 @@ type = "manual"
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -14257,6 +14334,7 @@ type = "manual"
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14288,6 +14366,7 @@ type = "manual"
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14328,6 +14407,7 @@ type = "manual"
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14362,6 +14442,7 @@ type = "manual"
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14415,6 +14496,7 @@ type = "manual"
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -14596,6 +14678,7 @@ type = "manual"
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = engine_with_sops(vec![sop]);
         let event = SopEvent {
@@ -16011,6 +16094,7 @@ type = "manual"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         store
             .save_run(&PersistedRun::new(
@@ -16057,6 +16141,7 @@ type = "manual"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         engine.active_runs.insert(run.run_id.clone(), run.clone());
 
@@ -16655,6 +16740,7 @@ type = "manual"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         store
             .save_run(&PersistedRun::new(
