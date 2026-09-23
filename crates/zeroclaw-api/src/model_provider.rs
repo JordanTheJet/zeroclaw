@@ -159,13 +159,20 @@ pub struct ToolCall {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
-    /// Total prompt size: uncached + cached input tokens.
+    /// Total prompt size: uncached + cached input tokens (including the
+    /// cache-write subset when the provider reports it separately).
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     /// Subset of `input_tokens` that was served from the model_provider's
     /// prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
+    /// Subset of `input_tokens` that the model_provider wrote into its
+    /// prompt cache on this request (Anthropic
+    /// `cache_creation_input_tokens`, OpenAI-compatible
+    /// `prompt_tokens_details.cache_creation_input_tokens`). Providers
+    /// bill these at a premium over the plain input rate.
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// An LLM response that may contain text, tool calls, or both.
@@ -282,6 +289,27 @@ pub enum ConversationMessage {
     },
     /// Results of tool executions, fed back to the LLM.
     ToolResults(Vec<ToolResultMessage>),
+}
+
+/// Project a full agent conversation history down to the flat `ChatMessage`
+/// shape durable session backends store: user/assistant chat turns only,
+/// system prompt excluded (the backend restores against the caller's own
+/// system prompt, not a persisted one). `AssistantToolCalls` and
+/// `ToolResults` are tool-loop plumbing that durable session transcripts have
+/// never persisted; only the visible chat turns are kept.
+///
+/// Callers that own the agent's authoritative post-turn history (after
+/// budget-enforcement trimming) should use this to replace a durable
+/// transcript wholesale rather than appending the turn's delta on top of a
+/// transcript the agent may have already trimmed underneath it.
+pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A chunk of content from a streaming response.
@@ -413,6 +441,35 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// A provider safety refusal that completed at the transport layer but cannot
+/// be accepted as an assistant response.
+///
+/// The optional usage belongs to the refusing attempt. It is carried on the
+/// typed cause so reliability and turn accounting can bill that work without
+/// treating it as accepted-response context usage. `category` is diagnostic
+/// metadata only and must not be rendered to users.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("anthropic refusal: model declined this request (safety classifiers)")]
+pub struct ModelRefusalError {
+    /// Model requested on the refusing attempt.
+    pub requested_model: String,
+    /// Refusal category token, when the provider supplied one.
+    pub category: Option<String>,
+    /// Normalized usage billed by the refusing attempt.
+    pub usage: Option<Box<TokenUsage>>,
+    /// Exact reliability candidate that emitted a streamed refusal.
+    ///
+    /// Leaf providers leave this unset. Composite providers fill it while
+    /// forwarding a stream so a non-streaming recovery can skip exactly the
+    /// already-billed candidate.
+    pub attempted_candidate: Option<String>,
+    /// Position of that candidate in the active reliability domain.
+    ///
+    /// This disambiguates same-profile fallback models, which intentionally
+    /// share one configured candidate/cooldown identity.
+    pub attempted_candidate_index: Option<usize>,
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -427,6 +484,9 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    #[error(transparent)]
+    ModelRefusal(#[from] Box<ModelRefusalError>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

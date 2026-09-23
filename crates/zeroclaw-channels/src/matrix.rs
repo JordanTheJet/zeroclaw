@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
 use matrix_sdk::{
-    Client,
+    Client, RoomMemberships,
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::{
@@ -202,6 +202,32 @@ mod allowlist {
         )
     }
 
+    /// Matches a voice-peer entry against a joined member's user ID the same
+    /// way the runtime matches an inbound sender: a leading `@` is optional on
+    /// either side and the comparison ignores ASCII case. Without this, a group
+    /// written as `alice:server` would voice ordinary replies (which the
+    /// runtime resolves) but silently fail to voice proactive sends (which have
+    /// to consult room membership), and a half-working config is exactly the
+    /// failure this gate exists to remove.
+    pub(super) fn voice_peer_matches(entry: &str, user_id: &str) -> bool {
+        entry
+            .trim_start_matches('@')
+            .eq_ignore_ascii_case(user_id.trim_start_matches('@'))
+    }
+
+    /// Voice verdict that needs no member list: an empty voice-peer set voices
+    /// nobody, and a `["*"]` set voices every room. `None` means the room's
+    /// membership decides, which costs a homeserver round-trip.
+    pub(super) fn voice_peers_verdict(voice_peers: &[String]) -> Option<bool> {
+        if voice_peers.is_empty() {
+            return Some(false);
+        }
+        if voice_peers.iter().any(|peer| peer == "*") {
+            return Some(true);
+        }
+        None
+    }
+
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
         if allowed_rooms.is_empty() {
             return true;
@@ -215,7 +241,7 @@ mod allowlist {
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
-    use zeroclaw_api::channel::ChannelApprovalResponse;
+    use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
 
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -229,6 +255,14 @@ mod approval {
     pub(super) fn generate_token_default() -> String {
         let mut rng = rand::rng();
         generate_token(&mut rng)
+    }
+
+    /// Build the outbound `SendMessage` for an approval prompt: the rendered
+    /// prompt text to the requesting recipient, with voice synthesis
+    /// suppressed. Kept as a small, pure helper so tests can assert its shape
+    /// (recipient, voice suppression) without standing up a live client.
+    pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
+        SendMessage::new(prompt, recipient).suppress_voice()
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -586,6 +620,18 @@ mod streaming {
     #[cfg(test)]
     pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
         matches!(state, State::Multi(drafts) if drafts.contains_key(key))
+    }
+
+    /// Thread anchor of the live draft for `key`, without consuming it. The
+    /// finalize path needs it to place a voice note in the same thread as the
+    /// text reply it accompanies.
+    pub(super) fn peek_thread_anchor(state: &State, key: &DraftKey) -> Option<OwnedEventId> {
+        match state {
+            State::Off => None,
+            State::Partial(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+            State::Single(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+            State::Multi(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+        }
     }
 
     pub(super) fn partial_should_edit(
@@ -1715,15 +1761,17 @@ mod client {
             .as_deref()
             .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
-        let response = reqwest::Client::builder()
-            .timeout(WHOAMI_TIMEOUT)
-            .build()
-            .context("matrix: build whoami HTTP client")?
-            .get(url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("matrix: whoami request failed")?;
+        let response = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().timeout(WHOAMI_TIMEOUT),
+            "channel.matrix",
+        )
+        .build()
+        .context("matrix: build whoami HTTP client")?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("matrix: whoami request failed")?;
         let status = response.status();
 
         if !status.is_success() {
@@ -2391,6 +2439,11 @@ mod inbound {
             }
             _ => None,
         };
+        // Read off this event alone: a reply whose parent is a voice note
+        // stays text-origin.
+        let voice_origin = media_kind
+            .as_ref()
+            .is_some_and(|info| matches!(info.kind, MediaCategory::Voice));
 
         if let Some(info) = media_kind {
             content = attach_media(
@@ -2457,7 +2510,7 @@ mod inbound {
             interruption_scope_id: interruption_scope,
             attachments,
             subject: None,
-
+            voice_origin,
             ..Default::default()
         };
 
@@ -2917,21 +2970,7 @@ pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,
 ) -> anyhow::Result<crate::transcription::TranscriptionManager> {
-    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
-        config,
-        agent_provider.to_string(),
-    )?;
-    if !agent_provider.is_empty() {
-        return Ok(manager);
-    }
-    let sole_provider = match manager.available_providers().as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    };
-    Ok(match sole_provider {
-        Some(alias) => manager.with_agent_transcription_provider(alias),
-        None => manager,
-    })
+    crate::transcription::build_channel_transcription_manager(config, agent_provider)
 }
 
 /// Resolves transcription state from live config at message time. `None` means
@@ -2941,6 +2980,16 @@ pub(crate) fn build_transcription_manager(
 /// Held as a closure rather than a config snapshot so reloadable provider
 /// policy is never copied into this long-lived channel handle
 /// (see AGENTS.md "Single Source Of Truth").
+/// Resolves the TTS manager from live config at send time. `None` means TTS is
+/// disabled or the owning agent has no `tts_provider`; the inner `Result`
+/// carries provider registration failures.
+///
+/// A closure rather than a snapshot, so reloadable provider policy is never
+/// copied into this long-lived channel handle
+/// (see AGENTS.md "Single Source Of Truth").
+pub(crate) type TtsResolver =
+    Arc<dyn Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync>;
+
 pub(crate) type TranscriptionResolver = Arc<
     dyn Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>> + Send + Sync,
 >;
@@ -2994,7 +3043,6 @@ mod outbound {
             },
         },
     };
-    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
     use std::time::Duration;
@@ -3388,12 +3436,15 @@ mod outbound {
                 }
                 attempt.follow()
             });
-            reqwest::Client::builder()
-                .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(redirect_policy)
-                .user_agent("zeroclaw-matrix/1.0")
-                .build()
-                .expect("default reqwest client config never fails to build")
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder()
+                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .redirect(redirect_policy)
+                    .user_agent("zeroclaw-matrix/1.0"),
+                "channel.matrix",
+            )
+            .build()
+            .expect("default reqwest client config never fails to build")
         })
     }
 
@@ -3876,16 +3927,13 @@ mod outbound {
         Voice,
     }
 
-    async fn upload_attachment(
+    pub(super) async fn upload_attachment(
         room: &Room,
         att: &MediaAttachment,
         kind: AttachmentKind,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
         let mime = attachment_mime(att);
-        if matches!(kind, AttachmentKind::Voice) {
-            return upload_voice(room, att, &mime, thread_anchor).await;
-        }
         let config = attachment_config_for(att, kind, &mime, thread_anchor);
         let resp = room
             .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
@@ -3950,9 +3998,18 @@ mod outbound {
                 size,
                 ..Default::default()
             }),
+            // `duration` and `waveform` must both be `Some` for the SDK to emit
+            // an `org.matrix.msc1767.audio` block at all, and without a
+            // duration clients render a voice bubble stuck at `00:00` with no
+            // seek bar. The length is read straight out of the Ogg container by
+            // `opus_duration` -- no decoding, and no length asserted when the
+            // bytes cannot be read with certainty, in which case the previous
+            // zero is still sent. The waveform stays empty: it is optional in
+            // MSC1767 and would need decoded PCM.
             AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                duration: Some(opus_duration(&att.data).unwrap_or(Duration::ZERO)),
                 size,
-                ..Default::default()
+                waveform: Some(Vec::new()),
             }),
             AttachmentKind::File | AttachmentKind::Auto => {
                 AttachmentInfo::File(BaseFileInfo { size })
@@ -3972,60 +4029,235 @@ mod outbound {
         }
     }
 
-    /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
-    /// stable matrix-sdk types don't carry. Send via raw JSON, attaching the
-    /// thread relation manually when the bot is replying inside one.
-    async fn upload_voice(
+    /// Playback length of an Ogg-Opus stream, read from the container alone.
+    ///
+    /// Opus always ticks at 48 kHz, so the length is the span the granule
+    /// positions cover, less the priming samples `OpusHead` asks the decoder to
+    /// discard:
+    ///
+    /// ```text
+    /// samples = final_granule - start_granule - pre_skip
+    /// ```
+    ///
+    /// `start_granule` is derived rather than stored. RFC 7845 section 4.5 lets
+    /// the first audio page carry a granule larger than the samples completing
+    /// on it, which is how a clip keeps the timeline of the recording it was cut
+    /// from; taking that page's granule as the origin would report the offset as
+    /// playback time. The origin is the granule minus the samples of the packets
+    /// completing on the page, counted from Opus table-of-contents metadata
+    /// (RFC 6716 section 3.1) without decoding audio.
+    ///
+    /// That page may instead carry a granule *below* those samples, but only
+    /// when it also ends the stream: the tail is trimmed to finish somewhere
+    /// other than a frame boundary, and the timeline starts at zero. The same
+    /// granule on a page that does not end the stream is invalid.
+    ///
+    /// Only a single logical stream is measured. A page whose serial differs
+    /// from the opening stream's, or a second beginning-of-stream page, belongs
+    /// to a chained or multiplexed file, whose length one number cannot honestly
+    /// describe.
+    ///
+    /// Returns `None` -- never a guess -- when the stream cannot be read end to
+    /// end: a bad capture pattern, a first page that is not a lone `OpusHead`
+    /// marked beginning-of-stream, a segment table or page body running past the
+    /// end, an audio page opening mid-packet, a table-of-contents byte that will
+    /// not parse, no page carrying a known granule, or a span shorter than
+    /// `pre_skip`.
+    pub(super) fn opus_duration(bytes: &[u8]) -> Option<Duration> {
+        /// `OggS`, version, header type, granule, serial, sequence, checksum,
+        /// segment count -- the fixed part of a page header.
+        const PAGE_HEADER_LEN: usize = 27;
+        /// `OpusHead`, version, channel count, `pre_skip`.
+        const OPUS_HEAD_LEN: usize = 12;
+        /// Opus granule positions always tick at 48 kHz, whatever the input
+        /// sample rate was.
+        const GRANULE_HZ: u64 = 48_000;
+        /// Header-type bit for a page opening with the tail of a packet carried
+        /// over from the page before it.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page that begins a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page that ends a logical stream.
+        const EOS: u8 = 0x04;
+        /// `OpusHead` then `OpusTags` precede the audio; the latter may span
+        /// pages, so audio begins once both have completed.
+        const HEADER_PACKETS: u32 = 2;
+
+        let mut cursor = 0usize;
+        let mut serial: Option<u32> = None;
+        let mut pre_skip: Option<u64> = None;
+        let mut header_packets = 0u32;
+        let mut start_granule: Option<u64> = None;
+        let mut last_granule: Option<u64> = None;
+
+        while bytes.len() - cursor >= PAGE_HEADER_LEN {
+            let header = bytes.get(cursor..cursor + PAGE_HEADER_LEN)?;
+            if &header[..4] != b"OggS" {
+                return None;
+            }
+            let header_type = header[5];
+            let granule = u64::from_le_bytes(header[6..14].try_into().ok()?);
+            let page_serial = u32::from_le_bytes(header[14..18].try_into().ok()?);
+            let segments = usize::from(header[26]);
+            // The segment table follows the fixed header; its bytes sum to the
+            // page body length.
+            let table_start = cursor.checked_add(PAGE_HEADER_LEN)?;
+            let body_start = table_start.checked_add(segments)?;
+            let table = bytes.get(table_start..body_start)?;
+            let body_len = table.iter().map(|&n| usize::from(n)).sum::<usize>();
+            let body_end = body_start.checked_add(body_len)?;
+            let body = bytes.get(body_start..body_end)?;
+
+            match serial {
+                None => {
+                    // The identification header opens the stream and holds its
+                    // page alone.
+                    if header[4] != 0
+                        || header_type & BOS == 0
+                        || body.len() < OPUS_HEAD_LEN
+                        || &body[..8] != b"OpusHead"
+                        || completed_packets(table) != 1
+                    {
+                        return None;
+                    }
+                    serial = Some(page_serial);
+                    pre_skip = Some(u64::from(u16::from_le_bytes([body[10], body[11]])));
+                }
+                // Another logical stream, concatenated after this one or
+                // interleaved with it. A reused serial still starts a new
+                // stream when the page is marked beginning-of-stream.
+                Some(open) if open != page_serial || header_type & BOS != 0 => return None,
+                Some(_) => {}
+            }
+
+            if header_packets < HEADER_PACKETS {
+                header_packets = header_packets.saturating_add(completed_packets(table));
+                if header_packets > HEADER_PACKETS {
+                    // Audio riding on the page that finishes `OpusTags`. The
+                    // first audio packet opens a page of its own, so there is
+                    // no page whose granule the origin can be derived from.
+                    return None;
+                }
+            } else if start_granule.is_none() {
+                // The first audio page fixes the origin the rest is measured
+                // from, so it has to be whole and timed.
+                if header_type & CONTINUED != 0 || granule == u64::MAX {
+                    return None;
+                }
+                let samples = completed_packet_samples(table, body)?;
+                start_granule = Some(match granule.checked_sub(samples) {
+                    Some(origin) => origin,
+                    // A granule below the samples completing on the page trims
+                    // the tail, which only a page ending the stream may do. The
+                    // timeline then starts at zero rather than being derivable
+                    // by working backwards.
+                    None if header_type & EOS != 0 => 0,
+                    None => return None,
+                });
+            }
+
+            // `u64::MAX` is the "granule not known for this page" marker.
+            if granule != u64::MAX {
+                last_granule = Some(granule);
+            }
+            // Always forward progress: `body_end` is at least one header past
+            // `cursor`, even for a page with no segments.
+            cursor = body_end;
+        }
+        if cursor != bytes.len() {
+            // Trailing bytes that are not a page: the buffer is truncated or
+            // is not what it claims to be.
+            return None;
+        }
+
+        let samples = last_granule?
+            .checked_sub(start_granule?)?
+            .checked_sub(pre_skip?)?;
+        Some(Duration::new(
+            samples / GRANULE_HZ,
+            // Exact, and cannot overflow: the remainder is below 48_000.
+            ((samples % GRANULE_HZ) * 1_000_000_000 / GRANULE_HZ) as u32,
+        ))
+    }
+
+    /// How many packets finish on a page, from its segment table.
+    ///
+    /// A lacing value below 255 ends a packet; a run of 255s carries one onto
+    /// the following page.
+    fn completed_packets(table: &[u8]) -> u32 {
+        u32::try_from(table.iter().filter(|&&lacing| lacing < 255).count()).unwrap_or(u32::MAX)
+    }
+
+    /// Samples carried by the packets that finish on one page.
+    ///
+    /// A trailing run of 255s belongs to a packet continuing onto the next page
+    /// and contributes nothing here, which is what makes this a count of the
+    /// audio the page's granule position accounts for.
+    fn completed_packet_samples(table: &[u8], body: &[u8]) -> Option<u64> {
+        let mut total = 0u64;
+        let mut offset = 0usize;
+        let mut packet_len = 0usize;
+        for &lacing in table {
+            packet_len = packet_len.checked_add(usize::from(lacing))?;
+            if lacing < 255 {
+                let end = offset.checked_add(packet_len)?;
+                total = total.checked_add(opus_packet_samples(body.get(offset..end)?)?)?;
+                offset = end;
+                packet_len = 0;
+            }
+        }
+        Some(total)
+    }
+
+    /// Samples in one Opus packet, on the 48 kHz granule clock.
+    ///
+    /// The first byte is the table of contents (RFC 6716 section 3.1): its top
+    /// five bits select the frame length and its bottom two how many frames the
+    /// packet holds. Length needs nothing further -- the encoded audio itself is
+    /// never touched.
+    fn opus_packet_samples(packet: &[u8]) -> Option<u64> {
+        /// Frame length per table-of-contents configuration, in samples at
+        /// 48 kHz: SILK narrow, medium and wideband run 10/20/40/60 ms, hybrid
+        /// super-wideband and fullband 10/20 ms, and CELT 2.5/5/10/20 ms per
+        /// band. Expressed in samples so the 2.5 ms case stays a whole number.
+        const FRAME_SAMPLES: [u64; 32] = [
+            480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960,
+            120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+        ];
+        /// A packet holds at most 120 ms of audio.
+        const MAX_PACKET_SAMPLES: u64 = 5_760;
+
+        let toc = *packet.first()?;
+        let frame = *FRAME_SAMPLES.get(usize::from(toc >> 3))?;
+        let frames = match toc & 0x03 {
+            0 => 1,
+            1 | 2 => 2,
+            // An arbitrary frame count, in the six low bits of the next byte.
+            _ => u64::from(*packet.get(1)? & 0x3F),
+        };
+        let samples = frame.checked_mul(frames)?;
+        (samples > 0 && samples <= MAX_PACKET_SAMPLES).then_some(samples)
+    }
+
+    /// Ogg/Opus is what `TtsManager::synthesize_opus` produces and what Matrix
+    /// clients expect for a voice note.
+    pub(super) const VOICE_NOTE_MIME: &str = "audio/ogg";
+    pub(super) const VOICE_NOTE_FILE_NAME: &str = "voice.ogg";
+
+    /// Deliver synthesized speech as an MSC3245 voice note, in the same
+    /// thread as the text reply it accompanies.
+    pub(super) async fn send_voice_note(
         room: &Room,
-        att: &MediaAttachment,
-        mime: &mime_guess::Mime,
+        audio: Vec<u8>,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mxc = room
-            .client()
-            .media()
-            .upload(mime, att.data.clone(), None)
-            .await
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "media upload failed"
-                );
-                anyhow::Error::msg(format!("media upload failed: {e}"))
-            })?;
-        let mut event = json!({
-            "msgtype": "m.audio",
-            "body": att.file_name,
-            "filename": att.file_name,
-            "url": mxc.content_uri.to_string(),
-            "info": {
-                "mimetype": mime.essence_str(),
-                "size": att.data.len(),
-            },
-            "org.matrix.msc3245.voice": {},
-            "org.matrix.msc1767.audio": {
-                "duration": 0u32,
-                "waveform": Vec::<u32>::new(),
-            },
-        });
-        if let Some(anchor) = thread_anchor
-            && let Some(obj) = event.as_object_mut()
-        {
-            obj.insert(
-                "m.relates_to".to_string(),
-                json!({
-                    "rel_type": "m.thread",
-                    "event_id": anchor.as_str(),
-                    "is_falling_back": true,
-                    "m.in_reply_to": { "event_id": anchor.as_str() },
-                }),
-            );
-        }
-        let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.response.event_id)
+        let att = MediaAttachment {
+            file_name: VOICE_NOTE_FILE_NAME.to_string(),
+            data: audio,
+            mime_type: Some(VOICE_NOTE_MIME.to_string()),
+            marker: None,
+        };
+        upload_attachment(room, &att, AttachmentKind::Voice, thread_anchor).await
     }
 
     fn derive_file_name(target: &str) -> String {
@@ -4062,6 +4294,10 @@ pub struct MatrixChannel {
     state_dir: PathBuf,
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<TranscriptionResolver>,
+    tts: Option<TtsResolver>,
+    /// Recipients the operator placed in a voice-modality peer group.
+    /// Resolved from live config on every send, never cached.
+    voice_peers: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     client: tokio::sync::OnceCell<Client>,
     pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
@@ -4110,6 +4346,8 @@ impl MatrixChannel {
             state_dir,
             workspace_dir: None,
             transcription: None,
+            tts: None,
+            voice_peers: Arc::new(Vec::new),
             client: tokio::sync::OnceCell::new(),
             pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
             streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
@@ -4146,6 +4384,25 @@ impl MatrixChannel {
         + 'static,
     ) -> Self {
         self.transcription = Some(Arc::new(factory));
+        self
+    }
+
+    /// Install the channel runtime's live-config TTS resolver, so the owning
+    /// agent's `tts_provider` and reloaded provider policy are honoured.
+    pub(crate) fn with_tts_manager_factory(
+        mut self,
+        factory: impl Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync + 'static,
+    ) -> Self {
+        self.tts = Some(Arc::new(factory));
+        self
+    }
+
+    /// Install the resolver for recipients in a voice-modality peer group.
+    pub(crate) fn with_voice_peer_resolver(
+        mut self,
+        voice_peers: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.voice_peers = voice_peers;
         self
     }
 
@@ -4190,6 +4447,123 @@ impl MatrixChannel {
         outbox.message_max_bytes = (self.config.stream_mode == MatrixStreamMode::SingleMessage)
             .then_some(self.config.effective_message_max_bytes());
         outbox
+    }
+
+    /// The half of the voice decision that needs no homeserver: `suppress_voice`
+    /// always wins, no TTS resolver means never, and an explicit `force_voice`
+    /// always does. `None` means the answer depends on the target room.
+    fn voice_intent(&self, message: &SendMessage) -> Option<bool> {
+        if self.tts.is_none() || message.suppress_voice {
+            return Some(false);
+        }
+        if message.force_voice {
+            return Some(true);
+        }
+        None
+    }
+
+    /// Whether `recipient` is a room holding a member of a voice-modality peer
+    /// group. Resolved from live config on every call.
+    ///
+    /// Peer groups name Matrix peers by user ID (`@user:server`), while an
+    /// outbound recipient is always a room (`!room:server`), so the two are
+    /// never comparable directly. For replies the runtime resolves the sender's
+    /// group and reports it as `force_voice`; this path exists for sends with
+    /// no inbound sender to consult — cron announcements and other proactive
+    /// delivery — where the room is the only identity available.
+    async fn room_has_voice_peer(&self, client: &Client, recipient: &str) -> bool {
+        let voice_peers = (self.voice_peers)();
+        if let Some(verdict) = allowlist::voice_peers_verdict(&voice_peers) {
+            return verdict;
+        }
+        let Ok(room) = outbound::resolve_joined_room(client, &self.alias_cache, recipient).await
+        else {
+            return false;
+        };
+        let Ok(members) = room.members(RoomMemberships::JOIN).await else {
+            return false;
+        };
+        members.iter().any(|m| {
+            crate::allowlist::is_user_allowed_by(
+                &voice_peers,
+                m.user_id().as_str(),
+                allowlist::voice_peer_matches,
+            )
+        })
+    }
+
+    /// Voice delivery is decided by configuration and the runtime's per-message
+    /// intent, never by inspecting the reply text.
+    async fn should_voice(&self, client: &Client, message: &SendMessage) -> bool {
+        match self.voice_intent(message) {
+            Some(verdict) => verdict,
+            None => self.room_has_voice_peer(client, &message.recipient).await,
+        }
+    }
+
+    /// Thread anchor for a voice note accompanying a plain send.
+    fn voice_thread_anchor(&self, message: &SendMessage) -> Option<OwnedEventId> {
+        if !self.config.reply_in_thread {
+            return None;
+        }
+        message
+            .thread_ts
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Thread anchor of a live draft, so a finalized reply's voice note lands
+    /// beside its text rather than in the main timeline.
+    async fn draft_thread_anchor(&self, recipient: &str, message_id: &str) -> Option<OwnedEventId> {
+        let key = streaming_key(recipient, message_id).ok()?;
+        let state = self.streaming_state.read().await;
+        streaming::peek_thread_anchor(&state, &key)
+    }
+
+    /// Synthesize `text` and post it as a voice note beside the text reply.
+    ///
+    /// Never propagates. The text reply has already landed by this point, so a
+    /// synthesis or upload failure must not make the runtime treat the whole
+    /// send as failed and retry it.
+    async fn deliver_voice_note(
+        &self,
+        client: &Client,
+        recipient: &str,
+        text: &str,
+        thread_anchor: Option<OwnedEventId>,
+    ) {
+        let Some(resolver) = self.tts.as_ref() else {
+            return;
+        };
+        let delivered: Result<Option<OwnedEventId>> = async {
+            let Some(manager) = resolver() else {
+                return Ok(None);
+            };
+            let manager = manager?;
+            // Speak the reply the reader sees: file markers are rendered as
+            // attachments, not read aloud.
+            let spoken = markers::parse(text).0;
+            if spoken.trim().is_empty() {
+                return Ok(None);
+            }
+            let audio = manager.synthesize_opus(&spoken).await?;
+            let room = outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
+            outbound::send_voice_note(&room, audio, thread_anchor.as_ref())
+                .await
+                .map(Some)
+        }
+        .await;
+
+        if let Err(e) = delivered {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: voice reply failed; the text reply was already delivered"
+            );
+        }
     }
 
     /// Edit-in-place draft update. Rate-limited per the configured interval.
@@ -4435,12 +4809,22 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.ensure_client().await?;
         let _ = outbound::send(&self.outbox(client), message).await?;
+        if self.should_voice(client, message).await {
+            let anchor = self.voice_thread_anchor(message);
+            self.deliver_voice_note(client, &message.recipient, &message.content, anchor)
+                .await;
+        }
         Ok(())
     }
 
     async fn send_final(&self, message: &SendMessage) -> Result<()> {
         let client = self.ensure_client().await?;
         let _ = outbound::send(&self.final_outbox(client), message).await?;
+        if self.should_voice(client, message).await {
+            let anchor = self.voice_thread_anchor(message);
+            self.deliver_voice_note(client, &message.recipient, &message.content, anchor)
+                .await;
+        }
         Ok(())
     }
 
@@ -4665,11 +5049,14 @@ impl Channel for MatrixChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
-        _suppress_voice: bool,
+        suppress_voice: bool,
     ) -> Result<()> {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
-        match self.config.stream_mode {
+        // Read before the draft is consumed below, so the voice note can be
+        // threaded with the text it accompanies.
+        let voice_anchor = self.draft_thread_anchor(recipient, message_id).await;
+        let finalized = match self.config.stream_mode {
             MatrixStreamMode::Off => Ok(()),
             MatrixStreamMode::Partial => {
                 let draft = {
@@ -4906,7 +5293,19 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
+        };
+
+        // `finalize_draft` carries no force_voice: the runtime routes those
+        // through send_final instead. Errors skip this by returning early.
+        if finalized.is_ok()
+            && !suppress_voice
+            && self.tts.is_some()
+            && self.room_has_voice_peer(client, recipient).await
+        {
+            self.deliver_voice_note(client, recipient, text, voice_anchor)
+                .await;
         }
+        finalized
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
@@ -5032,6 +5431,7 @@ impl Channel for MatrixChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
 
         let (tx, rx) = oneshot::channel();
@@ -5044,7 +5444,7 @@ impl Channel for MatrixChannel {
             },
         );
 
-        let send_msg = SendMessage::new(prompt, recipient);
+        let send_msg = approval::build_prompt_message(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
             self.pending_approvals.lock().await.remove(&token);
             return Err(e);
@@ -5090,6 +5490,907 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    /// Regression: Matrix
+    /// streams paragraphs via `update_draft` and does NOT implement the
+    /// `flush_draft_turn` narration contract, so it must NOT opt into the
+    /// orchestrator's narration-policy + flush-barrier path. Otherwise outbound
+    /// hooks fire on phantom flushes that deliver nothing while Matrix's real
+    /// paragraph sends bypass the policy. `supports_multi_message_streaming` stays
+    /// true (its own paragraph streaming); only the turn-flush capability is off.
+    #[test]
+    fn matrix_does_not_opt_into_turn_flush_narration() {
+        use super::MatrixChannel;
+        use std::sync::Arc;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+
+        let config = MatrixConfig {
+            homeserver: "https://matrix.example".to_string(),
+            access_token: Some("token".to_string()),
+            stream_mode: MatrixStreamMode::MultiMessage,
+            ..MatrixConfig::default()
+        };
+        let ch = MatrixChannel::new(
+            config,
+            "alias",
+            Arc::new(Vec::<String>::new),
+            std::env::temp_dir(),
+        )
+        .expect("matrix channel constructs from valid config");
+
+        assert!(
+            ch.supports_multi_message_streaming(),
+            "Matrix still streams paragraphs in multi_message mode"
+        );
+        assert!(
+            !ch.supports_turn_flush_narration(),
+            "Matrix must not run the orchestrator narration-policy path on phantom flushes"
+        );
+    }
+
+    mod voice_reply_delivery {
+        use std::sync::Arc;
+
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::ruma::{owned_room_id, owned_user_id};
+        use tempfile::TempDir;
+        use wiremock::matchers::{body_partial_json, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, MatrixConfig, OpenAITtsProviderConfig, TtsProviderConfig,
+        };
+
+        use super::super::MatrixChannel;
+
+        /// Opus is the OpenAI family default, so `synthesize_opus` returns the
+        /// provider bytes unchanged and no `ffmpeg` transcode is attempted.
+        const OPUS_BYTES: &[u8] = b"OggS-fake-opus-payload";
+
+        async fn homeserver_with_room(room: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND", "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/(upload|query)$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}, "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": { "join": { room: {
+                        "state": { "events": [] },
+                        "timeline": { "limited": false, "prev_batch": "t0", "events": [] }
+                    }}}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND", "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+            // The SDK reads the media config before any upload.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/media/(v3|r0)/config$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.upload.size": 10_000_000
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// A voice group names users, so deciding whether a room should be
+        /// voiced costs a member lookup. Proactive sends (cron announces) have
+        /// no inbound sender, so this is the only identity available to them.
+        async fn mount_room_members(server: &MockServer, room: &str, members: &[&str]) {
+            let chunk: Vec<serde_json::Value> = members
+                .iter()
+                .enumerate()
+                .map(|(i, user)| {
+                    serde_json::json!({
+                        "type": "m.room.member",
+                        "sender": user,
+                        "state_key": user,
+                        "event_id": format!("$member{i}:server"),
+                        "origin_server_ts": 0,
+                        "room_id": room,
+                        "content": { "membership": "join" }
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/members$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"chunk": chunk})),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn tts_endpoint() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/speech"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(OPUS_BYTES))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn config_with_tts(uri: String) -> Config {
+            let mut config = Config::default();
+            config.tts.enabled = true;
+            config.providers.tts.openai.insert(
+                "local".to_string(),
+                OpenAITtsProviderConfig {
+                    base: TtsProviderConfig {
+                        api_key: Some("test-key".to_string()),
+                        uri: Some(uri),
+                        response_format: Some("opus".to_string()),
+                        ..TtsProviderConfig::default()
+                    },
+                },
+            );
+            config.agents.insert(
+                "default".to_string(),
+                AliasedAgentConfig {
+                    tts_provider: "openai.local".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+        }
+
+        async fn channel_for(
+            homeserver: &MockServer,
+            tts_config: Config,
+            voice_peers: Vec<String>,
+            state_dir: &TempDir,
+        ) -> MatrixChannel {
+            let matrix_config = MatrixConfig {
+                homeserver: homeserver.uri(),
+                access_token: Some("secret-token".to_string()),
+                user_id: Some(owned_user_id!("@bot:server").to_string()),
+                device_id: Some("DEVICE".to_string()),
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let tts_config = Arc::new(tts_config);
+            MatrixChannel::new(
+                matrix_config,
+                "voice",
+                Arc::new(Vec::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel")
+            .with_voice_peer_resolver(Arc::new(move || voice_peers.clone()))
+            .with_tts_manager_factory(move || {
+                if !tts_config.tts.enabled {
+                    return None;
+                }
+                Some(crate::tts::TtsManager::from_config_for_agent(
+                    &tts_config,
+                    Some("default"),
+                ))
+            })
+        }
+
+        /// A voice group lists Matrix users (`@user:server`); the reply is
+        /// addressed to a room. Before this was a literal comparison of the two,
+        /// so a correctly configured group never voiced anything.
+        #[tokio::test]
+        async fn a_room_holding_a_voice_peer_receives_both_a_voice_note_and_the_text_reply() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "msgtype": "m.audio",
+                    "org.matrix.msc3245.voice": {}
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$voice:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("text reply is delivered");
+
+            // Mock `.expect(1)` assertions verify on drop: the text message,
+            // the media upload and the MSC3245 voice event must each land once.
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(1),
+                "the TTS endpoint must be asked to synthesize exactly once"
+            );
+        }
+
+        /// The event wrapper was always encrypted by `send_raw`; the audio was
+        /// not. Uploading the synthesized bytes in the clear hands the
+        /// homeserver a playable copy of an otherwise encrypted reply, so the
+        /// bytes that leave this process must not be the Opus payload.
+        #[tokio::test]
+        async fn an_encrypted_room_never_uploads_the_audio_in_the_clear() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            // The shared fixture answers this route with "not encrypted"; a
+            // higher priority (lower number) overrides it for this room only.
+            // Everything else about the fixture is unchanged.
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "algorithm": "m.megolm.v1.aes-sha2"
+                })))
+                .with_priority(1)
+                .mount(&homeserver)
+                .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.(message|encrypted)/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$sent:server"
+                })))
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .mount(&homeserver)
+                .await;
+            // Megolm key sharing runs before the event send. Answering these
+            // keeps the test on its first attempt instead of retry backoff.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/claim$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "failures": {}, "one_time_keys": {}
+                })))
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sendToDevice/.*$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("text reply is delivered");
+
+            let requests = homeserver.received_requests().await.unwrap_or_default();
+            let uploads: Vec<Vec<u8>> = requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/upload"))
+                .map(|r| r.body.clone())
+                .collect();
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| !r.url.path().contains("/send/m.room.message/")),
+                "an encrypted room must carry no plaintext room message"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r.url.path().contains("/send/m.room.encrypted/")),
+                "the voice note and its text reply are sent as encrypted events"
+            );
+            assert!(
+                !uploads.is_empty(),
+                "the voice note is still uploaded in an encrypted room"
+            );
+            for body in &uploads {
+                assert_ne!(
+                    body.as_slice(),
+                    OPUS_BYTES,
+                    "the synthesized audio must not reach the homeserver verbatim"
+                );
+                assert!(
+                    !body.starts_with(b"OggS"),
+                    "ciphertext must not carry the Ogg container magic: {:?}",
+                    &body[..body.len().min(8)]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn suppressed_voice_delivers_text_without_synthesizing() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec![room_id.to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("error notice", room_id.as_str()).suppress_voice())
+                .await
+                .expect("text reply is delivered");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "suppress_voice must not reach the synthesizer"
+            );
+        }
+
+        /// Delivery-level regression: a non-member sender's reply must stay
+        /// text-only even in a room that also holds a voice-group member.
+        /// Before the fix, the orchestrator's no-`send_via` reply arm kept
+        /// only the positive sender verdict (`force_voice`); a negative
+        /// verdict collapsed to `force_voice = false` with no
+        /// `suppress_voice` override, so `should_voice` fell back to
+        /// `room_has_voice_peer` and voiced the reply anyway because the
+        /// room's *other* occupant, `@alice:server`, was a voice peer.
+        ///
+        /// Drives the real production mapping
+        /// (`orchestrator::voice_override_from_sender_verdict`) — not a
+        /// hand-rolled stand-in — with the tri-state a non-member sender like
+        /// `@bob:server` actually gets (`Some(false)`, asserted separately in
+        /// `orchestrator::tests::matrix_voice_group_member_gets_a_voiced_reply_by_user_id`),
+        /// so this test is tied to that mapping and fails to build without
+        /// it. `matrix.rs`'s own `suppress_voice` handling predates the fix
+        /// and would pass this scenario either way, which is why the room
+        /// membership and the mapping call both have to be present here
+        /// rather than hand-constructing an already-suppressed `SendMessage`.
+        #[tokio::test]
+        async fn a_non_member_senders_reply_stays_text_only_in_a_room_with_a_voice_peer() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            // Alice being a voice peer in this room must not matter for
+            // Bob's reply: nothing may ever be uploaded for it.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+            assert_eq!(
+                (suppress, force_voice),
+                (Some(true), false),
+                "sanity-check the mapping this test depends on"
+            );
+
+            let mut send_msg = SendMessage::new("reply to bob", room_id.as_str());
+            if suppress.unwrap_or(false) {
+                send_msg = send_msg.suppress_voice();
+            } else if force_voice {
+                send_msg = send_msg.force_voice();
+            }
+
+            channel
+                .send_final(&send_msg)
+                .await
+                .expect("text reply is delivered");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "a non-member sender's reply must never be synthesized, even \
+                 though the room also holds voice-group member @alice:server"
+            );
+        }
+
+        /// Same regression as above, for the streaming-finalization path:
+        /// `finalize_draft`'s shared voice-note gate (after the
+        /// per-`stream_mode` branch) must also honor the mapped
+        /// `suppress_voice` rather than falling back to room membership.
+        /// `MatrixStreamMode::Off` (the channel default here) makes the
+        /// per-mode branch a no-op, so this needs no live draft — it
+        /// exercises exactly the shared gate at issue.
+        #[tokio::test]
+        async fn finalize_draft_keeps_a_non_member_senders_reply_text_only() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, _force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+
+            channel
+                .finalize_draft(
+                    room_id.as_str(),
+                    "draft-1",
+                    "reply to bob",
+                    suppress.unwrap_or(false),
+                )
+                .await
+                .expect("finalize_draft succeeds with no live draft in Off stream mode");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "streaming finalization must also treat a non-member sender's \
+                 negative verdict as authoritative, even though the room \
+                 holds voice-group member @alice:server"
+            );
+        }
+
+        #[tokio::test]
+        async fn synthesis_failure_still_delivers_the_text_reply() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            // The member list has to answer, or the voice gate fails closed
+            // before synthesis is ever reached and this asserts nothing.
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            // No /v1/audio/speech route mounted: synthesis fails.
+            let tts = MockServer::start().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            // Nothing to upload when there is no audio.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("a TTS failure must not fail the text reply");
+
+            assert!(
+                !tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "synthesis has to be attempted for its failure to be the thing under test"
+            );
+        }
+
+        /// The voice gate asks the homeserver who is in the room. When that
+        /// question cannot be answered, the room is not voiced: a shared room
+        /// is the wrong place to guess, and the text reply carries the answer
+        /// either way.
+        #[tokio::test]
+        async fn an_unanswerable_member_list_never_voices_the_room() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/members$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&homeserver)
+                .await;
+            // Synthesis would succeed if it were reached, so a voice note here
+            // would mean the gate opened on an unverified room.
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("an unreachable member list must not fail the text reply");
+
+            assert!(
+                tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "a room whose membership could not be read must not be synthesized for"
+            );
+        }
+    }
+
+    mod voice_reply_gate {
+        use super::super::{
+            MatrixChannel,
+            allowlist::{voice_peer_matches, voice_peers_verdict},
+        };
+        use std::sync::Arc;
+        use zeroclaw_api::channel::SendMessage;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        const ROOM: &str = "!room:localhost";
+        const PEER: &str = "@alice:localhost";
+
+        fn matrix_config(reply_in_thread: bool) -> MatrixConfig {
+            MatrixConfig {
+                homeserver: "http://127.0.0.1:8008".to_string(),
+                access_token: Some("test-token".to_string()),
+                reply_in_thread,
+                ..MatrixConfig::default()
+            }
+        }
+
+        /// `tts_wired` mirrors the orchestrator having installed a resolver at
+        /// all, independent of whether TTS is enabled right now.
+        fn channel(voice_peers: Vec<String>, tts_wired: bool) -> MatrixChannel {
+            let channel = MatrixChannel::new(
+                matrix_config(false),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid");
+            let channel = channel.with_voice_peer_resolver(Arc::new(move || voice_peers.clone()));
+            if tts_wired {
+                channel.with_tts_manager_factory(|| None)
+            } else {
+                channel
+            }
+        }
+
+        // ── the half that needs no homeserver ──────────────────────────────
+
+        #[test]
+        fn force_voice_reaches_a_text_default_peer() {
+            let channel = channel(Vec::new(), true);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).force_voice()),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn suppress_voice_beats_force_voice() {
+            let channel = channel(Vec::new(), true);
+            let message = SendMessage::new("hello", ROOM)
+                .force_voice()
+                .suppress_voice();
+            assert_eq!(channel.voice_intent(&message), Some(false));
+        }
+
+        #[test]
+        fn suppress_voice_beats_a_voice_peer() {
+            let channel = channel(vec![PEER.to_string()], true);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).suppress_voice()),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn without_a_tts_resolver_nothing_is_voiced() {
+            // The channel runtime never installed one, so the channel has no
+            // way to synthesize regardless of configuration.
+            let channel = channel(vec![PEER.to_string()], false);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM)),
+                Some(false)
+            );
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).force_voice()),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn an_ordinary_reply_defers_to_the_room() {
+            // Nothing about the message settles it, so the target room's
+            // membership has to be consulted.
+            let channel = channel(vec![PEER.to_string()], true);
+            assert_eq!(channel.voice_intent(&SendMessage::new("hello", ROOM)), None);
+        }
+
+        // ── the room verdict that avoids a homeserver round-trip ───────────
+
+        #[test]
+        fn no_configured_voice_peers_voices_nobody() {
+            assert_eq!(voice_peers_verdict(&[]), Some(false));
+        }
+
+        #[test]
+        fn wildcard_voices_every_room_without_asking_for_members() {
+            // The literal comparison this replaces never matched `"*"` against
+            // a room id, so a wildcard voice group was silently inert.
+            assert_eq!(voice_peers_verdict(&["*".to_string()]), Some(true));
+            assert_eq!(
+                voice_peers_verdict(&[PEER.to_string(), "*".to_string()]),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn named_peers_require_the_member_list() {
+            // A user ID cannot be compared with a room id, so membership is
+            // the only thing that can answer this.
+            assert_eq!(voice_peers_verdict(&[PEER.to_string()]), None);
+        }
+
+        #[test]
+        fn membership_matching_accepts_the_same_shapes_the_runtime_does() {
+            // The runtime normalizes an inbound sender with
+            // `normalize_peer_username`, which strips a leading `@` and
+            // lowercases. Membership matching has to agree, or a group written
+            // without the `@` voices ordinary replies and silently drops
+            // proactive ones.
+            assert!(voice_peer_matches(PEER, PEER));
+            assert!(voice_peer_matches("alice:localhost", PEER));
+            assert!(voice_peer_matches("@ALICE:LOCALHOST", PEER));
+            assert!(!voice_peer_matches("@bob:localhost", PEER));
+            assert!(
+                !voice_peer_matches(ROOM, PEER),
+                "a room id is not a peer identity on either side"
+            );
+        }
+
+        #[test]
+        fn voice_peers_resolve_per_call_not_at_construction() {
+            // Peer groups are reloadable; a cached list would go stale.
+            let peers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let read = Arc::clone(&peers);
+            let channel = MatrixChannel::new(
+                matrix_config(false),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid")
+            .with_tts_manager_factory(|| None)
+            .with_voice_peer_resolver(Arc::new(move || {
+                read.lock().map(|p| p.clone()).unwrap_or_default()
+            }));
+
+            assert_eq!(voice_peers_verdict(&(channel.voice_peers)()), Some(false));
+            if let Ok(mut p) = peers.lock() {
+                p.push("*".to_string());
+            }
+            assert_eq!(voice_peers_verdict(&(channel.voice_peers)()), Some(true));
+        }
+
+        #[test]
+        fn thread_anchor_follows_reply_in_thread() {
+            let threaded = MatrixChannel::new(
+                matrix_config(true),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid");
+            let mut message = SendMessage::new("hello", ROOM);
+            message.thread_ts = Some("$anchor:localhost".to_string());
+            assert!(threaded.voice_thread_anchor(&message).is_some());
+
+            let flat = channel(Vec::new(), true);
+            assert!(
+                flat.voice_thread_anchor(&message).is_none(),
+                "reply_in_thread = false must keep the voice note out of a thread"
+            );
+        }
+    }
+
     mod transcription_provider_resolution {
         use super::super::build_transcription_manager;
         use zeroclaw_config::schema::{
@@ -5950,6 +7251,120 @@ mod tests {
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
+        /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
+        /// orchestrator can answer a `mirror` peer in kind.
+        #[tokio::test]
+        async fn a_voice_message_forwards_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio-origin:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.voice_origin,
+                "an m.audio event carrying org.matrix.msc3245.voice is voice-origin"
+            );
+        }
+
+        /// A text event is not voice-origin, whatever its body says.
+        #[tokio::test]
+        async fn a_text_message_does_not_forward_voice_origin() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = text_parent_event(
+                "$text-origin:localhost",
+                "@alice:localhost",
+                "[voice transcript]: not actually a voice note",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                !msg.voice_origin,
+                "an m.text event is text-origin even when its body mimics a transcript"
+            );
+        }
+
+        /// A text reply whose parent is a voice note borrows the parent's
+        /// transcript but not its modality: only the event itself decides.
+        #[tokio::test]
+        async fn a_reply_to_a_voice_parent_does_not_forward_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+            mount_parent_event(&matrix, voice_event_json("$parent-origin:localhost"), 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-origin:localhost",
+                "$parent-origin:localhost",
+                "what does this say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "the parent transcript is still inserted: {}",
+                msg.content
+            );
+            assert!(
+                !msg.voice_origin,
+                "a text reply to a voice note is text-origin"
+            );
+        }
+
         // Encrypted-media variant: the event carries an E2EE `file` source;
         // the homeserver serves ciphertext and the client decrypts during
         // download, so the saved copy and the STT request must contain the
@@ -6364,6 +7779,21 @@ mod tests {
         }
 
         #[test]
+        fn echoed_media_placeholder_delivered_as_prose() {
+            // A text-only model sees the degradation placeholder in its
+            // history and may repeat it; the reply must reach the room as
+            // readable text, not as a marker or a stray bracket span.
+            let reply = format!(
+                "I can't view that, it shows as {}.",
+                zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
+            );
+            let (text, ms) = parse(&reply);
+            assert_eq!(text, reply);
+            assert!(ms.is_empty());
+            assert!(!text.contains('['));
+        }
+
+        #[test]
         fn multiple_markers_with_text_in_between() {
             let (text, ms) =
                 parse("before [image:https://x/y.jpg] middle [file:/tmp/doc.pdf] after");
@@ -6404,7 +7834,7 @@ mod tests {
 
     mod approval {
         use super::super::approval::{
-            TOKEN_LEN, generate_token, generate_token_default, parse_reply,
+            TOKEN_LEN, build_prompt_message, generate_token, generate_token_default, parse_reply,
         };
         use rand::SeedableRng;
         use rand::rngs::StdRng;
@@ -6579,13 +8009,34 @@ mod tests {
         }
 
         #[test]
+        fn approval_prompt_message_suppresses_voice() {
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &generate_token_default(),
+                "shell",
+                "ls -la",
+                None,
+            );
+
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+
+            assert_eq!(message.recipient, "!room:example.invalid");
+            assert_eq!(message.content, prompt);
+            assert!(
+                message.suppress_voice,
+                "the approval prompt must suppress voice synthesis"
+            );
+            assert!(!message.force_voice);
+        }
+
+        #[test]
         fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
             // Localization must not desync the (possibly translated) prompt
             // prose from Matrix's own approve/deny/always parser: the
             // keywords the prompt shows must remain the literal ASCII words
             // `parse_reply` expects, whatever locale is active.
             let token = generate_token_default();
-            let prompt = crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la");
+            let prompt =
+                crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la", None);
             assert!(
                 prompt.contains(&token),
                 "prompt should echo the token verbatim; got {prompt:?}"
@@ -10343,6 +11794,612 @@ mod tests {
             assert_eq!(
                 info_size(info),
                 UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
+        }
+    }
+
+    /// A voice note has to carry its own length or clients render it as a
+    /// `00:00` bubble with no seek bar. ZeroClaw reads that length out of the
+    /// Ogg container rather than decoding the audio, so these cover the parse
+    /// itself, the layouts it refuses to guess at, and the event the send path
+    /// actually puts on the wire.
+    mod outbound_voice_duration {
+        use std::time::Duration;
+
+        use matrix_sdk::attachment::AttachmentInfo;
+        use matrix_sdk::ruma::{event_id, mxc_uri, room_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use zeroclaw_api::media::MediaAttachment;
+
+        use super::super::outbound::{
+            AttachmentKind, attachment_config_for, opus_duration, upload_attachment,
+        };
+
+        /// One second of tone encoded by `opusenc`, so the parser is measured
+        /// against a real encoder rather than against our own idea of the
+        /// format. `opusinfo` reports its playback length as `0m:01.000s`, and
+        /// its `OpusTags` carry only encoder strings.
+        const VOICE_NOTE: &[u8] = include_bytes!("testdata/voice_note.ogg");
+        /// The fixture's length, on the 48 kHz granule clock.
+        const VOICE_NOTE_SAMPLES: u64 = 48_000;
+
+        // ---- helpers over real encoded bytes ------------------------------
+
+        /// Ogg's page checksum: polynomial `0x04c1_1db7`, no reflection, zero
+        /// initial value, no final inversion.
+        fn ogg_crc(page: &[u8]) -> u32 {
+            let mut crc = 0u32;
+            for &byte in page {
+                crc ^= u32::from(byte) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 == 0 {
+                        crc << 1
+                    } else {
+                        (crc << 1) ^ 0x04c1_1db7
+                    };
+                }
+            }
+            crc
+        }
+
+        /// Split a stream into its pages, as `(offset, end)` pairs.
+        fn page_bounds(bytes: &[u8]) -> Vec<(usize, usize)> {
+            let mut bounds = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < bytes.len() {
+                let segments = usize::from(bytes[cursor + 26]);
+                let body_start = cursor + 27 + segments;
+                let body_len: usize = bytes[cursor + 27..body_start]
+                    .iter()
+                    .map(|&n| usize::from(n))
+                    .sum();
+                let end = body_start + body_len;
+                bounds.push((cursor, end));
+                cursor = end;
+            }
+            bounds
+        }
+
+        /// Rebuild every page with a new serial and/or a shifted granule,
+        /// restoring each checksum so the result is a file a decoder would
+        /// accept, not merely one this parser happens to walk.
+        fn rewrite_pages(bytes: &[u8], serial: Option<u32>, granule_offset: u64) -> Vec<u8> {
+            let mut out = Vec::with_capacity(bytes.len());
+            for (start, end) in page_bounds(bytes) {
+                let mut page = bytes[start..end].to_vec();
+                let granule =
+                    u64::from_le_bytes(page[6..14].try_into().expect("eight granule bytes"));
+                if granule != u64::MAX {
+                    page[6..14].copy_from_slice(&(granule + granule_offset).to_le_bytes());
+                }
+                if let Some(serial) = serial {
+                    page[14..18].copy_from_slice(&serial.to_le_bytes());
+                }
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                let crc = ogg_crc(&page);
+                page[22..26].copy_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&page);
+            }
+            out
+        }
+
+        /// Whether every page in a stream carries the checksum of its contents.
+        fn checksums_hold(bytes: &[u8]) -> bool {
+            page_bounds(bytes).into_iter().all(|(start, end)| {
+                let mut page = bytes[start..end].to_vec();
+                let stored =
+                    u32::from_le_bytes(page[22..26].try_into().expect("four checksum bytes"));
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                ogg_crc(&page) == stored
+            })
+        }
+
+        /// Rebuild a stream with all of its audio on one page, keeping the
+        /// final granule and recomputing the checksum.
+        ///
+        /// This is the layout `opusenc` emits for any clip shorter than about a
+        /// second: a single audio page that also ends the stream, whose granule
+        /// trims the tail of the last packet and so sits *below* the samples
+        /// completing on it. `header_type` lets a test build the same page
+        /// without the end-of-stream flag, which is the invalid form.
+        fn repaged_onto_one_audio_page(bytes: &[u8], header_type: u8, granule: u64) -> Vec<u8> {
+            let bounds = page_bounds(bytes);
+            let (headers, audio) = bounds.split_at(2);
+            let mut out: Vec<u8> = headers
+                .iter()
+                .flat_map(|&(start, end)| bytes[start..end].to_vec())
+                .collect();
+
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for &(start, end) in audio {
+                let page = &bytes[start..end];
+                assert_eq!(
+                    page[5] & 0x01,
+                    0,
+                    "a packet spanning pages cannot be merged naively"
+                );
+                let segments = usize::from(page[26]);
+                table.extend_from_slice(&page[27..27 + segments]);
+                body.extend_from_slice(&page[27 + segments..]);
+            }
+            assert!(table.len() <= 255, "one page holds at most 255 segments");
+
+            let first = &bytes[audio[0].0..audio[0].1];
+            let mut page = Vec::from(*b"OggS");
+            page.push(0);
+            page.push(header_type);
+            page.extend_from_slice(&granule.to_le_bytes());
+            page.extend_from_slice(&first[14..22]); // serial and sequence
+            page.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            page.push(u8::try_from(table.len()).expect("segment count below 256"));
+            page.extend_from_slice(&table);
+            page.extend_from_slice(&body);
+            let crc = ogg_crc(&page);
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+            out.extend_from_slice(&page);
+            out
+        }
+
+        // ---- helpers building streams byte by byte ------------------------
+        //
+        // These carry zero checksums. The parser does not read them, and these
+        // fixtures exist to pin down which byte makes a stream unreadable.
+
+        /// Header-type bit for a page opening mid-packet.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page beginning a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page ending a logical stream.
+        const EOS: u8 = 0x04;
+        const PRE_SKIP: u16 = 312;
+        const SERIAL: u32 = 0x5a43_0001;
+        /// Table of contents for 20 ms of SILK wideband, one frame per packet.
+        const AUDIO_TOC: u8 = 0x08;
+        /// Samples one `AUDIO_TOC` packet decodes to at 48 kHz.
+        const PACKET_SAMPLES: u64 = 960;
+
+        /// `OpusHead` identification packet. Only the magic and `pre_skip`
+        /// matter to the parser; the rest is spec-shaped filler.
+        fn opus_head(pre_skip: u16) -> Vec<u8> {
+            let mut head = Vec::from(*b"OpusHead");
+            head.push(1); // version
+            head.push(1); // channel count
+            head.extend_from_slice(&pre_skip.to_le_bytes());
+            head.extend_from_slice(&48_000u32.to_le_bytes()); // input sample rate
+            head.extend_from_slice(&0u16.to_le_bytes()); // output gain
+            head.push(0); // channel mapping family
+            head
+        }
+
+        /// `OpusTags` comment packet with an empty vendor string and no
+        /// comments.
+        fn opus_tags() -> Vec<u8> {
+            let mut tags = Vec::from(*b"OpusTags");
+            tags.extend_from_slice(&0u32.to_le_bytes()); // vendor string length
+            tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
+            tags
+        }
+
+        /// An audio packet worth `PACKET_SAMPLES`.
+        fn audio_packet() -> Vec<u8> {
+            vec![AUDIO_TOC, 0x00, 0x00, 0x00]
+        }
+
+        /// One Ogg page with a segment table that really describes `packets`.
+        fn page(granule: u64, header_type: u8, packets: &[Vec<u8>]) -> Vec<u8> {
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for packet in packets {
+                let mut remaining = packet.len();
+                while remaining >= 255 {
+                    table.push(255u8);
+                    remaining -= 255;
+                }
+                table.push(u8::try_from(remaining).expect("lacing value below 255"));
+                body.extend_from_slice(packet);
+            }
+            raw_page(granule, header_type, SERIAL, &table, &body)
+        }
+
+        /// A page with an arbitrary segment table, so tests can claim a body
+        /// length the buffer does not actually hold.
+        fn raw_page(
+            granule: u64,
+            header_type: u8,
+            serial: u32,
+            table: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut out = Vec::from(*b"OggS");
+            out.push(0); // stream structure version
+            out.push(header_type);
+            out.extend_from_slice(&granule.to_le_bytes());
+            out.extend_from_slice(&serial.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // page sequence
+            out.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            out.push(u8::try_from(table.len()).expect("segment count below 256"));
+            out.extend_from_slice(table);
+            out.extend_from_slice(body);
+            out
+        }
+
+        /// The two header pages every Opus stream opens with.
+        fn header_pages() -> Vec<u8> {
+            let mut bytes = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            bytes.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            bytes
+        }
+
+        /// A spec-shaped stream running `samples` of audio: `OpusHead` alone on
+        /// a beginning-of-stream page, then `OpusTags`, then audio. The final
+        /// page's granule trims the tail of its packet, which is how an encoder
+        /// expresses a length that does not land on a packet boundary.
+        fn stream(samples: u64) -> Vec<u8> {
+            let final_granule = samples + u64::from(PRE_SKIP);
+            let whole_packets = final_granule / PACKET_SAMPLES;
+            let packets: Vec<Vec<u8>> = (0..whole_packets).map(|_| audio_packet()).collect();
+
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(whole_packets * PACKET_SAMPLES, 0, &packets));
+            bytes.extend_from_slice(&page(final_granule, EOS, &[audio_packet()]));
+            bytes
+        }
+
+        // ---- the parse ----------------------------------------------------
+
+        #[test]
+        fn a_real_encoded_stream_measures_its_playback_length() {
+            assert!(
+                checksums_hold(VOICE_NOTE),
+                "the fixture must be a checksum-valid Ogg stream"
+            );
+            assert_eq!(opus_duration(VOICE_NOTE), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn elapsed_time_is_measured_from_the_clip_start_not_the_timeline_origin() {
+            // A clip cropped out of a longer recording keeps the granule
+            // positions of its source, so the final granule is a timestamp
+            // rather than a sample count. One minute of origin must not become
+            // one minute of playback.
+            let origin = 60 * 48_000;
+            let cropped = rewrite_pages(VOICE_NOTE, None, origin);
+
+            assert!(
+                checksums_hold(&cropped),
+                "the shifted stream must stay checksum-valid"
+            );
+            assert_eq!(opus_duration(&cropped), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&cropped), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn a_lone_end_of_stream_audio_page_may_trim_below_its_packet_samples() {
+            // `opusenc` emits this for any clip under about a second: one audio
+            // page that also ends the stream, whose granule sits below the
+            // samples completing on it because the tail is trimmed. The origin
+            // is zero rather than something to derive by working backwards.
+            let trimmed = repaged_onto_one_audio_page(VOICE_NOTE, 0x04, 48_312);
+
+            assert!(checksums_hold(&trimmed), "the repaged stream stays valid");
+            assert_eq!(opus_duration(&trimmed), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&trimmed), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn chained_streams_with_distinct_serials_report_no_duration() {
+            // Concatenated logical streams each restart their own granule
+            // timeline, so no single duration describes the result.
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(&rewrite_pages(VOICE_NOTE, Some(0x0bad_f00d), 0));
+
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        /// Kept apart from the distinct-serial case on purpose: with both in
+        /// one test the serial check answers first and this guard is never
+        /// the assertion that fires.
+        #[test]
+        fn a_chain_reusing_the_serial_is_still_a_chain() {
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(VOICE_NOTE);
+
+            // Every page carries the opening stream's serial, so only the
+            // second stream's beginning-of-stream page marks the boundary.
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        #[test]
+        fn duration_spans_the_granule_positions_less_the_priming_samples() {
+            assert_eq!(
+                opus_duration(&stream(144_000)),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                opus_duration(&stream(72_000)),
+                Some(Duration::from_millis(1_500))
+            );
+            assert_eq!(opus_duration(&stream(720)), Some(Duration::from_millis(15)));
+        }
+
+        #[test]
+        fn a_length_between_milliseconds_lands_exactly() {
+            // A lone audio page holds 960 samples, 312 of which are priming:
+            // 648 samples, or 13.5 ms.
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_micros(13_500)));
+        }
+
+        #[test]
+        fn last_page_granule_wins() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(96_312, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(240_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn unknown_granule_pages_are_skipped_but_still_advance() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            // `u64::MAX` means "no granule for this page", not "zero length".
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn empty_body_page_does_not_stall_the_walk() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[]));
+            bytes.extend_from_slice(&raw_page(u64::MAX, 0, SERIAL, &[], b""));
+            bytes.extend_from_slice(&page(96_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(2)));
+        }
+
+        #[test]
+        fn unreadable_streams_report_no_duration_instead_of_guessing() {
+            let valid = stream(144_000);
+
+            let mut short_header = Vec::from(*b"OggS");
+            short_header.extend_from_slice(&[0u8; 8]);
+
+            let mut table_overruns = header_pages();
+            table_overruns.extend_from_slice(&raw_page(48_312, 0, SERIAL, &[255], b"five!"));
+
+            let mut below_pre_skip = header_pages();
+            below_pre_skip.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            below_pre_skip.extend_from_slice(&page(
+                u64::from(PRE_SKIP) - 1,
+                EOS,
+                &[audio_packet()],
+            ));
+
+            let mut head_too_short = page(0, BOS, &[opus_head(PRE_SKIP)[..9].to_vec()]);
+            head_too_short.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            head_too_short.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut opens_mid_packet = header_pages();
+            opens_mid_packet.extend_from_slice(&page(48_312, CONTINUED, &[audio_packet()]));
+
+            let mut first_audio_granule_unknown = header_pages();
+            first_audio_granule_unknown.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            first_audio_granule_unknown.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut zero_frame_count = header_pages();
+            // Table-of-contents code 3 reads its frame count from the next
+            // byte, and a packet of no frames has no length.
+            zero_frame_count.extend_from_slice(&page(48_312, EOS, &[vec![AUDIO_TOC | 0x03, 0x00]]));
+
+            let mut packet_too_long = header_pages();
+            // 60 ms frames, 48 of them: four times what a packet may hold.
+            packet_too_long.extend_from_slice(&page(48_312, EOS, &[vec![0x1b, 48]]));
+
+            let mut audio_shares_the_tags_page = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            audio_shares_the_tags_page.extend_from_slice(&page(
+                48_312,
+                EOS,
+                &[opus_tags(), audio_packet()],
+            ));
+
+            // The same trimmed page without the end-of-stream flag: a granule
+            // below the page's samples is only legal on a page ending the
+            // stream.
+            let trims_without_ending_the_stream =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0, 48_312);
+            // Ending the stream does not license a granule below `pre_skip`:
+            // that would skip more samples than the stream contains.
+            let trimmed_below_pre_skip =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0x04, u64::from(PRE_SKIP) - 1);
+
+            let mut head_shares_its_page = page(0, BOS, &[opus_head(PRE_SKIP), opus_tags()]);
+            head_shares_its_page.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut not_beginning_of_stream = page(0, 0, &[opus_head(PRE_SKIP)]);
+            not_beginning_of_stream.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            not_beginning_of_stream.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let cases: [(&str, Vec<u8>); 20] = [
+                ("empty", Vec::new()),
+                ("garbage", b"not an ogg file, just some plain text".to_vec()),
+                ("header shorter than a page header", short_header),
+                ("truncated mid body", valid[..valid.len() - 3].to_vec()),
+                ("trailing junk after the last page", {
+                    let mut b = valid.clone();
+                    b.extend_from_slice(b"tail");
+                    b
+                }),
+                ("first packet is not OpusHead", {
+                    let mut b = page(0, BOS, &[b"VorbisHead padding bytes".to_vec()]);
+                    b.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+                    b
+                }),
+                ("OpusHead truncated before pre_skip", head_too_short),
+                ("OpusHead sharing its page", head_shares_its_page),
+                (
+                    "audio sharing the OpusTags page",
+                    audio_shares_the_tags_page,
+                ),
+                (
+                    "first page not marked beginning-of-stream",
+                    not_beginning_of_stream,
+                ),
+                ("segment table claims more than exists", table_overruns),
+                ("span shorter than pre_skip", below_pre_skip),
+                (
+                    "granule below the page's samples without ending the stream",
+                    trims_without_ending_the_stream,
+                ),
+                (
+                    "end-of-stream granule below pre_skip",
+                    trimmed_below_pre_skip,
+                ),
+                ("first audio page opens mid-packet", opens_mid_packet),
+                (
+                    "first audio page has no granule",
+                    first_audio_granule_unknown,
+                ),
+                ("packet claiming no frames", zero_frame_count),
+                ("packet claiming more than 120 ms", packet_too_long),
+                (
+                    "every granule unknown",
+                    page(u64::MAX, BOS, &[opus_head(PRE_SKIP)]),
+                ),
+                ("header pages but no audio", header_pages()),
+            ];
+
+            for (label, bytes) in cases {
+                assert_eq!(
+                    opus_duration(&bytes),
+                    None,
+                    "{label} must not yield a duration"
+                );
+            }
+        }
+
+        // ---- the event that ships -----------------------------------------
+
+        fn voice_attachment(data: Vec<u8>) -> MediaAttachment {
+            MediaAttachment {
+                file_name: "voice.ogg".to_string(),
+                data,
+                mime_type: Some("audio/ogg".to_string()),
+                marker: None,
+            }
+        }
+
+        fn info_duration(info: AttachmentInfo) -> Option<Duration> {
+            match info {
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.duration,
+                _ => panic!("unexpected attachment info kind {info:?}"),
+            }
+        }
+
+        /// The voice arm of `attachment_info_for` is what the SDK send path
+        /// hands to `send_attachment`, so the measured length has to land here.
+        #[test]
+        fn voice_attachment_info_reports_the_measured_length() {
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            assert!(matches!(info, AttachmentInfo::Voice(_)));
+            assert_eq!(info_duration(info), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn unmeasurable_voice_attachment_keeps_the_zero_fallback() {
+            let att = voice_attachment(b"OggS-fake-opus-payload".to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            // Still `Some`: the SDK only emits `org.matrix.msc1767.audio` when
+            // duration and waveform are both present.
+            assert_eq!(info_duration(info), Some(Duration::ZERO));
+        }
+
+        /// Voice attachments go out through the SDK's shared attachment path,
+        /// with `AttachmentInfo::Voice` carrying the measured length, so the
+        /// proof belongs on the event that reaches the homeserver: both
+        /// duration fields must carry the clip's length, next to the
+        /// `org.matrix.msc3245.voice` flag that marks it a voice note.
+        #[tokio::test]
+        async fn the_sent_event_carries_the_measured_length() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+
+            matrix
+                .mock_authenticated_media_config()
+                .ok_default()
+                .mount()
+                .await;
+            matrix
+                .mock_upload()
+                .ok(mxc_uri!("mxc://localhost/voicenote"))
+                .mount()
+                .await;
+            matrix
+                .mock_room_send()
+                .ok(event_id!("$voicenote"))
+                .expect(1)
+                .mount()
+                .await;
+
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            upload_attachment(&room, &att, AttachmentKind::Voice, None)
+                .await
+                .expect("the voice note is sent");
+
+            let sent = matrix
+                .server()
+                .received_requests()
+                .await
+                .expect("the mock server records requests")
+                .into_iter()
+                .filter(|req| req.url.path().contains("/send/"))
+                .map(|req| req.body_json::<serde_json::Value>().expect("a JSON event"))
+                .next_back()
+                .expect("the voice event reached the homeserver");
+
+            assert_eq!(sent["msgtype"], serde_json::json!("m.audio"));
+            assert!(sent.get("org.matrix.msc3245.voice").is_some());
+            assert_eq!(sent["info"]["duration"], serde_json::json!(1_000));
+            assert_eq!(
+                sent["org.matrix.msc1767.audio"]["duration"],
+                serde_json::json!(1_000)
+            );
+        }
+
+        #[test]
+        fn the_fixture_is_the_length_the_tests_assert() {
+            // Guards the fixture against being replaced by a clip of another
+            // length without the expectations moving with it.
+            assert_eq!(
+                opus_duration(VOICE_NOTE),
+                Some(Duration::new(
+                    VOICE_NOTE_SAMPLES / 48_000,
+                    u32::try_from((VOICE_NOTE_SAMPLES % 48_000) * 1_000_000_000 / 48_000)
+                        .expect("a remainder below one second")
+                ))
             );
         }
     }

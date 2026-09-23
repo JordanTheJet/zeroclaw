@@ -158,8 +158,6 @@ struct LarkEvent {
 #[derive(Debug, serde::Deserialize)]
 struct LarkEventHeader {
     event_type: String,
-    #[allow(dead_code)]
-    event_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -253,7 +251,15 @@ fn build_approval_card(
     approval_id: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> serde_json::Value {
+    // Two pending cards from one turn are otherwise identical until tapped.
+    // The shared line is newline-terminated; Lark's markdown needs the blank
+    // line to render it as its own paragraph, and an empty line stays empty.
+    let position_line = match crate::util::approval_position_line(position).as_str() {
+        "" => String::new(),
+        line => format!("{line}\n"),
+    };
     let make_button = |label: &str, button_type: &str, decision: &str| {
         serde_json::json!({
             "tag": "button",
@@ -283,7 +289,7 @@ fn build_approval_card(
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": format!("**Tool:** `{tool_name}`\n\n{arguments_summary}")
+                    "content": format!("{position_line}**Tool:** `{tool_name}`\n\n{arguments_summary}")
                 },
                 {
                     "tag": "column_set",
@@ -1238,35 +1244,31 @@ impl LarkChannel {
         }
     }
 
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(Arc::new(m));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, audio transcription disabled"
-                );
-            }
-        }
-        self.transcription = Some(config);
         self
     }
 
@@ -3177,8 +3179,12 @@ impl Channel for LarkChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
-        let card =
-            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+        let card = build_approval_card(
+            &approval_id,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
+        );
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
@@ -5800,6 +5806,10 @@ mod tests {
         assert!(ch.transcription_manager.is_none());
     }
 
+    /// The manager cannot be built (enabled, but no usable provider), so the
+    /// channel keeps running without transcription. It must not record the
+    /// config either: a config with no manager advertised transcription the
+    /// channel could not perform, which is the drift this shared path removed.
     #[test]
     fn lark_manager_none_and_warn_on_init_failure() {
         let tc = zeroclaw_config::schema::TranscriptionConfig {
@@ -5809,7 +5819,10 @@ mod tests {
         };
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription_manager.is_none());
-        assert!(ch.transcription.is_some());
+        assert!(
+            ch.transcription.is_none(),
+            "config is recorded only alongside a manager"
+        );
     }
 
     #[test]
@@ -6106,7 +6119,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_contains_all_three_buttons() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo");
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None);
 
         // Card 2.0 schema lock — guard against future regressions where the
         // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
@@ -6139,7 +6152,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_round_trips_approval_id_in_all_buttons() {
-        let card = build_approval_card("approval-abc-123", "tool", "args");
+        let card = build_approval_card("approval-abc-123", "tool", "args", None);
         let columns = card["body"]["elements"][1]["columns"]
             .as_array()
             .expect("columns array");
@@ -6152,10 +6165,34 @@ mod tests {
     }
 
     #[test]
+    fn build_approval_card_shows_the_batch_position() {
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)));
+        let content = card["body"]["elements"][0]["content"]
+            .as_str()
+            .expect("markdown content");
+        let expected = crate::util::approval_position_line(Some((2, 3)));
+        assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
+        assert!(
+            content.starts_with(expected.trim_end()),
+            "the position leads the card body; got {content}"
+        );
+    }
+
+    #[test]
+    fn build_approval_card_omits_the_position_for_a_single_call() {
+        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)));
+        let none = build_approval_card("test-id", "shell", "args", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
+    }
+
+    #[test]
     fn build_approval_card_and_resolved_card_share_schema_version() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let send_card = build_approval_card("id", "shell", "args");
+        let send_card = build_approval_card("id", "shell", "args", None);
         let patch_card =
             build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
 
@@ -6943,6 +6980,7 @@ mod tests {
                         tool_name: "demo_tool".to_string(),
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
+                        position: None,
                     },
                 )
                 .await

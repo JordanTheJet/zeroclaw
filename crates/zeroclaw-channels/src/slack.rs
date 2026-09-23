@@ -553,7 +553,6 @@ impl SlackChannel {
         self
     }
 
-    /// Set a per-channel proxy URL that overrides the global proxy config.
     /// Enable the newer `markdown` block type for richer formatting.
     /// Only use this if your Slack workspace supports it.
     pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
@@ -561,6 +560,7 @@ impl SlackChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
@@ -586,28 +586,30 @@ impl SlackChannel {
         format!("https://slack.com/api/{method}")
     }
 
-    /// Configure voice transcription for audio file attachments.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }
@@ -4397,7 +4399,7 @@ impl SlackChannel {
                                 "alias": self.alias,
                                 "allowed_peer_count": allowed_peers.len(),
                             })),
-                        if allowed_peers.is_empty() {
+                        if !crate::allowlist::grants_anyone(&allowed_peers) {
                             "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                         } else {
                             "ignoring message from unauthorized user"
@@ -5000,6 +5002,48 @@ impl SlackChannel {
             entry.2 = Instant::now();
         }
     }
+}
+
+/// `chat.postMessage` body for a Socket Mode approval card.
+///
+/// Split out from the send so the rendered card can be asserted directly.
+/// Socket Mode builds its own Block Kit card rather than going through
+/// [`crate::util::build_yesno_approval_prompt`], so the position line has to be
+/// threaded into both surfaces the operator can read: the `text` notification
+/// fallback and the `mrkdwn` section.
+fn build_socket_mode_approval_body(
+    recipient: &str,
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+) -> serde_json::Value {
+    let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+    let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
+    let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
+    let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+    // Two pending cards from one turn are otherwise identical until tapped.
+    let position_line = crate::util::approval_position_line(position);
+    serde_json::json!({
+        "channel": recipient,
+        "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
+        "blocks": [{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("*{heading}* [`{token}`]\n{position_line}*{tool_label}:* `{tool_name}`\n*{args_label}:* {arguments_summary}"),
+            }
+        }, {
+            "type": "actions",
+            "elements": [
+                { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
+                { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
+                { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
+            ]
+        }]
+    })
 }
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
@@ -5782,7 +5826,7 @@ impl Channel for SlackChannel {
                                     "alias": self.alias,
                                     "allowed_peer_count": allowed_peers.len(),
                                 })),
-                                if allowed_peers.is_empty() {
+                                if !crate::allowlist::grants_anyone(&allowed_peers) {
                                     "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                                 } else {
                                     "ignoring message from unauthorized user"
@@ -6023,30 +6067,13 @@ impl Channel for SlackChannel {
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
         let send_result = if self.app_token.is_some() {
-            let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
-            let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
-            let args_label = i18n::get_required_cli_string("channel-approval-args-label");
-            let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
-            let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-            let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
-            let body = serde_json::json!({
-                "channel": recipient,
-                "text": format!("{heading} [{token}]\n{tool_label}: {}\n{args_label}: {}", request.tool_name, request.arguments_summary),
-                "blocks": [{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": format!("*{heading}* [`{token}`]\n*{tool_label}:* `{}`\n*{args_label}:* {}", request.tool_name, request.arguments_summary),
-                    }
-                }, {
-                    "type": "actions",
-                    "elements": [
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
-                    ]
-                }]
-            });
+            let body = build_socket_mode_approval_body(
+                recipient,
+                &token,
+                &request.tool_name,
+                &request.arguments_summary,
+                request.position_counter(),
+            );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(&self.bot_token)
@@ -6061,6 +6088,7 @@ impl Channel for SlackChannel {
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
+                    request.position_counter(),
                 ),
                 recipient,
             ))
@@ -6141,6 +6169,30 @@ mod tests {
             Arc::new(Vec::new),
         );
         assert_eq!(ch.channel_ids, vec!["C12345".to_string()]);
+    }
+
+    /// REGRESSION: Slack's own `with_transcription` never bound a provider, so
+    /// every audio attachment failed with "no transcription_provider
+    /// configured" even in a single-provider deployment. The shared snapshot
+    /// path binds the lone provider; the daemon path binds the owning agent's.
+    #[test]
+    fn with_transcription_binds_the_sole_provider() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            ..Default::default()
+        };
+        let ch = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec!["C12345".into()],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_transcription(tc);
+        let manager = ch.transcription_manager.as_ref().expect("manager is built");
+        assert_eq!(manager.bound_provider(), "groq");
+        assert!(ch.transcription.is_some());
     }
 
     #[test]
@@ -9136,6 +9188,54 @@ mod tests {
             }
         });
         assert!(SlackChannel::try_parse_approval_block_action(&envelope).is_none());
+    }
+
+    #[test]
+    fn socket_mode_approval_card_shows_the_batch_position_on_both_surfaces() {
+        // Socket Mode is the documented supervised-mode path, and it renders
+        // twice: the `text` notification fallback and the Block Kit section.
+        // A line in only one of them still leaves a card the operator cannot
+        // tell apart from the next one.
+        let body = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            Some((2, 3)),
+        );
+        let expected = crate::util::approval_position_line(Some((2, 3)));
+        assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
+
+        let notification = body["text"].as_str().expect("text is a string");
+        assert!(
+            notification.contains(expected.trim_end()),
+            "notification text should carry the position; got {notification}"
+        );
+
+        let section = body["blocks"][0]["text"]["text"]
+            .as_str()
+            .expect("section text is a string");
+        assert!(
+            section.contains(expected.trim_end()),
+            "Block Kit section should carry the position; got {section}"
+        );
+    }
+
+    #[test]
+    fn socket_mode_approval_card_omits_the_position_for_a_single_call() {
+        let single = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            Some((1, 1)),
+        );
+        let none =
+            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]

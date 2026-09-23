@@ -1,3 +1,5 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_cli;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 #[cfg(feature = "agent-runtime")]
@@ -11,6 +13,7 @@ mod cost_status_cli;
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+mod degraded_config_remediation;
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;

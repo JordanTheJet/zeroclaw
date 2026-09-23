@@ -32,6 +32,13 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn repo_relative_key(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 struct Crate {
     name: String,
     version: String,
@@ -692,6 +699,17 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
 )];
 
 #[test]
+fn repo_relative_key_normalizes_windows_separators() {
+    let root = Path::new("repository");
+    let source = root.join(r"crates\zeroclaw-gateway\src\static_files.rs");
+
+    assert_eq!(
+        repo_relative_key(&source, root),
+        "crates/zeroclaw-gateway/src/static_files.rs"
+    );
+}
+
+#[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
     let crates = workspace_crates();
@@ -733,11 +751,7 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                         .to_path_buf()
                 };
                 let resolved = normalize(&base, &include.path);
-                let rel = source_path
-                    .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
+                let rel = repo_relative_key(&source_path, &repo_root());
                 let excepted = ESCAPE_EXCEPTIONS
                     .iter()
                     .any(|(f, p)| *f == rel && *p == include.path);
@@ -758,10 +772,7 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                 if (!inside_crate || !shipped) && !excepted {
                     violations.push(format!(
                         "  {} ({})\n      includes `{}`\n      -> {}",
-                        source_path
-                            .strip_prefix(repo_root())
-                            .unwrap_or(&source_path)
-                            .display(),
+                        rel,
                         krate.name,
                         include.path,
                         resolved.display(),

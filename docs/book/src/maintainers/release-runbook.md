@@ -43,6 +43,23 @@ PR (step 2), or open it as a separate preceding PR if the diff is large.
 If `CHANGELOG-next.md` already exists from a previous aborted release cycle,
 review it for accuracy before reusing it.
 
+The file must carry an `## In brief` section directly after the preamble: two
+short paragraphs, at most 255 characters together, that say what the release
+is. The X and Discord announcement workflows publish that section, followed by
+the commit and contributor counts from the preamble and a link to the website's
+release post (or the GitHub release when no post exists yet). Without it they
+fall back to the first Highlights bullets, and without those to the raw commit
+list. The skill's `SKILL.md` has the style rules and a reference example.
+
+Preview the announcement text for any published tag without posting:
+
+```bash
+gh workflow run tweet-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+```
+
+The composed text appears in the run's job summary.
+
 ---
 
 ## Step 2: Bump and merge the version PR
@@ -54,7 +71,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 #### sh
 
 ```sh
-./scripts/release/bump-version.sh    # version from Cargo.toml
+./scripts/release/bump-version.sh --release    # version from Cargo.toml
 ```
 
 </div>
@@ -73,6 +90,19 @@ in step automatically, so never hand-edit a generated region. Live release
 availability remains hand-authored and is not inferred by the generator. This
 script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
 `scripts/dev/refresh-nix-hashes.sh`.
+
+Release mode requires `cargo`, `jq`, `nix-prefetch-git`, `perl`, `sha256sum`,
+Python 3.11+ with `tomllib`, Bash 4+ on `PATH`, the lockfile, and the Nix
+refresh script before it edits files. On macOS, install a modern Bash and put
+it ahead of `/bin/bash` on `PATH` for the Nix refresher. It stops if
+lockfile resolution, Nix hashes, or installer generation fails. A failure can
+leave earlier edits in the worktree: inspect them and rerun after fixing the
+reported prerequisite. Do not commit an incomplete bump. Without `--release`,
+the script retains its best-effort behavior for local preparation.
+
+The tag-cut helper, `scripts/release/cut_release_tag.sh`, also uses release
+mode. A preparation failure stops it before committing, fetching, tagging,
+or pushing; the ordinary local mode is not a tag-cut fallback.
 
 ### Refresh and pin translations
 
@@ -122,15 +152,11 @@ chore: bump version to vX.Y.Z
 
 If the PR also changes `[workspace.package] rust-version` or pinned Rust toolchains, treat it as a compatibility change, not just release plumbing. The PR should name the new MSRV, explain the source-build upgrade path, and show that CI, Docker, installer, and generated surfaces agree on the new floor before merge.
 
-Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
-adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
-through lane D. Get two independent Core Team approvals. Merge only when CI is green. The **Installer Drift**
-gate in CI fails the PR if a generated surface is out of sync with the spec, so
-a missed regeneration cannot land. The
-**Validate Translations Pin** gate resolves the submodule at the pinned commit
-and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
-for translation pipeline details.
+Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler adds. If the PR raises a toolchain floor, also apply `risk:high` and route it through lane D.
+
+Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
+
+The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 
