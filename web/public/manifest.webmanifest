@@ -1,10 +1,9 @@
 {
-  "id": "/",
   "name": "ZeroClaw",
   "short_name": "ZeroClaw",
   "description": "ZeroClaw web dashboard",
-  "start_url": "/",
-  "scope": "/",
+  "start_url": "../",
+  "scope": "../",
   "display": "standalone",
   "background_color": "#1e1e24",
   "theme_color": "#1e1e24",
