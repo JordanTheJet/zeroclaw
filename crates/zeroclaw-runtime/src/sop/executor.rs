@@ -152,6 +152,11 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
 /// Tools a SOP step turn must never see. Each would let the step act on the
 /// run it is part of (start, advance, or approve it) on whatever engine the
 /// turn holds, instead of returning a result to the driver that owns the run.
+/// Failure recorded for a headless step whose scoped tool policy could not be
+/// built. The step fails instead of running under an unscoped policy.
+pub(crate) const STEP_TURN_SCOPE_UNAVAILABLE: &str =
+    "SOP step turn not run: its scoped tool policy could not be built";
+
 pub(crate) const SOP_STEP_SELF_DRIVE_TOOLS: [&str; 3] =
     ["sop_execute", "sop_advance", "sop_approve"];
 
@@ -416,33 +421,58 @@ async fn drive_headless_run(
                 // turn that does so acts on a second engine built inside the
                 // turn, executes the successor steps there, and hands this
                 // driver a prose summary that then fails the step's schema.
-                // The live turn path already scopes these tools out; a policy
-                // that cannot be resolved is left to `agent::run`, which fails
-                // the step the same way it would have without the scope.
-                let overrides = match step_turn_security(&config, &agent_alias) {
-                    Ok(policy) => crate::agent::loop_::AgentRunOverrides {
-                        security: Some(Arc::new(policy)),
-                        ..Default::default()
-                    },
-                    Err(_) => crate::agent::loop_::AgentRunOverrides::default(),
+                // The live turn path already scopes these tools out.
+                //
+                // If the scoped policy cannot be built, the step fails here and
+                // the turn never runs. Falling back to `agent::run`'s own policy
+                // construction is not safe: that construction touches the
+                // filesystem, so a transient error can clear on the retry and
+                // the turn would then run WITHOUT the exclusions, restoring the
+                // self-drive path this scope exists to close.
+                let run_result = match step_turn_security(&config, &agent_alias) {
+                    Ok(policy) => {
+                        Box::pin(crate::agent::run(
+                            config.clone(),
+                            &agent_alias,
+                            Some(context),
+                            None,
+                            None,
+                            config
+                                .model_provider_for_agent(&agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            crate::agent::loop_::AgentRunOverrides {
+                                security: Some(Arc::new(policy)),
+                                ..Default::default()
+                            },
+                        ))
+                        .await
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                                "agent": agent_alias,
+                                "error": format!("{e:#}"),
+                            })),
+                            "SOP headless driver: step tool scope unavailable; failing the step"
+                        );
+                        Err(anyhow::Error::msg(format!(
+                            "{STEP_TURN_SCOPE_UNAVAILABLE}: {e:#}"
+                        )))
+                    }
                 };
-                let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
-                    &agent_alias,
-                    Some(context),
-                    None,
-                    None,
-                    config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path),
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    overrides,
-                ))
-                .await;
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -855,6 +885,46 @@ mod tests {
         );
         drop(resumed);
         assert!(HeadlessDriverLease::acquire(&engine, &run_id).is_some());
+    }
+
+    /// A step whose scoped tool policy cannot be built must fail without
+    /// running the turn. Running it anyway would let `agent::run` rebuild the
+    /// policy on its own, and a transient failure that clears on that retry
+    /// would run the turn with the SOP self-drive tools still exposed.
+    #[tokio::test]
+    async fn an_unbuildable_step_scope_fails_the_step_instead_of_running_unscoped() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("scope-unavailable")]);
+        let action = engine
+            .start_run("scope-unavailable", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        // No agents and no risk profiles: `SecurityPolicy::for_agent` cannot
+        // resolve the step agent, so the scoped policy cannot be built.
+        let config = zeroclaw_config::schema::Config {
+            data_dir: std::path::PathBuf::from("/tmp/zeroclaw-step-scope-unavailable-test"),
+            config_path: std::path::PathBuf::from(
+                "/tmp/zeroclaw-step-scope-unavailable-test/config.toml",
+            ),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        drive_headless_run(config, Arc::clone(&engine), None, action, None).await;
+
+        let guard = engine.lock().unwrap();
+        let run = guard.get_run(&run_id).expect("run is still known");
+        let result = run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 records a result");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains(STEP_TURN_SCOPE_UNAVAILABLE),
+            "the step must fail on the missing scope, not on a turn run without it; got: {}",
+            result.output
+        );
     }
 
     fn config_with_agent(
