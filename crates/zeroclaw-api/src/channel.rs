@@ -440,6 +440,13 @@ pub struct ChannelMessage {
     /// Inbound email References chain (parent thread); used to build the
     /// reply's References header. Empty for non-email channels.
     pub references: Vec<String>,
+    /// Set by the receiving channel when the platform marked the inbound event
+    /// itself as a voice message (Matrix: an `m.audio` event carrying
+    /// `org.matrix.msc3245.voice`). This field creates that fact for the
+    /// runtime — nothing else on the inbound side records it. Never derived
+    /// from message text, a reply parent, or room state. `false` means text
+    /// or unknown.
+    pub voice_origin: bool,
 }
 
 /// Message to send through a channel
@@ -467,6 +474,44 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+}
+
+/// A native poll to post in a chat.
+///
+/// Channels that cannot post one report [`Channel::supports_native_polls`] as
+/// `false`, and callers fall back to whatever they did before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollRequest {
+    /// Chat or peer to post the poll in, in the channel's own addressing.
+    pub recipient: String,
+    pub question: String,
+    /// Answer options, in the order they should be shown.
+    pub options: Vec<String>,
+    /// How many options one voter may pick. `1` is a single-choice poll.
+    pub selectable_count: u32,
+}
+
+impl PollRequest {
+    /// Single-choice poll. Use [`PollRequest::with_selectable_count`] for a
+    /// poll that accepts more than one answer per voter.
+    pub fn new(
+        recipient: impl Into<String>,
+        question: impl Into<String>,
+        options: Vec<String>,
+    ) -> Self {
+        Self {
+            recipient: recipient.into(),
+            question: question.into(),
+            options,
+            selectable_count: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_selectable_count(mut self, selectable_count: u32) -> Self {
+        self.selectable_count = selectable_count;
+        self
+    }
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -796,6 +841,31 @@ pub enum ListenerHealth {
     Unhealthy,
 }
 
+/// Error a [`Channel::finalize_draft`] implementation returns when it posted
+/// part of a chunked final answer and could not deliver the remainder. The
+/// accepted prefix is already on the wire, so a caller that falls back to
+/// resending the whole answer would duplicate the delivered chunks. Callers must
+/// treat this as degraded-but-committed delivery: do NOT resend the full answer;
+/// the undelivered suffix is lost. `delivered` is the number of physical chunks
+/// accepted before the failure, for logging only.
+#[derive(Debug)]
+pub struct FinalizePartialDelivery {
+    pub delivered: usize,
+}
+
+impl fmt::Display for FinalizePartialDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer partially delivered ({} chunk(s) accepted); \
+             remainder undelivered and must not be resent",
+            self.delivered
+        )
+    }
+}
+
+impl std::error::Error for FinalizePartialDelivery {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -952,6 +1022,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this channel can post a native poll through [`Channel::send_poll`].
+    /// Callers check this before offering one, so a channel without native
+    /// polls keeps whatever fallback the caller already had.
+    fn supports_native_polls(&self) -> bool {
+        false
+    }
+
     /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
     /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
     /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
@@ -1021,7 +1098,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Whether this channel implements the turn-flush narration contract:
+    /// `flush_draft_turn` delivers each completed agent text turn as a permanent
+    /// outbound message, and the orchestrator therefore routes that narration
+    /// through the outbound hook + leak-detection boundary and orders it ahead of
+    /// the approval prompt via a flush barrier.
+    ///
+    /// Distinct from [`Self::supports_multi_message_streaming`]: a channel can stream
+    /// multiple messages another way (e.g. paragraph edits via `update_draft`)
+    /// without implementing `flush_draft_turn`. Only channels that override
+    /// `flush_draft_turn` may return `true` here, otherwise the orchestrator runs
+    /// outbound policy on phantom flushes that deliver nothing. Default `false`.
+    fn supports_turn_flush_narration(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between successive messages in multi-message mode.
+    /// The message boundary is channel-specific (for example, Telegram uses
+    /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
     }
@@ -1098,8 +1192,42 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Discard a completed agent text turn WITHOUT sending it, marking that
+    /// narration consumed for this draft. Called when the outbound hook cancels a
+    /// narration flush: the cancelled turn must never be re-offered (no
+    /// resurrection), but narration produced by a *later* turn must still be
+    /// deliverable. Advancing the channel's delivered-prefix bookkeeping over the
+    /// cancelled text achieves both. Default: no-op.
+    async fn discard_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     /// `suppress_voice` forces text delivery even on voice-only peers.
+    ///
+    /// If finalization must chunk a long answer and a later chunk fails after an
+    /// earlier one was accepted, return [`FinalizePartialDelivery`] rather than a
+    /// generic error: it tells the caller the accepted prefix is already posted
+    /// so it must not resend the whole answer (which would duplicate the
+    /// delivered chunks). A generic `Err` still means nothing was committed and a
+    /// full-message fallback is safe.
     async fn finalize_draft(
         &self,
         _recipient: &str,
@@ -1158,6 +1286,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Create a new platform room/conversation when the channel supports it.
     async fn create_room(&self, _options: &RoomCreationOptions) -> anyhow::Result<String> {
         anyhow::bail!("channel does not support room creation")
+    }
+
+    /// Post a native poll when the channel supports it.
+    async fn send_poll(&self, _poll: &PollRequest) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support native polls")
     }
 
     /// Invite a user to an existing platform room/conversation.

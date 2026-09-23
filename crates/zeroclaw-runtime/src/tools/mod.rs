@@ -70,7 +70,7 @@ pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
-pub use zeroclaw_tools::git_operations::GitOperationsTool;
+pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -679,6 +679,26 @@ struct RuntimeShellAssembly {
     sandbox: Arc<dyn Sandbox>,
 }
 
+/// Adapts the runtime's canonical per-agent sandbox to the Git tool without
+/// making the lower-level tools crate depend on the runtime crate.
+struct RuntimeGitCommandBoundary {
+    sandbox: Arc<dyn Sandbox>,
+    runtime_kind: zeroclaw_config::schema::RuntimeKind,
+}
+
+impl GitCommandBoundary for RuntimeGitCommandBoundary {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        if self.runtime_kind == zeroclaw_config::schema::RuntimeKind::Docker {
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "tool-git-operations-error-docker-runtime-write-unsupported"
+            ));
+        }
+        self.sandbox
+            .wrap_command(command)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 /// Pair the canonical runtime kind with one shared sandbox instance for every
 /// runtime-backed executor assembled by the production tool registry.
 fn runtime_shell_assembly(
@@ -1170,9 +1190,12 @@ fn all_tools_with_runtime_on_thread(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
+        Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
-            workspace_dir.to_path_buf(),
+            Arc::new(RuntimeGitCommandBoundary {
+                sandbox: sandbox.clone(),
+                runtime_kind: root_config.runtime.kind,
+            }),
         )),
         Arc::new(PushoverTool::new(
             security.clone(),
@@ -1300,7 +1323,12 @@ fn all_tools_with_runtime_on_thread(
                 );
             }
         }
-        // Add full browser automation tool (pluggable backend)
+    }
+
+    // Full browser automation (pluggable backend) is a separate opt-in from
+    // `browser_open`: it drives a real Chrome/Chromium session that may
+    // already be logged in, so `[browser] enabled` alone must not grant it.
+    if browser_config.automation_enabled {
         match BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
@@ -2291,10 +2319,10 @@ fn register_plugin_tools(
 
     for scope in admitted {
         let package = scope.id().package().to_string();
-        let Some((manifest, wasm_path)) = details
+        let Some((manifest, component)) = details
             .iter()
-            .copied()
             .find(|(manifest, _)| manifest.name == package)
+            .map(|(manifest, component)| (*manifest, *component))
         else {
             continue;
         };
@@ -2317,7 +2345,7 @@ fn register_plugin_tools(
         }
 
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-            wasm_path.to_path_buf(),
+            component.clone(),
             scope,
             services.clone(),
             plugin_limits,
@@ -2378,6 +2406,202 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
+
+    #[test]
+    fn git_write_boundary_rejects_docker_runtime_writes() {
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+        const ENGLISH: &str = "Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.";
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Docker,
+        };
+        let mut command = std::process::Command::new("git");
+
+        let error = boundary.wrap_command(&mut command).unwrap_err();
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+
+        assert_eq!(
+            error.to_string(),
+            expected_error,
+            "Docker runtime must return its localized Git-write rejection"
+        );
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        assert_eq!(
+            crate::i18n::get_english_cli_string_with_args(KEY, &[]),
+            ENGLISH,
+            "the English diagnostic contract must remain stable"
+        );
+        assert_eq!(command.get_program(), "git");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_rejects_docker_git_writes_before_hook_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+
+        let tmp = TempDir::new().unwrap();
+        let repository = tmp.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-C", repository.to_str().unwrap()])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "test setup git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "ZeroClaw Test"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        run_git(&["config", "tag.gpgsign", "false"]);
+        std::fs::write(repository.join("tracked.txt"), "initial\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+        run_git(&["branch", "target"]);
+
+        let marker = tmp.path().join("host-hook-ran");
+        let hook = repository.join(".git/hooks/post-checkout");
+        run_git(&[
+            "config",
+            "core.hooksPath",
+            hook.parent().unwrap().to_str().unwrap(),
+        ]);
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let filter_marker = tmp.path().join("host-filter-ran");
+        let filter = tmp.path().join("clean-filter");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch {}\ncat\n", filter_marker.display()),
+        )
+        .unwrap();
+        let mut filter_permissions = std::fs::metadata(&filter).unwrap().permissions();
+        filter_permissions.set_mode(0o755);
+        std::fs::set_permissions(&filter, filter_permissions).unwrap();
+        run_git(&["config", "filter.marker.clean", filter.to_str().unwrap()]);
+        std::fs::write(
+            repository.join(".gitattributes"),
+            "filtered.txt filter=marker\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("filtered.txt"), "filtered\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: repository.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("docker".to_string()),
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                cfg.runtime.docker.clone(),
+            )),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            repository.as_path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("production registry must build")
+        .tools;
+        let git_operations = tools
+            .iter()
+            .find(|tool| tool.name() == "git_operations")
+            .expect("production registry must install git_operations");
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        let expected_checkout_error = format!("Checkout failed: {expected_error}");
+        let expected_add_error = format!("Add failed: {expected_error}");
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "checkout",
+                "branch": "target",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(expected_checkout_error.as_str())
+        );
+        assert!(
+            !marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a repository hook"
+        );
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "add",
+                "paths": "filtered.txt",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(result.error.as_deref(), Some(expected_add_error.as_str()));
+        assert!(
+            !filter_marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a clean filter"
+        );
+    }
+
+    #[test]
+    fn git_write_boundary_preserves_native_none_mode() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Native,
+        };
+        let mut command = std::process::Command::new("git");
+
+        boundary.wrap_command(&mut command).unwrap();
+
+        assert_eq!(command.get_program(), "git");
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -4137,6 +4361,7 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
@@ -4240,10 +4465,114 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(
+            !names.contains(&"browser"),
+            "[browser] enabled must gate browser_open only; full automation \
+             requires the separate automation_enabled opt-in"
+        );
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Opting into `[browser] automation_enabled` registers the full
+    /// `browser` automation tool alongside `browser_open`.
+    #[test]
+    fn all_tools_includes_browser_automation_when_opted_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("browser automation tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
+    }
+
+    /// The two flags gate independently: automation can be registered
+    /// without `browser_open`, proving `automation_enabled` is the only
+    /// thing standing between an operator and the automation tool.
+    #[test]
+    fn all_tools_registers_automation_without_browser_open() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("automation-only tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
     }
 
     #[tokio::test]

@@ -328,6 +328,13 @@ impl HistoryTrimNotice {
             dropped_messages: self.dropped_messages,
             kept_turns: self.kept_turns,
             reason: self.reason,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         }
     }
 }
@@ -356,10 +363,13 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history cap from canonical config at use time.
-    /// Daemon-backed sessions capture the shared live config handle so reloads
-    /// affect existing sessions without duplicating config-derived state.
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves the structured-history trim policy from canonical config at
+    /// use time: the effective cap and the low-water fraction, as one pair.
+    /// Daemon-backed sessions capture the shared live config handle so
+    /// reloads affect existing sessions without duplicating config-derived
+    /// state. Both halves resolve together so a reload cannot mix revisions.
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
     context_limits_resolver: Option<ContextLimitsResolver>,
@@ -383,6 +393,7 @@ pub struct Agent {
     /// True only when `history` contains the synthetic trim breadcrumb inserted
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
+    history_trim_generation: u64,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     /// The exact immutable route table used by `model_provider` for hint
     /// dispatch. It is replaced atomically with the provider on model switch.
@@ -441,7 +452,7 @@ pub struct Agent {
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
@@ -582,7 +593,8 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -614,7 +626,7 @@ pub struct AgentBuilder {
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
     config_generation: Option<ConfigGeneration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
@@ -637,7 +649,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_cap_resolver: None,
+            structured_history_limits_resolver: None,
             context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
@@ -669,7 +681,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
             delegate_tool: None,
@@ -730,11 +742,11 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_cap_resolver(
+    fn structured_history_limits_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+        resolver: Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>,
     ) -> Self {
-        self.structured_history_cap_resolver = Some(resolver);
+        self.structured_history_limits_resolver = Some(resolver);
         self
     }
 
@@ -743,9 +755,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Test convenience pinning the structured cap. The low-water fraction
+    /// stays at the crate default inside the pinned resolver; tests that
+    /// need a specific fraction must drive it through a runtime profile and
+    /// the live resolver path instead.
     #[cfg(test)]
     fn structured_max_history_messages(self, max: usize) -> Self {
-        self.structured_history_cap_resolver(Arc::new(move || max))
+        self.structured_history_limits_resolver(Arc::new(move || {
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: max,
+                low_water: zeroclaw_config::schema::DEFAULT_HISTORY_TRIM_LOW_WATER,
+            }
+        }))
     }
 
     pub fn multimodal_config(
@@ -1048,7 +1069,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_cap_resolver: self.structured_history_cap_resolver,
+            structured_history_limits_resolver: self.structured_history_limits_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
@@ -1076,6 +1097,7 @@ impl AgentBuilder {
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
+            history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
             model_route_resolver,
             response_cache: self.response_cache,
@@ -1100,7 +1122,7 @@ impl AgentBuilder {
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
             delegate_tool: self.delegate_tool,
@@ -1108,9 +1130,35 @@ impl AgentBuilder {
     }
 }
 
+/// Identifies the single message in a replayed buffer that actually
+/// received the provider-only recalled-memory preamble. The injector
+/// targets one message (the last user message at injection time); every
+/// other buffer a turn replays is either a pre-injection clone that never
+/// contained the preamble or a slice positioned after it. Callers pass the
+/// target only for the mutated history buffer, at the index the injected
+/// message holds within the exact slice being replayed — never for
+/// uninjected clones, which must replay byte-for-byte.
+struct MemoryPreambleTarget<'a> {
+    preamble: &'a str,
+    index: usize,
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Install a deterministic clock for downstream test fixtures.
+    ///
+    /// This method is available only to the crate's own tests or when the
+    /// dev-only `test-util` feature is enabled. Production builds always use
+    /// the live local clock.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_turn_datetime_for_test<F>(&mut self, provider: F)
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
     }
 
     /// The full `Config` the agent was constructed from, when available. Sourced
@@ -1137,7 +1185,7 @@ impl Agent {
     }
 
     fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(provider) = &self.turn_datetime {
             return provider();
         }
@@ -1347,6 +1395,18 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
+    }
+
+    pub fn set_history_has_trim_breadcrumb(&mut self, flag: bool) {
+        self.history_has_trim_breadcrumb = flag;
+    }
+
+    pub fn history_has_trim_breadcrumb(&self) -> bool {
+        self.history_has_trim_breadcrumb
+    }
+
+    pub fn history_trim_generation(&self) -> u64 {
+        self.history_trim_generation
     }
 
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
@@ -2273,18 +2333,28 @@ impl Agent {
                 })
             };
 
-        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
-                let cap_agent_alias = agent_alias.to_string();
-                Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
-                })
-            } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
+        let structured_history_limits_resolver: Arc<
+            dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync,
+        > = if let Some(cap_config) = live_config {
+            let cap_agent_alias = agent_alias.to_string();
+            // One read guard covers both halves: the cap and the low-water
+            // fraction are one trim decision and must come from one config
+            // revision even under a concurrent profile edit.
+            Arc::new(move || {
+                let config = cap_config.read();
+                crate::agent::history_trim::HistoryTrimLimits {
+                    max_messages: config
+                        .effective_structured_max_history_messages(&cap_agent_alias),
+                    low_water: config.effective_history_trim_low_water(&cap_agent_alias),
+                }
+            })
+        } else {
+            let limits = crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: config.effective_structured_max_history_messages(agent_alias),
+                low_water: config.effective_history_trim_low_water(agent_alias),
             };
+            Arc::new(move || limits)
+        };
 
         let builder = Agent::builder();
         #[cfg(test)]
@@ -2309,7 +2379,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_cap_resolver(structured_history_cap_resolver)
+            .structured_history_limits_resolver(structured_history_limits_resolver)
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
@@ -2374,18 +2444,22 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
-            .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+        let limits = self.structured_history_limits_resolver.as_ref().map_or(
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: self.config.resolved.max_history_messages,
+                low_water: self.config.resolved.history_trim_low_water,
+            },
+            |resolve| resolve(),
+        );
+        let max = limits.max_messages;
         if self.history.len() <= max {
             return None;
         }
+        let target = crate::agent::history_trim::history_trim_target(max, limits.low_water);
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max,
+            target,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
@@ -2395,6 +2469,7 @@ impl Agent {
 
         crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
         self.history_has_trim_breadcrumb = true;
+        self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
         let reason = crate::i18n::get_required_cli_string("history-trim-reason-message-cap");
         let channel = self.channel_name.clone();
         let agent_alias = self.observer_agent_alias();
@@ -2422,6 +2497,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_messages": max,
+                        "trim_target": target,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -2438,6 +2514,13 @@ impl Agent {
             channel: Some(channel),
             agent_alias,
             turn_id,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         Some(HistoryTrimNotice {
@@ -2779,7 +2862,41 @@ impl Agent {
         self.model_name.clone()
     }
 
-    fn replay_loop_messages(loop_messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+    fn replay_loop_messages(
+        loop_messages: &[ChatMessage],
+        injected: Option<MemoryPreambleTarget<'_>>,
+    ) -> Vec<ConversationMessage> {
+        // The turn engine injects the recalled-memory preamble onto the last
+        // user message (`turn::mod.rs`'s `memory` handling, which records the
+        // exact rendered block) for this turn's provider request only; it
+        // must never land in durable/canonical history, which every call
+        // site of this function feeds.
+        //
+        // The strip is positional, never content-discovered: only
+        // `injected.index` is considered, and only when that message is
+        // still a user-role message starting with the recorded preamble.
+        // Inferring the target from text instead — scanning every message
+        // for the preamble, even from the end — silently changes genuine
+        // history in two reachable cases. First, the no-trim and streamed
+        // callers replay pre-injection canonical clones alongside the
+        // recorded preamble; when the user's original text starts with that
+        // exact block, any content match strips genuine content from a
+        // buffer the injector never touched (those callers now pass `None`).
+        // Second, steering input appends newer user messages after the
+        // injected one, so a reverse scan can select the steering message,
+        // damaging it while leaving the injected memory in place. An older
+        // genuine message equal to the block is likewise never considered.
+        //
+        // The content confirmation is belt-and-braces, not discovery: it
+        // covers the trim dropping the injected message itself (the preamble
+        // leaves with it, so there is nothing to clean) without touching an
+        // unrelated message that shifted into the recorded position.
+        let strip_at = injected.as_ref().and_then(|target| {
+            loop_messages
+                .get(target.index)
+                .filter(|msg| msg.role == "user" && msg.content.starts_with(target.preamble))
+                .map(|_| target.index)
+        });
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
         let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
                                  results: Vec<ToolResultMessage>| {
@@ -2789,7 +2906,7 @@ impl Agent {
                 replayed.push(ConversationMessage::ToolResults(results));
             }
         };
-        for msg in loop_messages {
+        for (index, msg) in loop_messages.iter().enumerate() {
             if msg.role == "assistant"
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(&msg.content)
@@ -2878,7 +2995,21 @@ impl Agent {
                     continue;
                 }
             }
-            replayed.push(ConversationMessage::Chat(msg.clone()));
+            let stripped = if strip_at == Some(index) {
+                crate::agent::memory_inject::strip_memory_context_preamble(
+                    &msg.content,
+                    injected.as_ref().map(|target| target.preamble),
+                )
+            } else {
+                msg.content.as_str()
+            };
+            if stripped.len() == msg.content.len() {
+                replayed.push(ConversationMessage::Chat(msg.clone()));
+            } else {
+                let mut msg = msg.clone();
+                msg.content = stripped.to_string();
+                replayed.push(ConversationMessage::Chat(msg));
+            }
         }
         replayed
     }
@@ -3027,6 +3158,12 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let original_loop_history_len = loop_history.len();
+        let original_loop_history_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_injected_memory_preamble: Option<String> = None;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -3054,89 +3191,93 @@ impl Agent {
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
-                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                        crate::agent::loop_::ResolvedModelAccess {
-                            model_provider: self.model_provider.as_ref(),
-                            provider_name: &selected_route.provider_name,
-                            model: &selected_route.model,
-                            dispatch_model: &effective_model,
-                            temperature: self.temperature,
-                        },
-                        crate::agent::loop_::ResolvedIo {
-                            tools_registry: &self.tools,
-                            observer: self.observer.as_ref(),
-                            silent: false,
-                            approval: self.approval_manager.as_deref(),
-                            multimodal_config: &self.multimodal_config,
-                            // Inlined `full_config()` (per-field borrow) so it coexists with
-                            // the `&mut self.image_cache` in this same ToolLoop expression.
-                            config: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref()),
-                            hooks: self.hook_runner.as_deref(),
-                            activated_tools: self.activated_tools.as_ref(),
-                            model_switch_callback: None,
-                            receipt_generator: receipt_scope
-                                .as_ref()
-                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                        },
-                        crate::agent::loop_::ResolvedRuntimeKnobs {
-                            max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            excluded_tools: &[],
-                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                            pacing: &pacing,
-                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                            parallel_tools: self.config.resolved.parallel_tools,
-                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_limits,
-                            context_limits_resolver: self.context_limits_resolver.clone(),
-                            knobs: &knobs,
-                        },
-                    ),
-                    history: &mut loop_history,
-                    channel_name: &self.channel_name,
-                    channel_reply_target: None,
-                    cancellation_token: None,
-                    on_delta: None,
-                    shared_budget: None,
-                    channel: None,
-                    collected_receipts: receipt_scope
-                        .as_ref()
-                        .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                    event_tx: None,
-                    steering: None,
-                    new_messages_out: Some(&mut loop_new_messages),
-                    image_cache: Some(&mut self.image_cache),
-                    // Direct embedded Agent::turn call; source/transport/
-                    // trust stay placeholders, not yet stamped at the edge.
-                    memory: Some(crate::agent::memory_inject::TurnMemory {
-                        handle: self.memory.as_ref(),
-                        query: user_message.to_string(),
-                        sessions: vec![self.memory_session_id.clone()],
-                        suppress: false,
-                        cfg: self.memory_inject_cfg,
-                    }),
-                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                    agent_alias: agent_alias_for_loop.as_deref(),
-                    parent_agent_alias: None,
-                    turn_id: &turn_id,
-                    // Non-streamed `Agent::turn` returns text, not a
-                    // terminal `StreamedTurnSuccess`, so it publishes no
-                    // route snapshot.
-                    served_route_sink: None,
-                    // Live-daemon SOP path: re-assemble a nested step's agent
-                    // when it delegates elsewhere. Config survives only via
-                    // `provider_switch_config`; with `None` (test builder) a
-                    // cross-agent step FAILS CLOSED rather than inheriting
-                    // this turn's context.
-                    sop_reassembly: self
-                        .provider_switch_config
-                        .as_ref()
-                        .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                }),
+                Box::pin(crate::agent::loop_::run_tool_call_loop(
+                    crate::agent::loop_::ToolLoop {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: false,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_limits,
+                                context_limits_resolver: self.context_limits_resolver.clone(),
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut loop_history,
+                        history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                        injected_memory_preamble: &mut loop_injected_memory_preamble,
+                        channel_name: &self.channel_name,
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: Some(&mut loop_new_messages),
+                        image_cache: Some(&mut self.image_cache),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay placeholders, not yet stamped at the edge.
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
+                        turn_id: &turn_id,
+                        // Non-streamed `Agent::turn` returns text, not a
+                        // terminal `StreamedTurnSuccess`, so it publishes no
+                        // route snapshot.
+                        served_route_sink: None,
+                        // Live-daemon SOP path: re-assemble a nested step's agent
+                        // when it delegates elsewhere. Config survives only via
+                        // `provider_switch_config`; with `None` (test builder) a
+                        // cross-agent step FAILS CLOSED rather than inheriting
+                        // this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    },
+                )),
             ),
         );
         // Context-window recovery can change the provider-visible transcript
@@ -3187,11 +3328,54 @@ impl Agent {
                 None,
             );
         }
-        // Pop the original user message (pushed before the loop) so the
-        // replayed canonical version, including the original user message.
-        self.history.pop();
-        for replayed in Self::replay_loop_messages(&loop_new_messages) {
-            self.history.push(replayed);
+        // Write back any token-budget trim that happened inside the loop to
+        // durable history. `loop_history` is the TurnState's history which
+        // after `sync_pending` already contains the canonical current turn
+        // (user+assistant...), so `loop_history.len()` includes both the
+        // prefix and the canonical. To detect a trim we must compare only
+        // the prefix part, not the full length which always grows via
+        // `sync_pending` and tool appends.
+        let new_prefix_len = loop_history.len().saturating_sub(loop_new_messages.len());
+        let history_trimmed_in_loop = new_prefix_len != original_loop_history_len
+            || loop_history_crumb_present != original_loop_history_crumb;
+        if history_trimmed_in_loop {
+            // The loop's history is already the authoritative full transcript
+            // (trimmed prefix + canonical). It already contains the user and
+            // assistant messages, so we can replay it directly without
+            // appending `loop_new_messages` a second time — doing so duplicated
+            // the current turn (5 messages instead of 3).
+            //
+            // This is the mutated history buffer, the only one that can
+            // carry the injected preamble: the current turn's user message
+            // opens the canonical tail, which starts at `new_prefix_len`.
+            // The positional confirmation inside replay still verifies the
+            // message before stripping it.
+            let injected =
+                loop_injected_memory_preamble
+                    .as_deref()
+                    .map(|preamble| MemoryPreambleTarget {
+                        preamble,
+                        index: new_prefix_len,
+                    });
+            self.history.clear();
+            self.history
+                .extend(Self::replay_loop_messages(&loop_history, injected));
+            self.history_has_trim_breadcrumb = loop_history_crumb_present;
+            self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
+        } else {
+            // No trim: the loop did not change the prefix. Pop the pre-loop
+            // enriched user message and replay the canonical (which may be the
+            // request-enriched form, not the raw `enriched` we pushed).
+            // `loop_new_messages` is a pre-injection clone the loop's memory
+            // injection never touches (it mutates `loop_history` in place,
+            // and only ever pushes to this buffer, never replaces it), so
+            // no strip target is passed: an uninjected clone must replay
+            // byte-for-byte even when the user's original text starts with
+            // the recorded preamble.
+            self.history.pop();
+            for replayed in Self::replay_loop_messages(&loop_new_messages, None) {
+                self.history.push(replayed);
+            }
         }
         let response = match loop_result {
             Ok(response) => response,
@@ -3461,7 +3645,17 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut streamed_original_loop_history_len = loop_history.len();
+        let mut streamed_original_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_injected_memory_preamble: Option<String> = None;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
+        // Track total canonical ChatMessage length so prefix detection is not
+        // confused by `sync_pending` which always grows `loop_history` via the
+        // canonical. After each round, prefix_len = loop_history.len() - total_canonical_len.
+        let mut total_canonical_len = 0usize;
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
@@ -3562,97 +3756,107 @@ impl Agent {
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &selected_route.provider_name,
-                                model: &selected_route.model,
-                                dispatch_model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: true,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                // `None` here (rather than a shared global) is
-                                // deliberate: `run_tool_call_loop` mints a fresh,
-                                // task-local switch state for this round when it
-                                // sees `None`, so a `model_switch` requested this
-                                // round can never leak into a sibling round or a
-                                // concurrently running turn/agent.
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                // Fallback pair for the loop when no resolver is
-                                // wired; when `context_limits_resolver` is set
-                                // the loop re-resolves per call, so seed with the
-                                // resolver-free config limits instead of invoking
-                                // the resolver a second time here.
-                                context_limits: self.config.resolved.context_limits(),
-                                context_limits_resolver: self.context_limits_resolver.clone(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: cancel_token.clone(),
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: approval_bridge.as_deref(),
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: Some(event_tx.clone()),
-                        steering: None,
-                        new_messages_out: Some(&mut round_added),
-                        image_cache: Some(&mut self.image_cache),
-                        // Direct embedded Agent::turn call; source/transport/
-                        // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
-                        }),
-                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        parent_agent_alias: None,
-                        turn_id: &turn_id,
-                        served_route_sink: Some(served_route_sink.clone()),
-                        // Live-daemon SOP path: re-assemble a nested step's
-                        // agent when it delegates elsewhere. Config survives
-                        // only via `provider_switch_config`; with `None`
-                        // (test builder) a cross-agent step FAILS CLOSED
-                        // rather than inheriting this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                    }),
+                    Box::pin(crate::agent::loop_::run_tool_call_loop(
+                        crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &selected_route.provider_name,
+                                    model: &selected_route.model,
+                                    dispatch_model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: true,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    // `None` here (rather than a shared global) is
+                                    // deliberate: `run_tool_call_loop` mints a fresh,
+                                    // task-local switch state for this round when it
+                                    // sees `None`, so a `model_switch` requested this
+                                    // round can never leak into a sibling round or a
+                                    // concurrently running turn/agent.
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    // Fallback pair for the loop when no resolver is
+                                    // wired; when `context_limits_resolver` is set
+                                    // the loop re-resolves per call, so seed with the
+                                    // resolver-free config limits instead of invoking
+                                    // the resolver a second time here.
+                                    context_limits: self.config.resolved.context_limits(),
+                                    context_limits_resolver: self.context_limits_resolver.clone(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                            injected_memory_preamble: &mut loop_injected_memory_preamble,
+                            channel_name: &self.channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: cancel_token.clone(),
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: approval_bridge.as_deref(),
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: Some(event_tx.clone()),
+                            steering: None,
+                            new_messages_out: Some(&mut round_added),
+                            image_cache: Some(&mut self.image_cache),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            served_route_sink: Some(served_route_sink.clone()),
+                            // Live-daemon SOP path: re-assemble a nested step's
+                            // agent when it delegates elsewhere. Config survives
+                            // only via `provider_switch_config`; with `None`
+                            // (test builder) a cross-agent step FAILS CLOSED
+                            // rather than inheriting this turn's context.
+                            sop_reassembly: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref())
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        },
+                    )),
                 ),
             );
             // Scope the provider-fallback task-local around the round so the
@@ -3718,9 +3922,44 @@ impl Agent {
                 self.history.pop();
                 new_msgs.pop();
             }
-            for replayed in Self::replay_loop_messages(&round_added) {
+            // `round_added` is a pre-injection clone the loop's memory
+            // injection never touches (it mutates `loop_history` in place,
+            // once, before round 0, and only ever pushes to the canonical
+            // buffer), so no strip target is passed here either: even the
+            // round-0 user message it carries for a single tool-free
+            // exchange is the clean clone, and must replay byte-for-byte.
+            for replayed in Self::replay_loop_messages(&round_added, None) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
+            }
+            total_canonical_len += round_added.len();
+            // Write back durable token-budget trim from loop_history.
+            // `loop_history` after this round is [trimmed_prefix + all canonical ChatMessages so far]
+            // `total_canonical_len` tracks the ChatMessage length of all canonical so far,
+            // so prefix_len = loop_history.len() - total_canonical_len.
+            let new_prefix_len = loop_history.len().saturating_sub(total_canonical_len);
+            if new_prefix_len != streamed_original_loop_history_len
+                || loop_history_crumb_present != streamed_original_crumb
+            {
+                // The prefix was trimmed (old turns dropped or crumb inserted).
+                // Rebuild durable history from the authoritative loop_history
+                // which already contains the trimmed prefix + canonical. As
+                // above, this is the mutated buffer: the injected message,
+                // when retained, opens the canonical tail at `new_prefix_len`.
+                let injected =
+                    loop_injected_memory_preamble
+                        .as_deref()
+                        .map(|preamble| MemoryPreambleTarget {
+                            preamble,
+                            index: new_prefix_len,
+                        });
+                self.history.clear();
+                self.history
+                    .extend(Self::replay_loop_messages(&loop_history, injected));
+                self.history_has_trim_breadcrumb = loop_history_crumb_present;
+                self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
+                streamed_original_loop_history_len = new_prefix_len;
+                streamed_original_crumb = loop_history_crumb_present;
             }
 
             match loop_result {
@@ -3827,7 +4066,7 @@ impl Agent {
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
                     if committed_response.is_empty() {
-                        for replayed in Self::replay_loop_messages(&round_added) {
+                        for replayed in Self::replay_loop_messages(&round_added, None) {
                             if let ConversationMessage::Chat(message) = &replayed
                                 && message.role == "assistant"
                             {
@@ -4054,6 +4293,197 @@ mod tests {
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    /// Regression: trim write-back must never persist the provider-only
+    /// recalled-memory preamble the turn engine injects onto the last user
+    /// message. `replay_loop_messages` feeds every durable-history write-back
+    /// call site, so stripping it there covers both the buffered and
+    /// streamed trim paths. The strip target carries the injected message's
+    /// index within the replayed (mutated history) buffer.
+    #[test]
+    fn replay_loop_messages_strips_the_memory_context_preamble() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        let with_preamble = ChatMessage::user(format!("{preamble}what's the weather like"));
+        let assistant = ChatMessage::assistant("it's sunny".to_string());
+        let replayed = Agent::replay_loop_messages(
+            &[with_preamble, assistant],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 0,
+            }),
+        );
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(user_msg.content, "what's the weather like");
+        assert!(
+            !user_msg
+                .content
+                .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "durable history must never carry the recalled-memory preamble"
+        );
+    }
+
+    /// Regression: a genuine user message that merely starts with the same
+    /// marker text as a recalled-memory preamble must survive byte-for-byte
+    /// when no length was recorded for it — provenance is the caller's own
+    /// record of what it injected, never a match against the marker text.
+    #[test]
+    fn replay_loop_messages_preserves_a_user_message_that_looks_like_a_preamble() {
+        let looks_like_a_preamble = ChatMessage::user(format!(
+            "{}\n- k: a user-authored fact\n{}\n\nplease keep this text",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        ));
+        let original = looks_like_a_preamble.content.clone();
+        let replayed = Agent::replay_loop_messages(&[looks_like_a_preamble], None);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            user_msg.content, original,
+            "a genuine user message must survive byte-for-byte without a recorded preamble length"
+        );
+    }
+
+    /// Regression: the no-trim and streamed callers replay pre-injection
+    /// canonical clones (`loop_new_messages` / `round_added`) that the
+    /// loop's memory injection never touches. Those callers pass no strip
+    /// target, so replay is byte-for-byte even when the user's original
+    /// text starts with the exact recorded preamble — the case that
+    /// content-discovered stripping corrupted.
+    #[test]
+    fn replay_loop_messages_never_strips_an_uninjected_clone_even_when_text_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        // The user's genuine text starts with the exact recorded block, in
+        // a buffer the injector never touched.
+        let genuine = ChatMessage::user(format!("{preamble}my original question"));
+        let assistant = ChatMessage::assistant("answer 1".to_string());
+        let original = genuine.content.clone();
+
+        let replayed = Agent::replay_loop_messages(&[genuine, assistant], None);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            user_msg.content, original,
+            "an uninjected clone must survive intact: clones carry no strip target"
+        );
+    }
+
+    /// Regression: an older genuine user message that happens to equal the
+    /// exact rendered preamble must survive write-back. Replay strips only
+    /// the recorded target position in the mutated history buffer — never a
+    /// content match anywhere else in the buffer.
+    #[test]
+    fn replay_loop_messages_strips_only_the_injected_user_message_when_an_older_one_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        // A genuine older turn quoting the exact recalled block verbatim.
+        let older_collision = ChatMessage::user(preamble.clone());
+        let injected = ChatMessage::user(format!("{preamble}current question"));
+        let assistant = ChatMessage::assistant("answer".to_string());
+        let replayed = Agent::replay_loop_messages(
+            &[older_collision, injected, assistant],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 1,
+            }),
+        );
+
+        assert_eq!(replayed.len(), 3);
+        let ConversationMessage::Chat(older_msg) = &replayed[0] else {
+            panic!(
+                "expected the older user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            older_msg.content, preamble,
+            "an older genuine message matching the preamble must survive byte-for-byte"
+        );
+        let ConversationMessage::Chat(current_msg) = &replayed[1] else {
+            panic!(
+                "expected the injected user message to replay as Chat, got {:?}",
+                replayed[1]
+            );
+        };
+        assert_eq!(
+            current_msg.content, "current question",
+            "the injected message must still be stripped"
+        );
+    }
+
+    /// Regression: steering input appends newer user messages after the
+    /// injected one. Replay must strip the recorded target position only —
+    /// a later steering message starting with the same preamble block must
+    /// survive, and the injected memory must still be removed from the
+    /// original message.
+    #[test]
+    fn replay_loop_messages_preserves_a_later_steering_message_when_it_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        let injected = ChatMessage::user(format!("{preamble}current question"));
+        let assistant = ChatMessage::assistant("working on it".to_string());
+        // A steering follow-up that happens to start with the same block.
+        let steering = ChatMessage::user(format!("{preamble}steering follow-up"));
+        let steering_original = steering.content.clone();
+        let replayed = Agent::replay_loop_messages(
+            &[injected, assistant, steering],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 0,
+            }),
+        );
+
+        assert_eq!(replayed.len(), 3);
+        let ConversationMessage::Chat(current_msg) = &replayed[0] else {
+            panic!(
+                "expected the injected user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            current_msg.content, "current question",
+            "the injected message must still be stripped"
+        );
+        let ConversationMessage::Chat(steering_msg) = &replayed[2] else {
+            panic!(
+                "expected the steering message to replay as Chat, got {:?}",
+                replayed[2]
+            );
+        };
+        assert_eq!(
+            steering_msg.content, steering_original,
+            "a later steering message must survive even when it starts with the preamble"
+        );
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -9715,6 +10145,14 @@ mod tests {
         );
         assert_eq!(event.zeroclaw.get("channel"), None);
         assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
+        assert_eq!(
+            event
+                .attributes
+                .get("trim_target")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "cap 2 with the default 0.7 fraction floors to a target of 1"
+        );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
         assert!(event.attributes.get("turn_id").is_none());
@@ -9745,6 +10183,7 @@ mod tests {
                 dropped_messages,
                 kept_turns,
                 reason,
+                ..
             } = event
             {
                 trim_events.push((dropped_messages, kept_turns, reason));
@@ -14778,9 +15217,10 @@ model_provider = "custom.only"
         );
         assert_eq!(
             retained
-                .structured_history_cap_resolver
+                .structured_history_limits_resolver
                 .as_ref()
-                .expect("direct Agent history resolver")(),
+                .expect("direct Agent history resolver")()
+            .max_messages,
             3,
             "independently live history policy must adopt the reload while route state stays pinned"
         );

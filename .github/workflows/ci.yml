@@ -28,7 +28,8 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so they start as soon as the run does.
+# directly, so runner selection does not wait for fmt. The build matrix still
+# waits for path-changes to select its Windows task-owner recovery tests.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -147,6 +148,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Test release version preparation failures
+        run: python3 scripts/release/bump-version.test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
@@ -203,7 +207,13 @@ jobs:
               ;;
           esac
 
-          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|src/main\.rs|src/lib\.rs|src/ws_accept\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
+          # `src/.*\.rs` rather than an enumeration: the list rotted once already
+          # (it kept ws_accept.rs after the file was deleted and never gained the
+          # files that replaced it), silently dropping the relay's HTTP surface out
+          # of the trigger. A pattern cannot rot. Cargo.toml is included because a
+          # dependency bump changes what the image contains. Tests live in tests/
+          # and stay outside the trigger.
+          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|Cargo\.toml|src/.*\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -356,6 +366,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
+    # All build legs wait for this detector; only the Windows recovery step is filtered.
     needs: [path-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -441,13 +452,20 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
       - name: Test Windows task-owner recovery
         if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
-        run: >-
-           cargo test --profile ci --locked -p zeroclaw-runtime --lib
-           --target x86_64-pc-windows-msvc
-           control_plane::authority::tests::windows_process_exit_is_detected -- --exact
+        run: |
+          set -euo pipefail
+          cargo test --locked -p zeroclaw-runtime --lib \
+            --target x86_64-pc-windows-msvc \
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-exit.log"
+          cargo test --locked -p zeroclaw-runtime --lib \
+            --target x86_64-pc-windows-msvc \
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
   check:
     name: Check (${{ matrix.name }})

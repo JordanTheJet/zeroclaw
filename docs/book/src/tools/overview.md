@@ -11,7 +11,13 @@ observer event, and history entry, see
 
 Before adding a built-in tool or replacing one with an external integration,
 use the [Built-In Tool Inventory](../developing/tool-inventory.md)
-to choose the smallest durable home.
+to choose the smallest durable home. Working built-in integrations stay
+available until a replacement is real, documented, and independently reviewed;
+that replacement-first rule is the accepted
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) policy,
+recorded in the inventory's
+[Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
+section.
 
 ## Built-in tools
 
@@ -28,7 +34,7 @@ A minimal build ships with:
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
 | `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
 | `web_fetch` | Fetch a page and return clean plain text |
-| `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
+| `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
