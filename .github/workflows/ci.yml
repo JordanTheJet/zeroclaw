@@ -487,6 +487,11 @@ jobs:
       matrix:
         include:
           - name: no default features
+            # Cache key must stay distinct per leg: both legs share the same
+            # RUSTFLAGS, so without it they resolve to one key and the leg
+            # that saves first hands the other a mismatched dependency set.
+            # `check` preserves this leg's existing warm key.
+            cache-key: check
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
             rustflags: -D warnings
@@ -496,6 +501,7 @@ jobs:
           # drift lands green. This row compiles the test targets on the
           # default surface, where that mismatch is visible.
           - name: default features, all targets
+            cache-key: check-all-targets
             args: --workspace --exclude zeroclaw-desktop --all-targets
             sys_deps: ""
             rustflags: -D warnings
@@ -508,6 +514,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: 'true'
+          shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -529,15 +536,23 @@ jobs:
           - name: plugins cranelift backend
             features: plugins-wasm-cranelift
             suite: components
+            # Own key: this leg builds the cranelift + component-test
+            # dependency set, which the pulley/runtime-only legs sharing
+            # `check-plugin-backends` never produce, so under the shared key
+            # it recompiled ~620 dependency crates on every run.
+            cache-key: plugins-cranelift-components
           - name: plugins cranelift runtime
             features: plugins-wasm-cranelift
             suite: runtime
+            cache-key: plugins-cranelift-runtime
           - name: plugins pulley backend
             features: plugins-wasm-pulley
             suite: check
+            cache-key: check-plugin-backends
           - name: plugins runtime-only backend
             features: plugins-wasmtime
             suite: check
+            cache-key: check-plugin-backends
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -563,7 +578,7 @@ jobs:
         with:
           use-blacksmith: 'true'
           # Keep the new runtime build separate from the existing backend caches.
-          shared-key: ${{ matrix.suite == 'runtime' && 'plugins-cranelift-runtime' || '' }}
+          shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
