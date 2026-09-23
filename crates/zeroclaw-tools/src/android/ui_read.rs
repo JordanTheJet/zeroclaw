@@ -334,7 +334,10 @@ mod tests {
             output.contains("TextView 901: forged class node"),
             "class controls should be flattened, got: {output}"
         );
-        assert!(output.contains("[media attachment]"), "got: {output}");
+        assert!(
+            output.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "got: {output}"
+        );
 
         let structured = result.output.data().expect("structured data attached");
         assert_eq!(structured, &data, "structured bridge data must stay intact");

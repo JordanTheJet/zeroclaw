@@ -6,7 +6,10 @@ package, or use an MCP or CLI-backed integration.
 
 This is a classification map, not a removal plan. Do not remove or externalize a
 tool until the replacement preserves the operator contract: config, security
-policy, tool receipts, audit visibility, compatibility, and rollback.
+policy, tool receipts, audit visibility, compatibility, and rollback. That rule
+is the accepted lighter-core policy from
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165); see
+[Replacement-First Policy](#replacement-first-policy).
 
 The runtime registry source of truth is
 `crates/zeroclaw-runtime/src/tools/mod.rs`, especially `default_tools`,
@@ -66,7 +69,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | `screenshot`, `image_info`, `canvas` | Visual/UI tool surface. | Keep for now; classify with the visual/UI tool surface once plugin and dashboard boundaries settle. |
 | `llm_task` | Provider-dependent subtask execution. | Keep until provider-scoped subtask execution has a separate contract from delegation. |
 | `security_ops` | Config-gated security operations. | Keep gated; security operations need first-party policy visibility until a plugin can advertise equivalent permissions, receipts, and rollback. |
-| `verifiable_intent` | Config-gated trust policy. **The `vi_verify` tool is temporarily withheld from the model-visible registry.** | Keep gated and first-party; intent issuance and verification affect trust policy and should stay first-party until the credential boundary is stable. No chain verifier exists yet, so `vi_verify` is not registered even when `verifiable_intent.enabled = true`; enabling the section now only emits a warning naming that gap, at process startup and again on each daemon reload. The issuance and verification library paths are unchanged. Restore registration only behind a verify-and-evaluate path that consumes a verified chain result. |
+| `verifiable_intent` | Config-gated trust policy. **The `vi_verify` tool is temporarily withheld from the model-visible registry.** | Keep gated and first-party; intent issuance and verification affect trust policy and should stay first-party until the credential boundary is stable. No chain verifier exists yet, so `vi_verify` is not registered even when `verifiable_intent.enabled = true`; enabling the section now only emits a warning naming that gap, traced at process startup, again on each daemon reload, and once more when a `zeroclaw config patch` turns the section from disabled to enabled, and reported by `zeroclaw doctor` and the config API as the `verifiable_intent_tool_withheld` validation warning so it survives `observability.log_persistence = "none"`. Withholding the tool does not remove the issuance and verification library paths, which remain available to embedders. Restore registration only behind a verify-and-evaluate path that consumes a verified chain result, retiring both channels in that same change. |
 | Hardware probes (`hardware_board_info`, `hardware_memory_map`, `hardware_memory_read`) | Peripheral-gated hardware access. | Keep first-party while hardware tools are added through the peripheral registry path and touch physical devices under ZeroClaw permission rules. |
 | Android-native tools (`android_screenshot`, `android_ui_read`, `android_action`, `android_dialog`, `android_launch`, `android_device`) | Config-gated and compiled only for Android production targets; the APK and Rust client communicate over an app-private Unix-domain socket. | Keep first-party while device control stays coupled to approval policy and autonomy gating. Ordinary actions require execution-time foreground revalidation; `android_dialog` isolates privileged system confirmation from autonomous gestures. |
 
@@ -84,7 +87,7 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 | `image_gen`, `cloud_ops`, `cloud_patterns`, `project_intel`, `report_template` | Skill package, plugin, or MCP server. | These are optional workflows or vendor/data-service wrappers rather than core execution primitives. |
 | `weather` | Skill package or HTTP-backed skill; later plugin or MCP server if parity needs custom formatting or policy. | The current built-in is a no-key `wttr.in` wrapper. A minimal lookup fits the HTTP skill shape, but full externalization still needs parity for formatted output, the `tool.weather` proxy policy, and the built-in tool name / auto-approve behavior. |
 | `pushover` | Common notification path through `system.notify`, plus a narrowly scoped service plugin. | Its core shape is device notification, which overlaps the standard node capability; Pushover-specific authentication, delivery, failure modes, and adapter compatibility still need proof before it moves outside the core runtime. |
-| `git_operations` | CLI-backed integration or narrowly scoped plugin. | It has local and remote repository side effects, so any external replacement must preserve policy checks, receipts, and explicit operator visibility. |
+| `git_operations` | CLI-backed integration or narrowly scoped plugin. | It has local and remote repository side effects, so any external replacement must preserve policy checks, receipts, and explicit operator visibility. Worktree operations validate every requested target and linked-worktree metadata path against the applicable read/write grant; listing returns only entries whose worktree path resolves and whose metadata can be validated through the applicable read grant. Metadata symlinks are rejected rather than followed, including when their target would be otherwise allowed. Read-only commands must not execute repository-configured content filters, signature verifiers, or nested submodule diff commands, must not resolve mailmaps, and must not inspect submodule worktree state; they retain changed superproject gitlink commit IDs. They prohibit Git transport and disable implicit promisor-object fetches, so unavailable partial-clone objects fail rather than starting repository-selected transport. Write-classified commands preserve Git hooks and filters and apply the configured per-agent sandbox boundary. With `[runtime] kind = "docker"`, write-classified commands are rejected before any write-classified Git command is launched because Git does not enter the runtime container; read-classified commands are unchanged, and the shell tool remains the in-container command path. In native runtime mode, a no-op sandbox therefore does not confine Git. Only Landlock extends that sandbox to configured sibling roots; other sandbox backends can reject writes outside the agent workspace, mount the workspace read-only, omit the workspace, or hide global Git configuration. |
 
 ## No Action Yet
 
@@ -98,6 +101,30 @@ evidence:
 - Session reset/delete tools: implementations exist, but the agent registry does
   not register the destructive unscoped variants by default. Keep that boundary
   unless an operator/admin surface explicitly needs them.
+
+## Replacement-First Policy
+
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) is the
+accepted policy for moving working built-in integrations out of the core. Cite
+it in every removal, feature-gate, or migration review, and hold the proposal
+to these rules:
+
+- A working built-in integration stays available until its replacement is
+  real, documented, and independently reviewed.
+- The replacement review must cover configuration migration, security policy,
+  tool receipts or audit behavior where applicable, compatibility, and
+  rollback.
+- Each concrete removal, feature gate, or migration needs its own issue and PR
+  that carries that replacement evidence.
+- The RFC does not pre-approve any individual removal, feature gate, migration,
+  or runtime behavior change.
+- Schema V4 cleanup is a separate decision under
+  [#8310](https://github.com/zeroclaw-labs/zeroclaw/issues/8310). It does not
+  create a blanket exception for removing a working integration without a
+  replacement path.
+
+The [Migration Rules](#migration-rules) below are the questions that review
+must answer before a built-in tool leaves the core.
 
 ## Migration Rules
 
