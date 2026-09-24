@@ -23,22 +23,38 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+/// A path-mode attachment source, resolved once by the dispatcher and carried
+/// intact into the bounded read.
+///
+/// `target` is the canonical resolved path the agent policy authorized; the
+/// read binds to it, never to the raw request spelling. `root` is the approved
+/// read root the target sits beneath, or `None` when the policy bounds no root
+/// (the final component is then opened beneath its parent handle, which still
+/// refuses a swapped final component).
+pub struct AttachmentSource {
+    pub root: Option<std::path::PathBuf>,
+    pub target: std::path::PathBuf,
+}
+
 /// Read an attachment source through a directory handle bound to the root the
 /// dispatcher authorized (cap-std beneath/no-follow), enforcing type and size on
 /// that one handle.
 ///
 /// Re-opening the supplied pathname here would let a writer in the entitled
 /// workspace replace a component between the authorization check and the read,
-/// redirecting it outside the approved root. `source_root` is `None` when the
+/// redirecting it outside the approved root. `source.root` is `None` when the
 /// agent policy bounds no root for the path; the final component is then opened
 /// beneath its parent handle, which still refuses a swapped final component.
-fn read_source_bounded(
-    source_root: Option<&std::path::Path>,
-    path: &std::path::Path,
-) -> Result<Vec<u8>, JsonRpcError> {
+///
+/// The `target` used here is the canonical path the dispatcher authorized, not
+/// the raw request spelling, closing the alias-swap window between check and
+/// read.
+fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcError> {
     use cap_std::ambient_authority;
-    use cap_std::fs::Dir;
+    use cap_std::fs::{Dir, OpenOptions};
     use std::io::Read;
+
+    let path = source.target.as_path();
 
     let too_large = |len: u64| {
         rpc_err(
@@ -51,7 +67,7 @@ fn read_source_bounded(
         )
     };
 
-    let (root, rel) = match source_root {
+    let (root, rel) = match source.root.as_deref() {
         Some(root) => {
             let rel = path.strip_prefix(root).map_err(|_| {
                 rpc_err(
@@ -77,9 +93,19 @@ fn read_source_bounded(
 
     let dir = Dir::open_ambient_dir(&root, ambient_authority())
         .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
-    let file = dir
-        .open(&rel)
-        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+    // Open without following a final symlink and without blocking on a
+    // special-file peer. A FIFO with no writer would make a plain blocking
+    // open wait indefinitely on Linux (fifo(7)); `O_NONBLOCK` returns
+    // immediately so the regular-file check below can reject it. `nofollow`
+    // keeps a swapped final symlink from redirecting the read after the root
+    // was authorized.
+    let file = {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        set_nonblocking_nofollow(&mut opts);
+        dir.open_with(&rel, &opts)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?
+    };
     let metadata = file
         .metadata()
         .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
@@ -103,12 +129,43 @@ fn read_source_bounded(
     Ok(bytes)
 }
 
+/// Apply `O_NONBLOCK | O_NOFOLLOW` on Unix so a special-file peer cannot make
+/// the open block and a swapped final symlink cannot redirect the read. The
+/// cap-std `Dir` handle already refuses any component that escapes the approved
+/// root; `O_NOFOLLOW` additionally refuses a symlink *as the final component*,
+/// and `O_NONBLOCK` makes a writer-less FIFO fail immediately instead of
+/// blocking the async worker (fifo(7)). On non-Unix targets neither flag has an
+/// equivalent hazard on the path-mode surface, so the regular-file metadata
+/// check remains the type guard.
+#[cfg(unix)]
+fn set_nonblocking_nofollow(opts: &mut cap_std::fs::OpenOptions) {
+    use cap_std::fs::OpenOptionsExt;
+    // O_NONBLOCK (0o4000): opening a writer-less FIFO returns immediately
+    // instead of blocking. O_NOFOLLOW (0o400000 on Linux, 0x100 on macOS):
+    // refuse a final-component symlink so a retarget after authorization
+    // cannot redirect the read. Both are passed through `custom_flags`, which
+    // ORs into the open flags cap-std computes for the confined open.
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(not(target_os = "linux"))]
+    const O_NOFOLLOW: i32 = 0x100;
+    const O_NONBLOCK: i32 = 0o4000;
+    opts.custom_flags(O_NONBLOCK | O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking_nofollow(_opts: &mut cap_std::fs::OpenOptions) {
+    // No FIFO/O_NONBLOCK semantics to guard against on non-Unix path mode
+    // (WSS refuses path mode; local Windows has no fifo(7) wait). The
+    // regular-file metadata check remains the type guard.
+}
+
 pub async fn process_file_entry(
     entry: &FileEntry,
     session_id: &str,
     upload_root: &str,
     is_wss: bool,
-    source_root: Option<&std::path::Path>,
+    source: Option<&AttachmentSource>,
     sessions: &SessionStore,
 ) -> Result<FileEntryResult, JsonRpcError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -142,12 +199,41 @@ pub async fn process_file_entry(
         if !p.is_absolute() {
             return Err(rpc_err(INVALID_PARAMS, "Path must be absolute"));
         }
+        // Path mode reads through a source the dispatcher resolved and
+        // authorized: the canonical target plus its approved root. An unbound
+        // caller (the direct unit-test handlers, which never cross the auth
+        // gate) passes `None`; resolve the request here so the read still binds
+        // to a canonical target rather than the raw (swappable) request. Fail
+        // closed if it cannot be resolved.
+        let resolved_source;
+        let source = match source {
+            Some(source) => source,
+            None => {
+                let target = std::fs::canonicalize(p)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+                resolved_source = AttachmentSource { root: None, target };
+                &resolved_source
+            }
+        };
         // Judge and read the source through one handle bound to the authorized
-        // root: a device such as /dev/zero or a FIFO never reaches end of file,
-        // a large file is refused without being pulled into memory, and a
-        // component swapped after authorization cannot redirect the read.
-        let bytes = read_source_bounded(source_root, p)?;
-        let fname = p
+        // root: a device such as /dev/zero or a FIFO never reaches end of file
+        // (a writer-less FIFO is rejected without blocking), a large file is
+        // refused without being pulled into memory, and a component swapped
+        // after authorization cannot redirect the read. The open is
+        // non-blocking, but the subsequent bounded read is synchronous
+        // filesystem work, so run the whole bounded read on a blocking worker
+        // to keep it off the async runtime thread.
+        let owned = AttachmentSource {
+            root: source.root.clone(),
+            target: source.target.clone(),
+        };
+        let bytes = tokio::task::spawn_blocking(move || read_source_bounded(&owned))
+            .await
+            .map_err(|join| rpc_err(INVALID_PARAMS, format!("Cannot read file: {join}")))??;
+        // Name the upload from the canonical target the read was bound to, not
+        // the raw request spelling.
+        let fname = source
+            .target
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
@@ -549,7 +635,10 @@ mod tests {
 
     /// The dispatcher authorizes a source path, then this reads it. Binding the
     /// read to the authorized root is what stops a name inside that root from
-    /// being swapped for a link to a file outside it in between.
+    /// being swapped for a link to a file outside it in between. The dispatcher
+    /// resolves the request to a canonical target beneath the approved root and
+    /// carries both into the read; a final component later retargeted outside
+    /// the root is refused by the root-bound, no-follow open.
     #[tokio::test]
     async fn path_source_swapped_to_escape_the_approved_root_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -561,7 +650,9 @@ mod tests {
         let outside = tmp.path().join("outside.txt");
         std::fs::write(&outside, b"top secret").unwrap();
 
-        // The authorized name, planted as a link that leaves the root.
+        // The authorized name, planted as a link that leaves the root. The
+        // canonical target the dispatcher would carry is the in-root name; the
+        // root-bound no-follow open refuses to traverse the escaping link.
         let planted = root.join("attachment.txt");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &planted).unwrap();
@@ -575,7 +666,13 @@ mod tests {
             mime_type: None,
             source: FileSource::File,
         };
-        let err = process_file_entry(&entry, "s1", &ws, false, Some(root.as_path()), &store)
+        // Source bound to the approved root, with the in-root canonical name as
+        // the target — the object-bound decision the dispatcher carries.
+        let source = AttachmentSource {
+            root: Some(root.clone()),
+            target: planted.clone(),
+        };
+        let err = process_file_entry(&entry, "s1", &ws, false, Some(&source), &store)
             .await
             .expect_err("a source escaping the approved root must be refused");
         assert_eq!(err.code, INVALID_PARAMS);
@@ -596,7 +693,11 @@ mod tests {
             mime_type: None,
             source: FileSource::File,
         };
-        let ok = process_file_entry(&ok_entry, "s1", &ws, false, Some(root.as_path()), &store)
+        let ok_source = AttachmentSource {
+            root: Some(root.clone()),
+            target: inside.clone(),
+        };
+        let ok = process_file_entry(&ok_entry, "s1", &ws, false, Some(&ok_source), &store)
             .await
             .expect("a file inside the approved root must still read");
         assert_eq!(ok.size_bytes, 4);

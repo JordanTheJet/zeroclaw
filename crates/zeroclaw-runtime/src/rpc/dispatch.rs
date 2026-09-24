@@ -1555,7 +1555,12 @@ impl RpcDispatcher {
         // paths outright, with the same answer as any other refusal.
         let plain = requested.is_absolute() && super::fs::resolves_locally(requested);
         let allowed = if grants.admin {
-            Some(super::fs::ListingAuthorization::Unconfined)
+            // Operator account governs, but resolve the target so the handler
+            // enumerates a canonical path, never the raw (swappable) request.
+            requested
+                .canonicalize()
+                .ok()
+                .map(super::fs::ListingAuthorization::Unconfined)
         } else if plain {
             let config = self.ctx.config.read();
             super::fs::authorize_listing(&config, grants, requested)
@@ -1625,19 +1630,33 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// The approved read root for an attachment source, resolved through the
-    /// same agent policy `authorize_attachment_sources` judged it with. `None`
-    /// when the entry carries inline bytes or the policy bounds no root for it,
-    /// in which case the read falls back to a parent-handle open.
-    fn attachment_source_root(&self, alias: &str, entry: &FileEntry) -> Option<std::path::PathBuf> {
+    /// The authorized source for a path-mode attachment: the canonical resolved
+    /// target and its approved read root, resolved through the same agent policy
+    /// `authorize_attachment_sources` judged it with.
+    ///
+    /// `None` when the entry carries inline bytes (no path source) or the path
+    /// cannot be resolved. Resolving here and carrying the canonical target into
+    /// the bounded read is what keeps an alias that resolved inside an entitled
+    /// root at authorization time from being swapped to point outside before the
+    /// read: the read binds to this target, never to the raw request spelling.
+    /// `root` is `None` when the policy bounds no root for the target, in which
+    /// case the read falls back to a parent-handle open of the canonical target.
+    fn attachment_source(
+        &self,
+        alias: &str,
+        entry: &FileEntry,
+    ) -> Option<super::attachments::AttachmentSource> {
         if entry.data_b64.is_some() {
             return None;
         }
         let path = entry.path.as_deref()?;
         let config = self.ctx.config.read();
-        zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias)
-            .ok()?
-            .approved_read_root(std::path::Path::new(path))
+        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok()?;
+        // Resolve once; feed the same canonical target to root selection and to
+        // the read. Fail closed if it cannot be resolved.
+        let target = policy.resolve_policy_target(std::path::Path::new(path))?;
+        let root = policy.approved_read_root(&target);
+        Some(super::attachments::AttachmentSource { root, target })
     }
 
     /// Whether this connection holds operator-level (admin) grants. An
@@ -2980,6 +2999,22 @@ impl RpcDispatcher {
         let config_generation_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let config = self.ctx.config.read().clone();
 
+        // The wait for the config-generation lock above is also unbounded, and
+        // an authenticated permission-profile edit can hold it while it removes
+        // this caller's agent grant and publishes the new config. The grants
+        // and agent selector re-resolved after admission (before this second
+        // wait) are therefore stale here: they reflect the policy in force
+        // before the edit committed. Re-resolve authority now, under the lock
+        // and against the just-read config, and repeat the agent selector
+        // before anything is constructed or inserted, so a session cannot be
+        // built with authority the caller no longer holds. The workspace
+        // confinement below already re-runs against `grants`; bind it to the
+        // freshly resolved set.
+        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+        if let Some(grants) = grants.as_ref() {
+            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+        }
+
         // The session cwd: caller-supplied wins, then a resumed ACP session's
         // persisted cwd, then the agent's workspace dir.
         let cwd = req
@@ -4238,7 +4273,7 @@ impl RpcDispatcher {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
-                let source_root = self.attachment_source_root(&agent_alias, entry);
+                let source = self.attachment_source(&agent_alias, entry);
                 let result = tokio::select! {
                     biased;
                     _ = self.connection_cancel.cancelled() => {
@@ -4252,7 +4287,7 @@ impl RpcDispatcher {
                         sid,
                         &upload_root,
                         is_wss,
-                        source_root.as_deref(),
+                        source.as_ref(),
                         &self.ctx.sessions,
                     ) => result?,
                 };
@@ -6763,7 +6798,18 @@ impl RpcDispatcher {
                         .as_ref()
                         .and_then(|dir| {
                             let path = dir.join(filename);
-                            let meta = std::fs::metadata(&path).ok()?;
+                            // No-follow metadata: `personality/get` and `put`
+                            // already use root-bound no-follow helpers, so a
+                            // planted symlink at an allowlisted personality name
+                            // must not disclose an outside target's existence,
+                            // size, or mtime through the listing either. A
+                            // symlink resolves to its own (link) metadata here
+                            // and is reported as a non-file with the link's own
+                            // attributes, never the target's.
+                            let meta = std::fs::symlink_metadata(&path).ok()?;
+                            if !meta.is_file() {
+                                return None;
+                            }
                             let mtime = meta
                                 .modified()
                                 .ok()
@@ -7245,13 +7291,13 @@ impl RpcDispatcher {
         let mut results = Vec::with_capacity(req.files.len());
 
         for entry in &req.files {
-            let source_root = self.attachment_source_root(&agent_alias, entry);
+            let source = self.attachment_source(&agent_alias, entry);
             let result = process_file_entry(
                 entry,
                 sid,
                 &upload_root,
                 is_wss,
-                source_root.as_deref(),
+                source.as_ref(),
                 &self.ctx.sessions,
             )
             .await?;
@@ -22135,6 +22181,174 @@ mod tests {
                         .openai
                         .contains_key("default"),
                     "map-key {method}: the live config must be untouched"
+                );
+            }
+        });
+    }
+
+    // ── session/new rechecks the agent selector after config-lock admission ──
+    //
+    // `handle_session_new` re-resolves authority after the session admission
+    // queue, then waits AGAIN on the unbounded config write lock before it
+    // reads config and builds the session. An operator's permission-profile
+    // edit can hold that lock, strip the caller's agent grant, and publish
+    // while `session/new` is parked. The grants resolved before the lock wait
+    // are then stale; the handler must re-resolve authority and re-run the
+    // agent selector under the lock before constructing anything.
+
+    /// A roster where `alice` may create sessions with agent `alpha`.
+    fn session_new_roster_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, PermissionProfileConfig, RiskProfileConfig, UserConfig,
+        };
+
+        let mut config = roster_config_in(tmp, uid);
+        std::fs::create_dir_all(&config.data_dir).expect("the data dir is creatable");
+        // The workspace-confinement recheck requires the session cwd to be an
+        // existing directory inside the agent's authorized roots. Create and
+        // authorize the workspace both tests point their `cwd` at, so the sole
+        // authority variable under test is the agent grant itself — not an
+        // incidental unauthorized-workspace refusal.
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("the session workspace is creatable");
+        config.risk_profiles.insert(
+            "session-profile".into(),
+            RiskProfileConfig {
+                allowed_roots: vec![workspace.to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "session-profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "session-alpha".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                // The session-assembly tool gate refuses a constrained selector
+                // before the config lock; grant the wildcard so this fixture
+                // reaches the recheck under test rather than that earlier gate.
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                grants: HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Create, Verb::Read, Verb::Update],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["session-alpha".into()],
+            },
+        );
+        config
+    }
+
+    /// Republish the accepted policy with alice's agent grant removed, so a
+    /// principal re-resolved after this publish may no longer use `alpha`.
+    fn revoke_alice_agent_grant(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    #[test]
+    fn session_new_agent_grant_revoked_while_queued_on_the_config_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_new_roster_config(&tmp, 4242));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            // A caller-supplied session id lets us look for a durable/live
+            // session afterwards. The agent selector passes at the pre-queue
+            // check (alice still holds the grant when the call starts) and is
+            // rechecked under the config lock after the mid-wait revocation.
+            let session_id = "sess-revoked-while-queued".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let call = async move { alice.handle_session_new_for_test(&params).await };
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                call,
+                revoke_alice_agent_grant,
+            )
+            .await;
+
+            let err = result
+                .expect_err("a caller whose agent grant was revoked mid-wait must be refused");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+
+            // The refusal must leave no session behind: nothing built, nothing
+            // published, nothing inserted into the store.
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_survives_an_unrelated_policy_republication_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_new_roster_config(&tmp, 4242));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let session_id = "sess-unchanged-authority".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            // Republish the same authority (an unrelated edit) while parked. The
+            // recheck must NOT refuse: with the agent grant intact the call
+            // proceeds past the selector into construction. Construction may
+            // still fail for reasons unrelated to authority (no real provider is
+            // wired in this fixture), but it must never be a FORBIDDEN authority
+            // denial — that is the property under test.
+            let republish_unchanged = |ctx: &Arc<RpcContext>| {
+                let same = ctx.config.read().clone();
+                ctx.auth
+                    .refresh_from_config(&same)
+                    .expect("republishing the same policy compiles");
+            };
+
+            let call = async move { alice.handle_session_new_for_test(&params).await };
+            let result =
+                rpc_result_after_midwait_policy_change(Arc::clone(&ctx), call, republish_unchanged)
+                    .await;
+
+            if let Err(err) = &result {
+                assert_ne!(
+                    err.code, FORBIDDEN,
+                    "unchanged authority must not be refused at the recheck: {err:?}"
                 );
             }
         });
