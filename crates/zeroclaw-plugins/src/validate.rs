@@ -108,9 +108,14 @@ fn validation_services() -> crate::services::PluginHostServices {
     use crate::config::PluginConfigResolver;
     use crate::error::PluginError;
 
-    crate::services::PluginHostServices::new(PluginConfigResolver::new(|_scope| {
-        Err(PluginError::InvalidConfig(
-            "config resolution is unavailable during install-time load verification".into(),
-        ))
-    }))
+    crate::services::PluginHostServices::new(
+        PluginConfigResolver::new(|_scope| {
+            Err(PluginError::InvalidConfig(
+                "config resolution is unavailable during install-time load verification".into(),
+            ))
+        }),
+        // Durable state is equally unavailable: verification never runs a
+        // service frame, so nothing may read or write an instance's state.
+        crate::services::PluginStateService::unavailable(),
+    )
 }

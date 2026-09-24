@@ -210,6 +210,12 @@ pub struct PluginStateService {
 }
 
 impl PluginStateService {
+    /// A state service with no storage behind it: every call is unavailable.
+    #[must_use]
+    pub(crate) fn unavailable() -> Self {
+        Self::new(UnavailableState)
+    }
+
     /// Wrap the runtime-owned durable backend.
     #[must_use]
     pub fn new(backend: impl PluginStateBackend + 'static) -> Self {
@@ -255,10 +261,11 @@ impl PluginStateService {
     }
 }
 
-#[cfg(test)]
+/// A backend that answers every call with [`PluginStateError::Unavailable`],
+/// for host paths that instantiate a plugin without serving it (install-time
+/// load verification) and for tests.
 struct UnavailableState;
 
-#[cfg(test)]
 #[async_trait]
 impl PluginStateBackend for UnavailableState {
     async fn get(
@@ -393,7 +400,7 @@ pub(crate) fn test_host_services() -> PluginHostServices {
 /// Complete test bundle around a test-owned config resolver.
 #[cfg(test)]
 pub(crate) fn test_services(config: PluginConfigResolver) -> PluginHostServices {
-    PluginHostServices::new(config, PluginStateService::new(UnavailableState))
+    PluginHostServices::new(config, PluginStateService::unavailable())
 }
 
 #[cfg(test)]

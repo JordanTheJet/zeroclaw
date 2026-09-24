@@ -319,9 +319,9 @@ pub async fn verify_channel_loads(
         InboundQueue::default(),
         None,
     );
-    let http = store.data().http_enabled();
-    let linker = build_linker(http)?;
-    crate::component::ensure_http_coherent(&store, http)?;
+    let imports = crate::component::OptionalImports::for_store(store.data());
+    let linker = build_linker(imports)?;
+    crate::component::ensure_imports_coherent(&store, imports)?;
     call_store!(store, async |store: &mut Store<PluginState>| {
         wt_instantiate(
             ChannelPlugin::instantiate_async(store, &component, &linker).await,
