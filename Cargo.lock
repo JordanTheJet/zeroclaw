@@ -14543,6 +14543,7 @@ dependencies = [
  "process-wrap",
  "prometheus",
  "prost",
+ "qrcode",
  "rand 0.10.2",
  "rcgen",
  "regex",
