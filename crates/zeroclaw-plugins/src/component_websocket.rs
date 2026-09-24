@@ -157,6 +157,22 @@ pub struct WebSocketConnection {
     _authorization: AuthorizedEgress,
 }
 
+impl WebSocketConnection {
+    /// Drain one event without blocking.
+    ///
+    /// `None` means nothing is ready yet. Once the terminal event has been
+    /// drained and the socket task has ended, every later call reports
+    /// `Closed`, so a guest polling a finished connection stops instead of
+    /// spinning on `None` until its host-call budget runs out.
+    fn try_receive(&mut self) -> Result<Option<WebSocketEvent>, WebSocketError> {
+        match self.events.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(WebSocketError::Closed),
+        }
+    }
+}
+
 impl Drop for WebSocketConnection {
     fn drop(&mut self) {
         self.state
@@ -711,10 +727,9 @@ macro_rules! impl_websocket_host {
                     return Ok(Err(into_wit_error!($world, WebSocketError::Unavailable)));
                 }
                 let connection = self.resource_table_mut().get_mut(&resource)?;
-                match connection.events.try_recv() {
-                    Ok(event) => Ok(Ok(Some(into_wit_event!($world, event)))),
-                    Err(mpsc::error::TryRecvError::Empty) => Ok(Ok(None)),
-                    Err(mpsc::error::TryRecvError::Disconnected) => Ok(Ok(None)),
+                match connection.try_receive() {
+                    Ok(event) => Ok(Ok(event.map(|event| into_wit_event!($world, event)))),
+                    Err(error) => Ok(Err(into_wit_error!($world, error))),
                 }
             }
 
@@ -1115,6 +1130,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ping_gets_exactly_one_pong() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Ping(
+                    tokio_tungstenite::tungstenite::Bytes::from_static(b"beat"),
+                ))
+                .await
+                .unwrap();
+            let pong = socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                pong,
+                Message::Pong(tokio_tungstenite::tungstenite::Bytes::from_static(b"beat"))
+            );
+            let extra = tokio::time::timeout(Duration::from_millis(300), socket.next()).await;
+            assert!(
+                extra.is_err(),
+                "a second frame followed the pong: {extra:?}"
+            );
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let hostname = "not-in-dns.invalid";
+        let prepared = prepare_connection(options(&format!("ws://{hostname}:{}/", address.port()))) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .unwrap();
+        let egress = service(
+            EgressPolicy::new(&[hostname.to_string()], &[hostname.to_string()], &[], 1).unwrap(),
+        );
+        let authorization = egress
+            .authorize_addresses(websocket_request(scope("ping"), &prepared), [address])
+            .unwrap();
+        let (socket, negotiated) = dial_authorized(&prepared, &authorization, None)
+            .await
+            .unwrap();
+        let mut connection = start_connection(socket, negotiated, authorization);
+        assert!(matches!(
+            connection.events.recv().await,
+            Some(WebSocketEvent::Closed(_))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn dials_only_pinned_addresses_and_holds_an_instance_lease_until_resource_drop() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1191,6 +1252,18 @@ mod tests {
                 reason: "complete".to_string(),
             })))
         );
+        // Past the terminal event, polling reports closed rather than idle.
+        let after_terminal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match connection.try_receive() {
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    other => break other,
+                }
+            }
+        })
+        .await
+        .expect("socket task ends after its terminal event");
+        assert_eq!(after_terminal, Err(WebSocketError::Closed));
 
         assert!(matches!(
             egress.authorize_addresses(primary_request.clone(), [address]),

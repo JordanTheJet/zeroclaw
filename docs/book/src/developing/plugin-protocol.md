@@ -644,7 +644,8 @@ extra headers, offered subprotocols, and an optional TLS profile, and returns a
 `negotiated-subprotocol`. The host owns DNS, the destination decision, TLS, the
 upgrade handshake, and bounded queues; headers that belong to the handshake
 (`Host`, `Connection`, `Upgrade`, `Sec-WebSocket-*`) are refused. `receive`
-never blocks. Dropping the resource closes the socket and releases the
+never blocks, and once the terminal `closed` or `failed` event has been
+drained it returns the `closed` error rather than `none`. Dropping the resource closes the socket and releases the
 connection lease.
 
 ### TLS profiles
