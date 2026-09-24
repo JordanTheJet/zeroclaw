@@ -142,6 +142,7 @@ mod tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "test",

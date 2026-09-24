@@ -3545,6 +3545,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("production registry must build")
         .tools;
 
         let tool = tools

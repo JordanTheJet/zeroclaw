@@ -4871,6 +4871,7 @@ mod active_route_context_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
         let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
         let response = ChatResponse {

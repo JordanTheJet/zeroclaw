@@ -532,6 +532,7 @@ mod tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "stub",
             model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: Some(&mgr),
             channel_name: "stub",
@@ -621,6 +622,7 @@ mod tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "stub",
             model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: Some(&mgr),
             channel_name: "stub",
@@ -806,6 +808,7 @@ mod cancellation_tests {
             turn_id: "trace-approval-gate",
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         }
     }
 
@@ -860,7 +863,7 @@ mod cancellation_tests {
         match gate_tool_approval(
             &ctx,
             "shell",
-            &serde_json::json!({"command": "ls"}),
+            &mut serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
         )
@@ -884,7 +887,7 @@ mod cancellation_tests {
         match gate_tool_approval(
             &ctx,
             "file_write",
-            &serde_json::json!({"path": "x"}),
+            &mut serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
         )
@@ -917,7 +920,7 @@ mod cancellation_tests {
         match gate_tool_approval(
             &ctx,
             "shell",
-            &serde_json::json!({"command": "ls"}),
+            &mut serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
         )
@@ -945,7 +948,7 @@ mod cancellation_tests {
         match gate_tool_approval(
             &ctx,
             "file_write",
-            &serde_json::json!({"path": "x"}),
+            &mut serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
         )
