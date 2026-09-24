@@ -1011,6 +1011,80 @@ mod tests {
         .unwrap()
     }
 
+    /// A loopback TLS server identity for `socket.test`, signed by a private CA
+    /// that is trusted only through the `private-ca` profile.
+    struct PrivateCa {
+        acceptor: TlsAcceptor,
+        ca_pem: String,
+    }
+
+    impl PrivateCa {
+        fn new() -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca_parameters =
+                rcgen::CertificateParams::new(vec!["WebSocket Test CA".to_string()]).unwrap();
+            ca_parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca_certificate = ca_parameters.self_signed(&ca_key).unwrap();
+
+            let server_key = rcgen::KeyPair::generate().unwrap();
+            let server_parameters =
+                rcgen::CertificateParams::new(vec!["socket.test".to_string()]).unwrap();
+            let server_certificate = server_parameters
+                .signed_by(&server_key, &ca_certificate, &ca_key)
+                .unwrap();
+            let server_private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+            );
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![server_certificate.der().clone()], server_private_key)
+                .unwrap();
+            Self {
+                acceptor: TlsAcceptor::from(Arc::new(server_config)),
+                ca_pem: ca_certificate.pem(),
+            }
+        }
+
+        /// Egress granting `socket.test` with `max_connections`. The name
+        /// resolves to the loopback test server, so the grant carries the
+        /// private-address carveout for it.
+        fn service(&self, max_connections: usize) -> EgressHostService {
+            let profile = TlsProfile::new(
+                TlsProfileName::new("private-ca").unwrap(),
+                &["socket.test".to_string()],
+                false,
+                Some(SecretPropertyRef::parse("ca_pem").unwrap()),
+                None,
+            )
+            .unwrap();
+            let hosts = ["socket.test".to_string()];
+            service(
+                EgressPolicy::new(&hosts, &hosts, &[], max_connections)
+                    .and_then(|policy| policy.with_tls_profiles([profile]))
+                    .unwrap(),
+            )
+        }
+
+        fn options(&self, port: u16, path: &str) -> ConnectOptions {
+            let mut options = options(&format!("wss://socket.test:{port}{path}"));
+            options.tls_profile = Some("private-ca".to_string());
+            options
+        }
+
+        fn client_config(&self, authorization: &AuthorizedEgress) -> Arc<rustls::ClientConfig> {
+            build_tls_client_config(
+                authorization.tls_profile(),
+                &rustls::RootCertStore::empty(),
+                |reference| {
+                    assert_eq!(reference.as_str(), "ca_pem");
+                    Ok(self.ca_pem.clone())
+                },
+            )
+            .unwrap()
+        }
+    }
+
     #[test]
     fn reserved_upgrade_headers_are_rejected_case_insensitively() {
         for name in [
@@ -1131,11 +1205,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_ping_gets_exactly_one_pong() {
+        let ca = PrivateCa::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let acceptor = ca.acceptor.clone();
         let server = zeroclaw_spawn::spawn!(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let tls = acceptor.accept(stream).await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tls).await.unwrap();
             socket
                 .send(Message::Ping(
                     tokio_tungstenite::tungstenite::Bytes::from_static(b"beat"),
@@ -1155,16 +1232,13 @@ mod tests {
             socket.send(Message::Close(None)).await.unwrap();
         });
 
-        let hostname = "not-in-dns.invalid";
-        let prepared = prepare_connection(options(&format!("ws://{hostname}:{}/", address.port()))) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
-            .unwrap();
-        let egress = service(
-            EgressPolicy::new(&[hostname.to_string()], &[hostname.to_string()], &[], 1).unwrap(),
-        );
+        let prepared = prepare_connection(ca.options(address.port(), "/")).unwrap();
+        let egress = ca.service(1);
         let authorization = egress
             .authorize_addresses(websocket_request(scope("ping"), &prepared), [address])
             .unwrap();
-        let (socket, negotiated) = dial_authorized(&prepared, &authorization, None)
+        let tls_config = ca.client_config(&authorization);
+        let (socket, negotiated) = dial_authorized(&prepared, &authorization, Some(tls_config))
             .await
             .unwrap();
         let mut connection = start_connection(socket, negotiated, authorization);
@@ -1177,11 +1251,14 @@ mod tests {
 
     #[tokio::test]
     async fn dials_only_pinned_addresses_and_holds_an_instance_lease_until_resource_drop() {
+        let ca = PrivateCa::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let acceptor = ca.acceptor.clone();
         let server = zeroclaw_spawn::spawn!(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_hdr_async(stream, PinnedHandshake)
+            let tls = acceptor.accept(stream).await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tls, PinnedHandshake)
                 .await
                 .unwrap();
 
@@ -1198,21 +1275,19 @@ mod tests {
                 .unwrap();
         });
 
-        let hostname = "not-in-dns.invalid";
-        // This is a loopback-only transport test with a plaintext local server;
-        // TLS behavior is covered separately by the named-custom-CA test below.
-        let mut connection_options = options(&format!("ws://{hostname}:{}/events", address.port())); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        // `socket.test` need not resolve: the dial can reach only the address
+        // pinned by the authorization below.
+        let mut connection_options = ca.options(address.port(), "/events");
         connection_options.subprotocols = vec!["json.v1".to_string(), "binary.v1".to_string()];
         let prepared = prepare_connection(connection_options).unwrap();
-        let policy =
-            EgressPolicy::new(&[hostname.to_string()], &[hostname.to_string()], &[], 1).unwrap();
-        let egress = service(policy);
+        let egress = ca.service(1);
         let primary_scope = scope("primary");
         let primary_request = websocket_request(primary_scope.clone(), &prepared);
         let authorization = egress
             .authorize_addresses(primary_request.clone(), [address])
             .unwrap();
-        let (socket, negotiated) = dial_authorized(&prepared, &authorization, None)
+        let tls_config = ca.client_config(&authorization);
+        let (socket, negotiated) = dial_authorized(&prepared, &authorization, Some(tls_config))
             .await
             .unwrap();
         assert_eq!(negotiated.as_deref(), Some("binary.v1"));
@@ -1286,31 +1361,10 @@ mod tests {
 
     #[tokio::test]
     async fn secure_websockets_use_named_custom_ca_profiles_with_original_host_sni() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca_parameters =
-            rcgen::CertificateParams::new(vec!["WebSocket Test CA".to_string()]).unwrap();
-        ca_parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_certificate = ca_parameters.self_signed(&ca_key).unwrap();
-
-        let server_key = rcgen::KeyPair::generate().unwrap();
-        let server_parameters =
-            rcgen::CertificateParams::new(vec!["socket.test".to_string()]).unwrap();
-        let server_certificate = server_parameters
-            .signed_by(&server_key, &ca_certificate, &ca_key)
-            .unwrap();
-        let server_certificates = vec![server_certificate.der().clone()];
-        let server_private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
-        );
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(server_certificates, server_private_key)
-            .unwrap();
-
+        let ca = PrivateCa::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let acceptor = ca.acceptor.clone();
         let server = zeroclaw_spawn::spawn!(async move {
             let (untrusted_stream, _) = listener.accept().await.unwrap();
             assert!(acceptor.accept(untrusted_stream).await.is_err());
@@ -1324,25 +1378,8 @@ mod tests {
                 .unwrap();
         });
 
-        let profile = TlsProfile::new(
-            TlsProfileName::new("private-ca").unwrap(),
-            &["socket.test".to_string()],
-            false,
-            Some(SecretPropertyRef::parse("ca_pem").unwrap()),
-            None,
-        )
-        .unwrap();
-        // `socket.test` resolves to the loopback test server, so the grant
-        // carries the private-address carveout for it.
-        let hosts = ["socket.test".to_string()];
-        let policy = EgressPolicy::new(&hosts, &hosts, &[], 1)
-            .and_then(|policy| policy.with_tls_profiles([profile]))
-            .unwrap();
-        let egress = service(policy);
-        let mut connection_options =
-            options(&format!("wss://socket.test:{}/secure", address.port()));
-        connection_options.tls_profile = Some("private-ca".to_string());
-        let prepared = prepare_connection(connection_options).unwrap();
+        let egress = ca.service(1);
+        let prepared = prepare_connection(ca.options(address.port(), "/secure")).unwrap();
         let untrusted_authorization = egress
             .authorize_addresses(websocket_request(scope("secure"), &prepared), [address])
             .unwrap();
@@ -1361,16 +1398,7 @@ mod tests {
         let authorization = egress
             .authorize_addresses(websocket_request(scope("secure"), &prepared), [address])
             .unwrap();
-        let ca_pem = ca_certificate.pem();
-        let tls_config = build_tls_client_config(
-            authorization.tls_profile(),
-            &rustls::RootCertStore::empty(),
-            |reference| {
-                assert_eq!(reference.as_str(), "ca_pem");
-                Ok(ca_pem.clone())
-            },
-        )
-        .unwrap();
+        let tls_config = ca.client_config(&authorization);
         let (socket, negotiated) = dial_authorized(&prepared, &authorization, Some(tls_config))
             .await
             .unwrap();
