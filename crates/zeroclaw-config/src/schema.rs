@@ -9469,6 +9469,47 @@ pub struct PluginEntryConfig {
     /// field, `*` is not accepted here.
     #[serde(default)]
     pub egress_allow_private: Vec<String>,
+    /// Named TLS trust and optional client-certificate profiles a transport
+    /// may select for a destination. A profile chooses certificates only: its
+    /// `hosts` must each be granted by `egress_hosts`, and selecting it never
+    /// reaches a destination the grant does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[nested]
+    #[natural_key = "name"]
+    pub tls_profiles: Vec<PluginTlsProfileConfig>,
+}
+
+/// One named plugin TLS profile (`[[plugins.entries.tls_profiles]]`).
+///
+/// Every `*_secret` value names a top-level `x-secret: true` property in the
+/// plugin instance's manifest schema. They are references to certificate and
+/// key material held in the instance's secret config, not the material, so
+/// they stay readable plaintext beside `egress_hosts`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[prefix = "plugins.entries.tls_profiles"]
+pub struct PluginTlsProfileConfig {
+    /// Lowercase profile slug a plugin transport selects.
+    #[serde(default)]
+    pub name: String,
+    /// Destinations this profile may be used for. Each must be granted by the
+    /// entry's `egress_hosts`; same grammar.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Trust the roots plugin HTTPS already trusts (bundled plus this
+    /// machine's store). Default `true`.
+    #[serde(default = "default_true")]
+    pub system_roots: bool,
+    /// Secret property holding one or more PEM CA certificates to trust.
+    #[serde(default)]
+    pub custom_ca_secret: Option<String>,
+    /// Secret property holding a PEM client certificate chain (mTLS).
+    #[serde(default)]
+    pub client_certificate_secret: Option<String>,
+    /// Secret property holding the matching PEM client private key (mTLS).
+    #[serde(default)]
+    pub client_private_key_secret: Option<String>,
 }
 
 /// Plugin system configuration.
@@ -9544,6 +9585,17 @@ impl PluginsConfig {
             .iter()
             .find(|e| e.name == alias)
             .map(|e| (e.egress_hosts.clone(), e.egress_allow_private.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The TLS profiles on the `[[plugins.entries]]` row named `alias`, read
+    /// at use time like [`Self::entry_egress`]. A missing entry has none.
+    #[must_use]
+    pub fn entry_tls_profiles(&self, alias: &str) -> Vec<PluginTlsProfileConfig> {
+        self.entries
+            .iter()
+            .find(|e| e.name == alias)
+            .map(|e| e.tls_profiles.clone())
             .unwrap_or_default()
     }
 }
@@ -25265,6 +25317,95 @@ impl Config {
                     );
                 }
             }
+
+            // A TLS profile chooses certificates for a destination; it never
+            // grants one. Its hosts must therefore sit inside the entry's
+            // grant, and every secret it names must be a portable reference.
+            let mut profile_names = std::collections::HashSet::new();
+            for (index, profile) in entry.tls_profiles.iter().enumerate() {
+                let path = format!("plugins.entries.{}.tls_profiles[{index}]", entry.name);
+                if !zeroclaw_api::plugin_egress::is_valid_tls_profile_name(&profile.name) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("{path}.name"),
+                        "{path}.name {:?} must be a 1-64 byte lowercase slug of letters, digits, '-' or '_'",
+                        profile.name
+                    );
+                }
+                if !profile_names.insert(profile.name.as_str()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("{path}.name"),
+                        "plugins.entries.{}.tls_profiles has more than one profile named {:?}",
+                        entry.name,
+                        profile.name
+                    );
+                }
+                if profile.hosts.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{path}.hosts"),
+                        "{path}.hosts must name at least one destination"
+                    );
+                }
+                let profile_hosts = match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &profile.hosts,
+                    &format!("{path}.hosts"),
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, format!("{path}.hosts"), "{}", e),
+                };
+                for host in &profile_hosts {
+                    if !hosts.iter().any(|grant| {
+                        zeroclaw_infra::net_guard::egress_pattern_contains(grant, host)
+                    }) {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("{path}.hosts"),
+                            "{path}.hosts lists {host:?}, which is not granted by plugins.entries.{}.egress_hosts; a TLS profile selects certificates for a granted destination, it does not grant one",
+                            entry.name
+                        );
+                    }
+                }
+                if !profile.system_roots && profile.custom_ca_secret.is_none() {
+                    validation_bail!(
+                        InvalidFormat,
+                        path.clone(),
+                        "{path} trusts nothing: enable system_roots or set custom_ca_secret"
+                    );
+                }
+                for (field, secret) in [
+                    ("custom_ca_secret", profile.custom_ca_secret.as_deref()),
+                    (
+                        "client_certificate_secret",
+                        profile.client_certificate_secret.as_deref(),
+                    ),
+                    (
+                        "client_private_key_secret",
+                        profile.client_private_key_secret.as_deref(),
+                    ),
+                ] {
+                    if secret.is_some_and(|secret| {
+                        zeroclaw_api::plugin_key::SecretPropertyRef::parse(secret.to_owned())
+                            .is_err()
+                    }) {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("{path}.{field}"),
+                            "{path}.{field} must name a top-level secret property of the plugin's config schema"
+                        );
+                    }
+                }
+                if profile.client_certificate_secret.is_some()
+                    != profile.client_private_key_secret.is_some()
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        path.clone(),
+                        "{path} must set both client_certificate_secret and client_private_key_secret, or neither"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -30200,7 +30341,119 @@ enabled = true
             config: HashMap::new(),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: private.iter().map(|h| (*h).to_string()).collect(),
+            tls_profiles: Vec::new(),
         }
+    }
+
+    fn tls_profile(name: &str, hosts: &[&str]) -> super::PluginTlsProfileConfig {
+        super::PluginTlsProfileConfig {
+            name: name.to_string(),
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            system_roots: true,
+            custom_ca_secret: None,
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        }
+    }
+
+    fn validate_tls_profiles(
+        grant: &[&str],
+        profiles: Vec<super::PluginTlsProfileConfig>,
+    ) -> anyhow::Result<()> {
+        let mut config = Config::default();
+        let mut entry = plugin_entry_with_egress(grant, &[]);
+        entry.tls_profiles = profiles;
+        config.plugins.entries.push(entry);
+        config.validate()
+    }
+
+    #[test]
+    async fn validate_accepts_tls_profiles_inside_the_grant() {
+        let mut mtls = tls_profile(
+            "corp-mtls",
+            &["imap.corp.example.com", "*.mail.example.com"],
+        );
+        mtls.system_roots = false;
+        mtls.custom_ca_secret = Some("corp_ca".to_string());
+        mtls.client_certificate_secret = Some("client_cert".to_string());
+        mtls.client_private_key_secret = Some("client_key".to_string());
+        validate_tls_profiles(
+            &["imap.corp.example.com", "*.example.com"],
+            vec![mtls, tls_profile("public", &["imap.corp.example.com"])],
+        )
+        .expect("profiles inside the grant must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_a_tls_profile_for_an_ungranted_destination() {
+        let err = validate_tls_profiles(
+            &["imap.example.com"],
+            vec![tls_profile("corp", &["smtp.example.com"])],
+        )
+        .expect_err("a profile must not stand in for a grant");
+        let text = err.to_string();
+        assert!(text.contains("tls_profiles[0].hosts"), "got: {text}");
+        assert!(text.contains("not granted by"), "got: {text}");
+        // A wildcard profile over an exact grant widens it, so it is refused too.
+        assert!(
+            validate_tls_profiles(
+                &["example.com"],
+                vec![tls_profile("corp", &["*.example.com"])]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_incoherent_tls_profiles() {
+        let grant = ["imap.example.com"];
+        let named = |name: &str| tls_profile(name, &grant);
+
+        let mut no_trust = named("empty");
+        no_trust.system_roots = false;
+        let mut half_identity = named("half");
+        half_identity.client_certificate_secret = Some("cert".to_string());
+        let mut bad_secret = named("bad-ref");
+        bad_secret.custom_ca_secret = Some("../escape".to_string());
+
+        for (label, profiles) in [
+            ("bad name", vec![named("Upper")]),
+            ("duplicate", vec![named("same"), named("same")]),
+            ("no hosts", vec![tls_profile("none", &[])]),
+            ("no trust anchor", vec![no_trust]),
+            ("half an identity", vec![half_identity]),
+            ("non-portable secret", vec![bad_secret]),
+        ] {
+            assert!(
+                validate_tls_profiles(&grant, profiles).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    async fn tls_profiles_round_trip_through_toml() {
+        let parsed: Config = toml::from_str(
+            r#"
+[[plugins.entries]]
+name = "mail"
+egress_hosts = ["imap.example.com"]
+
+[[plugins.entries.tls_profiles]]
+name = "corp"
+hosts = ["imap.example.com"]
+system_roots = false
+custom_ca_secret = "corp_ca"
+"#,
+        )
+        .expect("tls_profiles parse");
+        let profiles = parsed.plugins.entry_tls_profiles("mail");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "corp");
+        assert!(!profiles[0].system_roots);
+        assert_eq!(profiles[0].custom_ca_secret.as_deref(), Some("corp_ca"));
+        assert!(parsed.plugins.entry_tls_profiles("absent").is_empty());
+        parsed.validate().expect("parsed profile validates");
     }
 
     #[test]

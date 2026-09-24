@@ -756,13 +756,64 @@ fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    use zeroclaw_plugins::egress::{
+        EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
+    };
     let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
-    zeroclaw_plugins::egress::EgressPolicy::new(
+    let profiles = config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .map(|profile| {
+            let secret = |field: &str, name: Option<String>| {
+                name.map(|name| {
+                    zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).map_err(|_| {
+                        EgressError::InvalidTlsProfile {
+                            profile: profile.name.clone(),
+                            reason: format!("{field} is not a portable secret property"),
+                        }
+                    })
+                })
+                .transpose()
+            };
+            let custom_ca = secret("custom_ca_secret", profile.custom_ca_secret.clone())?;
+            let certificate = secret(
+                "client_certificate_secret",
+                profile.client_certificate_secret.clone(),
+            )?;
+            let private_key = secret(
+                "client_private_key_secret",
+                profile.client_private_key_secret.clone(),
+            )?;
+            let identity = match (certificate, private_key) {
+                (Some(certificate), Some(private_key)) => {
+                    Some(TlsClientIdentity::new(certificate, private_key))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(EgressError::InvalidTlsProfile {
+                        profile: profile.name.clone(),
+                        reason: "client certificate and private key must be set together"
+                            .to_string(),
+                    });
+                }
+            };
+            TlsProfile::new(
+                TlsProfileName::new(profile.name.clone())?,
+                &profile.hosts,
+                profile.system_roots,
+                custom_ca,
+                identity,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    EgressPolicy::new(
         &hosts,
         &allow_private,
         &config.security.nat64_prefixes,
         config.plugins.limits.max_connections_per_instance,
-    )
+    )?
+    .with_tls_profiles(profiles)
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -2721,6 +2772,7 @@ const = true
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
             egress_hosts: Vec::new(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![
@@ -2814,6 +2866,7 @@ permissions = ["http_client"]
             config: HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let request = || {
             zeroclaw_plugins::egress::EgressRequest::new(
@@ -2856,6 +2909,43 @@ permissions = ["http_client"]
             ),
             "a raw package or binding entry must not bypass the canonical key"
         );
+
+        // The same row carries the instance's TLS profiles into policy, read at
+        // use time like the grant itself.
+        let profile = |hosts: &[&str]| zeroclaw_config::schema::PluginTlsProfileConfig {
+            name: "corp".to_string(),
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            system_roots: true,
+            custom_ca_secret: Some("corp_ca".to_string()),
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        };
+        let mut with_profile = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["api.example.com"])];
+        with_profile.plugins.entries = vec![row];
+        let authorized = plugin_egress_service(Arc::new(with_profile), None)
+            .authorize_addresses(request().with_tls_profile("corp").unwrap(), addresses)
+            .expect("a configured profile for a granted host must authorize");
+        assert_eq!(
+            authorized
+                .tls_profile()
+                .and_then(|profile| profile.custom_ca())
+                .map(|secret| secret.as_str()),
+            Some("corp_ca")
+        );
+
+        // A profile that names an ungranted host fails the whole policy
+        // closed, even if it slipped past load-time validation.
+        let mut widened = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["other.example.com"])];
+        widened.plugins.entries = vec![row];
+        assert!(matches!(
+            plugin_egress_service(Arc::new(widened), None)
+                .authorize_addresses(request(), addresses),
+            Err(zeroclaw_plugins::egress::EgressError::TlsProfileHostNotGranted { .. })
+        ));
     }
 
     #[test]
