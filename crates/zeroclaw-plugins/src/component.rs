@@ -384,6 +384,18 @@ impl PluginState {
         self.host_calls_remaining = MAX_HOST_CALLS_PER_FRAME;
     }
 
+    /// Open a frame without a store: a service frame for this instance's
+    /// capability when `service` is set, otherwise a metadata frame.
+    #[cfg(test)]
+    pub(crate) fn start_test_frame(&mut self, service: bool) {
+        let phase = match (service, self.scope.id().capability()) {
+            (true, PluginCapability::Tool) => PluginCallPhase::ToolExecute,
+            (true, PluginCapability::Channel) => PluginCallPhase::ChannelService,
+            _ => PluginCallPhase::Standard,
+        };
+        self.start_call(phase);
+    }
+
     fn finish_call(&mut self) {
         self.call_config = CallConfig::Inactive;
         self.host_calls_remaining = 0;
@@ -430,7 +442,10 @@ impl PluginState {
     }
 
     /// Whether the active frame may use this instance's scoped host services.
-    fn instance_services_enabled(&self) -> bool {
+    ///
+    /// Durable state, secrets, and new socket or WebSocket connections all
+    /// require it, so a metadata probe cannot reach the network or storage.
+    pub(crate) fn instance_services_enabled(&self) -> bool {
         matches!(
             (self.call_config.phase(), self.scope.id().capability()),
             (Some(PluginCallPhase::ToolExecute), PluginCapability::Tool)

@@ -186,7 +186,9 @@ impl PluginState {
         &mut self,
         options: ConnectOptions,
     ) -> Result<WebSocketConnection, WebSocketError> {
-        if !self.charge_host_call() {
+        // A connection opens only in a tool-execute or channel-service frame,
+        // never while the host is probing metadata.
+        if !self.charge_host_call() || !self.instance_services_enabled() {
             return Err(WebSocketError::Unavailable);
         }
         let prepared = prepare_connection(options)?;

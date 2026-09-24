@@ -529,7 +529,9 @@ async fn connect(
     mode: ConnectMode,
     tls_profile: Option<String>,
 ) -> Result<Resource<SocketConnection>, SocketFailure> {
-    if !state.charge_host_call() {
+    // A connection opens only in a tool-execute or channel-service frame,
+    // never while the host is probing metadata.
+    if !state.charge_host_call() || !state.instance_services_enabled() {
         return Err(SocketFailure::HostUnavailable);
     }
     let mut request =
@@ -1064,6 +1066,43 @@ mod tests {
             SocketReceive::Idle => panic!("unexpected idle event"),
             SocketReceive::Closed(reason) => panic!("connection closed early: {reason:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_opens_only_inside_a_service_frame() {
+        let address = start_plain_echo().await;
+        let spec = crate::component::PluginStoreSpec::new(
+            scope("main"),
+            crate::services::test_host_services(),
+            crate::component::test_limits(1_000),
+        )
+        .with_egress_policy(Some(service(["localhost"], [], 2)));
+        let mut state = PluginState::new(spec);
+
+        state.start_test_frame(false);
+        let refused = connect(
+            &mut state,
+            "localhost".to_string(),
+            address.port(),
+            ConnectMode::Plaintext,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(SocketFailure::HostUnavailable)),
+            "a metadata frame must not open a connection"
+        );
+
+        state.start_test_frame(true);
+        connect(
+            &mut state,
+            "localhost".to_string(),
+            address.port(),
+            ConnectMode::Plaintext,
+            None,
+        )
+        .await
+        .expect("a service frame opens the granted connection");
     }
 
     #[tokio::test]
