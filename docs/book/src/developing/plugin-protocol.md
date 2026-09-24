@@ -637,7 +637,8 @@ Failures are the typed `socket-error` cases.
 
 ### `websocket`
 
-Host-mediated outbound WebSocket. `connect` takes a `ws://` or `wss://` URL,
+Host-mediated outbound WebSocket. `connect` takes a plaintext (`ws`) or TLS
+(`wss`) WebSocket URL,
 extra headers, offered subprotocols, and an optional TLS profile, and returns a
 `connection` resource with `send`, `receive`, `close`, and
 `negotiated-subprotocol`. The host owns DNS, the destination decision, TLS, the

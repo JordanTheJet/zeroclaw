@@ -3,8 +3,8 @@
 //! This module owns framing and lifecycle only. Destination policy, DNS
 //! validation/pinning, TLS profile selection, and connection accounting remain
 //! in the instance's egress service: a WebSocket reaches exactly the hosts the
-//! operator granted in `egress_hosts`, `ws://` included (ADR-014 has no
-//! separate plaintext grant).
+//! operator granted in `egress_hosts`, plaintext WebSocket included (ADR-014
+//! has no separate plaintext grant).
 
 use std::future::pending;
 use std::str::FromStr;
@@ -1136,10 +1136,9 @@ mod tests {
         });
 
         let hostname = "not-in-dns.invalid";
-        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         // This is a loopback-only transport test with a plaintext local server;
         // TLS behavior is covered separately by the named-custom-CA test below.
-        let mut connection_options = options(&format!("ws://{hostname}:{}/events", address.port()));
+        let mut connection_options = options(&format!("ws://{hostname}:{}/events", address.port())); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         connection_options.subprotocols = vec!["json.v1".to_string(), "binary.v1".to_string()];
         let prepared = prepare_connection(connection_options).unwrap();
         let policy =
