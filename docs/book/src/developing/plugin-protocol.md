@@ -77,7 +77,9 @@ before you design around a capability that is not there.
   destination is refused before a packet leaves or a name is resolved.
   `socket_client` and `websocket_client` link the `sockets` and `websocket`
   imports on the same terms: the same grant, address-class rules, and
-  per-instance connection budget. Filesystem and
+  per-instance connection budget. A grant names hosts, not ports: with
+  `socket_client`, a granted host is reachable over raw TCP on any port, so
+  grant only hosts the plugin may speak any protocol to. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
