@@ -7140,6 +7140,7 @@ path = "{trigger_path}"
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            sop_driver_handles: None,
         }
     }
 

@@ -7687,15 +7687,19 @@ mod tests {
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let knobs = LoopKnobs::default();
+        let mut history_has_trim_breadcrumb = false;
+        let mut injected_memory_preamble = None;
 
         let run = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7714,11 +7718,14 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
             },
             history: &mut history,
+            history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+            injected_memory_preamble: &mut injected_memory_preamble,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,

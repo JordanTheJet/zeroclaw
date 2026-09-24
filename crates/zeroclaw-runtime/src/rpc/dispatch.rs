@@ -7276,6 +7276,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            initiating_agent: None,
         };
         let pr = PersistedRun::new(
             run.clone(),

@@ -17166,6 +17166,7 @@ fn test_channel_ctx_with_backend(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -17284,6 +17285,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -27155,6 +27157,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27359,6 +27362,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27546,6 +27550,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27742,6 +27747,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28312,6 +28318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -32448,6 +32455,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32610,6 +32618,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -40726,6 +40735,7 @@ BTC is currently around $65,000 based on latest tool output."#
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
         run_message_dispatch_loop(rx, router, 1).await;
 
