@@ -160,10 +160,29 @@ impl PluginStateStore {
         }
 
         enforce_quotas(&transaction, self, scope, &owner, &locator, value.len())?;
-        let revision = current_revision
-            .unwrap_or(0)
+        // Revisions come from one high-water mark per instance, so a key that
+        // is deleted and recreated never repeats a revision an earlier writer
+        // saw: a stale compare-and-swap cannot match a value it never read.
+        let issued: u64 = transaction
+            .query_row(
+                "SELECT last_revision FROM plugin_state_revisions WHERE owner = ?1",
+                params![owner.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| PluginStateError::Unavailable)?
+            .unwrap_or(0);
+        let revision = issued
+            .max(current_revision.unwrap_or(0))
             .checked_add(1)
             .ok_or(PluginStateError::Unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO plugin_state_revisions (owner, last_revision) VALUES (?1, ?2) \
+                 ON CONFLICT(owner) DO UPDATE SET last_revision = excluded.last_revision",
+                params![owner.as_slice(), revision],
+            )
+            .map_err(|_| PluginStateError::Unavailable)?;
         let ciphertext = self.seal(scope, key, revision, value)?;
         transaction
             .execute(
@@ -493,6 +512,10 @@ fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
                  ciphertext TEXT NOT NULL CHECK (ciphertext LIKE 'enc2:%')
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS plugin_state_owner ON plugin_state(owner);
+             CREATE TABLE IF NOT EXISTS plugin_state_revisions (
+                 owner BLOB PRIMARY KEY NOT NULL,
+                 last_revision INTEGER NOT NULL CHECK (last_revision > 0)
+             ) WITHOUT ROWID;
              PRAGMA user_version = 1;",
         )
         .map_err(|_| PluginStateError::Unavailable)?;
@@ -716,6 +739,17 @@ mod tests {
             store.delete(&scope, &key, 2).await,
             Err(PluginStateError::NotFound)
         );
+
+        // Recreating the key continues past every revision already issued, so
+        // a writer still holding revision 2 cannot overwrite the new value.
+        assert_eq!(store.put(&scope, &key, b"three", None).await, Ok(3));
+        assert_eq!(store.put(&scope, &key, b"four", Some(3)).await, Ok(4));
+        assert_eq!(store.delete(&scope, &key, 4).await, Ok(()));
+        assert_eq!(store.put(&scope, &key, b"five", None).await, Ok(5));
+        assert_eq!(
+            store.put(&scope, &key, b"stale", Some(2)).await,
+            Err(PluginStateError::Conflict)
+        );
     }
 
     #[tokio::test]
@@ -736,13 +770,13 @@ mod tests {
             Err(PluginStateError::QuotaExceeded)
         );
         assert_eq!(store.put(&scope, &key("first"), b"1234", None).await, Ok(1));
-        assert_eq!(store.put(&scope, &key("second"), b"12", None).await, Ok(1));
+        assert_eq!(store.put(&scope, &key("second"), b"12", None).await, Ok(2));
         assert_eq!(
             store.put(&scope, &key("third"), b"1", None).await,
             Err(PluginStateError::QuotaExceeded)
         );
         assert_eq!(
-            store.put(&scope, &key("second"), b"123", Some(1)).await,
+            store.put(&scope, &key("second"), b"123", Some(2)).await,
             Err(PluginStateError::QuotaExceeded)
         );
     }

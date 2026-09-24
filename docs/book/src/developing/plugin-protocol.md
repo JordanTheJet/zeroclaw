@@ -604,7 +604,9 @@ delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
 
 `state_read` permits `get`; `state_write` permits `put` and `delete`. `none` on
 `put` is an absent-key compare-and-swap, while `some(revision)` must match the
-current revision exactly. Writes return the new revision. Keys use the portable
+current revision exactly. Writes return the new revision. Revisions are opaque
+and never reused within an instance, so a key deleted and recreated cannot
+satisfy a stale compare-and-swap. Keys use the portable
 plugin-local grammar above and cannot select another instance. State is
 available only during tool execution and channel service frames; static calls,
 host-call budget exhaustion, storage/key failures, and integrity failures return
