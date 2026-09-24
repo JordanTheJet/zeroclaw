@@ -605,18 +605,15 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
-      # The root binary's plugin CLI tests. `mod plugins` and the plugin
-      # registry only compile under `plugins-wasm`, so the default-feature Test
-      # job never sees them; this is the one required step that runs them.
-      # `plugins::` covers the egress ceremony (including the POSIX `sh` proof
-      # that a printed grant command reaches `config set` as one literal
-      # argument), `plugin_registry::` the registry client, and `egress` the
-      # CLI-level install/list ceremony tests in `main.rs`. Filters are passed
-      # after `--` because `cargo test` accepts one positional TESTNAME; the
-      # harness ORs them.
+      # The root binary's tests with plugin support compiled in. `mod plugins`,
+      # the plugin registry and the plugin CLI's ceremony tests in `main.rs`
+      # only compile under `plugins-wasm`, so the default-feature Test job never
+      # sees them; this is the one required step that runs them. The whole
+      # suite runs rather than a name filter: the ceremony tests in `main.rs`
+      # share no common name, and a filter silently skipped most of them.
       - name: Run root CLI plugin tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: 'cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw -- plugins:: plugin_registry:: egress'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
 
   msrv:
     name: MSRV (declared floor)
