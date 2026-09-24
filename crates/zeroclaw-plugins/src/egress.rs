@@ -38,6 +38,14 @@ use zeroclaw_api::plugin_key::SecretPropertyRef;
 use crate::PluginPermission;
 use crate::instance::{PluginInstanceId, PluginInstanceScope};
 
+/// Deadline shared by outbound connection establishment and a TLS handshake.
+///
+/// Host policy, not operator configuration. It sits beside the shared
+/// authorization boundary so transport adapters cannot drift onto different
+/// connect budgets.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) const EGRESS_CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Protocol family and confidentiality mode requested by a plugin adapter.
 ///
 /// The distinction the host cares about is which effective grant a transport
@@ -1149,6 +1157,9 @@ pub enum EgressError {
     /// A selected TLS profile's certificate material is missing or invalid.
     #[error("plugin TLS profile {profile:?} has invalid {part}")]
     InvalidTlsMaterial { profile: String, part: String },
+    /// An adapter used an authorization issued to a different instance.
+    #[error("plugin egress authorization does not belong to this plugin instance")]
+    AuthorizationScopeMismatch,
     /// A selected TLS profile names a secret this instance cannot resolve.
     #[error("plugin TLS profile {profile:?} cannot resolve secret property {property:?}")]
     TlsSecretUnavailable { profile: String, property: String },
@@ -1261,6 +1272,7 @@ mod tests {
         EgressRequest::new(scope(binding), transport, host, port).unwrap()
     }
 
+    #[cfg(feature = "plugins-wasmtime")]
     fn secret(name: &str) -> SecretPropertyRef {
         SecretPropertyRef::parse(name.to_string()).unwrap()
     }

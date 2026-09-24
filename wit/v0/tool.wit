@@ -43,6 +43,11 @@ world tool-plugin {
     import secrets;
     /// Read and update encrypted durable state for this admitted tool instance.
     import state;
+    /// Host-mediated TCP, direct TLS, and STARTTLS. Linked only for an
+    /// instance holding the `socket_client` grant; every connection passes the
+    /// instance's egress grant first.
+    @unstable(feature = plugins-wit-v0-sockets)
+    import sockets;
     export plugin-info;
     export tool;
 }

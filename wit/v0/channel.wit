@@ -390,6 +390,11 @@ world channel-plugin {
     /// `unavailable`.
     import state;
     import inbound;
+    /// Host-mediated TCP, direct TLS, and STARTTLS. Linked only for an
+    /// instance holding the `socket_client` grant; every connection passes the
+    /// instance's egress grant first.
+    @unstable(feature = plugins-wit-v0-sockets)
+    import sockets;
     export plugin-info;
     export channel;
 }
