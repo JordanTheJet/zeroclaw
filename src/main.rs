@@ -3585,9 +3585,11 @@ fn existing_egress_grant_lines(
         return Vec::new();
     }
     let (granted, allow_private) = config.plugins.entry_egress(instance_key);
+    // Called only for rows the install just found, so the row exists.
     let state = EgressGrantState::Enforced {
         granted: granted.clone(),
         allow_private,
+        row_exists: true,
     };
     let plan = plan_egress_gap(
         egress_command_config_dir(config),
@@ -15291,6 +15293,102 @@ mod tests {
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: Vec::new(),
         }
+    }
+
+    /// The no-row repair works end to end. An installed HTTP plugin with no
+    /// config row (installed before this ceremony, or its row removed by hand)
+    /// gets a gap line whose command is a `config patch`, since `config set`
+    /// cannot create a row. That command is run through a real `sh`, with
+    /// `zeroclaw` replaced by a function that records its arguments and input;
+    /// the recorded patch is then applied the way the `config patch` handler
+    /// applies one (create the map key, convert the value, set it, save). The
+    /// row and its grant exist on disk afterwards, and the gap is gone.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_absent_row_repair_creates_the_row_and_its_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("gitea-tool", &["git.example.com"], false);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            config.plugins.entries.is_empty(),
+            "the instance starts with no row"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        let command = crate::plugins::egress_ceremony::egress_create_command(
+            egress_command_config_dir(&config),
+            &instance_key,
+            &["git.example.com".to_string()],
+        );
+        assert!(
+            lines[0].contains(&command),
+            "a missing row must be repaired by the command that creates it: {lines:?}"
+        );
+
+        // Run the printed command through a real shell.
+        let args_file = tmp.path().join("captured-args");
+        let stdin_file = tmp.path().join("captured-stdin");
+        let script = format!(
+            "zeroclaw() {{ printf '%s\\n' \"$@\" > '{}'; cat > '{}'; }}\n{command}\n",
+            args_file.display(),
+            stdin_file.display()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the printed command must run: {command}");
+        let args = std::fs::read_to_string(&args_file).expect("captured arguments");
+        let dir = egress_command_config_dir(&config)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec!["--config-dir", dir.as_str(), "config", "patch", "-"],
+            "the command must reach `config patch -` for the selected configuration"
+        );
+        let body = std::fs::read_to_string(&stdin_file).expect("captured input");
+
+        // Apply the patch as the handler does.
+        let ops: Vec<serde_json::Value> = serde_json::from_str(&body).expect("a JSON Patch");
+        assert_eq!(ops.len(), 1, "{body}");
+        assert_eq!(ops[0]["op"], "add", "{body}");
+        let path = ops[0]["path"]
+            .as_str()
+            .and_then(|p| p.strip_prefix('/'))
+            .expect("a JSON Pointer path")
+            .replace('/', ".");
+        assert!(
+            !config.ensure_map_or_list_key_for_path(&path),
+            "the row key must be creatable: {path}"
+        );
+        let value = json_value_to_setprop_string(&ops[0]["value"], &config, &path, 0, false)
+            .expect("the list converts like any patched value");
+        config
+            .set_prop_persistent(&path, &value)
+            .expect("the grant is written");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the patch saves");
+
+        let on_disk = entry_on_disk(&config.config_path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("the row carries egress_hosts")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["git.example.com"]);
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "after the repair the declaration is granted"
+        );
     }
 
     /// `plugin list`'s gap diagnostic, canonical case: the row the printed

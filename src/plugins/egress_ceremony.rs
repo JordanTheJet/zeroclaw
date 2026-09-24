@@ -88,6 +88,55 @@ pub fn egress_set_command_for(
     )
 }
 
+/// The command that creates an instance's missing row with its grant.
+///
+/// `config set plugins.entries.<key>.egress_hosts` resolves only keys already
+/// present in config, so for an instance with no row it fails with an unknown
+/// property and the plugin stays denied. That happens to an HTTP plugin
+/// installed before this ceremony existed, and after a row is removed by hand.
+/// `config patch` creates the keyed row for an `add` and writes the list in the
+/// same transaction, so the one printed command is the whole repair.
+///
+/// The patch is JSON on standard input: `printf` feeds it on POSIX shells, and
+/// PowerShell pipes a string to a native command's input. The JSON's double
+/// quotes are not literal in `cmd.exe`, so on Windows this is always the
+/// PowerShell form behind [`POWERSHELL_ONLY_MARKER`].
+#[must_use]
+pub fn egress_create_command(
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    hosts: &[String],
+) -> String {
+    egress_create_command_for(ShellDialect::host(), config_dir, instance_key, hosts)
+}
+
+/// [`egress_create_command`] rendered for an explicit shell dialect.
+#[must_use]
+pub fn egress_create_command_for(
+    dialect: ShellDialect,
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    hosts: &[String],
+) -> String {
+    let patch = serde_json::json!([{
+        "op": "add",
+        "path": format!("/plugins/entries/{instance_key}/egress_hosts"),
+        "value": hosts,
+    }])
+    .to_string();
+    let (dialect, marker) = dialect.command_form(&[&config_dir.to_string_lossy(), &patch]);
+    let feed = match dialect {
+        ShellDialect::Posix => format!("printf '%s\\n' {}", dialect.quote_literal(&patch)),
+        // PowerShell; a Windows line never gets here, because the patch's
+        // double quotes always send it to the PowerShell form.
+        ShellDialect::PowerShell | ShellDialect::Windows => dialect.quote_literal(&patch),
+    };
+    format!(
+        "{marker}{feed} | {} config patch -",
+        zeroclaw_invocation_for(dialect, config_dir)
+    )
+}
+
 /// `zeroclaw --config-dir '<dir>'`: the invocation prefix every printed
 /// operator command starts with, so it acts on the configuration the operator
 /// inspected rather than whichever one their shell resolves by default,
@@ -540,6 +589,10 @@ pub enum EgressGrantState {
     Enforced {
         granted: Vec<String>,
         allow_private: Vec<String>,
+        /// Whether the canonical row exists. It decides the repair command:
+        /// `config set` resolves only keys already in config, so a missing
+        /// row needs [`egress_create_command`], which creates it.
+        row_exists: bool,
     },
     /// The canonical row is absent and the operator's grant sits on a legacy
     /// package-name row the runtime does not read. Nothing is enforced until
@@ -579,6 +632,7 @@ pub fn resolve_grant_state(
             EgressGrantState::Enforced {
                 granted,
                 allow_private,
+                row_exists: row_names.iter().any(|row| row == instance_key),
             }
         }
     }
@@ -653,6 +707,7 @@ pub fn plan_egress_gap(
         EgressGrantState::Enforced {
             granted,
             allow_private,
+            row_exists,
         } => {
             // Coverage is judged over the entries the runtime accepts; whether
             // the row as a whole is accepted is the runtime's call.
@@ -664,8 +719,13 @@ pub fn plan_egress_gap(
             }
             let union = diff.union();
             let repair_incomplete = row_rejection(&union, allow_private, runtime);
+            let command = if *row_exists {
+                egress_set_command(config_dir, instance_key, &union)
+            } else {
+                egress_create_command(config_dir, instance_key, &union)
+            };
             EgressGapPlan::Grant {
-                command: egress_set_command(config_dir, instance_key, &union),
+                command,
                 missing: diff.declared_not_granted,
                 invalid,
                 rejected,
@@ -1313,10 +1373,68 @@ mod tests {
         }
     }
 
+    /// With no row, the repair is a `config patch` that creates it; `config
+    /// set` would fail with an unknown property. On POSIX the JSON reaches the
+    /// command's input intact through the shell (the end-to-end half is
+    /// `the_absent_row_repair_creates_the_row_and_its_grant` in `main.rs`); on
+    /// Windows the JSON's quotes send the whole line to the PowerShell form.
+    #[test]
+    fn an_instance_without_a_row_is_repaired_by_a_command_that_creates_it() {
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let absent = EgressGrantState::Enforced {
+            granted: Vec::new(),
+            allow_private: Vec::new(),
+            row_exists: false,
+        };
+        let EgressGapPlan::Grant {
+            command, missing, ..
+        } = plan_egress_gap(dir(), key, &v(&["api.example.com"]), &absent, &rt())
+        else {
+            panic!("an ungranted declaration must plan a grant");
+        };
+        assert_eq!(missing, v(&["api.example.com"]));
+        assert_eq!(
+            command,
+            super::egress_create_command(dir(), key, &v(&["api.example.com"]))
+        );
+        assert!(!command.contains(" config set "), "{command}");
+
+        let posix = super::egress_create_command_for(
+            super::ShellDialect::Posix,
+            dir(),
+            key,
+            &v(&["api.example.com"]),
+        );
+        assert!(posix.starts_with("printf '%s\\n' '[{"), "{posix}");
+        assert!(
+            posix.ends_with("| zeroclaw --config-dir '/srv/zeroclaw/profile-a' config patch -"),
+            "{posix}"
+        );
+        let windows = super::egress_create_command_for(
+            super::ShellDialect::Windows,
+            dir(),
+            key,
+            &v(&["api.example.com"]),
+        );
+        assert!(
+            windows.starts_with(super::POWERSHELL_ONLY_MARKER),
+            "{windows}"
+        );
+
+        // The same declaration on an existing row keeps the ordinary command.
+        let EgressGapPlan::Grant { command, .. } =
+            plan_egress_gap(dir(), key, &v(&["api.example.com"]), &enforced(&[]), &rt())
+        else {
+            panic!("an ungranted declaration must plan a grant");
+        };
+        assert!(command.contains(" config set "), "{command}");
+    }
+
     fn enforced(granted: &[&str]) -> EgressGrantState {
         EgressGrantState::Enforced {
             granted: v(granted),
             allow_private: Vec::new(),
+            row_exists: true,
         }
     }
 
@@ -1354,10 +1472,15 @@ mod tests {
             enforced(&[])
         );
         // No rows at all: enforced-empty, not stranded — renaming nothing
-        // would not help, and the grant command is the right next step.
+        // would not help — but marked as having no row, because the command
+        // that grants it has to create the row first.
         assert_eq!(
             resolve_grant_state(key, &legacy, &[], lookup),
-            enforced(&[])
+            EgressGrantState::Enforced {
+                granted: Vec::new(),
+                allow_private: Vec::new(),
+                row_exists: false,
+            }
         );
     }
 
@@ -1740,6 +1863,7 @@ mod tests {
             &EgressGrantState::Enforced {
                 granted: v(&["api.example.com"]),
                 allow_private: v(&["other.example.com"]),
+                row_exists: true,
             },
             &rt(),
         );
