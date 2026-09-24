@@ -6086,25 +6086,50 @@ impl RpcDispatcher {
         for result in &results {
             match result {
                 crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
-                    // This surface starts the run but hands off no driver, so
-                    // a first action that needs one leaves the run sitting in
-                    // `active_runs` with nothing to advance it. Leaving the producer key pointing at it would
-                    // make the next Git or reconciliation producer coalesce onto
-                    // that stalled run instead of doing the work — the key would
-                    // suppress real work rather than deduplicate it. Withdraw the
-                    // key here; the run itself is left alone, because a caller
-                    // that cannot drive it is not the one to decide its fate.
                     let needs_driver = matches!(
                         action.as_ref(),
                         crate::sop::SopRunAction::ExecuteStep { .. }
                             | crate::sop::SopRunAction::DeterministicStep { .. }
                     );
-                    if needs_driver && dedup_key.is_some() {
-                        let mut guard = match engine.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
+                    if needs_driver {
+                        // Drive the run this call started, exactly as the gateway
+                        // start path does: admitted into the daemon generation's
+                        // driver set, so a reload drains it, and refused (with the
+                        // run settled) if that generation has already drained.
+                        // Only a context with no generation, a one-shot caller,
+                        // detaches a driver instead.
+                        let config = self.ctx.config.read().clone();
+                        let driven = match self.ctx.sop_driver_handles.as_ref() {
+                            Some(handles) => crate::sop::spawn_and_register_sop_driver(
+                                handles,
+                                config,
+                                Arc::clone(engine),
+                                Some(Arc::clone(audit)),
+                                action.as_ref().clone(),
+                            ),
+                            None => {
+                                drop(crate::sop::spawn_headless_run_driver(
+                                    config,
+                                    Arc::clone(engine),
+                                    Some(Arc::clone(audit)),
+                                    action.as_ref().clone(),
+                                ));
+                                true
+                            }
                         };
-                        guard.forget_active_dispatch_dedup_for_run(run_id);
+                        // A shared producer key must only ever name a run that
+                        // something is advancing. If the driver was refused,
+                        // nothing will advance this run, and leaving the key
+                        // pointing at it would let the next Git or
+                        // reconciliation producer coalesce onto it instead of
+                        // doing the work. Withdraw the key in that case only.
+                        if !driven && dedup_key.is_some() {
+                            let mut guard = match engine.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.forget_active_dispatch_dedup_for_run(run_id);
+                        }
                     }
                     return to_result(SopRunResponse {
                         run_id: run_id.clone(),
@@ -9024,37 +9049,17 @@ mod tests {
         (dispatcher, engine, run_id, temp)
     }
 
-    /// This surface starts a run and hands off no driver, so a first action
-    /// needing one leaves the run active with nothing advancing it. If
-    /// the producer key kept pointing at it, the next Git or reconciliation
-    /// producer would coalesce onto that stalled run and skip its own work — the
-    /// key would suppress real work rather than deduplicate it.
-    #[tokio::test]
-    async fn sops_run_withdraws_the_producer_key_it_cannot_drive() {
+    /// An RPC dispatcher over one SOP, with the driver handles under test.
+    fn sops_run_dispatcher(
+        sop: crate::sop::types::Sop,
+        handles: Option<crate::sop::SopDriverHandles>,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
-        let sop_name = "undriven";
-        engine.set_sops_for_test(vec![crate::sop::types::Sop {
-            name: sop_name.to_string(),
-            description: "starts but is not driven here".to_string(),
-            version: "0.1.0".to_string(),
-            priority: crate::sop::types::SopPriority::Normal,
-            execution_mode: crate::sop::types::SopExecutionMode::Auto,
-            triggers: vec![crate::sop::types::SopTrigger::Manual],
-            steps: vec![crate::sop::types::SopStep {
-                number: 1,
-                title: "Step one".to_string(),
-                body: "Do the work".to_string(),
-                ..crate::sop::types::SopStep::default()
-            }],
-            cooldown_secs: 0,
-            max_concurrent: 4,
-            location: None,
-            deterministic: false,
-            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-            agent: None,
-        }]);
-
+        engine.set_sops_for_test(vec![sop]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(
             16,
@@ -9075,33 +9080,145 @@ mod tests {
             sessions,
             Arc::clone(&engine),
             audit,
+            handles,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        (
+            RpcDispatcher::new(ctx, tx, "local:test".into()),
+            engine,
+            temp,
+        )
+    }
 
-        let dedup_key = "ghpr_octocat/example#42";
-        let started = dispatcher
-            .handle_sops_run(&serde_json::json!({
-                "name": sop_name,
-                "dedup_key": dedup_key,
-            }))
+    fn manual_sop(
+        name: &str,
+        deterministic: bool,
+        step: crate::sop::types::SopStep,
+    ) -> crate::sop::types::Sop {
+        crate::sop::types::Sop {
+            name: name.to_string(),
+            description: "sops/run driver test".to_string(),
+            version: "0.1.0".to_string(),
+            priority: crate::sop::types::SopPriority::Normal,
+            // A deterministic SOP runs its steps without a model turn, which is
+            // what lets the driven test reach `Completed` with no provider.
+            execution_mode: if deterministic {
+                crate::sop::types::SopExecutionMode::Deterministic
+            } else {
+                crate::sop::types::SopExecutionMode::Auto
+            },
+            triggers: vec![crate::sop::types::SopTrigger::Manual],
+            steps: vec![step],
+            cooldown_secs: 0,
+            max_concurrent: 4,
+            location: None,
+            deterministic,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    async fn start_with_key(dispatcher: &RpcDispatcher, sop_name: &str, key: &str) -> String {
+        dispatcher
+            .handle_sops_run(&serde_json::json!({ "name": sop_name, "dedup_key": key }))
             .await
-            .expect("the run starts");
-        let run_id = started
+            .expect("the run starts")
             .get("run_id")
             .and_then(serde_json::Value::as_str)
             .expect("a run id comes back")
-            .to_string();
+            .to_string()
+    }
+
+    /// `sops/run` drives the run it starts, like the gateway start path. A
+    /// deterministic no-op step needs no model, so reaching `Completed` proves
+    /// a driver really advanced the run rather than leaving it at its first
+    /// step. Once terminal, the producer key no longer coalesces, so the same
+    /// work item can be retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_drives_the_run_it_starts() {
+        let sop_name = "driven";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "No-op".to_string(),
+            kind: crate::sop::types::SopStepKind::Capability,
+            capability: Some("noop".to_string()),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, true, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#42";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            let status = engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status);
+            if !matches!(
+                status,
+                Some(crate::sop::types::SopRunStatus::Running) | None
+            ) || std::time::Instant::now() >= deadline
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            status,
+            Some(crate::sop::types::SopRunStatus::Completed),
+            "a driver must advance the RPC-started run to a terminal state; run: {:?}",
+            engine.lock().unwrap().get_run(&run_id).map(|run| (
+                run.status,
+                run.step_results
+                    .iter()
+                    .map(|r| (r.step_number, r.status, r.output.clone()))
+                    .collect::<Vec<_>>()
+            ))
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "a terminal run must not keep suppressing a retry of the same work item"
+        );
+    }
+
+    /// A shared producer key must only name a run something is advancing. When
+    /// the daemon generation has already drained, the driver is refused and the
+    /// run is settled, so the key must not be left pointing at it: the next Git
+    /// or reconciliation producer would otherwise coalesce onto a run nothing
+    /// will ever advance, and the key would suppress real work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
+        let sop_name = "refused";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Step one".to_string(),
+            body: "Do the work".to_string(),
+            ..crate::sop::types::SopStep::default()
+        };
+        let handles = crate::sop::SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        let (dispatcher, engine, _temp) =
+            sops_run_dispatcher(manual_sop(sop_name, false, step), Some(handles));
+        let dedup_key = "ghpr_octocat/example#43";
+        let run_id = start_with_key(&dispatcher, sop_name, dedup_key).await;
 
         let guard = engine.lock().unwrap();
         assert!(
-            guard.active_runs().contains_key(&run_id),
-            "the run really is left active and undriven, which is the premise"
+            !guard.active_runs().contains_key(&run_id),
+            "a run whose driver was refused is settled, not left active"
         );
         assert_eq!(
             guard.active_dispatch_dedup_lookup(sop_name, dedup_key),
             None,
-            "the producer key must not still point at a run this surface cannot drive"
+            "the producer key must not point at a run nothing will advance"
         );
     }
 
