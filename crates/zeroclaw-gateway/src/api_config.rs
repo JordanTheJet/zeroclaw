@@ -2818,6 +2818,70 @@ mod tests {
         }
     }
 
+    /// The clobber direction, forced rather than raced: the agent's approved
+    /// patch lands first, then a gateway PATCH to a different field. The
+    /// gateway's live snapshot never saw the agent's write, so this pins that
+    /// gateway persistence re-reads the file and applies only its own change
+    /// instead of writing that stale snapshot back over the agent's.
+    #[tokio::test]
+    async fn gateway_patch_after_an_agent_patch_preserves_both_writes() {
+        use zeroclaw_api::tool::{APPROVAL_EXECUTION_BINDING_ARG, Tool};
+        use zeroclaw_runtime::tools::config_patch::ConfigPatchTool;
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(&dir);
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        let original: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(
+            original.gateway.host, "127.0.0.2",
+            "fixture must change the host"
+        );
+        assert_ne!(original.gateway.port, 4343, "fixture must change the port");
+        let state = test_state(config);
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        let mut args = serde_json::json!({"ops":[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]});
+        args[APPROVAL_EXECUTION_BINDING_ARG] = tool
+            .approval_summary_for_call(&args)
+            .unwrap()
+            .execution_binding
+            .unwrap();
+
+        let agent = tool.execute(args).await.unwrap();
+        assert!(
+            agent.success,
+            "agent patch must land first: {:?}",
+            agent.error
+        );
+
+        let (status, body) = response_json(
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {"op":"replace","path":"/gateway/port","value":4343}
+                ])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let saved: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.gateway.host, "127.0.0.2",
+            "the later gateway write must not revert the agent's change"
+        );
+        assert_eq!(
+            saved.gateway.port, 4343,
+            "the gateway's own change must land"
+        );
+    }
+
     #[tokio::test]
     async fn patch_add_does_not_materialize_resource_keyed_rate_alias() {
         let tmp = tempfile::tempdir().unwrap();
