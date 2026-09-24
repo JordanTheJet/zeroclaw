@@ -655,7 +655,9 @@ selects which certificate authorities to trust and, optionally, a client
 certificate for mutual TLS, read from the instance's `x-secret` properties. It
 never grants a destination: the request must first pass `egress_hosts`, and
 the profile must also cover the host. Naming a profile on a plaintext
-connection is an invalid request.
+connection is an invalid request. The properties a profile references are
+host-only: `secrets.get` returns `access-denied` for them, so the plugin never
+holds the private key it authenticates with.
 
 ### Per-plugin config (`__config` and `config.get`)
 

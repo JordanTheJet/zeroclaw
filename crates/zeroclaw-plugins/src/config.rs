@@ -6,7 +6,7 @@
 //! duration of a host call.
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use std::sync::Arc;
 
@@ -79,6 +79,7 @@ pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
     public_json: Value,
     secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
+    host_only: HashSet<SecretPropertyRef>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -92,7 +93,30 @@ impl ResolvedPluginConfig {
             scope: scope.clone(),
             public_json,
             secrets,
+            host_only: HashSet::new(),
         }
+    }
+
+    /// Withhold `references` from the guest while leaving them readable by
+    /// the host.
+    ///
+    /// The runtime marks the secret properties an instance's TLS profiles
+    /// reference: that material, a client private key included, is consumed
+    /// when the host builds a TLS connection and must not come back through
+    /// the guest's `secrets` import.
+    #[must_use]
+    pub fn reserve_for_host(
+        mut self,
+        references: impl IntoIterator<Item = SecretPropertyRef>,
+    ) -> Self {
+        self.host_only.extend(references);
+        self
+    }
+
+    /// Whether the guest-facing `secrets` import must refuse `name`.
+    #[must_use]
+    pub(crate) fn is_host_only(&self, name: &str) -> bool {
+        SecretPropertyRef::parse(name).is_ok_and(|reference| self.host_only.contains(&reference))
     }
 
     /// Borrow the validated non-secret JSON object for immediate guest injection.

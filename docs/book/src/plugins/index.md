@@ -340,6 +340,9 @@ A profile chooses certificates only. Its `hosts` must each be granted by
 `egress_hosts`, which config validation checks, and a request that names it
 still passes the ordinary grant first. The certificate material stays in the
 instance's encrypted config; the profile fields are just the property names.
+The host reads that material when it builds a connection, and the plugin cannot:
+`secrets.get` refuses any property a profile names, so a client private key
+never enters the guest.
 
 Those roots are read once per process. Rewriting the certificate file at the same
 path, or changing the operating system store, does not reach a running daemon;

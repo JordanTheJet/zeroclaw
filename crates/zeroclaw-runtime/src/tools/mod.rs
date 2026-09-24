@@ -854,6 +854,34 @@ pub(crate) fn plugin_egress_service(
     )
 }
 
+/// The secret properties an instance's TLS profiles reference.
+///
+/// That material (a CA bundle, a client certificate and its private key) is
+/// read by the host when it builds a TLS connection. Resolved config marks it
+/// host-only so the guest's `secrets` import cannot return it. A reference that
+/// is not a portable property name is skipped here: the egress policy rejects
+/// the profile, and no secret by that name can be resolved.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_secret_properties(
+    config: &Config,
+    instance_key: &str,
+) -> Vec<zeroclaw_api::plugin_key::SecretPropertyRef> {
+    config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .flat_map(|profile| {
+            [
+                profile.custom_ca_secret,
+                profile.client_certificate_secret,
+                profile.client_private_key_secret,
+            ]
+        })
+        .flatten()
+        .filter_map(|name| zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).ok())
+        .collect()
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_config_values(
     config: &Config,
@@ -892,12 +920,17 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        if let Some(live_config) = &live_config {
+        // Filled from the same config view the values come from, so the
+        // reserved set and the secrets it withholds share one revision.
+        let mut host_only = Vec::new();
+        let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
-                plugin_config_values(&live_config.read(), &config_entry_key, package)
+                let config = live_config.read();
+                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
+                plugin_config_values(&config, &config_entry_key, package)
             })
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
@@ -906,9 +939,11 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
-        }
+        };
+        resolved.map(|resolved| resolved.reserve_for_host(host_only))
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -2934,6 +2969,23 @@ permissions = ["http_client"]
                 .map(|secret| secret.as_str()),
             Some("corp_ca")
         );
+
+        // The same profile's material is reserved for the host, so the guest's
+        // `secrets` import cannot return it.
+        let mut with_identity = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+            client_certificate_secret: Some("client_cert".to_string()),
+            client_private_key_secret: Some("client_key".to_string()),
+            ..profile(&["api.example.com"])
+        }];
+        with_identity.plugins.entries = vec![row];
+        let reserved = plugin_tls_secret_properties(&with_identity, &instance_key);
+        assert_eq!(
+            reserved.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            ["corp_ca", "client_cert", "client_key"]
+        );
+        assert!(plugin_tls_secret_properties(&Config::default(), &instance_key).is_empty());
 
         // A profile that names an ungranted host fails the whole policy
         // closed, even if it slipped past load-time validation.

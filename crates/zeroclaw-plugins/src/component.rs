@@ -340,8 +340,9 @@ impl PluginState {
     ///
     /// Starts from the roots plugin HTTPS trusts and applies the authorization's
     /// TLS profile, reading any referenced certificate material from this
-    /// frame's resolved config. The material is host-consumed: the guest never
-    /// sees it, so this does not go through the guest-facing `secrets` gate.
+    /// frame's resolved config. The material is host-consumed: this read does
+    /// not go through the guest-facing `secrets` gate, and the runtime marks
+    /// every profile-referenced property host-only so that gate refuses it.
     ///
     /// # Errors
     ///
@@ -471,9 +472,16 @@ impl PluginState {
         if !self.scope.grants().allows(PluginPermission::ConfigRead) {
             return Err(SecretLookupError::AccessDenied);
         }
-        self.with_call_config(|config| config.secret(name).map(ToOwned::to_owned))
-            .map_err(|_| SecretLookupError::Unavailable)?
-            .ok_or(SecretLookupError::NotFound)
+        self.with_call_config(|config| {
+            if config.is_host_only(name) {
+                return Err(SecretLookupError::AccessDenied);
+            }
+            config
+                .secret(name)
+                .map(ToOwned::to_owned)
+                .ok_or(SecretLookupError::NotFound)
+        })
+        .map_err(|_| SecretLookupError::Unavailable)?
     }
 
     /// Read durable state under the immutable store-owned instance scope.
@@ -1072,6 +1080,32 @@ mod tests {
             state.finish_call();
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn guest_cannot_read_a_secret_reserved_for_the_host() {
+        let manifest = secret_manifest(PluginCapability::Tool);
+        let scope = secret_scope(&manifest, PluginCapability::Tool, "main", true);
+        let values = configured("one", "private-key-pem");
+        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, Some(&values)).map(|config| {
+                config.reserve_for_host([zeroclaw_api::plugin_key::SecretPropertyRef::parse(
+                    "api_key",
+                )
+                .expect("portable")])
+            })
+        }));
+        let mut state = PluginState::new(PluginStoreSpec::new(scope, services, test_limits(1_000)));
+
+        state.start_call(PluginCallPhase::ToolExecute);
+        assert_eq!(
+            state.secret("api_key"),
+            Err(SecretLookupError::AccessDenied)
+        );
+        let host_view = state
+            .with_call_config(|config| config.secret("api_key").map(ToOwned::to_owned))
+            .expect("resolved config");
+        assert_eq!(host_view.as_deref(), Some("private-key-pem"));
     }
 
     #[test]
