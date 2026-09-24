@@ -883,13 +883,52 @@ pub async fn handle_sop_save(
     }
     sop.name = name;
     let (dir, _mode) = sops_dir_and_mode(&state);
-    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+    // `PUT` edits the SOP named in its URL. If that SOP has been renamed or
+    // deleted since the client loaded it, refuse instead of recreating it
+    // under the retired name; creating a SOP is `POST /api/sops`.
+    match zeroclaw_runtime::sop::save_existing_sop_typed(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "saved": sop.name })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+/// Body for `POST /api/sops/{name}/rename`: the name to move the SOP to.
+#[derive(serde::Deserialize)]
+pub struct SopRenameBody {
+    pub to: String,
+}
+
+/// Move a SOP to a new name. `PUT /api/sops/{name}` can only ever overwrite
+/// the SOP named in its own URL, so a name change is its own collision-checked
+/// operation rather than a save with a different name in the body.
+pub async fn handle_sop_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<SopRenameBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, mode) = sops_dir_and_mode(&state);
+    match zeroclaw_runtime::sop::rename_sop_typed(&dir, &name, &body.to, mode) {
+        Ok(()) => Json(serde_json::json!({ "renamed": body.to, "from": name })).into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                zeroclaw_runtime::sop::SopAuthorError::AlreadyExists(_) => StatusCode::CONFLICT,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                zeroclaw_runtime::sop::SopAuthorError::Other(_) => StatusCode::BAD_REQUEST,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
     }
 }
 
@@ -1184,6 +1223,152 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
         }
+    }
+
+    fn authoring_rename_state(
+        token: &str,
+        names: &[&str],
+    ) -> (tempfile::TempDir, std::path::PathBuf, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        for name in names {
+            zeroclaw_runtime::sop::save_sop(&sops_dir, &authoring_checkpoint_sop(name)).unwrap();
+        }
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        (tmp, sops_dir, state)
+    }
+
+    #[tokio::test]
+    async fn authoring_rename_moves_the_sop_and_maps_failures_to_status_codes() {
+        let token = "author-token";
+        let (_tmp, sops_dir, state) =
+            authoring_rename_state(token, &["deploy-old", "deploy-taken"]);
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-old".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-new".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !sops_dir.join("deploy-old").exists(),
+            "the SOP moves rather than being copied"
+        );
+        assert!(sops_dir.join("deploy-new").exists());
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-new".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-taken".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a name another SOP owns is a conflict, not a merge"
+        );
+        assert!(sops_dir.join("deploy-new").exists());
+        assert!(sops_dir.join("deploy-taken").exists());
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-missing".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-anything".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = handle_sop_rename(
+            State(state),
+            bearer(token),
+            Path("deploy-new".to_string()),
+            Json(SopRenameBody {
+                to: "../escaped".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a rename target that escapes the SOP root is rejected"
+        );
+        assert!(!sops_dir.parent().unwrap().join("escaped").exists());
+    }
+
+    /// `PUT /api/sops/{name}` edits the SOP named in its URL. After a rename,
+    /// a client still holding the old name must get a not-found, and the
+    /// retired name must not be recreated.
+    #[tokio::test]
+    async fn authoring_save_after_rename_does_not_recreate_the_retired_sop() {
+        let token = "author-token";
+        let (_tmp, sops_dir, state) = authoring_rename_state(token, &["deploy-before"]);
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-after".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = handle_sop_save(
+            State(state),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(authoring_checkpoint_sop("deploy-before")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a stale edit of a renamed SOP is not found, not a silent re-create"
+        );
+        assert!(!sops_dir.join("deploy-before").exists());
+        assert!(sops_dir.join("deploy-after").exists());
+    }
+
+    #[tokio::test]
+    async fn authoring_rename_requires_auth() {
+        let (_tmp, sops_dir, state) = authoring_rename_state("author-token", &["deploy-old"]);
+
+        let resp = handle_sop_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("deploy-old".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-new".to_string(),
+            }),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            sops_dir.join("deploy-old").exists(),
+            "an unauthenticated rename must not touch the SOP root"
+        );
+        assert!(!sops_dir.join("deploy-new").exists());
     }
 
     fn authoring_state_with_policied_gate(
