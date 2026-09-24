@@ -781,12 +781,17 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so a reload drains them with the
+    /// generation that owns them. `None` standalone, where no generation exists.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
 impl GatewaySupervision {
@@ -795,15 +800,21 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            sop_driver_handles,
         }
     }
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+// One parameter per daemon-owned dependency; a bundling struct would only
+// move the list. Matches the existing allowance on the runtime spawn paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -820,6 +831,9 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon generation's driver supervisor set: approval surfaces
+    // register resumed headless drivers here so reload drains them.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     Box::pin(run_gateway_with_plugin_webhooks(
@@ -835,6 +849,7 @@ pub async fn run_gateway(
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            sop_driver_handles,
         ),
     ))
     .await
@@ -859,6 +874,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        sop_driver_handles,
     } = supervision;
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1852,6 +1868,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         tui_registry,
         sop_engine,
         sop_audit,
+        sop_driver_handles,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1936,6 +1953,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/sops/{name}/run",
             post(api_sop_author::handle_sop_run),
+        )
+        .route(
+            "/api/sops/{name}/rename",
+            post(api_sop_author::handle_sop_rename),
         )
         .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
         .route(
@@ -5369,6 +5390,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -6030,6 +6052,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -6098,6 +6121,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -6145,6 +6169,7 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -6216,6 +6241,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
                 Some(readiness),
             )
             .await
@@ -6279,6 +6305,7 @@ path = "{trigger_path}"
             "127.0.0.1",
             0,
             config,
+            None,
             None,
             None,
             None,
@@ -6357,6 +6384,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6443,6 +6471,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7115,6 +7144,7 @@ path = "{trigger_path}"
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -8697,6 +8727,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9616,6 +9647,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9737,6 +9769,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9837,6 +9870,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10044,6 +10078,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10131,6 +10166,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10223,6 +10259,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10320,6 +10357,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10412,6 +10450,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -10511,6 +10550,7 @@ data: [DONE]\n\n";
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -10661,6 +10701,7 @@ data: [DONE]\n\n";
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -11545,6 +11586,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -11630,6 +11672,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -12242,6 +12285,7 @@ data: [DONE]\n\n";
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
