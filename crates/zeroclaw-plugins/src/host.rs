@@ -196,7 +196,10 @@ impl PluginHost {
             // directory symlink supplied at the discovery root: it would make
             // an external package appear local before its manifest and payload
             // confinement checks begin.
-            if entry.file_type()?.is_dir() {
+            // Dot-prefixed directories are never packages: they include the
+            // staging directories `install_admitted` builds a package in.
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            if entry.file_type()?.is_dir() && !hidden {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
@@ -418,25 +421,34 @@ impl PluginHost {
         if dest_dir.exists() {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
-        std::fs::create_dir_all(&dest_dir)?;
 
-        // Persist the exact manifest and payload generations admitted above.
-        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml.as_bytes())?;
-        if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component.as_ref()) {
-            let dest = dest_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, component.bytes())?;
+        // Build the package in a staging directory and rename it into place,
+        // so a failed write (disk full, an unreadable skill file, an
+        // interrupted process) never leaves a half-written package under the
+        // real name: that would block every retry with `AlreadyLoaded` while
+        // discovery skips it, leaving nothing `plugin remove` can find.
+        // Discovery ignores dot-prefixed directories, so a staging directory
+        // stranded by a crash is never loaded either.
+        std::fs::create_dir_all(&self.plugins_dir)?;
+        let staging = self.plugins_dir.join(format!(
+            ".{}.installing-{}",
+            manifest.name,
+            std::process::id()
+        ));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
         }
-
-        // Copy skills/ subtree for skill-capable plugins.
-        if manifest.capabilities.contains(&PluginCapability::Skill) {
-            let src_skills = source_dir.join(SKILLS_SUBDIR);
-            let dest_skills = dest_dir.join(SKILLS_SUBDIR);
-            if src_skills.is_dir() {
-                copy_dir_recursive(&src_skills, &dest_skills)?;
-            }
+        let staged = write_package(
+            &staging,
+            &manifest,
+            &manifest_toml,
+            &source_dir,
+            component.as_ref(),
+        )
+        .and_then(|()| std::fs::rename(&staging, &dest_dir).map_err(PluginError::from));
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
         }
 
         let installed_name = manifest.name.clone();
@@ -844,6 +856,16 @@ fn validate_manifest_shape(
 /// frontmatter declares the agentskills.io-required `name` and `description`.
 fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), PluginError> {
     let skills_dir = plugin_dir.join(SKILLS_SUBDIR);
+    // Like a package root, the skills root is an admission boundary: a
+    // symlink here would let the bundle validated and later copied live
+    // outside the package.
+    if std::fs::symlink_metadata(&skills_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(PluginError::InvalidManifest(format!(
+            "skill plugin '{}' has a symlinked `skills/` directory at {}; package the skills in place",
+            plugin_name,
+            skills_dir.display()
+        )));
+    }
     if !skills_dir.is_dir() {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' is missing `skills/` directory at {}",
@@ -930,6 +952,37 @@ fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(
         )));
     }
 
+    Ok(())
+}
+
+/// Write an admitted package into `dir`: the exact manifest and component
+/// bytes admission read, plus the `skills/` subtree of a skill-capable package.
+fn write_package(
+    dir: &Path,
+    manifest: &PluginManifest,
+    manifest_toml: &str,
+    source_dir: &Path,
+    component: Option<&AdmittedComponent>,
+) -> Result<(), PluginError> {
+    std::fs::create_dir(dir)?;
+
+    // Persist the exact manifest and payload generations admitted above.
+    std::fs::write(dir.join("manifest.toml"), manifest_toml.as_bytes())?;
+    if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component) {
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, component.bytes())?;
+    }
+
+    // Copy skills/ subtree for skill-capable plugins.
+    if manifest.capabilities.contains(&PluginCapability::Skill) {
+        let src_skills = source_dir.join(SKILLS_SUBDIR);
+        if src_skills.is_dir() {
+            copy_dir_recursive(&src_skills, &dir.join(SKILLS_SUBDIR))?;
+        }
+    }
     Ok(())
 }
 
@@ -1883,6 +1936,88 @@ capabilities = ["tool"]
             std::fs::read(plugins.path().join("swapped/plugin.wasm")).unwrap(),
             b"\0asm admitted",
             "the verified bytes are the installed bytes"
+        );
+    }
+
+    /// An install that fails part-way leaves nothing under the package name and
+    /// no staging directory, so the retry after the cause is fixed succeeds
+    /// instead of hitting `AlreadyLoaded` on a half-written package. The
+    /// failure is real: admission reads only each skill's `SKILL.md`, so an
+    /// unreadable extra file passes admission and fails the copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_leaves_nothing_behind_and_the_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), "half", &["alpha"]);
+        let source_dir = source.path().join("half");
+        let unreadable = source_dir.join("skills/alpha/notes.txt");
+        std::fs::write(&unreadable, "extra").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&unreadable).is_ok() {
+            // Running as root: permissions cannot make the copy fail.
+            return;
+        }
+
+        let admitted = host.admit_source(source_dir.to_str().unwrap()).unwrap();
+        assert!(host.install_admitted(admitted).is_err());
+        let left: Vec<_> = std::fs::read_dir(plugins.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "a failed install left {left:?} behind");
+        assert!(host.get_plugin("half").is_none());
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let admitted = host.admit_source(source_dir.to_str().unwrap()).unwrap();
+        assert_eq!(host.install_admitted(admitted).unwrap(), "half");
+        assert!(plugins.path().join("half/skills/alpha/notes.txt").is_file());
+    }
+
+    /// A staging directory stranded by a crash is never discovered as a
+    /// package, even though it holds a complete manifest.
+    #[test]
+    fn discovery_skips_a_stranded_staging_directory() {
+        let plugins = tempdir().unwrap();
+        let staging = plugins.path().join(".stranded.installing-4242");
+        std::fs::create_dir_all(&staging).unwrap();
+        write_tool_source(&staging, "stranded", b"\0asm");
+
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    /// A symlinked `skills/` root is refused at admission, like a symlinked
+    /// package root: the bundle validated and then copied must live inside
+    /// the package.
+    #[cfg(unix)]
+    #[test]
+    fn admit_source_refuses_a_symlinked_skills_root() {
+        use std::os::unix::fs::symlink;
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        write_skill_bundle_plugin(external.path(), "ext", &["alpha"]);
+        write_skill_bundle_plugin(source.path(), "linked", &["alpha"]);
+        let source_dir = source.path().join("linked");
+        std::fs::remove_dir_all(source_dir.join("skills")).unwrap();
+        symlink(
+            external.path().join("ext/skills"),
+            source_dir.join("skills"),
+        )
+        .unwrap();
+
+        let err = host
+            .admit_source(source_dir.to_str().unwrap())
+            .expect_err("a symlinked skills root must be refused");
+        assert!(
+            err.to_string().contains("symlinked"),
+            "unexpected error: {err}"
         );
     }
 
