@@ -416,19 +416,74 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "the crates.io caller must pass only the named registry secret"
     );
 
-    let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
+    // The crates.io preflight runs beside the binary builds and gates the
+    // GitHub Release, so a release whose crates cannot publish never becomes
+    // public. It gets no token; the late `crates` call uploads what it verified.
+    let early = yaml_block(&release, "  crates-preflight:\n");
+    for required in [
+        "needs: [validate]\n",
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.validate.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+        "stage: preflight",
+        "dry_run: true",
+    ] {
+        assert!(
+            early.contains(required),
+            "early crates.io preflight is missing invariant: {required}"
+        );
+    }
     assert!(
-        workflow_call.contains(
-            "secrets:\n      CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: true"
-        ),
-        "the reusable publisher must declare the explicitly mapped registry secret"
+        !early.contains("secrets"),
+        "the early crates.io preflight cannot upload and must not receive any secret"
     );
+    let github_release = yaml_block(&release, "  publish:\n");
+    assert!(
+        github_release.contains(
+            "needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]"
+        ),
+        "the GitHub Release must wait for the crates.io preflight"
+    );
+    assert!(
+        !github_release
+            .lines()
+            .any(|line| line.starts_with("    if:")),
+        "the GitHub Release must keep the implicit success() gate over crates-preflight"
+    );
+    for required in [
+        "needs: [validate, publish, crates-preflight]",
+        "needs.crates-preflight.result == 'success'",
+        "stage: publish",
+        "verified_web_dist_digest: ${{ needs.crates-preflight.outputs.web_dist_digest }}",
+        "dry_run: false",
+    ] {
+        assert!(
+            crates_call.contains(required),
+            "the late crates.io call is missing invariant: {required}"
+        );
+    }
+
+    let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
+    for required in [
+        "CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: false",
+        "stage:\n",
+        "default: all",
+        "verified_web_dist_digest:\n",
+        "value: ${{ jobs.preflight.outputs.web_dist_digest }}",
+    ] {
+        assert!(
+            workflow_call.contains(required),
+            "the reusable publisher is missing workflow_call invariant: {required}"
+        );
+    }
 
     let preflight = yaml_block(&publisher, "  preflight:\n");
     let publish = yaml_block(&publisher, "  publish:\n");
     for required in [
-        "ref: ${{ inputs.release_tag }}",
-        "release_sha",
+        "ref: ${{ inputs.release_sha || inputs.release_tag }}",
+        "fetch-depth: 0",
+        "bash scripts/release/resolve_crates_release.sh",
+        "STAGE: ${{ inputs.stage }}",
         "cargo test --locked --test architecture publish_contract",
         "CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target",
         "./scripts/release/publish-crates.sh",
@@ -442,6 +497,46 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         !preflight.contains("CARGO_REGISTRY_TOKEN"),
         "the reversible preflight must never reference the registry token"
     );
+    // The publish stage reuses the preflight stage's verification, so every
+    // verification step skips there, while tag resolution never does.
+    let skips = |step: &str| {
+        step.lines()
+            .any(|line| line == "        if: steps.meta.outputs.stage != 'publish'")
+    };
+    for step in preflight.split("\n      - ").skip(1) {
+        let verifies = [
+            "rust-toolchain@",
+            "rust-cache@",
+            "setup-node@",
+            "cargo web build",
+            "web_dist_digest.sh",
+            "publish_contract",
+            "publish-crates.sh",
+            "upload-artifact@",
+        ]
+        .iter()
+        .any(|marker| step.contains(marker));
+        if verifies {
+            assert!(
+                skips(step),
+                "a preflight verification step must skip in the publish stage:\n{step}"
+            );
+        } else {
+            assert!(
+                !skips(step),
+                "tag resolution and the summary must run in every stage:\n{step}"
+            );
+        }
+    }
+    assert!(
+        publish.contains("if: ${{ inputs.dry_run == false && inputs.stage != 'preflight' }}"),
+        "the preflight stage must never reach the upload job"
+    );
+    assert!(
+        publish.contains("if [[ -z \"${CARGO_REGISTRY_TOKEN:-}\" ]]; then"),
+        "an optional token declaration relies on the publish step failing closed without it"
+    );
+
     for required in [
         "environment:\n      name: crates-io",
         "ref: ${{ needs.preflight.outputs.sha }}",
@@ -459,7 +554,7 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     // the publisher recheck the digest before anything reaches crates.io.
     for required in [
         "cargo web build",
-        "web_dist_digest: ${{ steps.web_digest.outputs.digest }}",
+        "web_dist_digest: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}",
         "bash scripts/release/web_dist_digest.sh web/dist",
         "WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}",
         "uses: actions/upload-artifact@",
