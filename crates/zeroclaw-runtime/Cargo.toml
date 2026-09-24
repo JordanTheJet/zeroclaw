@@ -137,7 +137,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 zeroclaw-tls = { workspace = true, features = ["testing"] }
 # The cron_run tool tests inject claim-release failures.
 zeroclaw-cron = { workspace = true, features = ["test-util"] }
+# Real relay for the relay full-path and frontdoor enrollment tests. This is the
+# only edge between the two crates: zerorelay must not dev-depend back on the
+# runtime, or publishing in dependency order becomes impossible.
 zerorelay = { workspace = true }
+rustls-pemfile = "2"
 futures-util = "0.3"
 tempfile = "3.26"
 # `test-util` enables tokio's paused-clock test runtime, which is what the relay
