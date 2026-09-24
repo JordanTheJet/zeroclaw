@@ -1237,6 +1237,15 @@ x-secret = true
         assert_eq!(resolved.secret("api_key"), Some("secret-value"));
         assert_eq!(resolved.secret("endpoint"), None);
         assert_eq!(resolved.secret("missing"), None);
+        assert!(!resolved.is_host_only("api_key"));
+        let resolved =
+            resolved.reserve_for_host([SecretPropertyRef::parse("api_key").expect("portable")]);
+        assert!(resolved.is_host_only("api_key"));
+        assert_eq!(
+            resolved.secret("api_key"),
+            Some("secret-value"),
+            "reserving a secret hides it from the guest, not from the host"
+        );
         assert!(!resolved.public_json().to_string().contains("secret-value"));
     }
 
