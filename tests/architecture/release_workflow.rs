@@ -470,6 +470,58 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "only calls that can upload may share the serialised publish group"
     );
 
+    // A version bump cannot merge unless the crates it announces package and
+    // compile. The Quality Gate runs the same tokenless preflight stage on
+    // pull requests and merge-queue entries that change the workspace version.
+    let quality_gate = workflow("ci.yml");
+    let bump_detector = yaml_block(&quality_gate, "  crates-preflight-changes:\n");
+    assert!(
+        bump_detector.contains(
+            "BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
+        ) && bump_detector
+            .contains("bash scripts/ci/crates_preflight_trigger.sh \"$EVENT_NAME\" \"$BASE_SHA\""),
+        "the version-bump detector must compare against the PR or merge-queue base"
+    );
+    let bump_preflight = yaml_block(&quality_gate, "  crates-preflight:\n");
+    for required in [
+        "needs: [crates-preflight-changes]",
+        "if: needs.crates-preflight-changes.outputs.run == 'true'",
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.crates-preflight-changes.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+        "stage: preflight",
+        "dry_run: true",
+    ] {
+        assert!(
+            bump_preflight.contains(required),
+            "the version-bump crates.io preflight is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !bump_preflight.contains("secrets"),
+        "pull requests, including forks, must never hand the publisher a secret"
+    );
+    let gate_needs = yaml_block(&quality_gate, "  gate:\n")
+        .lines()
+        .find(|line| line.starts_with("    needs: ["))
+        .expect("the required gate must declare needs");
+    for job in ["crates-preflight-changes", "crates-preflight"] {
+        assert!(
+            gate_needs.contains(&format!(" {job},")) || gate_needs.contains(&format!(" {job}]")),
+            "CI Required Gate must block on {job}"
+        );
+    }
+    assert!(
+        quality_gate.contains("run: bash scripts/ci/crates_preflight_trigger.test.sh"),
+        "the version-bump trigger must keep its process test in CI"
+    );
+    assert!(
+        publisher.contains(
+            "save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}"
+        ),
+        "pull-request runs of the publisher may read the Rust cache but never write it"
+    );
+
     let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
     for required in [
         "CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: false",

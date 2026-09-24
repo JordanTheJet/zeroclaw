@@ -158,6 +158,8 @@ Two independent Core Team approvals are the default. Toolchain-floor and release
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
+The **crates.io Package Preflight** gate runs whenever a PR changes `[workspace.package] version` to a stable `X.Y.Z`. It packages every crate in the release set and compiles each one from its own tarball, with no registry token, so a bump whose crates cannot publish cannot merge. Expect it to add about half an hour to the bump PR. It also runs again in the merge queue. If it fails, read the Preflight step first. A packaging or compile error is real and must be fixed in the bump PR. A crates.io API error, an npm install failure, or a runner timeout is infrastructure. Re-run only the failed jobs rather than pushing again. If crates.io itself stays unavailable, an admin merge over this check is the maintainer's call. The release run repeats the same preflight before the GitHub Release, so that override cannot publish a broken crate.
+
 **Confirm the merge landed correctly:**
 
 <div class="os-tabs-src">
