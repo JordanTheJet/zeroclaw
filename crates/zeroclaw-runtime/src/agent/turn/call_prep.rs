@@ -625,6 +625,39 @@ mod tests {
         }
     }
 
+    /// The routed view of a turn context is what the tool phase receives, so
+    /// it must carry the registry the approval gate and argument redaction
+    /// resolve tools against. Dropping it would silently disable operator-only
+    /// gating and secret redaction on every routed turn.
+    #[test]
+    fn route_specific_context_keeps_the_tool_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfigPatchTool::new(
+            dir.path().join("config.toml"),
+            Arc::new(SecurityPolicy::default()),
+        ))];
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (on_delta, _on_delta_rx) = mpsc::channel(1);
+        let mut base = test_ctx(&observer, &pacing, &on_delta);
+        base.tools = &tools;
+
+        let routed = base.for_route(
+            "routed-provider",
+            "routed-model",
+            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+        );
+
+        let tool = routed
+            .tool_by_name("config_patch")
+            .expect("a routed context must resolve registry tools");
+        assert!(
+            tool.approval_requires_operator(),
+            "the routed view must keep the operator-only marker the gate enforces"
+        );
+        assert_eq!(routed.tools.len(), base.tools.len());
+    }
+
     fn test_ctx<'a>(
         observer: &'a NoopObserver,
         pacing: &'a PacingConfig,

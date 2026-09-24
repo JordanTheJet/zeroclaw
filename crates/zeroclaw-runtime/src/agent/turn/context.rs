@@ -115,6 +115,11 @@ impl<'a> TurnCtx<'a> {
             parent_agent_alias: self.parent_agent_alias,
             serving_provider_name: Some(provider_name.to_string()),
             serving_model: Some(model.to_string()),
+            // The routed view is what the tool phase receives, and the registry
+            // is what the approval gate and argument redaction resolve tools
+            // against: an empty slice here would silently drop operator-only
+            // gating and secret redaction on every routed turn.
+            tools: self.tools,
         }
     }
 
