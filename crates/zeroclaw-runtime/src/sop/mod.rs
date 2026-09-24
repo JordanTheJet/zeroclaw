@@ -443,7 +443,9 @@ pub fn create_sop_typed(sops_dir: &Path, sop: &Sop) -> std::result::Result<(), S
     let _lock = lock_sops_dir(sops_dir).map_err(SopAuthorError::Io)?;
     // Re-checked under the lock: the bare check above is only a fast reject,
     // and the answer is not trustworthy until nothing else can be writing.
-    if dir.exists() {
+    // `path_occupied`, not `exists`: `exists` follows links, so a dangling
+    // symlink would read as free and the save would write through it.
+    if path_occupied(&dir) {
         return Err(SopAuthorError::AlreadyExists(sop.name.clone()));
     }
     save_sop_unlocked(sops_dir, sop).map_err(SopAuthorError::Other)
@@ -546,7 +548,30 @@ pub fn rename_sop_typed(
         std::fs::read_to_string(&manifest_path).map_err(|e| SopAuthorError::Io(e.into()))?;
     let updated = manifest_with_name(&original, to).map_err(SopAuthorError::Other)?;
 
-    write_file_atomic(&manifest_path, &updated).map_err(SopAuthorError::Io)?;
+    match write_file_atomic_detailed(&manifest_path, &updated) {
+        Ok(()) => {}
+        Err(AtomicWriteError::NotPublished(e)) => return Err(SopAuthorError::Io(e)),
+        // The manifest already names `to`. Stopping here would leave the SOP
+        // under its old directory with a manifest that disagrees with it, and
+        // the rollback below never runs for an early return. Finish the move
+        // so directory and manifest agree again; the only thing lost is the
+        // power-loss guarantee for this one entry, the same trade the flush
+        // after the move already makes.
+        Err(AtomicWriteError::PublishedNotFlushed(e)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "from": from,
+                        "to": to,
+                    })),
+                "SOP rename published the new manifest but could not flush its directory; \
+                 completing the move so the directory and manifest agree"
+            );
+        }
+    }
     if let Err(e) = std::fs::rename(&from_dir, &to_dir) {
         // The move is the commit point; it did not happen, so put the old
         // name back rather than leaving a directory that disagrees with its
@@ -651,25 +676,77 @@ fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
 /// target truncated. The target's permissions carry over, so replacing the
 /// inode cannot widen a deliberately tight manifest mode.
 fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_file_atomic_detailed(path, contents).map_err(AtomicWriteError::into_inner)
+}
+
+/// How an atomic replace failed, which decides what a caller may assume
+/// about the file on disk.
+#[derive(Debug)]
+enum AtomicWriteError {
+    /// The new contents never became visible: the target still holds exactly
+    /// what it held before.
+    NotPublished(anyhow::Error),
+    /// The new contents replaced the target and are what every reader now
+    /// sees; only flushing the directory entry failed. A retry would rewrite
+    /// identical bytes, and treating this as "nothing changed" would be false.
+    PublishedNotFlushed(anyhow::Error),
+}
+
+impl AtomicWriteError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::NotPublished(e) | Self::PublishedNotFlushed(e) => e,
+        }
+    }
+}
+
+/// [`write_file_atomic`], telling a failure before the replace apart from a
+/// failure after it.
+fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicWriteError> {
     use std::io::Write as _;
 
     let Some(dir) = path.parent() else {
-        anyhow::bail!("cannot write '{}': no parent directory", path.display());
+        return Err(AtomicWriteError::NotPublished(anyhow::Error::msg(format!(
+            "cannot write '{}': no parent directory",
+            path.display()
+        ))));
     };
 
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    if let Ok(existing) = std::fs::metadata(path) {
-        tmp.as_file().set_permissions(existing.permissions())?;
-    }
-    tmp.persist(path).map_err(|e| anyhow::Error::new(e.error))?;
+    let stage = || -> Result<tempfile::NamedTempFile> {
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(contents.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        if let Ok(existing) = std::fs::metadata(path) {
+            tmp.as_file().set_permissions(existing.permissions())?;
+        }
+        Ok(tmp)
+    };
+    let tmp = stage().map_err(AtomicWriteError::NotPublished)?;
+    tmp.persist(path)
+        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e.error)))?;
     // Flushing the file is only half of it: until the directory entry that
-    // names it is on disk too, a power loss can take the rename back. This is
-    // fatal here because nothing has been committed yet, so failing leaves the
-    // SOP exactly as it was.
-    sync_dir(dir)?;
-    Ok(())
+    // names it is on disk too, a power loss can take the rename back. But the
+    // rename has already happened and is visible, so a failure here must not
+    // be reported as though the file were unchanged.
+    sync_dir(dir).map_err(AtomicWriteError::PublishedNotFlushed)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Number of upcoming `sync_dir` calls on this thread that fail, so a test
+    // can land a failure after an atomic replace has already published.
+    static FAIL_NEXT_SYNC_DIR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn injected_sync_dir_failure() -> Option<anyhow::Error> {
+    FAIL_NEXT_SYNC_DIR.with(|remaining| {
+        let n = remaining.get();
+        (n > 0).then(|| {
+            remaining.set(n - 1);
+            anyhow::Error::msg("injected directory sync failure")
+        })
+    })
 }
 
 /// Flush a directory's entries so a rename into or out of it survives a
@@ -685,6 +762,10 @@ fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
 fn sync_dir(dir: &Path) -> Result<()> {
     use anyhow::Context as _;
 
+    #[cfg(test)]
+    if let Some(e) = injected_sync_dir_failure() {
+        return Err(e);
+    }
     std::fs::File::open(dir)
         .and_then(|handle| handle.sync_all())
         .with_context(|| format!("synchronizing directory {}", dir.display()))
@@ -692,6 +773,10 @@ fn sync_dir(dir: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if let Some(e) = injected_sync_dir_failure() {
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1592,10 +1677,31 @@ fn save_sop_unlocked(sops_dir: &Path, sop: &Sop) -> Result<()> {
 
     let manifest = SopManifest::from_sop(sop);
     let toml_content = toml::to_string_pretty(&manifest)?;
-    std::fs::write(sop_dir.join("SOP.toml"), toml_content)?;
-    std::fs::write(sop_dir.join("SOP.md"), render_steps(&sop.steps))?;
+    // Each file is replaced atomically, so an unlocked reader never sees a
+    // truncated or half-written file. The two files are still two writes:
+    // see the reader contract in `docs/book/src/sop/how-it-works.md`.
+    write_file_atomic(&sop_dir.join("SOP.toml"), &toml_content)?;
+    write_file_atomic(&sop_dir.join("SOP.md"), &render_steps(&sop.steps))?;
 
     Ok(())
+}
+
+/// Save edits to a SOP that already exists, under the authoring lock.
+///
+/// An edit-save names the SOP it was loaded from. If that SOP has since been
+/// renamed or deleted, writing it would silently resurrect a retired identity
+/// alongside the renamed one. Creating a SOP is its own explicit operation
+/// ([`create_sop_typed`]), so an edit-save whose target no longer exists is
+/// refused as `NotFound`. The target is also resolved without following
+/// symlinks and confirmed to sit inside the SOP root before anything is
+/// written, so a planted link cannot redirect the save outside it.
+pub fn save_existing_sop_typed(
+    sops_dir: &Path,
+    sop: &Sop,
+) -> std::result::Result<(), SopAuthorError> {
+    let _lock = lock_sops_dir(sops_dir).map_err(SopAuthorError::Io)?;
+    resolve_existing_sop_dir(sops_dir, &sop.name)?;
+    save_sop_unlocked(sops_dir, sop).map_err(classify_author_error)
 }
 
 // ── Validation ──────────────────────────────────────────────────
@@ -2237,6 +2343,121 @@ mod tests {
         let err = write_file_atomic(&target, "x = 1\n")
             .expect_err("writing into a directory that does not exist must fail");
         assert!(!target.exists(), "{err}");
+    }
+
+    /// A flush failure after the new manifest is already published must not
+    /// abort the rename. Returning early left the SOP under its old directory
+    /// with a manifest naming the new one, and the rollback never ran because
+    /// it only covers a failed move. The rename completes instead, so the
+    /// directory and the manifest agree.
+    #[test]
+    fn rename_completes_when_the_manifest_flush_fails_after_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        save_sop(root.path(), &named_sop("alpha", "Only step")).unwrap();
+
+        // The first directory flush in the rename is the one right after the
+        // manifest is replaced.
+        FAIL_NEXT_SYNC_DIR.with(|remaining| remaining.set(1));
+        let result = rename_sop_typed(root.path(), "alpha", "beta", SopExecutionMode::Supervised);
+        FAIL_NEXT_SYNC_DIR.with(|remaining| remaining.set(0));
+
+        result.expect("a flush failure after publishing is advisory, not a failed rename");
+        assert!(!root.path().join("alpha").exists(), "the SOP moved");
+        let moved = load_sop(&root.path().join("beta"), SopExecutionMode::Supervised)
+            .expect("the renamed SOP loads");
+        assert_eq!(moved.name, "beta", "directory and manifest agree");
+    }
+
+    /// Readers take no lock, so a save must never expose a truncated or
+    /// half-written file. Each of the two files is replaced atomically; a
+    /// reader racing the saves always loads a complete SOP whose steps are
+    /// one revision or the other.
+    #[test]
+    fn a_concurrent_reader_never_loads_a_partial_save() {
+        let root = tempfile::tempdir().unwrap();
+        let revisions = ["Revision one step", "Revision two step"];
+        save_sop(root.path(), &named_sop("busy", revisions[0])).unwrap();
+        let sop_dir = root.path().join("busy");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = std::sync::Arc::clone(&stop);
+            let sop_dir = sop_dir.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let sop = load_sop(&sop_dir, SopExecutionMode::Supervised)
+                        .expect("a reader must never see a truncated or missing file");
+                    assert_eq!(sop.name, "busy");
+                    assert_eq!(sop.steps.len(), 1, "the steps file is always complete");
+                    assert!(
+                        revisions.contains(&sop.steps[0].title.as_str()),
+                        "a reader sees a whole revision of each file, got {:?}",
+                        sop.steps[0].title
+                    );
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..300 {
+            save_sop(root.path(), &named_sop("busy", revisions[i % 2])).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let reads = reader.join().expect("the reader never saw a partial file");
+        assert!(reads > 0, "the reader actually raced the saves");
+    }
+
+    /// An edit-save names the SOP it was loaded from. After that SOP is
+    /// renamed, a stale edit must not recreate it under the retired name.
+    #[test]
+    fn an_edit_save_does_not_recreate_a_renamed_sop() {
+        let root = tempfile::tempdir().unwrap();
+        save_sop(root.path(), &named_sop("alpha", "Original step")).unwrap();
+        rename_sop_typed(root.path(), "alpha", "beta", SopExecutionMode::Supervised).unwrap();
+
+        let err = save_existing_sop_typed(root.path(), &named_sop("alpha", "Stale edit"))
+            .expect_err("saving a retired name must not recreate it");
+        assert!(matches!(err, SopAuthorError::NotFound(_)), "{err}");
+        assert!(
+            !root.path().join("alpha").exists(),
+            "the retired name stays retired"
+        );
+        assert_eq!(
+            load_sop(&root.path().join("beta"), SopExecutionMode::Supervised)
+                .unwrap()
+                .steps[0]
+                .title,
+            "Original step",
+            "the renamed SOP is untouched by the stale edit"
+        );
+    }
+
+    /// An edit-save resolves its target without following links. A symlink
+    /// planted in the SOP root must not redirect the save to a directory
+    /// outside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_save_refuses_a_symlinked_target_and_writes_nothing_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        save_sop(outside.path(), &named_sop("linked", "Outside step")).unwrap();
+        let external_manifest = outside.path().join("linked").join("SOP.toml");
+        let before = std::fs::read(&external_manifest).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("linked"), root.path().join("linked"))
+            .unwrap();
+
+        let err = save_existing_sop_typed(root.path(), &named_sop("linked", "Redirected edit"))
+            .expect_err("a symlinked SOP must not be saved through");
+        assert!(
+            err.to_string().contains("not a directory in the SOP root"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&external_manifest).unwrap(),
+            before,
+            "nothing outside the root is written"
+        );
     }
 
     #[cfg(unix)]
