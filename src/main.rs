@@ -9031,7 +9031,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                     } else {
                         raw_path.to_string()
                     };
-                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    if matches!(op_name, "add" | "replace")
+                        && config.ensure_map_or_list_key_for_path(&path)
                     {
                         let err = ConfigApiError::new(
                             ConfigApiCode::ValidationFailed,
