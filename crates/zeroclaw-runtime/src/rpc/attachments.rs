@@ -93,6 +93,23 @@ fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcErro
 
     let dir = Dir::open_ambient_dir(&root, ambient_authority())
         .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+    // Descend to the file's parent one component at a time, refusing to follow
+    // a symlink at ANY intermediate component, then open the final component
+    // no-follow beneath that parent handle.
+    //
+    // `dir.open_with(&rel, nofollow)` only applies `O_NOFOLLOW` to the terminal
+    // `open(2)`: cap-std still resolves intermediate components of a multi-part
+    // `rel` through its own in-root symlink walk. A writer entitled to the
+    // approved root could therefore plant a *relative* in-root symlink as an
+    // intermediate directory component (`sub -> ../../elsewhere`) and redirect
+    // the read after the dispatcher authorized the canonical target — the
+    // final-component nofollow never sees it. An absolute-target swap is
+    // already refused because it escapes the cap-std root, which is why the
+    // existing escape test passes while this relative-intermediate hole did
+    // not. Walking each component with `O_NOFOLLOW | O_DIRECTORY` closes it:
+    // every hop is a handle-bound, no-follow directory open, so no symlink on
+    // the path — intermediate or terminal — is ever traversed.
+    let (parent_dir, file_name) = open_parent_nofollow(&dir, &rel)?;
     // Open without following a final symlink and without blocking on a
     // special-file peer. A FIFO with no writer would make a plain blocking
     // open wait indefinitely on Linux (fifo(7)); `O_NONBLOCK` returns
@@ -103,7 +120,8 @@ fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcErro
         let mut opts = OpenOptions::new();
         opts.read(true);
         set_nonblocking_nofollow(&mut opts);
-        dir.open_with(&rel, &opts)
+        parent_dir
+            .open_with(&file_name, &opts)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?
     };
     let metadata = file
@@ -127,6 +145,103 @@ fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcErro
         return Err(too_large(bytes.len() as u64));
     }
     Ok(bytes)
+}
+
+/// Walk `rel` beneath `dir` one component at a time, opening every intermediate
+/// component as a directory with `O_NOFOLLOW | O_DIRECTORY` so no symlink on the
+/// path is ever traversed, and return the parent `Dir` handle plus the final
+/// component name for the caller to open no-follow.
+///
+/// This is the intermediate-component counterpart to the final-component
+/// `O_NOFOLLOW`: `Dir::open_with(rel, nofollow)` applies the flag only to the
+/// terminal `open(2)`, so a multi-component `rel` still resolves its interior
+/// through cap-std's in-root symlink walk. A writer in the entitled root could
+/// plant a relative in-root symlink as an interior component and redirect the
+/// read after authorization. Descending each hop with a handle-bound no-follow
+/// directory open removes that walk entirely: an interior symlink fails the
+/// `O_NOFOLLOW` open (ELOOP) instead of being followed.
+fn open_parent_nofollow(
+    dir: &cap_std::fs::Dir,
+    rel: &std::path::Path,
+) -> Result<(cap_std::fs::Dir, std::ffi::OsString), JsonRpcError> {
+    use std::path::Component;
+
+    // Split off the final component; everything before it is the directory
+    // chain we descend no-follow.
+    let file_name = match rel.file_name() {
+        Some(name) => name.to_os_string(),
+        None => {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cannot read file: path has no file name",
+            ));
+        }
+    };
+
+    let mut current = dir
+        .try_clone()
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+
+    let parent = rel.parent().unwrap_or_else(|| std::path::Path::new(""));
+    for component in parent.components() {
+        match component {
+            // A normal directory name: descend it no-follow. Any other
+            // component kind (RootDir, Prefix, ParentDir, CurDir) has no place
+            // in a root-relative attachment path and is refused rather than
+            // silently normalized — `..` in particular must never climb out.
+            Component::Normal(name) => {
+                current = open_child_dir_nofollow(&current, name)?;
+            }
+            Component::CurDir => {}
+            other => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Cannot read file: unexpected path component {other:?} in attachment path"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok((current, file_name))
+}
+
+/// Open a single child directory component beneath `parent` with
+/// `O_NOFOLLOW | O_DIRECTORY` (Unix) so a symlinked component fails to open
+/// instead of being followed, returning the resulting confined `Dir` handle.
+#[cfg(unix)]
+fn open_child_dir_nofollow(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> Result<cap_std::fs::Dir, JsonRpcError> {
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    // O_DIRECTORY: the component must be a real directory (a non-dir fails
+    // ENOTDIR). O_NOFOLLOW: a symlinked component fails ELOOP instead of being
+    // traversed. O_NONBLOCK guards against a FIFO planted as an interior
+    // component wedging the open.
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK);
+    let file = parent
+        .open_with(name, &opts)
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+}
+
+/// Non-Unix fallback: cap-std's own in-root `open_dir` walk, which refuses
+/// components that escape the confined root. `O_NOFOLLOW`/`O_DIRECTORY` have no
+/// portable custom-flag equivalent here, and the platforms without them (WSS
+/// refuses path mode; local Windows) do not expose the relative-symlink
+/// interior-swap hazard on this surface.
+#[cfg(not(unix))]
+fn open_child_dir_nofollow(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> Result<cap_std::fs::Dir, JsonRpcError> {
+    parent
+        .open_dir(name)
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))
 }
 
 /// Apply `O_NONBLOCK | O_NOFOLLOW` on Unix so a special-file peer cannot make
@@ -699,6 +814,98 @@ mod tests {
         let ok = process_file_entry(&ok_entry, "s1", &ws, false, Some(&ok_source), &store)
             .await
             .expect("a file inside the approved root must still read");
+        assert_eq!(ok.size_bytes, 4);
+    }
+
+    /// The interior-component counterpart to the escape test above, reproducing
+    /// the exact TOCTOU the reviewer demonstrated. The dispatcher authorizes an
+    /// in-root canonical target (`root/public/file.txt`) while `public` is a
+    /// real directory. A writer entitled to the root then swaps the intermediate
+    /// component for a *relative in-root* symlink pointing at a sibling
+    /// (`public -> secrets`) — a sibling that a more-specific `forbidden_paths`
+    /// entry would have denied at authorization. The link target never leaves
+    /// the filesystem root, so cap-std's confinement does NOT refuse it and the
+    /// old single `dir.open_with(rel, nofollow)` followed it, returning
+    /// `SECRET-CONTENT` instead of the authorized `PUBLIC-CONTENT`. Only the
+    /// component-by-component no-follow descent refuses the swapped interior
+    /// component. A genuinely nested in-root file proves the descent does not
+    /// over-refuse ordinary nested paths.
+    ///
+    /// (`process_file_entry` is the read seam; the `forbidden_paths` denial
+    /// itself is the dispatcher's authorization job, covered in `dispatch.rs`.
+    /// What this asserts is the read never returns an object other than the one
+    /// authorization judged, which is what makes the policy denial meaningful.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_source_with_relative_intermediate_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let root = tmp.path().join("approved");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // An in-root sibling standing in for a more-specific forbidden path.
+        // Its target file shares the authorized leaf name so following the
+        // swapped interior link would silently return these bytes.
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets").join("file.txt"), b"SECRET-CONTENT").unwrap();
+
+        // The authorized object: a real directory with a real file, canonical
+        // at authorization time.
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        std::fs::write(root.join("public").join("file.txt"), b"PUBLIC-CONTENT").unwrap();
+
+        let target = root.join("public").join("file.txt");
+        let source = AttachmentSource {
+            root: Some(root.clone()),
+            target: target.clone(),
+        };
+
+        // TOCTOU swap AFTER the source was authorized: replace the `public`
+        // directory with a RELATIVE in-root symlink to the forbidden sibling.
+        // The link stays under the fs root, so root confinement alone does not
+        // refuse it — the no-follow interior descent must.
+        std::fs::rename(root.join("public"), root.join("public.real")).unwrap();
+        std::os::unix::fs::symlink("secrets", root.join("public")).unwrap();
+
+        let entry = FileEntry {
+            path: Some(target.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let err = process_file_entry(&entry, "s1", &ws, false, Some(&source), &store)
+            .await
+            .expect_err("a swapped in-root relative interior symlink must be refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            !err.message.contains("SECRET"),
+            "refusal must not carry the forbidden sibling's bytes: {}",
+            err.message
+        );
+
+        // Control: a genuinely nested directory inside the root still reads, so
+        // the refusal above is the swapped interior link and not the nesting.
+        let real_sub = root.join("real");
+        std::fs::create_dir_all(&real_sub).unwrap();
+        let inside = real_sub.join("ok.txt");
+        std::fs::write(&inside, b"fine").unwrap();
+        let ok_entry = FileEntry {
+            path: Some(inside.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let ok_source = AttachmentSource {
+            root: Some(root.clone()),
+            target: inside.clone(),
+        };
+        let ok = process_file_entry(&ok_entry, "s1", &ws, false, Some(&ok_source), &store)
+            .await
+            .expect("a genuinely nested in-root file must still read");
         assert_eq!(ok.size_bytes, 4);
     }
 

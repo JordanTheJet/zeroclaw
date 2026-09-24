@@ -10844,9 +10844,25 @@ mod tests {
             "the persisted narrowing itself is authorized: {narrowed}"
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(
-            on_disk.contains("session-scoped"),
-            "the narrowed profile must be persisted: {on_disk}"
+        // Assert on the mutation, not just the table key: `session-scoped` is
+        // present whether or not the narrowing took effect, so a silent no-op
+        // would pass a `contains("session-scoped")` check. Parse the persisted
+        // config and prove `allowed_agents` was actually cleared to `[]`.
+        let parsed: toml::Value = toml::from_str(&on_disk)
+            .unwrap_or_else(|e| panic!("persisted config must parse: {e}\n{on_disk}"));
+        let allowed_agents = parsed
+            .get("permission_profiles")
+            .and_then(|v| v.get("session-scoped"))
+            .and_then(|v| v.get("allowed_agents"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "permission_profiles.session-scoped.allowed_agents must be persisted: {on_disk}"
+                )
+            });
+        assert_eq!(
+            allowed_agents,
+            &toml::Value::Array(vec![]),
+            "the narrowing must persist an empty allowed_agents, not a no-op: {on_disk}"
         );
 
         release_admitted.notify_one();
@@ -12499,10 +12515,16 @@ mod tests {
             // binding was established on a token that lacks the newly-required
             // acr, so re-resolution fails closed until the client re-verifies.
             let refused = rpc(&mut oidc, &mut rx, 4, "config/list", json!({})).await;
-            assert!(
-                refused.get("error").is_some(),
+            // Pin the refusal code, not merely `error.is_some()`: any unrelated
+            // failure in the `config/list` handler would satisfy a bare
+            // is-some. A failed OIDC rebind resolves through
+            // `DenyReason::BadCredential` to `AUTH_REQUIRED` (`rpc/auth.rs`), so
+            // assert exactly that the way the sibling tests pin `FORBIDDEN`.
+            assert_eq!(
+                refused["error"]["code"],
+                json!(AUTH_REQUIRED),
                 "a connection established before the acr tightened must be forced to \
-                 re-verify, not keep resolving: {refused}"
+                 re-verify with AUTH_REQUIRED, not keep resolving: {refused}"
             );
         });
     }
