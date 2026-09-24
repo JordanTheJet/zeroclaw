@@ -1024,7 +1024,7 @@ mod tests {
         let held = zeroclaw_config::write_lock::shared_config_write_lock()
             .lock_owned()
             .await;
-        let pending = tokio::spawn(async move { tool.execute(args).await });
+        let pending = zeroclaw_spawn::spawn!(async move { tool.execute(args).await });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             !pending.is_finished(),

@@ -2584,9 +2584,12 @@ data: {\"type\":\"message_stop\"}\n\n",
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let (mut socket, _) = connect_async(format!("ws://{address}/ws/chat?agent=web"))
-            .await
-            .unwrap();
+        let (mut socket, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{address}/ws/chat?agent=web" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .unwrap();
         socket.next().await.unwrap().unwrap();
         socket
             .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
