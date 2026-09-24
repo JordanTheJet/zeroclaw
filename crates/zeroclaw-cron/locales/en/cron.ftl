@@ -20,4 +20,5 @@ cron-pre-hook-output-truncated = [pre_hook output truncated]
 cron-pre-hook-runtime-missing = pre_hook setup error: runtime missing for cron precondition
 cron-manual-refused-in-flight = cron job {$id} is already in flight; manual trigger refused
 cron-manual-claim-failed = failed to claim cron job {$id} for a manual run: {$error}
+cron-manual-refused-unreconciled = cron job {$id} was not run: its declaration has not been reconciled with the current config, so the stored job may not match it
 cron-owner-ambiguous = cron job {$id} is claimed by {$count} enabled agents ({$owners}); exactly one agent must list it in [agents.<x>].cron_jobs so the job runs under a determinate security policy

@@ -25,13 +25,13 @@ pub use schedule::{
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
-    claim_job_for_agent_with_token, claim_job_with_token, clear_stale_locks, due_jobs,
-    finish_agent_claim, get_job, get_job_for_agent, list_jobs, list_jobs_by_agent, list_runs,
-    list_runs_for_agent, record_last_run, record_last_run_with_status, record_run, release_job,
-    release_job_for_token, remove_job, remove_job_for_agent, remove_jobs_by_agent,
-    rename_jobs_by_agent, reschedule_after_run, reschedule_after_run_with_status,
-    resolve_job_id_or_name, skip_missed_run, sync_declarative_jobs, update_job,
-    update_job_for_agent,
+    claim_job_for_agent_with_token, claim_job_with_token, clear_stale_locks,
+    declarative_jobs_reconciled, due_jobs, finish_agent_claim, get_job, get_job_for_agent,
+    list_jobs, list_jobs_by_agent, list_runs, list_runs_for_agent, record_last_run,
+    record_last_run_with_status, record_run, release_job, release_job_for_token, remove_job,
+    remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
+    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
+    sync_declarative_jobs, update_job, update_job_for_agent,
 };
 /// Fault injection for claim release, for this crate's tests and for callers
 /// that test their own release handling against it.

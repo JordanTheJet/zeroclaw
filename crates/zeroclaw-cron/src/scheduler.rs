@@ -440,6 +440,29 @@ async fn run_manual_job_inner(
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
 
+    // A declarative row keeps the body from the last successful sync, while
+    // its gate resolves from live config. The scheduled path withholds such
+    // rows until reconciliation succeeds; a manual trigger must too, or it
+    // could run an old body under a new precondition.
+    if job.source == "declarative" && !crate::declarative_jobs_reconciled(config) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"job_id": job.id})),
+            "manual cron trigger refused: declarative reconciliation has not succeeded"
+        );
+        return manual_refusal(
+            job,
+            started_at,
+            "error",
+            get_required_cli_string_with_args(
+                "cron-manual-refused-unreconciled",
+                &[("id", &job.id)],
+            ),
+        );
+    }
+
     // Claim before the precondition, not just before the body: the claim is
     // the single owner of an execution window, gate included. Without it a due
     // scheduled run and a manual trigger could both pass the same gate and run
@@ -595,7 +618,6 @@ pub async fn run(
         jobs_with_builtin.insert("__builtin_backup".to_string(), backup_job);
     }
 
-    let mut declarative_sync_failed = false;
     match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
             if !jobs_with_builtin.is_empty() {
@@ -614,7 +636,6 @@ pub async fn run(
             // a new precondition. Refusing to run declarative jobs is the only
             // outcome that keeps the gate and the work it authorizes describing
             // the same declaration.
-            declarative_sync_failed = true;
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -686,7 +707,10 @@ pub async fn run(
                 // Held back while reconciliation is unresolved: a declarative
                 // row may still carry a body from before the config change the
                 // gate is being resolved from.
-                let jobs = withhold_declarative_when_unreconciled(jobs, declarative_sync_failed);
+                let jobs = withhold_declarative_when_unreconciled(
+                    jobs,
+                    !crate::declarative_jobs_reconciled(&config),
+                );
                 let jobs = claim_due_jobs(&config, jobs);
                 process_due_jobs(
                     &config,
@@ -4263,6 +4287,76 @@ mod tests {
             );
             cron::release_job(&config, &job.id).unwrap();
         }
+    }
+
+    /// A failed reconciliation holds a declarative job on every path, then a
+    /// successful one releases it.
+    ///
+    /// The scheduler used to record the failure in a loop-local flag, so a
+    /// gateway, RPC or agent-tool trigger could still run the stored body,
+    /// which may predate the config its gate is resolved from.
+    #[tokio::test]
+    async fn manual_and_scheduled_runs_refuse_a_declarative_job_until_it_reconciles() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "reconcile-me", "exit 0", 30);
+        assert!(cron::declarative_jobs_reconciled(&config));
+
+        // A later reconciliation fails, as an invalid edit to any declaration
+        // would make it. The stored row is untouched.
+        let mut broken = config.cron.clone();
+        broken.get_mut("reconcile-me").expect("declared").schedule =
+            zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "not a cron expression".into(),
+                tz: None,
+            };
+        assert!(cron::sync_declarative_jobs(&config, &broken).is_err());
+        assert!(!cron::declarative_jobs_reconciled(&config));
+
+        let manual = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
+        assert!(!manual.success, "the manual run must be refused");
+        assert!(
+            !manual.output.contains(GATED_BODY_MARKER),
+            "the stored body must not run: {}",
+            manual.output
+        );
+        assert!(
+            manual.output.contains("has not been reconciled"),
+            "got: {}",
+            manual.output
+        );
+        assert!(
+            withhold_declarative_when_unreconciled(
+                vec![job.clone()],
+                !cron::declarative_jobs_reconciled(&config)
+            )
+            .is_empty(),
+            "the scheduled path must hold it back too"
+        );
+
+        // A successful reconciliation releases both paths.
+        cron::sync_declarative_jobs(&config, &config.cron).expect("valid config reconciles");
+        let manual = run_manual_job(
+            &config,
+            &job,
+            CronDeliveryContext::RpcManual,
+            &None,
+            test_agent_executor(),
+        )
+        .await;
+        assert!(
+            manual.success,
+            "released after reconciling: {}",
+            manual.output
+        );
     }
 
     #[test]

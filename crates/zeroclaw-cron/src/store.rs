@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
@@ -1546,7 +1546,43 @@ fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
     Ok(None)
 }
 
+/// Whether this process's most recent declarative reconciliation succeeded,
+/// per cron database.
+///
+/// A declarative row stores the job body as of the last successful sync, while
+/// its precondition gate is always resolved from live config. Until a sync has
+/// succeeded in this process, a row may pair an old body with a new gate, so
+/// every path that runs a declarative job has to be able to ask. Absent means
+/// no reconciliation has run here yet, which is treated the same as a failure.
+static DECLARATIVE_RECONCILED: LazyLock<Mutex<HashMap<std::path::PathBuf, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether declarative rows for this database reflect live config.
+///
+/// True only after `sync_declarative_jobs` has succeeded in this process and
+/// has not failed since.
+pub fn declarative_jobs_reconciled(config: &Config) -> bool {
+    DECLARATIVE_RECONCILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cron_db_path(config))
+        .copied()
+        .unwrap_or(false)
+}
+
 pub fn sync_declarative_jobs(
+    config: &Config,
+    decls: &std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
+) -> Result<()> {
+    let result = sync_declarative_jobs_inner(config, decls);
+    DECLARATIVE_RECONCILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cron_db_path(config), result.is_ok());
+    result
+}
+
+fn sync_declarative_jobs_inner(
     config: &Config,
     decls: &std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
 ) -> Result<()> {
