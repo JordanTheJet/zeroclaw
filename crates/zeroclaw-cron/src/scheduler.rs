@@ -739,10 +739,17 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Result<&'a str
     // so preferring it would run the job -- and its config-declared pre_hook --
     // under the previous owner's allowed commands, workspace roots, autonomy,
     // and action budget. Live config is the source of truth here.
-    if job.source == "declarative"
-        && let Some(alias) = owners.first()
-    {
-        return Ok(alias);
+    //
+    // With no enabled agent listing it, a declarative job has no owner at all.
+    // Falling through to the stored alias would run it as whoever owned it last,
+    // even an agent that has since been disabled, so it fails closed instead.
+    if job.source == "declarative" {
+        return owners.first().copied().ok_or_else(|| {
+            format!(
+                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+                id = job.id
+            )
+        });
     }
 
     if !job.agent_alias.is_empty()
@@ -4384,6 +4391,32 @@ mod tests {
     }
 
     // ── Ownership resolution for declarative jobs ────────────────────
+
+    /// A declarative job nobody enabled lists has no owner, whatever the row says.
+    ///
+    /// The stored alias is only a record of who owned the job when it was last
+    /// synced. Once the last listing agent is disabled or drops the id, falling
+    /// back to that alias would keep running the job, and its config-declared
+    /// pre_hook, as an agent that no longer owns it.
+    #[tokio::test]
+    async fn an_unowned_declarative_job_fails_closed_instead_of_using_its_stored_alias() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = declarative_gated_job(&mut config, "orphaned-job", "exit 0", 30);
+        assert_eq!(job.agent_alias, TEST_AGENT);
+        assert!(resolve_owning_agent(&config, &job).is_ok());
+
+        // The only listing agent is disabled; its config entry still exists.
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("seeded agent")
+            .enabled = false;
+
+        let refused = resolve_owning_agent(&config, &job)
+            .expect_err("a declarative job with no enabled owner must not resolve");
+        assert!(refused.contains("has no owning agent"), "got: {refused}");
+    }
 
     #[tokio::test]
     async fn declarative_gate_runs_under_the_current_owner_not_the_stored_one() {
