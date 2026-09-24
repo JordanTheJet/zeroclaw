@@ -463,6 +463,13 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         );
     }
 
+    assert!(
+        publisher.contains(
+            "  group: ${{ inputs.stage == 'preflight' && format('crates-io-preflight-{0}', github.run_id) || 'crates-io-publish' }}\n  cancel-in-progress: false"
+        ),
+        "only calls that can upload may share the serialised publish group"
+    );
+
     let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
     for required in [
         "CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: false",

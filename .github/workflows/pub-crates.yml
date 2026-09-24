@@ -71,8 +71,11 @@ on:
         default: true
         type: boolean
 
+# Uploads are serialised across every run. A preflight-only call cannot upload,
+# so it gets a group of its own: sharing the publish group would let it queue
+# behind a long upload or, as the newer pending entry, cancel a pending one.
 concurrency:
-  group: crates-io-publish
+  group: ${{ inputs.stage == 'preflight' && format('crates-io-preflight-{0}', github.run_id) || 'crates-io-publish' }}
   cancel-in-progress: false
 
 permissions:
