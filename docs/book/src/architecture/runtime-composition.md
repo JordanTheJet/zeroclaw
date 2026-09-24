@@ -160,7 +160,7 @@ Parity tests in the first implementation slice must show that the effective tool
 - **[#11012](https://github.com/zeroclaw-labs/zeroclaw/issues/11012) and its RFC [#9487](https://github.com/zeroclaw-labs/zeroclaw/issues/9487)** own the inbound command path (`RuntimeIngress` / `InboundTurn`). This proposal owns what a turn is *built from*. The two meet at the `Runtime` handle, which ingress handlers hold.
 - **[#10998](https://github.com/zeroclaw-labs/zeroclaw/issues/10998)** (core tools only in the default runtime) consumes `ToolSource`: the optional tools move behind the application's `ToolSource`, and the runtime keeps only its core tools.
 
-## Where the contract lives: open decision
+## Where the contract lives
 
 The contract needs `Config` and `SecurityPolicy`, which live in `zeroclaw-config`. That rules out `zeroclaw-api`, which has no workspace dependencies by design. The remaining homes are:
 
@@ -170,7 +170,9 @@ The contract needs `Config` and `SecurityPolicy`, which live in `zeroclaw-config
 | B. A new contract crate depending on api and config | Clean boundary; application wiring can depend on it without the runtime | A new crate ahead of the planned kernel extraction; the ADR-016 record already notes the risk of establishing boundaries early |
 | C. The planned `zeroclaw-kernel` | The destination both active runtime exceptions already name | Does not exist; extracting it first would block this work on the agent-loop extraction |
 
-The recommendation is **A with a recorded exception**: scope `src/composition.rs` plus the entry-point adapters in the migration below, destination `zeroclaw-kernel`, reviewed at the agent-loop extraction design review. This PR does not merge without that decision.
+**Decision: option A.** The contract lives in `zeroclaw-runtime`, under a holding-crate exception recorded per ADR-016. The exception row is proposed separately, as ADR-016 requires, in [#11092](https://github.com/zeroclaw-labs/zeroclaw/pull/11092): scope `src/composition.rs`, the entry-point adapters that consume it, and the capability-carrying `DaemonRegistry` starter signatures; destination `zeroclaw-kernel`; reviewed at the agent-loop extraction design review.
+
+**The exception is pending Core Team review.** The placement was chosen under a delegated code call, which is not the Core Team approval ADR-016 requires. Until a Core Team member approves #11092, no exception exists, and the skeleton that accompanies this page must not merge.
 
 ## Migration order for callers
 
@@ -207,6 +209,5 @@ The issue asks for any retained dependency to be explained rather than hidden be
 
 ## Open decisions
 
-1. **Placement** of the contract, above. Blocking for merge.
-2. **`run_turn` versus waiting for `RuntimeIngress`.** Shipping `run_turn` first unblocks the independent-consumer criterion but adds a surface that must later defer to ingress.
-3. **Whether `ProviderSource` also receives the requesting principal** once principal-scoped tool selection lands. It is left out here because it is not yet a resolved input.
+1. **`run_turn` versus waiting for `RuntimeIngress`.** Shipping `run_turn` first unblocks the independent-consumer criterion but adds a surface that must later defer to ingress.
+2. **Whether `ProviderSource` also receives the requesting principal** once principal-scoped tool selection lands. It is left out here because it is not yet a resolved input.
