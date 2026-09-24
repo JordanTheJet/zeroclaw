@@ -483,6 +483,16 @@ impl Tool for ConfigPatchTool {
             return Ok(ToolResult::err(error));
         }
 
+        // Join the process-wide config transaction for the whole read → apply
+        // → save sequence, so gateway, RPC, and channel-identity writers cannot
+        // interleave with it. Taken only here, after approval: holding it
+        // across the preview or a human approval wait would stall every config
+        // writer in the process. `save_patch_if_source_unchanged` takes the
+        // per-path disk lock beneath it, which is the documented order.
+        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+
         // Fresh read of the on-disk state, not the boot-time snapshot: the
         // operator may have edited config since this process started, and a
         // stale base would resurrect overwritten values. By the time an agent
@@ -542,11 +552,11 @@ impl Tool for ConfigPatchTool {
             });
         }
 
-        // Version-check against writers outside this lock (the CLI, the
-        // gateway, an editor). The write lock blocks other `config_patch`
-        // calls; this re-read catches anyone else who changed the file since
-        // the base read, so a concurrent update is failed explicitly rather
-        // than silently clobbered by `save_dirty` rewriting from our base.
+        // Version-check against writers outside the transaction lock (a
+        // separate CLI process, an editor). The lock blocks other in-process
+        // writers, including other `config_patch` calls; this re-read catches
+        // anyone else who changed the file since the base read, so a concurrent
+        // update is failed explicitly rather than silently clobbered.
         match tokio::fs::read_to_string(&self.config_path).await {
             Ok(current) if sha256(current.as_bytes()) == base_digest => {}
             Ok(_) => {
@@ -996,6 +1006,44 @@ mod tests {
             result.error
         );
         assert_eq!(read_config(&path).gateway.host, "10.0.0.42");
+    }
+
+    /// `execute` joins the process-wide config transaction: while another
+    /// writer holds the lock, the patch neither reads nor writes, and it
+    /// proceeds once the lock is released.
+    #[tokio::test]
+    async fn execute_waits_for_the_process_wide_config_transaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_config(dir.path()).await;
+        let tool = config_patch_tool(path.clone());
+        let mut args = serde_json::json!({
+            "ops": [{"op": "replace", "path": "/gateway/host", "value": "10.0.0.43"}]
+        });
+        bind_preview(&tool, &mut args);
+
+        let held = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+        let pending = tokio::spawn(async move { tool.execute(args).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "execute must wait while another config transaction holds the lock"
+        );
+        assert_ne!(
+            read_config(&path).gateway.host,
+            "10.0.0.43",
+            "nothing is written while another transaction holds the lock"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+            .await
+            .expect("execute proceeds once the lock is released")
+            .expect("execute task")
+            .expect("execute");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(read_config(&path).gateway.host, "10.0.0.43");
     }
 
     #[tokio::test]

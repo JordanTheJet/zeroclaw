@@ -111,20 +111,4 @@ mod tests {
         drop(held);
         assert!(shared_config_write_lock().try_lock().is_ok());
     }
-
-    /// The ordering the module relies on: a writer holding the transaction
-    /// lock can always take the disk lock beneath it, as every transaction
-    /// writer does when it calls a `Config` save method.
-    #[tokio::test]
-    async fn disk_lock_is_acquirable_under_the_transaction_lock() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.toml");
-        let transaction = shared_config_write_lock().lock_owned().await;
-        let disk = tokio::time::timeout(std::time::Duration::from_secs(5), acquire(&path))
-            .await
-            .expect("disk lock must not wait on the transaction lock")
-            .expect("disk lock");
-        drop(disk);
-        drop(transaction);
-    }
 }
