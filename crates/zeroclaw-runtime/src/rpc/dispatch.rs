@@ -1588,46 +1588,71 @@ impl RpcDispatcher {
     /// account's wider read access is not lent to the caller. Inline
     /// `data_b64` entries carry their own bytes and pass. `None` grants are an
     /// unbound dispatcher (the direct unit-test handlers) and pass.
+    ///
+    /// Returns one slot per input entry, index-aligned with `entries`: `None`
+    /// for an inline (`data_b64`) entry, or `Some(AttachmentSource)` carrying
+    /// the single canonical target this authorization judged. The caller MUST
+    /// bind the bounded read to the returned source — never re-resolve the raw
+    /// request path — so an alias that resolved inside an entitled root at
+    /// authorization time cannot be swapped to point elsewhere before the read
+    /// (the canonicalization contract in `policy.rs`). When grants are absent or
+    /// admin (no per-path authorization runs) the slots are still resolved so
+    /// the read binds to the same canonical target as the confined path.
     fn authorize_attachment_sources(
         &self,
         method: Method,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
         alias: &str,
         entries: &[FileEntry],
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Vec<Option<super::attachments::AttachmentSource>>, JsonRpcError> {
+        // Resolve every path entry to its canonical target ONCE, up front, and
+        // reuse that resolution for both the readability judgement and the
+        // returned read binding. This is the single point of truth the read
+        // must consume.
+        let resolved: Vec<Option<super::attachments::AttachmentSource>> = entries
+            .iter()
+            .map(|entry| self.attachment_source(alias, entry))
+            .collect();
+
+        // Unbound dispatcher (direct unit-test handlers) or an operator grant:
+        // no per-path authorization gate, but still carry the resolved targets.
         let Some(grants) = grants else {
-            return Ok(());
+            return Ok(resolved);
         };
         if grants.admin {
-            return Ok(());
+            return Ok(resolved);
         }
-        let sources: Vec<&str> = entries
-            .iter()
-            .filter(|entry| entry.data_b64.is_none())
-            .filter_map(|entry| entry.path.as_deref())
-            .collect();
-        if sources.is_empty() {
-            return Ok(());
-        }
-        let config = self.ctx.config.read();
-        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok();
-        for source in sources {
-            let path = std::path::Path::new(source);
-            let allowed = path.is_absolute()
-                && super::fs::resolves_locally(path)
-                && policy
-                    .as_ref()
-                    .is_some_and(|policy| policy.is_resolved_path_readable(path));
+
+        for (entry, source) in entries.iter().zip(resolved.iter()) {
+            // Inline bytes carry no path source and need no read authorization.
+            if entry.data_b64.is_some() {
+                continue;
+            }
+            let Some(raw) = entry.path.as_deref() else {
+                continue;
+            };
+            // Judge readability on the SAME canonical target the read will bind
+            // to, not on the raw request spelling. A path that would not resolve
+            // (source is None) is refused closed.
+            let allowed = source.as_ref().is_some_and(|src| {
+                let path = &src.target;
+                path.is_absolute() && super::fs::resolves_locally(path) && {
+                    let config = self.ctx.config.read();
+                    zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias)
+                        .ok()
+                        .is_some_and(|policy| policy.is_resolved_path_readable(path))
+                }
+            });
             if !allowed {
                 let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal is not granted attachment source {source:?}: only an absolute local \
+                    "Principal is not granted attachment source {raw:?}: only an absolute local \
                      path that agent {alias:?} may read can be attached by path"
                 ));
                 self.audit_auth_denial(method, &denied);
                 return Err(rpc_err(denied.code, denied.message));
             }
         }
-        Ok(())
+        Ok(resolved)
     }
 
     /// The authorized source for a path-mode attachment: the canonical resolved
@@ -4257,23 +4282,32 @@ impl RpcDispatcher {
                 .to_string_lossy()
                 .to_string();
             let is_wss = self.peer_label.starts_with("wss:");
-            if !is_wss
-                && let Err(denied) = self.authorize_attachment_sources(
+            // Resolve + authorize attachment sources once; the returned slots
+            // are index-aligned with req.attachments and carry the exact
+            // canonical target each read must bind to. On WSS, path sources are
+            // rejected inside process_file_entry, so no resolution is needed.
+            let attachment_sources = if is_wss {
+                Vec::new()
+            } else {
+                match self.authorize_attachment_sources(
                     Method::SessionPrompt,
                     grants.as_ref(),
                     &agent_alias,
                     &req.attachments,
-                )
-            {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
+                ) {
+                    Ok(sources) => sources,
+                    Err(denied) => {
+                        return Err(self
+                            .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                            .await);
+                    }
+                }
+            };
             if !prompt.is_empty() {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
-                let source = self.attachment_source(&agent_alias, entry);
+                let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
                 let result = tokio::select! {
                     biased;
                     _ = self.connection_cancel.cancelled() => {
@@ -4287,7 +4321,7 @@ impl RpcDispatcher {
                         sid,
                         &upload_root,
                         is_wss,
-                        source.as_ref(),
+                        source,
                         &self.ctx.sessions,
                     ) => result?,
                 };
@@ -7278,29 +7312,28 @@ impl RpcDispatcher {
             .to_string();
 
         let is_wss = self.peer_label.starts_with("wss:");
-        if !is_wss {
+        // Resolve + authorize once; the returned slots are index-aligned with
+        // req.files and carry the exact canonical target each read binds to. On
+        // WSS, path sources are rejected in process_file_entry.
+        let attachment_sources = if is_wss {
+            Vec::new()
+        } else {
             self.authorize_attachment_sources(
                 Method::FileAttach,
                 self.stamped_grants(),
                 &agent_alias,
                 &req.files,
-            )?;
-        }
+            )?
+        };
 
         let mut total_bytes: u64 = 0;
         let mut results = Vec::with_capacity(req.files.len());
 
-        for entry in &req.files {
-            let source = self.attachment_source(&agent_alias, entry);
-            let result = process_file_entry(
-                entry,
-                sid,
-                &upload_root,
-                is_wss,
-                source.as_ref(),
-                &self.ctx.sessions,
-            )
-            .await?;
+        for (idx, entry) in req.files.iter().enumerate() {
+            let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
+            let result =
+                process_file_entry(entry, sid, &upload_root, is_wss, source, &self.ctx.sessions)
+                    .await?;
             total_bytes += result.size_bytes;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -10741,6 +10774,92 @@ mod tests {
         );
     }
 
+    /// End-to-end persisted narrowing over RPC: an operator drives a real
+    /// `config/set permission_profiles.session-scoped.allowed_agents = []`
+    /// (persisted to disk AND published as an accepted revision through the
+    /// actual mutation handler) while alice's prompt is parked at admission.
+    /// When released, the admitted prompt is denied before it reaches the
+    /// provider — proving the recheck reads the committed mutation, not only a
+    /// synthetic `refresh_from_config`. The mutation travels the same handler a
+    /// production `config/set` uses.
+    #[tokio::test]
+    async fn session_prompt_denied_before_execution_by_a_persisted_config_set_narrowing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        // Grant the operator connection the authority to persist a profile edit.
+        {
+            let profile = config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists");
+            profile.grants.insert(
+                zeroclaw_api::grants::Resource::Config,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Update,
+                ],
+            );
+            profile.config_write_paths = vec!["permission_profiles.*".into()];
+        }
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-persisted-narrow";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+
+        // Two connections for the same principal: one carries the parked prompt,
+        // the other drives the persisted mutation.
+        let (mut prompter, mut prompter_rx) = roster_peer(&ctx, 4242).await;
+        let (mut operator, mut operator_rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut prompter, 11, sid, 6).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+
+        // Drive the narrowing through the real config/set RPC: this persists to
+        // disk and republishes the accepted revision via the production handler.
+        let narrowed = rpc(
+            &mut operator,
+            &mut operator_rx,
+            12,
+            "config/set",
+            json!({
+                "prop": "permission_profiles.session-scoped.allowed_agents",
+                "value": []
+            }),
+        )
+        .await;
+        assert!(
+            narrowed.get("error").is_none(),
+            "the persisted narrowing itself is authorized: {narrowed}"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            on_disk.contains("session-scoped"),
+            "the narrowed profile must be persisted: {on_disk}"
+        );
+
+        release_admitted.notify_one();
+
+        let (response, notifications) = response_and_notifications(&mut prompter_rx, 11).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 6);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a prompt narrowed by a persisted config/set must be denied before the provider"
+        );
+    }
+
     #[tokio::test]
     async fn session_prompt_survives_an_unrelated_policy_republication_after_admission() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11550,7 +11669,87 @@ mod tests {
         );
     }
 
-    // ── SOP runs, approvals, and authoring apply the agent selector ─────
+    /// Deterministic alias swap: the request names a symlink that resolves, at
+    /// authorization time, to a file inside the agent's entitled workspace. The
+    /// read must bind to that single resolved canonical target — proving
+    /// authorization and read consume the SAME resolution and there is no
+    /// second, raw-path resolution the swap could exploit. The upload is named
+    /// from the resolved target, not the alias spelling.
+    #[tokio::test]
+    async fn file_attach_by_path_binds_the_read_to_the_authorized_resolved_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, inside, _secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A symlink INSIDE the workspace pointing at the allowed in-root file.
+        let alias = agent_workspace.join("alias.link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            9,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": alias.to_string_lossy()}]}),
+        )
+        .await;
+        assert!(
+            attached["result"]["files"].is_array(),
+            "an alias resolving inside an entitled root must be attached: {attached}"
+        );
+        // The stored file is content-addressed (hash name), so assert the read
+        // bound to the resolved target by its byte length: inside.txt's content.
+        let size = attached["result"]["files"][0]["size_bytes"].as_u64();
+        assert_eq!(
+            size,
+            Some(std::fs::metadata(&inside).unwrap().len()),
+            "the read must bind to the resolved target's bytes: {attached}"
+        );
+    }
+
+    /// A symlink inside the workspace that points OUTSIDE every entitled root
+    /// must be refused: authorization judges readability on the resolved target
+    /// (the outside file), not the in-root alias spelling, so the escape is
+    /// caught before any read and nothing is copied in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_attach_by_path_refuses_an_in_root_alias_that_escapes_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, _inside, secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A symlink whose *name* lives inside the entitled workspace but whose
+        // target escapes every agent root.
+        let escape = agent_workspace.join("escape.link");
+        std::os::unix::fs::symlink(&secret, &escape).unwrap();
+        // Snapshot AFTER creating the alias so the alias itself is not counted
+        // as a copied-in attachment; the assertion checks no NEW file appears.
+        let files_before = files_under(&agent_workspace);
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            10,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": escape.to_string_lossy()}]}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(FORBIDDEN),
+            "an in-root alias resolving outside every root must be refused: {refused}"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused escaping alias must not be copied into the agent's workspace"
+        );
+    }
 
     fn gated_sop(name: &str, agent: &str) -> crate::sop::Sop {
         use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger};
@@ -12228,6 +12427,83 @@ mod tests {
             )
             .await;
             assert!(again.get("error").is_none(), "{again}");
+        });
+    }
+
+    /// End-to-end ACR tightening over RPC: an established OIDC connection drives
+    /// an authenticated `config/set` that raises `oidc.corp.required_acr`, then
+    /// its very next RPC on the same connection is refused because the binding
+    /// must re-verify a token that now lacks the required acr. This exercises
+    /// the real mutation + re-resolution path through `process_line`, not a
+    /// synthetic `publish_accepted`. The control (a `providers.*` edit that
+    /// changes no authorization input) leaves the connection usable, proving the
+    /// refusal is specific to the tightened authority.
+    #[test]
+    fn tightening_required_acr_through_config_set_forces_the_connection_to_reverify() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Permit oidc.* writes so the ACR edit itself is authorized; the
+            // fixture principal already holds Config:Update.
+            let mut config = oidc_session_config(&tmp);
+            config
+                .permission_profiles
+                .get_mut("oidc-ops")
+                .expect("the fixture profile exists")
+                .config_write_paths = vec!["providers.*".into(), "oidc.*".into()];
+            let (ctx, _chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+            let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+            // Control: a provider edit changes no authorization input, so the
+            // established binding keeps working afterward.
+            let control = rpc(
+                &mut oidc,
+                &mut rx,
+                1,
+                "config/set",
+                json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "still-usable"
+                }),
+            )
+            .await;
+            assert!(control.get("error").is_none(), "control edit: {control}");
+            let after_control = rpc(&mut oidc, &mut rx, 2, "config/list", json!({})).await;
+            assert!(
+                after_control.get("error").is_none(),
+                "an unrelated edit must not disturb the connection: {after_control}"
+            );
+
+            // Tighten the acr requirement through the real RPC mutation path.
+            let tightened = rpc(
+                &mut oidc,
+                &mut rx,
+                3,
+                "config/set",
+                json!({
+                    "prop": "oidc.corp.required_acr",
+                    "value": ["urn:example:assurance:mfa"]
+                }),
+            )
+            .await;
+            assert!(
+                tightened.get("error").is_none(),
+                "the ACR-tightening save itself is authorized: {tightened}"
+            );
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(
+                on_disk.contains("urn:example:assurance:mfa"),
+                "the tightened acr must be persisted: {on_disk}"
+            );
+
+            // The next RPC on the same connection must be refused: the OIDC
+            // binding was established on a token that lacks the newly-required
+            // acr, so re-resolution fails closed until the client re-verifies.
+            let refused = rpc(&mut oidc, &mut rx, 4, "config/list", json!({})).await;
+            assert!(
+                refused.get("error").is_some(),
+                "a connection established before the acr tightened must be forced to \
+                 re-verify, not keep resolving: {refused}"
+            );
         });
     }
 

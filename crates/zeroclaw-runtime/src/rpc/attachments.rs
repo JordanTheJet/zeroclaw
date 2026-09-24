@@ -140,17 +140,16 @@ fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcErro
 #[cfg(unix)]
 fn set_nonblocking_nofollow(opts: &mut cap_std::fs::OpenOptions) {
     use cap_std::fs::OpenOptionsExt;
-    // O_NONBLOCK (0o4000): opening a writer-less FIFO returns immediately
-    // instead of blocking. O_NOFOLLOW (0o400000 on Linux, 0x100 on macOS):
-    // refuse a final-component symlink so a retarget after authorization
-    // cannot redirect the read. Both are passed through `custom_flags`, which
-    // ORs into the open flags cap-std computes for the confined open.
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400000;
-    #[cfg(not(target_os = "linux"))]
-    const O_NOFOLLOW: i32 = 0x100;
-    const O_NONBLOCK: i32 = 0o4000;
-    opts.custom_flags(O_NONBLOCK | O_NOFOLLOW);
+    // Use libc's per-target flag values rather than hardcoded octal: the
+    // numeric values differ across platforms (e.g. O_NONBLOCK is 0o4000 on
+    // Linux but 0o0004 on Darwin/BSD, where 0o4000 is actually O_EXCL), so a
+    // literal would silently set the wrong flag off-Linux and let a writer-less
+    // FIFO block the worker. O_NONBLOCK: opening a writer-less FIFO returns
+    // immediately instead of blocking (fifo(7)). O_NOFOLLOW: refuse a
+    // final-component symlink so a retarget after authorization cannot redirect
+    // the read. Both are ORed through `custom_flags` into the flags cap-std
+    // computes for the confined open.
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
 }
 
 #[cfg(not(unix))]
@@ -874,6 +873,65 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// A writer-less FIFO is the precise hazard `O_NONBLOCK` guards: a plain
+    /// blocking `open(2)` on it waits indefinitely for a writer (fifo(7)). This
+    /// test would hang (and time out) if the nonblocking flag were mis-set —
+    /// exactly the Darwin/BSD defect where a hardcoded `0o4000` selects
+    /// `O_EXCL` instead of `O_NONBLOCK`. The refusal must return promptly and
+    /// as a type refusal, WITHOUT any pathname-only precheck (the open itself
+    /// must be what refuses the non-regular file). A normal-file control in the
+    /// same workspace proves the guard does not over-refuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_mode_refuses_a_writerless_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        // Create a FIFO with no writer inside the workspace.
+        let fifo = tmp.path().join("pipe.fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path; 0o600 is a plain mode.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let fifo_entry = FileEntry {
+            path: Some(fifo.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process_file_entry(&fifo_entry, "s1", &ws, false, None, &store),
+        )
+        .await
+        .expect("the writer-less FIFO refusal must not block on a missing writer")
+        .expect_err("a FIFO is not a regular file and must be refused");
+        assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+        assert!(err.message.contains("regular file"), "{}", err.message);
+
+        // Control: an ordinary regular file in the same workspace is accepted.
+        let regular = tmp.path().join("ok.txt");
+        std::fs::write(&regular, b"hello").unwrap();
+        let ok_entry = FileEntry {
+            path: Some(regular.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let result = process_file_entry(&ok_entry, "s1", &ws, false, None, &store)
+            .await
+            .expect("a normal regular file must be accepted by the guard");
+        assert_eq!(
+            result.size_bytes, 5,
+            "the control file's bytes must be read"
+        );
     }
 
     #[tokio::test]
