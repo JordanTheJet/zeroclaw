@@ -293,8 +293,15 @@ impl PluginHost {
     }
 
     /// List all discovered plugins.
+    ///
+    /// Sorted by package name so the listing is stable across runs: the loaded
+    /// set is a hash map, and an operator diffing two `plugin list` outputs, or a
+    /// script reading the verified rows, needs the order to mean nothing.
     pub fn list_plugins(&self) -> Vec<PluginInfo> {
-        self.loaded.values().map(plugin_info_from_loaded).collect()
+        let mut plugins: Vec<PluginInfo> =
+            self.loaded.values().map(plugin_info_from_loaded).collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        plugins
     }
 
     /// Get info about a specific plugin.
@@ -306,6 +313,16 @@ impl PluginHost {
     #[must_use]
     pub fn manifest(&self, name: &str) -> Option<&PluginManifest> {
         self.loaded.get(name).map(|plugin| &plugin.manifest)
+    }
+
+    /// The exact component bytes admitted for an installed plugin: the bytes
+    /// the daemon compiles, so a load check against them checks what will run.
+    /// `None` for an unknown plugin and for a skill-only plugin that ships no
+    /// WASM.
+    pub fn admitted_component(&self, name: &str) -> Option<&AdmittedComponent> {
+        self.loaded
+            .get(name)
+            .and_then(|plugin| plugin.component.as_ref())
     }
 
     /// Install a plugin from a directory path. Returns the installed
@@ -965,6 +982,35 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loaded set is a hash map; the listing must not inherit its order.
+    #[test]
+    fn list_plugins_is_sorted_by_name_regardless_of_discovery_order() {
+        let dir = tempdir().unwrap();
+        for name in ["zeta-plugin", "mid-plugin", "alpha-plugin"] {
+            let plugin_dir = dir.path().join("plugins").join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    r#"
+name = "{name}"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#
+                ),
+            )
+            .unwrap();
+            // Discovery admits the declared component, so it has to exist.
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let names: Vec<String> = host.list_plugins().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["alpha-plugin", "mid-plugin", "zeta-plugin"]);
+    }
     use tempfile::tempdir;
 
     #[test]
