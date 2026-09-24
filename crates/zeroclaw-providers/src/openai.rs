@@ -23,9 +23,6 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
-/// Maximum silence between body reads for OpenAI Responses SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
@@ -849,17 +846,23 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
-/// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
+/// and the JSON body attached. `idle_timeout` is the streaming client's
+/// read-idle bound; it names the bound that fired in timeout errors, including
+/// whether `timeout_secs` can raise it. Sends `StreamEvent::Final` on clean
+/// stream end.
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) {
     let http_response = match request_builder.send().await {
         Ok(r) => r,
         Err(err) => {
             let _ = tx
-                .send(Err(StreamError::ModelProvider(err.to_string())))
+                .send(Err(StreamError::ModelProvider(
+                    super::stream_idle_error_message(&err, idle_timeout),
+                )))
                 .await;
             return;
         }
@@ -896,7 +899,9 @@ pub(crate) async fn run_responses_sse(
             }
             Some(Err(err)) => {
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(err.to_string())))
+                    .send(Err(StreamError::ModelProvider(
+                        super::stream_idle_error_message(&err, idle_timeout),
+                    )))
                     .await;
                 return;
             }
@@ -976,8 +981,11 @@ pub struct OpenAiResponsesModelProvider {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     /// HTTP request timeout in seconds for non-streaming LLM API calls.
-    /// Streaming SSE calls use `streaming_client` which sets only a
-    /// connect timeout so long-running responses aren't killed mid-stream.
+    /// Streaming SSE calls use `streaming_client`, which sets no overall
+    /// timeout (long-running responses aren't killed mid-stream) and derives
+    /// its read-idle bound as `max(300 s, timeout_secs)` via
+    /// `stream_idle_timeout`: the 300 s floor applies when this field is
+    /// unset or lower, and a higher value raises the idle bound to match.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
     extra_headers: std::collections::HashMap<String, String>,
@@ -1164,15 +1172,12 @@ impl OpenAiResponsesModelProvider {
     ///
     /// `responses_url` is the full endpoint rather than a base URL; the target
     /// test parses its host, so it matches either shape. Returns `None` when
-    /// the operator already pinned the header through `extra_headers`, which
-    /// `build_default_headers` puts on every request — a second value here
-    /// would send the header twice.
+    /// the operator already pinned a valid header value through
+    /// `extra_headers`, which `build_default_headers` puts on every request; a
+    /// second value here would send the header twice. A pinned value
+    /// `build_default_headers` skips as invalid does not count.
     fn opencode_session_value(&self) -> Option<String> {
-        if self
-            .extra_headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
-        {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
             return None;
         }
         crate::opencode_session::session_token(&self.responses_url)
@@ -1198,6 +1203,7 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1209,10 +1215,11 @@ impl OpenAiResponsesModelProvider {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1380,6 +1387,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
+        let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1437,7 +1445,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             }
             let request_builder = request_builder.json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens).await;
+            run_responses_sse(request_builder, &tx, count_tokens, idle_timeout).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1497,7 +1505,12 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_responses_sse(request, &tx, false),
+            run_responses_sse(
+                request,
+                &tx,
+                false,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            ),
         )
         .await
         .expect("response.completed must finish without waiting for EOF");
@@ -1744,6 +1757,53 @@ mod tests {
                 "{api_url}: header selection must match the request host {host}"
             );
         }
+    }
+
+    #[test]
+    fn opencode_session_pin_counts_only_when_the_value_is_valid() {
+        let provider_with = |value: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url("https://opencode.ai/zen/v1")
+                .credential(Some("test-key"))
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-opencode-session".to_string(),
+                    value.to_string(),
+                )]))
+                .build()
+        };
+        assert!(
+            provider_with("pinned-by-operator")
+                .opencode_session_value()
+                .is_none(),
+            "a valid operator pin must win over the derived value"
+        );
+        assert!(
+            provider_with("bad\nvalue")
+                .opencode_session_value()
+                .is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_responses_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default, so this checks both clients the Responses provider builds.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+        let provider = |api_url: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build()
+        };
+
+        let opencode = provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_client()));
+
+        let other = provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_client()));
     }
 
     #[test]
@@ -2821,6 +2881,93 @@ mod tests {
         assert!(
             wire_tools.is_empty(),
             "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_names_idle_bound_when_provider_stalls_before_headers() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled Responses test server");
+        let addr = listener
+            .local_addr()
+            .expect("stalled Responses test server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (_socket, _) = listener
+                .accept()
+                .await
+                .expect("accept stalled Responses test request");
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("build short-read-timeout Responses test client");
+        let request = client
+            .post(format!("http://{addr}/responses"))
+            .header("Accept", "text/event-stream")
+            .json(&serde_json::json!({}));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_responses_sse(
+                request,
+                &tx,
+                false,
+                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
+            ),
+        )
+        .await
+        .expect("stalled Responses stream must hit the read-idle bound");
+
+        let item = rx
+            .recv()
+            .await
+            .expect("stalled Responses stream must yield an error");
+        server.abort();
+        let message = match item {
+            Err(StreamError::ModelProvider(message)) => message,
+            Err(other) => panic!("expected a model provider error, got {other:?}"),
+            Ok(_) => panic!("expected an error from the stalled Responses stream"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
         );
     }
 }

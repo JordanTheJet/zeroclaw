@@ -343,7 +343,6 @@ struct GitStatusUpdate {
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
     session_id: String,
-    family: String,
     model_provider_ref: String,
     models: Vec<String>,
     current: Option<String>,
@@ -509,6 +508,18 @@ struct PromptCompletion {
     turn_generation: u64,
     error: Option<String>,
     transport_closed: bool,
+}
+
+/// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
+/// Fluent key whose localized label describes that provenance. Unknown values
+/// (older or future daemons) fall back to a label-less render.
+fn token_source_fluent_key(source: &str) -> String {
+    match source {
+        "provider" => "zc-chat-history-trimmed-token-source-provider".to_string(),
+        "estimate" => "zc-chat-history-trimmed-token-source-estimate".to_string(),
+        "calibrated" => "zc-chat-history-trimmed-token-source-calibrated".to_string(),
+        other => format!("zc-chat-history-trimmed-token-source-{other}"),
+    }
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -682,6 +693,20 @@ impl Chat {
 
     /// One summary per tracked session, in stable creation order, for the
     /// agent sidebar. Cheap: derives from live state, owns nothing.
+    /// Terminal status candidates for every live session this pane tracks,
+    /// focused or not, paired with the owning agent alias. Background sessions
+    /// keep draining transport events each tick, so their state is current.
+    pub(crate) fn terminal_statuses(&self) -> Vec<(TurnStatus, String)> {
+        let mut out = Vec::with_capacity(self.background.len() + 1);
+        if let ChatPhase::Active(state) = &self.phase {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        for state in &self.background {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        out
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<SidebarSessionSummary> {
         let active = match &self.phase {
             ChatPhase::Active(state) => Some(state.as_ref()),
@@ -3851,10 +3876,10 @@ impl Chat {
         })
     }
 
-    /// Fetch the model catalog for a model_provider family. Returns an empty vec
+    /// Fetch the model catalog for the full model_provider reference. Returns an empty vec
     /// on failure; the caller surfaces the error on the info bar.
-    async fn fetch_models(rpc: &RpcClient, family: &str) -> Vec<String> {
-        match rpc.catalog_models(family).await {
+    async fn fetch_models(rpc: &RpcClient, model_provider_ref: &str) -> Vec<String> {
+        match rpc.catalog_models(model_provider_ref).await {
             Ok(res) => res.models,
             Err(_) => Vec::new(),
         }
@@ -3878,14 +3903,8 @@ impl Chat {
             state.mark_dirty_full();
             return;
         };
-        let family = model_provider_ref
-            .split('.')
-            .next()
-            .unwrap_or(&model_provider_ref)
-            .to_string();
-
         // Warm cache: open immediately, no fetch, no loading state.
-        if state.input_bar.model_catalog_provider() == Some(family.as_str())
+        if state.input_bar.model_catalog_provider() == Some(model_provider_ref.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
             let models = state.input_bar.model_catalog().to_vec();
@@ -3914,19 +3933,17 @@ impl Chat {
         let rpc = rpc.clone();
         let tx = model_fetch_tx.clone();
         let session_id = state.session_id.clone();
-        let model_provider_ref_c = model_provider_ref.clone();
         let session_model = state.model.clone();
         tokio::spawn(async move {
-            let models = Self::fetch_models(&rpc, &family).await;
+            let models = Self::fetch_models(&rpc, &model_provider_ref).await;
             let current = match session_model {
                 Some(m) => Some(m),
-                None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+                None => Self::configured_model(&rpc, &model_provider_ref).await,
             };
             let _ = tx
                 .send(ModelFetchResult {
                     session_id,
-                    family,
-                    model_provider_ref: model_provider_ref_c,
+                    model_provider_ref,
                     models,
                     current,
                 })
@@ -3958,12 +3975,11 @@ impl Chat {
         }
         state
             .input_bar
-            .set_model_catalog(res.family, res.models.clone());
+            .set_model_catalog(res.model_provider_ref, res.models.clone());
         state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
             res.models,
             res.current.as_deref(),
         ));
-        let _ = res.model_provider_ref;
         state.info_message = None;
         state.mark_dirty_full();
     }
@@ -4549,10 +4565,15 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_model_window,
+            ),
+            _ => (None, None, None),
         }
     }
 
@@ -5826,24 +5847,10 @@ fn render_entry_into(
             }
         }
         ChatEntry::AgentMessage(text) => {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-                theme::agent_label_style().add_modifier(sel_mod),
-            )]));
-            let md_lines = markdown_to_lines(text.as_ref(), width);
-            for mut line in md_lines {
-                if is_selected {
-                    line = Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|s| {
-                                s.patch_style(Style::default().add_modifier(Modifier::REVERSED))
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                lines.push(line);
-            }
+            render_agent_message_into(text, is_selected, width, lines);
+        }
+        ChatEntry::AgentMessageContinuation(text) => {
+            render_agent_message_into(text, is_selected, width, lines);
         }
         ChatEntry::AgentThought(text) => {
             if show_thoughts {
@@ -5878,6 +5885,35 @@ fn render_entry_into(
         }
     }
     None
+}
+
+fn render_agent_message_into(
+    text: &str,
+    is_selected: bool,
+    width: u16,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+        theme::agent_label_style().add_modifier(sel_mod),
+    )]));
+    let md_lines = markdown_to_lines(text, width);
+    for mut line in md_lines {
+        if is_selected {
+            line = Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| s.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        lines.push(line);
+    }
 }
 
 /// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
@@ -6105,6 +6141,34 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     Some(Rect::new(x, anchor.y, cells, 1))
 }
 
+fn pinned_preview_source(message: &str, width: u16) -> &str {
+    if width == 0 {
+        return "";
+    }
+
+    let mut has_content = false;
+    let mut cells = 0;
+    for (offset, grapheme, grapheme_width) in crate::display_width::grapheme_widths(message) {
+        // Match Span's control filtering and WordWrapper's oversized-symbol handling.
+        if grapheme.contains(char::is_control) || grapheme_width > usize::from(width) {
+            continue;
+        }
+        if !has_content {
+            if ratatui::text::StyledGrapheme::new(grapheme, Style::default()).is_whitespace() {
+                continue;
+            }
+            has_content = true;
+        }
+        // One positive-width lookahead lets the existing wrapper settle the first
+        // row's word boundary without laying out the invisible message tail.
+        if cells >= usize::from(width) && grapheme_width > 0 {
+            return &message[..offset + grapheme.len()];
+        }
+        cells += grapheme_width;
+    }
+    message
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConversationRenderWork {
@@ -6169,7 +6233,10 @@ fn render_conversation(
     if first_row_h == 1 {
         let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
         let msg = state.first_message.as_deref().unwrap_or_default();
-        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        let line = Line::from(Span::styled(
+            pinned_preview_source(msg, first_row.width),
+            theme::dim_style(),
+        ));
         f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
     }
 
@@ -7379,6 +7446,10 @@ impl PendingElicitation {
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
+    /// A response committed after the prompt RPC returned but before its
+    /// terminal notification arrived. Late chunks extend this buffer in place;
+    /// the next ordering boundary freezes it back into `AgentMessage`.
+    AgentMessageContinuation(String),
     AgentThought(Arc<str>),
     /// Local system/info message (e.g. "Attached: photo.png").
     SystemMessage(Arc<str>),
@@ -7455,6 +7526,8 @@ enum LinesDirty {
     /// `rebuild_lines` can extend `cached_lines` instead of rebuilding from scratch,
     /// avoiding re-parsing markdown for unchanged `AgentMessage` entries.
     Appended,
+    /// The final cached entry changed without shifting the render window.
+    TailChanged(usize),
     /// Full rebuild required (entry mutation, selection/thoughts change, reset).
     Full,
 }
@@ -7664,6 +7737,11 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// Agent-message entry committed by prompt-response fallback while its
+    /// terminal notification may still be in flight. Continuation chunks for
+    /// the same local generation extend this entry instead of creating a
+    /// second `Agent:` block.
+    prompt_settled_stream_entry: Option<(u64, usize)>,
     /// Set when any `ToolCall` event arrived during the current turn.
     /// Used by `commit_turn` to distinguish "empty completion with tool
     /// calls" (normal — tool output is the visible record) from "empty
@@ -7762,8 +7840,11 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Configured context limit for this session's model.
+    /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
+    /// Model's full context window; when present, the bar denominator so the
+    /// trim budget shows as a marker rather than the 100% point.
+    pub context_model_window: Option<u64>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -7835,6 +7916,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -7875,6 +7957,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_model_window: None,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -7893,10 +7976,31 @@ impl ChatState {
     }
 
     fn mark_dirty_append(&mut self) {
-        if self.dirty == LinesDirty::Clean {
-            self.dirty = LinesDirty::Appended;
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::Appended,
+            LinesDirty::TailChanged(_) => self.dirty = LinesDirty::Full,
+            LinesDirty::Appended | LinesDirty::Full => {}
         }
         // Full is sticky — don't downgrade.
+    }
+
+    fn mark_dirty_tail(&mut self, entry_index: usize) {
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::TailChanged(entry_index),
+            LinesDirty::TailChanged(index) if index == entry_index => {}
+            LinesDirty::Appended => {
+                // An intervening append does not make previously cached text fresh.
+                if (self.cached_render_start
+                    ..self
+                        .cached_render_start
+                        .saturating_add(self.cached_entry_count))
+                    .contains(&entry_index)
+                {
+                    self.dirty = LinesDirty::Full;
+                }
+            }
+            LinesDirty::TailChanged(_) | LinesDirty::Full => self.dirty = LinesDirty::Full,
+        }
     }
 
     /// Whether text input currently belongs to the composer rather than a
@@ -8477,6 +8581,46 @@ impl ChatState {
         start = start.min(natural_start);
         let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
 
+        // A prompt-response fallback may commit the current stream just before
+        // its final chunks arrive. Re-render only that final entry: earlier
+        // markdown and row metadata remain valid.
+        if let LinesDirty::TailChanged(entry_index) = self.dirty
+            && start == self.cached_render_start
+            && entry_index + 1 == end
+            && let Some(range_pos) = self
+                .cached_line_ranges
+                .iter()
+                .position(|&(index, _, _)| index == entry_index)
+            && range_pos + 1 == self.cached_line_ranges.len()
+        {
+            let line_start = self.cached_line_ranges[range_pos].1;
+            self.cached_lines.truncate(line_start);
+            self.cached_line_ranges.truncate(range_pos);
+
+            let mut changed_lines = Vec::new();
+            let footer_line = render_entry_into(
+                &self.entries[entry_index],
+                self.is_entry_highlighted(entry_index),
+                self.show_thoughts,
+                self.disclosure_for_entry(&self.entries[entry_index]),
+                width,
+                &mut changed_lines,
+            );
+            self.cached_tool_footer_lines.remove(&entry_index);
+            if let Some(footer_line) = footer_line {
+                self.cached_tool_footer_lines
+                    .insert(entry_index, line_start + footer_line);
+            }
+            let line_end = line_start + changed_lines.len();
+            self.cached_lines.extend(changed_lines);
+            self.cached_line_ranges
+                .push((entry_index, line_start, line_end));
+            self.cached_row_breaks = row_breaks_for_lines(&self.cached_lines, width);
+            self.dirty = LinesDirty::Clean;
+            self.rebuild_screen_ranges(width);
+            return;
+        }
+
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
             let render_from = start + self.cached_entry_count;
@@ -9054,6 +9198,36 @@ impl ChatState {
         }
     }
 
+    fn append_to_prompt_settled_stream(&mut self, text: &str) -> bool {
+        let Some((generation, entry_index)) = self.prompt_settled_stream_entry else {
+            return false;
+        };
+        if generation != self.turn_generation {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        }
+        let Some(ChatEntry::AgentMessageContinuation(existing)) = self.entries.get_mut(entry_index)
+        else {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        };
+        existing.push_str(text);
+        self.mark_dirty_tail(entry_index);
+        true
+    }
+
+    fn freeze_prompt_settled_stream(&mut self) {
+        let Some((_, entry_index)) = self.prompt_settled_stream_entry.take() else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(entry_index) else {
+            return;
+        };
+        if let ChatEntry::AgentMessageContinuation(text) = entry {
+            *entry = ChatEntry::AgentMessage(Arc::<str>::from(std::mem::take(text)));
+        }
+    }
+
     pub fn apply_update(&mut self, update: SessionUpdate) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
@@ -9073,6 +9247,9 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
+                    return;
+                }
                 // Flush any accumulated thought before the response text begins
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
@@ -9088,6 +9265,7 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.freeze_prompt_settled_stream();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -9099,6 +9277,7 @@ impl ChatState {
                 raw_input,
                 ..
             } => {
+                self.freeze_prompt_settled_stream();
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
@@ -9165,27 +9344,93 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                model_context_window,
                 ..
             } => {
-                if input_tokens.is_some() {
-                    self.context_input_tokens = input_tokens;
-                }
-                if max_context_tokens.is_some() {
-                    self.context_max_tokens = max_context_tokens;
-                }
+                self.context_input_tokens = input_tokens;
+                // Budget and capacity are one authoritative per-call snapshot.
+                // In particular, `None` capacity is meaningful: compatibility
+                // fallback routes omit it and must clear a prior configured
+                // route's denominator instead of retaining stale state.
+                self.context_max_tokens = max_context_tokens;
+                self.context_model_window = model_context_window;
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
                 kept_turns,
                 reason,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                unsatisfiable_floor,
                 ..
             } => {
+                self.freeze_prompt_settled_stream();
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
-                let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
-                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
-                );
+                // The unsatisfiable newest-turn/schema floor is flagged
+                // explicitly by the runtime: the retained request cannot fit
+                // the configured budget even though history MAY have been
+                // trimmed on the way to that floor, so the notice must not
+                // claim a successful trim.
+                let at_floor = unsatisfiable_floor == Some(true);
+                let notice = if at_floor {
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed-floor",
+                        &[
+                            ("reason", &reason),
+                            ("after", &tokens_after.unwrap_or_default().to_string()),
+                            ("budget", &token_budget.unwrap_or_default().to_string()),
+                        ],
+                    )
+                } else {
+                    match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => {
+                            let mut notice = crate::i18n::t_args(
+                                "zc-chat-history-trimmed-tokens",
+                                &[
+                                    ("reason", &reason),
+                                    ("before", &before.to_string()),
+                                    ("after", &after.to_string()),
+                                    ("dropped", &dropped),
+                                    ("kept", &kept),
+                                ],
+                            );
+                            // The configured budget is context, never the trim
+                            // target: recovery trims toward a provider-overflow
+                            // target, so the notice must not present the
+                            // configured limit as governing the trim.
+                            if let Some(budget) = token_budget {
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-budget-clause",
+                                    &[("budget", &budget.to_string())],
+                                ));
+                            }
+                            let before_label = tokens_before_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            let after_label = tokens_after_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            if let (Some(before_label), Some(after_label)) =
+                                (before_label, after_label)
+                            {
+                                notice.push(' ');
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-sources",
+                                    &[("before", &before_label), ("after", &after_label)],
+                                ));
+                            }
+                            notice
+                        }
+                        _ => crate::i18n::t_args(
+                            "zc-chat-history-trimmed",
+                            &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                        ),
+                    }
+                };
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -9238,6 +9483,7 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
+        self.freeze_prompt_settled_stream();
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
         }
@@ -9265,17 +9511,28 @@ impl ChatState {
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
-        self.mark_dirty_append();
         self.settle_turn_lifecycle(clean);
     }
 
     fn settle_turn_from_prompt_response(&mut self) {
-        if self.flush_streaming_text() {
+        self.freeze_prompt_settled_stream();
+        let text = std::mem::take(&mut self.streaming_text);
+        if !text.is_empty() {
             self.turn_had_streaming_text = true;
+            let entry_index = self.entries.len();
+            self.entries.push(ChatEntry::AgentMessageContinuation(text));
+            self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
+            self.mark_dirty_append();
         }
         self.flush_streaming_thought();
-        self.turn_had_streaming_text = false;
-        self.turn_had_tool_calls = false;
+        if self
+            .prompt_settled_stream_entry
+            .is_some_and(|(_, entry_index)| entry_index + 1 != self.entries.len())
+        {
+            self.freeze_prompt_settled_stream();
+        }
+        // Preserve per-turn provenance for a delayed terminal notification;
+        // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false);
     }
@@ -9311,6 +9568,23 @@ impl ChatState {
     /// running (the turn is still winding down); a pending elicitation
     /// counts only when it targets this session (defense against a stale
     /// modal surviving a session switch).
+    /// Terminal-facing turn status. An operator wait outranks whatever the
+    /// turn was doing, so the terminal reads as blocked while a prompt is up
+    /// and returns to the turn's own state once it is answered.
+    pub(crate) fn terminal_status(&self) -> TurnStatus {
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|e| e.session_id == self.session_id)
+        {
+            TurnStatus::WaitingForInput
+        } else if self.pending_approval.is_some() {
+            TurnStatus::WaitingForApproval
+        } else {
+            self.turn_status.clone()
+        }
+    }
+
     pub(crate) fn sidebar_status(&self) -> SidebarStatus {
         if self.last_error.is_some() {
             SidebarStatus::Errored
@@ -9329,6 +9603,7 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        self.freeze_prompt_settled_stream();
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
         self.last_error = None;
@@ -9863,6 +10138,7 @@ impl ChatState {
     }
 
     fn prepare_for_notification_resync(&mut self) {
+        self.freeze_prompt_settled_stream();
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.streaming_text.clear();
@@ -10029,6 +10305,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.prompt_settled_stream_entry = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.browse_cursor = None;
@@ -10047,6 +10324,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_model_window = None;
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
         // so a switched-to session doesn't inherit the previous plan's tasks.
         // Rebuilding from freshly resolved settings also applies any Config-pane
@@ -10090,6 +10368,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
             }
         }
         ChatEntry::AgentMessage(t) => t.to_string(),
+        ChatEntry::AgentMessageContinuation(t) => t.clone(),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::SystemMessage(t) => t.to_string(),
         ChatEntry::Tool {
@@ -10110,7 +10389,7 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
         ChatEntry::UserMessage { .. } => {
             crate::i18n::t_args("zc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
         }
-        ChatEntry::AgentMessage(_) => crate::i18n::t_args(
+        ChatEntry::AgentMessage(_) | ChatEntry::AgentMessageContinuation(_) => crate::i18n::t_args(
             "zc-chat-clipboard-agent",
             &[("text", &clipboard_text(entry))],
         ),
@@ -10148,6 +10427,10 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
+    // The editor owned the terminal and may have set its own title, so the
+    // cached view of it is no longer true. Without this the next sync dedupes
+    // against a value the terminal no longer shows and never corrects it.
+    crate::osc_status::invalidate();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
@@ -10199,6 +10482,32 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[test]
+    fn context_usage_clears_stale_capacity_when_next_route_omits_it() {
+        let mut state = state();
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_max_tokens, Some(180_000));
+        assert_eq!(state.context_model_window, Some(200_000));
+
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            max_context_tokens: Some(32_000),
+            model_context_window: None,
+        });
+        assert_eq!(state.context_input_tokens, Some(12_000));
+        assert_eq!(state.context_max_tokens, Some(32_000));
+        assert_eq!(
+            state.context_model_window, None,
+            "a compatibility-fallback frame must clear the prior route's capacity"
+        );
     }
 
     fn resume_entry(session_id: &str, agent_alias: &str, was_focused: bool) -> ResumeEntry {
@@ -12330,6 +12639,52 @@ mod tests {
     fn model_picker_overlay_default_is_closed() {
         let s = state();
         assert!(!s.model_picker.is_open());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_preserves_provider_alias_and_isolates_cache() {
+        let (tx, mut requests) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+        let mut chat = Chat::new(client.clone(), PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (results_tx, mut results_rx) = mpsc::channel(1);
+
+        for provider in ["custom.first", "custom.second", "anthropic.work"] {
+            let model = format!("{provider}-model");
+            let active = active_state(&mut chat);
+            active.model_provider_ref = Some(provider.to_string());
+            active.model = Some(model.clone());
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Loading));
+
+            let request = next_rpc_request(&mut requests, "catalog request expected").await;
+            assert_eq!(request["method"], "config/catalog-models");
+            assert_eq!(request["params"]["model_provider"], provider);
+            respond_ok(
+                &rpc,
+                &request,
+                serde_json::json!({ "models": [model.clone()] }),
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), results_rx.recv())
+                .await
+                .expect("catalog response should complete")
+                .expect("catalog result channel should remain open");
+            chat.apply_model_fetch(result);
+
+            let active = active_state(&mut chat);
+            assert_eq!(active.input_bar.model_catalog_provider(), Some(provider));
+            assert_eq!(active.input_bar.model_catalog(), &[model]);
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            active.model_picker = ModelPickerOverlay::None;
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            assert!(
+                requests.try_recv().is_err(),
+                "same alias should reuse its catalog"
+            );
+            active.model_picker = ModelPickerOverlay::None;
+        }
     }
 
     #[test]
@@ -15709,12 +16064,20 @@ mod tests {
         );
     }
 
+    // This test intentionally holds the process-global keymap test guard while
+    // async dispatch runs so override-mutating tests cannot race it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn rtg_9739_composer_enter_and_primary_enter_dispatch_without_approval() {
+    async fn rtg_9739_composer_enter_and_modifier_enter_dispatch_without_approval() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+
         for kind in [PaneKind::Chat, PaneKind::Acp] {
-            for (key, prompt) in [
+            let mut cases = vec![
                 (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), "submit"),
                 (
                     KeyEvent::new(
@@ -15724,7 +16087,15 @@ mod tests {
                     ),
                     "inject",
                 ),
-            ] {
+            ];
+            if cfg!(target_os = "macos") {
+                cases.push((
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                    "control inject",
+                ));
+            }
+
+            for (key, prompt) in cases {
                 let (tx, mut rx) = mpsc::channel::<String>(16);
                 let outbound = Arc::new(RpcOutbound::new(tx));
                 let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
@@ -17309,6 +17680,12 @@ mod tests {
             dropped_messages: 12,
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -17317,6 +17694,203 @@ mod tests {
                 if text.contains("history message limit exceeded")
                     && text.contains("12")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_token_accounting_renders_in_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            kept_turns: 33,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("configured token budget: 500000")
+                    && text.contains("context token budget exceeded")
+                    && text.contains("12")
+                    && text.contains("33")
+                    && text.contains("provider")
+                    && text.contains("estimate")
+                    && text.contains("before")
+                    && text.contains("after")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && text.contains("configured token budget: 500000")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: None,
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && !text.contains("budget")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_untrimmable_floor_does_not_claim_history_changed() {
+        // The unsatisfiable newest-turn/schema floor carries the explicit
+        // `unsatisfiable_floor` flag while the projected `tokens_after`
+        // still exceeds the configured budget. The notice must not claim
+        // history was trimmed.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 0,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(117_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("calibrated".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("117000")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("was trimmed:")
+                    && !text.contains("messages dropped")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_floor_with_real_drops_reports_both_facts() {
+        // A breadcrumb-induced floor after real turns were removed carries
+        // BOTH the honest drop count and the unsatisfiable flag; the notice
+        // must use the floor wording, not claim an ordinary successful trim.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("Earlier conversation history was trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_without_flag_keeps_trimmed_wording_when_over_budget() {
+        // Older daemons never emit the flag; their events must keep rendering
+        // through the ordinary wording paths even when counts exceed the
+        // budget, so the flag alone drives the floor discriminator.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 1,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("Earlier conversation history was trimmed")
+                    && !text.contains("could not be trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_estimated_sources_render_estimate_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some("estimate".to_string()),
+            tokens_after_source: Some("estimate".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("estimated")
+                    && text.contains("estimated before")
+                    && text.contains("estimated after")
         ));
     }
 
@@ -20393,6 +20967,69 @@ mod tests {
         assert_eq!(s.title(), "personal_code  — my work  40be773");
     }
 
+    fn pinned_preview_buffer(message: &str, width: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::Widget;
+
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(Line::from(Span::styled(message, theme::dim_style())))
+            .wrap(Wrap { trim: true })
+            .render(area, &mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn pinned_preview_preserves_wrapped_first_row() {
+        let messages = [
+            "",
+            "   ",
+            "one two three four five",
+            "  original ask with leading space",
+            "a verylongunbrokenwordandmore",
+            "word       another word",
+            "line one\nline two\tand more",
+            "\u{754c}\u{754c} a \u{754c}bc",
+            "e\u{301} \u{26a0}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} next word",
+            "\u{200b} a\u{a0}b \u{200b}c",
+        ];
+        for message in messages {
+            for width in 0..=24 {
+                assert_eq!(
+                    pinned_preview_buffer(pinned_preview_source(message, width), width),
+                    pinned_preview_buffer(message, width),
+                    "message {message:?}, width {width}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_preview_long_message_only_borrows_visible_prefix() {
+        for message in ["word ".repeat(100_000), "x".repeat(500_000)] {
+            let preview = pinned_preview_source(&message, 80);
+            assert_eq!(preview.len(), 81);
+            assert_eq!(preview.as_ptr(), message.as_ptr());
+            assert_eq!(
+                pinned_preview_buffer(preview, 80),
+                pinned_preview_buffer(&message, 80),
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_preview_keeps_grapheme_clusters_and_recomputes_for_width() {
+        let message = "\u{1f469}\u{200d}\u{1f4bb}".repeat(1000);
+        for width in [2, 3, 8, 20] {
+            let preview = pinned_preview_source(&message, width);
+            assert_eq!(preview.chars().count() % 3, 0);
+            assert!(preview.len() <= (usize::from(width) / 2 + 2) * 11);
+            assert_eq!(
+                pinned_preview_buffer(preview, width),
+                pinned_preview_buffer(&message, width),
+            );
+        }
+    }
+
     #[test]
     fn first_message_captures_first_user_message_only() {
         let mut s = state();
@@ -20846,6 +21483,180 @@ mod tests {
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_before_turn_complete_does_not_duplicate_streamed_text() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let replies = active_state(&mut chat)
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "streamed reply")
+            })
+            .count();
+        assert_eq!(
+            replies, 1,
+            "a delayed terminal frame must not duplicate text committed by response settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_keeps_late_stream_chunk_in_one_agent_entry() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for interposed_error in [false, true] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active
+                .enqueue_message("hello".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+            let (notif_tx, notif_rx) = broadcast::channel(4);
+            chat.notif_rx = notif_rx;
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "agent_message_chunk",
+                        "session_id": "sess-1",
+                        "text": "```rust\nlet daemon = 1;"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+            let state = active_state(&mut chat);
+            state.rebuild_lines(80);
+            assert_eq!(state.dirty, LinesDirty::Clean);
+            assert!(state.prompt_settled_stream_entry.is_some());
+            let continuation_index = state.prompt_settled_stream_entry.unwrap().1;
+
+            if interposed_error {
+                state.input_bar.insert_text("   ");
+                let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                    crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+                    },
+                )
+                .unwrap();
+                chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                    .await;
+                let state = active_state(&mut chat);
+                assert_eq!(state.dirty, LinesDirty::Appended);
+                assert!(matches!(
+                    state.entries().last(),
+                    Some(ChatEntry::SystemMessage(_))
+                ));
+                assert!(state.prompt_settled_stream_entry.is_some());
+                assert!(
+                    writer_rx.try_recv().is_err(),
+                    "whitespace must not dispatch a prompt"
+                );
+            }
+
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "agent_message_chunk",
+                        "session_id": "sess-1",
+                        "text": "\nlet late = 2;\n```"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.dirty,
+                if interposed_error {
+                    LinesDirty::Full
+                } else {
+                    LinesDirty::TailChanged(continuation_index)
+                }
+            );
+            assert!(matches!(
+                state.entries().get(continuation_index),
+                Some(ChatEntry::AgentMessageContinuation(text))
+                    if text == "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+            ));
+            state.rebuild_lines(80);
+            assert_eq!(state.dirty, LinesDirty::Clean);
+            assert!(rendered_text(&state.cached_lines).contains("let late = 2;"));
+            assert_eq!(
+                state.cached_line_screen_ranges.len(),
+                state.cached_lines.len()
+            );
+            assert_eq!(state.cached_code_blocks.len(), 1);
+            assert!(state.cached_code_blocks[0].text.contains("let late = 2;"));
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/update".to_string(),
+                    params: serde_json::json!({
+                        "type": "turn_complete",
+                        "session_id": "sess-1",
+                        "outcome": "completed",
+                        "content": "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+                    }),
+                })
+                .unwrap();
+            chat.drain_notifications();
+            assert_eq!(active_state(&mut chat).dirty, LinesDirty::Clean);
+
+            let replies = active_state(&mut chat)
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replies, ["```rust\nlet daemon = 1;\nlet late = 2;\n```"]);
+        }
     }
 
     #[tokio::test]

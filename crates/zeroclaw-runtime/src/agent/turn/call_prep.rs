@@ -471,6 +471,7 @@ mod tests {
             observer,
             provider_name: "test",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "test",
@@ -487,6 +488,8 @@ mod tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 

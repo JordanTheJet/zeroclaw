@@ -24,6 +24,7 @@ pub mod runtime;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod services;
 pub mod signature;
+pub mod validate;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]
@@ -52,6 +53,10 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// Lowercase or uppercase hexadecimal SHA-256 of the exact WASM payload.
+    /// Required for executable plugins when signature policy is strict.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests
